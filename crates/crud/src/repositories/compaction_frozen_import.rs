@@ -104,6 +104,13 @@ pub struct FrozenImportRecord {
     pub acknowledgement: SourceRef,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeliveryCheckpointImportSource {
+    pub output_ordinal: u64,
+    pub source_thread: String,
+    pub source: SourceRef,
+}
+
 /// Fields are private: callers cannot mint an own claim from a delivery ID.
 #[derive(Clone, Debug)]
 pub struct PreparedFrozenImport {
@@ -336,6 +343,86 @@ pub(crate) async fn compaction_prepare_frozen_import(
     })
 }
 
+/// Attach exact immutable grants from one delivered Task output to the
+/// published checkpoint that replaces precisely those output sources. This is
+/// deliberately separate from accepted TaskRun-basis forwarding: authority
+/// comes from the delivery acknowledgement and immutable output manifest.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn compaction_prepare_delivery_checkpoint_imports(
+    store: &CrudStore,
+    workspace: &str,
+    destination: &str,
+    delivery: &str,
+    acknowledgement: &SourceRef,
+    sources: &[DeliveryCheckpointImportSource],
+    checkpoint_thread: &str,
+    checkpoint: &SourceRef,
+) -> Result<Vec<PreparedFrozenImport>> {
+    ensure!(
+        !sources.is_empty(),
+        "delivery checkpoint import set is empty"
+    );
+    ensure!(
+        sources.len() <= 65_536,
+        "delivery checkpoint import set exceeds supported quantum"
+    );
+    let unique = sources
+        .iter()
+        .map(|source| {
+            (
+                source.output_ordinal,
+                source.source_thread.clone(),
+                source.source.clone(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    ensure!(
+        unique.len() == sources.len(),
+        "delivery checkpoint imports are duplicated"
+    );
+    let mut prepared = Vec::with_capacity(sources.len());
+    for source in sources {
+        prepared.push(
+            compaction_prepare_frozen_import(
+                store,
+                workspace,
+                destination,
+                delivery,
+                acknowledgement,
+                source.output_ordinal,
+                &source.source_thread,
+                &source.source,
+            )
+            .await?,
+        );
+    }
+    let wanted = prepared
+        .iter()
+        .map(|import| {
+            (
+                import.record.source_thread.clone(),
+                import.record.source.clone(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    ensure!(
+        checkpoint_historically_contains(
+            store,
+            workspace,
+            checkpoint_thread,
+            checkpoint,
+            &wanted,
+            true,
+        )
+        .await?,
+        "delivery checkpoint exceeds its accepted output grants"
+    );
+    for import in &mut prepared {
+        import.target_checkpoint = Some((checkpoint_thread.into(), checkpoint.clone()));
+    }
+    Ok(prepared)
+}
+
 /// Forward only evidence from the exact TaskRun basis accepted by this child.
 /// Preparation reads immutable reference/import metadata outside the writer.
 /// Publication revalidates the TaskRun binding, ready digest, exact proof and
@@ -424,12 +511,13 @@ pub(crate) async fn compaction_prepare_accepted_checkpoint_imports(
         })
         .collect::<std::collections::BTreeSet<_>>();
     ensure!(
-        checkpoint_historically_contains_all(
+        checkpoint_historically_contains(
             store,
             workspace,
             checkpoint_thread,
             checkpoint,
             &wanted,
+            false,
         )
         .await?,
         "accepted checkpoint replacement binding changed"
@@ -521,12 +609,13 @@ async fn accepted_import_binding_current<C: ConnectionTrait>(
 /// Check saved coverage only. The target root and any checkpoint used as an
 /// atomic grant must still be published objects; expanded predecessors and raw
 /// leaves are historical metadata, not live source dependencies.
-async fn checkpoint_historically_contains_all(
+async fn checkpoint_historically_contains(
     store: &CrudStore,
     workspace: &str,
     checkpoint_thread: &str,
     checkpoint: &SourceRef,
     wanted: &std::collections::BTreeSet<(String, SourceRef)>,
+    exact: bool,
 ) -> Result<bool> {
     if compaction_checkpoint_source(
         &store.connection,
@@ -576,6 +665,9 @@ async fn checkpoint_historically_contains_all(
             continue;
         }
         if !source.scope.starts_with("checkpoint:") {
+            if exact {
+                return Ok(false);
+            }
             done.insert(key);
             continue;
         }
@@ -950,8 +1042,21 @@ pub(crate) async fn compaction_append_frozen_imports(
             } else {
                 false
             };
+            let delivery_checkpoint_current = if prepared.accepted_basis.is_none() {
+                if let Some((checkpoint_thread, checkpoint)) = &prepared.target_checkpoint {
+                    compaction_checkpoint_source(&tx, workspace, checkpoint_thread, &checkpoint.id)
+                        .await?
+                        .as_ref()
+                        == Some(checkpoint)
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
             if forwarded
-                || (prepared.accepted_basis.is_none()
+                || (delivery_checkpoint_current
+                    && prepared.accepted_basis.is_none()
                     && compaction_frozen_history::Entity::find()
                         .select_only()
                         .join_as(

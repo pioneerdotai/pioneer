@@ -13,7 +13,7 @@ use pioneer_provider::{
     ChatRequest, ChatResponse, Provider, ProviderFailureClassification, ProviderTermination,
     StreamChunk,
 };
-use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, Database, DbBackend, EntityTrait, IntoActiveModel, Statement};
 use std::{
     collections::VecDeque,
     sync::{
@@ -119,6 +119,424 @@ impl CompactionClock for ManualClock {
             rx.changed().await.unwrap();
         }
     }
+}
+
+#[test]
+fn runner_payload_projection_uses_structured_sources_and_preserves_context_verbatim() {
+    let event_source = SourceRef {
+        scope: "event:turn".into(),
+        id: "event".into(),
+        version: "event-revision:1".into(),
+    };
+    let technical = pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+        pioneer_protocol::ItemCompletedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item: pioneer_protocol::TurnItem::SystemEvent {
+                id: "system".into(),
+                level: pioneer_protocol::SystemEventLevel::Info,
+                message: "usage notification".into(),
+                code: Some("agent_runtime_event".into()),
+                details: Some(serde_json::json!({
+                    "nativeMethod": "thread/tokenUsage/updated",
+                    "usage": "[REDACTED]"
+                })),
+            },
+        },
+    );
+    assert!(
+        model_source_payload(&event_source, serde_json::to_string(&technical).unwrap())
+            .unwrap()
+            .is_none()
+    );
+
+    let context_source = SourceRef {
+        scope: "context:turn".into(),
+        id: "context".into(),
+        version: "context-revision:1".into(),
+    };
+    let quoted = r#"{"role":"user","content":"Thread status changed [REDACTED]"}"#;
+    assert_eq!(
+        model_source_payload(&context_source, quoted.into()).unwrap(),
+        Some(quoted.into())
+    );
+
+    let item_source = SourceRef {
+        scope: "item:turn".into(),
+        id: "agent-item".into(),
+        version: "item-revision:1".into(),
+    };
+    let agent_message = |text: &str| pioneer_protocol::TurnItem::AgentMessage {
+        id: "agent-item".into(),
+        text: text.into(),
+        phase: Default::default(),
+        markdown: None,
+        markdown_version: None,
+    };
+    for empty in ["", " ", "\n\t"] {
+        assert!(
+            model_source_payload(
+                &item_source,
+                serde_json::to_string(&agent_message(empty)).unwrap()
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+    assert_eq!(
+        model_source_payload(
+            &item_source,
+            serde_json::to_string(&agent_message("meaningful item answer")).unwrap()
+        )
+        .unwrap(),
+        Some("meaningful item answer".into())
+    );
+}
+
+#[tokio::test]
+async fn turn_started_and_edited_payload_projection_matches_history_without_event_envelope() {
+    use pioneer_protocol::{PersistedActorRef, SandboxMode, UserInput};
+
+    let f = fixture("unused", vec![], true, false).await;
+    let thread = f.store.get_thread_model("thread").await.unwrap().unwrap();
+    let (_, mut turn) = f.store.get_turn("thread", "turn").await.unwrap().unwrap();
+    let started = pioneer_crud::CanonicalTurnEventPayload::TurnStarted(
+        pioneer_crud::CanonicalTurnStartedEventPayload {
+            thread,
+            sandbox_mode: SandboxMode::FullAccess,
+            turn: turn.clone(),
+            input: vec![
+                UserInput::Text {
+                    text: "started user text".into(),
+                    text_elements: vec![],
+                },
+                UserInput::LocalFile {
+                    path: "/synthetic/started.txt".into(),
+                },
+                UserInput::Artifact {
+                    artifact_id: "artifact-started".into(),
+                    version_id: Some("version-started".into()),
+                },
+            ],
+            actor: Some(PersistedActorRef::System),
+            reasoning_effort: Some("must-not-reach-summarizer".into()),
+            work_owner: Default::default(),
+        },
+    );
+    turn.message_revision += 1;
+    turn.id = "edited-turn".into();
+    let edited = pioneer_crud::CanonicalTurnEventPayload::TurnMessageEdited(
+        pioneer_protocol::TurnMessageEditedEvent {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn,
+            input: vec![
+                UserInput::Text {
+                    text: "edited user text".into(),
+                    text_elements: vec![],
+                },
+                UserInput::File {
+                    url: "https://example.invalid/edited.txt".into(),
+                },
+            ],
+            changed_by: PersistedActorRef::System,
+            changed_at: 123,
+        },
+    );
+
+    for (id, event, expected) in [
+        (
+            "started-source",
+            started.clone(),
+            vec!["started user text", "started.txt", "artifact-started"],
+        ),
+        (
+            "edited-source",
+            edited.clone(),
+            vec!["edited user text", "edited.txt"],
+        ),
+    ] {
+        let history = super::history::event_message(event.clone())
+            .unwrap()
+            .unwrap();
+        let projected = model_source_payload(
+            &SourceRef {
+                scope: "event:turn".into(),
+                id: id.into(),
+                version: "event-revision:1".into(),
+            },
+            serde_json::to_string(&event).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&projected).unwrap();
+        assert_eq!(body["content"], history.content);
+        assert_eq!(
+            body["content_parts"],
+            serde_json::to_value(&history.content_parts).unwrap()
+        );
+        assert!(!history.content_parts.is_empty());
+        for value in expected {
+            assert!(projected.contains(value));
+        }
+        for internal in [
+            "permission_profile",
+            "permissionProfile",
+            "sandbox_mode",
+            "sandboxMode",
+            "reasoning_effort",
+            "must-not-reach-summarizer",
+            "changed_by",
+            "changedBy",
+            "workspace_id",
+            "workspaceId",
+        ] {
+            assert!(!projected.contains(internal));
+        }
+    }
+
+    let media_only = vec![
+        UserInput::File {
+            url: "https://example.invalid/report.pdf".into(),
+        },
+        UserInput::LocalFile {
+            path: "/synthetic/local.txt".into(),
+        },
+        UserInput::Image {
+            url: "https://example.invalid/photo.png".into(),
+        },
+        UserInput::LocalImage {
+            path: "/synthetic/diagram.png".into(),
+        },
+        UserInput::Audio {
+            url: "https://example.invalid/audio.wav".into(),
+        },
+        UserInput::LocalAudio {
+            path: "/synthetic/local.wav".into(),
+        },
+        UserInput::Video {
+            url: "https://example.invalid/video.mp4".into(),
+        },
+        UserInput::LocalVideo {
+            path: "/synthetic/local.mp4".into(),
+        },
+        UserInput::Artifact {
+            artifact_id: "artifact-only".into(),
+            version_id: Some("version-only".into()),
+        },
+    ];
+    let mut attachment_started = started.clone();
+    let pioneer_crud::CanonicalTurnEventPayload::TurnStarted(started_body) =
+        &mut attachment_started
+    else {
+        unreachable!()
+    };
+    started_body.input = media_only.clone();
+    let mut attachment_edited = edited.clone();
+    let pioneer_crud::CanonicalTurnEventPayload::TurnMessageEdited(edited_body) =
+        &mut attachment_edited
+    else {
+        unreachable!()
+    };
+    edited_body.input = media_only;
+    for event in [attachment_started, attachment_edited] {
+        let history = super::history::event_message(event.clone())
+            .unwrap()
+            .unwrap();
+        let projected = model_source_payload(
+            &SourceRef {
+                scope: "event:turn".into(),
+                id: "attachment-only".into(),
+                version: "event-revision:1".into(),
+            },
+            serde_json::to_string(&event).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&projected).unwrap();
+        assert_eq!(body["content"], history.content);
+        assert_eq!(
+            body["content_parts"],
+            serde_json::to_value(&history.content_parts).unwrap()
+        );
+        assert_eq!(history.content_parts.len(), 8);
+        assert!(history.content.contains("artifact-only"));
+        assert!(history.content.contains("version-only"));
+        for expected in [
+            "report.pdf",
+            "local.txt",
+            "photo.png",
+            "diagram.png",
+            "audio.wav",
+            "local.wav",
+            "video.mp4",
+            "local.mp4",
+        ] {
+            assert!(projected.contains(expected));
+        }
+        for internal in [
+            "permission_profile",
+            "sandbox_mode",
+            "reasoning_effort",
+            "changed_by",
+            "workspace_id",
+            "message_revision",
+        ] {
+            assert!(!projected.contains(internal));
+        }
+    }
+
+    f.store
+        .database_connection()
+        .execute_unprepared(
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) \
+             VALUES('edited-turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        )
+        .await
+        .unwrap();
+    for (id, turn_id, sequence, event_type, event) in [
+        ("started-source", "turn", 2_i64, "turn/started", &started),
+        (
+            "edited-source",
+            "edited-turn",
+            1_i64,
+            "turn/message/edited",
+            &edited,
+        ),
+    ] {
+        f.store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) \
+                 VALUES(?, 'thread', ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                [
+                    id.into(),
+                    turn_id.into(),
+                    sequence.into(),
+                    event_type.into(),
+                    serde_json::to_string(event).unwrap().into(),
+                ],
+            ))
+            .await
+            .unwrap();
+    }
+    let started_sources = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries;
+    let edited_sources = f
+        .store
+        .compaction_source_page("ws", "thread", "edited-turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries;
+    let references = started_sources
+        .into_iter()
+        .chain(edited_sources)
+        .map(|entry| (entry.reference.id.clone(), entry.reference))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut plan = f.runner.snapshot.plan.clone();
+    plan.fingerprint = "input-model-projection-plan".into();
+    let epoch = f
+        .store
+        .compaction_projection_version("ws", "thread")
+        .await
+        .unwrap();
+    let snapshot = admit_operation(
+        &f.store,
+        "ws",
+        "thread",
+        &CompactionSettings::default(),
+        &f.runner.snapshot.admission.selection,
+        None,
+        f.runner.summarizer.as_ref(),
+        PreparedOperation {
+            owner: "input-model-projection-owner".into(),
+            execution_turn: "turn".into(),
+            source_projection: None,
+            expected_checkpoint: None,
+            summary_basis: None,
+            operation_deadline_ms: None,
+            projection_version: epoch,
+            source_epochs: std::collections::BTreeMap::from([("thread".into(), epoch)]),
+            plan,
+            manifest: vec![
+                ManifestEntry {
+                    ordinal: 0,
+                    unit: 0,
+                    reference_only: false,
+                    thread_id: "thread".into(),
+                    source: references["started-source"].clone(),
+                },
+                ManifestEntry {
+                    ordinal: 1,
+                    unit: 1,
+                    reference_only: true,
+                    thread_id: "thread".into(),
+                    source: references["edited-source"].clone(),
+                },
+            ],
+            target_identity: "input-model-projection-target".into(),
+            target_tokens: 500,
+        },
+        10,
+    )
+    .await
+    .unwrap();
+    let state = f
+        .store
+        .compaction_runner_state(&snapshot.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let runner = CompactionRunner::new(
+        f.store.clone(),
+        "ws".into(),
+        "thread".into(),
+        snapshot,
+        f.runner.summarizer.clone(),
+        Arc::new(Target(true)),
+        f.observer.clone(),
+        f.clock.clone(),
+    );
+    let portion = runner
+        .portion(&state, AttemptPurpose::Portion)
+        .await
+        .unwrap();
+    let summary_input = serde_json::to_string(&portion.request.input).unwrap();
+    assert!(summary_input.contains("started user text"));
+    assert!(summary_input.contains("started.txt"));
+    assert!(summary_input.contains("artifact-started"));
+    assert!(summary_input.contains("edited user text"));
+    assert!(summary_input.contains("edited.txt"));
+    for internal in [
+        "permission_profile",
+        "permissionProfile",
+        "sandbox_mode",
+        "sandboxMode",
+        "must-not-reach-summarizer",
+        "changed_by",
+        "changedBy",
+    ] {
+        assert!(!summary_input.contains(internal));
+    }
+    assert_eq!(portion.request.input.compact_units.len(), 1);
+    assert_eq!(portion.request.input.reference_only.len(), 1);
+    let compact_payload = &portion.request.input.compact_units[0].text;
+    let reference_payload = &portion.request.input.reference_only[0].text;
+    assert!(compact_payload.contains("content_parts"));
+    assert!(reference_payload.contains("content_parts"));
+    assert!(compact_payload.contains("/synthetic/started.txt"));
+    assert!(reference_payload.contains("https://example.invalid/edited.txt"));
+    let actual_budget = f.runner.summarizer.input_tokens(&portion.request).unwrap();
+    let mut text_only = portion.request.clone();
+    text_only.input.compact_units[0].text = "started user text".into();
+    text_only.input.reference_only[0].text = "edited user text".into();
+    assert!(actual_budget > f.runner.summarizer.input_tokens(&text_only).unwrap());
 }
 
 async fn wait_for_sleep(sleeps: &mut tokio::sync::broadcast::Receiver<u64>, expected: u64) {
@@ -269,7 +687,63 @@ struct Fixture {
     provider: Arc<ProviderFixture>,
     clock: Arc<ManualClock>,
     observer: Arc<Observer>,
-    payload: String,
+    model_text: String,
+    canonical_payload: String,
+}
+
+fn canonical_reasoning_event_payload(item_id: &str, text: &str) -> String {
+    serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+        pioneer_protocol::ItemCompletedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item: pioneer_protocol::TurnItem::Reasoning {
+                id: item_id.into(),
+                summary: vec![],
+                content: vec![text.into()],
+            },
+        },
+    ))
+    .unwrap()
+}
+
+fn canonical_token_usage_event_payload(item_id: &str) -> String {
+    serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+        pioneer_protocol::ItemCompletedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item: pioneer_protocol::TurnItem::SystemEvent {
+                id: item_id.into(),
+                level: pioneer_protocol::SystemEventLevel::Info,
+                message: "synthetic usage notification".into(),
+                code: Some("agent_runtime_event".into()),
+                details: Some(serde_json::json!({
+                    "nativeMethod": "thread/tokenUsage/updated",
+                    "usage": "[REDACTED]"
+                })),
+            },
+        },
+    ))
+    .unwrap()
+}
+
+fn canonical_agent_message_event_payload(item_id: &str, text: &str) -> String {
+    serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+        pioneer_protocol::ItemCompletedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item: pioneer_protocol::TurnItem::AgentMessage {
+                id: item_id.into(),
+                text: text.into(),
+                phase: Default::default(),
+                markdown: None,
+                markdown_version: None,
+            },
+        },
+    ))
+    .unwrap()
 }
 
 #[tokio::test]
@@ -994,10 +1468,11 @@ fn ordinary_active_api_tool_result_is_not_rewritten_by_history_projection() {
 #[tokio::test]
 async fn runner_keeps_large_compressed_active_payload_while_loading_reference_only_excerpt() {
     let f = fixture(&"漢🌍".repeat(40_000), vec![], true, false).await;
-    let reference_payload = serde_json::json!({"text":"reference ".repeat(20_000)}).to_string();
+    let reference_payload =
+        canonical_reasoning_event_payload("reference-reasoning", &"reference ".repeat(20_000));
     f.store.database_connection().execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES('reference','thread','turn',2,'fixture',?,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES('reference','thread','turn',2,'item/completed',?,CURRENT_TIMESTAMP)",
         [reference_payload.into()],
     )).await.unwrap();
     let reference = f
@@ -1937,7 +2412,21 @@ async fn fixture(
     observer_fails: bool,
 ) -> Fixture {
     fixture_with_canonical_payload(
-        serde_json::json!({"text":text}).to_string(),
+        serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "fixture-agent-message".into(),
+                    text: text.into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+        ))
+        .unwrap(),
         replies,
         target_fits,
         observer_fails,
@@ -1978,12 +2467,14 @@ async fn fixture_with_canonical_payloads(
             .unwrap();
     }
     for (index, payload) in payloads.iter().enumerate() {
+        let canonical: pioneer_crud::CanonicalTurnEventPayload =
+            serde_json::from_str(payload).expect("fixture source must be canonical");
         let id = if index == 0 {
             "source".to_owned()
         } else {
             format!("source-{index}")
         };
-        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','turn',?,'fixture',?,CURRENT_TIMESTAMP)",[id.into(), i64::try_from(index + 1).unwrap().into(), payload.clone().into()])).await.unwrap();
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','turn',?,?,?,CURRENT_TIMESTAMP)",[id.into(), i64::try_from(index + 1).unwrap().into(), canonical.event_type().into(), payload.clone().into()])).await.unwrap();
     }
     let sources = store
         .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
@@ -1994,6 +2485,9 @@ async fn fixture_with_canonical_payloads(
         .map(|entry| entry.reference)
         .collect::<Vec<_>>();
     assert_eq!(sources.len(), payloads.len());
+    let model_text = super::model_source_payload(&sources[0], payloads[0].clone())
+        .unwrap()
+        .unwrap_or_default();
     let selection = ModelSelection {
         transport: Transport::Api,
         instance: "fixture-instance".into(),
@@ -2080,7 +2574,8 @@ async fn fixture_with_canonical_payloads(
         provider,
         clock,
         observer,
-        payload: payloads[0].clone(),
+        model_text,
+        canonical_payload: payloads[0].clone(),
     }
 }
 
@@ -2216,7 +2711,7 @@ async fn gateway_retry_validation_cancellation_and_deadline_interrupt_backoff() 
     ).await.unwrap();
     second_hook.release();
     wait_for_sleep(&mut sleeps, 30).await;
-    f.clock.advance(900_000);
+    f.clock.advance(f.runner.snapshot.admission.deadline_ms);
     assert!(matches!(
         run.await.unwrap(),
         CompactionExit::Reconcile(FailureKind::Deadline)
@@ -2431,7 +2926,24 @@ async fn compaction_runner_portions_cover_huge_source_once_and_reuse_committed_r
         assert_eq!(call.max_tokens, Some(500));
         assert!(call.tools.is_none());
     }
-    assert_eq!(restored, f.payload);
+    assert_eq!(restored, f.model_text);
+    assert_ne!(f.canonical_payload, f.model_text);
+    let stored = f
+        .store
+        .compaction_reference_payload(
+            "ws",
+            "thread",
+            &f.store
+                .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+                .await
+                .unwrap()
+                .entries[0]
+                .reference,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored, f.canonical_payload);
     let count = calls.len();
     drop(calls);
     let row = f
@@ -2906,7 +3418,7 @@ async fn compaction_runner_attempt_and_operation_deadlines_drop_transport() {
     assert_eq!(f.provider.active.load(Ordering::SeqCst), 0);
     f.clock.advance(302_250);
     f.provider.wait_calls(2).await;
-    f.clock.advance(900_000);
+    f.clock.advance(f.runner.snapshot.admission.deadline_ms);
     assert_eq!(
         task.await.unwrap().unwrap(),
         CompactionExit::Reconcile(FailureKind::Deadline)
@@ -2920,7 +3432,7 @@ async fn compaction_runner_attempt_and_operation_deadlines_drop_transport() {
             .unwrap()
             .unwrap()
             .deadline_ms,
-        900_000
+        f.runner.snapshot.admission.deadline_ms
     );
 }
 #[tokio::test]
@@ -3017,7 +3529,11 @@ async fn admission_resumes_exact_plan_without_resetting_deadline() {
     .await
     .unwrap();
     assert_eq!(first.id, resumed.id);
-    assert_eq!(resumed.admission.deadline_ms, 900010);
+    assert_eq!(
+        first.admission.deadline_ms,
+        10 + pioneer_compaction::OPERATION_MILLIS
+    );
+    assert_eq!(resumed.admission.deadline_ms, first.admission.deadline_ms);
     let mut changed = prepared.clone();
     changed.target_identity = "changed-target".into();
     let changed = admit_operation(
@@ -3073,6 +3589,191 @@ async fn admission_resumes_exact_plan_without_resetting_deadline() {
         "failed"
     );
     assert_eq!(*f.provider.count.borrow(), 0);
+}
+
+#[tokio::test]
+async fn admission_and_runner_remove_technical_compact_and_reference_only_payloads_before_provider()
+{
+    let f = fixture("meaningful compact material", vec![], true, false).await;
+    for (sequence, id) in [(2_i64, "technical-compact"), (3, "technical-reference")] {
+        let payload = canonical_token_usage_event_payload(id);
+        f.store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) \
+                 VALUES(?, 'thread', 'turn', ?, 'item/completed', ?, CURRENT_TIMESTAMP)",
+                [id.into(), sequence.into(), payload.into()],
+            ))
+            .await
+            .unwrap();
+    }
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) \
+             VALUES('empty-agent-message','thread','turn',4,'item/completed',?,CURRENT_TIMESTAMP)",
+            [canonical_agent_message_event_payload("empty-agent-message", "  \n").into()],
+        ))
+        .await
+        .unwrap();
+    let mut references = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .map(|entry| (entry.reference.id.clone(), entry.reference))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let meaningful = references.remove("source").unwrap();
+    let technical_compact = references.remove("technical-compact").unwrap();
+    let technical_reference = references.remove("technical-reference").unwrap();
+    let empty_agent_message = references.remove("empty-agent-message").unwrap();
+    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+    let projection = super::frozen::capture(&f.store, "ws", "thread", &allowed, &[])
+        .await
+        .unwrap();
+    let mut plan = f.runner.snapshot.plan.clone();
+    plan.fingerprint = "typed-admission-filter-plan".into();
+    let prepared = PreparedOperation {
+        owner: "typed-admission-filter-owner".into(),
+        execution_turn: "turn".into(),
+        source_projection: Some(projection),
+        expected_checkpoint: None,
+        summary_basis: None,
+        operation_deadline_ms: None,
+        projection_version: f.runner.snapshot.projection_version,
+        source_epochs: f.runner.snapshot.source_epochs.clone(),
+        plan,
+        manifest: vec![
+            ManifestEntry {
+                ordinal: 0,
+                unit: 0,
+                reference_only: false,
+                thread_id: "thread".into(),
+                source: meaningful,
+            },
+            ManifestEntry {
+                ordinal: 1,
+                unit: 1,
+                reference_only: false,
+                thread_id: "thread".into(),
+                source: technical_compact.clone(),
+            },
+            ManifestEntry {
+                ordinal: 2,
+                unit: 2,
+                reference_only: true,
+                thread_id: "thread".into(),
+                source: technical_reference.clone(),
+            },
+            ManifestEntry {
+                ordinal: 3,
+                unit: 3,
+                reference_only: false,
+                thread_id: "thread".into(),
+                source: empty_agent_message.clone(),
+            },
+        ],
+        target_identity: "typed-admission-filter-target".into(),
+        target_tokens: 500,
+    };
+    let settings = CompactionSettings::default();
+    let selection = &f.runner.snapshot.admission.selection;
+    let snapshot = admit_operation(
+        &f.store,
+        "ws",
+        "thread",
+        &settings,
+        selection,
+        None,
+        f.runner.summarizer.as_ref(),
+        prepared.clone(),
+        10,
+    )
+    .await
+    .unwrap();
+    let compact = f
+        .store
+        .compaction_manifest_page(&snapshot.id, false, 0, 0)
+        .await
+        .unwrap();
+    let reference_only = f
+        .store
+        .compaction_manifest_page(&snapshot.id, true, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(compact.len(), 1);
+    assert!(reference_only.is_empty());
+
+    let runner = CompactionRunner::new(
+        f.store.clone(),
+        "ws".into(),
+        "thread".into(),
+        snapshot,
+        f.runner.summarizer.clone(),
+        Arc::new(Target(true)),
+        f.observer.clone(),
+        f.clock.clone(),
+    );
+    assert!(matches!(
+        runner.run(CancellationToken::new()).await.unwrap(),
+        CompactionExit::Applied(_)
+    ));
+    let calls = f.provider.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let provider_input = serde_json::to_string(&calls[0].messages).unwrap();
+    assert!(provider_input.contains("meaningful compact material"));
+    assert!(!provider_input.contains("synthetic usage notification"));
+    assert!(!provider_input.contains("thread/tokenUsage/updated"));
+    assert!(!provider_input.contains("empty-agent-message"));
+    drop(calls);
+
+    let mut excluded_only = prepared;
+    excluded_only.owner = "excluded-only-owner".into();
+    excluded_only.target_identity = "excluded-only-target".into();
+    excluded_only.plan.fingerprint = "excluded-only-plan".into();
+    excluded_only.manifest = vec![
+        ManifestEntry {
+            ordinal: 0,
+            unit: 0,
+            reference_only: false,
+            thread_id: "thread".into(),
+            source: technical_compact,
+        },
+        ManifestEntry {
+            ordinal: 1,
+            unit: 1,
+            reference_only: true,
+            thread_id: "thread".into(),
+            source: technical_reference,
+        },
+        ManifestEntry {
+            ordinal: 2,
+            unit: 2,
+            reference_only: false,
+            thread_id: "thread".into(),
+            source: empty_agent_message,
+        },
+    ];
+    assert!(
+        admit_operation(
+            &f.store,
+            "ws",
+            "thread",
+            &settings,
+            selection,
+            None,
+            f.runner.summarizer.as_ref(),
+            excluded_only,
+            20,
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(*f.provider.count.borrow(), 1);
 }
 
 #[tokio::test]
@@ -3245,7 +3946,7 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
             async move { runner.run(CancellationToken::new()).await }
         });
         f.provider.wait_calls(2).await;
-        f.clock.advance(900_000);
+        f.clock.advance(f.runner.snapshot.admission.deadline_ms);
         assert!(matches!(
             task.await.unwrap().unwrap(),
             CompactionExit::Reconcile(FailureKind::Deadline)
@@ -3257,6 +3958,7 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
             .await
             .unwrap()
             .unwrap();
+        let resumed_deadline = before.deadline_ms + pioneer_compaction::OPERATION_MILLIS;
         assert!(before.cursor > pioneer_compaction::runner::SourceCursor::default());
         assert_eq!(before.attempts, 2);
         if case == "legacy" {
@@ -3282,7 +3984,7 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
         if matches!(case, "edited" | "stop") {
             assert!(
                 !f.store
-                    .compaction_resume_deadline("operation", "turn", 1_800_000)
+                    .compaction_resume_deadline("operation", "turn", resumed_deadline)
                     .await
                     .unwrap()
             );
@@ -3302,7 +4004,7 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
         )).await.unwrap();
         assert!(
             f.store
-                .compaction_resume_deadline("operation", "turn", 1_800_000)
+                .compaction_resume_deadline("operation", "turn", resumed_deadline)
                 .await
                 .is_err()
         );
@@ -3325,9 +4027,9 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
             .unwrap();
         let (one, two) = tokio::join!(
             f.store
-                .compaction_resume_deadline("operation", "turn", 1_800_000),
+                .compaction_resume_deadline("operation", "turn", resumed_deadline),
             f.store
-                .compaction_resume_deadline("operation", "turn", 1_800_000),
+                .compaction_resume_deadline("operation", "turn", resumed_deadline),
         );
         assert_ne!(
             one.unwrap(),
@@ -3346,7 +4048,7 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
             (after.attempts, after.retries, after.corrections),
             (before.attempts, before.retries, before.corrections)
         );
-        assert_eq!(after.deadline_ms, 1_800_000);
+        assert_eq!(after.deadline_ms, resumed_deadline);
         let snapshot = serde_json::from_str(
             &f.store
                 .compaction_operation("operation")
@@ -3749,9 +4451,14 @@ async fn expected_head_does_not_force_a_projection_basis_after_historical_edit()
     );
     f.store
         .database_connection()
-        .execute_unprepared(
-            "UPDATE turn_event SET payload='{\"text\":\"corrected source\"}' WHERE id='source'",
-        )
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE turn_event SET payload=? WHERE id='source'",
+            [
+                canonical_agent_message_event_payload("fixture-agent-message", "corrected source")
+                    .into(),
+            ],
+        ))
         .await
         .unwrap();
     assert!(
@@ -3762,7 +4469,7 @@ async fn expected_head_does_not_force_a_projection_basis_after_historical_edit()
             .is_some(),
         "published checkpoint was invalidated by its historical leaf edit"
     );
-    let repeated = admit_operation(
+    let stale_source = admit_operation(
         &f.store,
         "ws",
         "thread",
@@ -3774,8 +4481,13 @@ async fn expected_head_does_not_force_a_projection_basis_after_historical_edit()
         0,
     )
     .await
-    .unwrap();
-    assert_eq!(repeated.id, admitted.id);
+    .unwrap_err();
+    assert!(
+        stale_source
+            .to_string()
+            .contains("compaction source unavailable during admission"),
+        "{stale_source:#}"
+    );
     assert!(
         f.store
             .compaction_checkpoint(&head)
@@ -3825,7 +4537,9 @@ impl Provider for SmallWindowMain {
 #[tokio::test]
 async fn native_discovers_working_context_head_published_after_inherited_snapshot() {
     use pioneer_agent::compaction::controller::NativeContext;
-    use pioneer_crud::compaction::{CommitOutcome, SourceAssertion};
+    use pioneer_crud::compaction::{
+        CommitOutcome, DeliveryCheckpointImportSource, SourceAssertion,
+    };
     use pioneer_protocol::{PersistedActorRef, SandboxMode};
     use pioneer_provider::{ChatMessage, ProviderRegistry};
 
@@ -4169,6 +4883,107 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     assert_eq!(d_output_references.len(), 2);
     let d_covered_source = d_output_references[0].sources[0].clone();
     let d_retained_source = d_output_references[1].sources[0].clone();
+    let technical_event = pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+        pioneer_protocol::ItemCompletedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "context-d".into(),
+            turn_id: "turn-d".into(),
+            item: pioneer_protocol::TurnItem::SystemEvent {
+                id: "d-technical-between-output".into(),
+                level: SystemEventLevel::Info,
+                message: "raw delivered token usage must stay hidden".into(),
+                code: Some("agent_runtime_event".into()),
+                details: Some(serde_json::json!({
+                    "nativeMethod": "thread/tokenUsage/updated",
+                    "usage": {"inputTokens": 123456}
+                })),
+            },
+        },
+    );
+    f.store
+        .materialize_native_agent_turn_event(
+            technical_event.clone(),
+            chrono::Utc::now().timestamp(),
+            None,
+        )
+        .await
+        .unwrap();
+    let d_technical_source = f
+        .store
+        .compaction_source_page("ws", "context-d", "turn-d", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.item_id.as_deref() == Some("d-technical-between-output"))
+        .unwrap()
+        .reference;
+    let mut legacy_references = d_output_references.clone();
+    let mut technical_reference = legacy_references[1].clone();
+    technical_reference.unit_id = "d-technical-between-output".into();
+    technical_reference.sources = vec![d_technical_source.clone()];
+    technical_reference.replay_source = None;
+    technical_reference.tool_item_id = None;
+    technical_reference.tool_call_id = None;
+    technical_reference.tool_name = None;
+    let legacy_technical_wire = super::history::legacy_event_message(technical_event)
+        .unwrap()
+        .unwrap();
+    technical_reference.wire_sha256 = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+        serde_json::to_vec(&legacy_technical_wire).unwrap(),
+    ));
+    legacy_references.insert(1, technical_reference);
+    let mut identity = <sha2::Sha256 as sha2::Digest>::new();
+    for reference in &legacy_references {
+        let bytes = serde_json::to_vec(reference).unwrap();
+        sha2::Digest::update(&mut identity, (bytes.len() as u64).to_be_bytes());
+        sha2::Digest::update(&mut identity, bytes);
+    }
+    let legacy_output = pioneer_compaction::frozen::FrozenHistoryRef {
+        format: pioneer_compaction::FORMAT_VERSION,
+        manifest_id: "legacy-delivered-output-with-technical-event".into(),
+        messages: legacy_references.len() as u64,
+        identity_sha256: hex::encode(sha2::Digest::finalize(identity)),
+    };
+    f.store
+        .compaction_begin_frozen_history_with_imports(
+            "ws",
+            "context-d",
+            &legacy_output,
+            0,
+            &hex::encode(<sha2::Sha256 as sha2::Digest>::digest([])),
+        )
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_frozen_history(
+            "ws",
+            "context-d",
+            &legacy_output.manifest_id,
+            0,
+            &legacy_references,
+        )
+        .await
+        .unwrap();
+    assert!(
+        f.store
+            .compaction_finish_frozen_history("ws", "context-d", &legacy_output)
+            .await
+            .unwrap()
+    );
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_task_output SET manifest_id=? WHERE task_run_turn_id='rt-d'",
+        [legacy_output.manifest_id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let d_output = f
+        .store
+        .compaction_task_output("ws", "rt-d")
+        .await
+        .unwrap()
+        .unwrap();
     for statement in [
         "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES ('candidate-d','task-d','run-d','rt-d','context-d','turn-d',0,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('delivery-turn-d','thread','completed','conversation','system','9999-12-31T23:59:59Z','9999-12-31T23:59:59Z')",
@@ -4292,9 +5107,894 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         std::collections::BTreeSet::from(["context-d".to_owned()]),
         "the delivered output grants only D's own immutable result"
     );
+    // A checkpoint published by the output owner may cover both useful A and
+    // model-invisible technical T. Admission must use the authenticated A,T
+    // boundary, while the recaptured model history contains only the summary.
+    let delivered_summary_owner = super::native::native_owner("ws", "context-d");
+    let delivered_summary_selection = ModelSelection {
+        transport: Transport::Api,
+        instance: "summary-fixture".into(),
+        model: "summary-model".into(),
+        effort: None,
+    };
+    let delivered_summary_epoch = f
+        .store
+        .compaction_projection_version("ws", "context-d")
+        .await
+        .unwrap();
+    let delivered_summary_operation = OperationSnapshot {
+        id: "delivered-output-technical-operation".into(),
+        owner: delivered_summary_owner.clone(),
+        expected_checkpoint: None,
+        projection_version: delivered_summary_epoch,
+        source_epochs: std::collections::BTreeMap::from([(
+            "context-d".into(),
+            delivered_summary_epoch,
+        )]),
+        admission: CompactionSettings::default()
+            .admit(&delivered_summary_selection, None, 0)
+            .unwrap(),
+        plan: CompactionPlan {
+            mode: CompactionMode::Normal,
+            coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
+            compact: vec![0, 1],
+            retain: vec![],
+            coverage: vec![d_covered_source.clone(), d_technical_source.clone()],
+            fingerprint: "delivered-output-technical-plan".into(),
+        },
+    };
+    f.store
+        .compaction_admit("ws", "context-d", &delivered_summary_operation)
+        .await
+        .unwrap();
+    f.store
+        .compaction_prepare_runner(
+            &delivered_summary_operation.id,
+            &ModelBudget::new(None, None, None),
+            2,
+            0,
+        )
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_manifest(
+            &delivered_summary_operation.id,
+            &[
+                ManifestEntry {
+                    ordinal: 0,
+                    unit: 0,
+                    reference_only: false,
+                    thread_id: "context-d".into(),
+                    source: d_covered_source.clone(),
+                },
+                ManifestEntry {
+                    ordinal: 1,
+                    unit: 1,
+                    reference_only: false,
+                    thread_id: "context-d".into(),
+                    source: d_technical_source.clone(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    let delivered_summary = Checkpoint {
+        id: "delivered-output-technical-checkpoint".into(),
+        operation_id: delivered_summary_operation.id.clone(),
+        owner: delivered_summary_owner.clone(),
+        previous: None,
+        coverage: vec![d_covered_source.clone(), d_technical_source.clone()],
+        summary: HEADINGS
+            .iter()
+            .map(|heading| format!("{heading}\nAccepted delivered A without raw T.\n"))
+            .collect(),
+        selection: delivered_summary_selection.clone(),
+        projection_version: delivered_summary_epoch,
+        format_version: pioneer_compaction::FORMAT_VERSION,
+    };
+    assert_eq!(
+        delivered_summary.coverage,
+        vec![d_covered_source.clone(), d_technical_source.clone()],
+        "the checkpoint must retain the exact frozen source versions"
+    );
+    f.store
+        .compaction_save_candidate(&delivered_summary, 0)
+        .await
+        .unwrap();
+    for (sql, values) in [
+        (
+            "UPDATE compaction_checkpoint SET status='applied' WHERE id=?",
+            vec![delivered_summary.id.clone().into()],
+        ),
+        (
+            "UPDATE compaction_context SET head=? WHERE owner=?",
+            vec![
+                delivered_summary.id.clone().into(),
+                delivered_summary.owner.clone().into(),
+            ],
+        ),
+        (
+            "UPDATE compaction_operation SET status='completed',outcome='applied' WHERE id=?",
+            vec![delivered_summary.operation_id.clone().into()],
+        ),
+    ] {
+        f.store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                values,
+            ))
+            .await
+            .unwrap();
+    }
+    let delivered_summary_calls = f.provider.calls.lock().unwrap().len();
+    let delivered_summary_source = f
+        .store
+        .compaction_checkpoint_source("ws", "context-d", &delivered_summary.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let delivered_fence = f.store.compaction_history_read_fence().await.unwrap();
+    let delivered_outputs = super::delivered::AuthorizedOutputSet {
+        workspace: "ws".into(),
+        destination: "thread".into(),
+        checkpoint: None,
+        fence: delivered_fence,
+        authorization_revision: 0,
+        source_epochs: std::collections::BTreeMap::from([
+            (
+                "thread".into(),
+                f.store
+                    .compaction_projection_version("ws", "thread")
+                    .await
+                    .unwrap(),
+            ),
+            ("context-d".into(), delivered_summary_epoch),
+        ]),
+        branches: vec![super::delivered::AuthorizedOutputBranch {
+            snapshot: delivered.clone(),
+            acknowledgement: acknowledgement.clone(),
+            acknowledgements: vec![acknowledgement.clone()],
+            source_threads: source_threads.clone(),
+        }],
+    };
+    let delivered_checkpoint_sources = vec![
+        DeliveryCheckpointImportSource {
+            output_ordinal: 0,
+            source_thread: "context-d".into(),
+            source: d_covered_source.clone(),
+        },
+        DeliveryCheckpointImportSource {
+            output_ordinal: 1,
+            source_thread: "context-d".into(),
+            source: d_technical_source.clone(),
+        },
+    ];
+    let mut wrong_version_sources = delivered_checkpoint_sources.clone();
+    wrong_version_sources[0].source.version = "wrong-exact-version".into();
+    assert!(
+        f.store
+            .compaction_prepare_delivery_checkpoint_imports(
+                "ws",
+                "thread",
+                &delivered.delivery_id,
+                &acknowledgement,
+                &wrong_version_sources,
+                "context-d",
+                &delivered_summary_source,
+            )
+            .await
+            .is_err(),
+        "a delivery grant must not authorize a different source version"
+    );
+    assert!(
+        f.store
+            .compaction_prepare_delivery_checkpoint_imports(
+                "ws",
+                "thread",
+                &delivered.delivery_id,
+                &acknowledgement,
+                &[DeliveryCheckpointImportSource {
+                    output_ordinal: 2,
+                    source_thread: "context-d".into(),
+                    source: d_retained_source.clone(),
+                }],
+                "context-d",
+                &delivered_summary_source,
+            )
+            .await
+            .is_err(),
+        "an output grant outside the checkpoint coverage must not authorize it"
+    );
+    let delivered_projection_json = super::frozen::capture_execution_basis_with_outputs(
+        &f.store,
+        "ws",
+        "thread",
+        Some("next-parent-turn"),
+        None,
+        None,
+        Some(&delivered_outputs),
+    )
+    .await
+    .unwrap();
+    let delivered_projection: pioneer_compaction::frozen::FrozenHistoryRef =
+        serde_json::from_str(&delivered_projection_json).unwrap();
+    let delivered_projection_messages = super::frozen::restore(
+        &f.store,
+        "ws",
+        &std::collections::BTreeSet::from(["thread".into(), "context-d".into()]),
+        &delivered_projection,
+    )
+    .await
+    .unwrap();
+    assert!(delivered_projection_messages.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == delivered_summary.id)
+        })
+    }));
+    assert!(delivered_projection_messages.iter().all(|message| {
+        !message
+            .content
+            .contains("raw delivered token usage must stay hidden")
+            && !message.content.contains("123456")
+    }));
+    let delivered_projection_imports = f
+        .store
+        .compaction_frozen_import_page("ws", "thread", &delivered_projection.manifest_id, 0)
+        .await
+        .unwrap();
+    let delivered_projection_references = f
+        .store
+        .compaction_frozen_history_page("ws", "thread", &delivered_projection.manifest_id, 0)
+        .await
+        .unwrap();
+    for record in delivered_projection_imports
+        .iter()
+        .filter(|record| record.source == d_covered_source || record.source == d_technical_source)
+    {
+        let target =
+            &delivered_projection_references[usize::try_from(record.message_ordinal).unwrap()];
+        assert_eq!(
+            target.sources,
+            vec![delivered_summary_source.clone()],
+            "delivery proof for A/T must target the exact replacing checkpoint"
+        );
+    }
+    assert_eq!(
+        delivered_projection_imports
+            .iter()
+            .filter(|record| {
+                record.source == d_covered_source
+                    || record.source == d_technical_source
+                    || record.source == d_retained_source
+            })
+            .map(|record| record.output_ordinal)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([0, 1, 2]),
+        "checkpoint and retained output must keep all original frozen ordinals"
+    );
+    assert_eq!(
+        f.provider.calls.lock().unwrap().len(),
+        delivered_summary_calls,
+        "an existing delivered-output summary must not invoke the summarizer"
+    );
+    let repeated_projection_json = super::frozen::capture_execution_basis_with_outputs(
+        &f.store,
+        "ws",
+        "thread",
+        Some("next-parent-turn"),
+        None,
+        None,
+        Some(&delivered_outputs),
+    )
+    .await
+    .unwrap();
+    let repeated_projection: pioneer_compaction::frozen::FrozenHistoryRef =
+        serde_json::from_str(&repeated_projection_json).unwrap();
+    let repeated_messages = super::frozen::restore(
+        &f.store,
+        "ws",
+        &std::collections::BTreeSet::from(["thread".into(), "context-d".into()]),
+        &repeated_projection,
+    )
+    .await
+    .unwrap();
+    assert_eq!(repeated_messages, delivered_projection_messages);
+    assert!(repeated_messages.iter().all(|message| {
+        !message
+            .content
+            .contains("raw delivered token usage must stay hidden")
+            && !message.content.contains("123456")
+    }));
+    assert_eq!(
+        f.store
+            .compaction_frozen_import_page("ws", "thread", &repeated_projection.manifest_id, 0,)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|record| {
+                record.source == d_covered_source
+                    || record.source == d_technical_source
+                    || record.source == d_retained_source
+            })
+            .map(|record| record.output_ordinal)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([0, 1, 2]),
+        "repeat capture/restore must retain the immutable output ordinals"
+    );
+    assert_eq!(
+        f.provider.calls.lock().unwrap().len(),
+        delivered_summary_calls
+    );
+    let wider_operation = OperationSnapshot {
+        id: "delivered-output-outside-boundary-operation".into(),
+        owner: delivered_summary_owner.clone(),
+        expected_checkpoint: Some(delivered_summary.id.clone()),
+        projection_version: delivered_summary_epoch,
+        source_epochs: std::collections::BTreeMap::from([
+            ("context-d".into(), delivered_summary_epoch),
+            (
+                "thread".into(),
+                f.store
+                    .compaction_projection_version("ws", "thread")
+                    .await
+                    .unwrap(),
+            ),
+        ]),
+        admission: CompactionSettings::default()
+            .admit(&delivered_summary_selection, None, 0)
+            .unwrap(),
+        plan: CompactionPlan {
+            mode: CompactionMode::Normal,
+            coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
+            compact: vec![0, 1, 2],
+            retain: vec![],
+            coverage: vec![
+                d_covered_source.clone(),
+                d_technical_source.clone(),
+                acknowledgement.clone(),
+            ],
+            fingerprint: "delivered-output-outside-boundary-plan".into(),
+        },
+    };
+    f.store
+        .compaction_admit("ws", "context-d", &wider_operation)
+        .await
+        .unwrap();
+    f.store
+        .compaction_prepare_runner(
+            &wider_operation.id,
+            &ModelBudget::new(None, None, None),
+            3,
+            0,
+        )
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_manifest(
+            &wider_operation.id,
+            &[
+                ManifestEntry {
+                    ordinal: 0,
+                    unit: 0,
+                    reference_only: false,
+                    thread_id: "context-d".into(),
+                    source: d_covered_source.clone(),
+                },
+                ManifestEntry {
+                    ordinal: 1,
+                    unit: 1,
+                    reference_only: false,
+                    thread_id: "context-d".into(),
+                    source: d_technical_source.clone(),
+                },
+                ManifestEntry {
+                    ordinal: 2,
+                    unit: 2,
+                    reference_only: false,
+                    thread_id: "thread".into(),
+                    source: acknowledgement.clone(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    let wider_checkpoint = Checkpoint {
+        id: "delivered-output-outside-boundary-checkpoint".into(),
+        operation_id: wider_operation.id.clone(),
+        owner: delivered_summary_owner.clone(),
+        previous: Some(delivered_summary.id.clone()),
+        coverage: wider_operation.plan.coverage.clone(),
+        summary: HEADINGS
+            .iter()
+            .map(|heading| format!("{heading}\nMust not cross the delivered boundary.\n"))
+            .collect(),
+        selection: delivered_summary_selection.clone(),
+        projection_version: delivered_summary_epoch,
+        format_version: pioneer_compaction::FORMAT_VERSION,
+    };
+    f.store
+        .compaction_save_candidate(&wider_checkpoint, 0)
+        .await
+        .unwrap();
+    for (sql, values) in [
+        (
+            "UPDATE compaction_checkpoint SET status='applied' WHERE id=?",
+            vec![wider_checkpoint.id.clone().into()],
+        ),
+        (
+            "UPDATE compaction_context SET head=? WHERE owner=?",
+            vec![
+                wider_checkpoint.id.clone().into(),
+                wider_checkpoint.owner.clone().into(),
+            ],
+        ),
+        (
+            "UPDATE compaction_operation SET status='completed',outcome='applied' WHERE id=?",
+            vec![wider_checkpoint.operation_id.clone().into()],
+        ),
+    ] {
+        f.store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                values,
+            ))
+            .await
+            .unwrap();
+    }
+    let fallback_projection_json = super::frozen::capture_execution_basis_with_outputs(
+        &f.store,
+        "ws",
+        "thread",
+        Some("next-parent-turn"),
+        None,
+        None,
+        Some(&delivered_outputs),
+    )
+    .await
+    .unwrap();
+    let fallback_projection: pioneer_compaction::frozen::FrozenHistoryRef =
+        serde_json::from_str(&fallback_projection_json).unwrap();
+    let fallback_messages = super::frozen::restore(
+        &f.store,
+        "ws",
+        &std::collections::BTreeSet::from(["thread".into(), "context-d".into()]),
+        &fallback_projection,
+    )
+    .await
+    .unwrap();
+    assert!(fallback_messages.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == delivered_summary.id)
+        })
+    }));
+    assert!(fallback_messages.iter().all(|message| {
+        message.provenance.as_ref().is_none_or(|origin| {
+            origin
+                .sources
+                .iter()
+                .all(|source| source.id != wider_checkpoint.id)
+        })
+    }));
+    assert_eq!(
+        f.provider.calls.lock().unwrap().len(),
+        delivered_summary_calls
+    );
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_context SET head=? WHERE owner=?",
+            [
+                delivered_summary.id.clone().into(),
+                delivered_summary_owner.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    // This second immutable delivery presents S_A as one atomic output
+    // reference alongside raw B. A later checkpoint may replace S_A+B, but
+    // its grant must remain tied to output ordinals 0/1, not raw A/T leaves.
+    let mut atomic_messages = [
+        delivered_projection_messages
+            .iter()
+            .find(|message| {
+                message.provenance.as_ref().is_some_and(|origin| {
+                    origin
+                        .sources
+                        .iter()
+                        .any(|source| source.id == delivered_summary.id)
+                })
+            })
+            .unwrap()
+            .clone(),
+        delivered_projection_messages
+            .iter()
+            .find(|message| {
+                message.provenance.as_ref().is_some_and(|origin| {
+                    origin
+                        .sources
+                        .iter()
+                        .any(|source| source.id == d_retained_source.id)
+                })
+            })
+            .unwrap()
+            .clone(),
+    ];
+    for message in &mut atomic_messages {
+        let origin = message.provenance.as_mut().unwrap();
+        assert_eq!(origin.thread_id, "context-d");
+        origin.context_thread = None;
+        origin.inherited = false;
+    }
+    let atomic_output = super::frozen::capture(
+        &f.store,
+        "ws",
+        "context-d",
+        &std::collections::BTreeSet::from(["context-d".into()]),
+        &atomic_messages,
+    )
+    .await
+    .unwrap();
+    let atomic_references = f
+        .store
+        .compaction_frozen_history_page("ws", "context-d", &atomic_output.manifest_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(atomic_references.len(), 2);
+    assert_eq!(
+        atomic_references[0].sources,
+        vec![delivered_summary_source.clone()]
+    );
+    assert_eq!(
+        atomic_references[1].sources,
+        vec![d_retained_source.clone()]
+    );
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_task_output SET manifest_id=? WHERE task_run_turn_id='rt-d'",
+            [atomic_output.manifest_id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    let atomic_delivered = f
+        .store
+        .compaction_delivery_output("ws", "delivery-d")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(atomic_delivered.output.history, atomic_output);
+    let atomic_epoch = f
+        .store
+        .compaction_projection_version("ws", "context-d")
+        .await
+        .unwrap();
+    let atomic_operation = OperationSnapshot {
+        id: "delivered-atomic-summary-operation".into(),
+        owner: delivered_summary_owner.clone(),
+        expected_checkpoint: Some(delivered_summary.id.clone()),
+        projection_version: atomic_epoch,
+        source_epochs: std::collections::BTreeMap::from([("context-d".into(), atomic_epoch)]),
+        admission: CompactionSettings::default()
+            .admit(&delivered_summary_selection, None, 0)
+            .unwrap(),
+        plan: CompactionPlan {
+            mode: CompactionMode::Normal,
+            coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
+            compact: vec![0],
+            retain: vec![],
+            coverage: vec![d_retained_source.clone()],
+            fingerprint: "delivered-atomic-summary-plan".into(),
+        },
+    };
+    f.store
+        .compaction_admit("ws", "context-d", &atomic_operation)
+        .await
+        .unwrap();
+    f.store
+        .compaction_prepare_runner(
+            &atomic_operation.id,
+            &ModelBudget::new(None, None, None),
+            1,
+            0,
+        )
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_manifest(
+            &atomic_operation.id,
+            &[ManifestEntry {
+                ordinal: 0,
+                unit: 0,
+                reference_only: false,
+                thread_id: "context-d".into(),
+                source: d_retained_source.clone(),
+            }],
+        )
+        .await
+        .unwrap();
+    let atomic_checkpoint = Checkpoint {
+        id: "delivered-atomic-summary-checkpoint".into(),
+        operation_id: atomic_operation.id.clone(),
+        owner: delivered_summary_owner.clone(),
+        previous: Some(delivered_summary.id.clone()),
+        coverage: atomic_operation.plan.coverage.clone(),
+        summary: HEADINGS
+            .iter()
+            .map(|heading| format!("{heading}\nAccepted S_A and B.\n"))
+            .collect(),
+        selection: delivered_summary_selection.clone(),
+        projection_version: atomic_epoch,
+        format_version: pioneer_compaction::FORMAT_VERSION,
+    };
+    f.store
+        .compaction_save_candidate(&atomic_checkpoint, 0)
+        .await
+        .unwrap();
+    for (sql, values) in [
+        (
+            "UPDATE compaction_checkpoint SET status='applied' WHERE id=?",
+            vec![atomic_checkpoint.id.clone().into()],
+        ),
+        (
+            "UPDATE compaction_context SET head=? WHERE owner=?",
+            vec![
+                atomic_checkpoint.id.clone().into(),
+                atomic_checkpoint.owner.clone().into(),
+            ],
+        ),
+        (
+            "UPDATE compaction_operation SET status='completed',outcome='applied' WHERE id=?",
+            vec![atomic_operation.id.clone().into()],
+        ),
+    ] {
+        f.store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                values,
+            ))
+            .await
+            .unwrap();
+    }
+    let atomic_checkpoint_source = f
+        .store
+        .compaction_checkpoint_source("ws", "context-d", &atomic_checkpoint.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let atomic_grants = [
+        DeliveryCheckpointImportSource {
+            output_ordinal: 0,
+            source_thread: "context-d".into(),
+            source: delivered_summary_source.clone(),
+        },
+        DeliveryCheckpointImportSource {
+            output_ordinal: 1,
+            source_thread: "context-d".into(),
+            source: d_retained_source.clone(),
+        },
+    ];
+    assert_eq!(
+        f.store
+            .compaction_prepare_delivery_checkpoint_imports(
+                "ws",
+                "thread",
+                &atomic_delivered.delivery_id,
+                &acknowledgement,
+                &atomic_grants,
+                "context-d",
+                &atomic_checkpoint_source,
+            )
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let mut wrong_atomic_version = atomic_grants.clone();
+    wrong_atomic_version[0].source.version = "wrong-exact-version".into();
+    assert!(
+        f.store
+            .compaction_prepare_delivery_checkpoint_imports(
+                "ws",
+                "thread",
+                &atomic_delivered.delivery_id,
+                &acknowledgement,
+                &wrong_atomic_version,
+                "context-d",
+                &atomic_checkpoint_source,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        f.store
+            .compaction_prepare_delivery_checkpoint_imports(
+                "ws",
+                "thread",
+                &atomic_delivered.delivery_id,
+                &acknowledgement,
+                &atomic_grants,
+                "context-d",
+                &f.store
+                    .compaction_checkpoint_source("ws", "context-d", &wider_checkpoint.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .await
+            .is_err(),
+        "extra historical coverage must remain outside the atomic output grant"
+    );
+    let atomic_outputs = super::delivered::AuthorizedOutputSet {
+        workspace: "ws".into(),
+        destination: "thread".into(),
+        checkpoint: None,
+        fence: f.store.compaction_history_read_fence().await.unwrap(),
+        authorization_revision: 0,
+        source_epochs: std::collections::BTreeMap::from([
+            (
+                "thread".into(),
+                f.store
+                    .compaction_projection_version("ws", "thread")
+                    .await
+                    .unwrap(),
+            ),
+            ("context-d".into(), atomic_epoch),
+        ]),
+        branches: vec![super::delivered::AuthorizedOutputBranch {
+            snapshot: atomic_delivered.clone(),
+            acknowledgement: acknowledgement.clone(),
+            acknowledgements: vec![acknowledgement.clone()],
+            source_threads: std::collections::BTreeSet::from(["context-d".into()]),
+        }],
+    };
+    let atomic_calls = f.provider.calls.lock().unwrap().len();
+    let atomic_projection_json = super::frozen::capture_execution_basis_with_outputs(
+        &f.store,
+        "ws",
+        "thread",
+        Some("next-parent-turn"),
+        None,
+        None,
+        Some(&atomic_outputs),
+    )
+    .await
+    .unwrap();
+    let atomic_projection: pioneer_compaction::frozen::FrozenHistoryRef =
+        serde_json::from_str(&atomic_projection_json).unwrap();
+    let atomic_restored = super::frozen::restore(
+        &f.store,
+        "ws",
+        &std::collections::BTreeSet::from(["thread".into(), "context-d".into()]),
+        &atomic_projection,
+    )
+    .await
+    .unwrap();
+    assert!(
+        atomic_restored
+            .iter()
+            .any(
+                |message| message.provenance.as_ref().is_some_and(|origin| origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == atomic_checkpoint.id))
+            )
+    );
+    assert!(atomic_restored.iter().all(|message| {
+        !message
+            .content
+            .contains("raw delivered token usage must stay hidden")
+    }));
+    assert!(atomic_restored.iter().all(|message| {
+        message.provenance.as_ref().is_none_or(|origin| {
+            origin.sources.iter().all(|source| {
+                source.id != d_covered_source.id && source.id != d_technical_source.id
+            })
+        })
+    }));
+    let atomic_imports = f
+        .store
+        .compaction_frozen_import_page("ws", "thread", &atomic_projection.manifest_id, 0)
+        .await
+        .unwrap();
+    assert!(
+        atomic_imports.iter().all(|import| {
+            import.source != d_covered_source && import.source != d_technical_source
+        }),
+        "an atomic S_A grant must not become a grant for raw A/T"
+    );
+    let atomic_refs = f
+        .store
+        .compaction_frozen_history_page("ws", "thread", &atomic_projection.manifest_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        atomic_imports
+            .iter()
+            .filter(|import| {
+                import.source == delivered_summary_source || import.source == d_retained_source
+            })
+            .map(|import| import.output_ordinal)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([0, 1])
+    );
+    for import in atomic_imports.iter().filter(|import| {
+        import.source == delivered_summary_source || import.source == d_retained_source
+    }) {
+        assert_eq!(
+            atomic_refs[usize::try_from(import.message_ordinal).unwrap()].sources,
+            vec![atomic_checkpoint_source.clone()]
+        );
+    }
+    let atomic_repeat_json = super::frozen::capture_execution_basis_with_outputs(
+        &f.store,
+        "ws",
+        "thread",
+        Some("next-parent-turn"),
+        None,
+        None,
+        Some(&atomic_outputs),
+    )
+    .await
+    .unwrap();
+    let atomic_repeat: pioneer_compaction::frozen::FrozenHistoryRef =
+        serde_json::from_str(&atomic_repeat_json).unwrap();
+    assert_eq!(
+        super::frozen::restore(
+            &f.store,
+            "ws",
+            &std::collections::BTreeSet::from(["thread".into(), "context-d".into()]),
+            &atomic_repeat,
+        )
+        .await
+        .unwrap(),
+        atomic_restored
+    );
+    assert_eq!(f.provider.calls.lock().unwrap().len(), atomic_calls);
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_task_output SET manifest_id=? WHERE task_run_turn_id='rt-d'",
+            [legacy_output.manifest_id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_context SET head=? WHERE owner=?",
+            [
+                d_prepared
+                    .receipt
+                    .identity
+                    .checkpoint
+                    .clone()
+                    .unwrap()
+                    .into(),
+                delivered_summary_owner.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
     // Parent has independently summarized the first accepted output unit. The
     // next capture must omit that payload, retain the second unit, and keep the
-    // second unit's immutable output ordinal (1) for its import proof.
+    // second visible unit's immutable output ordinal (2) for its import proof;
+    // ordinal 1 is the model-invisible technical event between them.
     let output_summary_owner = super::native::native_owner("ws", "thread");
     let output_summary_selection = ModelSelection {
         transport: Transport::Api,
@@ -4464,7 +6164,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
             })
             .map(|record| record.output_ordinal)
             .collect::<std::collections::BTreeSet<_>>(),
-        std::collections::BTreeSet::from([0, 1]),
+        std::collections::BTreeSet::from([0, 2]),
         "an output without checkpoint filtering retains both immutable ordinals"
     );
     accepted_output.checkpoint = accepted_checkpoint;
@@ -4481,6 +6181,31 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     .unwrap();
     let next_parent_projection: pioneer_compaction::frozen::FrozenHistoryRef =
         serde_json::from_str(&next_parent_projection_json).unwrap();
+    let next_parent_messages = super::frozen::restore(
+        &f.store,
+        "ws",
+        &std::collections::BTreeSet::from(["thread".into(), "context-d".into()]),
+        &next_parent_projection,
+    )
+    .await
+    .unwrap();
+    assert!(next_parent_messages.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == output_summary.id)
+        })
+    }));
+    assert!(next_parent_messages.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin.sources.iter().any(|source| {
+                source.scope == d_retained_source.scope
+                    && source.id == d_retained_source.id
+                    && source.version == d_retained_source.version
+            })
+        })
+    }));
     let (import_count, _) = f
         .store
         .compaction_frozen_import_state("ws", "thread", &next_parent_projection.manifest_id)
@@ -4497,11 +6222,17 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         .iter()
         .find(|record| record.source == d_retained_source)
         .expect("the uncovered second output unit retains its accepted import");
-    assert_eq!(retained_import.output_ordinal, 1);
+    assert_eq!(retained_import.output_ordinal, 2);
     assert!(
         import_records
             .iter()
             .all(|record| { record.source != d_covered_source && record.output_ordinal != 0 })
+    );
+    assert!(
+        import_records.iter().all(|record| {
+            record.source != d_covered_source && record.source.id != output_summary.id
+        }),
+        "the parent checkpoint retains its own provenance, without a delivery grant"
     );
     assert!(
         f.store
@@ -4822,6 +6553,20 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         ))
         .await
         .unwrap();
+    let retained_event_for_atomic_fixture =
+        pioneer_entity::turn_event::Entity::find_by_id(d_retained_source.id.as_str())
+            .one(&f.store.database_connection())
+            .await
+            .unwrap()
+            .expect("the retained output event must exist before the deletion scenario");
+    let retained_event_revision_for_atomic_fixture =
+        pioneer_entity::compaction_event_revision::Entity::find_by_id(
+            d_retained_source.id.as_str(),
+        )
+        .one(&f.store.database_connection())
+        .await
+        .unwrap()
+        .expect("the retained output revision must exist before the deletion scenario");
     f.store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
@@ -5368,6 +7113,177 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         .await
         .expect("the sent summary status should be checked directly"),
         "an unavailable summary actually sent to the provider must stale continuity"
+    );
+    // The legacy-output scenarios above are complete. Rebind the same
+    // delivered TaskRun to its atomic fixture before asserting its grants:
+    // preparation resolves the *current* output from the delivery relation,
+    // not the earlier `atomic_delivered` value kept in this test.
+    // That earlier scenario physically removed B; restore the exact fixture
+    // event for this separate atomic-output scenario, whose premise is [S_A,B].
+    pioneer_entity::turn_event::Entity::insert(
+        retained_event_for_atomic_fixture.into_active_model(),
+    )
+    .exec(&f.store.database_connection())
+    .await
+    .unwrap();
+    // The INSERT trigger advances the revision after the earlier DELETE. This
+    // is a separate synthetic scenario using the original immutable output,
+    // so restore its exact fixture version as well as its canonical row.
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_event_revision SET revision=? WHERE source_id=?",
+            [
+                retained_event_revision_for_atomic_fixture.revision.into(),
+                d_retained_source.id.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_task_output SET manifest_id=? WHERE task_run_turn_id='rt-d'",
+            [atomic_output.manifest_id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_context SET head=? WHERE owner=?",
+            [
+                atomic_checkpoint.id.clone().into(),
+                delivered_summary_owner.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    let bound_atomic_delivery = f
+        .store
+        .compaction_delivery_output("ws", &atomic_delivered.delivery_id)
+        .await
+        .unwrap()
+        .expect("the atomic delivery must remain bound to its TaskRun");
+    assert_eq!(
+        bound_atomic_delivery.delivery_id,
+        atomic_delivered.delivery_id
+    );
+    assert_eq!(bound_atomic_delivery.output, atomic_delivered.output);
+    assert_eq!(bound_atomic_delivery.output.history, atomic_output);
+    let bound_references = f
+        .store
+        .compaction_frozen_history_page("ws", "context-d", &atomic_output.manifest_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(bound_references.len(), atomic_grants.len());
+    for (ordinal, (reference, grant)) in bound_references.iter().zip(&atomic_grants).enumerate() {
+        assert_eq!(grant.output_ordinal, ordinal as u64);
+        assert_eq!(reference.source_thread, grant.source_thread);
+        assert_eq!(
+            reference.sources.as_slice(),
+            std::slice::from_ref(&grant.source)
+        );
+    }
+    for grant in &atomic_grants {
+        assert_eq!(
+            f.store
+                .compaction_reference_thread("ws", &grant.source)
+                .await
+                .unwrap(),
+            Some(grant.source_thread.clone()),
+            "atomic output source {:?} must still exist before preparing a grant",
+            grant.source
+        );
+    }
+    assert_eq!(
+        f.store
+            .compaction_prepare_delivery_checkpoint_imports(
+                "ws",
+                "thread",
+                &bound_atomic_delivery.delivery_id,
+                &acknowledgement,
+                &atomic_grants,
+                "context-d",
+                &atomic_checkpoint_source,
+            )
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    // The atomic output and its checkpoint remain usable after the raw
+    // predecessor disappears. Restoring S_A and recapturing it must not need
+    // the historical A/T payloads merely to validate their saved coverage.
+    let covered_delete = if d_covered_source.scope.starts_with("item:") {
+        "DELETE FROM turn_item WHERE id=?"
+    } else {
+        "DELETE FROM turn_event WHERE id=?"
+    };
+    for (sql, id) in [
+        (covered_delete, d_covered_source.id.as_str()),
+        (
+            "DELETE FROM turn_event WHERE id=?",
+            d_technical_source.id.as_str(),
+        ),
+    ] {
+        f.store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                [id.into()],
+            ))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        f.store
+            .compaction_prepare_delivery_checkpoint_imports(
+                "ws",
+                "thread",
+                &bound_atomic_delivery.delivery_id,
+                &acknowledgement,
+                &atomic_grants,
+                "context-d",
+                &atomic_checkpoint_source,
+            )
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let restored_atomic_output = super::frozen::restore(
+        &f.store,
+        "ws",
+        &std::collections::BTreeSet::from(["context-d".into()]),
+        &atomic_output,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored_atomic_output, atomic_messages.to_vec());
+    let recaptured_atomic = super::frozen::capture(
+        &f.store,
+        "ws",
+        "context-d",
+        &std::collections::BTreeSet::from(["context-d".into()]),
+        &restored_atomic_output,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        super::frozen::restore(
+            &f.store,
+            "ws",
+            &std::collections::BTreeSet::from(["context-d".into()]),
+            &recaptured_atomic,
+        )
+        .await
+        .unwrap(),
+        restored_atomic_output
     );
 }
 
@@ -6076,7 +7992,7 @@ async fn prepared_graph_keeps_published_roots_after_historical_edit_and_delete()
             .store
             .compaction_activate_runner(
                 operation_id,
-                &RunnerState::new(900_000, &budget, 500, None).unwrap(),
+                &RunnerState::new(operation.admission.deadline_ms, &budget, 500, None).unwrap(),
             )
             .await
             .unwrap();
@@ -6255,9 +8171,13 @@ async fn prepared_graph_keeps_published_roots_after_historical_edit_and_delete()
 
 #[tokio::test]
 async fn compaction_empty_task_policy_never_reads_unselected_parent_payload() {
-    // This existing fixture source is deliberately not a typed Turn event.
-    // An Empty/Custom context must not materialize it merely to discard it.
+    // Empty/Custom context must not materialize a malformed unselected parent.
     let f = fixture("unparseable unselected parent payload", vec![], true, false).await;
+    f.store
+        .database_connection()
+        .execute_unprepared("UPDATE turn_event SET payload='not-canonical-json' WHERE id='source'")
+        .await
+        .unwrap();
     for mode in [
         pioneer_protocol::TaskAgentContextMode::Empty,
         pioneer_protocol::TaskAgentContextMode::Custom,
@@ -7833,6 +9753,218 @@ async fn execution_restore_normalizes_covering_and_partial_checkpoint_replacemen
             .unwrap();
     }
 
+    // Two independent owners replace non-adjacent immutable sources. The
+    // hidden event occupies an original ordinal but never enters the model
+    // list. After the first projection, the second must select its units from
+    // the *current* list rather than reuse immutable-boundary indexes.
+    install(
+        &f,
+        "retained-before",
+        "operation-pair-a",
+        "checkpoint-pair-a",
+        &[
+            ("retained-before", references["before"].clone()),
+            ("z-source", references["A"].clone()),
+        ],
+        "PAIR(A1+A2)",
+    )
+    .await;
+    install(
+        &f,
+        "retained-middle",
+        "operation-pair-b",
+        "checkpoint-pair-b",
+        &[
+            ("retained-middle", references["middle"].clone()),
+            ("a-source", references["B"].clone()),
+        ],
+        "PAIR(B1+B2)",
+    )
+    .await;
+    let technical_event = pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+        pioneer_protocol::ItemCompletedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "retained-before".into(),
+            turn_id: "turn-retained-before".into(),
+            item: pioneer_protocol::TurnItem::SystemEvent {
+                id: "pair-hidden-technical".into(),
+                level: pioneer_protocol::SystemEventLevel::Info,
+                message: "hidden usage event".into(),
+                code: Some("agent_runtime_event".into()),
+                details: Some(serde_json::json!({
+                    "nativeMethod": "thread/tokenUsage/updated"
+                })),
+            },
+        },
+    );
+    f.store
+        .materialize_native_agent_turn_event(
+            technical_event.clone(),
+            chrono::Utc::now().timestamp(),
+            None,
+        )
+        .await
+        .unwrap();
+    let technical_source = f
+        .store
+        .compaction_source_page(
+            "ws",
+            "retained-before",
+            "turn-retained-before",
+            PagedSource::Event,
+            0,
+        )
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.item_id.as_deref() == Some("pair-hidden-technical"))
+        .unwrap()
+        .reference;
+    let mut hidden = super::history::legacy_event_message(technical_event)
+        .unwrap()
+        .unwrap();
+    let mut hidden_origin = messages[0].provenance.as_ref().unwrap().clone();
+    hidden_origin.logical_turn_id = Some("pair-hidden-technical-turn".into());
+    hidden_origin.unit_id = "pair-hidden-technical-unit".into();
+    hidden_origin.sources = vec![pioneer_provider::MessageSourceRef {
+        scope: technical_source.scope.clone(),
+        id: technical_source.id.clone(),
+        version: technical_source.version.clone(),
+    }];
+    hidden.provenance = Some(hidden_origin);
+    let boundary = vec![
+        messages[0].clone(),
+        hidden,
+        messages[1].clone(),
+        messages[2].clone(),
+        messages[3].clone(),
+        messages[4].clone(),
+    ];
+    let model_ordinals = [0, 2, 3, 4, 5];
+    let heads = [
+        ("retained-before", "checkpoint-pair-a"),
+        ("retained-middle", "checkpoint-pair-b"),
+    ];
+    for order in [heads, [heads[1], heads[0]]] {
+        let mut projected = model_ordinals
+            .iter()
+            .map(|ordinal| boundary[*ordinal].clone())
+            .collect::<Vec<_>>();
+        let mut resolver = super::coverage::CheckpointGraphResolver::default();
+        for (thread, head) in order {
+            let owner = super::native::native_owner("ws", thread);
+            let selected = super::checkpoint::project_checkpoint_in_context_with_boundary(
+                &f.store,
+                &super::checkpoint::ProjectionContext {
+                    workspace: "ws",
+                    context_thread: "execution",
+                    source_thread: thread,
+                    owner: &owner,
+                    allowed: &allowed,
+                    allow_historical_gaps: false,
+                },
+                head,
+                &mut projected,
+                Some(&super::checkpoint::ProjectionBoundaryEvidence {
+                    messages: &boundary,
+                    model_ordinals: &model_ordinals,
+                }),
+                &mut resolver,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                selected,
+                if head == "checkpoint-pair-a" {
+                    std::collections::BTreeSet::from([0, 2])
+                } else {
+                    std::collections::BTreeSet::from([3, 4])
+                },
+                "replacement proofs must retain original boundary ordinals"
+            );
+        }
+        let projected_text = projected
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(projected_text.len(), 3);
+        assert_eq!(
+            projected_text
+                .iter()
+                .filter(|text| text.contains("PAIR(A1+A2)"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            projected_text
+                .iter()
+                .filter(|text| text.contains("PAIR(B1+B2)"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            projected_text
+                .iter()
+                .filter(|text| text.contains("after"))
+                .count(),
+            1
+        );
+        assert!(
+            projected_text
+                .iter()
+                .all(|text| !text.contains("hidden usage event"))
+        );
+        assert!(
+            projected_text
+                .iter()
+                .all(|text| text != "before" && text != "middle")
+        );
+        assert_eq!(projected[2].provenance, messages[4].provenance);
+
+        // A second projection of the same immutable boundary is idempotent.
+        for (thread, head) in order {
+            let owner = super::native::native_owner("ws", thread);
+            super::checkpoint::project_checkpoint_in_context_with_boundary(
+                &f.store,
+                &super::checkpoint::ProjectionContext {
+                    workspace: "ws",
+                    context_thread: "execution",
+                    source_thread: thread,
+                    owner: &owner,
+                    allowed: &allowed,
+                    allow_historical_gaps: false,
+                },
+                head,
+                &mut projected,
+                None,
+                &mut resolver,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            projected
+                .iter()
+                .map(|message| message.content.clone())
+                .collect::<Vec<_>>(),
+            projected_text
+        );
+    }
+    // These heads belonged only to the independent pair regression; the
+    // original covering/partial-checkpoint scenario below stays unchanged.
+    for thread in ["retained-before", "retained-middle"] {
+        f.store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_context SET head=NULL WHERE owner=?",
+                [super::native::native_owner("ws", thread).into()],
+            ))
+            .await
+            .unwrap();
+    }
+
     install(
         &f,
         "z-source",
@@ -9066,6 +11198,26 @@ async fn check_nested_task_basis(legacy: bool) {
                         == "task-basis:run"
                 )
         );
+        let mut hydrated = history.clone();
+        super::frozen::hydrate_accepted_own(
+            &f.store,
+            "ws",
+            "child",
+            &nested,
+            "grand",
+            &mut hydrated,
+        )
+        .await
+        .unwrap();
+        assert_eq!(hydrated, history);
+        assert_eq!(
+            hydrated
+                .iter()
+                .filter(|message| message.content == "independent identical observation")
+                .count(),
+            2,
+            "duplicate legacy provenance entries remain distinct after new capture and hydration"
+        );
     }
 
     assert_eq!(
@@ -9183,6 +11335,7 @@ async fn check_nested_task_basis(legacy: bool) {
 #[tokio::test]
 async fn frozen_failed_event_preserves_old_wire_form_and_new_terminal_status() {
     use pioneer_provider::ChatMessage;
+    use sha2::{Digest, Sha256};
     let f = fixture("irrelevant", vec![], true, false).await;
     // This fixture's raw synthetic event has no canonical projector ACK.
     // Remove it before exercising the actual ordered event materializer.
@@ -9294,7 +11447,235 @@ async fn frozen_failed_event_preserves_old_wire_form_and_new_terminal_status() {
             .await
             .unwrap();
         assert_eq!(restored, vec![message]);
+        let execution = super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            None,
+            "synthetic-execution",
+            &allowed,
+            &serde_json::to_string(&descriptor).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            execution.messages[0].content,
+            "Historical turn Interrupted: None"
+        );
     }
+
+    let blocker = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.item_id.as_deref() == Some("source-blocker"))
+        .unwrap()
+        .reference;
+    let item = pioneer_protocol::TurnItem::SystemEvent {
+        id: "source-blocker".into(),
+        level: SystemEventLevel::Info,
+        message: "recorded permission blocker".into(),
+        code: Some("permission_denied".into()),
+        details: None,
+    };
+    let mut legacy = ChatMessage::user(format!(
+        "Recorded historical event:\n{}",
+        serde_json::to_string(&item).unwrap()
+    ));
+    legacy.provenance = Some(pioneer_provider::MessageProvenance {
+        logical_turn_id: None,
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        context_thread: None,
+        unit_id: "legacy-system-event".into(),
+        sources: vec![pioneer_provider::MessageSourceRef {
+            scope: blocker.scope,
+            id: blocker.id,
+            version: blocker.version,
+        }],
+        inherited: false,
+        complete: true,
+        protected_input: false,
+    });
+    let descriptor = super::frozen::capture(&f.store, "ws", "thread", &allowed, &[legacy])
+        .await
+        .unwrap();
+    let restored = super::frozen::restore(&f.store, "ws", &allowed, &descriptor)
+        .await
+        .unwrap();
+    assert_eq!(restored.len(), 1);
+    assert!(restored[0].content.contains("recorded permission blocker"));
+    assert!(restored[0].content.contains("source-blocker"));
+    let execution = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        None,
+        "synthetic-execution",
+        &allowed,
+        &serde_json::to_string(&descriptor).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(execution.messages.len(), 1);
+    assert!(
+        execution.messages[0]
+            .content
+            .contains("recorded permission blocker")
+    );
+    assert!(!execution.messages[0].content.contains("source-blocker"));
+
+    let mut corrupted_reference = f
+        .store
+        .compaction_frozen_history_page("ws", "thread", &descriptor.manifest_id, 0)
+        .await
+        .unwrap()
+        .remove(0);
+    corrupted_reference.wire_sha256 = "0".repeat(64);
+    let reference_bytes = serde_json::to_vec(&corrupted_reference).unwrap();
+    let mut identity = Sha256::new();
+    identity.update((reference_bytes.len() as u64).to_be_bytes());
+    identity.update(&reference_bytes);
+    let corrupted = pioneer_compaction::frozen::FrozenHistoryRef {
+        format: descriptor.format,
+        manifest_id: "corrupted-legacy-event-wire".into(),
+        messages: 1,
+        identity_sha256: hex::encode(identity.finalize()),
+    };
+    f.store
+        .compaction_begin_frozen_history("ws", "thread", &corrupted)
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_frozen_history(
+            "ws",
+            "thread",
+            &corrupted.manifest_id,
+            0,
+            &[corrupted_reference],
+        )
+        .await
+        .unwrap();
+    assert!(
+        f.store
+            .compaction_finish_frozen_history("ws", "thread", &corrupted)
+            .await
+            .unwrap()
+    );
+    let error = super::frozen::restore(&f.store, "ws", &allowed, &corrupted)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "frozen source no longer renders the captured model message"
+    );
+}
+
+#[tokio::test]
+async fn legacy_frozen_empty_agent_message_authenticates_wire_then_disappears_from_model_history() {
+    use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
+    use pioneer_provider::ChatMessage;
+    use sha2::{Digest, Sha256};
+
+    let f = fixture("irrelevant", vec![], true, false).await;
+    f.store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+        .await
+        .unwrap();
+    f.store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "legacy-empty-agent".into(),
+                    text: " \n\t".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    let source = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.item_id.as_deref() == Some("legacy-empty-agent"))
+        .unwrap()
+        .reference;
+    let legacy_wire = ChatMessage::assistant(" \n\t");
+    let reference = FrozenMessageRef {
+        logical_turn_id: None,
+        source_thread: "thread".into(),
+        context_thread: None,
+        unit_id: "legacy-empty-agent-unit".into(),
+        sources: vec![source],
+        inherited: false,
+        complete: true,
+        protected_input: false,
+        wire_sha256: hex::encode(Sha256::digest(serde_json::to_vec(&legacy_wire).unwrap())),
+        replay_source: None,
+        tool_item_id: None,
+        tool_call_id: None,
+        tool_name: None,
+        event_input_role: None,
+    };
+    let reference_bytes = serde_json::to_vec(&reference).unwrap();
+    let mut identity = Sha256::new();
+    identity.update((reference_bytes.len() as u64).to_be_bytes());
+    identity.update(&reference_bytes);
+    let descriptor = FrozenHistoryRef {
+        format: pioneer_compaction::FORMAT_VERSION,
+        manifest_id: "legacy-empty-agent-manifest".into(),
+        messages: 1,
+        identity_sha256: hex::encode(identity.finalize()),
+    };
+    f.store
+        .compaction_begin_frozen_history("ws", "thread", &descriptor)
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_frozen_history("ws", "thread", &descriptor.manifest_id, 0, &[reference])
+        .await
+        .unwrap();
+    assert!(
+        f.store
+            .compaction_finish_frozen_history("ws", "thread", &descriptor)
+            .await
+            .unwrap()
+    );
+
+    let restored = super::frozen::restore(
+        &f.store,
+        "ws",
+        &std::collections::BTreeSet::from(["thread".into()]),
+        &descriptor,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].content, " \n\t");
+    let execution = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        None,
+        "synthetic-execution",
+        &std::collections::BTreeSet::from(["thread".into()]),
+        &serde_json::to_string(&descriptor).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(execution.messages.is_empty());
+    assert_eq!(descriptor.messages, 1, "the source ordinal remains frozen");
 }
 
 #[tokio::test]
@@ -9805,6 +12186,51 @@ async fn capture_carries_foreign_own_authority_onto_late_summary() {
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from([(source_a.clone(), 0), (source_b.clone(), 1)]),
         "checkpoint projection must preserve immutable output ordinals"
+    );
+    // An output-aware capture can have no newly authorized delivery branches.
+    // The checkpoint already has accepted Task-basis proofs and must keep that
+    // authorization path instead of requesting a new delivery grant.
+    let mut accepted_output_epochs = capture.source_epochs.clone();
+    for (source_thread, epoch) in &mut accepted_output_epochs {
+        *epoch = f
+            .store
+            .compaction_projection_version("ws", source_thread)
+            .await
+            .unwrap();
+    }
+    let accepted_output_selection = super::delivered::AuthorizedOutputSet {
+        workspace: "ws".into(),
+        destination: "consumer-one".into(),
+        checkpoint: None,
+        fence: f.store.compaction_history_read_fence().await.unwrap(),
+        authorization_revision: 0,
+        source_epochs: accepted_output_epochs,
+        branches: vec![],
+    };
+    let recaptured = super::frozen::capture_execution_basis_prepared_with_outputs(
+        &f.store,
+        "ws",
+        "consumer-one",
+        Some("turn-consumer-one"),
+        Some("turn-consumer-one"),
+        None,
+        Some(&accepted_output_selection),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recaptured.messages, capture.messages);
+    assert_eq!(
+        f.store
+            .compaction_frozen_import_page(
+                "ws",
+                "consumer-one",
+                &recaptured.descriptor.manifest_id,
+                0,
+            )
+            .await
+            .unwrap(),
+        carried,
+        "accepted checkpoint imports must survive output-aware recapture"
     );
 
     async fn publish_capture(
@@ -10740,6 +13166,70 @@ async fn accepted_checkpoint_projection_deduplicates_nested_summaries_in_both_ow
             projected, once,
             "B must stay authoritative while absorbed A and covered raw rows are removed"
         );
+    }
+}
+
+#[tokio::test]
+async fn nested_checkpoint_dedup_keeps_hidden_boundary_ordinal_in_both_owner_orders() {
+    for b_thread in ["aaa-hidden-b-first", "zzz-hidden-b-last"] {
+        let scenario = contained_checkpoint_fixture(
+            b_thread,
+            pioneer_compaction::CoverageDomain::OwnContribution,
+        )
+        .await;
+        let mut hidden = pioneer_provider::ChatMessage::user("authenticated technical wire");
+        let mut hidden_origin = scenario.initial[2].provenance.clone().unwrap();
+        hidden_origin.unit_id = "hidden-technical-unit".into();
+        hidden_origin.sources[0].id = "hidden-technical-source".into();
+        hidden.provenance = Some(hidden_origin);
+        let boundary = vec![
+            scenario.initial[0].clone(),
+            hidden,
+            scenario.initial[1].clone(),
+            scenario.initial[2].clone(),
+        ];
+        let mut projected = vec![
+            scenario.initial[0].clone(),
+            scenario.initial[1].clone(),
+            scenario.initial[2].clone(),
+        ];
+        let mut resolver = super::coverage::CheckpointGraphResolver::default();
+        super::checkpoint::project_accepted_checkpoints_with_boundary_evidence(
+            &scenario.fixture.store,
+            "ws",
+            "child",
+            &scenario.allowed,
+            &mut projected,
+            Some(super::checkpoint::ProjectionBoundaryEvidence {
+                messages: &boundary,
+                model_ordinals: &[0, 2, 3],
+            }),
+            None,
+            &mut resolver,
+        )
+        .await
+        .unwrap();
+        assert_eq!(projected.len(), 2);
+        assert_eq!(
+            projected[0].provenance.as_ref().unwrap().sources[0].id,
+            scenario.b.id
+        );
+        assert_eq!(projected[1].content, "uncovered tail");
+        assert!(projected.iter().all(|message| {
+            !message.content.contains("authenticated technical wire")
+                && message.provenance.as_ref().unwrap().sources[0].id != scenario.a.id
+        }));
+        let once = projected.clone();
+        super::checkpoint::project_accepted_checkpoints(
+            &scenario.fixture.store,
+            "ws",
+            "child",
+            &scenario.allowed,
+            &mut projected,
+        )
+        .await
+        .unwrap();
+        assert_eq!(projected, once);
     }
 }
 
@@ -13297,6 +15787,318 @@ async fn covered_event_input_still_suppresses_its_uncovered_mixed_ui_copy() {
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn message_mutations_suppress_stale_event_copies_without_live_inputs_on_cold_and_warm_reads()
+{
+    use pioneer_protocol::{
+        ItemCompletedNotification, PersistedActorRef, TurnItem, TurnMessageDeletedEvent,
+        TurnMessageEditedEvent, UserInput, UserMessageAttachment,
+    };
+
+    for delete in [false, true] {
+        let f = fixture("unused", vec![], true, false).await;
+        let db = f.store.database_connection();
+        db.execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+            .await
+            .unwrap();
+        db.execute_unprepared("DELETE FROM turn_input WHERE turn_id='turn'")
+            .await
+            .unwrap();
+        db.execute_unprepared(
+            "UPDATE turn SET status='completed',send_mode='message' WHERE id='turn'",
+        )
+        .await
+        .unwrap();
+        f.store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item: TurnItem::UserMessage {
+                        id: "stale-user-copy".into(),
+                        text: "stale user text".into(),
+                        attachments: vec![UserMessageAttachment::LocalFile {
+                            path: "/synthetic/stale-attachment.txt".into(),
+                        }],
+                    },
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+
+        let (_, mut turn) = f.store.get_turn("thread", "turn").await.unwrap().unwrap();
+        turn.message_revision += 1;
+        let timestamp = chrono::Utc::now().timestamp();
+        f.store
+            .materialize_native_agent_turn_event(
+                pioneer_crud::CanonicalTurnEventPayload::TurnMessageEdited(
+                    TurnMessageEditedEvent {
+                        workspace_id: "ws".into(),
+                        thread_id: "thread".into(),
+                        turn: turn.clone(),
+                        input: vec![
+                            UserInput::Text {
+                                text: "stale user text".into(),
+                                text_elements: vec![],
+                            },
+                            UserInput::LocalFile {
+                                path: "/synthetic/stale-attachment.txt".into(),
+                            },
+                        ],
+                        changed_by: PersistedActorRef::System,
+                        changed_at: timestamp,
+                    },
+                ),
+                timestamp,
+                None,
+            )
+            .await
+            .unwrap();
+        db.execute_unprepared("DELETE FROM turn_input WHERE turn_id='turn'")
+            .await
+            .unwrap();
+        let before_fence = f.store.compaction_history_read_fence().await.unwrap();
+        let before =
+            super::history::load_line_history(&f.store, "ws", "thread", None, &before_fence)
+                .await
+                .unwrap();
+        let before_text = before
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(before_text.contains("stale user text"));
+        assert!(
+            serde_json::to_string(&before)
+                .unwrap()
+                .contains("stale-attachment.txt")
+        );
+
+        turn.message_revision += 1;
+        let mutation = if delete {
+            turn.message_deleted = true;
+            pioneer_crud::CanonicalTurnEventPayload::TurnMessageDeleted(TurnMessageDeletedEvent {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn,
+                deleted_by: PersistedActorRef::System,
+                deleted_at: timestamp,
+            })
+        } else {
+            pioneer_crud::CanonicalTurnEventPayload::TurnMessageEdited(TurnMessageEditedEvent {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn,
+                input: vec![],
+                changed_by: PersistedActorRef::System,
+                changed_at: timestamp,
+            })
+        };
+        f.store
+            .materialize_native_agent_turn_event(mutation, timestamp, None)
+            .await
+            .unwrap();
+        db.execute_unprepared(
+            "UPDATE compaction_event_revision SET projection_revision=revision, \
+             projection_kind='technical' WHERE source_id IN \
+             (SELECT id FROM turn_event WHERE turn_id='turn' AND \
+             event_type IN ('turn/message/edited','turn/message/deleted'))",
+        )
+        .await
+        .unwrap();
+
+        let fence = f.store.compaction_history_read_fence().await.unwrap();
+        let cold = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+            .await
+            .unwrap();
+        let warm = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+            .await
+            .unwrap();
+        assert_eq!(cold, warm);
+        for message in cold {
+            assert!(!message.content.contains("stale user text"));
+            assert!(
+                !serde_json::to_string(&message)
+                    .unwrap()
+                    .contains("stale-attachment.txt")
+            );
+        }
+        assert_eq!(f.provider.count.borrow().clone(), 0);
+    }
+}
+
+#[tokio::test]
+async fn foreground_and_background_token_preflight_share_filtered_meaningful_reasoning_history() {
+    let f = fixture("unused", vec![], true, false).await;
+    let db = f.store.database_connection();
+    db.execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+        .await
+        .unwrap();
+    for (id, summary, content) in [
+        ("reasoning-content", vec![], vec!["content-only"]),
+        ("reasoning-summary", vec!["summary-only"], vec![]),
+        (
+            "reasoning-both",
+            vec!["combined-summary"],
+            vec!["combined-content"],
+        ),
+    ] {
+        f.store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item: pioneer_protocol::TurnItem::Reasoning {
+                        id: id.into(),
+                        summary: summary.into_iter().map(str::to_owned).collect(),
+                        content: content.into_iter().map(str::to_owned).collect(),
+                    },
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+    }
+    f.store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: pioneer_protocol::TurnItem::SystemEvent {
+                    id: "filtered-token-usage".into(),
+                    level: SystemEventLevel::Info,
+                    message: "must not reach token preflight".into(),
+                    code: Some("agent_runtime_event".into()),
+                    details: Some(serde_json::json!({
+                        "nativeMethod": "thread/tokenUsage/updated",
+                        "usage": {"inputTokens": 999_999}
+                    })),
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let foreground = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+        .await
+        .unwrap();
+    let background_store = f.store.with_maintenance_access();
+    let background =
+        super::history::load_line_history(&background_store, "ws", "thread", None, &fence)
+            .await
+            .unwrap();
+    assert_eq!(foreground, background);
+    let rendered = foreground
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for expected in [
+        "content-only",
+        "summary-only",
+        "combined-content\ncombined-summary",
+    ] {
+        assert!(rendered.contains(expected));
+    }
+    assert!(!rendered.contains("must not reach token preflight"));
+    assert!(!rendered.contains("999999"));
+
+    let projection = |messages| {
+        pioneer_agent::compaction::request::NativeRequestProjection::full(
+            ChatRequest {
+                model: "gpt-4".into(),
+                messages,
+                temperature: None,
+                max_tokens: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                compiled_prompt: None,
+            },
+            vec![],
+            ModelBudget::new(Some(128_000), None, Some(4_096)),
+            false,
+        )
+        .unwrap()
+    };
+    let foreground_preflight = projection(foreground);
+    let background_preflight = projection(background);
+    assert_eq!(
+        foreground_preflight.estimated_input_tokens,
+        background_preflight.estimated_input_tokens
+    );
+    assert_eq!(
+        foreground_preflight.message_input_tokens,
+        background_preflight.message_input_tokens
+    );
+
+    use pioneer_agent::compaction::controller::NativeContext;
+    use pioneer_provider::ProviderRegistry;
+    let providers =
+        ProviderRegistry::with_provider("filtered-preflight", Arc::new(SmallWindowMain));
+    let context = NativeContext {
+        overflow_recovery: false,
+        recovery_deadline_ms: None,
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "turn".into(),
+        conversation_thread_id: None,
+        provider_instance: "filtered-preflight".into(),
+        provider: providers
+            .get_or_create_for_workspace("ws", "filtered-preflight")
+            .unwrap(),
+        events: Arc::new(ExecutionEventHub::new()),
+        cancellation: CancellationToken::new(),
+    };
+    let prepared = super::test_support::prepare_native_request(
+        &f.store,
+        &providers,
+        &CompactionSettings::default(),
+        &context,
+        ChatRequest {
+            model: "gpt-4".into(),
+            messages: foreground_preflight.request.messages.clone(),
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        },
+        None,
+        false,
+        f.observer.clone(),
+        f.clock.clone(),
+    )
+    .await
+    .unwrap();
+    let prepared_text = prepared
+        .request
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for expected in [
+        "content-only",
+        "summary-only",
+        "combined-content\ncombined-summary",
+    ] {
+        assert!(prepared_text.contains(expected));
+    }
+    assert!(!prepared_text.contains("must not reach token preflight"));
+    assert!(prepared.receipt.identity.checkpoint.is_none());
+    assert_eq!(f.provider.calls.lock().unwrap().len(), 0);
 }
 
 #[tokio::test]

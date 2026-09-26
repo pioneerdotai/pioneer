@@ -1710,12 +1710,10 @@ impl TaskAgentExecutor {
                 .await
                 .map_err(|message| anyhow!(message))
                 .context("failed to normalize composer work capabilities")?;
-            // Admission needs the expanded Skill IDs for every backend. CLI
-            // preparation still owns attachment presentation, so retain the
-            // original pack there until its own normalization/materialization.
-            if cli_runtime_backend.is_none() {
-                launch.capabilities = normalized.execution.clone();
-            }
+            // The hidden child is already admitted when CLI preparation runs,
+            // so its canonical capabilities must be executable Skill IDs too.
+            // Keep pack presentation separately for the user-message item.
+            launch.capabilities = normalized.execution.clone();
             Some(normalized)
         } else {
             None
@@ -2187,6 +2185,9 @@ impl TaskAgentExecutor {
 
         if let Some((runtime_id, runtime_kind)) = cli_runtime_backend {
             let action_author = input_author;
+            let cli_presentation_capabilities = normalized_composer_capabilities
+                .as_ref()
+                .map(|normalized| normalized.presentation.clone());
             return message_future(async move {
                 // The shared CLI preparation future is deliberately large. Run it
                 // from a fresh Tokio task so Task scheduler dispatch frames do not
@@ -2234,15 +2235,22 @@ impl TaskAgentExecutor {
                         .await
                         .context("failed to accept Task conversation history")?;
                     }
+                    let mut cli_params = TurnStartParams {
+                        input: child_input,
+                        model: Some(effective_model.model),
+                        model_provider: Some(effective_model_provider),
+                        mode: Some(child_mode),
+                        ..turn_params
+                    };
+                    // The child admission above uses expanded executable skills.
+                    // CLI preparation normalizes again for its own preflight and
+                    // must see the original selection to publish one pack item.
+                    if let Some(presentation) = cli_presentation_capabilities {
+                        cli_params.capabilities = presentation;
+                    }
                     let prepared = prepare_processor
                         .prepare_task_cli_runtime_turn(
-                            TurnStartParams {
-                                input: child_input,
-                                model: Some(effective_model.model),
-                                model_provider: Some(effective_model_provider),
-                                mode: Some(child_mode),
-                                ..turn_params
-                            },
+                            cli_params,
                             runtime_id,
                             runtime_kind,
                             child_permission_profile,
@@ -6831,9 +6839,12 @@ where
         async {
             // insert-if-absent may have accepted another immutable snapshot.
             // Never pair it with messages assembled by the losing capture or
-            // project a newer checkpoint into the concurrent winner. This
-            // path returns the accepted manifest's literal order/count.
-            restore_task_run_conversation_snapshot_literal_fields(
+            // project a newer checkpoint into the concurrent winner.
+            // Authenticate the accepted manifest's literal order/count and
+            // original import ordinals before projecting that same immutable
+            // descriptor for execution. Never send literal technical entries
+            // to runtime capture, budgeting, or the provider.
+            let _literal = restore_task_run_conversation_snapshot_literal_fields(
                 history_store,
                 &persisted,
                 task_id,
@@ -6841,6 +6852,14 @@ where
                 conversation_thread,
                 source_turn_id,
                 execution_thread_id,
+            )
+            .await?;
+            crate::compaction::frozen::restore_accepted_snapshot_for_execution_without_checkpoint(
+                history_store,
+                &persisted.workspace_id,
+                &persisted.conversation_thread_id,
+                execution_thread_id,
+                &persisted.history_json,
             )
             .await
         },
@@ -6888,7 +6907,7 @@ async fn restore_task_run_conversation_snapshot_literal_fields(
     )
     .await
     .context("failed to restore accepted concurrent Task snapshot")?;
-    crate::compaction::frozen::hydrate_accepted_own(
+    crate::compaction::frozen::hydrate_accepted_own_literal(
         store,
         &snapshot.workspace_id,
         &snapshot.conversation_thread_id,
@@ -7114,6 +7133,523 @@ mod prepared_snapshot_tests {
             .unwrap();
         assert_eq!(persisted.history_json, winner_json);
         assert_eq!(persisted.task_id, "race-task");
+    }
+
+    #[tokio::test]
+    async fn competing_legacy_snapshot_keeps_literal_technical_ordinal_with_accepted_import() {
+        use pioneer_crud::compaction::FrozenImportRecord;
+        use pioneer_keystore::MemorySecretStore;
+        use pioneer_protocol::{ItemCompletedNotification, SystemEventLevel, TurnItem};
+        use pioneer_provider::providers::EchoProvider;
+        use sea_orm::{DbBackend, Statement};
+        use sha2::Digest;
+
+        let store = fixture("race-legacy-ws").await;
+        let loser = prepared(&store, "race-legacy-ws", "loser-turn", "losing history").await;
+        let mut winner = prepared(&store, "race-legacy-ws", "winner-turn", "winning history").await;
+        let b = prepared(&store, "race-legacy-ws", "own-turn", "own history").await;
+        let item = TurnItem::SystemEvent {
+            id: "legacy-technical-entry".into(),
+            level: SystemEventLevel::Info,
+            message: "Thread status changed".into(),
+            code: Some("agent_thread_status_changed".into()),
+            details: None,
+        };
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: "race-legacy-ws".into(),
+                    thread_id: "parent".into(),
+                    turn_id: "winner-turn".into(),
+                    item: item.clone(),
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+        let mut technical_events = store
+            .compaction_source_page(
+                "race-legacy-ws",
+                "parent",
+                "winner-turn",
+                PagedSource::Event,
+                0,
+            )
+            .await
+            .unwrap()
+            .entries;
+        assert_eq!(technical_events.len(), 1);
+        let technical_source = technical_events.remove(0).reference;
+        let mut technical = ChatMessage::user(format!(
+            "Recorded historical event:\n{}",
+            serde_json::to_string(&item).unwrap()
+        ));
+        technical.provenance = Some(MessageProvenance {
+            logical_turn_id: None,
+            workspace_id: "race-legacy-ws".into(),
+            thread_id: "parent".into(),
+            context_thread: None,
+            unit_id: "winner-turn:legacy-technical-entry".into(),
+            sources: vec![MessageSourceRef {
+                scope: technical_source.scope,
+                id: technical_source.id,
+                version: technical_source.version,
+            }],
+            inherited: true,
+            complete: true,
+            protected_input: false,
+        });
+        winner.messages = vec![winner.messages.remove(0), technical, b.messages[0].clone()];
+        // Register an old wire manifest literally: current capture correctly
+        // refuses to create new manifests containing excluded model entries.
+        let references = winner
+            .messages
+            .iter()
+            .map(|message| {
+                let origin = message.provenance.as_ref().unwrap();
+                let reference = pioneer_compaction::frozen::FrozenMessageRef {
+                    logical_turn_id: origin.logical_turn_id.clone(),
+                    source_thread: origin.thread_id.clone(),
+                    context_thread: origin.context_thread.clone(),
+                    unit_id: origin.unit_id.clone(),
+                    sources: origin
+                        .sources
+                        .iter()
+                        .map(|source| pioneer_compaction::SourceRef {
+                            scope: source.scope.clone(),
+                            id: source.id.clone(),
+                            version: source.version.clone(),
+                        })
+                        .collect(),
+                    event_input_role: None,
+                    inherited: origin.inherited,
+                    complete: origin.complete,
+                    protected_input: origin.protected_input,
+                    wire_sha256: hex::encode(sha2::Sha256::digest(
+                        serde_json::to_vec(message).unwrap(),
+                    )),
+                    replay_source: None,
+                    tool_item_id: None,
+                    tool_call_id: None,
+                    tool_name: None,
+                };
+                reference.validate().unwrap();
+                reference
+            })
+            .collect::<Vec<_>>();
+        let mut identity = sha2::Sha256::new();
+        for reference in &references {
+            let bytes = serde_json::to_vec(reference).unwrap();
+            identity.update((bytes.len() as u64).to_be_bytes());
+            identity.update(bytes);
+        }
+        let identity_sha256 = hex::encode(identity.finalize());
+        let empty_import_digest = pioneer_crud::compaction::EMPTY_FROZEN_IMPORT_SHA256;
+        let capture_key = serde_json::to_vec(&(
+            1_u32,
+            "race-legacy-ws",
+            "parent",
+            &identity_sha256,
+            references.len(),
+            empty_import_digest,
+            0_usize,
+        ))
+        .unwrap();
+        winner.descriptor = pioneer_compaction::frozen::FrozenHistoryRef {
+            format: 1,
+            manifest_id: format!("fh_{}", hex::encode(sha2::Sha256::digest(capture_key))),
+            messages: references.len() as u64,
+            identity_sha256,
+        };
+        store
+            .compaction_begin_frozen_history_with_imports(
+                "race-legacy-ws",
+                "parent",
+                &winner.descriptor,
+                0,
+                empty_import_digest,
+            )
+            .await
+            .unwrap();
+        store
+            .compaction_append_frozen_history(
+                "race-legacy-ws",
+                "parent",
+                &winner.descriptor.manifest_id,
+                0,
+                &references,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .compaction_finish_frozen_history("race-legacy-ws", "parent", &winner.descriptor,)
+                .await
+                .unwrap()
+        );
+        let winner_json = serde_json::to_string(&winner.descriptor).unwrap();
+
+        // Model the already published legacy import metadata. Production
+        // preparation/append proof validation is covered independently; this
+        // fixture isolates the positional hydration of an accepted manifest.
+        let imported = b.messages[0].provenance.as_ref().unwrap();
+        let source = pioneer_compaction::SourceRef {
+            scope: imported.sources[0].scope.clone(),
+            id: imported.sources[0].id.clone(),
+            version: imported.sources[0].version.clone(),
+        };
+        let record = FrozenImportRecord {
+            message_ordinal: 2,
+            source_thread: "parent".into(),
+            source: source.clone(),
+            delivery_id: "legacy-delivery".into(),
+            candidate_id: "legacy-candidate".into(),
+            output_manifest: "legacy-output".into(),
+            output_ordinal: 0,
+            acknowledgement: source.clone(),
+        };
+        let record_bytes = serde_json::to_vec(&record).unwrap();
+        let mut digest = sha2::Sha256::new();
+        digest.update((record_bytes.len() as u64).to_le_bytes());
+        digest.update(&record_bytes);
+        let db = store.database_connection();
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES (?,0,2,?,?,?,?,?,?)",
+            [
+                winner.descriptor.manifest_id.clone().into(),
+                source.scope.clone().into(),
+                source.id.clone().into(),
+                source.version.clone().into(),
+                "parent".into(),
+                serde_json::to_string(&record).unwrap().into(),
+                i64::try_from(record_bytes.len()).unwrap().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_frozen_history SET import_count=1,next_import=1,imports_sha256=? WHERE id=?",
+            [hex::encode(digest.finalize()).into(), winner.descriptor.manifest_id.clone().into()],
+        ))
+        .await
+        .unwrap();
+
+        let accepted_scopes = crate::compaction::frozen::accepted_history_scopes(
+            &store,
+            "race-legacy-ws",
+            "parent",
+            &winner_json,
+        )
+        .await
+        .unwrap();
+        let literal_before = crate::turn_runtime_snapshot::restore_history_json(
+            &store,
+            "race-legacy-ws",
+            &accepted_scopes,
+            &winner_json,
+        )
+        .await
+        .unwrap();
+        assert_eq!(literal_before.len(), 3);
+        assert!(literal_before[1].content.contains("Thread status changed"));
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let (published, accepted) = tokio::sync::oneshot::channel();
+        let competing_store = store.clone();
+        let competing_barrier = barrier.clone();
+        let competing_json = winner_json.clone();
+        let competitor = tokio::spawn(async move {
+            competing_barrier.wait().await;
+            published
+                .send(
+                    competing_store
+                        .insert_task_run_conversation_snapshot_if_absent(
+                            pioneer_crud::NewTaskRunConversationSnapshot {
+                                run_id: "race-run".into(),
+                                task_id: "race-task".into(),
+                                workspace_id: "race-legacy-ws".into(),
+                                conversation_thread_id: "parent".into(),
+                                source_turn_id: None,
+                                history_json: competing_json,
+                                created_at: chrono::Utc::now().fixed_offset(),
+                            },
+                        )
+                        .await,
+                )
+                .unwrap();
+        });
+        let (history, accepted_json, _) = publish_prepared_task_snapshot(
+            &store,
+            &store,
+            "race-run",
+            "race-task",
+            "race-legacy-ws",
+            "parent",
+            None,
+            "execution",
+            loser,
+            move || async move {
+                barrier.wait().await;
+                accepted.await??;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        competitor.await.unwrap();
+        assert_eq!(accepted_json, winner_json);
+        let accepted_snapshot = store
+            .get_task_run_conversation_snapshot("race-run")
+            .await
+            .unwrap()
+            .unwrap();
+        let literal = restore_task_run_conversation_snapshot_literal_fields(
+            &store,
+            &accepted_snapshot,
+            "race-task",
+            "race-legacy-ws",
+            "parent",
+            None,
+            "execution",
+        )
+        .await
+        .unwrap();
+        assert_eq!(literal.len(), 3);
+        assert_eq!(
+            literal
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            literal_before
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(literal[1].provenance.as_ref().unwrap().inherited);
+        assert_eq!(
+            literal[2]
+                .provenance
+                .as_ref()
+                .unwrap()
+                .context_thread
+                .as_deref(),
+            Some("execution")
+        );
+        let mut twice = literal.clone();
+        crate::compaction::frozen::hydrate_accepted_own_literal(
+            &store,
+            "race-legacy-ws",
+            "parent",
+            &accepted_json,
+            "execution",
+            &mut twice,
+        )
+        .await
+        .unwrap();
+        assert_eq!(twice, literal);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "winning history");
+        assert_eq!(history[1].content, "own history");
+        assert!(
+            history
+                .iter()
+                .all(|message| !message.content.contains("Thread status changed"))
+        );
+        assert_eq!(
+            history[1]
+                .provenance
+                .as_ref()
+                .unwrap()
+                .context_thread
+                .as_deref(),
+            Some("execution")
+        );
+        assert!(!history[1].provenance.as_ref().unwrap().inherited);
+
+        let execution = crate::compaction::frozen::restore_accepted_history_for_execution(
+            &store,
+            "race-legacy-ws",
+            Some("parent"),
+            "execution",
+            &accepted_scopes,
+            &accepted_json,
+        )
+        .await
+        .unwrap();
+        assert_eq!(execution.messages, history);
+
+        let references = store
+            .compaction_frozen_history_page(
+                "race-legacy-ws",
+                "parent",
+                &winner.descriptor.manifest_id,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(references.len(), 3);
+        for (reference, message) in references.iter().zip(&literal_before) {
+            assert_eq!(
+                reference.wire_sha256,
+                hex::encode(sha2::Sha256::digest(serde_json::to_vec(message).unwrap()))
+            );
+        }
+        assert_eq!(
+            references[0].unit_id,
+            literal[0].provenance.as_ref().unwrap().unit_id
+        );
+        assert_eq!(
+            references[1].unit_id,
+            literal[1].provenance.as_ref().unwrap().unit_id
+        );
+        assert_eq!(
+            references[2].unit_id,
+            literal[2].provenance.as_ref().unwrap().unit_id
+        );
+        let imports = store
+            .compaction_frozen_import_page(
+                "race-legacy-ws",
+                "parent",
+                &winner.descriptor.manifest_id,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].message_ordinal, 2);
+        assert_eq!(imports[0].source, source);
+        assert_eq!(accepted_snapshot.history_json, winner_json);
+
+        let scoped = BTreeSet::from(["parent".to_owned(), "execution".to_owned()]);
+        assert!(
+            crate::compaction::frozen::capture(
+                &store,
+                "race-legacy-ws",
+                "execution",
+                &scoped,
+                &literal,
+            )
+            .await
+            .is_err(),
+            "new capture must continue to reject a technical literal entry"
+        );
+
+        let request = |messages| {
+            pioneer_agent::compaction::request::NativeRequestProjection::full(
+                pioneer_provider::ChatRequest {
+                    model: "gpt-4".into(),
+                    messages,
+                    temperature: None,
+                    max_tokens: None,
+                    tools: None,
+                    tool_choice: None,
+                    parallel_tool_calls: None,
+                    reasoning: None,
+                    compiled_prompt: None,
+                },
+                vec![],
+                pioneer_compaction::ModelBudget::new(Some(128_000), None, Some(4_096)),
+                false,
+            )
+            .unwrap()
+        };
+        let visible_budget = request(history.clone());
+        let literal_budget = request(literal.clone());
+        assert_eq!(visible_budget.request.messages, history);
+        assert!(visible_budget.estimated_input_tokens < literal_budget.estimated_input_tokens);
+
+        let again = prepared(&store, "race-legacy-ws", "loser-turn", "losing history").await;
+        let (repeated, repeated_json, _) = publish_prepared_task_snapshot(
+            &store,
+            &store,
+            "race-run",
+            "race-task",
+            "race-legacy-ws",
+            "parent",
+            None,
+            "execution",
+            again,
+            || async { Ok(()) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(repeated_json, winner_json);
+        assert_eq!(repeated, history);
+        assert!(
+            repeated
+                .iter()
+                .all(|message| !message.content.contains("losing history"))
+        );
+
+        let db = store.database_connection();
+        for sql in [
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('execution-turn','execution','in_progress','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('execution','parent','parent',1,CURRENT_TIMESTAMP)",
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('execution-run-turn','race-task','race-run','execution','execution-turn','initial',0,1,'in_progress',CURRENT_TIMESTAMP)",
+        ] {
+            db.execute_unprepared(sql).await.unwrap();
+        }
+        let processor = MessageProcessor::new(
+            Arc::new(ThreadManager::new("gpt-4", "openai")),
+            Arc::new(ProviderRegistry::with_provider(
+                "openai",
+                Arc::new(EchoProvider::new()),
+            )),
+            Arc::new(SessionManager::new()),
+            Arc::new(WorkspaceManager::new(db)),
+            Arc::new(store.clone()),
+            Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
+            summary::SummaryConfig {
+                summary_model: Some("gpt-4".into()),
+                summary_model_provider: Some("openai".into()),
+                title_model: Some("gpt-4".into()),
+                title_model_provider: Some("openai".into()),
+            },
+            crate::message::tests::test_tool_loop_config(),
+        );
+        let mut hook = AgentTurnHookRuntimeContext::default();
+        hook.conversation_thread_id = Some("parent".into());
+        processor
+            .persist_turn_runtime_snapshot(
+                "execution",
+                "race-legacy-ws",
+                "execution-turn",
+                ThreadMode::Agent,
+                &hook,
+                "gpt-4",
+                "openai",
+                None,
+                &std::collections::HashMap::new(),
+                &[],
+                &[],
+                &[],
+                &std::collections::HashMap::new(),
+                &history,
+                &[],
+            )
+            .await
+            .unwrap();
+        let runtime = store
+            .get_turn_runtime_snapshot("execution-turn")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!runtime.history_json.trim_start().starts_with('['));
+        let (_, restored) =
+            crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(
+                &store, &runtime,
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored, history);
+        assert!(
+            restored
+                .iter()
+                .all(|message| !message.content.contains("Thread status changed"))
+        );
     }
 }
 

@@ -1188,7 +1188,21 @@ async fn load_line_history_inner(
                 && selected.is_none_or(|sources| sources.contains(&event.reference))
         });
         for event in &mut events {
-            if event.projection_kind.is_none() {
+            use pioneer_protocol::constants::events as kinds;
+            let structural_kind = match event.source_type.as_str() {
+                kinds::TURN_STARTED => Some("input"),
+                kinds::TURN_MESSAGE_EDITED => Some("input_revision"),
+                kinds::TURN_MESSAGE_DELETED => Some("input_deleted"),
+                _ => None,
+            };
+            // Older cached model classifications must not erase structural
+            // message mutations. Refresh only the few source types whose
+            // lifecycle meaning is known from their trusted event type; all
+            // other warm rows retain the bounded metadata-only path.
+            if event.projection_kind.is_none()
+                || structural_kind
+                    .is_some_and(|kind| event.projection_kind.as_deref() != Some(kind))
+            {
                 let payload = source_payload(&store, workspace, thread, event).await?;
                 let parsed: Event = serde_json::from_str(&payload)?;
                 ensure!(
@@ -1595,11 +1609,27 @@ async fn load_line_history_inner(
                         "canonical event scope mismatch"
                     );
                     let Some(mut message) = event_message_with_input_copy_policy(
-                        event,
+                        event.clone(),
                         (use_input_rows || has_authoritative_event_input)
                             && row.projection_kind.as_deref() == Some("input_copy"),
                     )?
                     else {
+                        if row.projection_kind.as_deref() != Some("technical")
+                            && pioneer_crud::compaction::event_projection_metadata(&event).1
+                                == "technical"
+                        {
+                            ensure!(
+                                store
+                                    .compaction_record_event_projection(
+                                        workspace,
+                                        thread,
+                                        &row.reference,
+                                        &event,
+                                    )
+                                    .await?,
+                                "canonical event changed while caching model exclusion"
+                            );
+                        }
                         continue;
                     };
                     message.provenance = Some(origin(
@@ -1766,6 +1796,20 @@ fn event_message_with_input_copy_policy(
     event: Event,
     suppress_non_artifact_input_copy_media: bool,
 ) -> Result<Option<ChatMessage>> {
+    use pioneer_crud::CanonicalEventModelProjection as Projection;
+    match pioneer_crud::canonical_event_model_projection(&event) {
+        Projection::Omit => return Ok(None),
+        Projection::Input => {
+            return Ok(Some(match &event {
+                Event::TurnStarted(value) => input_message(&value.input)?,
+                Event::TurnMessageEdited(value) => input_message(&value.input)?,
+                _ => anyhow::bail!("invalid input event model projection"),
+            }));
+        }
+        Projection::Assistant(text) => return Ok(Some(ChatMessage::assistant(text))),
+        Projection::User(text) => return Ok(Some(ChatMessage::user(text))),
+        Projection::Default => {}
+    }
     Ok(Some(match event {
         Event::TurnStarted(value) if !value.input.is_empty() => input_message(&value.input)?,
         Event::TurnMessageEdited(value) if !value.input.is_empty() => input_message(&value.input)?,

@@ -3816,7 +3816,7 @@ impl RecoveryCoordinator {
             action: job.action,
             max_attempts: job.max_attempts,
             base_backoff_secs: policy_snapshot_u64(job, "base_backoff_secs").unwrap_or(1),
-            // Legacy snapshots predate the single 15-minute compaction/retry
+            // Legacy snapshots predate the single hour-long compaction/retry
             // operation. Preserve their admission time, never restart the clock.
             max_wall_clock_secs: if job.action == RecoveryAction::CompactHistory
                 && matches!(
@@ -5672,7 +5672,10 @@ mod tests {
         job.policy_snapshot["max_wall_clock_secs"] = serde_json::json!(120);
         let admission = job.scheduled_at_unix;
         let policy = coordinator.policy_for_recovery_job(&job).await.unwrap();
-        assert_eq!(policy.max_wall_clock_secs, 900);
+        assert_eq!(
+            policy.max_wall_clock_secs,
+            pioneer_compaction::OPERATION_MILLIS / 1000
+        );
         assert_eq!(policy.max_attempts, 1);
         assert_eq!(job.scheduled_at_unix, admission);
         job.action = RecoveryAction::DisableStreaming;

@@ -336,7 +336,9 @@ fn desktop_shell_is_composition_only() {
         assert!(!shell.contains(forbidden), "shell owns {forbidden}");
     }
     let bootstrap = source("desktop/src/client_runtime/mod.rs");
-    assert!(source("desktop/src/main.rs").contains("DesktopRuntimeCoordinator::open_window"));
+    let main = source("desktop/src/main.rs");
+    assert!(main.contains("DesktopRuntimeCoordinator::open_window"));
+    assert!(main.contains("gpui_kit::init(cx)"));
     assert!(bootstrap.contains("Root::new(shell, window, cx)"));
     assert_eq!(bootstrap.matches("Root::new(").count(), 1);
     assert!(bootstrap.contains("DesktopShellView::new"));
@@ -345,7 +347,7 @@ fn desktop_shell_is_composition_only() {
             shell
                 .matches(&format!("Root::render_{name}_layer("))
                 .count(),
-            1
+            0
         );
     }
     for file in sources(&root().join("crates/desktop/src/client_runtime")) {

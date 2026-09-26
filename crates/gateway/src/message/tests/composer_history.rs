@@ -482,29 +482,29 @@ async fn check_composer_history_failure_stays_in_task_without_rejecting_parent()
                 break;
             }
             if backend.is_some() {
-                // CLI history is an admission input: an invalid accepted basis
-                // must fail the TaskRun before a child Turn or provider session
-                // is materialized. The parent Composer message stays accepted.
+                // Composer now admits the hidden child before preparing CLI
+                // history. Failure must close that child and its run without
+                // activating a provider session or rejecting the parent.
                 assert_eq!(
-                    wait_for_run_status(store.clone(), &run_id, TaskRunStatus::Failed).await,
-                    TaskRunStatus::Failed,
+                    wait_for_run_status(store.clone(), &run_id, TaskRunStatus::Blocked).await,
+                    TaskRunStatus::Blocked,
+                    "CLI history failure: {:?}",
+                    store.get_task_run(&run_id).await.unwrap(),
                 );
-                assert!(
-                    store
-                        .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
-                        .await
-                        .unwrap()
-                        .is_none(),
-                    "failed CLI history admission must not leave a child Turn ghost"
-                );
-                let failed_run = store.get_task_run(&run_id).await.unwrap().unwrap();
-                let error = failed_run.error.expect("failed CLI TaskRun needs a reason");
-                assert_eq!(error.code, "task_executor_start_failed");
-                assert!(
-                    error
-                        .message
-                        .contains("injected history preparation failure")
-                );
+                let child = store
+                    .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
+                    .await
+                    .unwrap()
+                    .expect("admitted CLI child must remain durable")
+                    .1;
+                assert_eq!(child.status, TurnStatus::Blocked);
+                assert_eq!(child.error.as_deref(), Some("task_turn_admission_failed"));
+                let blocked_run = store.get_task_run(&run_id).await.unwrap().unwrap();
+                let error = blocked_run
+                    .error
+                    .expect("blocked CLI TaskRun needs a reason");
+                assert_eq!(error.code, "child_turn_blocked");
+                assert_eq!(error.message, "child_turn_blocked");
             } else {
                 timeout(Duration::from_secs(15), async {
                     loop {

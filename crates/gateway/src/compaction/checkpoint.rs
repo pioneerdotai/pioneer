@@ -148,12 +148,68 @@ pub(super) async fn project_accepted_checkpoints_with_resolver(
     messages: &mut Vec<ChatMessage>,
     resolver: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<()> {
+    project_accepted_checkpoints_with_boundary_evidence(
+        store,
+        workspace,
+        context_thread,
+        allowed,
+        messages,
+        None,
+        None,
+        resolver,
+    )
+    .await
+}
+
+pub(super) struct ProjectionBoundaryEvidence<'a> {
+    /// The authenticated, ordered source boundary before model-visibility
+    /// filtering. These messages are used only to admit a checkpoint and are
+    /// never copied into the projected model history.
+    pub messages: &'a [ChatMessage],
+    /// For each model-visible message, its exact ordinal in `messages`.
+    pub model_ordinals: &'a [usize],
+}
+
+pub(super) async fn project_accepted_checkpoints_with_boundary_evidence(
+    store: &CrudStore,
+    workspace: &str,
+    context_thread: &str,
+    allowed: &BTreeSet<String>,
+    messages: &mut Vec<ChatMessage>,
+    boundary: Option<ProjectionBoundaryEvidence<'_>>,
+    mut replacements: Option<
+        &mut BTreeMap<pioneer_agent::compaction::composition::ScopedHistorySource, BTreeSet<usize>>,
+    >,
+    resolver: &mut super::coverage::CheckpointGraphResolver,
+) -> Result<()> {
+    if let Some(boundary) = &boundary {
+        ensure!(
+            boundary.model_ordinals.len() == messages.len()
+                && boundary
+                    .model_ordinals
+                    .iter()
+                    .enumerate()
+                    .all(|(index, ordinal)| {
+                        boundary
+                            .messages
+                            .get(*ordinal)
+                            .and_then(|message| message.provenance.as_ref())
+                            == messages
+                                .get(index)
+                                .and_then(|message| message.provenance.as_ref())
+                    }),
+            "checkpoint boundary evidence does not match model history"
+        );
+    }
+    let admitted_messages = boundary
+        .as_ref()
+        .map_or(messages.as_slice(), |boundary| boundary.messages);
     // Discovery follows only source owners that are actually represented in
     // the accepted request. Inherited H may have been frozen before its owner
     // published a working-context checkpoint, so it is a candidate source even
     // without an OWN import. This is not an application grant: the published
     // root scope and exact whole-message boundary are checked below.
-    let threads: BTreeSet<_> = messages
+    let threads: BTreeSet<_> = admitted_messages
         .iter()
         .filter_map(|message| {
             let origin = message.provenance.as_ref()?;
@@ -190,7 +246,7 @@ pub(super) async fn project_accepted_checkpoints_with_resolver(
                 .await?
                 .is_some()
             {
-                match project_checkpoint_in_context(
+                match project_checkpoint_in_context_with_boundary(
                     store,
                     &ProjectionContext {
                         workspace,
@@ -202,11 +258,31 @@ pub(super) async fn project_accepted_checkpoints_with_resolver(
                     },
                     &id,
                     messages,
+                    boundary.as_ref(),
                     resolver,
                 )
                 .await
                 {
-                    Ok(()) => break,
+                    Ok(selected_boundary) => {
+                        if !selected_boundary.is_empty()
+                            && let Some(replacements) = replacements.as_deref_mut()
+                        {
+                            let source = store
+                                .compaction_checkpoint_source(workspace, &source_thread, &id)
+                                .await?
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("projected checkpoint disappeared")
+                                })?;
+                            replacements.insert(
+                                pioneer_agent::compaction::composition::ScopedHistorySource {
+                                    thread: source_thread.clone(),
+                                    source,
+                                },
+                                selected_boundary,
+                            );
+                        }
+                        break;
+                    }
                     Err(error) if error.downcast_ref::<ProjectionBoundary>().is_some() => {}
                     Err(error) => return Err(error),
                 }
@@ -363,6 +439,19 @@ async fn project_checkpoint_in_context(
     messages: &mut Vec<ChatMessage>,
     resolver: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<()> {
+    project_checkpoint_in_context_with_boundary(store, context, head, messages, None, resolver)
+        .await
+        .map(|_| ())
+}
+
+pub(super) async fn project_checkpoint_in_context_with_boundary(
+    store: &CrudStore,
+    context: &ProjectionContext<'_>,
+    head: &str,
+    messages: &mut Vec<ChatMessage>,
+    boundary: Option<&ProjectionBoundaryEvidence<'_>>,
+    resolver: &mut super::coverage::CheckpointGraphResolver,
+) -> Result<BTreeSet<usize>> {
     // A request may already contain this summary alongside covered originals
     // (for example after joining frozen branches). Normalize exact coverage in
     // that case too: the presence of a head reference does not prove that its
@@ -391,6 +480,135 @@ async fn project_checkpoint_in_context(
         .iter()
         .map(identity)
         .collect::<BTreeSet<_>>();
+    let admitted_messages = boundary.map_or(messages.as_slice(), |boundary| boundary.messages);
+    let (represented, admitted_leaves) =
+        checkpoint_message_leaves(store, context, &expanded, admitted_messages, resolver).await?;
+    let current_leaves = if boundary.is_some() {
+        checkpoint_message_leaves(store, context, &expanded, messages, resolver)
+            .await?
+            .1
+    } else {
+        admitted_leaves.clone()
+    };
+    let mut represented_coverage = represented.clone();
+    for (replay, source) in &expanded.replay_aliases {
+        if represented.contains(replay) {
+            represented_coverage.insert(source.clone());
+        }
+    }
+    if expanded
+        .leaves
+        .difference(&represented_coverage)
+        .next()
+        .is_some()
+    {
+        ensure!(
+            context.allow_historical_gaps,
+            ProjectionBoundary("checkpoint exceeds the selected history boundary")
+        );
+    }
+    let select = |candidate_messages: &[ChatMessage],
+                  leaves_by_message: &BTreeMap<
+        usize,
+        (
+            BTreeSet<pioneer_agent::compaction::composition::ScopedHistorySource>,
+            BTreeSet<SourceRef>,
+        ),
+    >|
+     -> Result<(BTreeSet<usize>, bool)> {
+        let mut selected = BTreeSet::new();
+        let mut covered_by_other_checkpoint = false;
+        for (index, (leaves, checkpoints)) in leaves_by_message {
+            // A strictly larger durable checkpoint is already authoritative.
+            // Equality does not suppress this candidate: its own stale copies
+            // still need replacement by the current durable body.
+            if !checkpoints.contains(&expanded.root)
+                && !checkpoints.is_empty()
+                && expanded.leaves.is_subset(leaves)
+                && expanded.leaves != *leaves
+            {
+                covered_by_other_checkpoint = true;
+                continue;
+            }
+            let identities = leaves.iter().map(identity).collect::<BTreeSet<_>>();
+            if identities.is_disjoint(&covered) || !identities.is_subset(&covered) {
+                continue;
+            }
+            let origin = candidate_messages[*index]
+                .provenance
+                .as_ref()
+                .expect("origin selected above");
+            ensure!(
+                origin.complete
+                    && (!origin.protected_input
+                        || leaves
+                            .iter()
+                            .map(identity)
+                            .all(|leaf| emergency_inputs.contains(&leaf)))
+                    && candidate_messages[*index].role != pioneer_provider::Role::System,
+                "checkpoint cannot replace pending or protected input"
+            );
+            selected.insert(*index);
+        }
+        if !selected.is_empty() {
+            let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+                context.workspace,
+                context.context_thread,
+                candidate_messages,
+                &vec![0; candidate_messages.len()],
+            )?;
+            for (unit, indexes) in layout.units.iter().zip(&layout.message_indexes) {
+                if indexes.iter().any(|index| selected.contains(index)) {
+                    ensure!(
+                        unit.complete && indexes.iter().all(|index| selected.contains(index)),
+                        ProjectionBoundary("checkpoint splits a pending or whole canonical round")
+                    );
+                }
+            }
+        }
+        Ok((selected, covered_by_other_checkpoint))
+    };
+    let (selected_boundary, _) = select(admitted_messages, &admitted_leaves)?;
+    // The immutable boundary proves exact historical coverage. Model removal
+    // uses indexes in today's list, which may contain earlier summaries.
+    let (selected, covered_by_other_checkpoint) = select(messages, &current_leaves)?;
+    let summary =
+        checkpoint_message_from_expanded(store, context, head, &expanded, resolver).await?;
+    let first = selected.first().copied().unwrap_or(0);
+    let insert_summary = !covered_by_other_checkpoint;
+    let mut projected =
+        Vec::with_capacity(messages.len() + usize::from(insert_summary) - selected.len());
+    if messages.is_empty() && insert_summary {
+        projected.push(summary.clone());
+    }
+    for (index, message) in messages.iter().enumerate() {
+        if index == first && insert_summary {
+            projected.push(summary.clone());
+        }
+        if !selected.contains(&index) {
+            projected.push(message.clone());
+        }
+    }
+    *messages = projected;
+    Ok(selected_boundary)
+}
+
+async fn checkpoint_message_leaves(
+    store: &CrudStore,
+    context: &ProjectionContext<'_>,
+    expanded: &Expanded,
+    messages: &[ChatMessage],
+    resolver: &mut super::coverage::CheckpointGraphResolver,
+) -> Result<(
+    BTreeSet<pioneer_agent::compaction::composition::ScopedHistorySource>,
+    BTreeMap<
+        usize,
+        (
+            BTreeSet<pioneer_agent::compaction::composition::ScopedHistorySource>,
+            BTreeSet<SourceRef>,
+        ),
+    >,
+)> {
     let mut represented = BTreeSet::new();
     let mut leaves_by_message = BTreeMap::new();
     let mut cached = BTreeMap::<
@@ -465,103 +683,5 @@ async fn project_checkpoint_in_context(
         represented.extend(leaves.iter().cloned());
         leaves_by_message.insert(index, (leaves, checkpoints));
     }
-    let mut represented_coverage = represented.clone();
-    for (replay, source) in &expanded.replay_aliases {
-        if represented.contains(replay) {
-            represented_coverage.insert(source.clone());
-        }
-    }
-    if expanded
-        .leaves
-        .difference(&represented_coverage)
-        .next()
-        .is_some()
-    {
-        ensure!(
-            context.allow_historical_gaps,
-            ProjectionBoundary("checkpoint exceeds the selected history boundary")
-        );
-    }
-    // Boundary admission above is exact, including historical versions. This
-    // version-free key is used only after admission to remove today's copy of
-    // an already covered identity; an edit must not turn it into a new tail.
-    let mut selected = BTreeSet::new();
-    let mut covered_by_other_checkpoint = false;
-    for (index, (leaves, checkpoints)) in leaves_by_message {
-        // This is the reciprocal of the replacement check below (and of the
-        // bidirectional checkpoint containment rule in composition.rs). Use
-        // exact saved leaves here: a source revision is part of historical
-        // checkpoint coverage, even though admitted current raw rows are
-        // removed by version-free identity below. The candidate's own message
-        // is deliberately excluded: all of its copies must be selected and
-        // replaced by the authoritative saved body.
-        let represents_candidate = checkpoints.contains(&expanded.root);
-        if !represents_candidate
-            && !checkpoints.is_empty()
-            && expanded.leaves.is_subset(&leaves)
-            && expanded.leaves != leaves
-        {
-            covered_by_other_checkpoint = true;
-            continue;
-        }
-        let identities = leaves.iter().map(identity).collect::<BTreeSet<_>>();
-        if identities.is_disjoint(&covered) {
-            continue;
-        }
-        // Distinct partially-overlapping summaries are atomic. Keep both;
-        // replace an existing unit only when the new checkpoint contains it.
-        if !identities.is_subset(&covered) {
-            continue;
-        }
-        let origin = messages[index]
-            .provenance
-            .as_ref()
-            .expect("origin selected above");
-        ensure!(
-            origin.complete
-                && (!origin.protected_input
-                    || leaves
-                        .iter()
-                        .map(identity)
-                        .all(|leaf| emergency_inputs.contains(&leaf)))
-                && messages[index].role != pioneer_provider::Role::System,
-            "checkpoint cannot replace pending or protected input"
-        );
-        selected.insert(index);
-    }
-    if !selected.is_empty() {
-        let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
-            context.workspace,
-            context.context_thread,
-            messages,
-            &vec![0; messages.len()],
-        )?;
-        for (unit, indexes) in layout.units.iter().zip(&layout.message_indexes) {
-            if indexes.iter().any(|index| selected.contains(index)) {
-                ensure!(
-                    unit.complete && indexes.iter().all(|index| selected.contains(index)),
-                    ProjectionBoundary("checkpoint splits a pending or whole canonical round")
-                );
-            }
-        }
-    }
-    let summary =
-        checkpoint_message_from_expanded(store, context, head, &expanded, resolver).await?;
-    let first = selected.first().copied().unwrap_or(0);
-    let insert_summary = !covered_by_other_checkpoint;
-    let mut projected =
-        Vec::with_capacity(messages.len() + usize::from(insert_summary) - selected.len());
-    if messages.is_empty() && insert_summary {
-        projected.push(summary.clone());
-    }
-    for (index, message) in messages.iter().enumerate() {
-        if index == first && insert_summary {
-            projected.push(summary.clone());
-        }
-        if !selected.contains(&index) {
-            projected.push(message.clone());
-        }
-    }
-    *messages = projected;
-    Ok(())
+    Ok((represented, leaves_by_message))
 }

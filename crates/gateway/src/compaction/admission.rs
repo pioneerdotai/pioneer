@@ -1,4 +1,5 @@
-//! Admission/resume contains metadata only; every database batch is bounded.
+//! Admission/resume uses bounded metadata and source reads; model projection
+//! runs only after each database read has released its capacity.
 use super::*;
 use pioneer_compaction::{CompactionPlan, CompactionSettings, ModelSelection, effective_selection};
 use pioneer_crud::compaction::{ManifestEntry, SOURCE_PAGE_BYTES};
@@ -36,9 +37,34 @@ pub(crate) async fn admit_operation(
     current: &ModelSelection,
     cli_override: Option<&ModelSelection>,
     summarizer: &dyn Summarizer,
-    prepared: PreparedOperation,
+    mut prepared: PreparedOperation,
     now_ms: u64,
 ) -> Result<OperationSnapshot> {
+    // Filter the canonical manifest before fingerprinting, budgeting or
+    // publishing an operation. Older cached classifications can still name a
+    // source whose current typed model projection is empty.
+    let mut manifest = Vec::with_capacity(prepared.manifest.len());
+    for mut entry in prepared.manifest {
+        if entry.source.scope.starts_with("event:") || entry.source.scope.starts_with("item:") {
+            store
+                .compaction_prepare_references(
+                    workspace,
+                    &entry.thread_id,
+                    std::slice::from_ref(&entry.source),
+                )
+                .await?;
+            let payload = store
+                .compaction_reference_payload(workspace, &entry.thread_id, &entry.source)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("compaction source unavailable during admission"))?;
+            if super::model_source_payload(&entry.source, payload)?.is_none() {
+                continue;
+            }
+        }
+        entry.ordinal = manifest.len() as u64;
+        manifest.push(entry);
+    }
+    prepared.manifest = manifest;
     let selection = effective_selection(current, settings.selection.as_ref(), cli_override);
     let budget = summarizer.model_budget();
     // Fresh captures of the same accepted history have different storage IDs.

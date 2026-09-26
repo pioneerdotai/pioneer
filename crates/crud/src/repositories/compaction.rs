@@ -13,8 +13,8 @@ pub use background::{CompactionLifecycleRecovery, CompletedHistoryCheck};
 #[cfg(any(test, feature = "test-support"))]
 pub use frozen_import::{CheckpointImportGraphReadObserver, observe_checkpoint_import_graph_reads};
 pub use frozen_import::{
-    EMPTY_FROZEN_IMPORT_SHA256, FROZEN_IMPORT_PAGE_BYTES, FrozenImportRecord, PreparedFrozenImport,
-    frozen_import_identity,
+    DeliveryCheckpointImportSource, EMPTY_FROZEN_IMPORT_SHA256, FROZEN_IMPORT_PAGE_BYTES,
+    FrozenImportRecord, PreparedFrozenImport, frozen_import_identity,
 };
 pub use history::{
     AcceptedTaskBasis, HistoryCausalBoundary, HistoryReadFence, HistoryTurnBoundary,

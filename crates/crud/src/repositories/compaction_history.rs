@@ -1994,7 +1994,14 @@ pub fn event_projection_metadata(
         Event::TurnStarted(_) => return (None, "input"),
         Event::TurnMessageEdited(_) => return (None, "input_revision"),
         Event::TurnMessageDeleted(_) => return (None, "input_deleted"),
-        _ => return (None, "status"),
+        _ => {
+            let kind = if crate::canonical_event_model_projection(event).is_omitted() {
+                "technical"
+            } else {
+                "status"
+            };
+            return (None, kind);
+        }
     };
     let kind = match item {
         TurnItem::SystemEvent { code, .. }
@@ -2002,7 +2009,11 @@ pub fn event_projection_metadata(
         {
             "technical"
         }
+        // Input-copy identities are structural even when their visible body is
+        // empty. Revisions/deletions use them to suppress stale text and
+        // attachment references.
         TurnItem::UserMessage { .. } => "input_copy",
+        _ if crate::canonical_event_model_projection(event).is_omitted() => "technical",
         _ if update => "update",
         TurnItem::Reasoning { .. } => "reasoning",
         TurnItem::AgentMessage { .. } => "assistant",

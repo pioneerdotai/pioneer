@@ -468,6 +468,9 @@ impl CompactionRunner {
                     .compaction_reference_payload(&self.workspace, thread, source)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("source unavailable or stale"))?;
+                let text = model_source_payload(source, text)?.ok_or_else(|| {
+                    anyhow::anyhow!("compaction manifest contains non-model source")
+                })?;
                 #[cfg(test)]
                 self.active_payload_loads
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -523,6 +526,9 @@ impl CompactionRunner {
                         )
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("reference source unavailable or stale"))?;
+                    let Some(payload) = model_source_payload(&entry.source, payload)? else {
+                        anyhow::bail!("compaction reference manifest contains non-model source");
+                    };
                     let payload = historical_source_model_payload(
                         &entry.source,
                         payload,
@@ -1292,6 +1298,53 @@ impl CompactionRunner {
             final_portion: false,
         })
     }
+}
+
+fn model_source_payload(source: &SourceRef, payload: String) -> Result<Option<String>> {
+    use pioneer_crud::CanonicalEventModelProjection as Projection;
+    if source.scope.starts_with("event:") {
+        let event: pioneer_crud::CanonicalTurnEventPayload = serde_json::from_str(&payload)?;
+        return Ok(
+            match pioneer_crud::canonical_event_model_projection(&event) {
+                Projection::Omit => None,
+                Projection::Assistant(text) | Projection::User(text) => Some(text),
+                Projection::Input => Some(match &event {
+                    pioneer_crud::CanonicalTurnEventPayload::TurnStarted(value) => {
+                        model_input_payload(&value.input)?
+                    }
+                    pioneer_crud::CanonicalTurnEventPayload::TurnMessageEdited(value) => {
+                        model_input_payload(&value.input)?
+                    }
+                    _ => anyhow::bail!("invalid input event model projection"),
+                }),
+                Projection::Default => Some(payload),
+            },
+        );
+    }
+    if source.scope.starts_with("item:") {
+        let item: pioneer_protocol::TurnItem = serde_json::from_str(&payload)?;
+        return Ok(match pioneer_crud::canonical_item_model_projection(&item) {
+            Projection::Omit => None,
+            Projection::Assistant(text) | Projection::User(text) => Some(text),
+            Projection::Input => anyhow::bail!("invalid item input model projection"),
+            Projection::Default => Some(payload),
+        });
+    }
+    Ok(Some(payload))
+}
+
+fn model_input_payload(inputs: &[pioneer_protocol::UserInput]) -> Result<String> {
+    let message = history::input_message(inputs)?;
+    if message.content_parts.is_empty() {
+        return Ok(message.content);
+    }
+    // SummaryInput is text-only, so serialize only the model-visible input
+    // body. Its typed attachment references and text share one representation
+    // for compact, reference_only, fragmentation and their token estimates.
+    Ok(serde_json::to_string(&serde_json::json!({
+        "content": message.content,
+        "content_parts": message.content_parts,
+    }))?)
 }
 
 #[cfg(test)]

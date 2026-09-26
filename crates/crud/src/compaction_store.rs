@@ -2,9 +2,10 @@
 use crate::compaction::{
     AcceptedTaskBasis, CanonicalFragment, CanonicalSource, CheckpointEdges, CheckpointMetadata,
     CommitOutcome, CompactionLifecycleRecovery, CompletedHistoryCheck, DeliveredTaskOutputPage,
-    FrozenImportRecord, HistoricalEventProjection, HistoryCausalBoundary, HistoryReadFence,
-    HistoryTurnBoundary, ManifestEntry, OperationRecord, PagedSource, PreparedFrozenImport,
-    RunnerPlanRecord, SourceAssertion, SourcePage, TaskDeliveryOutputSnapshot, TaskOutputSnapshot,
+    DeliveryCheckpointImportSource, FrozenImportRecord, HistoricalEventProjection,
+    HistoryCausalBoundary, HistoryReadFence, HistoryTurnBoundary, ManifestEntry, OperationRecord,
+    PagedSource, PreparedFrozenImport, RunnerPlanRecord, SourceAssertion, SourcePage,
+    TaskDeliveryOutputSnapshot, TaskOutputSnapshot,
 };
 use crate::{CanonicalTurnEventPayload, CrudStore, repositories};
 use anyhow::Result;
@@ -708,6 +709,29 @@ impl CrudStore {
             output_ordinal,
             source_thread,
             source,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn compaction_prepare_delivery_checkpoint_imports(
+        &self,
+        workspace: &str,
+        destination: &str,
+        delivery: &str,
+        acknowledgement: &SourceRef,
+        sources: &[DeliveryCheckpointImportSource],
+        checkpoint_thread: &str,
+        checkpoint: &SourceRef,
+    ) -> Result<Vec<PreparedFrozenImport>> {
+        repositories::compaction::frozen_import::compaction_prepare_delivery_checkpoint_imports(
+            self,
+            workspace,
+            destination,
+            delivery,
+            acknowledgement,
+            sources,
+            checkpoint_thread,
+            checkpoint,
         )
         .await
     }

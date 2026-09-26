@@ -850,7 +850,7 @@ async fn durable_retry_budget_and_exact_candidate_idempotency() {
     );
     assert!(
         !restarted
-            .compaction_claim_attempt("op", 3, 900_010, false, false)
+            .compaction_claim_attempt("op", 3, (10 + OPERATION_MILLIS) as i64, false, false)
             .await
             .unwrap()
     );
@@ -5726,21 +5726,22 @@ async fn compaction_recovery_metadata_pages_do_not_starve_later_operations() {
             .unwrap()
             .is_empty()
     );
+    let after_deadline = 10 + OPERATION_MILLIS;
     let first = store
-        .compaction_lifecycle_recovery(1_000_000, "")
+        .compaction_lifecycle_recovery(after_deadline, "")
         .await
         .unwrap();
     assert_eq!(first.len(), 16);
     let last = first.last().unwrap().id.clone();
     let second = store
-        .compaction_lifecycle_recovery(1_000_000, &last)
+        .compaction_lifecycle_recovery(after_deadline, &last)
         .await
         .unwrap();
     assert_eq!(second.len(), 1);
     assert_eq!(second[0].id, "recovery-16");
     assert!(
         store
-            .compaction_lifecycle_recovery(1_000_000, &second[0].id)
+            .compaction_lifecycle_recovery(after_deadline, &second[0].id)
             .await
             .unwrap()
             .is_empty()

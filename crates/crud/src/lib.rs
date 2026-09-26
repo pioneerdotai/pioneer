@@ -4,6 +4,7 @@ mod compaction_store;
 mod convention;
 mod events;
 mod memory;
+mod model_history;
 mod projector;
 mod repositories;
 mod task_events;
@@ -24,6 +25,10 @@ pub use repositories::projection_receipt_cleanup::ProjectionReceiptCleanupOutcom
 
 pub use events::{
     AppendedTurnEvent, CanonicalTurnEventPayload, CanonicalTurnStartedEventPayload, TurnWorkOwner,
+};
+pub use model_history::{
+    CanonicalEventModelProjection, canonical_event_model_projection,
+    canonical_item_model_projection,
 };
 pub use repositories::administrative_audit::{
     NewAdministrativeAuditEvent, audit_action_to_db, audit_domain_to_db, audit_target_kind_to_db,

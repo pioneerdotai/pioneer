@@ -4,7 +4,7 @@ use super::*;
 use anyhow::Context;
 use pioneer_agent::compaction::composition::ScopedHistorySource;
 use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
-use pioneer_crud::compaction::PreparedFrozenImport;
+use pioneer_crud::compaction::{DeliveryCheckpointImportSource, PreparedFrozenImport};
 use pioneer_provider::{
     CanonicalProviderRoundEnvelope, ChatMessage, MessageProvenance, MessageSourceRef,
 };
@@ -241,6 +241,55 @@ pub(crate) async fn hydrate_accepted_own(
     execution_thread: &str,
     messages: &mut [ChatMessage],
 ) -> Result<()> {
+    hydrate_accepted_own_view(
+        store,
+        workspace,
+        parent,
+        history_json,
+        execution_thread,
+        messages,
+        AcceptedHydrationView::Execution,
+    )
+    .await
+}
+
+/// The insert-if-absent loser restores the accepted manifest literally. Its
+/// message positions are manifest ordinals, including model-invisible entries.
+pub(crate) async fn hydrate_accepted_own_literal(
+    store: &CrudStore,
+    workspace: &str,
+    parent: &str,
+    history_json: &str,
+    execution_thread: &str,
+    messages: &mut [ChatMessage],
+) -> Result<()> {
+    hydrate_accepted_own_view(
+        store,
+        workspace,
+        parent,
+        history_json,
+        execution_thread,
+        messages,
+        AcceptedHydrationView::Literal,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum AcceptedHydrationView {
+    Literal,
+    Execution,
+}
+
+async fn hydrate_accepted_own_view(
+    store: &CrudStore,
+    workspace: &str,
+    parent: &str,
+    history_json: &str,
+    execution_thread: &str,
+    messages: &mut [ChatMessage],
+    view: AcceptedHydrationView,
+) -> Result<()> {
     if history_json.trim_start().starts_with('[') {
         return Ok(());
     }
@@ -251,10 +300,6 @@ pub(crate) async fn hydrate_accepted_own(
     let descriptor: FrozenHistoryRef = serde_json::from_str(history_json)?;
     let (_, references) =
         frozen_manifest_references(store, workspace, Some(parent), &descriptor, None).await?;
-    ensure!(
-        messages.len() == references.len(),
-        "accepted Task basis identity mismatch"
-    );
     let mut checkpoint_graphs = super::coverage::CheckpointGraphResolver::default();
     let accepted = read_accepted_imports(
         store,
@@ -266,12 +311,140 @@ pub(crate) async fn hydrate_accepted_own(
         &mut checkpoint_graphs,
     )
     .await?;
-    for index in accepted.into_keys() {
-        let origin = messages[index].provenance.as_mut().unwrap();
-        origin.context_thread = Some(execution_thread.into());
-        origin.inherited = false;
+    if accepted.is_empty() {
+        return Ok(());
+    }
+
+    if matches!(view, AcceptedHydrationView::Literal) {
+        ensure!(
+            messages.len() == references.len(),
+            "accepted Task basis identity mismatch"
+        );
+        return hydrate_visible_messages(
+            messages,
+            &references,
+            &(0..references.len()).collect::<Vec<_>>(),
+            &accepted,
+            execution_thread,
+        );
+    }
+
+    // Provenance is not a per-message key: legacy task-basis arrays assign
+    // the same source/unit identity to every message. Reconstruct the visible
+    // ordinal sequence once, preserving gaps left by today's typed policy,
+    // then pair that sequence positionally with the already restored history.
+    // This is linear, accepts duplicate identities, and never guesses which
+    // duplicate an accepted import belongs to.
+    let mut allowed = BTreeSet::from([parent.to_owned()]);
+    for reference in &references {
+        allowed.insert(reference.source_thread.clone());
+        allowed.extend(reference.context_thread.clone());
+    }
+    let mut visible_ordinals = Vec::with_capacity(messages.len());
+    let mut restore_state = FrozenExecutionRestoreState::from_references(
+        store,
+        workspace,
+        &allowed,
+        &references,
+        &mut checkpoint_graphs,
+    )
+    .await?;
+    for (page_index, page) in references
+        .chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize)
+        .enumerate()
+    {
+        let restored = restore_execution_entries_page(
+            store,
+            workspace,
+            &allowed,
+            page,
+            &mut checkpoint_graphs,
+            &mut restore_state,
+        )
+        .await?;
+        ensure!(
+            restored.len() == page.len(),
+            "frozen history count mismatch"
+        );
+        let page_start = page_index * pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize;
+        visible_ordinals.extend(
+            restored
+                .into_iter()
+                .enumerate()
+                .filter_map(|(page_ordinal, entry)| entry.map(|_| page_start + page_ordinal)),
+        );
+    }
+    ensure!(
+        messages.len() == visible_ordinals.len(),
+        "accepted Task basis identity mismatch"
+    );
+    hydrate_visible_messages(
+        messages,
+        &references,
+        &visible_ordinals,
+        &accepted,
+        execution_thread,
+    )
+}
+
+fn hydrate_visible_messages(
+    messages: &mut [ChatMessage],
+    references: &[FrozenMessageRef],
+    visible_ordinals: &[usize],
+    accepted: &BTreeMap<usize, AcceptedMessageImports>,
+    execution_thread: &str,
+) -> Result<()> {
+    ensure!(
+        messages.len() == visible_ordinals.len(),
+        "accepted Task basis identity mismatch"
+    );
+    for (message, ordinal) in messages.iter_mut().zip(visible_ordinals.iter().copied()) {
+        let origin = message
+            .provenance
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("accepted Task basis message has no provenance"))?;
+        ensure!(
+            message_origin_identity(origin) == frozen_reference_identity(&references[ordinal]),
+            "accepted Task basis identity mismatch"
+        );
+        if accepted.contains_key(&ordinal) {
+            origin.context_thread = Some(execution_thread.into());
+            origin.inherited = false;
+        }
     }
     Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FrozenProvenanceIdentity {
+    logical_turn_id: Option<String>,
+    source_thread: String,
+    unit_id: String,
+    sources: Vec<SourceRef>,
+    complete: bool,
+    protected_input: bool,
+}
+
+fn frozen_reference_identity(reference: &FrozenMessageRef) -> FrozenProvenanceIdentity {
+    FrozenProvenanceIdentity {
+        logical_turn_id: reference.logical_turn_id.clone(),
+        source_thread: reference.source_thread.clone(),
+        unit_id: reference.unit_id.clone(),
+        sources: reference.sources.clone(),
+        complete: reference.complete,
+        protected_input: reference.protected_input,
+    }
+}
+
+fn message_origin_identity(origin: &MessageProvenance) -> FrozenProvenanceIdentity {
+    FrozenProvenanceIdentity {
+        logical_turn_id: origin.logical_turn_id.clone(),
+        source_thread: origin.thread_id.clone(),
+        unit_id: origin.unit_id.clone(),
+        sources: origin.sources.iter().map(source).collect(),
+        complete: origin.complete,
+        protected_input: origin.protected_input,
+    }
 }
 
 async fn read_accepted_imports(
@@ -955,6 +1128,12 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
         .await?;
     }
     let mut own_outputs = BTreeMap::<ScopedHistorySource, (usize, u64)>::new();
+    // Only roots produced while projecting a delivered output may consume its
+    // delivery grants. Parent summaries and accepted-basis checkpoints have
+    // independent provenance, even when their historical leaves overlap.
+    let mut delivery_replacements =
+        BTreeMap::<ScopedHistorySource, BTreeMap<usize, Vec<DeliveryCheckpointImportSource>>>::new(
+        );
     if !omits_history && let Some(outputs) = outputs {
         for (branch_index, branch) in outputs.branches.iter().enumerate() {
             ensure!(
@@ -969,6 +1148,9 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
             let RestoredFrozenSelection {
                 messages: mut imported,
                 original_ordinals,
+                mut boundary_messages,
+                boundary_original_ordinals,
+                model_ordinals,
             } = restore_frozen_excluding_coverage(
                 &store,
                 workspace,
@@ -986,11 +1168,15 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
                 imported.len() == original_ordinals.len(),
                 "filtered Task output lost its immutable ordinals"
             );
+            ensure!(
+                boundary_messages.len() == boundary_original_ordinals.len(),
+                "Task output boundary lost its immutable ordinals"
+            );
             let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
                 workspace,
                 &branch.snapshot.output.source_thread,
-                &imported,
-                &vec![0; imported.len()],
+                &boundary_messages,
+                &vec![0; boundary_messages.len()],
             )?;
             for (unit, indexes) in layout.units.iter().zip(&layout.message_indexes) {
                 if unit.role != pioneer_compaction::SourceRole::Own
@@ -1000,18 +1186,19 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
                     continue;
                 }
                 for index in indexes {
-                    let origin = imported[*index]
+                    let origin = boundary_messages[*index]
                         .provenance
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("output origin is missing"))?;
                     for reference in &origin.sources {
                         let reference = source(reference);
+                        let key = ScopedHistorySource {
+                            thread: origin.thread_id.clone(),
+                            source: reference,
+                        };
                         own_outputs
-                            .entry(ScopedHistorySource {
-                                thread: origin.thread_id.clone(),
-                                source: reference,
-                            })
-                            .or_insert((branch_index, original_ordinals[*index]));
+                            .entry(key.clone())
+                            .or_insert((branch_index, boundary_original_ordinals[*index]));
                     }
                 }
             }
@@ -1026,6 +1213,61 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
                 if !origin.inherited && logical.is_some() {
                     origin.logical_turn_id = logical.clone();
                 }
+            }
+            for message in &mut boundary_messages {
+                let origin = message.provenance.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!("accepted Task output has no source identity")
+                })?;
+                origin.context_thread = Some(thread.into());
+                if !origin.inherited && logical.is_some() {
+                    origin.logical_turn_id = logical.clone();
+                }
+            }
+            let mut projected_replacements = BTreeMap::new();
+            super::checkpoint::project_accepted_checkpoints_with_boundary_evidence(
+                &store,
+                workspace,
+                thread,
+                &allowed,
+                &mut imported,
+                Some(super::checkpoint::ProjectionBoundaryEvidence {
+                    messages: &boundary_messages,
+                    model_ordinals: &model_ordinals,
+                }),
+                Some(&mut projected_replacements),
+                &mut checkpoint_graphs,
+            )
+            .await?;
+            for (root, selected) in projected_replacements {
+                let mut grants = BTreeSet::new();
+                for index in selected {
+                    let origin = boundary_messages[index]
+                        .provenance
+                        .as_ref()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("projected output lost its source origin")
+                        })?;
+                    for reference in &origin.sources {
+                        grants.insert((
+                            boundary_original_ordinals[index],
+                            origin.thread_id.clone(),
+                            source(reference),
+                        ));
+                    }
+                }
+                delivery_replacements.entry(root).or_default().insert(
+                    branch_index,
+                    grants
+                        .into_iter()
+                        .map(|(output_ordinal, source_thread, source)| {
+                            DeliveryCheckpointImportSource {
+                                output_ordinal,
+                                source_thread,
+                                source,
+                            }
+                        })
+                        .collect(),
+                );
             }
             // The delivered text is the transport copy of this exact output.
             // Denied branches never reach here and retain that disclosed text.
@@ -1087,20 +1329,75 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
                     thread: origin.thread_id.clone(),
                     source: source(reference),
                 };
-                if let Some((branch_index, ordinal)) = own_outputs.get(&key) {
-                    let branch = &outputs.branches[*branch_index];
+                if let Some(grant) = own_outputs.get(&key) {
+                    let (branch_index, ordinal) = *grant;
+                    let branch = &outputs.branches[branch_index];
                     let prepared = store
                         .compaction_prepare_frozen_import(
                             workspace,
                             thread,
                             &branch.snapshot.delivery_id,
                             &branch.acknowledgement,
-                            *ordinal,
+                            ordinal,
                             &key.thread,
                             &key.source,
                         )
                         .await?;
                     imports.entry(key).or_default().push(prepared);
+                } else if let Some(branches) = delivery_replacements.get(&key)
+                    && !imports.contains_key(&key)
+                {
+                    let graph = checkpoint_graphs
+                        .resolve(&store, workspace, Some(&allowed), &key.source)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("checkpoint root is unavailable"))?;
+                    ensure!(
+                        !graph.leaves.is_empty(),
+                        "checkpoint replacement has no delivered output leaves"
+                    );
+                    let mut selected_branch = None;
+                    for (branch_index, sources) in branches {
+                        let mut represented = BTreeSet::new();
+                        for grant in sources {
+                            let scoped = ScopedHistorySource {
+                                thread: grant.source_thread.clone(),
+                                source: grant.source.clone(),
+                            };
+                            if grant.source.scope.starts_with("checkpoint:") {
+                                let granted_graph = checkpoint_graphs
+                                    .resolve(&store, workspace, Some(&allowed), &grant.source)
+                                    .await?
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("granted checkpoint is unavailable")
+                                    })?;
+                                represented.extend(granted_graph.leaves.iter().cloned());
+                            } else {
+                                represented.insert(scoped);
+                            }
+                        }
+                        if represented == graph.leaves {
+                            selected_branch = Some((*branch_index, sources));
+                            break;
+                        }
+                    }
+                    let (branch_index, sources) = selected_branch.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "checkpoint replacement exceeds each accepted Task delivery"
+                        )
+                    })?;
+                    let branch = &outputs.branches[branch_index];
+                    let prepared = store
+                        .compaction_prepare_delivery_checkpoint_imports(
+                            workspace,
+                            thread,
+                            &branch.snapshot.delivery_id,
+                            &branch.acknowledgement,
+                            sources,
+                            &key.thread,
+                            &key.source,
+                        )
+                        .await?;
+                    imports.entry(key).or_default().extend(prepared);
                 }
             }
         }
@@ -1656,17 +1953,41 @@ async fn capture_with_imports_prepared_using_renderer(
         digest_entry(&mut digest, reference)?;
     }
     let mut verified_messages = Vec::with_capacity(messages.len());
+    let mut restore_state = FrozenExecutionRestoreState::from_references(
+        store,
+        workspace,
+        allowed_threads,
+        &references,
+        &mut checkpoint_graphs,
+    )
+    .await?;
     for page in references.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
-        verified_messages.extend(
-            restore_entries_page(
-                store,
-                workspace,
-                allowed_threads,
-                page,
-                &mut checkpoint_graphs,
-            )
-            .await?,
+        let authenticated = restore_entries_page(
+            store,
+            workspace,
+            allowed_threads,
+            page,
+            &mut checkpoint_graphs,
+        )
+        .await?;
+        ensure!(
+            authenticated.len() == page.len(),
+            "frozen history count mismatch"
         );
+        let restored = restore_execution_entries_page(
+            store,
+            workspace,
+            allowed_threads,
+            page,
+            &mut checkpoint_graphs,
+            &mut restore_state,
+        )
+        .await?;
+        ensure!(
+            restored.iter().all(Option::is_some),
+            "new frozen history contains a non-model event"
+        );
+        verified_messages.extend(restored.into_iter().flatten());
     }
     let accepted_scopes = prepared_manifest_scopes(
         store,
@@ -1730,7 +2051,7 @@ async fn capture_with_imports_prepared_using_renderer(
                 checkpoint_graphs,
             });
         }
-        let messages = restore_with_resolver(
+        let messages = restore_model_with_resolver(
             store,
             workspace,
             allowed_threads,
@@ -2172,6 +2493,9 @@ async fn frozen_reference_leaves(
 struct RestoredFrozenSelection {
     messages: Vec<ChatMessage>,
     original_ordinals: Vec<u64>,
+    boundary_messages: Vec<ChatMessage>,
+    boundary_original_ordinals: Vec<u64>,
+    model_ordinals: Vec<usize>,
 }
 
 struct FrozenCoverageSelection<'a> {
@@ -2251,6 +2575,9 @@ async fn restore_frozen_excluding_coverage(
         .collect::<Vec<_>>();
     let mut messages = Vec::with_capacity(retained.len());
     let mut original_ordinals = Vec::with_capacity(retained.len());
+    let mut boundary_messages = Vec::with_capacity(retained.len());
+    let mut boundary_original_ordinals = Vec::with_capacity(retained.len());
+    let mut model_ordinals = Vec::with_capacity(retained.len());
     for page in retained.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
         let references = page
             .iter()
@@ -2265,8 +2592,18 @@ async fn restore_frozen_excluding_coverage(
             &mut restore_state,
         )
         .await?;
-        for ((ordinal, _), message) in page.iter().zip(restored) {
+        let literal =
+            restore_entries_page(store, workspace, allowed, &references, checkpoint_graphs).await?;
+        ensure!(
+            literal.len() == page.len() && restored.len() == page.len(),
+            "frozen history count mismatch after checkpoint projection"
+        );
+        for (((ordinal, _), message), authenticated) in page.iter().zip(restored).zip(literal) {
+            let boundary_ordinal = boundary_messages.len();
+            boundary_original_ordinals.push(*ordinal);
+            boundary_messages.push(authenticated);
             if let Some(message) = message {
+                model_ordinals.push(boundary_ordinal);
                 original_ordinals.push(*ordinal);
                 messages.push(message);
             }
@@ -2275,6 +2612,9 @@ async fn restore_frozen_excluding_coverage(
     Ok(RestoredFrozenSelection {
         original_ordinals,
         messages,
+        boundary_messages,
+        boundary_original_ordinals,
+        model_ordinals,
     })
 }
 
@@ -2984,6 +3324,7 @@ pub(crate) async fn restore_accepted_history_for_execution(
             owner,
             allowed,
             &descriptor,
+            None,
         )
         .await?
     } else {
@@ -3000,24 +3341,53 @@ pub(crate) async fn restore_accepted_history_for_execution(
     })
 }
 
+/// Project the exact snapshot won by insert-if-absent for execution. The
+/// caller verifies its literal wire first; this path does not discover a newer
+/// checkpoint or reuse messages from the losing capture.
+pub(crate) async fn restore_accepted_snapshot_for_execution_without_checkpoint(
+    store: &CrudStore,
+    workspace: &str,
+    parent: &str,
+    execution_thread: &str,
+    history_json: &str,
+) -> Result<Vec<ChatMessage>> {
+    if history_json.trim_start().starts_with('[') {
+        return serde_json::from_str(history_json).context("invalid legacy conversation history");
+    }
+    let descriptor: FrozenHistoryRef = serde_json::from_str(history_json)?;
+    let mut allowed = accepted_history_scopes(store, workspace, parent, history_json).await?;
+    allowed.insert(execution_thread.to_owned());
+    let (messages, _) = restore_accepted_execution_projection_without_checkpoint(
+        store,
+        workspace,
+        parent,
+        &allowed,
+        &descriptor,
+        Some(execution_thread),
+    )
+    .await?;
+    Ok(messages)
+}
+
 async fn restore_accepted_execution_projection_without_checkpoint(
     store: &CrudStore,
     workspace: &str,
     owner: &str,
     allowed: &BTreeSet<String>,
     descriptor: &FrozenHistoryRef,
+    execution_thread: Option<&str>,
 ) -> Result<(Vec<ChatMessage>, Vec<ScopedHistorySource>)> {
     let (_, references) =
         frozen_manifest_references(store, workspace, Some(owner), descriptor, Some(allowed))
             .await?;
     let mut checkpoint_graphs = super::coverage::CheckpointGraphResolver::default();
-    let _ = read_accepted_imports(
+    let accepted = read_accepted_imports(
         store,
         workspace,
         owner,
         descriptor,
         &references,
-        None,
+        execution_thread,
         &mut checkpoint_graphs,
     )
     .await?;
@@ -3031,7 +3401,10 @@ async fn restore_accepted_execution_projection_without_checkpoint(
     .await?;
     let mut messages = Vec::with_capacity(references.len());
     let mut direct_sources = BTreeSet::new();
-    for page in references.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
+    for (page_index, page) in references
+        .chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize)
+        .enumerate()
+    {
         let restored = restore_execution_entries_page(
             store,
             workspace,
@@ -3041,10 +3414,24 @@ async fn restore_accepted_execution_projection_without_checkpoint(
             &mut state,
         )
         .await?;
-        for (reference, message) in page.iter().zip(restored) {
-            let Some(message) = message else {
+        ensure!(
+            restored.len() == page.len(),
+            "frozen history count mismatch"
+        );
+        let page_start = page_index * pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize;
+        for (page_ordinal, (reference, message)) in page.iter().zip(restored).enumerate() {
+            let Some(mut message) = message else {
                 continue;
             };
+            if let Some(execution_thread) = execution_thread {
+                hydrate_visible_messages(
+                    std::slice::from_mut(&mut message),
+                    &references,
+                    &[page_start + page_ordinal],
+                    &accepted,
+                    execution_thread,
+                )?;
+            }
             direct_sources.extend(reference.sources.iter().cloned().map(|source| {
                 ScopedHistorySource {
                     thread: reference.source_thread.clone(),
@@ -3150,15 +3537,15 @@ async fn restore_with_resolver(
     let (owner, references) =
         frozen_manifest_references(store, workspace, None, descriptor, Some(allowed_threads))
             .await?;
-    let mut result = Vec::with_capacity(references.len());
+    let mut restored = Vec::with_capacity(references.len());
     for page in references.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
-        result.extend(
+        restored.extend(
             restore_entries_page(store, workspace, allowed_threads, &page, checkpoint_graphs)
                 .await?,
         );
     }
     ensure!(
-        result.len() == references.len(),
+        restored.len() == references.len(),
         "frozen history count mismatch"
     );
     let _ = read_accepted_imports(
@@ -3171,7 +3558,54 @@ async fn restore_with_resolver(
         checkpoint_graphs,
     )
     .await?;
-    Ok(result)
+    Ok(restored)
+}
+
+async fn restore_model_with_resolver(
+    store: &CrudStore,
+    workspace: &str,
+    allowed_threads: &BTreeSet<String>,
+    descriptor: &FrozenHistoryRef,
+    checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
+) -> Result<Vec<ChatMessage>> {
+    let (owner, references) =
+        frozen_manifest_references(store, workspace, None, descriptor, Some(allowed_threads))
+            .await?;
+    let _ = read_accepted_imports(
+        store,
+        workspace,
+        &owner,
+        descriptor,
+        &references,
+        None,
+        checkpoint_graphs,
+    )
+    .await?;
+    let mut state = FrozenExecutionRestoreState::from_references(
+        store,
+        workspace,
+        allowed_threads,
+        &references,
+        checkpoint_graphs,
+    )
+    .await?;
+    let mut messages = Vec::with_capacity(references.len());
+    for page in references.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
+        messages.extend(
+            restore_execution_entries_page(
+                store,
+                workspace,
+                allowed_threads,
+                page,
+                checkpoint_graphs,
+                &mut state,
+            )
+            .await?
+            .into_iter()
+            .flatten(),
+        );
+    }
+    Ok(messages)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3920,6 +4354,140 @@ mod policy_tests {
                 .unwrap(),
             assistant
         );
+    }
+
+    #[test]
+    fn hydration_uses_original_ordinals_with_duplicate_provenance_and_filtered_gaps() {
+        let source = SourceRef {
+            scope: "task-basis:legacy-run".into(),
+            id: "legacy-run".into(),
+            version: "task-basis-revision:1".into(),
+        };
+        let reference = FrozenMessageRef {
+            logical_turn_id: None,
+            source_thread: "parent".into(),
+            context_thread: None,
+            unit_id: "legacy-task-basis:legacy-run".into(),
+            sources: vec![source.clone()],
+            inherited: true,
+            complete: true,
+            protected_input: false,
+            wire_sha256: "a".repeat(64),
+            replay_source: None,
+            tool_item_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            event_input_role: None,
+        };
+        let mut duplicate = ChatMessage::assistant("same legacy message");
+        duplicate.provenance = Some(MessageProvenance {
+            logical_turn_id: None,
+            workspace_id: "ws".into(),
+            thread_id: "parent".into(),
+            context_thread: None,
+            unit_id: "legacy-task-basis:legacy-run".into(),
+            sources: vec![MessageSourceRef {
+                scope: source.scope,
+                id: source.id,
+                version: source.version,
+            }],
+            inherited: true,
+            complete: true,
+            protected_input: false,
+        });
+        let mut messages = vec![duplicate.clone(), duplicate];
+        let references = vec![reference.clone(), reference.clone(), reference.clone()];
+        let accepted = BTreeMap::from([
+            (1, AcceptedMessageImports::default()),
+            (2, AcceptedMessageImports::default()),
+        ]);
+
+        hydrate_visible_messages(
+            &mut messages,
+            &references,
+            &[0, 2],
+            &accepted,
+            "child-execution",
+        )
+        .unwrap();
+
+        let first = messages[0].provenance.as_ref().unwrap();
+        assert_eq!(first.context_thread, None);
+        assert!(first.inherited);
+        let second = messages[1].provenance.as_ref().unwrap();
+        assert_eq!(second.context_thread.as_deref(), Some("child-execution"));
+        assert!(!second.inherited);
+    }
+
+    #[test]
+    fn literal_hydration_keeps_hidden_ordinal_and_is_idempotent() {
+        let source = SourceRef {
+            scope: "task-basis:legacy-run".into(),
+            id: "legacy-run".into(),
+            version: "task-basis-revision:1".into(),
+        };
+        let reference = FrozenMessageRef {
+            logical_turn_id: None,
+            source_thread: "parent".into(),
+            context_thread: None,
+            unit_id: "legacy-task-basis:legacy-run".into(),
+            sources: vec![source.clone()],
+            inherited: true,
+            complete: true,
+            protected_input: false,
+            wire_sha256: "a".repeat(64),
+            replay_source: None,
+            tool_item_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            event_input_role: None,
+        };
+        let message = |text: &str| {
+            let mut message = ChatMessage::assistant(text);
+            message.provenance = Some(MessageProvenance {
+                logical_turn_id: None,
+                workspace_id: "ws".into(),
+                thread_id: "parent".into(),
+                context_thread: None,
+                unit_id: reference.unit_id.clone(),
+                sources: vec![MessageSourceRef {
+                    scope: source.scope.clone(),
+                    id: source.id.clone(),
+                    version: source.version.clone(),
+                }],
+                inherited: true,
+                complete: true,
+                protected_input: false,
+            });
+            message
+        };
+        let references = vec![reference.clone(), reference.clone(), reference.clone()];
+        let accepted = BTreeMap::from([(2, AcceptedMessageImports::default())]);
+        let mut literal = vec![message("A"), message("technical T"), message("B")];
+        let ordinals = [0, 1, 2];
+        hydrate_visible_messages(&mut literal, &references, &ordinals, &accepted, "execution")
+            .unwrap();
+        assert_eq!(
+            literal
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "technical T", "B"]
+        );
+        assert!(literal[1].provenance.as_ref().unwrap().inherited);
+        assert_eq!(
+            literal[2]
+                .provenance
+                .as_ref()
+                .unwrap()
+                .context_thread
+                .as_deref(),
+            Some("execution")
+        );
+        let once = literal.clone();
+        hydrate_visible_messages(&mut literal, &references, &ordinals, &accepted, "execution")
+            .unwrap();
+        assert_eq!(literal, once);
     }
 
     fn ordered_message(text: &str, thread: &str, source: &str) -> ChatMessage {

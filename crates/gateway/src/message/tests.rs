@@ -8153,7 +8153,7 @@ fn test_summary_config() -> super::summary::SummaryConfig {
     }
 }
 
-fn test_tool_loop_config() -> ToolLoopConfig {
+pub(super) fn test_tool_loop_config() -> ToolLoopConfig {
     let web = GatewayWebToolsConfig::default();
     ToolLoopConfig {
         provider: pioneer_provider::ProviderTimeoutPolicy::default(),
@@ -23212,7 +23212,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
 
 #[test]
 fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation() {
-    run_gateway_message_test("composer-cli-skill-pack", || async {
+    run_large_history_message_test("composer-cli-skill-pack", async {
         for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
             for select_pack in [true, false] {
                 let mut harness =
@@ -23370,8 +23370,14 @@ fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation
                 assert_eq!(
                     starts.len(),
                     1,
-                    "{runtime_kind:?} select_pack={select_pack}: {:?}",
-                    task.task.error
+                    "{runtime_kind:?} select_pack={select_pack}: task={:?}, run={:?}, turns={:?}",
+                    task.task.error,
+                    task.runs[0].error,
+                    harness
+                        .crud_store
+                        .list_task_run_turns(&task.runs[0].id)
+                        .await
+                        .unwrap()
                 );
                 let run = &task.runs[0];
                 let lineage =
@@ -23421,7 +23427,8 @@ fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation
                     .expect("hidden CLI user message");
                 if select_pack {
                     assert!(
-                        matches!(attachments.as_slice(), [UserMessageAttachment::SkillPack { capability }] if capability.pack_id == pack_id)
+                        matches!(attachments.as_slice(), [UserMessageAttachment::SkillPack { capability }] if capability.pack_id == pack_id),
+                        "hidden child pack presentation differs: {attachments:?}"
                     );
                 } else {
                     assert_eq!(attachments.len(), 2);
@@ -24760,7 +24767,12 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
     let parent = "accepted-large-task-parent";
     let mut raw_bytes = 0usize;
     for index in 0..12 {
-        let text = format!("ACCEPTED TASK CHUNK {index:02} {}", "x".repeat(730_000));
+        // Keep the provider frame above the 8 MiB cap without making a
+        // single giant BPE word dominate history-transfer timing.
+        let text = format!(
+            "ACCEPTED TASK CHUNK {index:02} {}",
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx ".repeat(22_200)
+        );
         raw_bytes += text.len();
         seed_completed_task_parent_with_inputs(
             &processor,
@@ -24829,7 +24841,10 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
             turn_id: "accepted-source-00".to_owned(),
             expected_revision: 0,
             input: vec![UserInput::Text {
-                text: format!("EDITED ACCEPTED SOURCE 00 {}", "y".repeat(730_000)),
+                text: format!(
+                    "EDITED ACCEPTED SOURCE 00 {}",
+                    "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy ".repeat(22_200)
+                ),
                 text_elements: Vec::new(),
             }],
             mentions: Vec::new(),
@@ -26777,6 +26792,40 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             TaskStatus::Completed,
             "{runtime_id} native Task should reconcile through the normal Task result path"
         );
+        // The fake provider completes immediately, so a read before its
+        // durable start acknowledgement races the real start RPC owner. Use
+        // the completed exact receipt (already awaited by the helper) to
+        // reconstruct the start-only provider state for this failure fixture.
+        let mut start_acknowledgement = crud_store
+            .get_cli_runtime_thread_binding(parent_thread_id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut start_cursor: serde_json::Value =
+            serde_json::from_str(&start_acknowledgement.resume_cursor_json).unwrap();
+        assert_eq!(
+            start_cursor.pointer("/pioneerContext/acceptedTurnId"),
+            Some(&json!(lineage.child_turn_id))
+        );
+        assert_eq!(
+            start_cursor.pointer("/pioneerContext/completedTurnId"),
+            Some(&json!(lineage.child_turn_id))
+        );
+        let receipt = start_cursor
+            .get_mut("pioneerContext")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        for completed_field in [
+            "completedTurnId",
+            "contextOwnerThreadId",
+            "contextHistoryJson",
+            "contextManifestOwnerThreadId",
+            "deliveredTurns",
+            "deliveredSources",
+        ] {
+            receipt.remove(completed_field);
+        }
+        start_acknowledgement.resume_cursor_json = serde_json::to_string(&start_cursor).unwrap();
         // A provider-side failure is resumable in the same session, but is
         // never a completed fork boundary. Keep the actual sent history guards.
         let failed_parent = crud_store
@@ -26804,15 +26853,17 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             .await
             .unwrap();
         }
-        // Use the start acknowledgement, which has no completion for this child.
+        // Exercise the start-only acknowledgement, without treating the
+        // completed provider output as a fork boundary for a failed attempt.
         let failed_basis = crate::cli_runtime::thread_binding::failed_context_basis_from_binding(
             &crud_store,
-            &parent_binding,
+            &start_acknowledgement,
             Some((&run.id, 0, false)),
         )
         .await
-        .unwrap()
-        .expect("acknowledged failed Composer turn must retain its CLI session");
+        .unwrap();
+        let failed_basis =
+            failed_basis.expect("acknowledged failed Composer turn must retain its CLI session");
         assert!(
             failed_basis
                 .delivered_turns
@@ -26837,7 +26888,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
         assert!(
             crate::cli_runtime::thread_binding::failed_context_basis_from_binding(
                 &crud_store,
-                &parent_binding,
+                &start_acknowledgement,
                 Some((&run.id, 1, false)),
             )
             .await
@@ -26845,7 +26896,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             .is_none(),
             "edited parent input cannot reuse sent history"
         );
-        let mut other_session = parent_binding.clone();
+        let mut other_session = start_acknowledgement.clone();
         other_session.native_thread_id = "different-provider-session".into();
         assert!(
             crate::cli_runtime::thread_binding::failed_context_basis_from_binding(
@@ -26866,7 +26917,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
         assert!(
             crate::cli_runtime::thread_binding::failed_context_basis_from_binding(
                 &crud_store,
-                &parent_binding,
+                &start_acknowledgement,
                 Some((&run.id, 0, false)),
             )
             .await
@@ -26986,7 +27037,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                     lineage.child_turn_id
                 ),
                 format!(
-                    "INSERT INTO turn_execution(turn_id,thread_id,workspace_id,executor_kind,executor_key,status,owner_id,owner_generation,lease_until,heartbeat_at,created_at,updated_at) SELECT '{child_turn}','{child}',workspace_id,'cli_runtime',executor_key,'{status}',owner_id,owner_generation,lease_until,heartbeat_at,created_at,updated_at FROM turn_execution WHERE turn_id='{}'",
+                    "INSERT INTO turn_execution(turn_id,thread_id,workspace_id,executor_kind,executor_key,status,owner_id,owner_generation,lease_until,heartbeat_at,started_at,completed_at,created_at,updated_at) SELECT '{child_turn}','{child}',workspace_id,'cli_runtime',executor_key,'{status}',owner_id,owner_generation,lease_until,heartbeat_at,started_at,completed_at,created_at,updated_at FROM turn_execution WHERE turn_id='{}'",
                     lineage.child_turn_id
                 ),
                 format!(
@@ -27033,10 +27084,10 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 ),
                 (
                     format!(
-                        "UPDATE turn_execution SET status='running' WHERE turn_id='{child_turn}'"
+                        "UPDATE turn_execution SET status='running',completed_at=NULL WHERE turn_id='{child_turn}'"
                     ),
                     format!(
-                        "UPDATE turn_execution SET status='{status}' WHERE turn_id='{child_turn}'"
+                        "UPDATE turn_execution SET status='{status}',completed_at=COALESCE(started_at,created_at) WHERE turn_id='{child_turn}'"
                     ),
                 ),
                 (
@@ -71307,7 +71358,7 @@ async fn compaction_lifecycle_observer_uses_the_operation_scope_for_started_and_
         lifecycle_store
             .compaction_activate_runner(
                 &id,
-                &RunnerState::new(900_000, &budget, 500, None).unwrap(),
+                &RunnerState::new(snapshot.admission.deadline_ms, &budget, 500, None).unwrap(),
             )
             .await
             .unwrap();
@@ -72723,6 +72774,434 @@ async fn compaction_history_load_rejects_missing_and_foreign_scope_before_provid
             .is_err()
     );
     assert_eq!(provider.call_count(), 0);
+}
+
+async fn seed_filtered_background_preflight(
+    processor: &MessageProcessor,
+    store: &CrudStore,
+    workspace: &str,
+    thread_id: &str,
+    turn_id: &str,
+    reasoning: bool,
+    technical_noise: bool,
+) {
+    ensure_test_superuser_execution_authority(store).await;
+    let timestamp = phase_13_now_secs();
+    store
+        .materialize_turn_start(
+            &phase_13_test_thread(workspace, thread_id, timestamp),
+            SandboxMode::FullAccess,
+            &phase_13_turn(turn_id, TurnStatus::InProgress),
+            &[UserInput::Text {
+                text: "background protected input".into(),
+                text_elements: vec![],
+            }],
+            pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    if reasoning {
+        for (id, summary, content) in [
+            (
+                "background-reasoning-content",
+                vec![],
+                vec![format!(
+                    "background content-only canary {}",
+                    "content reasoning payload ".repeat(3_000)
+                )],
+            ),
+            (
+                "background-reasoning-summary",
+                vec![format!(
+                    "background summary-only canary {}",
+                    "summary reasoning payload ".repeat(3_000)
+                )],
+                vec![],
+            ),
+            (
+                "background-reasoning-both",
+                vec![format!(
+                    "background combined-summary canary {}",
+                    "combined summary payload ".repeat(3_000)
+                )],
+                vec![format!(
+                    "background combined-content canary {}",
+                    "combined content payload ".repeat(3_000)
+                )],
+            ),
+        ] {
+            store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: workspace.into(),
+                        thread_id: thread_id.into(),
+                        turn_id: turn_id.into(),
+                        item: TurnItem::Reasoning {
+                            id: format!("{thread_id}-{id}"),
+                            summary,
+                            content,
+                        },
+                    },
+                    timestamp + 1,
+                )
+                .await
+                .unwrap();
+        }
+    }
+    if technical_noise {
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: workspace.into(),
+                    thread_id: thread_id.into(),
+                    turn_id: turn_id.into(),
+                    item: TurnItem::SystemEvent {
+                        id: format!("{thread_id}-token-usage"),
+                        level: pioneer_protocol::SystemEventLevel::Info,
+                        message: format!(
+                            "background technical noise canary {}",
+                            "excluded token usage payload ".repeat(10_000)
+                        ),
+                        code: Some("agent_runtime_event".into()),
+                        details: Some(serde_json::json!({
+                            "nativeMethod": "thread/tokenUsage/updated",
+                            "usage": {"inputTokens": 999999}
+                        })),
+                    },
+                },
+                timestamp + 2,
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: workspace.into(),
+                thread_id: thread_id.into(),
+                turn: phase_13_turn(turn_id, TurnStatus::Completed),
+            },
+            timestamp + 3,
+        )
+        .await
+        .unwrap();
+    persist_test_execution_authorization_context_for_principal(
+        processor,
+        authenticated_test_superuser().as_ref(),
+        workspace,
+        thread_id,
+        turn_id,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_background_preflight_ignores_technical_noise_but_budgets_reasoning() {
+    struct SilentObserver;
+    #[async_trait::async_trait]
+    impl crate::compaction::CompactionObserver for SilentObserver {
+        async fn started(
+            &self,
+            _: &str,
+            _: &pioneer_compaction::runner::RunnerState,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn heartbeat(&self, _: &str) {}
+        async fn terminal(
+            &self,
+            _: &str,
+            _: &pioneer_compaction::runner::RunnerState,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    let provider = Arc::new(CaptureSummaryProvider::new(
+        pioneer_compaction::summary::HEADINGS
+            .iter()
+            .map(|heading| format!("{heading}\nRetained filtered background state."))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    ));
+    let harness =
+        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
+    let current = pioneer_compaction::ModelSelection {
+        transport: pioneer_compaction::Transport::Codex,
+        instance: "fixture-codex".into(),
+        model: "gpt-5.4".into(),
+        effort: None,
+    };
+    let settings = pioneer_compaction::CompactionSettings {
+        selection: Some(pioneer_compaction::ModelSelection {
+            transport: pioneer_compaction::Transport::Api,
+            instance: "summary-capture".into(),
+            model: "test-model".into(),
+            effort: None,
+        }),
+    };
+    let run = |thread: &'static str, turn: &'static str, fixed_input_tokens: u64| {
+        let processor = harness.processor.clone();
+        let scoped_store = harness.crud_store.with_maintenance_access();
+        let workspace = harness.workspace_id.clone();
+        let current = current.clone();
+        let settings = settings.clone();
+        async move {
+            let mut diagnostic = pioneer_crud::compaction::HistoryCheckDiagnostic::default();
+            let outcome = crate::compaction::prepare_completed_history_owned(
+                &processor,
+                &scoped_store,
+                &workspace,
+                thread,
+                turn,
+                &current,
+                &settings,
+                None,
+                Arc::new(SilentObserver),
+                tokio_util::sync::CancellationToken::new(),
+                crate::compaction::ContextWorkPriority::Background,
+                None,
+                None,
+                fixed_input_tokens,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+                &mut diagnostic,
+            )
+            .await
+            .unwrap();
+            (outcome, diagnostic)
+        }
+    };
+
+    for (thread, turn, reasoning, noise) in [
+        (
+            "background-probe-base",
+            "background-probe-base-turn",
+            false,
+            false,
+        ),
+        (
+            "background-probe-noise",
+            "background-probe-noise-turn",
+            false,
+            true,
+        ),
+        (
+            "background-probe-reasoning",
+            "background-probe-reasoning-turn",
+            true,
+            false,
+        ),
+        (
+            "background-probe-reasoning-noise",
+            "background-probe-reasoning-noise-turn",
+            true,
+            true,
+        ),
+    ] {
+        seed_filtered_background_preflight(
+            &harness.processor,
+            &harness.crud_store,
+            &harness.workspace_id,
+            thread,
+            turn,
+            reasoning,
+            noise,
+        )
+        .await;
+    }
+    let (base_outcome, base) = run("background-probe-base", "background-probe-base-turn", 0).await;
+    let (noise_outcome, noise) =
+        run("background-probe-noise", "background-probe-noise-turn", 0).await;
+    let (reasoning_outcome, reasoning) = run(
+        "background-probe-reasoning",
+        "background-probe-reasoning-turn",
+        0,
+    )
+    .await;
+    let (reasoning_noise_outcome, reasoning_noise) = run(
+        "background-probe-reasoning-noise",
+        "background-probe-reasoning-noise-turn",
+        0,
+    )
+    .await;
+    assert_eq!(
+        base_outcome,
+        pioneer_crud::compaction::HistoryCheckOutcome::Fits
+    );
+    assert_eq!(noise_outcome, base_outcome);
+    assert_eq!(reasoning_outcome, base_outcome);
+    assert_eq!(reasoning_noise_outcome, base_outcome);
+    assert_eq!(
+        (
+            noise.context_tokens,
+            noise.input_limit,
+            noise.output_reserve
+        ),
+        (base.context_tokens, base.input_limit, base.output_reserve)
+    );
+    assert_eq!(
+        (
+            reasoning_noise.context_tokens,
+            reasoning_noise.input_limit,
+            reasoning_noise.output_reserve,
+        ),
+        (
+            reasoning.context_tokens,
+            reasoning.input_limit,
+            reasoning.output_reserve,
+        )
+    );
+    assert_eq!(noise.estimated_input_tokens, base.estimated_input_tokens);
+    assert_eq!(
+        reasoning_noise.estimated_input_tokens,
+        reasoning.estimated_input_tokens
+    );
+    let base_tokens = base.estimated_input_tokens.unwrap();
+    let reasoning_tokens = reasoning.estimated_input_tokens.unwrap();
+    assert!(reasoning_tokens > base_tokens + 2_048);
+    assert_eq!(provider.call_count(), 0);
+
+    let budget = pioneer_compaction::ModelBudget {
+        context: base.context_tokens.unwrap(),
+        input_limit: base.input_limit,
+        max_output: None,
+        separate_reasoning: 0,
+    };
+    let reserve = base.output_reserve.unwrap();
+    let mut low = 0_u64;
+    let mut high = budget.context;
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if budget.fits(middle, reserve, false) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let max_fitting_input = low;
+    // The planner reserves summary output in addition to ModelBudget padding;
+    // leave enough room for both while keeping the reasoning delta across the edge.
+    let summary_allowance = 16_384_u64;
+    assert!(max_fitting_input > base_tokens + summary_allowance);
+    assert!(reasoning_tokens > base_tokens + summary_allowance);
+    let threshold_fixed = max_fitting_input - base_tokens - summary_allowance;
+    assert!(budget.fits(base_tokens + threshold_fixed, reserve, false));
+    assert!(!budget.fits(reasoning_tokens + threshold_fixed, reserve, false));
+
+    for (thread, turn, reasoning, noise) in [
+        (
+            "background-edge-base",
+            "background-edge-base-turn",
+            false,
+            false,
+        ),
+        (
+            "background-edge-noise",
+            "background-edge-noise-turn",
+            false,
+            true,
+        ),
+        (
+            "background-edge-reasoning",
+            "background-edge-reasoning-turn",
+            true,
+            false,
+        ),
+        (
+            "background-edge-reasoning-noise",
+            "background-edge-reasoning-noise-turn",
+            true,
+            true,
+        ),
+    ] {
+        seed_filtered_background_preflight(
+            &harness.processor,
+            &harness.crud_store,
+            &harness.workspace_id,
+            thread,
+            turn,
+            reasoning,
+            noise,
+        )
+        .await;
+    }
+    let (edge_base_outcome, edge_base) = run(
+        "background-edge-base",
+        "background-edge-base-turn",
+        threshold_fixed,
+    )
+    .await;
+    let (edge_noise_outcome, edge_noise) = run(
+        "background-edge-noise",
+        "background-edge-noise-turn",
+        threshold_fixed,
+    )
+    .await;
+    assert_eq!(
+        edge_base_outcome,
+        pioneer_crud::compaction::HistoryCheckOutcome::Fits
+    );
+    assert_eq!(edge_noise_outcome, edge_base_outcome);
+    assert_eq!(
+        (
+            edge_noise.context_tokens,
+            edge_noise.input_limit,
+            edge_noise.output_reserve,
+        ),
+        (
+            edge_base.context_tokens,
+            edge_base.input_limit,
+            edge_base.output_reserve,
+        )
+    );
+    assert_eq!(
+        edge_noise.estimated_input_tokens,
+        edge_base.estimated_input_tokens
+    );
+    let (edge_reasoning_outcome, edge_reasoning) = run(
+        "background-edge-reasoning",
+        "background-edge-reasoning-turn",
+        threshold_fixed,
+    )
+    .await;
+    let (edge_reasoning_noise_outcome, edge_reasoning_noise) = run(
+        "background-edge-reasoning-noise",
+        "background-edge-reasoning-noise-turn",
+        threshold_fixed,
+    )
+    .await;
+    assert_eq!(
+        edge_reasoning_outcome,
+        pioneer_crud::compaction::HistoryCheckOutcome::Compacted
+    );
+    assert_eq!(edge_reasoning_noise_outcome, edge_reasoning_outcome);
+    assert_eq!(
+        edge_reasoning_noise.estimated_input_tokens,
+        edge_reasoning.estimated_input_tokens
+    );
+
+    let requests = provider.snapshot_requests();
+    assert!(!requests.is_empty());
+    let summary_input = requests
+        .iter()
+        .flat_map(|request| request.messages.iter())
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!summary_input.contains("background technical noise canary"));
+    assert!(!summary_input.contains("excluded token usage payload"));
+    assert!(!summary_input.contains("999999"));
+    for canary in [
+        "background content-only canary",
+        "background summary-only canary",
+        "background combined-content canary",
+        "background combined-summary canary",
+    ] {
+        assert!(summary_input.contains(canary));
+    }
 }
 
 #[tokio::test]
