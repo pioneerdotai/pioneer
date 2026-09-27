@@ -646,16 +646,6 @@ impl CrudStore {
         )
         .await
     }
-    pub async fn compaction_retain_frozen_context_sources(
-        &self,
-        workspace: &str,
-        messages: &[FrozenMessageRef],
-    ) -> Result<()> {
-        repositories::compaction::frozen::compaction_retain_frozen_context_sources(
-            self, workspace, messages,
-        )
-        .await
-    }
     /// Ready is published only after the bounded writer has filled all exact
     /// ordinals. The content digest is checked by the caller before this CAS.
     pub async fn compaction_finish_frozen_history(
