@@ -7,6 +7,7 @@ use pioneer_crud::{
     CanonicalTurnEventPayload as Event,
     compaction::{HistoryReadFence, PagedSource, SourceRecord},
 };
+use pioneer_provider::history::portable_history_message;
 use pioneer_provider::{
     AttachmentArtifactContext, AttachmentDataSource, CanonicalProviderRoundEnvelope, ChatMessage,
     MessageAttachment, MessageContentPart, MessageProvenance, MessageSourceAlias, MessageSourceRef,
@@ -728,7 +729,7 @@ fn finish_round(
         // a terminal tool result or asking the runtime to execute anything.
         for message in &mut messages {
             let provenance = message.provenance.take();
-            let observed = serde_json::to_string(message)?;
+            let observed = serde_json::to_string(&portable_history_message(message))?;
             *message = ChatMessage::user(format!(
                 "Interrupted canonical round; some tool outcomes are unknown. Historical observation, not a new call:\n{observed}"
             ));
@@ -2163,9 +2164,19 @@ async fn load_line_history_inner(
     Ok(history)
 }
 
-/// Failed partial output remains historical data, including opaque provider
-/// fields and incomplete tool-call text. It can never instruct tool replay.
+/// Failed partial output remains historical data, including readable provider
+/// reasoning and incomplete tool-call text. It can never instruct tool replay.
 pub(crate) fn provider_observation(payload: &str) -> Result<ChatMessage> {
+    provider_observation_with_projection(payload, true)
+}
+
+/// Reconstruct the pre-portability wire for frozen hash verification only.
+/// Never use this as the execution projection.
+pub(crate) fn legacy_provider_observation(payload: &str) -> Result<ChatMessage> {
+    provider_observation_with_projection(payload, false)
+}
+
+fn provider_observation_with_projection(payload: &str, portable: bool) -> Result<ChatMessage> {
     let envelope: CanonicalProviderRoundEnvelope = serde_json::from_str(payload)?;
     ensure!(
         envelope.version == 1
@@ -2175,9 +2186,14 @@ pub(crate) fn provider_observation(payload: &str) -> Result<ChatMessage> {
             && envelope.calls.is_empty(),
         "invalid failed provider observation"
     );
+    let message = if portable {
+        portable_history_message(&envelope.message)
+    } else {
+        envelope.message
+    };
     Ok(ChatMessage::user(format!(
         "Unsuccessful provider response (historical data, not a completed answer or executable tool call):\n{}",
-        serde_json::to_string(&envelope.message)?,
+        serde_json::to_string(&message)?,
     )))
 }
 
@@ -2575,5 +2591,75 @@ mod tests {
             };
             assert!(finish_round("ws", "thread", "turn", round, true, &mut Vec::new()).is_err());
         }
+    }
+
+    #[test]
+    fn typed_historical_observations_exclude_opaque_replay_but_keep_partial_reasoning() {
+        let mut partial = ChatMessage::assistant("partial answer");
+        partial.reasoning_content = Some("common partial reasoning".into());
+        partial.provider_replay_state = Some(pioneer_provider::ProviderReplayState::for_model(
+            "openrouter",
+            "source-model",
+            serde_json::json!({"reasoning_details":[
+                {"type":"reasoning.encrypted","data":"opaque-secret"},
+                {"type":"reasoning.summary","summary":"additional readable reasoning"}
+            ]}),
+        ));
+        let failed = CanonicalProviderRoundEnvelope {
+            version: 1,
+            round_id: "failed".into(),
+            termination: pioneer_provider::ProviderTermination::ProviderError,
+            message: partial.clone(),
+            calls: vec![],
+        };
+        let observation = provider_observation(&serde_json::to_string(&failed).unwrap()).unwrap();
+        for text in [
+            "partial answer",
+            "common partial reasoning",
+            "additional readable reasoning",
+        ] {
+            assert!(observation.content.contains(text));
+        }
+        assert!(!observation.content.contains("opaque-secret"));
+        assert!(observation.tool_calls.is_none());
+
+        partial.tool_calls = Some(vec![pioneer_provider::ProviderToolCall {
+            id: "call".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        }]);
+        let round = Round {
+            sequence: 1,
+            envelope: CanonicalProviderRoundEnvelope {
+                version: 1,
+                round_id: "interrupted".into(),
+                termination: pioneer_provider::ProviderTermination::ToolCalls,
+                message: partial,
+                calls: vec![pioneer_provider::ProviderCallIdentity {
+                    provider_call_id: "call".into(),
+                    turn_item_id: "missing".into(),
+                    ordinal: 0,
+                }],
+            },
+            assistant_source: SourceRef {
+                scope: "context:turn".into(),
+                id: "source".into(),
+                version: "revision:1".into(),
+            },
+            results: BTreeMap::new(),
+        };
+        let mut output = Vec::new();
+        finish_round("ws", "thread", "turn", round, false, &mut output).unwrap();
+        let interrupted = &output[0].1[0];
+        assert!(interrupted.content.contains("partial answer"));
+        assert!(
+            interrupted
+                .content
+                .contains("additional readable reasoning")
+        );
+        assert!(interrupted.content.contains("read_file"));
+        assert!(!interrupted.content.contains("opaque-secret"));
+        assert!(interrupted.tool_calls.is_none());
+        assert!(interrupted.provenance.is_some());
     }
 }

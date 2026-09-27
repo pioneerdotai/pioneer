@@ -9,6 +9,7 @@ pub mod attachments;
 pub mod catalog;
 pub mod factory;
 pub mod file_tools;
+pub mod history;
 mod http;
 pub mod providers;
 pub mod reasoning_registry;

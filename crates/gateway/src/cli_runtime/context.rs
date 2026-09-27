@@ -87,8 +87,7 @@ fn thread_context_from_history(history: &[ChatMessage]) -> Result<CliRuntimeCont
         // never be exposed as readable cross-provider history. Binary content
         // is projected through native CLI input items below; stable markers
         // retain its position and relationship to this historical message.
-        let mut portable = message.clone();
-        portable.provider_replay_state = None;
+        let mut portable = pioneer_provider::history::portable_history_message(message);
         portable.content_parts = message
             .content_parts
             .iter()
@@ -594,6 +593,132 @@ mod tests {
         );
         assert!(!plan.bundle.full_system_text.contains("Tool Usage"));
         assert!(!plan.bundle.full_system_text.contains("api prompt file"));
+    }
+
+    #[test]
+    fn codex_and_claude_bootstrap_keep_portable_replay_reasoning_for_native_return() {
+        let root = temp_workspace("portable-reasoning");
+        let mut historical = ChatMessage::assistant("retained answer");
+        historical.reasoning_content = Some("additional common reasoning".into());
+        historical.provider_replay_state = Some(ProviderReplayState::for_model(
+            "openrouter",
+            "source-model",
+            serde_json::json!({"reasoning_details":[
+                {"type":"reasoning.encrypted","data":"opaque-secret"},
+                {"type":"reasoning.summary","summary":"replay-only reasoning"}
+            ]}),
+        ));
+        historical.provenance = Some(pioneer_provider::MessageProvenance {
+            logical_turn_id: Some("turn_1".into()),
+            workspace_id: "workspace_1".into(),
+            thread_id: "thread_1".into(),
+            context_thread: None,
+            unit_id: "answer".into(),
+            sources: vec![pioneer_provider::MessageSourceRef {
+                scope: "context:turn_1".into(),
+                id: "source".into(),
+                version: "revision:1".into(),
+            }],
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
+            complete: true,
+            protected_input: false,
+            inherited: false,
+        });
+        let canonical = historical.clone();
+        let history = [ChatMessage::user("original question"), historical];
+        for (kind, label) in [
+            (CLIAgentRuntimeKind::Codex, "Codex CLI"),
+            (CLIAgentRuntimeKind::Claude, "Claude CLI"),
+        ] {
+            let plan = compile_cli_runtime_delivery_plan(
+                root.as_path(),
+                CLIRuntimeContextBuildInput {
+                    workspace_id: "workspace_1",
+                    thread_id: "thread_1",
+                    initiating_thread_id: "thread_1",
+                    turn_id: "turn_2",
+                    runtime_id: "runtime",
+                    runtime_label: label,
+                    runtime_kind: kind,
+                    model: None,
+                    cwd: Some(root.to_str().unwrap()),
+                    permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(
+                    ),
+                    history: Some(&history),
+                    selected_skill_names: &[],
+                    selected_capabilities: None,
+                },
+            )
+            .unwrap();
+            let text = &plan.turn_context.text;
+            assert!(text.contains("original question"));
+            assert!(text.contains("additional common reasoning"));
+            assert!(text.contains("replay-only reasoning"));
+            assert!(!text.contains("opaque-secret"));
+            assert!(text.find("original question") < text.find("retained answer"));
+            let mut mapping = CLIRuntimeTurnInputMapping {
+                input: vec![CLIRuntimeTurnInputItem::Text {
+                    text: "current request".into(),
+                }],
+                diagnostics: vec![],
+            };
+            prepend_cli_turn_context_and_history_input(
+                &mut mapping,
+                &plan,
+                Some(&history),
+                "workspace_1",
+                Some(root.to_str().unwrap()),
+                label,
+            )
+            .unwrap();
+            let outgoing = serde_json::to_string(&mapping.input).unwrap();
+            assert!(outgoing.contains("replay-only reasoning"));
+            assert!(!outgoing.contains("opaque-secret"));
+        }
+        let native = pioneer_provider::history::portable_history_message(&canonical);
+        assert_eq!(
+            native.reasoning_content.as_deref(),
+            Some("additional common reasoning\n\nreplay-only reasoning")
+        );
+        let native_request = pioneer_provider::history::project_request_for_provider(
+            "deepseek",
+            pioneer_provider::ChatRequest {
+                model: "deepseek-chat".into(),
+                messages: vec![
+                    history[0].clone(),
+                    history[1].clone(),
+                    ChatMessage::assistant("CLI result"),
+                ],
+                temperature: None,
+                max_tokens: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                compiled_prompt: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            native_request.messages[1].reasoning_content,
+            native.reasoning_content
+        );
+        assert_eq!(native_request.messages[2].content, "CLI result");
+        assert!(native_request.messages[1].provider_replay_state.is_none());
+        assert_eq!(history[1], canonical);
+
+        let mut replay_only = canonical.clone();
+        replay_only.reasoning_content = None;
+        let text = super::thread_context_from_history(&[replay_only.clone()])
+            .unwrap()
+            .text;
+        assert!(text.contains("replay-only reasoning"));
+        assert!(!text.contains("opaque-secret"));
+        assert_eq!(
+            replay_only.provider_replay_state,
+            canonical.provider_replay_state
+        );
     }
 
     #[test]

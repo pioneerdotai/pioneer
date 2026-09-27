@@ -75,6 +75,18 @@ fn total_token_usage(usage: Option<&TokenUsage>) -> Option<u64> {
     )
 }
 
+fn bind_replay_to_response_target(
+    replay: &mut Option<pioneer_provider::ProviderReplayState>,
+    provider: &str,
+    model: &str,
+) {
+    if let Some(replay) = replay.as_mut()
+        && replay.provider == provider
+    {
+        replay.model = Some(model.to_owned());
+    }
+}
+
 /// Persist the provider accumulator, including opaque state absent from UI text.
 /// This acknowledged observation precedes failure/recovery and never becomes an
 /// executable assistant/tool round. Cancellation still drops this owned future.
@@ -186,6 +198,11 @@ pub(super) async fn request_agent_round(
                 }
                 if chunk.provider_replay_state.is_some() {
                     provider_replay_state = chunk.provider_replay_state.take();
+                    bind_replay_to_response_target(
+                        &mut provider_replay_state,
+                        provider_name.as_str(),
+                        model_name.as_str(),
+                    );
                 }
                 if chunk.is_final {
                     termination = chunk.termination;
@@ -301,7 +318,7 @@ pub(super) async fn request_agent_round(
 
     let model_name = request.model.clone();
 
-    let response = provider.chat(request).await.map_err(|error| {
+    let mut response = provider.chat(request).await.map_err(|error| {
         adapter_error_for_target(
             FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
             provider.as_ref(),
@@ -312,6 +329,11 @@ pub(super) async fn request_agent_round(
             &error,
         )
     })?;
+    bind_replay_to_response_target(
+        &mut response.provider_replay_state,
+        provider.name(),
+        model_name.as_str(),
+    );
 
     let startup_output = if !response.text.is_empty() {
         Some(pioneer_observability::turn_startup::Output::BufferedText)
@@ -465,6 +487,11 @@ pub(super) async fn stream_provider_response(
             }
             if chunk_replay.is_some() {
                 provider_replay_state = chunk_replay;
+                bind_replay_to_response_target(
+                    &mut provider_replay_state,
+                    provider_name.as_str(),
+                    model_name.as_str(),
+                );
             }
             if is_final {
                 termination = chunk_termination;
@@ -1538,6 +1565,23 @@ fn extract_retry_after_ms(message_lower: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_response_replay_is_bound_to_the_exact_execution_model() {
+        let mut replay = Some(pioneer_provider::ProviderReplayState::new(
+            "openrouter",
+            serde_json::json!({"opaque":"state"}),
+        ));
+        bind_replay_to_response_target(&mut replay, "openrouter", "model-a");
+        assert_eq!(replay.as_ref().unwrap().model.as_deref(), Some("model-a"));
+
+        let mut unattributed = Some(pioneer_provider::ProviderReplayState::new(
+            "unexpected-provider",
+            serde_json::json!({"opaque":"state"}),
+        ));
+        bind_replay_to_response_target(&mut unattributed, "openrouter", "model-a");
+        assert!(unattributed.as_ref().unwrap().model.is_none());
+    }
 
     #[test]
     fn openrouter_image_input_endpoint_error_is_recoverable_capability_rejection() {

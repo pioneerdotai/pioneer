@@ -44,7 +44,9 @@ pub(crate) use tool_outcomes::{retained_shell_outcome, retained_tool_policy};
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
 use pioneer_compaction::runner::{
-    AttemptPurpose, FailureDiagnostic, FailureKind, RunnerAction, RunnerPhase, RunnerState,
+    AttemptPurpose, FailureDiagnostic, FailureKind,
+    PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION,
+    PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION, RunnerAction, RunnerPhase, RunnerState,
     SourceCursor,
 };
 use pioneer_compaction::summary::{
@@ -263,8 +265,22 @@ fn historical_source_model_payload(
     if projection_version == 0 {
         return Ok(payload);
     }
+    if projection_version >= PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION
+        && source.scope.starts_with("context:")
+    {
+        return Ok(pioneer_provider::history::portable_history_payload(
+            &payload,
+        ));
+    }
+    if projection_version == PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION
+        && source.scope.starts_with("task-basis:")
+    {
+        return pioneer_provider::history::portable_task_basis_payload(&payload);
+    }
     ensure!(
-        projection_version == pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION,
+        projection_version == pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION
+            || projection_version == PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION
+            || projection_version == PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION,
         "unsupported historical source text projection"
     );
     if source.scope.starts_with("item:") {
@@ -286,11 +302,21 @@ fn historical_source_model_payload(
     Ok(payload)
 }
 
-fn source_text_projection_for_cursor(state: &RunnerState) -> u32 {
-    if state.source_text_projection_version == 0 && state.cursor.character == 0 {
-        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION
-    } else {
+fn source_text_projection_for_cursor(state: &RunnerState, source: &SourceRef) -> u32 {
+    if state.cursor.character > 0 {
         state.source_text_projection_version
+    } else {
+        source_text_projection_for_new_source(source)
+    }
+}
+
+fn source_text_projection_for_new_source(source: &SourceRef) -> u32 {
+    if source.scope.starts_with("task-basis:") {
+        PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION
+    } else if source.scope.starts_with("context:") {
+        PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION
+    } else {
+        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION
     }
 }
 
@@ -492,10 +518,8 @@ impl CompactionRunner {
 
     #[cfg(test)]
     async fn reference_excerpts(&self) -> Result<&Vec<ReferenceExcerpt>> {
-        self.reference_excerpts_with_projection(
-            pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION,
-        )
-        .await
+        self.reference_excerpts_with_projection(PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION)
+            .await
     }
 
     async fn reference_excerpts_with_projection(
@@ -1048,15 +1072,10 @@ impl CompactionRunner {
         }
         // Build bounded reference-only excerpts before materializing the active
         // full payload. They are reused across portions and retries.
-        let source_text_projection_version = source_text_projection_for_cursor(state);
-        let finish_legacy_source_before_upgrade =
-            state.source_text_projection_version == 0 && state.cursor.character > 0;
         // Reference-only excerpts carry no cursor or coverage, so they can use
         // the current projection even while a legacy active source drains.
         let reference_excerpts = self
-            .reference_excerpts_with_projection(
-                pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION,
-            )
+            .reference_excerpts_with_projection(PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION)
             .await?;
         let mut reference_scopes = BTreeMap::<&str, Vec<SourceRef>>::new();
         for excerpt in reference_excerpts {
@@ -1085,6 +1104,8 @@ impl CompactionRunner {
         let first = first
             .first()
             .ok_or_else(|| anyhow::anyhow!("no source progress available"))?;
+        let mut source_text_projection_version =
+            source_text_projection_for_cursor(state, &first.source);
         if first.source.scope.starts_with("checkpoint:")
             && Some(first.source.id.as_str()) == self.snapshot.expected_checkpoint.as_deref()
             && state.previous_checkpoint == self.snapshot.expected_checkpoint
@@ -1254,14 +1275,9 @@ impl CompactionRunner {
                         character: 0,
                     },
                 };
-                if finish_legacy_source_before_upgrade {
-                    return Ok(Portion {
-                        request,
-                        cursor,
-                        source_text_projection_version,
-                        completed,
-                        final_portion: next.is_none(),
-                    });
+                if let Some(next) = next {
+                    source_text_projection_version =
+                        source_text_projection_for_new_source(&next.source);
                 }
                 if finishes_unit {
                     boundary = Some(Portion {

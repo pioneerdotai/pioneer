@@ -879,6 +879,7 @@ impl crate::traits::Provider for BedrockProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         let prepared = prepare_messages_for_provider_async(
             self.name(),
+            request.model.as_str(),
             &self.capabilities(),
             request
                 .rendered_messages_with_compiled_sections()
@@ -1138,10 +1139,11 @@ mod tests {
     }
 
     use super::*;
-    use crate::attachments::prepare_messages_for_provider;
+    use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
     use crate::traits::Provider;
     use crate::types::{
-        ChatMessage, ChatRequest, CompiledPromptPayload, ReasoningConfig, ReasoningEffort,
+        ChatMessage, ChatRequest, CompiledPromptPayload, MessageProvenance, MessageSourceRef,
+        ProviderReplayState, ReasoningConfig, ReasoningEffort,
     };
     use std::sync::{Mutex, OnceLock};
 
@@ -1153,6 +1155,130 @@ mod tests {
     fn prepared_for(messages: &[ChatMessage]) -> crate::attachments::PreparedProviderMessages {
         let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
         prepare_messages_for_provider(provider.name(), &provider.capabilities(), messages).unwrap()
+    }
+
+    #[test]
+    fn foreign_reasoning_is_present_in_bedrock_wire_as_unsigned_text() {
+        let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
+        let mut message = ChatMessage::assistant("answer");
+        message.provider_replay_state = Some(ProviderReplayState::for_model(
+            "openrouter",
+            "source-model",
+            serde_json::json!({"reasoning_details":[{
+                "type":"reasoning.summary","summary":"meaningful rationale"
+            }]}),
+        ));
+        message.provenance = Some(MessageProvenance {
+            logical_turn_id: Some("turn".into()),
+            workspace_id: "workspace".into(),
+            thread_id: "thread".into(),
+            context_thread: None,
+            unit_id: "answer".into(),
+            sources: vec![MessageSourceRef {
+                scope: "event:turn".into(),
+                id: "source".into(),
+                version: "revision:1".into(),
+            }],
+            complete: true,
+            protected_input: false,
+            inherited: false,
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
+        });
+        let request = ChatRequest {
+            model: "anthropic.claude-target".into(),
+            messages: vec![message],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        let prepared = prepare_messages_for_provider_model(
+            provider.name(),
+            request.model.as_str(),
+            &provider.capabilities(),
+            request.messages.as_slice(),
+        )
+        .unwrap();
+        let wire = BedrockProvider::build_request(&request, &prepared).unwrap();
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(json.contains("meaningful rationale"));
+        assert!(json.contains("portable unsigned text"));
+        assert!(!json.contains("reasoning_details"));
+    }
+
+    #[test]
+    fn multiblock_reasoning_is_not_duplicated_on_bedrock_wire() {
+        let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
+        let mut canonical = ChatMessage::assistant("answer");
+        canonical.reasoning_content = Some("first second".into());
+        canonical.provider_replay_state = Some(ProviderReplayState::for_model(
+            "bedrock",
+            "source-model",
+            serde_json::json!({"blocks":[
+                {"reasoningText":{"text":"first ","signature":"opaque-one"}},
+                {"reasoningText":{"text":"second","signature":"opaque-two"}}
+            ]}),
+        ));
+        canonical.provenance = Some(MessageProvenance {
+            logical_turn_id: Some("turn".into()),
+            workspace_id: "workspace".into(),
+            thread_id: "thread".into(),
+            context_thread: None,
+            unit_id: "answer".into(),
+            sources: vec![MessageSourceRef {
+                scope: "event:turn".into(),
+                id: "source".into(),
+                version: "revision:1".into(),
+            }],
+            complete: true,
+            protected_input: false,
+            inherited: false,
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
+        });
+        let request = ChatRequest {
+            model: "different-model".into(),
+            messages: vec![canonical.clone()],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        let prepared = prepare_messages_for_provider_model(
+            provider.name(),
+            &request.model,
+            &provider.capabilities(),
+            &request.messages,
+        )
+        .unwrap();
+        let wire = BedrockProvider::build_request(&request, &prepared).unwrap();
+        let json = serde_json::to_string(&wire).unwrap();
+        assert_eq!(json.matches("first second").count(), 1);
+        assert!(!json.contains("opaque-one"));
+        let same_request = ChatRequest {
+            model: "source-model".into(),
+            ..request.clone()
+        };
+        let compatible = prepare_messages_for_provider_model(
+            provider.name(),
+            &same_request.model,
+            &provider.capabilities(),
+            &same_request.messages,
+        )
+        .unwrap();
+        let exact_wire = BedrockProvider::build_request(&same_request, &compatible).unwrap();
+        let exact_json = serde_json::to_string(&exact_wire).unwrap();
+        assert!(exact_json.contains("opaque-one"));
+        assert!(exact_json.contains("opaque-two"));
+        assert!(!exact_json.contains("first second"));
+        assert!(canonical.provider_replay_state.is_some());
     }
 
     #[test]

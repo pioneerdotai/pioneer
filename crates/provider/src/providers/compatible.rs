@@ -993,6 +993,7 @@ impl OpenAiCompatibleProvider {
             <OpenAiCompatibleProvider as crate::traits::Provider>::capabilities(self);
         let prepared = prepare_messages_for_provider_async(
             self.name.as_str(),
+            request.model.as_str(),
             &capabilities,
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
@@ -1010,6 +1011,14 @@ impl OpenAiCompatibleProvider {
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )?;
         self.build_chat_request_from_prepared(request, stream, prepared)
+    }
+
+    #[cfg(test)]
+    pub(super) fn render_chat_request_for_test(
+        &self,
+        request: ChatRequest,
+    ) -> Result<serde_json::Value> {
+        serde_json::to_value(self.build_chat_request(request, false)?).map_err(Into::into)
     }
 
     fn build_chat_request_from_prepared(
@@ -1430,12 +1439,35 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attachments::prepare_messages_for_provider;
+    use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
     use crate::traits::Provider;
     use crate::types::{
-        AttachmentDataSource, InputTypeSupport, MessageAttachment, MessageContentPart,
-        ProviderInputCapabilities, ProviderToolCall, ReasoningConfig, ReasoningEffort,
+        AttachmentArtifactContext, AttachmentDataSource, InputTypeSupport, MessageAttachment,
+        MessageContentPart, MessageProvenance, MessageSourceRef, ProviderInputCapabilities,
+        ProviderToolCall, ReasoningConfig, ReasoningEffort,
     };
+
+    fn complete_round(messages: &mut [ChatMessage]) {
+        for (index, message) in messages.iter_mut().enumerate() {
+            message.provenance = Some(MessageProvenance {
+                logical_turn_id: Some("turn".into()),
+                workspace_id: "workspace".into(),
+                thread_id: "thread".into(),
+                context_thread: None,
+                unit_id: "round".into(),
+                sources: vec![MessageSourceRef {
+                    scope: "event:turn".into(),
+                    id: format!("source-{index}"),
+                    version: "revision:1".into(),
+                }],
+                complete: true,
+                protected_input: false,
+                inherited: false,
+                source_aliases: vec![],
+                ambiguous_input_aliases: vec![],
+            });
+        }
+    }
 
     fn prepared_for(
         provider: &OpenAiCompatibleProvider,
@@ -1458,6 +1490,161 @@ mod tests {
             "sk-test-key",
             AuthStyle::Bearer,
         )
+    }
+
+    #[tokio::test]
+    async fn completed_transcript_keeps_typed_media_through_preflight_budget_and_wire() {
+        let provider = OpenAiCompatibleProvider::new(
+            "deepseek",
+            "https://api.example.com/v1",
+            "test-key",
+            AuthStyle::Bearer,
+        )
+        .with_input_capabilities(ProviderInputCapabilities {
+            text: true,
+            file: InputTypeSupport::native_inline_only(),
+            image: InputTypeSupport::data_url_inline_only(),
+            audio: InputTypeSupport::disabled(),
+            video: InputTypeSupport::disabled(),
+        });
+        let mut messages = vec![
+            ChatMessage::assistant_tool_calls_with_provider_state(
+                None::<String>,
+                None::<String>,
+                vec![ProviderToolCall {
+                    id: "call".into(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                }],
+                Some(ProviderReplayState::for_model(
+                    "openrouter",
+                    "source",
+                    serde_json::json!({"reasoning_details":[]}),
+                )),
+            ),
+            ChatMessage::tool_result("call", "read", "tool result"),
+        ];
+        messages[1].content_parts = vec![
+            MessageContentPart::image(MessageAttachment {
+                mime_type: "image/png".into(),
+                name: Some("snapshot.png".into()),
+                size_bytes: None,
+                sha256: None,
+                source: AttachmentDataSource::Bytes {
+                    base64_data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+VrWQAAAAASUVORK5CYII=".into(),
+                },
+                artifact: Some(AttachmentArtifactContext {
+                    workspace_id: "workspace".into(),
+                    artifact_id: "artifact-image".into(),
+                    artifact_version_id: Some("v1".into()),
+                }),
+            }),
+            MessageContentPart::file(MessageAttachment {
+                mime_type: "text/plain".into(),
+                name: Some("document.txt".into()),
+                size_bytes: Some(20),
+                sha256: None,
+                source: AttachmentDataSource::Bytes {
+                    base64_data: "dG9vbCByZXN1bHQgZG9jdW1lbnQ=".into(),
+                },
+                artifact: Some(AttachmentArtifactContext {
+                    workspace_id: "workspace".into(),
+                    artifact_id: "artifact-file".into(),
+                    artifact_version_id: Some("v2".into()),
+                }),
+            }),
+        ];
+        complete_round(&mut messages);
+        let canonical = messages.clone();
+        let prepared = prepare_messages_for_provider_model(
+            provider.name(),
+            "deepseek-reasoner",
+            &provider.capabilities(),
+            &messages,
+        )
+        .unwrap();
+        assert_eq!(prepared.budget_report.attachment_count, 2);
+        assert!(prepared.budget_report.total_bytes > 20);
+        assert_eq!(
+            prepared.attachments[0]
+                .artifact
+                .as_ref()
+                .map(|artifact| artifact.artifact_id.as_str()),
+            Some("artifact-image")
+        );
+        assert_eq!(
+            prepared.attachments[1]
+                .artifact
+                .as_ref()
+                .map(|artifact| artifact.artifact_id.as_str()),
+            Some("artifact-file")
+        );
+        let request = ChatRequest {
+            model: "deepseek-reasoner".into(),
+            messages: messages.clone(),
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        let budgeted = crate::attachments::runtime::with_async_authority_scope(
+            "completed-transcript-media-fixture".to_owned(),
+            provider.prepare_input_budget(request),
+        )
+        .await
+        .unwrap();
+        assert_eq!(budgeted.media.len(), 2);
+        assert!(
+            budgeted
+                .media
+                .iter()
+                .all(|estimate| estimate.input_tokens > 0)
+        );
+        assert_eq!(budgeted.request.messages[1].content_parts.len(), 2);
+        assert!(matches!(
+            &budgeted.request.messages[1].content_parts[0],
+            MessageContentPart::Image { image }
+                if image.sha256.is_some()
+                    && image.artifact.as_ref().is_some_and(|artifact| artifact.artifact_id == "artifact-image")
+        ));
+        assert!(matches!(
+            &budgeted.request.messages[1].content_parts[1],
+            MessageContentPart::File { file }
+                if file.sha256.is_some()
+                    && file.artifact.as_ref().is_some_and(|artifact| artifact.artifact_id == "artifact-file")
+        ));
+        let prepared_wire = prepare_messages_for_provider_model(
+            provider.name(),
+            "deepseek-reasoner",
+            &provider.capabilities(),
+            &budgeted.request.messages,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared_wire.budget_report.total_bytes,
+            prepared.budget_report.total_bytes
+        );
+        let wire = provider
+            .build_chat_request_from_prepared(budgeted.request, false, prepared_wire)
+            .unwrap();
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["messages"].as_array().unwrap().len(), 2);
+        assert!(json["messages"][0].get("tool_calls").is_none());
+        assert!(json["messages"][1].get("tool_call_id").is_none());
+        assert!(
+            json["messages"][1]["content"]
+                .to_string()
+                .contains("image_url")
+        );
+        assert!(
+            json["messages"][1]["content"]
+                .to_string()
+                .contains("file_data")
+        );
+        assert_eq!(messages, canonical);
     }
 
     #[test]
@@ -1644,6 +1831,60 @@ mod tests {
                 .arguments,
             "{\"path\":\"README.md\"}"
         );
+    }
+
+    #[test]
+    fn openrouter_completed_tool_round_renders_for_deepseek_compatible_wire() {
+        let calls = vec![ProviderToolCall {
+            id: "call_1".to_owned(),
+            name: "inspect".to_owned(),
+            arguments: "{}".to_owned(),
+        }];
+        let replay = ProviderReplayState::new(
+            "openrouter",
+            serde_json::json!({
+                "reasoning_details": [
+                    {"type":"reasoning.encrypted","data":"opaque"},
+                    {"type":"reasoning.summary","summary":"portable openrouter reasoning"}
+                ]
+            }),
+        );
+        let mut messages = vec![
+            ChatMessage::assistant_tool_calls_with_provider_state(
+                None::<String>,
+                Some("portable openrouter reasoning"),
+                calls,
+                Some(replay.clone()),
+            ),
+            ChatMessage::tool_result("call_1", "inspect", "tool outcome"),
+        ];
+        complete_round(&mut messages);
+        let canonical = messages.clone();
+        let provider = OpenAiCompatibleProvider::new(
+            "deepseek",
+            "https://api.deepseek.com",
+            "key",
+            AuthStyle::Bearer,
+        );
+
+        let prepared = prepare_messages_for_provider_model(
+            provider.name(),
+            "deepseek-chat",
+            &provider.capabilities(),
+            messages.as_slice(),
+        )
+        .unwrap();
+        let wire = provider.convert_messages(&prepared).unwrap();
+
+        assert_eq!(wire.len(), 2);
+        assert_eq!(
+            wire[0].reasoning_content.as_deref(),
+            Some("portable openrouter reasoning")
+        );
+        assert_eq!(wire[0].tool_calls.as_ref().unwrap()[0].id, "call_1");
+        assert_eq!(wire[1].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(canonical[0].provider_replay_state.as_ref(), Some(&replay));
+        assert_eq!(messages, canonical);
     }
 
     #[test]

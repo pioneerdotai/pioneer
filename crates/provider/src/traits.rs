@@ -61,6 +61,7 @@ pub trait Provider: Send + Sync {
         &self,
         request: ChatRequest,
     ) -> Result<crate::attachments::PreparedInputBudget> {
+        let request = crate::history::project_request_for_provider(self.name(), request)?;
         crate::attachments::input_estimate::prepare(self.name(), &self.capabilities(), request)
             .await
     }
@@ -265,5 +266,61 @@ mod tests {
             MockProvider.warmup().await.expect("default warm-up"),
             ProviderWarmupOutcome::NotSupported
         );
+    }
+
+    #[tokio::test]
+    async fn default_budget_preflight_uses_target_model_history_projection() {
+        use crate::{MessageProvenance, MessageSourceRef, ProviderReplayState};
+
+        let replay = ProviderReplayState::for_model(
+            "foreign",
+            "source-model",
+            serde_json::json!({
+                "schema_version":1,
+                "assistant_message":{
+                    "content":null,
+                    "reasoning_content":"meaningful reasoning",
+                    "tool_calls":[]
+                }
+            }),
+        );
+        let mut message = ChatMessage::assistant("answer");
+        message.provider_replay_state = Some(replay.clone());
+        message.provenance = Some(MessageProvenance {
+            logical_turn_id: Some("turn".into()),
+            workspace_id: "workspace".into(),
+            thread_id: "thread".into(),
+            context_thread: None,
+            unit_id: "answer".into(),
+            sources: vec![MessageSourceRef {
+                scope: "event:turn".into(),
+                id: "source".into(),
+                version: "revision:1".into(),
+            }],
+            complete: true,
+            protected_input: false,
+            inherited: false,
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
+        });
+        let request = ChatRequest {
+            model: "target-model".into(),
+            messages: vec![message.clone()],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+
+        let prepared = MockProvider.prepare_input_budget(request).await.unwrap();
+        assert_eq!(
+            prepared.request.messages[0].reasoning_content.as_deref(),
+            Some("meaningful reasoning")
+        );
+        assert!(prepared.request.messages[0].provider_replay_state.is_none());
+        assert_eq!(message.provider_replay_state.as_ref(), Some(&replay));
     }
 }

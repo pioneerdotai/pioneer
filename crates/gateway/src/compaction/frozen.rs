@@ -5271,9 +5271,12 @@ async fn restore_entry_from_payloads(
         } else if source.scope.starts_with("context:") {
             if let Ok(envelope) = serde_json::from_str::<CanonicalProviderRoundEnvelope>(payload) {
                 if envelope.termination == pioneer_provider::ProviderTermination::ProviderError {
-                    candidates.push(FrozenModelCandidate::exact(
-                        super::history::provider_observation(payload)?,
+                    let portable = super::history::provider_observation(payload)?;
+                    candidates.push(FrozenModelCandidate::upgraded(
+                        super::history::legacy_provider_observation(payload)?,
+                        portable.clone(),
                     ));
+                    candidates.push(FrozenModelCandidate::exact(portable));
                 } else {
                     candidates.push(FrozenModelCandidate::exact(envelope.message));
                 }
@@ -5384,10 +5387,13 @@ async fn finish_restored_entry(
                 serde_json::to_string(message)?
             )))
         };
+        let portable = pioneer_provider::history::portable_history_message(&candidate.model);
+        let model = interrupted(&portable)?;
         candidates.push(FrozenModelCandidate::upgraded(
             interrupted(&candidate.wire)?,
-            interrupted(&candidate.model)?,
+            model.clone(),
         ));
+        candidates.push(FrozenModelCandidate::exact(model));
     }
     let verified = verified_model_candidate(&reference.wire_sha256, candidates)?;
     let mut message = match projection {
@@ -5471,6 +5477,47 @@ mod policy_tests {
         assert_eq!(projected.content.matches("frozen-unique-output").count(), 1);
         assert!(
             verified_model_message(&"0".repeat(64), vec![FrozenModelCandidate::exact(current)])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_frozen_provider_observation_verifies_old_wire_before_portable_model() {
+        let mut message = ChatMessage::assistant("partial answer");
+        message.reasoning_content = Some("common reason".into());
+        message.provider_replay_state = Some(pioneer_provider::ProviderReplayState::for_model(
+            "openrouter",
+            "source-model",
+            serde_json::json!({"reasoning_details":[
+                {"type":"reasoning.encrypted","data":"opaque-secret"},
+                {"type":"reasoning.summary","summary":"readable reason"}
+            ]}),
+        ));
+        let payload = serde_json::to_string(&pioneer_provider::CanonicalProviderRoundEnvelope {
+            version: 1,
+            round_id: "failed".into(),
+            termination: pioneer_provider::ProviderTermination::ProviderError,
+            message,
+            calls: vec![],
+        })
+        .unwrap();
+        let legacy = super::history::legacy_provider_observation(&payload).unwrap();
+        let portable = super::history::provider_observation(&payload).unwrap();
+        assert!(legacy.content.contains("opaque-secret"));
+        assert!(!portable.content.contains("opaque-secret"));
+        assert!(portable.content.contains("readable reason"));
+        let hash = wire_digest(&legacy).unwrap();
+        let restored = verified_model_message(
+            &hash,
+            vec![
+                FrozenModelCandidate::upgraded(legacy, portable.clone()),
+                FrozenModelCandidate::exact(portable),
+            ],
+        )
+        .unwrap();
+        assert!(!restored.content.contains("opaque-secret"));
+        assert!(
+            verified_model_message(&"0".repeat(64), vec![FrozenModelCandidate::exact(restored)])
                 .is_err()
         );
     }

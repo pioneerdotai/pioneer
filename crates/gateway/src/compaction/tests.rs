@@ -1025,7 +1025,7 @@ fn durable_character_cursor_remains_bound_to_its_text_projection() {
     legacy_json["cursor"]["character"] = serde_json::json!(37);
     let legacy: RunnerState = serde_json::from_value(legacy_json).unwrap();
     assert_eq!(legacy.source_text_projection_version, 0);
-    assert_eq!(source_text_projection_for_cursor(&legacy), 0);
+    assert_eq!(source_text_projection_for_cursor(&legacy, &source), 0);
     let legacy_text = historical_source_model_payload(
         &source,
         raw.clone(),
@@ -1050,7 +1050,7 @@ fn durable_character_cursor_remains_bound_to_its_text_projection() {
     let mut legacy_boundary = legacy.clone();
     legacy_boundary.cursor.character = 0;
     assert_eq!(
-        source_text_projection_for_cursor(&legacy_boundary),
+        source_text_projection_for_cursor(&legacy_boundary, &source),
         pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION
     );
 
@@ -1944,6 +1944,113 @@ async fn frozen_command_upgrade_is_bound_to_canonical_event_not_message_text() {
 }
 
 #[tokio::test]
+async fn legacy_frozen_failed_provider_observation_restores_portable_execution_after_hash() {
+    use pioneer_provider::{
+        CanonicalProviderRoundEnvelope, ChatMessage, MessageProvenance, MessageSourceRef,
+        ProviderReplayState, ProviderTermination,
+    };
+    let f = fixture("unused", vec![], true, false).await;
+    let mut partial = ChatMessage::assistant("partial answer");
+    partial.reasoning_content = Some("common reasoning".into());
+    partial.provider_replay_state = Some(ProviderReplayState::for_model(
+        "openrouter",
+        "source-model",
+        serde_json::json!({"reasoning_details":[
+            {"type":"reasoning.encrypted","data":"opaque-secret"},
+            {"type":"reasoning.summary","summary":"additional reasoning"}
+        ]}),
+    ));
+    let payload = serde_json::to_string(&CanonicalProviderRoundEnvelope {
+        version: 1,
+        round_id: "failed-round".into(),
+        termination: ProviderTermination::ProviderError,
+        message: partial,
+        calls: vec![],
+    })
+    .unwrap();
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES('frozen-failed','turn','failed-round',5,'provider_observation',?,'{}',CURRENT_TIMESTAMP)",
+        [payload.clone().into()],
+    )).await.unwrap();
+    let source = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::ProviderContext, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.reference.id == "frozen-failed")
+        .unwrap()
+        .reference;
+    let mut legacy = super::history::legacy_provider_observation(&payload).unwrap();
+    legacy.provenance = Some(MessageProvenance {
+        logical_turn_id: Some("turn".into()),
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        context_thread: None,
+        unit_id: "failed-round".into(),
+        sources: vec![MessageSourceRef {
+            scope: source.scope.clone(),
+            id: source.id.clone(),
+            version: source.version.clone(),
+        }],
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
+        complete: true,
+        protected_input: false,
+        inherited: false,
+    });
+    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+    let descriptor = super::frozen::capture(&f.store, "ws", "thread", &allowed, &[legacy.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        super::frozen::restore(&f.store, "ws", &allowed, &descriptor)
+            .await
+            .unwrap(),
+        vec![legacy.clone()]
+    );
+    let restored = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        None,
+        "thread",
+        &allowed,
+        &serde_json::to_string(&descriptor).unwrap(),
+    )
+    .await
+    .unwrap()
+    .messages;
+    assert_eq!(restored.len(), 1);
+    assert!(restored[0].content.contains("partial answer"));
+    assert!(restored[0].content.contains("common reasoning"));
+    assert!(restored[0].content.contains("additional reasoning"));
+    assert!(!restored[0].content.contains("opaque-secret"));
+    assert_eq!(restored[0].provenance, legacy.provenance);
+    let mut corrupted = f
+        .store
+        .compaction_frozen_history_page("ws", "thread", &descriptor.manifest_id, 0)
+        .await
+        .unwrap()
+        .remove(0);
+    corrupted.wire_sha256 = "0".repeat(64);
+    assert!(
+        super::frozen::restore_reference_for_test(&f.store, "ws", &corrupted)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        f.store
+            .compaction_reference_payload("ws", "thread", &source)
+            .await
+            .unwrap()
+            .unwrap(),
+        payload
+    );
+}
+
+#[tokio::test]
 async fn classified_technical_event_does_not_load_its_compressed_payload() {
     let f = fixture("unused", vec![], true, false).await;
     f.store.database_connection().execute_unprepared(
@@ -2591,6 +2698,31 @@ async fn fixture_with_canonical_payloads(
     }
 }
 
+// These runner tests synthesize a durable manifest after the common fixture
+// activates its operation. Seed the already-active snapshot directly: the
+// production append API intentionally rejects changes after activation.
+async fn seed_active_manifest_entries(store: &CrudStore, entries: &[ManifestEntry]) {
+    for entry in entries {
+        store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES('operation',?,?,?,?,?,?,?)",
+                [
+                    i64::try_from(entry.ordinal).unwrap().into(),
+                    i64::try_from(entry.unit).unwrap().into(),
+                    entry.reference_only.into(),
+                    entry.thread_id.clone().into(),
+                    entry.source.scope.clone().into(),
+                    entry.source.id.clone().into(),
+                    entry.source.version.clone().into(),
+                ],
+            ))
+            .await
+            .unwrap();
+    }
+}
+
 async fn install_publication_retry_probe(fixture: &Fixture) {
     fixture
         .store
@@ -3193,7 +3325,10 @@ async fn compaction_runner_durably_finishes_legacy_cursor_before_projecting_next
     assert_eq!(after_first_checkpoint.cursor.unit, 0);
     assert_eq!(after_first_checkpoint.cursor.source, 1);
     assert_eq!(after_first_checkpoint.cursor.character, 0);
-    assert_eq!(after_first_checkpoint.source_text_projection_version, 0);
+    assert_eq!(
+        after_first_checkpoint.source_text_projection_version,
+        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION
+    );
     assert!(after_first_checkpoint.previous_checkpoint.is_some());
     second_run.abort();
     assert!(second_run.await.unwrap_err().is_cancelled());
@@ -3223,7 +3358,10 @@ async fn compaction_runner_durably_finishes_legacy_cursor_before_projecting_next
         before_interrupted_retry.cursor,
         after_first_checkpoint.cursor
     );
-    assert_eq!(before_interrupted_retry.source_text_projection_version, 0);
+    assert_eq!(
+        before_interrupted_retry.source_text_projection_version,
+        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION
+    );
     assert_eq!(
         before_interrupted_retry.previous_checkpoint,
         after_first_checkpoint.previous_checkpoint
@@ -22524,4 +22662,1341 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
             !unit.text.contains("nested-copy-257") && !unit.text.contains("historical-copy-0")
         }));
     }
+}
+#[test]
+fn native_budget_measures_portable_reasoning_and_not_incompatible_replay() {
+    use pioneer_agent::compaction::request::NativeRequestProjection;
+    use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef, ProviderReplayState};
+
+    let reasoning = "meaningful rationale ".repeat(300);
+    let mut message = ChatMessage::assistant("answer");
+    message.provider_replay_state = Some(ProviderReplayState::for_model(
+        "deepseek",
+        "source-model",
+        serde_json::json!({
+            "schema_version":1,
+            "assistant_message":{
+                "content":"answer",
+                "reasoning_content":reasoning,
+                "tool_calls":[]
+            },
+            "opaque":"x".repeat(12_000)
+        }),
+    ));
+    message.provenance = Some(MessageProvenance {
+        logical_turn_id: Some("turn".into()),
+        workspace_id: "workspace".into(),
+        thread_id: "thread".into(),
+        context_thread: None,
+        unit_id: "answer".into(),
+        sources: vec![MessageSourceRef {
+            scope: "event:turn".into(),
+            id: "source".into(),
+            version: "revision:1".into(),
+        }],
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
+        complete: true,
+        protected_input: false,
+        inherited: false,
+    });
+    let request = ChatRequest {
+        model: "target-model".into(),
+        messages: vec![message],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let projected =
+        pioneer_provider::history::project_request_for_provider("openrouter", request).unwrap();
+    assert!(projected.messages[0].provider_replay_state.is_none());
+    assert_eq!(
+        projected.messages[0].reasoning_content.as_deref(),
+        Some(reasoning.as_str())
+    );
+    let without_reasoning = ChatRequest {
+        messages: vec![ChatMessage::assistant("answer")],
+        ..projected.clone()
+    };
+    let budget = ModelBudget::new(Some(32_000), None, None);
+    let measured = NativeRequestProjection::full(projected, vec![], budget.clone(), false).unwrap();
+    let missing = NativeRequestProjection::full(without_reasoning, vec![], budget, false).unwrap();
+    assert!(measured.estimated_input_tokens > missing.estimated_input_tokens);
+    assert!(
+        !serde_json::to_string(&measured.request.messages)
+            .unwrap()
+            .contains(&"x".repeat(12_000))
+    );
+    let mut multiblock = ChatMessage::assistant("answer");
+    multiblock.reasoning_content = Some("first second".into());
+    multiblock.provenance = measured.request.messages[0].provenance.clone();
+    multiblock.provider_replay_state = Some(ProviderReplayState::for_model(
+        "anthropic",
+        "source-model",
+        serde_json::json!({"blocks":[
+            {"type":"thinking","thinking":"first ","signature":"opaque-one"},
+            {"type":"thinking","thinking":"second","signature":"opaque-two"}
+        ]}),
+    ));
+    let canonical = multiblock.clone();
+    let multiblock_request = ChatRequest {
+        model: "target-model".into(),
+        messages: vec![multiblock],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let outbound =
+        pioneer_provider::history::project_request_for_provider("openrouter", multiblock_request)
+            .unwrap();
+    assert_eq!(
+        outbound.messages[0].reasoning_content.as_deref(),
+        Some("first second")
+    );
+    assert!(outbound.messages[0].provider_replay_state.is_none());
+    let mut expected_message = canonical.clone();
+    expected_message.provider_replay_state = None;
+    let expected = ChatRequest {
+        messages: vec![expected_message],
+        ..outbound.clone()
+    };
+    assert_eq!(outbound.messages, expected.messages);
+    let budget = ModelBudget::new(Some(32_000), None, None);
+    let actual = NativeRequestProjection::full(outbound, vec![], budget.clone(), false).unwrap();
+    let once = NativeRequestProjection::full(expected, vec![], budget, false).unwrap();
+    assert_eq!(actual.estimated_input_tokens, once.estimated_input_tokens);
+    assert!(
+        !serde_json::to_string(&actual.request.messages)
+            .unwrap()
+            .contains("opaque-one")
+    );
+    assert!(canonical.provider_replay_state.is_some());
+}
+
+#[tokio::test]
+async fn foreground_native_projection_reuses_one_owner_across_model_windows() {
+    use pioneer_agent::compaction::controller::NativeContext;
+    use pioneer_provider::{
+        CanonicalProviderRoundEnvelope, ChatMessage, MessageProvenance, MessageSourceRef,
+        ProviderRegistry, ProviderReplayState, ProviderTermination,
+    };
+
+    let f = fixture("seed", vec![], true, false).await;
+    let mut historical =
+        ChatMessage::assistant(format!("saved answer {}", "long fact ".repeat(6_000)));
+    historical.reasoning_content = Some("common rationale".into());
+    historical.provider_replay_state = Some(ProviderReplayState::for_model(
+        "deepseek",
+        "source-model",
+        serde_json::json!({
+            "schema_version":1,
+            "assistant_message":{
+                "content":null,
+                "reasoning_content":"additional rationale",
+                "tool_calls":[]
+            },
+            "opaque":"opaque-replay-secret"
+        }),
+    ));
+    let canonical = serde_json::to_string(&CanonicalProviderRoundEnvelope {
+        version: 1,
+        round_id: "historical-round".into(),
+        termination: ProviderTermination::Complete,
+        message: historical.clone(),
+        calls: vec![],
+    })
+    .unwrap();
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES('native-portable-context','turn','native-portable-item',2,'assistant_round',?,'{}',CURRENT_TIMESTAMP)",
+        [canonical.clone().into()],
+    )).await.unwrap();
+    let source = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::ProviderContext, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.reference.id == "native-portable-context")
+        .unwrap()
+        .reference;
+    historical.provenance = Some(MessageProvenance {
+        logical_turn_id: Some("turn".into()),
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        context_thread: None,
+        unit_id: "historical-round".into(),
+        sources: vec![MessageSourceRef {
+            scope: source.scope,
+            id: source.id,
+            version: source.version,
+        }],
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
+        complete: true,
+        protected_input: false,
+        inherited: false,
+    });
+    let canonical_message = historical.clone();
+    let providers = ProviderRegistry::with_provider("main-fixture", Arc::new(SmallWindowMain));
+    providers
+        .insert("summary-fixture", f.provider.clone())
+        .unwrap();
+    let context = NativeContext {
+        overflow_recovery: false,
+        recovery_deadline_ms: None,
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "turn".into(),
+        conversation_thread_id: None,
+        provider_instance: "main-fixture".into(),
+        provider: providers
+            .get_or_create_for_workspace("ws", "main-fixture")
+            .unwrap(),
+        events: Arc::new(ExecutionEventHub::new()),
+        cancellation: CancellationToken::new(),
+    };
+    let settings = CompactionSettings {
+        selection: Some(ModelSelection {
+            transport: Transport::Api,
+            instance: "summary-fixture".into(),
+            model: "summary-model".into(),
+            effort: None,
+        }),
+    };
+    let request = |model: &str| ChatRequest {
+        model: model.into(),
+        messages: vec![historical.clone(), ChatMessage::user("current input")],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let fitting = super::native::prepare_native_projection(
+        &f.store,
+        &providers,
+        &settings,
+        &context,
+        request("gpt-4o"),
+        None,
+        false,
+        f.observer.clone(),
+        f.clock.clone(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let joined = fitting
+        .request
+        .messages
+        .iter()
+        .map(|message| {
+            format!(
+                "{}{}",
+                message.content,
+                message.reasoning_content.as_deref().unwrap_or_default()
+            )
+        })
+        .collect::<String>();
+    assert!(joined.contains("common rationale"));
+    assert!(joined.contains("additional rationale"));
+    assert!(!joined.contains("opaque-replay-secret"));
+    assert_eq!(f.provider.calls.lock().unwrap().len(), 0);
+    let owner = super::native::native_owner("ws", "thread");
+    assert!(f.store.compaction_head(&owner).await.unwrap().is_none());
+
+    let compacted = super::native::prepare_native_projection(
+        &f.store,
+        &providers,
+        &settings,
+        &context,
+        request("gpt-4"),
+        None,
+        false,
+        f.observer.clone(),
+        f.clock.clone(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let head = f
+        .store
+        .compaction_head(&owner)
+        .await
+        .unwrap()
+        .expect("smaller window must publish one checkpoint");
+    assert!(
+        compacted
+            .request
+            .messages
+            .iter()
+            .any(|message| message.content.contains("current input"))
+    );
+    assert!(
+        compacted
+            .request
+            .messages
+            .iter()
+            .any(|message| message.content.contains("State."))
+    );
+    assert!(f.provider.calls.lock().unwrap().len() > 0);
+    assert_eq!(historical, canonical_message);
+    let stored: String = f
+        .store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT payload FROM turn_llm_context WHERE id='native-portable-context'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "payload")
+        .unwrap();
+    assert_eq!(stored, canonical);
+    assert!(
+        f.store
+            .compaction_checkpoint(&head)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn durable_context_cursor_finishes_old_text_before_portable_next_source() {
+    use pioneer_provider::{
+        CanonicalProviderRoundEnvelope, ChatMessage, ProviderReplayState, ProviderTermination,
+    };
+
+    for old_version in [None, Some(1_u32)] {
+        let f = fixture("unused", vec![], true, false).await;
+        let context_payload = |id: &str, opaque: &str| {
+            let mut message = ChatMessage::assistant(format!("answer {id}"));
+            message.provider_replay_state = Some(ProviderReplayState::for_model(
+                "openrouter",
+                "source-model",
+                serde_json::json!({
+                    "reasoning_details":[{"type":"reasoning.encrypted","data":opaque}]
+                }),
+            ));
+            serde_json::to_string(&CanonicalProviderRoundEnvelope {
+                version: 1,
+                round_id: id.into(),
+                termination: ProviderTermination::Complete,
+                message,
+                calls: vec![],
+            })
+            .unwrap()
+        };
+        let old = context_payload("old", &"x".repeat(18_000));
+        let next = context_payload("next", "next-opaque-secret");
+        let db = f.store.database_connection();
+        for (id, sequence, payload) in [("cursor-old", 2_i64, &old), ("cursor-next", 3_i64, &next)]
+        {
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES(?,'turn',?,?,'assistant_round',?,'{}',CURRENT_TIMESTAMP)",
+                [id.into(), id.into(), sequence.into(), payload.to_owned().into()],
+            ))
+            .await
+            .unwrap();
+        }
+        let entries = f
+            .store
+            .compaction_source_page("ws", "thread", "turn", PagedSource::ProviderContext, 0)
+            .await
+            .unwrap()
+            .entries;
+        let source = |id: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.reference.id == id)
+                .unwrap()
+                .reference
+                .clone()
+        };
+        let old_source = source("cursor-old");
+        let next_source = source("cursor-next");
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_manifest SET source_scope=?,source_id=?,source_version=? WHERE operation_id='operation' AND ordinal=0",
+            [
+                old_source.scope.clone().into(),
+                old_source.id.clone().into(),
+                old_source.version.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        seed_active_manifest_entries(
+            &f.store,
+            &[ManifestEntry {
+                ordinal: 1,
+                unit: 0,
+                reference_only: false,
+                thread_id: "thread".into(),
+                source: next_source.clone(),
+            }],
+        )
+        .await;
+        let offset = 8_000_u64;
+        assert!(
+            offset
+                > pioneer_provider::history::portable_history_payload(&old)
+                    .chars()
+                    .count() as u64
+        );
+        let mut saved = serde_json::to_value(
+            f.store
+                .compaction_runner_state("operation")
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        match old_version {
+            None => {
+                saved
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("source_text_projection_version");
+            }
+            Some(version) => saved["source_text_projection_version"] = version.into(),
+        }
+        saved["cursor"]["character"] = offset.into();
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_runner_state SET state=? WHERE operation_id='operation'",
+            [saved.to_string().into()],
+        ))
+        .await
+        .unwrap();
+        let state = f
+            .store
+            .compaction_runner_state("operation")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.source_text_projection_version,
+            old_version.unwrap_or(0)
+        );
+        let restart = || {
+            CompactionRunner::new(
+                f.store.clone(),
+                "ws".into(),
+                "thread".into(),
+                f.runner.snapshot.clone(),
+                f.runner.summarizer.clone(),
+                Arc::new(Target(true)),
+                f.observer.clone(),
+                f.clock.clone(),
+            )
+        };
+        let retry = restart();
+        let first = retry
+            .portion(&state, AttemptPurpose::Portion)
+            .await
+            .unwrap();
+        let repeated = retry
+            .portion(&state, AttemptPurpose::Portion)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&first.request.input).unwrap(),
+            serde_json::to_value(&repeated.request.input).unwrap()
+        );
+        assert_eq!(first.completed, [old_source.clone(), next_source.clone()]);
+        assert!(first.final_portion);
+        assert_eq!(first.cursor.source, 0);
+        assert_eq!(first.cursor.character, 0);
+        assert_eq!(
+            first.source_text_projection_version,
+            PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION
+        );
+        assert_eq!(first.request.input.compact_units.len(), 2);
+        assert_eq!(first.request.input.compact_units[0].part, offset);
+        assert_eq!(
+            first.request.input.compact_units[0].text,
+            old.chars().skip(offset as usize).collect::<String>()
+        );
+        assert_eq!(
+            first.request.input.compact_units[1].text,
+            pioneer_provider::history::portable_history_payload(&next)
+        );
+        assert!(
+            !first.request.input.compact_units[1]
+                .text
+                .contains("next-opaque-secret")
+        );
+        let portable = retry
+            .active_payload_fragment_with_projection(
+                "thread",
+                &old_source,
+                0,
+                PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            portable.text,
+            pioneer_provider::history::portable_history_payload(&old)
+        );
+        assert_eq!(
+            retry
+                .active_payload
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .projection_version,
+            PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION
+        );
+        let backoff = state
+            .claim(0)
+            .unwrap()
+            .attempt_failed(FailureKind::Transient, 0, Some(12_000))
+            .unwrap();
+        assert!(matches!(backoff.phase, RunnerPhase::Backoff { .. }));
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_runner_state SET generation=?,state=? WHERE operation_id='operation'",
+            [
+                backoff.generation.into(),
+                serde_json::to_string(&backoff).unwrap().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        // The injected backoff follows one admitted attempt. Keep the
+        // operation's durable attempt counter in sync with that state.
+        db.execute_unprepared("UPDATE compaction_operation SET attempts=1 WHERE id='operation'")
+            .await
+            .unwrap();
+        let saved_retry = f
+            .store
+            .compaction_runner_state("operation")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved_retry.cursor, state.cursor);
+        assert_eq!(
+            saved_retry.source_text_projection_version,
+            old_version.unwrap_or(0)
+        );
+        let after_retry = restart()
+            .portion(&saved_retry, AttemptPurpose::Portion)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&first.request.input).unwrap(),
+            serde_json::to_value(&after_retry.request.input).unwrap()
+        );
+
+        // The representation switch happens inside this one summary request;
+        // the persisted next cursor records v2 and no manual cursor reset is
+        // required between the two sources.
+        f.clock.advance(12_000);
+        let applied = restart().run(CancellationToken::new()).await.unwrap();
+        let CompactionExit::Applied(head) = applied else {
+            panic!("restarted runner did not publish its candidate")
+        };
+        let persisted = f
+            .store
+            .compaction_runner_state("operation")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.source_text_projection_version,
+            PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION
+        );
+        assert_eq!(persisted.cursor, first.cursor);
+        assert_eq!(
+            persisted.previous_checkpoint.as_deref(),
+            Some(head.as_str())
+        );
+        let checkpoint = f.store.compaction_checkpoint(&head).await.unwrap().unwrap();
+        assert_eq!(
+            checkpoint
+                .coverage
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [old_source.clone(), next_source.clone()]
+                .into_iter()
+                .collect()
+        );
+        assert!(!checkpoint.summary.is_empty());
+        for (id, expected) in [("cursor-old", old), ("cursor-next", next)] {
+            let stored: String = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "SELECT payload FROM turn_llm_context WHERE id=?",
+                    [id.into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "payload")
+                .unwrap();
+            assert_eq!(stored, expected);
+        }
+    }
+}
+
+#[test]
+fn source_projection_version_switches_only_at_a_source_boundary() {
+    let budget = ModelBudget::new(Some(8_000), None, None);
+    let mut state = RunnerState::new(90_000, &budget, 100, None).unwrap();
+    let command = SourceRef {
+        scope: "item:turn".into(),
+        id: "command".into(),
+        version: "item-revision:1".into(),
+    };
+    let context = SourceRef {
+        scope: "context:turn".into(),
+        id: "provider-round".into(),
+        version: "context-revision:1".into(),
+    };
+    assert_eq!(state.source_text_projection_version, 1);
+    assert_eq!(source_text_projection_for_cursor(&state, &command), 1);
+    assert_eq!(source_text_projection_for_cursor(&state, &context), 2);
+    state.cursor.character = 9;
+    assert_eq!(source_text_projection_for_cursor(&state, &context), 1);
+    state.source_text_projection_version = 2;
+    assert_eq!(source_text_projection_for_cursor(&state, &command), 2);
+    state.cursor.character = 0;
+    assert_eq!(source_text_projection_for_cursor(&state, &command), 1);
+}
+
+#[tokio::test]
+async fn partially_read_portable_context_survives_checkpoint_and_restart() {
+    use pioneer_provider::{
+        CanonicalProviderRoundEnvelope, ChatMessage, ProviderReplayState, ProviderTermination,
+    };
+    let f = fixture("unused", vec![Reply::Success, Reply::Hang], true, false).await;
+    let db = f.store.database_connection();
+    let payload = |id: &str, text: String| {
+        let mut message = ChatMessage::assistant(text);
+        message.provider_replay_state = Some(ProviderReplayState::for_model(
+            "openrouter",
+            "source-model",
+            serde_json::json!({"reasoning_details":[{"type":"reasoning.encrypted","data":"opaque-secret"}]}),
+        ));
+        serde_json::to_string(&CanonicalProviderRoundEnvelope {
+            version: 1,
+            round_id: id.into(),
+            termination: ProviderTermination::Complete,
+            message,
+            calls: vec![],
+        })
+        .unwrap()
+    };
+    let first_raw = payload(
+        "portable-large",
+        "large context ".to_owned() + &"a".repeat(50_000),
+    );
+    let next_raw = payload("portable-next", "next context fact".into());
+    for (id, sequence, value) in [
+        ("portable-large", 2_i64, &first_raw),
+        ("portable-next", 3_i64, &next_raw),
+    ] {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES(?,'turn',?,?,'assistant_round',?,'{}',CURRENT_TIMESTAMP)",
+            [id.into(), id.into(), sequence.into(), value.clone().into()],
+        )).await.unwrap();
+    }
+    let entries = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::ProviderContext, 0)
+        .await
+        .unwrap()
+        .entries;
+    let source = |id: &str| {
+        entries
+            .iter()
+            .find(|entry| entry.reference.id == id)
+            .unwrap()
+            .reference
+            .clone()
+    };
+    let first_source = source("portable-large");
+    let next_source = source("portable-next");
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_manifest SET source_scope=?,source_id=?,source_version=? WHERE operation_id='operation' AND ordinal=0",
+        [first_source.scope.clone().into(), first_source.id.clone().into(), first_source.version.clone().into()],
+    )).await.unwrap();
+    seed_active_manifest_entries(
+        &f.store,
+        &[ManifestEntry {
+            ordinal: 1,
+            unit: 0,
+            reference_only: false,
+            thread_id: "thread".into(),
+            source: next_source.clone(),
+        }],
+    )
+    .await;
+    let mut state = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    state.cursor.character = 1000;
+    state.source_text_projection_version = PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION;
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_runner_state SET state=? WHERE operation_id='operation'",
+        [serde_json::to_string(&state).unwrap().into()],
+    ))
+    .await
+    .unwrap();
+
+    let first_run = tokio::spawn({
+        let runner = f.runner.clone();
+        async move { runner.run(CancellationToken::new()).await }
+    });
+    f.provider.wait_calls(2).await;
+    let saved = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(saved.cursor.character > state.cursor.character);
+    assert_eq!(
+        saved.source_text_projection_version,
+        PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION
+    );
+    let checkpoint_id = saved.previous_checkpoint.as_ref().unwrap();
+    let checkpoint = f
+        .store
+        .compaction_checkpoint(checkpoint_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        checkpoint.coverage.is_empty(),
+        "a partial source cannot acquire coverage"
+    );
+    assert!(!checkpoint.summary.is_empty());
+    first_run.abort();
+    assert!(first_run.await.unwrap_err().is_cancelled());
+
+    let resumed = Arc::new(CompactionRunner::new(
+        f.store.clone(),
+        "ws".into(),
+        "thread".into(),
+        f.runner.snapshot.clone(),
+        f.runner.summarizer.clone(),
+        Arc::new(Target(true)),
+        f.observer.clone(),
+        f.clock.clone(),
+    ));
+    let second_run = tokio::spawn({
+        let runner = resumed.clone();
+        async move { runner.run(CancellationToken::new()).await }
+    });
+    wait_backoff(&f.store).await;
+    let retry = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.cursor, saved.cursor);
+    assert_eq!(retry.previous_checkpoint, saved.previous_checkpoint);
+    assert_eq!(
+        retry.source_text_projection_version,
+        PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION
+    );
+    let not_before_ms = match retry.phase {
+        RunnerPhase::Backoff { not_before_ms, .. } => not_before_ms,
+        phase => panic!("expected backoff after interrupted call, got {phase:?}"),
+    };
+    f.clock.advance(not_before_ms);
+    let CompactionExit::Applied(head) = second_run.await.unwrap().unwrap() else {
+        panic!("portable source did not finish after restart")
+    };
+    let calls = f.provider.calls.lock().unwrap();
+    let inputs = calls
+        .iter()
+        .map(|call| serde_json::from_str::<SummaryInput>(&call.messages[1].content).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        serde_json::to_value(&inputs[1]).unwrap(),
+        serde_json::to_value(&inputs[2]).unwrap()
+    );
+    let accepted = std::iter::once(&inputs[0])
+        .chain(inputs[2..].iter())
+        .flat_map(|input| input.compact_units.iter().map(|part| part.text.as_str()))
+        .collect::<String>();
+    let expected = pioneer_provider::history::portable_history_payload(&first_raw)
+        .chars()
+        .skip(state.cursor.character as usize)
+        .collect::<String>()
+        + &pioneer_provider::history::portable_history_payload(&next_raw);
+    assert_eq!(accepted, expected);
+    drop(calls);
+    let final_state = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        final_state.source_text_projection_version,
+        PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION
+    );
+    assert_eq!(
+        final_state.previous_checkpoint.as_deref(),
+        Some(head.as_str())
+    );
+    assert_eq!(
+        f.store
+            .compaction_checkpoint(&head)
+            .await
+            .unwrap()
+            .unwrap()
+            .coverage,
+        [first_source, next_source]
+    );
+    for (id, expected) in [("portable-large", first_raw), ("portable-next", next_raw)] {
+        let stored: String = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT payload FROM turn_llm_context WHERE id=?",
+                [id.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "payload")
+            .unwrap();
+        assert_eq!(stored, expected);
+    }
+}
+
+#[tokio::test]
+async fn runner_projects_provider_reasoning_for_compact_and_reference_only_without_rewriting_source()
+ {
+    use pioneer_provider::{
+        CanonicalProviderRoundEnvelope, ChatMessage, ProviderReplayState, ProviderTermination,
+    };
+
+    let f = fixture("event seed", vec![], true, false).await;
+    let envelope = |round: &str, reasoning: &str, opaque: &str| {
+        let (provider, blocks) = if round == "compact-round" {
+            (
+                "anthropic",
+                serde_json::json!([
+                    {"type":"thinking","thinking":"compact ","signature":opaque},
+                    {"type":"thinking","thinking":"rationale","signature":"second-signature"}
+                ]),
+            )
+        } else {
+            (
+                "bedrock",
+                serde_json::json!([
+                    {"reasoningText":{"text":"reference ","signature":opaque}},
+                    {"reasoningText":{"text":"rationale","signature":"second-signature"}}
+                ]),
+            )
+        };
+        serde_json::to_string(&CanonicalProviderRoundEnvelope {
+            version: 1,
+            round_id: round.into(),
+            termination: ProviderTermination::Complete,
+            message: {
+                let mut message = ChatMessage::assistant(format!("answer {round}"));
+                message.reasoning_content = Some(reasoning.into());
+                message.provider_replay_state = Some(ProviderReplayState::for_model(
+                    provider,
+                    "source-model",
+                    serde_json::json!({"blocks":blocks}),
+                ));
+                message
+            },
+            calls: vec![],
+        })
+        .unwrap()
+    };
+    let compact_payload = envelope("compact-round", "compact rationale", "compact-opaque");
+    let reference_payload = envelope("reference-round", "reference rationale", "reference-opaque");
+    for (id, sequence, payload) in [
+        ("compact-context", 1_i64, compact_payload.as_str()),
+        ("reference-context", 2_i64, reference_payload.as_str()),
+    ] {
+        f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES(?, 'turn', ?, ?, 'assistant_round', ?, '{}', CURRENT_TIMESTAMP)",
+            [id.into(), id.into(), sequence.into(), payload.into()],
+        )).await.unwrap();
+    }
+    let page = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::ProviderContext, 0)
+        .await
+        .unwrap();
+    let compact_source = page
+        .entries
+        .iter()
+        .find(|entry| entry.reference.id == "compact-context")
+        .unwrap()
+        .reference
+        .clone();
+    let reference_source = page
+        .entries
+        .iter()
+        .find(|entry| entry.reference.id == "reference-context")
+        .unwrap()
+        .reference
+        .clone();
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_manifest SET source_thread='thread',source_scope=?,source_id=?,source_version=? WHERE operation_id='operation' AND ordinal=0",
+        [compact_source.scope.clone().into(), compact_source.id.clone().into(), compact_source.version.clone().into()],
+    )).await.unwrap();
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES('operation',1,1,1,'thread',?,?,?)",
+        [reference_source.scope.into(), reference_source.id.into(), reference_source.version.into()],
+    )).await.unwrap();
+
+    assert!(matches!(
+        f.runner.run(CancellationToken::new()).await.unwrap(),
+        CompactionExit::Applied(_)
+    ));
+    let calls = f.provider.calls.lock().unwrap();
+    let input: SummaryInput = serde_json::from_str(&calls[0].messages[1].content).unwrap();
+    let compact = input
+        .compact_units
+        .iter()
+        .map(|unit| unit.text.as_str())
+        .collect::<String>();
+    let reference = input
+        .reference_only
+        .iter()
+        .map(|unit| unit.text.as_str())
+        .collect::<String>();
+    assert_eq!(compact.matches("compact rationale").count(), 1);
+    assert!(!compact.contains("compact-opaque"));
+    assert_eq!(reference.matches("reference rationale").count(), 1);
+    assert!(!reference.contains("reference-opaque"));
+    drop(calls);
+
+    let stored: String = f
+        .store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT payload FROM turn_llm_context WHERE id='compact-context'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "payload")
+        .unwrap();
+    assert_eq!(stored, compact_payload);
+}
+
+#[tokio::test]
+async fn alternating_source_projections_share_one_summarizer_request() {
+    use pioneer_provider::{CanonicalProviderRoundEnvelope, ChatMessage, ProviderTermination};
+    let f = fixture("event fact", vec![], true, false).await;
+    let db = f.store.database_connection();
+    let context_payload = |id: &str| {
+        serde_json::to_string(&CanonicalProviderRoundEnvelope {
+            version: 1,
+            round_id: id.into(),
+            termination: ProviderTermination::Complete,
+            message: ChatMessage::assistant(format!("context fact {id}")),
+            calls: vec![],
+        })
+        .unwrap()
+    };
+    for (id, sequence) in [("alternating-first", 2_i64), ("alternating-last", 4_i64)] {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES(?,'turn',?,?,'assistant_round',?,'{}',CURRENT_TIMESTAMP)",
+            [id.into(), id.into(), sequence.into(), context_payload(id).into()],
+        )).await.unwrap();
+    }
+    let mut item = historical_command_fixture("item fact");
+    let pioneer_protocol::TurnItem::CommandExecution { id, .. } = &mut item else {
+        unreachable!()
+    };
+    *id = "alternating-item".into();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES('alternating-item','turn','alternating-item','command_execution','completed',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        [serde_json::to_string(&item).unwrap().into()],
+    )).await.unwrap();
+    let contexts = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::ProviderContext, 0)
+        .await
+        .unwrap()
+        .entries;
+    let context = |id: &str| {
+        contexts
+            .iter()
+            .find(|entry| entry.reference.id == id)
+            .unwrap()
+            .reference
+            .clone()
+    };
+    let item_source = f
+        .store
+        .compaction_tool_item_reference("ws", "thread", "turn", "alternating-item")
+        .await
+        .unwrap()
+        .unwrap();
+    let expected = [
+        context("alternating-first"),
+        item_source,
+        context("alternating-last"),
+    ];
+    let first_source = f
+        .store
+        .compaction_manifest_page("operation", false, 0, 0)
+        .await
+        .unwrap()[0]
+        .source
+        .clone();
+    let expected_coverage = std::iter::once(first_source)
+        .chain(expected.iter().cloned())
+        .collect::<Vec<_>>();
+    seed_active_manifest_entries(
+        &f.store,
+        &expected
+            .iter()
+            .enumerate()
+            .map(|(index, source)| ManifestEntry {
+                ordinal: index as u64 + 1,
+                unit: index as u64 + 1,
+                reference_only: false,
+                thread_id: "thread".into(),
+                source: source.clone(),
+            })
+            .collect::<Vec<_>>(),
+    )
+    .await;
+    let exit = f.runner.run(CancellationToken::new()).await.unwrap();
+    let final_state = f.store.compaction_runner_state("operation").await.unwrap();
+    assert!(
+        matches!(exit, CompactionExit::Applied(_)),
+        "unexpected exit {exit:?}; state {final_state:?}"
+    );
+    let calls = f.provider.calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "source text version switches must not split a fitting request"
+    );
+    let input: SummaryInput = serde_json::from_str(&calls[0].messages[1].content).unwrap();
+    assert_eq!(input.compact_units.len(), 4);
+    for (index, needle) in [
+        "event fact",
+        "context fact alternating-first",
+        "item fact",
+        "context fact alternating-last",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(input.compact_units[index].text.contains(needle));
+    }
+    drop(calls);
+    let state = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state.source_text_projection_version,
+        PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION
+    );
+    let head = f.store.compaction_head("owner").await.unwrap().unwrap();
+    assert_eq!(
+        f.store
+            .compaction_checkpoint(&head)
+            .await
+            .unwrap()
+            .unwrap()
+            .coverage
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected_coverage.into_iter().collect()
+    );
+}
+
+#[tokio::test]
+async fn legacy_task_basis_compact_and_reference_use_portable_source_text() {
+    use pioneer_provider::{ChatMessage, ProviderReplayState};
+
+    async fn install_basis(f: &Fixture, history: &str) -> SourceRef {
+        let db = f.store.database_connection();
+        for sql in [
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('task','ws','thread','thread','thread','turn','agent','running','Task','fixture')",
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('basis-run','task','basis-run',1,1,'running','agent')",
+        ] {
+            db.execute_unprepared(sql).await.unwrap();
+        }
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('basis-run','task','ws','thread','turn',?,CURRENT_TIMESTAMP)",
+            [history.into()],
+        ))
+        .await
+        .unwrap();
+        f.store
+            .compaction_legacy_task_basis_source("ws", "thread", "basis-run")
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    let mut common = ChatMessage::assistant("first fact");
+    common.reasoning_content = Some("common rationale".into());
+    common.provider_replay_state = Some(ProviderReplayState::for_model(
+        "openrouter",
+        "old-model",
+        serde_json::json!({"reasoning_details":[
+            {"type":"reasoning.text","text":"common rationale"},
+            {"type":"reasoning.encrypted","data":"opaque-secret"}
+        ]}),
+    ));
+    let mut replay_only = ChatMessage::assistant("second fact");
+    replay_only.provider_replay_state = Some(ProviderReplayState::for_model(
+        "openrouter",
+        "old-model",
+        serde_json::json!({"reasoning_details":[
+            {"type":"reasoning.summary","summary":"additional rationale"},
+            {"type":"reasoning.encrypted","data":"opaque-secret"}
+        ]}),
+    ));
+    let history = serde_json::to_string(&vec![
+        ChatMessage::user("original question"),
+        common,
+        replay_only,
+    ])
+    .unwrap();
+    let expected = pioneer_provider::history::portable_task_basis_payload(&history).unwrap();
+    assert_eq!(expected.matches("common rationale").count(), 1);
+    assert_eq!(expected.matches("additional rationale").count(), 1);
+    assert!(!expected.contains("opaque-secret"));
+
+    let compact = fixture("later event", vec![Reply::Success], true, false).await;
+    let basis = install_basis(&compact, &history).await;
+    for old_version in [0, 1, PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION] {
+        assert_eq!(
+            historical_source_model_payload(&basis, history.clone(), old_version).unwrap(),
+            history,
+            "a persisted old cursor must keep its original source text"
+        );
+    }
+    assert_eq!(
+        historical_source_model_payload(
+            &basis,
+            history.clone(),
+            PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION,
+        )
+        .unwrap(),
+        expected
+    );
+    let mut cursor = RunnerState::new(
+        100_000,
+        &ModelBudget::new(Some(4096), None, None),
+        500,
+        None,
+    )
+    .unwrap();
+    assert_eq!(source_text_projection_for_cursor(&cursor, &basis), 3);
+    cursor.cursor.character = 7;
+    for version in [0, 1, 2, 3] {
+        cursor.source_text_projection_version = version;
+        assert_eq!(source_text_projection_for_cursor(&cursor, &basis), version);
+    }
+    let original = compact
+        .store
+        .compaction_manifest_page("operation", false, 0, 0)
+        .await
+        .unwrap()[0]
+        .source
+        .clone();
+    compact.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_manifest SET source_scope=?,source_id=?,source_version=? WHERE operation_id='operation' AND ordinal=0",
+        [basis.scope.clone().into(),basis.id.clone().into(),basis.version.clone().into()],
+    )).await.unwrap();
+    seed_active_manifest_entries(
+        &compact.store,
+        &[ManifestEntry {
+            ordinal: 1,
+            unit: 1,
+            reference_only: false,
+            thread_id: "thread".into(),
+            source: original.clone(),
+        }],
+    )
+    .await;
+    let state = compact
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    let portion = compact
+        .runner
+        .portion(&state, AttemptPurpose::Portion)
+        .await
+        .unwrap();
+    assert_eq!(
+        portion.request.input.compact_units[0].sources,
+        [basis.clone()]
+    );
+    assert_eq!(portion.request.input.compact_units[0].text, expected);
+    assert_eq!(portion.completed, [basis.clone(), original]);
+    assert_eq!(portion.source_text_projection_version, 1);
+    compact
+        .runner
+        .summarizer
+        .summarize(portion.request.clone())
+        .await
+        .unwrap();
+    let compact_calls = compact.provider.calls.lock().unwrap();
+    assert_eq!(compact_calls.len(), 1);
+    let compact_input: SummaryInput =
+        serde_json::from_str(&compact_calls[0].messages[1].content).unwrap();
+    assert_eq!(compact_input.compact_units[0].text, expected);
+    drop(compact_calls);
+    let mut legacy = state.clone();
+    legacy.cursor.character = 7;
+    legacy.source_text_projection_version = 1;
+    compact
+        .store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_runner_state SET state=? WHERE operation_id='operation'",
+            [serde_json::to_string(&legacy).unwrap().into()],
+        ))
+        .await
+        .unwrap();
+    let persisted = compact
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.cursor, legacy.cursor);
+    assert_eq!(persisted.source_text_projection_version, 1);
+    let restarted = CompactionRunner::new(
+        compact.store.clone(),
+        "ws".into(),
+        "thread".into(),
+        compact.runner.snapshot.clone(),
+        compact.runner.summarizer.clone(),
+        compact.runner.target.clone(),
+        compact.observer.clone(),
+        compact.clock.clone(),
+    );
+    let resumed = restarted
+        .portion(&persisted, AttemptPurpose::Portion)
+        .await
+        .unwrap();
+    assert_eq!(resumed.request.input.compact_units[0].part, 7);
+    assert_eq!(
+        resumed.request.input.compact_units[0].text,
+        history.chars().skip(7).collect::<String>()
+    );
+    assert_eq!(
+        restarted
+            .active_payload_fragment_with_projection(
+                "thread",
+                &basis,
+                0,
+                PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION,
+            )
+            .await
+            .unwrap()
+            .text,
+        expected,
+    );
+    let stored = compact
+        .store
+        .compaction_reference_payload("ws", "thread", &basis)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored, history);
+
+    let reference_history = history.replace("opaque-secret", &"opaque-secret".repeat(2_000));
+    assert!(reference_history.len() > RUNNER_FRAGMENT_CHARACTERS as usize);
+    assert_eq!(
+        pioneer_provider::history::portable_task_basis_payload(&reference_history).unwrap(),
+        expected
+    );
+    let reference = fixture("active event", vec![], true, false).await;
+    let reference_basis = install_basis(&reference, &reference_history).await;
+    seed_active_manifest_entries(
+        &reference.store,
+        &[ManifestEntry {
+            ordinal: 1,
+            unit: 1,
+            reference_only: true,
+            thread_id: "thread".into(),
+            source: reference_basis.clone(),
+        }],
+    )
+    .await;
+    let state = reference
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    let portion = reference
+        .runner
+        .portion(&state, AttemptPurpose::Portion)
+        .await
+        .unwrap();
+    assert_eq!(portion.request.input.reference_only.len(), 1);
+    assert_eq!(
+        portion.request.input.reference_only[0].source,
+        reference_basis
+    );
+    assert_eq!(portion.request.input.reference_only[0].text, expected);
+    assert!(!portion.completed.contains(&basis));
+    reference
+        .runner
+        .summarizer
+        .summarize(portion.request)
+        .await
+        .unwrap();
+    let reference_calls = reference.provider.calls.lock().unwrap();
+    assert_eq!(reference_calls.len(), 1);
+    let reference_input: SummaryInput =
+        serde_json::from_str(&reference_calls[0].messages[1].content).unwrap();
+    assert_eq!(reference_input.reference_only[0].text, expected);
 }

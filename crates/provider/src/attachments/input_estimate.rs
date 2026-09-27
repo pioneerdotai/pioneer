@@ -33,9 +33,13 @@ pub(crate) async fn prepare(
             media: vec![],
         });
     }
-    let prepared =
-        super::prepare_messages_for_provider_async(provider, capabilities, &request.messages)
-            .await?;
+    let prepared = super::prepare_messages_for_provider_async(
+        provider,
+        request.model.as_str(),
+        capabilities,
+        &request.messages,
+    )
+    .await?;
     super::ensure_no_unrendered_attachments(provider, &prepared)?;
     let provider = provider.to_owned();
     // Header/document parsing and base64 encoding remain outside async workers
@@ -570,6 +574,7 @@ mod tests {
             "fixture-media-authority".into(),
             super::super::prepare_messages_for_provider_async(
                 "openai",
+                prepared.request.model.as_str(),
                 &caps,
                 &prepared.request.messages,
             ),

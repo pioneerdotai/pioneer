@@ -39,6 +39,7 @@ impl crate::traits::Provider for EchoProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         let prepared = prepare_messages_for_provider_async(
             self.name(),
+            request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )

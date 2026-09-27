@@ -1,9 +1,9 @@
-#[cfg(test)]
-use crate::attachments::prepare_messages_for_provider;
 use crate::attachments::{
     PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes,
     ensure_no_unrendered_attachments, prepare_messages_for_provider_async,
 };
+#[cfg(test)]
+use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
 use crate::reasoning_registry;
 use crate::tools::stream::{IncrementalLineDecoder, sse_data};
 use crate::types::{
@@ -686,6 +686,7 @@ impl crate::traits::Provider for GeminiProvider {
         let model = request.model.clone();
         let prepared = prepare_messages_for_provider_async(
             self.name(),
+            request.model.as_str(),
             &self.capabilities(),
             request
                 .rendered_messages_with_compiled_sections()
@@ -753,6 +754,7 @@ impl crate::traits::Provider for GeminiProvider {
         let model = request.model.clone();
         let prepared = prepare_messages_for_provider_async(
             self.name(),
+            request.model.as_str(),
             &self.capabilities(),
             request
                 .rendered_messages_with_compiled_sections()
@@ -1046,7 +1048,63 @@ mod tests {
 
     use super::*;
     use crate::traits::Provider;
-    use crate::types::{ChatMessage, CompiledPromptPayload, ReasoningConfig, ReasoningEffort};
+    use crate::types::{
+        ChatMessage, CompiledPromptPayload, MessageProvenance, MessageSourceRef, ReasoningConfig,
+        ReasoningEffort,
+    };
+
+    #[test]
+    fn foreign_reasoning_is_present_in_gemini_wire_as_unsigned_text() {
+        let provider = GeminiProvider::new("key");
+        let mut message = ChatMessage::assistant("answer");
+        message.provider_replay_state = Some(ProviderReplayState::for_model(
+            "openrouter",
+            "source-model",
+            serde_json::json!({"reasoning_details":[{
+                "type":"reasoning.summary","summary":"meaningful rationale"
+            }]}),
+        ));
+        message.provenance = Some(MessageProvenance {
+            logical_turn_id: Some("turn".into()),
+            workspace_id: "workspace".into(),
+            thread_id: "thread".into(),
+            context_thread: None,
+            unit_id: "answer".into(),
+            sources: vec![MessageSourceRef {
+                scope: "event:turn".into(),
+                id: "source".into(),
+                version: "revision:1".into(),
+            }],
+            complete: true,
+            protected_input: false,
+            inherited: false,
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
+        });
+        let request = ChatRequest {
+            model: "gemini-target".into(),
+            messages: vec![message],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        let prepared = prepare_messages_for_provider_model(
+            provider.name(),
+            request.model.as_str(),
+            &provider.capabilities(),
+            request.messages.as_slice(),
+        )
+        .unwrap();
+        let wire = GeminiProvider::build_request_from_prepared(&request, &prepared).unwrap();
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(json.contains("meaningful rationale"));
+        assert!(json.contains("portable unsigned text"));
+        assert!(!json.contains("reasoning_details"));
+    }
 
     #[test]
     fn creates_with_api_key() {

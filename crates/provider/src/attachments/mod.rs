@@ -104,12 +104,33 @@ pub fn prepare_messages_for_provider(
     prepare_messages_for_provider_with_config(provider_name, capabilities, messages, &config)
 }
 
+/// Synchronous request preflight with a concrete replay compatibility target.
+/// Production adapters use the async equivalent; this entry point lets local
+/// wire-builder tests exercise the identical projection without transport.
+#[cfg(test)]
+pub fn prepare_messages_for_provider_model(
+    provider_name: &str,
+    model: &str,
+    capabilities: &ProviderCapabilities,
+    messages: &[ChatMessage],
+) -> Result<PreparedProviderMessages> {
+    let config = default_attachment_pipeline_config();
+    prepare_messages_for_provider_target(
+        provider_name,
+        Some(model),
+        capabilities,
+        messages,
+        &config,
+    )
+}
+
 /// Runs filesystem, DNS, blocking HTTP and retry materialization outside the
 /// async worker pool. The semaphore bounds concurrent blocking work; the
 /// durable execution governor bounds how many Turns may wait to enter this
 /// stage.
 pub async fn prepare_messages_for_provider_async(
     provider_name: &str,
+    model: &str,
     capabilities: &ProviderCapabilities,
     messages: &[ChatMessage],
 ) -> Result<PreparedProviderMessages> {
@@ -122,15 +143,19 @@ pub async fn prepare_messages_for_provider_async(
     .map_err(|_| anyhow::anyhow!("attachment materialization capacity wait timed out"))?
     .map_err(|_| anyhow::anyhow!("attachment materialization governor is closed"))?;
     let provider_name = provider_name.to_owned();
+    let model = model.to_owned();
     let capabilities = capabilities.clone();
     let messages = messages.to_vec();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         runtime::with_blocking_authority_scope(authority_fingerprint, || {
-            prepare_messages_for_provider(
+            let config = default_attachment_pipeline_config();
+            prepare_messages_for_provider_target(
                 provider_name.as_str(),
+                Some(model.as_str()),
                 &capabilities,
                 messages.as_slice(),
+                &config,
             )
         })
     })
@@ -144,13 +169,23 @@ pub fn prepare_messages_for_provider_with_config(
     messages: &[ChatMessage],
     config: &AttachmentPipelineConfig,
 ) -> Result<PreparedProviderMessages> {
+    prepare_messages_for_provider_target(provider_name, None, capabilities, messages, config)
+}
+
+fn prepare_messages_for_provider_target(
+    provider_name: &str,
+    model: Option<&str>,
+    capabilities: &ProviderCapabilities,
+    messages: &[ChatMessage],
+    config: &AttachmentPipelineConfig,
+) -> Result<PreparedProviderMessages> {
     let attachment_count_hint = messages
         .iter()
         .map(|message| message.content_parts.len())
         .sum::<usize>();
     observability::emit_preflight_start(provider_name, messages.len(), attachment_count_hint);
 
-    let result = prepare_messages_impl(provider_name, capabilities, messages, config);
+    let result = prepare_messages_impl(provider_name, model, capabilities, messages, config);
     match &result {
         Ok(prepared) => {
             observability::emit_preflight_ok(provider_name, prepared.budget_report);
@@ -171,10 +206,15 @@ pub fn prepare_messages_for_provider_with_config(
 
 fn prepare_messages_impl(
     provider_name: &str,
+    model: Option<&str>,
     capabilities: &ProviderCapabilities,
     messages: &[ChatMessage],
     config: &AttachmentPipelineConfig,
 ) -> Result<PreparedProviderMessages> {
+    let projected_messages = model
+        .map(|model| crate::history::project_messages_for_provider(provider_name, model, messages))
+        .transpose()?;
+    let messages = projected_messages.as_deref().unwrap_or(messages);
     let attachment_count = messages
         .iter()
         .flat_map(|message| message.content_parts.iter())

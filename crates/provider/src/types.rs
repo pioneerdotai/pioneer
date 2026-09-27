@@ -384,11 +384,19 @@ impl MessageContentPart {
     }
 }
 
-/// Provider-owned state that must be replayed unchanged with an assistant
-/// message. The common agent stores this value but never interprets it.
+/// Provider-owned state that must be replayed unchanged only to its proven
+/// provider/model target. The payload remains provider-owned; the history
+/// projection may extract explicitly typed human-readable fields when a
+/// completed round is moved to an incompatible target.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderReplayState {
     pub provider: String,
+    /// Exact model whose continuation contract produced this state. Legacy
+    /// records omit it and are therefore portable history, not proof that an
+    /// active continuation can be replayed to an arbitrary model exposed by
+    /// the same provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub payload: JsonValue,
 }
 
@@ -396,8 +404,25 @@ impl ProviderReplayState {
     pub fn new(provider: impl Into<String>, payload: JsonValue) -> Self {
         Self {
             provider: provider.into(),
+            model: None,
             payload,
         }
+    }
+
+    pub fn for_model(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        payload: JsonValue,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            model: Some(model.into()),
+            payload,
+        }
+    }
+
+    pub fn is_compatible_with(&self, provider: &str, model: &str) -> bool {
+        self.provider == provider && self.model.as_deref() == Some(model)
     }
 
     pub fn payload_for(&self, provider: &str) -> Option<&JsonValue> {
@@ -1247,7 +1272,11 @@ fn replay_state_bytes(state: &ProviderReplayState) -> usize {
     if serde_json::to_writer(&mut counter, &state.payload).is_err() {
         return usize::MAX;
     }
-    state.provider.len().saturating_add(counter.bytes)
+    state
+        .provider
+        .len()
+        .saturating_add(state.model.as_deref().map_or(0, str::len))
+        .saturating_add(counter.bytes)
 }
 
 #[derive(Default)]
@@ -1348,6 +1377,33 @@ mod tests {
             serde_json::from_str::<ChatMessage>(&encoded).expect("assistant round deserializes");
 
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn replay_compatibility_is_exact_and_legacy_payloads_remain_readable() {
+        let legacy: ProviderReplayState = serde_json::from_value(serde_json::json!({
+            "provider":"openrouter",
+            "payload":{"opaque":"unchanged"}
+        }))
+        .unwrap();
+        assert!(legacy.model.is_none());
+        assert!(!legacy.is_compatible_with("openrouter", "any-model"));
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap(),
+            serde_json::json!({
+                "provider":"openrouter",
+                "payload":{"opaque":"unchanged"}
+            })
+        );
+
+        let scoped = ProviderReplayState::for_model(
+            "openrouter",
+            "exact-model",
+            serde_json::json!({"opaque":"unchanged"}),
+        );
+        assert!(scoped.is_compatible_with("openrouter", "exact-model"));
+        assert!(!scoped.is_compatible_with("openrouter", "other-model"));
+        assert!(!scoped.is_compatible_with("other-provider", "exact-model"));
     }
 
     #[test]

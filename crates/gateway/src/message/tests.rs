@@ -66615,6 +66615,23 @@ async fn seed_phase_13_compaction_thread(
     thread_id: &str,
     raw_marker: &str,
 ) {
+    seed_phase_13_compaction_thread_with_actor(
+        crud_store,
+        workspace_id,
+        thread_id,
+        raw_marker,
+        pioneer_protocol::PersistedActorRef::System,
+    )
+    .await;
+}
+
+async fn seed_phase_13_compaction_thread_with_actor(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    thread_id: &str,
+    raw_marker: &str,
+    actor: pioneer_protocol::PersistedActorRef,
+) {
     let base_timestamp = phase_13_now_secs();
     for index in 0..2 {
         let timestamp = base_timestamp + i64::from(index) * 3;
@@ -66633,7 +66650,7 @@ async fn seed_phase_13_compaction_thread(
                     text: user_text,
                     text_elements: Vec::new(),
                 }],
-                pioneer_protocol::PersistedActorRef::System,
+                actor.clone(),
             )
             .await
             .expect("turn start should materialize");
@@ -74427,4 +74444,559 @@ async fn compaction_history_waits_for_changed_settings_without_spending_provider
     assert!(diagnostic.estimated_input_tokens.unwrap() > 0);
     assert!(diagnostic.context_tokens.unwrap() > 0);
     assert!(diagnostic.operation.is_some() && diagnostic.checkpoint.is_some());
+}
+#[tokio::test]
+async fn background_completed_history_projects_reasoning_before_fit_and_compaction() {
+    use pioneer_compaction::{CompactionSettings, ModelSelection, Transport};
+    use pioneer_crud::compaction::{HistoryCheckDiagnostic, HistoryCheckOutcome};
+    use pioneer_provider::{
+        CanonicalProviderRoundEnvelope, ChatMessage, ProviderCallIdentity, ProviderReplayState,
+        ProviderTermination, ProviderToolCall,
+    };
+    use sea_orm::{DbBackend, Statement};
+
+    struct ProjectionObserver;
+    #[async_trait::async_trait]
+    impl crate::compaction::CompactionObserver for ProjectionObserver {
+        async fn started(
+            &self,
+            _: &str,
+            _: &pioneer_compaction::runner::RunnerState,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn heartbeat(&self, _: &str) {}
+        async fn terminal(
+            &self,
+            _: &str,
+            _: &pioneer_compaction::runner::RunnerState,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    crate::compaction::load_test_catalog();
+    let summary = [
+        "Goal and constraints",
+        "Decisions and rationale",
+        "Completed work and results",
+        "Failed attempts and unknowns",
+        "Current work and next step",
+        "Source references",
+    ]
+    .into_iter()
+    .map(|heading| format!("## {heading}\nretained fact"))
+    .collect::<Vec<_>>()
+    .join("\n\n");
+    let provider = Arc::new(CaptureSummaryProvider::new(summary));
+    let harness =
+        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
+    let thread = "background-portable-history";
+    let turn = format!("{thread}turn1");
+    let historical_turn = format!("{thread}turn0");
+    ensure_test_superuser_execution_authority(harness.crud_store.as_ref()).await;
+    seed_phase_13_compaction_thread_with_actor(
+        &harness.crud_store,
+        &harness.workspace_id,
+        thread,
+        "prior",
+        pioneer_protocol::PersistedActorRef::Principal(
+            authenticated_test_superuser().principal_id.clone(),
+        ),
+    )
+    .await;
+    persist_test_execution_authorization_context_for_principal(
+        &harness.processor,
+        authenticated_test_superuser().as_ref(),
+        &harness.workspace_id,
+        thread,
+        &turn,
+    )
+    .await;
+    let mut message = ChatMessage::assistant_tool_calls_with_provider_state(
+        Some("saved answer"),
+        None::<String>,
+        vec![ProviderToolCall {
+            id: "portable-call".into(),
+            name: "inspect".into(),
+            arguments: "{}".into(),
+        }],
+        None,
+    );
+    message.reasoning_content = Some("common rationale ".repeat(2_000));
+    message.provider_replay_state = Some(ProviderReplayState::for_model(
+        "deepseek",
+        "source-model",
+        serde_json::json!({
+            "schema_version":1,
+            "assistant_message":{
+                "content":"saved answer",
+                "reasoning_content":"additional rationale ".repeat(2_000),
+                "tool_calls":[{"id":"portable-call","type":"function",
+                    "function":{"name":"inspect","arguments":"{}"}}]
+            },
+            "opaque":"opaque-replay-secret"
+        }),
+    ));
+    let canonical = serde_json::to_string(&CanonicalProviderRoundEnvelope {
+        version: 1,
+        round_id: "portable-round".into(),
+        termination: ProviderTermination::ToolCalls,
+        message,
+        calls: vec![ProviderCallIdentity {
+            provider_call_id: "portable-call".into(),
+            turn_item_id: "portable-tool-item".into(),
+            ordinal: 0,
+        }],
+    })
+    .unwrap();
+    harness.crud_store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES('portable-context',?, 'agent_message_0', 5, 'assistant_round', ?, '{}', CURRENT_TIMESTAMP)",
+        [historical_turn.clone().into(), canonical.clone().into()],
+    )).await.unwrap();
+    let result = serde_json::json!({
+        "kind": "json",
+        "truncated": false,
+        "value": ChatMessage::tool_result("portable-call", "inspect", "portable tool result")
+    })
+    .to_string();
+    harness.crud_store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES('portable-result',?, 'portable-tool-item', 6, 'tool_result_v2', ?, '{}', CURRENT_TIMESTAMP)",
+        [historical_turn.into(), result.into()],
+    )).await.unwrap();
+
+    let current = ModelSelection {
+        transport: Transport::Api,
+        instance: "openai".into(),
+        model: "test-model".into(),
+        effort: None,
+    };
+    let settings = CompactionSettings {
+        selection: Some(ModelSelection {
+            transport: Transport::Api,
+            instance: "summary-capture".into(),
+            model: "test-model".into(),
+            effort: None,
+        }),
+    };
+    let mut fitting = HistoryCheckDiagnostic::default();
+    let fits = crate::compaction::prepare_completed_history_owned(
+        &harness.processor,
+        &harness.crud_store.with_maintenance_access(),
+        &harness.workspace_id,
+        thread,
+        &turn,
+        &current,
+        &settings,
+        None,
+        Arc::new(ProjectionObserver),
+        tokio_util::sync::CancellationToken::new(),
+        crate::compaction::ContextWorkPriority::Background,
+        None,
+        None,
+        0,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
+        &mut fitting,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fits, HistoryCheckOutcome::Fits);
+    assert_eq!(provider.call_count(), 0);
+    assert!(fitting.estimated_input_tokens.unwrap() > 4_000);
+
+    let context = fitting.context_tokens.unwrap();
+    let reserve = fitting.output_reserve.unwrap();
+    let fixed = (context - reserve) * 100 / 105 - 6_000;
+    let mut compacted = HistoryCheckDiagnostic::default();
+    let outcome = crate::compaction::prepare_completed_history_owned(
+        &harness.processor,
+        &harness.crud_store.with_maintenance_access(),
+        &harness.workspace_id,
+        thread,
+        &turn,
+        &current,
+        &settings,
+        None,
+        Arc::new(ProjectionObserver),
+        tokio_util::sync::CancellationToken::new(),
+        crate::compaction::ContextWorkPriority::Background,
+        None,
+        None,
+        fixed,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
+        &mut compacted,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, HistoryCheckOutcome::Compacted);
+    assert!(provider.call_count() > 0);
+    let requests = provider.snapshot_requests();
+    let summary_wire = requests
+        .iter()
+        .map(|request| {
+            request
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<String>()
+        })
+        .collect::<String>();
+    assert!(summary_wire.contains("common rationale"));
+    assert!(summary_wire.contains("additional rationale"));
+    assert!(!summary_wire.contains("opaque-replay-secret"));
+    let owner = crate::compaction::native_owner(&harness.workspace_id, thread);
+    assert_eq!(
+        harness.crud_store.compaction_head(&owner).await.unwrap(),
+        compacted.checkpoint
+    );
+    let stored: String = harness
+        .crud_store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT payload FROM turn_llm_context WHERE id='portable-context'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "payload")
+        .unwrap();
+    assert_eq!(stored, canonical);
+}
+
+#[tokio::test]
+async fn background_deepseek_effort_matches_provider_preflight_and_token_boundary() {
+    use pioneer_agent::compaction::request::NativeRequestProjection;
+    use pioneer_compaction::{CompactionSettings, ModelBudget, ModelSelection, Transport};
+    use pioneer_crud::compaction::{HistoryCheckDiagnostic, HistoryCheckOutcome};
+    use pioneer_provider::{
+        CanonicalProviderRoundEnvelope, ChatMessage, ChatRequest, ProviderCallIdentity,
+        ProviderTermination, ProviderToolCall, ReasoningConfig, ReasoningEffort, Role,
+        providers::DeepSeekProvider,
+    };
+    use sea_orm::{DbBackend, Statement};
+
+    struct SilentObserver;
+    #[async_trait::async_trait]
+    impl crate::compaction::CompactionObserver for SilentObserver {
+        async fn started(
+            &self,
+            _: &str,
+            _: &pioneer_compaction::runner::RunnerState,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn heartbeat(&self, _: &str) {}
+        async fn terminal(
+            &self,
+            _: &str,
+            _: &pioneer_compaction::runner::RunnerState,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    crate::compaction::load_test_catalog();
+    let summary = [
+        "Goal and constraints",
+        "Decisions and rationale",
+        "Completed work and results",
+        "Failed attempts and unknowns",
+        "Current work and next step",
+        "Source references",
+    ]
+    .into_iter()
+    .map(|heading| format!("## {heading}\nretained fact"))
+    .collect::<Vec<_>>()
+    .join("\n\n");
+    let summarizer = Arc::new(CaptureSummaryProvider::new(summary));
+    let registry = phase_13_provider_registry(summarizer.clone());
+    registry
+        .insert("deepseek", Arc::new(DeepSeekProvider::new("unused-key")))
+        .unwrap();
+    let harness = setup_phase_13_compaction_harness(registry).await;
+    let thread = "background-deepseek-effort";
+    let turn = format!("{thread}turn1");
+    let historical_turn = format!("{thread}turn0");
+    ensure_test_superuser_execution_authority(harness.crud_store.as_ref()).await;
+    seed_phase_13_compaction_thread_with_actor(
+        &harness.crud_store,
+        &harness.workspace_id,
+        thread,
+        "prior",
+        pioneer_protocol::PersistedActorRef::Principal(
+            authenticated_test_superuser().principal_id.clone(),
+        ),
+    )
+    .await;
+    persist_test_execution_authorization_context_for_principal(
+        &harness.processor,
+        authenticated_test_superuser().as_ref(),
+        &harness.workspace_id,
+        thread,
+        &turn,
+    )
+    .await;
+    let call = ProviderToolCall {
+        id: "historical-call".into(),
+        name: "inspect".into(),
+        arguments: "{}".into(),
+    };
+    // The historical unit must be large enough to compact while the latest
+    // completed turn and the checkpoint goal remain protected by the planner.
+    let historical_content = "saved context fact ".repeat(10_000);
+    let canonical = serde_json::to_string(&CanonicalProviderRoundEnvelope {
+        version: 1,
+        round_id: "historical-round".into(),
+        termination: ProviderTermination::ToolCalls,
+        message: ChatMessage::assistant_tool_calls_with_provider_state(
+            Some(historical_content.clone()),
+            None::<String>,
+            vec![call],
+            Some(pioneer_provider::ProviderReplayState::for_model(
+                "deepseek",
+                "deepseek-v4-flash",
+                serde_json::json!({
+                    "schema_version":1,
+                    "assistant_message":{
+                        "content":historical_content,
+                        "tool_calls":[{"id":"historical-call","type":"function",
+                            "function":{"name":"inspect","arguments":"{}"}}]
+                    },
+                    "opaque":"opaque-only"
+                }),
+            )),
+        ),
+        calls: vec![ProviderCallIdentity {
+            provider_call_id: "historical-call".into(),
+            turn_item_id: "historical-tool-item".into(),
+            ordinal: 0,
+        }],
+    })
+    .unwrap();
+    let result = serde_json::json!({
+        "kind":"json",
+        "truncated":false,
+        "value":ChatMessage::tool_result("historical-call", "inspect", "verified tool result")
+    })
+    .to_string();
+    let db = harness.crud_store.database_connection();
+    for (id, item, sequence, source, payload) in [
+        (
+            "effort-round",
+            "historical-round",
+            5_i64,
+            "assistant_round",
+            &canonical,
+        ),
+        (
+            "effort-result",
+            "historical-tool-item",
+            6_i64,
+            "tool_result_v2",
+            &result,
+        ),
+    ] {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES(?,?,?,?,?,?,'{}',CURRENT_TIMESTAMP)",
+            [id.into(), historical_turn.clone().into(), item.into(), sequence.into(), source.into(), payload.to_owned().into()],
+        ))
+        .await
+        .unwrap();
+    }
+    let settings = CompactionSettings {
+        selection: Some(ModelSelection {
+            transport: Transport::Api,
+            instance: "summary-capture".into(),
+            model: "test-model".into(),
+            effort: None,
+        }),
+    };
+    let maintenance = harness.crud_store.with_maintenance_access();
+    let mut ready = false;
+    for _ in 0..16 {
+        ready = maintenance
+            .compaction_prepare_history_quantum(&harness.workspace_id, thread)
+            .await
+            .unwrap();
+        if ready {
+            break;
+        }
+    }
+    assert!(ready);
+    let captured = harness
+        .processor
+        .capture_current_context_basis_prepared(
+            &maintenance,
+            &harness.workspace_id,
+            thread,
+            &turn,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(captured.checkpoint.is_none());
+    let model = "deepseek-v4-flash";
+    let provider = DeepSeekProvider::new("unused-key");
+    let mut enabled_estimate = None;
+    let mut enabled_budget = None;
+    let mut enabled_reserve = None;
+    for (effort, reasoning, thinking) in [
+        (None, None, false),
+        (Some("none"), Some(ReasoningConfig::Disabled), false),
+        (
+            Some("high"),
+            Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+            true,
+        ),
+    ] {
+        let current = ModelSelection {
+            transport: Transport::Api,
+            instance: "deepseek".into(),
+            model: model.into(),
+            effort: effort.map(str::to_owned),
+        };
+        let original = ChatRequest {
+            model: model.into(),
+            messages: captured.messages.clone(),
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: reasoning.clone(),
+            compiled_prompt: None,
+        };
+        let prepared = provider.prepare_input_budget(original).await.unwrap();
+        let projected = &prepared.request.messages;
+        let call = projected
+            .iter()
+            .find(|message| message.content.contains("saved context fact"))
+            .expect("historical assistant content must survive projection");
+        assert_eq!(call.role == Role::User, thinking);
+        assert_eq!(call.tool_calls.is_none(), thinking);
+        let result = projected
+            .iter()
+            .find(|message| message.content.contains("verified tool result"))
+            .expect("completed tool result must survive projection");
+        assert_eq!(result.role == Role::User, thinking);
+        assert_eq!(
+            serde_json::to_string(projected)
+                .unwrap()
+                .contains("opaque-only"),
+            !thinking,
+            "only the completed non-thinking round in a thinking request is portable"
+        );
+        let limits = pioneer_provider::catalog::model_catalog()
+            .unwrap()
+            .limits(provider.name(), model);
+        let budget = ModelBudget::new(
+            Some(limits.context_window),
+            limits.max_input,
+            limits.max_output,
+        );
+        let expected =
+            NativeRequestProjection::full(prepared.request, vec![], budget.clone(), false).unwrap();
+        let mut diagnostic = HistoryCheckDiagnostic::default();
+        let outcome = crate::compaction::prepare_completed_history_owned(
+            &harness.processor,
+            &harness.crud_store.with_maintenance_access(),
+            &harness.workspace_id,
+            thread,
+            &turn,
+            &current,
+            &settings,
+            None,
+            Arc::new(SilentObserver),
+            tokio_util::sync::CancellationToken::new(),
+            crate::compaction::ContextWorkPriority::Background,
+            None,
+            None,
+            0,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+            &mut diagnostic,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, HistoryCheckOutcome::Fits);
+        assert_eq!(
+            diagnostic.estimated_input_tokens,
+            Some(expected.estimated_input_tokens)
+        );
+        if thinking {
+            enabled_estimate = Some(expected.estimated_input_tokens);
+            enabled_reserve = Some(expected.output_reserve);
+            enabled_budget = Some(budget);
+        }
+    }
+    assert_eq!(summarizer.call_count(), 0);
+    let estimate = enabled_estimate.unwrap();
+    let reserve = enabled_reserve.unwrap();
+    let budget = enabled_budget.unwrap();
+    let mut low = 0_u64;
+    let mut high = budget.context;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if budget.fits(estimate.saturating_add(mid), reserve, false) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    assert!(low > 0);
+    assert!(budget.fits(estimate + low - 1, reserve, false));
+    assert!(!budget.fits(estimate + low, reserve, false));
+    // At the first overflowing offset, the large historical unit remains
+    // eligible while the protected current turn and checkpoint goal fit.
+    let compaction_fixed = low;
+    let mut diagnostic = HistoryCheckDiagnostic::default();
+    let outcome = crate::compaction::prepare_completed_history_owned(
+        &harness.processor,
+        &harness.crud_store.with_maintenance_access(),
+        &harness.workspace_id,
+        thread,
+        &turn,
+        &ModelSelection {
+            transport: Transport::Api,
+            instance: "deepseek".into(),
+            model: model.into(),
+            effort: Some("high".into()),
+        },
+        &settings,
+        None,
+        Arc::new(SilentObserver),
+        tokio_util::sync::CancellationToken::new(),
+        crate::compaction::ContextWorkPriority::Background,
+        None,
+        None,
+        compaction_fixed,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
+        &mut diagnostic,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, HistoryCheckOutcome::Compacted);
+    assert_eq!(
+        diagnostic.estimated_input_tokens,
+        Some(estimate + compaction_fixed)
+    );
+    assert!(summarizer.call_count() > 0);
+    let saved: String = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT payload FROM turn_llm_context WHERE id='effort-round'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "payload")
+        .unwrap();
+    assert_eq!(saved, canonical);
 }

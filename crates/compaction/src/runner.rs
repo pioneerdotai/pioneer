@@ -4,6 +4,11 @@
 use crate::{ATTEMPT_MILLIS, ModelBudget};
 use serde::{Deserialize, Serialize};
 
+/// The next source-text representation after main's historical-command v1.
+pub const PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION: u32 = 2;
+/// Adds typed legacy Task-basis projection without changing v0/v1/v2 cursor offsets.
+pub const PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION: u32 = 3;
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SourceCursor {
     pub unit: u64,

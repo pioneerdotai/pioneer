@@ -885,6 +885,7 @@ impl crate::traits::Provider for OpenAiProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         let prepared = prepare_messages_for_provider_async(
             self.name(),
+            request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
@@ -974,6 +975,7 @@ impl crate::traits::Provider for OpenAiProvider {
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
         let prepared = prepare_messages_for_provider_async(
             self.name(),
+            request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
@@ -1324,12 +1326,35 @@ fn openai_embedding_model_info(model: &OpenAiEmbeddingModelDefinition) -> Provid
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attachments::prepare_messages_for_provider;
+    use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
     use crate::traits::Provider;
     use crate::types::{
-        AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart, ProviderToolCall,
-        ReasoningConfig, ReasoningEffort,
+        AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart,
+        ProviderReplayState, ProviderToolCall, ReasoningConfig, ReasoningEffort,
     };
+
+    #[test]
+    fn active_foreign_replay_is_rejected_before_openai_serializer_can_ignore_it() {
+        let provider = OpenAiProvider::new("test-key");
+        let mut message = ChatMessage::assistant("partial");
+        message.provider_replay_state = Some(ProviderReplayState::for_model(
+            "openrouter",
+            "source-model",
+            serde_json::json!({"opaque":"state"}),
+        ));
+        let error = prepare_messages_for_provider_model(
+            provider.name(),
+            "gpt-target",
+            &provider.capabilities(),
+            &[message],
+        )
+        .expect_err("foreign active replay must fail before OpenAI wire conversion");
+        assert!(
+            error
+                .downcast_ref::<crate::history::IncompatibleProviderReplayContinuation>()
+                .is_some()
+        );
+    }
 
     #[test]
     fn creates_with_api_key() {

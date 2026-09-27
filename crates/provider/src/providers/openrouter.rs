@@ -832,6 +832,7 @@ impl crate::traits::Provider for OpenRouterProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         let prepared = prepare_messages_for_provider_async(
             self.name(),
+            request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
@@ -922,6 +923,7 @@ impl crate::traits::Provider for OpenRouterProvider {
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
         let prepared = prepare_messages_for_provider_async(
             self.name(),
+            request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
@@ -1321,12 +1323,35 @@ fn openrouter_reasoning_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attachments::prepare_messages_for_provider;
+    use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
+    use crate::providers::OpenAiCompatibleProvider;
     use crate::traits::Provider;
     use crate::types::{
-        AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart, ProviderToolCall,
-        ReasoningConfig, ReasoningEffort,
+        AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart,
+        MessageProvenance, MessageSourceRef, ProviderToolCall, ReasoningConfig, ReasoningEffort,
     };
+
+    fn complete_round(messages: &mut [ChatMessage]) {
+        for (index, message) in messages.iter_mut().enumerate() {
+            message.provenance = Some(MessageProvenance {
+                logical_turn_id: Some("turn".into()),
+                workspace_id: "workspace".into(),
+                thread_id: "thread".into(),
+                context_thread: None,
+                unit_id: "round".into(),
+                sources: vec![MessageSourceRef {
+                    scope: "event:turn".into(),
+                    id: format!("source-{index}"),
+                    version: "revision:1".into(),
+                }],
+                complete: true,
+                protected_input: false,
+                inherited: false,
+                source_aliases: vec![],
+                ambiguous_input_aliases: vec![],
+            });
+        }
+    }
 
     fn model_from_json(json: &str) -> ProviderModelInfo {
         let response: ModelsListResponse = serde_json::from_str(json).expect("models response");
@@ -1588,22 +1613,148 @@ mod tests {
                 name: "inspect".to_owned(),
                 arguments: "{}".to_owned(),
             }],
-            Some(ProviderReplayState::new(
+            Some(ProviderReplayState::for_model(
                 "openrouter",
+                "same-model",
                 serde_json::json!({ "reasoning_details": reasoning_details.clone() }),
             )),
         );
 
         let provider = OpenRouterProvider::new("test-key");
-        let prepared =
-            prepare_messages_for_provider(provider.name(), &provider.capabilities(), &[assistant])
-                .unwrap();
+        let prepared = prepare_messages_for_provider_model(
+            provider.name(),
+            "same-model",
+            &provider.capabilities(),
+            &[assistant],
+        )
+        .unwrap();
         let api_messages = OpenRouterProvider::convert_messages(&prepared).unwrap();
 
         assert_eq!(
             api_messages[0].reasoning_details,
             serde_json::from_value::<Vec<serde_json::Value>>(reasoning_details).ok()
         );
+    }
+
+    #[test]
+    fn deepseek_completed_tool_round_renders_for_openrouter_without_foreign_replay() {
+        let calls = vec![ProviderToolCall {
+            id: "call_1".to_owned(),
+            name: "inspect".to_owned(),
+            arguments: "{}".to_owned(),
+        }];
+        let replay = OpenAiCompatibleProvider::assistant_replay_state(
+            "deepseek",
+            None,
+            Some("portable deepseek reasoning".to_owned()),
+            calls.as_slice(),
+        );
+        let mut messages = vec![
+            ChatMessage::assistant_tool_calls_with_provider_state(
+                None::<String>,
+                Some("portable deepseek reasoning"),
+                calls,
+                Some(replay.clone()),
+            ),
+            ChatMessage::tool_result("call_1", "inspect", "tool outcome"),
+        ];
+        complete_round(&mut messages);
+        let canonical = messages.clone();
+
+        let provider = OpenRouterProvider::new("test-key");
+        let prepared = prepare_messages_for_provider_model(
+            provider.name(),
+            "openrouter-target-model",
+            &provider.capabilities(),
+            messages.as_slice(),
+        )
+        .unwrap();
+        let wire = OpenRouterProvider::convert_messages(&prepared).unwrap();
+
+        assert_eq!(wire.len(), 2);
+        assert_eq!(
+            wire[0].reasoning_content.as_deref(),
+            Some("portable deepseek reasoning")
+        );
+        assert!(wire[0].reasoning_details.is_none());
+        assert_eq!(wire[0].tool_calls.as_ref().unwrap()[0].id, "call_1");
+        assert_eq!(wire[1].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(canonical[0].provider_replay_state.as_ref(), Some(&replay));
+        assert_eq!(messages, canonical);
+    }
+
+    #[test]
+    fn openrouter_model_change_uses_portable_reasoning_not_source_model_replay() {
+        let replay = ProviderReplayState::for_model(
+            "openrouter",
+            "source-model",
+            serde_json::json!({"reasoning_details":[
+                {"type":"reasoning.encrypted","data":"opaque-source-state"},
+                {"type":"reasoning.summary","summary":"portable model-change rationale"}
+            ]}),
+        );
+        let mut messages = vec![ChatMessage::assistant("answer")];
+        messages[0].provider_replay_state = Some(replay.clone());
+        complete_round(&mut messages);
+        let provider = OpenRouterProvider::new("test-key");
+
+        let prepared = prepare_messages_for_provider_model(
+            provider.name(),
+            "target-model",
+            &provider.capabilities(),
+            messages.as_slice(),
+        )
+        .unwrap();
+        let wire = OpenRouterProvider::convert_messages(&prepared).unwrap();
+
+        assert!(wire[0].reasoning_details.is_none());
+        assert_eq!(
+            wire[0].reasoning_content.as_deref(),
+            Some("portable model-change rationale")
+        );
+        assert_eq!(messages[0].provider_replay_state.as_ref(), Some(&replay));
+    }
+
+    #[test]
+    fn foreign_replay_adds_distinct_readable_reasoning_to_actual_wire() {
+        let replay = ProviderReplayState::for_model(
+            "deepseek",
+            "source-model",
+            serde_json::json!({
+                "schema_version":1,
+                "assistant_message":{
+                    "content":"answer",
+                    "reasoning_content":"additional replay rationale",
+                    "tool_calls":[]
+                },
+                "opaque":"opaque-signature"
+            }),
+        );
+        let mut message = ChatMessage::assistant("answer");
+        message.reasoning_content = Some("common rationale".into());
+        message.provider_replay_state = Some(replay.clone());
+        complete_round(std::slice::from_mut(&mut message));
+        let canonical = message.clone();
+        let provider = OpenRouterProvider::new("test-key");
+        let prepared = prepare_messages_for_provider_model(
+            provider.name(),
+            "target-model",
+            &provider.capabilities(),
+            &[message],
+        )
+        .unwrap();
+        let wire = OpenRouterProvider::convert_messages(&prepared).unwrap();
+        assert_eq!(
+            wire[0].reasoning_content.as_deref(),
+            Some("common rationale\n\nadditional replay rationale")
+        );
+        assert!(wire[0].reasoning_details.is_none());
+        assert!(
+            !serde_json::to_string(&wire)
+                .unwrap()
+                .contains("opaque-signature")
+        );
+        assert_eq!(canonical.provider_replay_state.as_ref(), Some(&replay));
     }
 
     #[test]

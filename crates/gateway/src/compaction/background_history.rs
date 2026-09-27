@@ -7,7 +7,7 @@ use pioneer_compaction::{
     coverage_domain_for, effective_selection, plan_compaction,
 };
 use pioneer_crud::compaction::{HistoryCheckDiagnostic, HistoryCheckOutcome, ManifestEntry};
-use pioneer_provider::ChatRequest;
+use pioneer_provider::{ChatRequest, ReasoningConfig, ReasoningEffort};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
@@ -314,6 +314,25 @@ pub(crate) async fn prepare_completed_history_owned(
         // This estimates only the retained Pioneer history. It makes no claim
         // about hidden CLI instructions/tokens and never controls its context.
         // Every later native call still budgets its own complete request.
+        let reasoning = if current.transport == Transport::Api {
+            current
+                .effort
+                .as_deref()
+                .map(|effort| {
+                    let effort = ReasoningEffort::from_str(effort)
+                        .ok_or_else(|| anyhow::anyhow!("unsupported native reasoning effort"))?;
+                    Ok::<_, anyhow::Error>(if effort == ReasoningEffort::None {
+                        ReasoningConfig::Disabled
+                    } else {
+                        ReasoningConfig::Effort(effort)
+                    })
+                })
+                .transpose()?
+        } else {
+            // CLI efforts are metadata-defined; their runtimes own the hidden
+            // context, and this request only estimates Pioneer history.
+            None
+        };
         let request = ChatRequest {
             model: current.model.clone(),
             messages,
@@ -322,8 +341,20 @@ pub(crate) async fn prepare_completed_history_owned(
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
-            reasoning: None,
+            reasoning,
             compiled_prompt: None,
+        };
+        let request = if current.transport == Transport::Api {
+            pioneer_provider::history::project_request_for_provider(&catalog, request)?
+        } else {
+            ChatRequest {
+                messages: request
+                    .messages
+                    .iter()
+                    .map(pioneer_provider::history::portable_history_message)
+                    .collect(),
+                ..request
+            }
         };
         diagnostic.stage = "budget".into();
         let full = completed_history_request_projection(request, budget.clone())?;

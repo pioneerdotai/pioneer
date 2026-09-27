@@ -561,6 +561,7 @@ impl crate::traits::Provider for CopilotProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         let prepared = prepare_messages_for_provider_async(
             self.name(),
+            request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
@@ -644,6 +645,7 @@ impl crate::traits::Provider for CopilotProvider {
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
         let prepared = prepare_messages_for_provider_async(
             self.name(),
+            request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
