@@ -7,6 +7,14 @@ pub(crate) use super::compaction_lifecycle as lifecycle;
 pub(crate) use super::compaction_runner as runner;
 pub(crate) use super::compaction_source_projection as source_projection;
 pub(crate) use super::compaction_task_output as task_output;
+
+/// Context rows retained by cleanup and admitted to newly built model history.
+/// Exact source lookup for existing frozen histories remains independent of this rule.
+pub const MODEL_HISTORY_CONTEXT_SOURCES: [&str; 2] = ["assistant_round", "tool_result_v2"];
+
+pub fn model_history_context_source(source: &str) -> bool {
+    MODEL_HISTORY_CONTEXT_SOURCES.contains(&source)
+}
 use crate::CrudStore;
 use anyhow::{Result, ensure};
 pub use background::{CompactionLifecycleRecovery, CompletedHistoryCheck};
@@ -1154,6 +1162,52 @@ pub(crate) async fn compaction_sources_current<C: ConnectionTrait>(
     .one(db)
     .await?
     .ok_or_else(|| anyhow::anyhow!("source validation missing"))?;
+    Ok(row.matched == sources.len() as i64)
+}
+
+/// Admit only cleanup-stable context identities to a newly published history.
+/// The same scoped revision lookup used by source validation is required here;
+/// a source name alone cannot authenticate a caller-supplied reference.
+pub(crate) async fn compaction_model_context_sources_current<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    thread: &str,
+    sources: &[SourceRef],
+) -> Result<bool> {
+    ensure!(
+        sources.len() <= SOURCE_PAGE_ROWS as usize,
+        "source validation batch exceeds row bound"
+    );
+    let payload = serde_json::to_string(sources)?;
+    ensure!(
+        payload.len() <= SOURCE_PAGE_BYTES,
+        "source validation batch exceeds byte bound"
+    );
+    let row = MatchedSourceCount::find_by_statement(sqlite_specific_sql(
+        r#"SELECT COUNT(*) AS matched FROM json_each(?1) wanted WHERE EXISTS (
+            SELECT 1 FROM compaction_source_revision revision
+            JOIN turn_llm_context context_source
+              ON context_source.id=revision.source_id AND context_source.turn_id=revision.turn_id
+            JOIN turn context_turn ON context_turn.id=revision.turn_id
+            JOIN thread context_thread ON context_thread.id=context_turn.thread_id
+            WHERE revision.present=1 AND context_thread.workspace_id=?2
+              AND context_turn.thread_id=?3
+              AND context_source.source IN (?4,?5)
+              AND 'context:'||revision.turn_id=json_extract(wanted.value,'$.scope')
+              AND revision.source_id=json_extract(wanted.value,'$.id')
+              AND 'revision:'||revision.revision=json_extract(wanted.value,'$.version')
+        )"#,
+        [
+            payload.into(),
+            workspace.into(),
+            thread.into(),
+            MODEL_HISTORY_CONTEXT_SOURCES[0].into(),
+            MODEL_HISTORY_CONTEXT_SOURCES[1].into(),
+        ],
+    ))
+    .one(db)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("context source validation missing"))?;
     Ok(row.matched == sources.len() as i64)
 }
 

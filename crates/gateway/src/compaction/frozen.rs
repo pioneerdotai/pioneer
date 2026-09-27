@@ -624,6 +624,80 @@ fn digest_entry(digest: &mut Sha256, reference: &FrozenMessageRef) -> Result<()>
     digest.update(bytes);
     Ok(())
 }
+
+/// JSON-array batches are bounded before the repository serializes them for
+/// exact scoped metadata validation. The brackets and commas count as bytes.
+fn bounded_context_source_pages(sources: &[SourceRef]) -> Result<Vec<&[SourceRef]>> {
+    let mut pages = Vec::new();
+    let mut start = 0;
+    let mut bytes = 2;
+    for (index, source) in sources.iter().enumerate() {
+        let source_bytes = serde_json::to_vec(source)?.len();
+        ensure!(
+            source_bytes + 2 <= pioneer_crud::compaction::SOURCE_PAGE_BYTES,
+            "single context source exceeds validation quantum"
+        );
+        let separator = usize::from(index > start);
+        if index - start >= pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize
+            || bytes + separator + source_bytes > pioneer_crud::compaction::SOURCE_PAGE_BYTES
+        {
+            pages.push(&sources[start..index]);
+            start = index;
+            bytes = 2;
+        }
+        bytes += usize::from(index > start) + source_bytes;
+    }
+    if start < sources.len() {
+        pages.push(&sources[start..]);
+    }
+    Ok(pages)
+}
+
+#[cfg(test)]
+#[test]
+fn context_source_validation_pages_obey_row_and_serialized_byte_bounds() {
+    let rows = (0..=pioneer_crud::compaction::SOURCE_PAGE_ROWS)
+        .map(|index| SourceRef {
+            scope: "context:turn".into(),
+            id: format!("source-{index}"),
+            version: "revision:1".into(),
+        })
+        .collect::<Vec<_>>();
+    let pages = bounded_context_source_pages(&rows).unwrap();
+    assert_eq!(pages.len(), 2);
+    assert_eq!(
+        pages.iter().map(|page| page.len()).sum::<usize>(),
+        rows.len()
+    );
+    assert!(
+        pages
+            .iter()
+            .all(|page| page.len() <= pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize)
+    );
+
+    let wide = (0..3)
+        .map(|index| SourceRef {
+            scope: "context:turn".into(),
+            id: format!(
+                "{index}-{}",
+                "x".repeat(pioneer_crud::compaction::SOURCE_PAGE_BYTES / 2)
+            ),
+            version: "revision:1".into(),
+        })
+        .collect::<Vec<_>>();
+    let pages = bounded_context_source_pages(&wide).unwrap();
+    assert!(pages.len() > 1);
+    assert!(
+        pages
+            .iter()
+            .all(|page| serde_json::to_vec(page).unwrap().len()
+                <= pioneer_crud::compaction::SOURCE_PAGE_BYTES)
+    );
+    assert_eq!(
+        pages.iter().map(|page| page.len()).sum::<usize>(),
+        wide.len()
+    );
+}
 fn authorize(
     workspace: &str,
     allowed: &BTreeSet<String>,
@@ -2360,6 +2434,36 @@ async fn capture_with_imports_prepared_using_renderer(
                     .get(&(reference.source_thread.clone(), source.clone()))
                     .copied();
             }
+        }
+    }
+    // Validate both render and replay dependencies before restore reads any
+    // context payload, and before a manifest can be created. Existing frozen
+    // histories retain their independent legacy restore rules.
+    let mut context_sources = BTreeMap::<String, BTreeSet<SourceRef>>::new();
+    for reference in &references {
+        for source in reference
+            .sources
+            .iter()
+            .chain(reference.replay_source.iter())
+        {
+            if source.scope.starts_with("context:") {
+                context_sources
+                    .entry(reference.source_thread.clone())
+                    .or_default()
+                    .insert(source.clone());
+            }
+        }
+    }
+    for (thread, sources) in context_sources {
+        let sources = sources.into_iter().collect::<Vec<_>>();
+        for page in bounded_context_source_pages(&sources)? {
+            super::history::prepare_references(store, workspace, &thread, page).await?;
+            ensure!(
+                store
+                    .compaction_model_context_sources_current(workspace, &thread, page)
+                    .await?,
+                "new frozen history contains an inadmissible context source"
+            );
         }
     }
     for reference in &references {

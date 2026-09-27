@@ -214,6 +214,20 @@ impl CrudStore {
         )
         .await
     }
+    pub async fn compaction_model_context_sources_current(
+        &self,
+        workspace: &str,
+        thread: &str,
+        sources: &[SourceRef],
+    ) -> Result<bool> {
+        repositories::compaction::compaction_model_context_sources_current(
+            &self.connection,
+            workspace,
+            thread,
+            sources,
+        )
+        .await
+    }
     pub async fn compaction_historical_event_projections(
         &self,
         workspace: &str,

@@ -1949,6 +1949,7 @@ async fn legacy_frozen_failed_provider_observation_restores_portable_execution_a
         CanonicalProviderRoundEnvelope, ChatMessage, MessageProvenance, MessageSourceRef,
         ProviderReplayState, ProviderTermination,
     };
+    use sha2::Digest;
     let f = fixture("unused", vec![], true, false).await;
     let mut partial = ChatMessage::assistant("partial answer");
     partial.reasoning_content = Some("common reasoning".into());
@@ -1975,7 +1976,7 @@ async fn legacy_frozen_failed_provider_observation_restores_portable_execution_a
     )).await.unwrap();
     let source = f
         .store
-        .compaction_source_page("ws", "thread", "turn", PagedSource::ProviderContext, 0)
+        .compaction_source_metadata_page("ws", "thread", "turn", PagedSource::ProviderContext, 0)
         .await
         .unwrap()
         .entries
@@ -2002,9 +2003,51 @@ async fn legacy_frozen_failed_provider_observation_restores_portable_execution_a
         inherited: false,
     });
     let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
-    let descriptor = super::frozen::capture(&f.store, "ws", "thread", &allowed, &[legacy.clone()])
+    // This is an already-published legacy manifest. New capture deliberately
+    // refuses provider_observation dependencies, while old restore stays exact.
+    let reference = pioneer_compaction::frozen::FrozenMessageRef {
+        logical_turn_id: Some("turn".into()),
+        source_thread: "thread".into(),
+        context_thread: None,
+        unit_id: "failed-round".into(),
+        sources: vec![source.clone()],
+        event_input_role: None,
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
+        publication_aliases: None,
+        inherited: false,
+        complete: true,
+        protected_input: false,
+        wire_sha256: hex::encode(sha2::Sha256::digest(serde_json::to_vec(&legacy).unwrap())),
+        replay_source: None,
+        tool_item_id: None,
+        tool_call_id: None,
+        tool_name: None,
+    };
+    let reference_bytes = serde_json::to_vec(&reference).unwrap();
+    let mut identity = sha2::Sha256::new();
+    identity.update((reference_bytes.len() as u64).to_be_bytes());
+    identity.update(&reference_bytes);
+    let descriptor = pioneer_compaction::frozen::FrozenHistoryRef {
+        format: pioneer_compaction::FORMAT_VERSION,
+        manifest_id: "legacy-provider-observation".into(),
+        messages: 1,
+        identity_sha256: hex::encode(identity.finalize()),
+    };
+    f.store
+        .compaction_begin_frozen_history("ws", "thread", &descriptor)
         .await
         .unwrap();
+    f.store
+        .compaction_append_frozen_history("ws", "thread", &descriptor.manifest_id, 0, &[reference])
+        .await
+        .unwrap();
+    assert!(
+        f.store
+            .compaction_finish_frozen_history("ws", "thread", &descriptor)
+            .await
+            .unwrap()
+    );
     assert_eq!(
         super::frozen::restore(&f.store, "ws", &allowed, &descriptor)
             .await
@@ -2051,6 +2094,85 @@ async fn legacy_frozen_failed_provider_observation_restores_portable_execution_a
 }
 
 #[tokio::test]
+async fn direct_capture_rejects_excluded_context_before_payload_and_manifest_write() {
+    use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
+    let f = fixture("unused", vec![], true, false).await;
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES('zz-forbidden-context','turn','failed',5,'provider_observation','{broken','{}',CURRENT_TIMESTAMP)",
+        [],
+    )).await.unwrap();
+    let source = f
+        .store
+        .compaction_source_metadata_page("ws", "thread", "turn", PagedSource::ProviderContext, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.reference.id == "zz-forbidden-context")
+        .unwrap()
+        .reference;
+    let mut sources = Vec::new();
+    for index in 0..pioneer_crud::compaction::SOURCE_PAGE_ROWS {
+        let id = format!("allowed-{index:03}");
+        f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES(?,'turn','allowed',?,'assistant_round','{broken','{}',CURRENT_TIMESTAMP)",
+            [id.clone().into(), (index as i64 + 6).into()],
+        )).await.unwrap();
+        sources.push(MessageSourceRef {
+            scope: "context:turn".into(),
+            id,
+            version: "revision:1".into(),
+        });
+    }
+    sources.push(MessageSourceRef {
+        scope: source.scope,
+        id: source.id,
+        version: source.version,
+    });
+    let mut message = ChatMessage::user("must not publish");
+    message.provenance = Some(MessageProvenance {
+        logical_turn_id: Some("turn".into()),
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        context_thread: None,
+        unit_id: "failed".into(),
+        sources,
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
+        complete: true,
+        protected_input: false,
+        inherited: false,
+    });
+    let count = || async {
+        f.store
+            .database_connection()
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS total FROM compaction_frozen_history",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "total")
+            .unwrap()
+    };
+    let before = count().await;
+    let error = super::frozen::capture(
+        &f.store,
+        "ws",
+        "thread",
+        &std::collections::BTreeSet::from(["thread".into()]),
+        &[message],
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("inadmissible context source"));
+    assert_eq!(count().await, before);
+}
+
+#[tokio::test]
 async fn classified_technical_event_does_not_load_its_compressed_payload() {
     let f = fixture("unused", vec![], true, false).await;
     f.store.database_connection().execute_unprepared(
@@ -2086,6 +2208,53 @@ async fn classified_technical_event_does_not_load_its_compressed_payload() {
         .await
         .unwrap();
     assert!(history.is_empty());
+}
+
+#[tokio::test]
+async fn excluded_context_never_decompresses_its_payload() {
+    let f = fixture("visible event", vec![], true, false).await;
+    let db = f.store.database_connection();
+    db.execute_unprepared(
+        "UPDATE turn SET status='completed' WHERE id='turn'; \
+         INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES('excluded-compressed','turn','fixture-agent-message',1,'provider_observation','original','{}',CURRENT_TIMESTAMP)",
+    )
+    .await
+    .unwrap();
+    let config = serde_json::json!({
+        "table":"turn_llm_context", "column":"payload", "compression_level":3,
+        "dict_chooser":"'[nodict]'"
+    });
+    db.query_one_write_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT zstd_enable_transparent(?)",
+        [config.to_string().into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE _turn_llm_context_zstd SET payload=?,_payload_dict=-1 WHERE id='excluded-compressed'",
+        [vec![0_u8, 1, 2, 3].into()],
+    ))
+    .await
+    .unwrap();
+    super::history::prepare_history(&f.store, "ws", "thread")
+        .await
+        .unwrap();
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let messages = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+        .await
+        .unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content == "visible event")
+    );
+    assert!(
+        messages
+            .iter()
+            .all(|message| !message.content.contains("original"))
+    );
 }
 
 #[tokio::test]
@@ -17119,6 +17288,194 @@ async fn completed_task_output_excludes_later_turns_before_decoding_and_survives
             .is_err()
     );
     assert!(f.provider.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn new_task_output_ignores_cleanup_context_before_payload_and_aliases() {
+    use pioneer_provider::{
+        CanonicalProviderRoundEnvelope, ChatMessage, ProviderCallIdentity, ProviderToolCall,
+    };
+
+    let f = fixture("durable event message", vec![], true, false).await;
+    let store = f.store.with_maintenance_access();
+    let db = store.database_connection();
+    db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
+        .await
+        .unwrap();
+    for (id, sequence, source) in [
+        ("excluded-observation", 1_i64, "provider_observation"),
+        ("excluded-tool", 2, "tool_result"),
+        ("excluded-unknown", 3, "future_context_source"),
+    ] {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES(?,'turn','fixture-agent-message',?,?,'{broken payload','{}',CURRENT_TIMESTAMP)",
+            [id.into(), sequence.into(), source.into()],
+        ))
+        .await
+        .unwrap();
+    }
+    let round = CanonicalProviderRoundEnvelope {
+        version: 1,
+        round_id: "allowed-round".into(),
+        termination: ProviderTermination::ToolCalls,
+        message: ChatMessage::assistant_tool_calls(
+            None::<String>,
+            vec![ProviderToolCall {
+                id: "provider-call".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+        ),
+        calls: vec![ProviderCallIdentity {
+            provider_call_id: "provider-call".into(),
+            turn_item_id: "tool-item".into(),
+            ordinal: 0,
+        }],
+    };
+    let result = pioneer_tools::ToolResultView::Json {
+        value: serde_json::to_value(ChatMessage::tool_result(
+            "provider-call",
+            "read_file",
+            "allowed result",
+        ))
+        .unwrap(),
+        truncated: false,
+    };
+    for (id, item, sequence, source, payload) in [
+        (
+            "allowed-round-source",
+            "allowed-round",
+            4_i64,
+            "assistant_round",
+            serde_json::to_string(&round).unwrap(),
+        ),
+        (
+            "allowed-result-source",
+            "tool-item",
+            5,
+            "tool_result_v2",
+            serde_json::to_string(&result).unwrap(),
+        ),
+    ] {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES(?,'turn',?,?,?,?, '{}',CURRENT_TIMESTAMP)",
+            [id.into(), item.into(), sequence.into(), source.into(), payload.into()],
+        ))
+        .await
+        .unwrap();
+    }
+    let legacy = ChatMessage::assistant_tool_calls(
+        None::<String>,
+        vec![ProviderToolCall {
+            id: "legacy-call".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        }],
+    );
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES('legacy-round-source','turn','fixture-agent-message',6,'assistant_round',?,'{}',CURRENT_TIMESTAMP)",
+        [serde_json::to_string(&legacy).unwrap().into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_unprepared(
+        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES('legacy-result-source','turn','legacy-call',7,'tool_result','{broken payload','{}',CURRENT_TIMESTAMP)",
+    )
+    .await
+    .unwrap();
+    super::history::prepare_history(&store, "ws", "thread")
+        .await
+        .unwrap();
+    let fence = store.compaction_history_read_fence().await.unwrap();
+    let before = super::history::load_task_output_history(&store, "ws", "thread", "turn", &fence)
+        .await
+        .unwrap();
+    assert_eq!(
+        super::history::load_line_history(&store, "ws", "thread", None, &fence)
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(
+        before
+            .iter()
+            .any(|message| message.content == "durable event message")
+    );
+    assert!(
+        before
+            .iter()
+            .any(|message| message.content == "allowed result")
+    );
+    assert!(before.iter().any(|message| message.tool_calls.is_some()));
+    assert_eq!(
+        before
+            .iter()
+            .filter(|message| message.tool_calls.is_some())
+            .count(),
+        1,
+        "only the answered canonical tool round may enter model history"
+    );
+    assert!(
+        before
+            .iter()
+            .all(|message| !message.content.contains("broken payload"))
+    );
+
+    db.execute_unprepared(
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal) VALUES ('filter-task','ws','thread','thread','agent','running','Filter','fixture'); \
+         INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('filter-run','filter-task','filter-run',1,1,'running','agent'); \
+         INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('filter-run-turn','filter-task','filter-run','thread','turn','initial',0,1,'candidate_created',CURRENT_TIMESTAMP)",
+    )
+    .await
+    .unwrap();
+    let task_turn = store
+        .get_task_run_turn("filter-run-turn")
+        .await
+        .unwrap()
+        .unwrap();
+    let output = super::frozen::capture_task_output(&store, "ws", &task_turn)
+        .await
+        .unwrap();
+    let references = store
+        .compaction_frozen_history_page("ws", "thread", &output.history.manifest_id, 0)
+        .await
+        .unwrap();
+    let ids = references
+        .iter()
+        .flat_map(|message| message.sources.iter().chain(message.replay_source.iter()))
+        .map(|source| source.id.as_str())
+        .collect::<Vec<_>>();
+    assert!(ids.contains(&"allowed-round-source"));
+    assert!(ids.contains(&"allowed-result-source"));
+    assert!(ids.iter().all(|id| !id.starts_with("excluded-")));
+    assert!(!ids.contains(&"legacy-round-source"));
+    assert!(!ids.contains(&"legacy-result-source"));
+    assert_eq!(
+        store
+            .delete_turn_llm_context_for_turn("turn")
+            .await
+            .unwrap(),
+        4
+    );
+    let fence = store.compaction_history_read_fence().await.unwrap();
+    let after = super::history::load_task_output_history(&store, "ws", "thread", "turn", &fence)
+        .await
+        .unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        super::frozen::restore(
+            &store,
+            "ws",
+            &std::collections::BTreeSet::from(["thread".to_owned()]),
+            &output.history,
+        )
+        .await
+        .unwrap(),
+        before
+    );
 }
 
 #[tokio::test]

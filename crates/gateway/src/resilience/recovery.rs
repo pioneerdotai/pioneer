@@ -3874,7 +3874,7 @@ impl RecoveryCoordinator {
         let mut sources = HashMap::new();
         while after < high_water {
             let page = store
-                .compaction_source_page(
+                .compaction_source_metadata_page(
                     &workspace,
                     &thread,
                     turn_id,
@@ -3887,11 +3887,10 @@ impl RecoveryCoordinator {
                 "retained history source disappeared"
             );
             after = page.next_sequence;
-            for row in page
-                .entries
-                .into_iter()
-                .filter(|row| row.sequence <= high_water)
-            {
+            for row in page.entries.into_iter().filter(|row| {
+                row.sequence <= high_water
+                    && pioneer_crud::compaction::model_history_context_source(&row.source_type)
+            }) {
                 let payload = match row.payload {
                     Some(payload) => payload,
                     None => store
@@ -3909,6 +3908,35 @@ impl RecoveryCoordinator {
                 });
             }
         }
+        // Legacy assistant calls cannot be replayed with their cleanup-eligible
+        // tool_result rows. Dropping that sequence is safe only when durable
+        // terminal item state proves every call completed. Never inspect the
+        // excluded tool_result payload to make this decision.
+        let mut verified_legacy = HashSet::new();
+        for row in rows.iter().filter(|row| row.source == "assistant_round") {
+            if serde_json::from_str::<pioneer_provider::CanonicalProviderRoundEnvelope>(
+                &row.payload,
+            )
+            .is_ok()
+            {
+                continue;
+            }
+            let legacy: ChatMessage = serde_json::from_str(&row.payload)?;
+            let calls = validated_legacy_assistant_calls(turn_id, &legacy)?;
+            for call in calls {
+                anyhow::ensure!(
+                    crate::compaction::retained_shell_outcome(
+                        &store, &workspace, &thread, turn_id, &call.id, &call.id, &call.name,
+                    )
+                    .await?
+                    .is_some(),
+                    "incomplete legacy tool outcome for call `{}`",
+                    call.id
+                );
+            }
+            verified_legacy.insert(row.sequence);
+        }
+        rows.retain(|row| !verified_legacy.contains(&row.sequence));
         // Capture the exact round/item mapping before the existing recovery
         // assembler orders results and synthesizes safe interrupted observations.
         let origins = retained_history_origins(&workspace, &thread, turn_id, &rows, &sources)?;
@@ -4271,19 +4299,7 @@ fn retained_history_origins(
     let mut result = HashMap::<i64, RetainedRoundOrigins>::new();
     let mut current = None;
     for row in rows {
-        if row.source == "provider_observation" {
-            let source = sources
-                .get(&row.sequence)
-                .ok_or_else(|| anyhow::anyhow!("failed observation source missing"))?;
-            result.insert(
-                row.sequence,
-                RetainedRoundOrigins {
-                    assistant: provenance(&source.id, source),
-                    tools: HashMap::new(),
-                },
-            );
-            current = None;
-        } else if row.source == "assistant_round" {
+        if row.source == "assistant_round" {
             current = None;
             if let Ok(envelope) = serde_json::from_str::<
                 pioneer_provider::CanonicalProviderRoundEnvelope,
@@ -4351,139 +4367,53 @@ fn assemble_retained_provider_history_with_outcomes(
     resumable_item_ids: &HashSet<String>,
     recovered: &HashMap<String, ChatMessage>,
 ) -> Result<Vec<RetainedProviderHistoryMessage>> {
+    rows.retain(|row| pioneer_crud::compaction::model_history_context_source(&row.source));
     rows.sort_by_key(|row| row.sequence);
-
-    let canonical_start = rows.iter().position(|row| {
-        row.source == "tool_result_v2"
-            || row.source == "provider_observation"
-            || (row.source == "assistant_round"
-                && serde_json::from_str::<pioneer_provider::CanonicalProviderRoundEnvelope>(
-                    row.payload.as_str(),
-                )
-                .is_ok())
-    });
-    let Some(canonical_start) = canonical_start else {
-        return assemble_legacy_provider_history(turn_id, rows);
-    };
-
-    let canonical_rows = rows.split_off(canonical_start);
-    let mut retained = assemble_legacy_provider_history(turn_id, rows)?;
-    retained.extend(assemble_canonical_provider_history(
-        turn_id,
-        canonical_rows,
-        resumable_item_ids,
-        recovered,
-    )?);
-    Ok(retained)
+    let mut canonical_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.source == "assistant_round"
+            && serde_json::from_str::<pioneer_provider::CanonicalProviderRoundEnvelope>(
+                &row.payload,
+            )
+            .is_err()
+        {
+            // The coordinator must establish durable terminal outcomes before
+            // removing legacy calls. This assembler has no such evidence.
+            let legacy: ChatMessage = serde_json::from_str(&row.payload).map_err(|error| {
+                anyhow::anyhow!("invalid retained assistant round for turn `{turn_id}`: {error}")
+            })?;
+            validated_legacy_assistant_calls(turn_id, &legacy)?;
+            anyhow::bail!("incomplete legacy tool outcome for turn `{turn_id}`");
+        }
+        canonical_rows.push(row);
+    }
+    assemble_canonical_provider_history(turn_id, canonical_rows, resumable_item_ids, recovered)
 }
 
-fn assemble_legacy_provider_history(
+fn validated_legacy_assistant_calls<'a>(
     turn_id: &str,
-    rows: Vec<RetainedProviderHistoryRow>,
-) -> Result<Vec<RetainedProviderHistoryMessage>> {
-    if rows.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut retained = Vec::with_capacity(rows.len());
-    let mut pending_tool_calls = HashSet::<String>::new();
-    let mut answered_tool_calls = HashSet::<String>::new();
-
-    for row in rows {
-        match row.source.as_str() {
-            "assistant_round" => {
-                if pending_tool_calls
-                    .iter()
-                    .any(|call_id| !answered_tool_calls.contains(call_id))
-                {
-                    bail!(
-                        "retained provider history for turn `{turn_id}` starts a new assistant round before every prior tool call has a retained result"
-                    );
-                }
-
-                let message =
-                    serde_json::from_str::<ChatMessage>(row.payload.as_str()).map_err(|error| {
-                        anyhow::anyhow!(
-                            "invalid retained assistant round for turn `{turn_id}`: {error}"
-                        )
-                    })?;
-                if message.role != Role::Assistant {
-                    bail!(
-                        "retained provider history for turn `{turn_id}` contains a non-assistant round"
-                    );
-                }
-                let tool_calls = message.tool_calls.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "retained assistant round for turn `{turn_id}` has no tool calls"
-                    )
-                })?;
-                if tool_calls.is_empty() {
-                    bail!(
-                        "retained assistant round for turn `{turn_id}` has an empty tool-call list"
-                    );
-                }
-
-                pending_tool_calls.clear();
-                answered_tool_calls.clear();
-                for call in tool_calls {
-                    if !pending_tool_calls.insert(call.id.clone()) {
-                        bail!(
-                            "retained assistant round for turn `{turn_id}` contains duplicate tool call `{}`",
-                            call.id
-                        );
-                    }
-                }
-                retained.push(RetainedProviderHistoryMessage {
-                    sequence: row.sequence,
-                    message,
-                });
-            }
-            "tool_result" => {
-                let item_id = row.item_id.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "retained tool result for turn `{turn_id}` is missing its call id"
-                    )
-                })?;
-                let tool_name = row.tool_name.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "retained tool result for turn `{turn_id}` call `{item_id}` is missing its tool name"
-                    )
-                })?;
-                if !pending_tool_calls.contains(item_id.as_str()) {
-                    bail!(
-                        "retained tool result for turn `{turn_id}` call `{item_id}` has no preceding complete assistant round"
-                    );
-                }
-                if !answered_tool_calls.insert(item_id.clone()) {
-                    bail!(
-                        "retained provider history for turn `{turn_id}` contains duplicate result for tool call `{item_id}`"
-                    );
-                }
-                let view =
-                    serde_json::from_str::<pioneer_tools::ToolResultView>(row.payload.as_str())?;
-                retained.push(RetainedProviderHistoryMessage {
-                    sequence: row.sequence,
-                    message: recovered_tool_result_message(item_id, tool_name, view),
-                });
-            }
-            source => {
-                bail!(
-                    "retained provider history for turn `{turn_id}` contains unsupported source `{source}`"
-                );
-            }
-        }
-    }
-
-    if pending_tool_calls
-        .iter()
-        .any(|call_id| !answered_tool_calls.contains(call_id))
-    {
-        bail!(
-            "retained provider history for turn `{turn_id}` is incomplete; refusing to send a malformed provider request"
+    message: &'a ChatMessage,
+) -> Result<&'a [pioneer_provider::ProviderToolCall]> {
+    anyhow::ensure!(
+        message.role == Role::Assistant,
+        "retained provider history for turn `{turn_id}` contains a non-assistant round"
+    );
+    let calls = message.tool_calls.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("retained assistant round for turn `{turn_id}` has no tool calls")
+    })?;
+    anyhow::ensure!(
+        !calls.is_empty(),
+        "retained assistant round for turn `{turn_id}` has an empty tool-call list"
+    );
+    let mut identities = HashSet::new();
+    for call in calls {
+        anyhow::ensure!(
+            identities.insert(call.id.as_str()),
+            "retained assistant round for turn `{turn_id}` contains duplicate tool call `{}`",
+            call.id
         );
     }
-
-    Ok(retained)
+    Ok(calls)
 }
 
 fn assemble_canonical_provider_history(
@@ -4646,21 +4576,6 @@ fn assemble_canonical_provider_history(
     let mut pending: Option<PendingRound> = None;
     for row in rows {
         match row.source.as_str() {
-            "provider_observation" => {
-                if let Some(previous) = pending.take() {
-                    flush_round(
-                        turn_id,
-                        previous,
-                        resumable_item_ids,
-                        recovered,
-                        &mut retained,
-                    )?;
-                }
-                retained.push(RetainedProviderHistoryMessage {
-                    sequence: row.sequence,
-                    message: crate::compaction::provider_observation(&row.payload)?,
-                });
-            }
             "assistant_round" => {
                 if let Some(previous) = pending.take() {
                     flush_round(
@@ -4745,50 +4660,6 @@ fn resumable_tool_interruption_message(provider_call_id: &str, tool_name: &str) 
         Some(payload),
     )
     .into_chat_message()
-}
-
-fn recovered_tool_result_message(
-    item_id: String,
-    tool_name: String,
-    view: pioneer_tools::ToolResultView,
-) -> ChatMessage {
-    let (content, payload) = match view {
-        pioneer_tools::ToolResultView::Text { text, truncated } => (
-            text.clone(),
-            serde_json::json!({
-                "output": text,
-                "truncated": truncated,
-                "recovered_from_turn_llm_context": true,
-            }),
-        ),
-        pioneer_tools::ToolResultView::Json {
-            mut value,
-            truncated,
-        } => {
-            if !value.is_object() {
-                value = serde_json::json!({ "value": value });
-            }
-            if let Some(map) = value.as_object_mut() {
-                map.entry("truncated".to_owned())
-                    .or_insert(serde_json::Value::Bool(truncated));
-                map.insert(
-                    "recovered_from_turn_llm_context".to_owned(),
-                    serde_json::Value::Bool(true),
-                );
-            }
-            let content =
-                serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
-            (content, value)
-        }
-        pioneer_tools::ToolResultView::Empty => (
-            String::new(),
-            serde_json::json!({
-                "recovered_from_turn_llm_context": true
-            }),
-        ),
-    };
-
-    ModelInputItem::tool_result(item_id, tool_name, content, Some(payload)).into_chat_message()
 }
 
 fn policy_snapshot_i64(job: &RecoveryJobRecord, key: &str) -> Option<i64> {
@@ -5080,7 +4951,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_provider_history_replays_complete_assistant_round_losslessly() {
+    fn legacy_round_requires_durable_outcome_even_with_result_rows() {
         let assistant = ChatMessage::assistant_tool_calls_with_provider_state(
             Some("working"),
             Some("private reasoning"),
@@ -5139,16 +5010,12 @@ mod tests {
             ),
         ];
 
-        let retained = assemble_retained_provider_history("turn_lossless", rows).unwrap();
-
-        assert_eq!(retained.len(), 3);
-        assert_eq!(retained[0].message, assistant);
-        assert_eq!(retained[1].message.tool_call_id.as_deref(), Some("call_b"));
-        assert_eq!(retained[2].message.tool_call_id.as_deref(), Some("call_a"));
+        let error = assemble_retained_provider_history("turn_lossless", rows).unwrap_err();
+        assert!(error.to_string().contains("incomplete legacy tool outcome"));
     }
 
     #[test]
-    fn retained_provider_history_rejects_legacy_tool_result_without_assistant_round() {
+    fn legacy_tool_result_without_assistant_round_is_excluded() {
         let rows = vec![retained_history_row(
             1,
             "tool_result",
@@ -5157,17 +5024,15 @@ mod tests {
             serde_json::to_string(&pioneer_tools::ToolResultView::Empty).unwrap(),
         )];
 
-        let error = assemble_retained_provider_history("turn_legacy", rows).unwrap_err();
-
         assert!(
-            error
-                .to_string()
-                .contains("no preceding complete assistant round")
+            assemble_retained_provider_history("turn_legacy", rows)
+                .unwrap()
+                .is_empty()
         );
     }
 
     #[test]
-    fn retained_provider_history_rejects_incomplete_parallel_tool_results() {
+    fn incomplete_legacy_tool_sequence_blocks_without_durable_outcomes() {
         let assistant = ChatMessage::assistant_tool_calls(
             None::<String>,
             vec![
@@ -5200,9 +5065,12 @@ mod tests {
             ),
         ];
 
-        let error = assemble_retained_provider_history("turn_incomplete", rows).unwrap_err();
-
-        assert!(error.to_string().contains("is incomplete"));
+        assert!(
+            assemble_retained_provider_history("turn_incomplete", rows)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete legacy tool outcome")
+        );
     }
 
     fn canonical_round_row(
@@ -5260,7 +5128,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_failed_partial_recovery_is_data_and_never_replays_its_calls() {
+    fn failed_partial_observation_is_excluded_without_replaying_its_calls() {
         let mut partial = ChatMessage::assistant("unfinished answer");
         partial.tool_calls = Some(vec![ProviderToolCall {
             id: "already-called".into(),
@@ -5290,12 +5158,7 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(restored.len(), 3);
-        assert_eq!(restored[2].message.role, pioneer_provider::Role::User);
-        assert!(restored[2].message.tool_calls.is_none());
-        assert!(restored[2].message.content.contains("unfinished answer"));
-        assert!(restored[2].message.content.contains("already-called"));
-        assert!(!restored[2].message.content.contains("Reissue"));
+        assert_eq!(restored.len(), 2);
         assert_eq!(
             restored
                 .iter()
@@ -5341,11 +5204,44 @@ mod tests {
                 .await
                 .unwrap();
         }
+        for (sequence, source) in [
+            (5, "provider_observation"),
+            (6, "tool_result"),
+            (7, "unknown_future_source"),
+        ] {
+            store
+                .insert_turn_llm_context(NewTurnLlmContextEntry {
+                    turn_id: turn.into(),
+                    item_id: None,
+                    attempt_id: None,
+                    sequence,
+                    source: source.into(),
+                    tool_name: None,
+                    payload: "{broken payload".into(),
+                    output_policy_snapshot: "{}".into(),
+                    created_at: chrono::Utc::now().fixed_offset(),
+                    expires_at: None,
+                })
+                .await
+                .unwrap();
+        }
         let messages = coordinator
             .retained_provider_history_for_turn(turn)
             .await
             .unwrap();
         assert_eq!(messages.len(), 4);
+        assert_eq!(
+            store.delete_turn_llm_context_for_turn(turn).await.unwrap(),
+            3
+        );
+        let after_cleanup = coordinator
+            .retained_provider_history_for_turn(turn)
+            .await
+            .unwrap();
+        assert_eq!(after_cleanup.len(), messages.len());
+        for (before, after) in messages.iter().zip(after_cleanup) {
+            assert_eq!(before.message, after.message);
+        }
         for pair in messages.chunks_exact(2) {
             let assistant = pair[0].message.provenance.as_ref().unwrap();
             let tool = pair[1].message.provenance.as_ref().unwrap();
@@ -5384,6 +5280,7 @@ mod tests {
             "turn_terminal_restore",
             "shell_terminal",
         );
+        let legacy_item = "legacy_shell_terminal";
         materialize_turn_with_tool_item(
             store.as_ref(),
             workspace,
@@ -5393,7 +5290,7 @@ mod tests {
             None,
         )
         .await;
-        let mut row = canonical_round_row(1, "shell_round", "provider_shell", item);
+        let mut row = canonical_round_row(3, "shell_round", "provider_shell", item);
         let mut envelope: pioneer_provider::CanonicalProviderRoundEnvelope =
             serde_json::from_str(&row.payload).unwrap();
         envelope.message.tool_calls.as_mut().unwrap()[0].name = "exec_command".into();
@@ -5449,11 +5346,91 @@ mod tests {
             )
             .await
             .unwrap();
+        let canonical_source = store
+            .compaction_tool_item_reference(workspace, thread, turn, item)
+            .await
+            .unwrap()
+            .unwrap();
+        // A completed legacy round can be discarded using the terminal item;
+        // its old result bytes are ignored, while the following canonical
+        // round keeps its own call/result identity.
+        let legacy = ChatMessage::assistant_tool_calls(
+            None::<String>,
+            vec![ProviderToolCall {
+                id: legacy_item.into(),
+                name: "exec_command".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        store
+            .insert_turn_llm_context(NewTurnLlmContextEntry {
+                turn_id: turn.into(),
+                item_id: Some("legacy_shell_round".into()),
+                attempt_id: None,
+                sequence: 1,
+                source: "assistant_round".into(),
+                tool_name: None,
+                payload: serde_json::to_string(&legacy).unwrap(),
+                output_policy_snapshot: "{}".into(),
+                created_at: chrono::Utc::now().fixed_offset(),
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+        store
+            .insert_turn_llm_context(NewTurnLlmContextEntry {
+                turn_id: turn.into(),
+                item_id: Some(legacy_item.into()),
+                attempt_id: None,
+                sequence: 2,
+                source: "tool_result".into(),
+                tool_name: Some("exec_command".into()),
+                payload: "{broken".into(),
+                output_policy_snapshot: "{}".into(),
+                created_at: chrono::Utc::now().fixed_offset(),
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+        let unknown = coordinator
+            .retained_provider_history_for_turn(turn)
+            .await
+            .unwrap_err();
+        assert!(
+            unknown
+                .to_string()
+                .contains("incomplete legacy tool outcome")
+        );
+        let mut legacy_shell = shell.clone();
+        if let TurnItem::CommandExecution { id, .. } = &mut legacy_shell {
+            *id = legacy_item.into();
+        }
+        store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item: legacy_shell,
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+        let completed_legacy_source = store
+            .compaction_tool_item_reference(workspace, thread, turn, legacy_item)
+            .await
+            .unwrap()
+            .unwrap();
         let restored = coordinator
             .retained_provider_history_for_turn(turn)
             .await
             .unwrap();
         assert_eq!(restored.len(), 2);
+        assert_eq!(
+            restored[0].message.tool_calls.as_ref().unwrap()[0].id,
+            "provider_shell"
+        );
         assert_eq!(
             restored[1].message.tool_call_id.as_deref(),
             Some("provider_shell")
@@ -5465,15 +5442,79 @@ mod tests {
                 .contains("retained terminal output")
         );
         assert!(!restored[1].message.content.contains("Reissue"));
-        assert_eq!(
-            restored[1].message.provenance.as_ref().unwrap().sources[0].scope,
-            format!("item:{turn}")
-        );
+        let restored_source = &restored[1].message.provenance.as_ref().unwrap().sources[0];
+        assert_eq!(restored_source.scope, canonical_source.scope);
+        assert_eq!(restored_source.id, canonical_source.id);
+        assert_eq!(restored_source.version, canonical_source.version);
+        assert_ne!(restored_source.id, completed_legacy_source.id);
         assert_eq!(
             store.list_turn_llm_context(turn).await.unwrap().len(),
-            1,
+            3,
             "reconciliation must not write a second result copy"
         );
+        assert_eq!(
+            store
+                .compaction_tool_item_reference(workspace, thread, turn, legacy_item)
+                .await
+                .unwrap(),
+            Some(completed_legacy_source),
+            "recovery history preparation must not reexecute the completed legacy call"
+        );
+        let legacy_row_id = store
+            .list_turn_llm_context(turn)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.item_id.as_deref() == Some("legacy_shell_round"))
+            .unwrap()
+            .id;
+        let mut wrong_role = ChatMessage::user("invalid assistant role");
+        wrong_role.tool_calls = legacy.tool_calls.clone();
+        let mut empty_calls = ChatMessage::assistant("empty calls");
+        empty_calls.tool_calls = Some(Vec::new());
+        let mut duplicate_calls = legacy.clone();
+        let repeated_call = duplicate_calls.tool_calls.as_ref().unwrap()[0].clone();
+        duplicate_calls
+            .tool_calls
+            .as_mut()
+            .unwrap()
+            .push(repeated_call);
+        for (invalid, expected) in [
+            (wrong_role, "non-assistant round"),
+            (ChatMessage::assistant("no calls"), "has no tool calls"),
+            (empty_calls, "empty tool-call list"),
+            (duplicate_calls, "duplicate tool call"),
+        ] {
+            store
+                .database_connection()
+                .execute_raw(sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DbBackend::Sqlite,
+                    "UPDATE turn_llm_context SET payload=? WHERE id=?",
+                    [
+                        serde_json::to_string(&invalid).unwrap().into(),
+                        legacy_row_id.clone().into(),
+                    ],
+                ))
+                .await
+                .unwrap();
+            let error = coordinator
+                .retained_provider_history_for_turn(turn)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+        store
+            .database_connection()
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "UPDATE turn_llm_context SET payload=? WHERE id=?",
+                [
+                    serde_json::to_string(&legacy).unwrap().into(),
+                    legacy_row_id.into(),
+                ],
+            ))
+            .await
+            .unwrap();
         // Explicit failure is still a known outcome, never a reason to repeat.
         let mut failed = shell;
         if let TurnItem::CommandExecution {
@@ -5551,6 +5592,23 @@ mod tests {
     }
 
     #[test]
+    fn excluded_context_between_canonical_call_and_result_is_not_parsed() {
+        let retained = assemble_retained_provider_history(
+            "turn_filtered",
+            vec![
+                canonical_round_row(1, "round", "provider_call", "turn_item"),
+                retained_history_row(2, "provider_observation", None, None, "{broken".into()),
+                retained_history_row(3, "tool_result", None, None, "{broken".into()),
+                retained_history_row(4, "unknown_source", None, None, "{broken".into()),
+                exact_result_row(5, "turn_item", "provider_call", "known result"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[1].message.content, "known result");
+    }
+
+    #[test]
     fn canonical_provider_history_reports_reconciliation_for_partial_round() {
         let error = assemble_retained_provider_history(
             "turn_partial",
@@ -5589,7 +5647,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_legacy_prefix_can_continue_with_canonical_rounds_after_upgrade() {
+    fn legacy_prefix_requires_durable_outcomes_before_canonical_rounds() {
         let legacy_assistant = ChatMessage::assistant_tool_calls(
             None::<String>,
             vec![ProviderToolCall {
@@ -5598,7 +5656,7 @@ mod tests {
                 arguments: "{}".to_owned(),
             }],
         );
-        let retained = assemble_retained_provider_history(
+        let error = assemble_retained_provider_history(
             "turn_upgraded",
             vec![
                 retained_history_row(
@@ -5623,19 +5681,8 @@ mod tests {
                 exact_result_row(4, "turn_item_v2", "provider_call", "canonical result"),
             ],
         )
-        .unwrap();
-
-        assert_eq!(retained.len(), 4);
-        let legacy_payload =
-            serde_json::from_str::<serde_json::Value>(&retained[1].message.content).unwrap();
-        assert_eq!(legacy_payload["output"], "legacy result");
-        assert_eq!(legacy_payload["truncated"], false);
-        assert_eq!(legacy_payload["recovered_from_turn_llm_context"], true);
-        assert_eq!(
-            retained[1].message.tool_call_id.as_deref(),
-            Some("legacy_call")
-        );
-        assert_eq!(retained[3].message.content, "canonical result");
+        .unwrap_err();
+        assert!(error.to_string().contains("incomplete legacy tool outcome"));
     }
 
     #[test]
@@ -7996,6 +8043,24 @@ mod tests {
             })
             .await
             .expect("in-flight assistant round should persist");
+
+        // An old result row is cleanup-eligible and cannot prove that the
+        // side effect completed. Its payload must not be parsed in recovery.
+        crud_store
+            .insert_turn_llm_context(NewTurnLlmContextEntry {
+                turn_id: turn_id.to_owned(),
+                item_id: Some(item_id.to_owned()),
+                attempt_id: None,
+                sequence: 2,
+                source: "tool_result".to_owned(),
+                tool_name: Some("web_fetch".to_owned()),
+                payload: "{broken".to_owned(),
+                output_policy_snapshot: serde_json::json!({}).to_string(),
+                created_at: chrono::Utc::now().fixed_offset(),
+                expires_at: None,
+            })
+            .await
+            .expect("legacy result should persist");
 
         let job = crud_store
             .enqueue_recovery_job(

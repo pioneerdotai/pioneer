@@ -438,11 +438,11 @@ async fn metadata(
             "history discovery lost its captured boundary"
         );
         after = page.next_sequence;
-        records.extend(
-            page.entries
-                .into_iter()
-                .filter(|row| row.sequence <= high_water),
-        );
+        records.extend(page.entries.into_iter().filter(|row| {
+            row.sequence <= high_water
+                && (!matches!(kind, PagedSource::ProviderContext)
+                    || pioneer_crud::compaction::model_history_context_source(&row.source_type))
+        }));
     }
     Ok(records)
 }
@@ -1792,7 +1792,7 @@ async fn load_line_history_inner(
         // event or item part of checkpoint coverage.
         let context_aliases = contexts
             .iter()
-            .filter(|row| is_covered(&row.reference))
+            .filter(|row| row.source_type == "tool_result_v2" && is_covered(&row.reference))
             .filter_map(|row| row.item_id.clone())
             .collect::<BTreeSet<_>>();
         if covered.is_some() {
@@ -1856,7 +1856,12 @@ async fn load_line_history_inner(
             .map(str::to_owned)
             .collect::<BTreeSet<_>>();
         aliases.extend(context_aliases);
-        aliases.extend(contexts.iter().filter_map(|row| row.item_id.clone()));
+        aliases.extend(
+            contexts
+                .iter()
+                .filter(|row| row.source_type == "tool_result_v2")
+                .filter_map(|row| row.item_id.clone()),
+        );
         let mut ordered = Vec::<(i64, Vec<ChatMessage>)>::new();
         let use_input_rows = if let Some(selected) = selected {
             selected
@@ -1935,35 +1940,19 @@ async fn load_line_history_inner(
                                 results: BTreeMap::new(),
                             });
                         } else {
-                            let mut message = ChatMessage::user(format!(
-                                "Legacy provider observation (available original):\n{payload}"
-                            ));
-                            message.provenance = Some(origin(
-                                workspace,
-                                thread,
-                                &turn.id,
-                                &row.reference.id,
-                                vec![row.reference.clone()],
-                            ));
-                            ordered.push((row.sequence, vec![message]));
+                            // Legacy assistant tool calls require old tool_result
+                            // rows, which are excluded from new history. Drop the
+                            // whole sequence; never send an unanswered call.
+                            let legacy: ChatMessage = serde_json::from_str(&payload)?;
+                            ensure!(
+                                legacy.role == Role::Assistant
+                                    && legacy
+                                        .tool_calls
+                                        .as_ref()
+                                        .is_some_and(|calls| !calls.is_empty()),
+                                "invalid legacy assistant round"
+                            );
                         }
-                    }
-                    "provider_observation" => {
-                        let mut message = provider_observation(&payload)?;
-                        message.provenance = Some(origin(
-                            workspace,
-                            thread,
-                            &turn.id,
-                            &row.reference.id,
-                            vec![row.reference.clone()],
-                        ));
-                        let order = row
-                            .item_id
-                            .as_ref()
-                            .and_then(|id| starts.get(id))
-                            .copied()
-                            .unwrap_or(row.sequence);
-                        ordered.push((order, vec![message]));
                     }
                     "tool_result_v2" => {
                         let round = pending
@@ -1994,19 +1983,7 @@ async fn load_line_history_inner(
                             "duplicate canonical tool result"
                         );
                     }
-                    _ => {
-                        let mut message = ChatMessage::user(format!(
-                            "Legacy provider observation; outcome is not inferred:\n{payload}"
-                        ));
-                        message.provenance = Some(origin(
-                            workspace,
-                            thread,
-                            &turn.id,
-                            &row.reference.id,
-                            vec![row.reference.clone()],
-                        ));
-                        ordered.push((row.sequence, vec![message]));
-                    }
+                    _ => anyhow::bail!("unsupported model history context source"),
                 }
             }
         }

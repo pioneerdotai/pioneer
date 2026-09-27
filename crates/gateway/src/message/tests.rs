@@ -70747,7 +70747,7 @@ async fn compaction_result_reader_pages_exact_source_and_rejects_cross_scope() {
 }
 
 #[tokio::test]
-async fn compaction_failed_partial_writer_loader_and_frozen_reader_preserve_observation() {
+async fn compaction_failed_partial_writer_preserves_event_but_excludes_observation_from_history() {
     let thread = "thr_failed_partial";
     let turn = "turn_failed_partial";
     let (processor, store, workspace) = setup_execution_window_terminal_turn(thread, turn).await;
@@ -70795,27 +70795,51 @@ async fn compaction_failed_partial_writer_loader_and_frozen_reader_preserve_obse
         .unwrap();
     assert_eq!(page.entries.len(), 1);
     assert_eq!(page.entries[0].source_type, "provider_observation");
+    store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: workspace.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "allowed-history-message".into(),
+                    text: "completed durable message".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
     let fence = store.compaction_history_read_fence().await.unwrap();
     let history = crate::compaction::load_line_history(&store, &workspace, thread, None, &fence)
         .await
         .unwrap();
-    let partial = history
-        .into_iter()
-        .filter(|message| message.content.contains("Unsuccessful provider response"))
-        .collect::<Vec<_>>();
-    assert_eq!(partial.len(), 1);
-    assert_eq!(partial[0].role, pioneer_provider::Role::User);
-    assert!(partial[0].tool_calls.is_none());
-    assert!(partial[0].content.contains("not-executed"));
-    assert!(partial[0].content.contains("received reasoning"));
+    assert!(
+        history
+            .iter()
+            .all(|message| !message.content.contains("Unsuccessful provider response"))
+    );
+    assert!(
+        history
+            .iter()
+            .all(|message| !message.content.contains("not-executed"))
+    );
+    assert!(
+        history
+            .iter()
+            .any(|message| message.content.contains("completed durable message"))
+    );
     let allowed = std::collections::BTreeSet::from([thread.to_owned()]);
-    let frozen = crate::compaction::frozen::capture(&store, &workspace, thread, &allowed, &partial)
+    let frozen = crate::compaction::frozen::capture(&store, &workspace, thread, &allowed, &history)
         .await
         .unwrap();
     let restored = crate::compaction::frozen::restore(&store, &workspace, &allowed, &frozen)
         .await
         .unwrap();
-    assert_eq!(restored, partial);
+    assert_eq!(restored, history);
     processor
         .persist_turn_runtime_snapshot(
             thread,
@@ -70831,7 +70855,7 @@ async fn compaction_failed_partial_writer_loader_and_frozen_reader_preserve_obse
             &[],
             &[],
             &std::collections::HashMap::new(),
-            &partial,
+            &history,
             &[],
         )
         .await
@@ -70847,11 +70871,66 @@ async fn compaction_failed_partial_writer_loader_and_frozen_reader_preserve_obse
         crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(&store, &runtime)
             .await
             .unwrap();
-    assert_eq!(runtime_history, partial);
+    assert_eq!(runtime_history, history);
+    let mut frozen_rows = Vec::new();
+    while (frozen_rows.len() as u64) < frozen.messages {
+        let next = store
+            .compaction_frozen_history_page(
+                &workspace,
+                thread,
+                &frozen.manifest_id,
+                frozen_rows.len() as u64,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !next.is_empty(),
+            "published manifest has a missing reference page"
+        );
+        frozen_rows.extend(next);
+    }
+    assert_eq!(frozen_rows.len(), history.len());
+    let excluded_id = &page.entries[0].reference.id;
+    assert!(frozen_rows.iter().all(|reference| {
+        reference
+            .sources
+            .iter()
+            .all(|source| &source.id != excluded_id)
+            && reference
+                .replay_source
+                .as_ref()
+                .is_none_or(|source| &source.id != excluded_id)
+    }));
+    store.delete_turn_llm_context_for_turn(turn).await.unwrap();
     assert!(
-        !serde_json::to_string(&frozen)
+        store
+            .compaction_source_page(
+                &workspace,
+                thread,
+                turn,
+                pioneer_crud::compaction::PagedSource::ProviderContext,
+                0,
+            )
+            .await
             .unwrap()
-            .contains("partial answer")
+            .entries
+            .is_empty()
+    );
+    let after_cleanup = crate::compaction::load_line_history(
+        &store,
+        &workspace,
+        thread,
+        None,
+        &store.compaction_history_read_fence().await.unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(after_cleanup, history);
+    assert_eq!(
+        crate::compaction::frozen::restore(&store, &workspace, &allowed, &frozen)
+            .await
+            .unwrap(),
+        history
     );
 }
 
