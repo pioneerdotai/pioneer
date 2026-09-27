@@ -1,4 +1,6 @@
 use super::*;
+#[path = "checkpoint_input_alias_tests.rs"]
+mod checkpoint_input_alias_tests;
 use migration::{Migrator, MigratorTrait};
 use pioneer_agent::compaction::composition::ScopedHistorySource;
 use pioneer_compaction::summary::{HEADINGS, SummaryInput};
