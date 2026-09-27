@@ -44,7 +44,7 @@ pub(crate) use tool_outcomes::{retained_shell_outcome, retained_tool_policy};
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
 use pioneer_compaction::runner::{
-    AttemptPurpose, FailureDiagnostic, FailureKind,
+    AttemptPurpose, COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION, FailureDiagnostic, FailureKind,
     PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION,
     PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION, RunnerAction, RunnerPhase, RunnerState,
     SourceCursor,
@@ -272,7 +272,7 @@ fn historical_source_model_payload(
             &payload,
         ));
     }
-    if projection_version == PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION
+    if projection_version >= PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION
         && source.scope.starts_with("task-basis:")
     {
         return pioneer_provider::history::portable_task_basis_payload(&payload);
@@ -280,7 +280,8 @@ fn historical_source_model_payload(
     ensure!(
         projection_version == pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION
             || projection_version == PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION
-            || projection_version == PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION,
+            || projection_version == PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION
+            || projection_version == COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION,
         "unsupported historical source text projection"
     );
     if source.scope.starts_with("item:") {
@@ -310,14 +311,8 @@ fn source_text_projection_for_cursor(state: &RunnerState, source: &SourceRef) ->
     }
 }
 
-fn source_text_projection_for_new_source(source: &SourceRef) -> u32 {
-    if source.scope.starts_with("task-basis:") {
-        PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION
-    } else if source.scope.starts_with("context:") {
-        PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION
-    } else {
-        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION
-    }
+fn source_text_projection_for_new_source(_source: &SourceRef) -> u32 {
+    COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION
 }
 
 struct IndexedPayload {
@@ -494,9 +489,10 @@ impl CompactionRunner {
                     .compaction_reference_payload(&self.workspace, thread, source)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("source unavailable or stale"))?;
-                let text = model_source_payload(source, text)?.ok_or_else(|| {
-                    anyhow::anyhow!("compaction manifest contains non-model source")
-                })?;
+                let text = model_source_payload_for_version(source, text, projection_version)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("compaction manifest contains non-model source")
+                    })?;
                 #[cfg(test)]
                 self.active_payload_loads
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -516,16 +512,7 @@ impl CompactionRunner {
         payload.fragment(source, character_offset)
     }
 
-    #[cfg(test)]
     async fn reference_excerpts(&self) -> Result<&Vec<ReferenceExcerpt>> {
-        self.reference_excerpts_with_projection(PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION)
-            .await
-    }
-
-    async fn reference_excerpts_with_projection(
-        &self,
-        projection_version: u32,
-    ) -> Result<&Vec<ReferenceExcerpt>> {
         self.reference_excerpts
             .get_or_try_init(|| async {
                 let entries = self
@@ -550,13 +537,18 @@ impl CompactionRunner {
                         )
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("reference source unavailable or stale"))?;
-                    let Some(payload) = model_source_payload(&entry.source, payload)? else {
+                    let Some(payload) = model_source_payload_for_version(
+                        &entry.source,
+                        payload,
+                        COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION,
+                    )?
+                    else {
                         anyhow::bail!("compaction reference manifest contains non-model source");
                     };
                     let payload = historical_source_model_payload(
                         &entry.source,
                         payload,
-                        projection_version,
+                        COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION,
                     )?;
                     let mut characters = payload.chars();
                     let excerpt = characters
@@ -1074,9 +1066,7 @@ impl CompactionRunner {
         // full payload. They are reused across portions and retries.
         // Reference-only excerpts carry no cursor or coverage, so they can use
         // the current projection even while a legacy active source drains.
-        let reference_excerpts = self
-            .reference_excerpts_with_projection(PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION)
-            .await?;
+        let reference_excerpts = self.reference_excerpts().await?;
         let mut reference_scopes = BTreeMap::<&str, Vec<SourceRef>>::new();
         for excerpt in reference_excerpts {
             reference_scopes
@@ -1317,6 +1307,14 @@ impl CompactionRunner {
 }
 
 fn model_source_payload(source: &SourceRef, payload: String) -> Result<Option<String>> {
+    model_source_payload_for_version(source, payload, COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION)
+}
+
+fn model_source_payload_for_version(
+    source: &SourceRef,
+    payload: String,
+    projection_version: u32,
+) -> Result<Option<String>> {
     use pioneer_crud::CanonicalEventModelProjection as Projection;
     if source.scope.starts_with("event:") {
         let event: pioneer_crud::CanonicalTurnEventPayload = serde_json::from_str(&payload)?;
@@ -1324,6 +1322,13 @@ fn model_source_payload(source: &SourceRef, payload: String) -> Result<Option<St
             match pioneer_crud::canonical_event_model_projection(&event) {
                 Projection::Omit => None,
                 Projection::Assistant(text) | Projection::User(text) => Some(text),
+                Projection::Commentary(text) => Some(
+                    if projection_version >= COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION {
+                        pioneer_crud::portable_commentary_text(&text)
+                    } else {
+                        text
+                    },
+                ),
                 Projection::Input => Some(match &event {
                     pioneer_crud::CanonicalTurnEventPayload::TurnStarted(value) => {
                         model_input_payload(&value.input)?
@@ -1342,6 +1347,13 @@ fn model_source_payload(source: &SourceRef, payload: String) -> Result<Option<St
         return Ok(match pioneer_crud::canonical_item_model_projection(&item) {
             Projection::Omit => None,
             Projection::Assistant(text) | Projection::User(text) => Some(text),
+            Projection::Commentary(text) => Some(
+                if projection_version >= COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION {
+                    pioneer_crud::portable_commentary_text(&text)
+                } else {
+                    text
+                },
+            ),
             Projection::Input => anyhow::bail!("invalid item input model projection"),
             Projection::Default => Some(payload),
         });

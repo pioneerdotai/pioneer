@@ -1,5 +1,13 @@
 use crate::CanonicalTurnEventPayload;
-use pioneer_protocol::{TurnItem, TurnPermissionAuditEvent, TurnPermissionAuditEventKind};
+use pioneer_protocol::{
+    AgentMessagePhase, TurnItem, TurnPermissionAuditEvent, TurnPermissionAuditEventKind,
+};
+
+/// Portable text for an assistant message emitted before the turn's final answer.
+/// The marker is added only when projecting a typed canonical item.
+pub fn portable_commentary_text(text: &str) -> String {
+    format!("[Intermediate assistant message (commentary); not the final answer]\n{text}")
+}
 
 /// Typed model-facing projection of a canonical event. Canonical events remain
 /// durable and available to execution, audit and UI consumers; this policy
@@ -9,6 +17,7 @@ pub enum CanonicalEventModelProjection {
     Omit,
     Input,
     Assistant(String),
+    Commentary(String),
     User(String),
     Default,
 }
@@ -103,6 +112,11 @@ pub fn canonical_item_model_projection(item: &TurnItem) -> CanonicalEventModelPr
         TurnItem::AgentMessage { text, .. } if text.trim().is_empty() => {
             CanonicalEventModelProjection::Omit
         }
+        TurnItem::AgentMessage {
+            text,
+            phase: AgentMessagePhase::Commentary,
+            ..
+        } => CanonicalEventModelProjection::Commentary(text.clone()),
         TurnItem::AgentMessage { text, .. } => {
             CanonicalEventModelProjection::Assistant(text.clone())
         }
@@ -203,6 +217,41 @@ mod tests {
             markdown: None,
             markdown_version: None,
         }
+    }
+
+    #[test]
+    fn commentary_projection_preserves_typed_phase_and_original_text() {
+        let mut item = agent_message("Inspecting the tool result.");
+        let TurnItem::AgentMessage { phase, .. } = &mut item else {
+            unreachable!()
+        };
+        *phase = AgentMessagePhase::Commentary;
+        let canonical = serde_json::to_string(&item).unwrap();
+        assert_eq!(
+            canonical_item_model_projection(&item),
+            CanonicalEventModelProjection::Commentary("Inspecting the tool result.".into())
+        );
+        assert_eq!(
+            canonical_event_model_projection(&completed(item.clone())),
+            CanonicalEventModelProjection::Commentary("Inspecting the tool result.".into())
+        );
+        assert_eq!(serde_json::to_string(&item).unwrap(), canonical);
+        assert_eq!(
+            portable_commentary_text("Inspecting the tool result."),
+            "[Intermediate assistant message (commentary); not the final answer]\nInspecting the tool result."
+        );
+        assert_eq!(
+            canonical_item_model_projection(&agent_message("Final answer.")),
+            CanonicalEventModelProjection::Assistant("Final answer.".into())
+        );
+        let legacy: TurnItem = serde_json::from_value(serde_json::json!({
+            "type": "agentMessage", "id": "legacy", "text": "Older answer."
+        }))
+        .unwrap();
+        assert_eq!(
+            canonical_item_model_projection(&legacy),
+            CanonicalEventModelProjection::Assistant("Older answer.".into())
+        );
     }
 
     fn system(code: &str, details: Option<serde_json::Value>) -> TurnItem {

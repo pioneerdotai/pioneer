@@ -2074,6 +2074,7 @@ async fn load_line_history_inner(
                         event.clone(),
                         (use_input_rows || has_authoritative_event_input)
                             && row.projection_kind.as_deref() == Some("input_copy"),
+                        true,
                     )?
                     else {
                         if row.projection_kind.as_deref() != Some("technical")
@@ -2205,13 +2206,24 @@ pub(super) fn historical_command_event_json(event: &Event) -> Result<Option<Stri
 /// Current canonical event renderer. Frozen restore also retains explicit
 /// digest-checked compatibility candidates for older manifests.
 pub(crate) fn event_message(event: Event) -> Result<Option<ChatMessage>> {
-    event_message_with_input_copy_policy(event, false)
+    event_message_with_input_copy_policy(event, false, true)
+}
+
+/// Exact pre-commentary renderer used only to validate older frozen wire hashes.
+pub(crate) fn pre_commentary_event_message(event: Event) -> Result<Option<ChatMessage>> {
+    event_message_with_input_copy_policy(event, false, false)
+}
+
+pub(crate) fn pre_commentary_event_message_suppressing_input_copy_media(
+    event: Event,
+) -> Result<Option<ChatMessage>> {
+    event_message_with_input_copy_policy(event, true, false)
 }
 
 pub(crate) fn event_message_suppressing_input_copy_media(
     event: Event,
 ) -> Result<Option<ChatMessage>> {
-    event_message_with_input_copy_policy(event, true)
+    event_message_with_input_copy_policy(event, true, true)
 }
 
 /// Wire-compatible renderer for frozen manifests written before typed
@@ -2272,6 +2284,7 @@ pub(crate) fn legacy_event_message(event: Event) -> Result<Option<ChatMessage>> 
 fn event_message_with_input_copy_policy(
     event: Event,
     suppress_non_artifact_input_copy_media: bool,
+    project_commentary: bool,
 ) -> Result<Option<ChatMessage>> {
     use pioneer_crud::CanonicalEventModelProjection as Projection;
     match pioneer_crud::canonical_event_model_projection(&event) {
@@ -2284,6 +2297,13 @@ fn event_message_with_input_copy_policy(
             }));
         }
         Projection::Assistant(text) => return Ok(Some(ChatMessage::assistant(text))),
+        Projection::Commentary(text) => {
+            return Ok(Some(ChatMessage::assistant(if project_commentary {
+                pioneer_crud::portable_commentary_text(&text)
+            } else {
+                text
+            })));
+        }
         Projection::User(text) => return Ok(Some(ChatMessage::user(text))),
         Projection::Default => {}
     }

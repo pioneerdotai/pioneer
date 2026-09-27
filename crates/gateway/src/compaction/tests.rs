@@ -197,6 +197,309 @@ fn runner_payload_projection_uses_structured_sources_and_preserves_context_verba
 }
 
 #[tokio::test]
+async fn commentary_phase_reaches_cold_history_and_real_summarizer_input() {
+    use pioneer_agent::compaction::request::NativeRequestProjection;
+    use pioneer_protocol::{AgentMessagePhase, ItemCompletedNotification, TurnItem};
+
+    let event = |id: &str, text: &str, phase| {
+        serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+            ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: TurnItem::AgentMessage {
+                    id: id.into(),
+                    text: text.into(),
+                    phase,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+        ))
+        .unwrap()
+    };
+    let raw = vec![
+        event("before", "checking fixture", AgentMessagePhase::Commentary),
+        event("after", "tool inspected", AgentMessagePhase::Commentary),
+        event("final", "fixture answer", AgentMessagePhase::FinalAnswer),
+    ];
+    let f = fixture_with_canonical_payloads(raw.clone(), vec![Reply::Success], true, false).await;
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let cold = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+        .await
+        .unwrap();
+    let messages: Vec<_> = cold
+        .iter()
+        .filter(|message| {
+            message.content.contains("fixture") || message.content.contains("tool inspected")
+        })
+        .collect();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(
+        messages[0].content,
+        pioneer_crud::portable_commentary_text("checking fixture")
+    );
+    assert_eq!(
+        messages[1].content,
+        pioneer_crud::portable_commentary_text("tool inspected")
+    );
+    assert_eq!(messages[2].content, "fixture answer");
+    assert!(
+        messages
+            .iter()
+            .all(|message| message.reasoning_content.is_none())
+    );
+    let native = NativeRequestProjection::full(
+        ChatRequest {
+            model: "fixture-model".into(),
+            messages: messages.iter().map(|message| (*message).clone()).collect(),
+            temperature: None,
+            max_tokens: Some(128),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        },
+        vec![],
+        ModelBudget::new(Some(16_384), None, Some(128)),
+        false,
+    )
+    .unwrap();
+    assert_eq!(native.request.messages[0].content, messages[0].content);
+    assert_eq!(native.request.messages[1].content, messages[1].content);
+    assert_eq!(native.request.messages[2].content, messages[2].content);
+
+    assert!(matches!(
+        f.runner.run(CancellationToken::new()).await.unwrap(),
+        CompactionExit::Applied(_)
+    ));
+    let calls = f.provider.calls.lock().unwrap();
+    let compact = calls
+        .iter()
+        .flat_map(|call| {
+            serde_json::from_str::<SummaryInput>(&call.messages[1].content)
+                .unwrap()
+                .compact_units
+        })
+        .map(|part| part.text)
+        .collect::<String>();
+    assert!(compact.contains(&pioneer_crud::portable_commentary_text("checking fixture")));
+    assert!(compact.contains(&pioneer_crud::portable_commentary_text("tool inspected")));
+    assert!(compact.contains("fixture answer"));
+    assert_eq!(
+        compact.matches("[Intermediate assistant message").count(),
+        2
+    );
+    drop(calls);
+    let sources = f
+        .store
+        .compaction_manifest_page("operation", false, 0, 0)
+        .await
+        .unwrap();
+    for (index, source) in sources.iter().enumerate() {
+        assert_eq!(
+            f.store
+                .compaction_reference_payload("ws", "thread", &source.source)
+                .await
+                .unwrap()
+                .unwrap(),
+            raw[index]
+        );
+    }
+}
+
+#[tokio::test]
+async fn published_summary_stays_frozen_while_uncovered_commentary_uses_new_projection() {
+    use pioneer_agent::compaction::controller::NativeContext;
+    use pioneer_provider::{ChatMessage, ProviderRegistry};
+
+    let old = "covered old response ".repeat(4_000);
+    let f = fixture(&old, vec![], true, false).await;
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let mut history = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    let providers = ProviderRegistry::new(|_| "fixture-key".into());
+    providers
+        .insert("summary-fixture", f.provider.clone())
+        .unwrap();
+    providers
+        .insert("main-fixture", Arc::new(SmallWindowMain))
+        .unwrap();
+    let context = NativeContext {
+        overflow_recovery: false,
+        recovery_deadline_ms: None,
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "turn".into(),
+        conversation_thread_id: None,
+        provider_instance: "main-fixture".into(),
+        provider: providers
+            .get_or_create_for_workspace("ws", "main-fixture")
+            .unwrap(),
+        events: Arc::new(ExecutionEventHub::new()),
+        cancellation: CancellationToken::new(),
+    };
+    let request = ChatRequest {
+        model: "gpt-4".into(),
+        messages: vec![history.remove(0), ChatMessage::user("Continue")],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let settings = CompactionSettings {
+        selection: Some(ModelSelection {
+            transport: Transport::Api,
+            instance: "summary-fixture".into(),
+            model: "summary-model".into(),
+            effort: None,
+        }),
+    };
+    let native = super::test_support::prepare_native_request(
+        &f.store,
+        &providers,
+        &settings,
+        &context,
+        request,
+        None,
+        false,
+        f.observer.clone(),
+        f.clock.clone(),
+    )
+    .await
+    .unwrap();
+    let head = native.receipt.identity.checkpoint.unwrap();
+    assert_eq!(
+        f.store
+            .compaction_head(&super::native_owner("ws", "thread"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(head.as_str())
+    );
+    let before = f.store.compaction_checkpoint(&head).await.unwrap().unwrap();
+    let calls_before = f.provider.calls.lock().unwrap().len();
+    f.store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+        .await
+        .unwrap();
+    f.store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "uncovered-commentary".into(),
+                    text: "tail progress".into(),
+                    phase: pioneer_protocol::AgentMessagePhase::Commentary,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    let prepared =
+        super::frozen::capture_execution_basis_prepared(&f.store, "ws", "thread", None, None, None)
+            .await
+            .unwrap();
+    let rendered = prepared
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains(&before.summary));
+    assert!(rendered.contains(&pioneer_crud::portable_commentary_text("tail progress")));
+    assert!(!rendered.contains("covered old response"));
+    let restored = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        None,
+        "synthetic-execution",
+        &std::collections::BTreeSet::from(["thread".into()]),
+        &serde_json::to_string(&prepared.descriptor).unwrap(),
+    )
+    .await
+    .unwrap();
+    let restored_text = restored
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(restored_text.contains(&before.summary));
+    assert!(restored_text.contains(&pioneer_crud::portable_commentary_text("tail progress")));
+    assert_eq!(
+        f.store
+            .compaction_head(&super::native_owner("ws", "thread"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(head.as_str())
+    );
+    let after = f.store.compaction_checkpoint(&head).await.unwrap().unwrap();
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.summary, before.summary);
+    assert_eq!(after.coverage, before.coverage);
+    assert_eq!(after.previous, before.previous);
+    assert_eq!(f.provider.calls.lock().unwrap().len(), calls_before);
+}
+
+#[test]
+fn commentary_source_text_keeps_legacy_cursor_representations_exact() {
+    let item = pioneer_protocol::TurnItem::AgentMessage {
+        id: "commentary".into(),
+        text: "checking result".into(),
+        phase: pioneer_protocol::AgentMessagePhase::Commentary,
+        markdown: None,
+        markdown_version: None,
+    };
+    let source = SourceRef {
+        scope: "item:turn".into(),
+        id: "commentary".into(),
+        version: "item-revision:1".into(),
+    };
+    let raw = serde_json::to_string(&item).unwrap();
+    for version in 0..=PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION {
+        let text = model_source_payload_for_version(&source, raw.clone(), version)
+            .unwrap()
+            .unwrap();
+        assert_eq!(text, "checking result");
+        assert_eq!(
+            historical_source_model_payload(&source, text, version).unwrap(),
+            "checking result"
+        );
+    }
+    let text =
+        model_source_payload_for_version(&source, raw, COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION)
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        text,
+        pioneer_crud::portable_commentary_text("checking result")
+    );
+    assert_eq!(
+        historical_source_model_payload(
+            &source,
+            text.clone(),
+            COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION
+        )
+        .unwrap(),
+        text
+    );
+}
+
+#[tokio::test]
 async fn turn_started_and_edited_payload_projection_matches_history_without_event_envelope() {
     use pioneer_protocol::{PersistedActorRef, SandboxMode, UserInput};
 
@@ -1051,13 +1354,13 @@ fn durable_character_cursor_remains_bound_to_its_text_projection() {
     legacy_boundary.cursor.character = 0;
     assert_eq!(
         source_text_projection_for_cursor(&legacy_boundary, &source),
-        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION
+        COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION
     );
 
     let fresh = RunnerState::new(900_000, &ModelBudget::new(None, None, None), 500, None).unwrap();
     assert_eq!(
         fresh.source_text_projection_version,
-        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION
+        COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION
     );
     let restarted: RunnerState =
         serde_json::from_str(&serde_json::to_string(&fresh).unwrap()).unwrap();
@@ -1559,6 +1862,68 @@ async fn runner_keeps_large_compressed_active_payload_while_loading_reference_on
         1,
         "the active compressed object was materialized more than once"
     );
+}
+
+#[tokio::test]
+async fn commentary_reference_only_excerpt_uses_the_current_budgeted_projection() {
+    let f = fixture("active answer", vec![], true, false).await;
+    let payload = serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+        pioneer_protocol::ItemCompletedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item: pioneer_protocol::TurnItem::AgentMessage {
+                id: "reference-commentary".into(),
+                text: "checking reference".into(),
+                phase: pioneer_protocol::AgentMessagePhase::Commentary,
+                markdown: None,
+                markdown_version: None,
+            },
+        },
+    ))
+    .unwrap();
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES('reference-commentary','thread','turn',2,'item/completed',?,CURRENT_TIMESTAMP)",
+        [payload.into()],
+    )).await.unwrap();
+    let reference = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 1)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES('operation',1,0,1,'thread',?,?,?)",
+        [reference.scope.clone().into(), reference.id.clone().into(), reference.version.clone().into()],
+    )).await.unwrap();
+    let excerpts = f.runner.reference_excerpts().await.unwrap();
+    assert_eq!(excerpts.len(), 1);
+    assert_eq!(
+        excerpts[0].text,
+        pioneer_crud::portable_commentary_text("checking reference")
+    );
+    let state = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    let portion = f
+        .runner
+        .portion(&state, AttemptPurpose::Portion)
+        .await
+        .unwrap();
+    assert_eq!(portion.request.input.reference_only.len(), 1);
+    assert_eq!(
+        portion.request.input.reference_only[0].text,
+        excerpts[0].text
+    );
+    assert!(!portion.completed.contains(&reference));
+    assert!(f.runner.fits(&portion.request).unwrap());
 }
 
 #[tokio::test]
@@ -3496,7 +3861,7 @@ async fn compaction_runner_durably_finishes_legacy_cursor_before_projecting_next
     assert_eq!(after_first_checkpoint.cursor.character, 0);
     assert_eq!(
         after_first_checkpoint.source_text_projection_version,
-        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION
+        COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION
     );
     assert!(after_first_checkpoint.previous_checkpoint.is_some());
     second_run.abort();
@@ -3529,7 +3894,7 @@ async fn compaction_runner_durably_finishes_legacy_cursor_before_projecting_next
     );
     assert_eq!(
         before_interrupted_retry.source_text_projection_version,
-        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION
+        COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION
     );
     assert_eq!(
         before_interrupted_retry.previous_checkpoint,
@@ -3586,7 +3951,7 @@ async fn compaction_runner_durably_finishes_legacy_cursor_before_projecting_next
         .unwrap();
     assert_eq!(
         final_state.source_text_projection_version,
-        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION
+        COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION
     );
     assert!(matches!(final_state.phase, RunnerPhase::Applied { .. }));
     let reference = f
@@ -12129,6 +12494,115 @@ async fn legacy_frozen_empty_agent_message_authenticates_wire_then_disappears_fr
     .unwrap();
     assert!(execution.messages.is_empty());
     assert_eq!(descriptor.messages, 1, "the source ordinal remains frozen");
+}
+
+#[tokio::test]
+async fn frozen_commentary_authenticates_old_wire_before_execution_upgrade() {
+    use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
+    use pioneer_protocol::AgentMessagePhase;
+    use pioneer_provider::ChatMessage;
+    use sha2::{Digest, Sha256};
+
+    let f = fixture("irrelevant", vec![], true, false).await;
+    f.store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+        .await
+        .unwrap();
+    f.store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "old-commentary".into(),
+                    text: "checking result".into(),
+                    phase: AgentMessagePhase::Commentary,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    let source = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.item_id.as_deref() == Some("old-commentary"))
+        .unwrap()
+        .reference;
+    let wire = ChatMessage::assistant("checking result");
+    let reference = FrozenMessageRef {
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
+        publication_aliases: None,
+        logical_turn_id: None,
+        source_thread: "thread".into(),
+        context_thread: None,
+        unit_id: "old-commentary-unit".into(),
+        sources: vec![source],
+        inherited: false,
+        complete: true,
+        protected_input: false,
+        wire_sha256: hex::encode(Sha256::digest(serde_json::to_vec(&wire).unwrap())),
+        replay_source: None,
+        tool_item_id: None,
+        tool_call_id: None,
+        tool_name: None,
+        event_input_role: None,
+    };
+    let bytes = serde_json::to_vec(&reference).unwrap();
+    let mut digest = Sha256::new();
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(&bytes);
+    let descriptor = FrozenHistoryRef {
+        format: pioneer_compaction::FORMAT_VERSION,
+        manifest_id: "old-commentary-manifest".into(),
+        messages: 1,
+        identity_sha256: hex::encode(digest.finalize()),
+    };
+    f.store
+        .compaction_begin_frozen_history("ws", "thread", &descriptor)
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_frozen_history("ws", "thread", &descriptor.manifest_id, 0, &[reference])
+        .await
+        .unwrap();
+    assert!(
+        f.store
+            .compaction_finish_frozen_history("ws", "thread", &descriptor)
+            .await
+            .unwrap()
+    );
+    let allowed = std::collections::BTreeSet::from(["thread".into()]);
+    let literal = super::frozen::restore(&f.store, "ws", &allowed, &descriptor)
+        .await
+        .unwrap();
+    assert_eq!(literal.len(), 1);
+    assert_eq!(literal[0].content, "checking result");
+    let execution = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        None,
+        "synthetic-execution",
+        &allowed,
+        &serde_json::to_string(&descriptor).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(execution.messages.len(), 1);
+    assert_eq!(
+        execution.messages[0].content,
+        pioneer_crud::portable_commentary_text("checking result")
+    );
+    assert_eq!(execution.messages[0].reasoning_content, None);
 }
 
 #[tokio::test]
@@ -22955,7 +23429,7 @@ async fn durable_context_cursor_finishes_old_text_before_portable_next_source() 
         assert_eq!(first.cursor.character, 0);
         assert_eq!(
             first.source_text_projection_version,
-            PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION
+            COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION
         );
         assert_eq!(first.request.input.compact_units.len(), 2);
         assert_eq!(first.request.input.compact_units[0].part, offset);
@@ -23037,7 +23511,7 @@ async fn durable_context_cursor_finishes_old_text_before_portable_next_source() 
         );
 
         // The representation switch happens inside this one summary request;
-        // the persisted next cursor records v2 and no manual cursor reset is
+        // the persisted next cursor records v4 and no manual cursor reset is
         // required between the two sources.
         f.clock.advance(12_000);
         let applied = restart().run(CancellationToken::new()).await.unwrap();
@@ -23052,7 +23526,7 @@ async fn durable_context_cursor_finishes_old_text_before_portable_next_source() 
             .unwrap();
         assert_eq!(
             persisted.source_text_projection_version,
-            PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION
+            COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION
         );
         assert_eq!(persisted.cursor, first.cursor);
         assert_eq!(
@@ -23101,15 +23575,19 @@ fn source_projection_version_switches_only_at_a_source_boundary() {
         id: "provider-round".into(),
         version: "context-revision:1".into(),
     };
-    assert_eq!(state.source_text_projection_version, 1);
-    assert_eq!(source_text_projection_for_cursor(&state, &command), 1);
-    assert_eq!(source_text_projection_for_cursor(&state, &context), 2);
+    assert_eq!(
+        state.source_text_projection_version,
+        COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION
+    );
+    assert_eq!(source_text_projection_for_cursor(&state, &command), 4);
+    assert_eq!(source_text_projection_for_cursor(&state, &context), 4);
+    state.source_text_projection_version = 1;
     state.cursor.character = 9;
     assert_eq!(source_text_projection_for_cursor(&state, &context), 1);
     state.source_text_projection_version = 2;
     assert_eq!(source_text_projection_for_cursor(&state, &command), 2);
     state.cursor.character = 0;
-    assert_eq!(source_text_projection_for_cursor(&state, &command), 1);
+    assert_eq!(source_text_projection_for_cursor(&state, &command), 4);
 }
 
 #[tokio::test]
@@ -23292,7 +23770,7 @@ async fn partially_read_portable_context_survives_checkpoint_and_restart() {
         .unwrap();
     assert_eq!(
         final_state.source_text_projection_version,
-        PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION
+        COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION
     );
     assert_eq!(
         final_state.previous_checkpoint.as_deref(),
@@ -23321,6 +23799,118 @@ async fn partially_read_portable_context_survives_checkpoint_and_restart() {
             .unwrap();
         assert_eq!(stored, expected);
     }
+}
+
+#[tokio::test]
+async fn partially_read_commentary_source_restarts_with_v4_text_and_exact_coverage() {
+    let body = format!("checking result {}", "detail ".repeat(10_000));
+    let raw = serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+        pioneer_protocol::ItemCompletedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item: pioneer_protocol::TurnItem::AgentMessage {
+                id: "large-commentary".into(),
+                text: body.clone(),
+                phase: pioneer_protocol::AgentMessagePhase::Commentary,
+                markdown: None,
+                markdown_version: None,
+            },
+        },
+    ))
+    .unwrap();
+    let f =
+        fixture_with_canonical_payload(raw, vec![Reply::Success, Reply::Hang], true, false).await;
+    let source = f
+        .store
+        .compaction_manifest_page("operation", false, 0, 0)
+        .await
+        .unwrap()[0]
+        .source
+        .clone();
+    let first_run = tokio::spawn({
+        let runner = f.runner.clone();
+        async move { runner.run(CancellationToken::new()).await }
+    });
+    f.provider.wait_calls(2).await;
+    let saved = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(saved.cursor.character > 0);
+    assert_eq!(
+        saved.source_text_projection_version,
+        COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION
+    );
+    let partial = f
+        .store
+        .compaction_checkpoint(saved.previous_checkpoint.as_ref().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(partial.coverage.is_empty());
+    first_run.abort();
+    assert!(first_run.await.unwrap_err().is_cancelled());
+    let restarted = Arc::new(CompactionRunner::new(
+        f.store.clone(),
+        "ws".into(),
+        "thread".into(),
+        f.runner.snapshot.clone(),
+        f.runner.summarizer.clone(),
+        Arc::new(Target(true)),
+        f.observer.clone(),
+        f.clock.clone(),
+    ));
+    let second_run = tokio::spawn({
+        let runner = restarted.clone();
+        async move { runner.run(CancellationToken::new()).await }
+    });
+    wait_backoff(&f.store).await;
+    let retry = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.cursor, saved.cursor);
+    assert_eq!(
+        retry.source_text_projection_version,
+        COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION
+    );
+    let deadline = match retry.phase {
+        RunnerPhase::Backoff { not_before_ms, .. } => not_before_ms,
+        phase => panic!("expected retry backoff, got {phase:?}"),
+    };
+    f.clock.advance(deadline);
+    let CompactionExit::Applied(head) = second_run.await.unwrap().unwrap() else {
+        panic!("commentary source did not finish after restart")
+    };
+    let calls = f.provider.calls.lock().unwrap();
+    let inputs = calls
+        .iter()
+        .map(|call| serde_json::from_str::<SummaryInput>(&call.messages[1].content).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        serde_json::to_value(&inputs[1]).unwrap(),
+        serde_json::to_value(&inputs[2]).unwrap()
+    );
+    let sent = std::iter::once(&inputs[0])
+        .chain(inputs[2..].iter())
+        .flat_map(|input| input.compact_units.iter().map(|part| part.text.as_str()))
+        .collect::<String>();
+    assert_eq!(sent, pioneer_crud::portable_commentary_text(&body));
+    drop(calls);
+    assert_eq!(
+        f.store
+            .compaction_checkpoint(&head)
+            .await
+            .unwrap()
+            .unwrap()
+            .coverage,
+        [source]
+    );
 }
 
 #[tokio::test]
@@ -23562,7 +24152,7 @@ async fn alternating_source_projections_share_one_summarizer_request() {
         .unwrap();
     assert_eq!(
         state.source_text_projection_version,
-        PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION
+        COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION
     );
     let head = f.store.compaction_head("owner").await.unwrap().unwrap();
     assert_eq!(
@@ -23659,7 +24249,7 @@ async fn legacy_task_basis_compact_and_reference_use_portable_source_text() {
         None,
     )
     .unwrap();
-    assert_eq!(source_text_projection_for_cursor(&cursor, &basis), 3);
+    assert_eq!(source_text_projection_for_cursor(&cursor, &basis), 4);
     cursor.cursor.character = 7;
     for version in [0, 1, 2, 3] {
         cursor.source_text_projection_version = version;
@@ -23705,7 +24295,10 @@ async fn legacy_task_basis_compact_and_reference_use_portable_source_text() {
     );
     assert_eq!(portion.request.input.compact_units[0].text, expected);
     assert_eq!(portion.completed, [basis.clone(), original]);
-    assert_eq!(portion.source_text_projection_version, 1);
+    assert_eq!(
+        portion.source_text_projection_version,
+        COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION
+    );
     compact
         .runner
         .summarizer

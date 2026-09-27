@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 pub const PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION: u32 = 2;
 /// Adds typed legacy Task-basis projection without changing v0/v1/v2 cursor offsets.
 pub const PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION: u32 = 3;
+/// Adds typed commentary projection while preserving every earlier cursor representation.
+pub const COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SourceCursor {
@@ -147,7 +149,7 @@ impl RunnerState {
             retries: 0,
             corrections: 0,
             target_tokens,
-            source_text_projection_version: 1,
+            source_text_projection_version: COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION,
             cursor: SourceCursor::default(),
             previous_checkpoint,
             phase: RunnerPhase::Ready {
