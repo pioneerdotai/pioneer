@@ -1,6 +1,6 @@
 use migration::{Migrator, MigratorTrait};
 use pioneer_compaction::*;
-use pioneer_crud::{CrudStore, compaction::*};
+use pioneer_crud::{CrudStore, NewTurnLlmContextEntry, compaction::*};
 use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 
 async fn store() -> CrudStore {
@@ -1015,6 +1015,572 @@ async fn large_canonical_source_reads_are_version_bound_and_cleanup_preserves_or
         store.compaction_apply(&cp, None, &[source]).await.unwrap(),
         CommitOutcome::Stale
     );
+}
+
+#[tokio::test]
+async fn frozen_context_retention_covers_every_cleanup_api_and_keeps_legacy_whitelist() {
+    use pioneer_compaction::frozen::FrozenMessageRef;
+
+    let store = store().await;
+    let now = chrono::Utc::now().fixed_offset();
+    let insert = |source: &str, sequence: i64, expires_at| NewTurnLlmContextEntry {
+        turn_id: "turn".into(),
+        item_id: Some(format!("item-{sequence}")),
+        attempt_id: None,
+        sequence,
+        source: source.into(),
+        tool_name: None,
+        payload: format!("retention-payload-{sequence}"),
+        output_policy_snapshot: "{}".into(),
+        created_at: now,
+        expires_at,
+    };
+    let retained = store
+        .insert_turn_llm_context(insert(
+            "provider_observation_outside_legacy_whitelist",
+            1,
+            Some(now - chrono::Duration::days(1)),
+        ))
+        .await
+        .unwrap();
+    let message = FrozenMessageRef {
+        logical_turn_id: None,
+        source_thread: "thread".into(),
+        context_thread: None,
+        unit_id: "retained-context".into(),
+        sources: vec![SourceRef {
+            scope: "context:turn".into(),
+            id: retained.id.clone(),
+            version: "revision:1".into(),
+        }],
+        event_input_role: None,
+        source_aliases: Vec::new(),
+        ambiguous_input_aliases: Vec::new(),
+        publication_aliases: None,
+        inherited: false,
+        complete: true,
+        protected_input: false,
+        wire_sha256: "a".repeat(64),
+        replay_source: None,
+        tool_item_id: None,
+        tool_call_id: None,
+        tool_name: None,
+    };
+    store
+        .compaction_retain_frozen_context_sources("ws", std::slice::from_ref(&message))
+        .await
+        .unwrap();
+    store
+        .compaction_retain_frozen_context_sources("ws", std::slice::from_ref(&message))
+        .await
+        .expect("retention retry must be idempotent");
+
+    store
+        .insert_turn_llm_context(insert(
+            "expired-unreferenced",
+            2,
+            Some(now - chrono::Duration::days(1)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(store.delete_expired_turn_llm_context().await.unwrap(), 1);
+
+    store
+        .insert_turn_llm_context(insert("terminal-unreferenced", 3, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .delete_turn_llm_context_for_terminal_turns()
+            .await
+            .unwrap(),
+        1
+    );
+
+    store
+        .insert_turn_llm_context(insert("turn-unreferenced", 4, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .delete_turn_llm_context_for_turn("turn")
+            .await
+            .unwrap(),
+        1
+    );
+
+    for (sequence, source) in [(5, "assistant_round"), (6, "tool_result_v2")] {
+        store
+            .insert_turn_llm_context(insert(source, sequence, None))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .delete_turn_llm_context_for_turn("turn")
+            .await
+            .unwrap(),
+        0
+    );
+    let remaining = store.list_turn_llm_context("turn").await.unwrap();
+    assert_eq!(remaining.len(), 3);
+    assert!(remaining.iter().any(|row| row.id == retained.id));
+    assert!(remaining.iter().any(|row| row.source == "assistant_round"));
+    assert!(remaining.iter().any(|row| row.source == "tool_result_v2"));
+
+    let exact = &message.sources[0];
+    assert_eq!(
+        store
+            .compaction_reference_payload("ws", "thread", exact)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("retention-payload-1")
+    );
+    let mut wrong_revision = exact.clone();
+    wrong_revision.version = "revision:2".into();
+    assert!(
+        store
+            .compaction_reference_payload("ws", "thread", &wrong_revision)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut missing = exact.clone();
+    missing.id = "actually-missing".into();
+    assert!(
+        store
+            .compaction_reference_payload("ws", "thread", &missing)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn frozen_context_retention_statement_rolls_back_as_one_atomic_validation() {
+    use pioneer_compaction::frozen::FrozenMessageRef;
+
+    let store = store().await;
+    let db = store.database_connection();
+    for (id, sequence) in [("retain-first", 1), ("retain-abort", 2)] {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_llm_context(id,turn_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES (?,'turn',?,'non_whitelist','{}','{}',CURRENT_TIMESTAMP)",
+            [id.into(), sequence.into()],
+        ))
+        .await
+        .unwrap();
+    }
+    let message = FrozenMessageRef {
+        logical_turn_id: None,
+        source_thread: "thread".into(),
+        context_thread: None,
+        unit_id: "atomic-retention".into(),
+        sources: ["retain-first", "retain-abort"]
+            .into_iter()
+            .map(|id| SourceRef {
+                scope: "context:turn".into(),
+                id: id.into(),
+                version: "revision:1".into(),
+            })
+            .collect(),
+        event_input_role: None,
+        source_aliases: Vec::new(),
+        ambiguous_input_aliases: Vec::new(),
+        publication_aliases: None,
+        inherited: false,
+        complete: true,
+        protected_input: false,
+        wire_sha256: "b".repeat(64),
+        replay_source: None,
+        tool_item_id: None,
+        tool_call_id: None,
+        tool_name: None,
+    };
+    db.execute_unprepared(
+        "CREATE TEMP TRIGGER abort_frozen_retention BEFORE UPDATE OF frozen_revision \
+         ON compaction_source_revision WHEN NEW.source_id='retain-abort' \
+         BEGIN SELECT RAISE(ABORT,'fixture retention rollback'); END",
+    )
+    .await
+    .unwrap();
+    assert!(
+        store
+            .compaction_retain_frozen_context_sources("ws", std::slice::from_ref(&message))
+            .await
+            .is_err()
+    );
+    let retained: i64 = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS count FROM compaction_source_revision WHERE frozen_revision IS NOT NULL",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "count")
+        .unwrap();
+    assert_eq!(retained, 0, "a failed retention batch must roll back fully");
+    db.execute_unprepared("DROP TRIGGER abort_frozen_retention")
+        .await
+        .unwrap();
+    store
+        .compaction_retain_frozen_context_sources("ws", std::slice::from_ref(&message))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .delete_turn_llm_context_for_turn("turn")
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn frozen_context_retention_validation_failure_leaves_the_batch_unchanged() {
+    use pioneer_compaction::frozen::FrozenMessageRef;
+
+    let store = store().await;
+    let db = store.database_connection();
+    let insert = |id: &str, sequence: i64| {
+        Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_llm_context(id,turn_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES (?,'turn',?,'non_whitelist','{}','{}',CURRENT_TIMESTAMP)",
+            [id.into(), sequence.into()],
+        )
+    };
+    let message = |unit: &str, source_thread: &str, sources: Vec<SourceRef>| FrozenMessageRef {
+        logical_turn_id: None,
+        source_thread: source_thread.into(),
+        context_thread: None,
+        unit_id: unit.into(),
+        sources,
+        event_input_role: None,
+        source_aliases: Vec::new(),
+        ambiguous_input_aliases: Vec::new(),
+        publication_aliases: None,
+        inherited: false,
+        complete: true,
+        protected_input: false,
+        wire_sha256: "c".repeat(64),
+        replay_source: None,
+        tool_item_id: None,
+        tool_call_id: None,
+        tool_name: None,
+    };
+    let reference = |id: &str, scope: &str, version: &str| SourceRef {
+        scope: scope.into(),
+        id: id.into(),
+        version: version.into(),
+    };
+    async fn frozen_revision(store: &CrudStore, id: &str) -> Option<i64> {
+        store
+            .database_connection()
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT frozen_revision FROM compaction_source_revision WHERE source_id=?",
+                [id.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "frozen_revision")
+            .unwrap()
+    }
+
+    db.execute_raw(insert("already-retained", 1)).await.unwrap();
+    store
+        .compaction_retain_frozen_context_sources(
+            "ws",
+            &[message(
+                "already-retained",
+                "thread",
+                vec![reference("already-retained", "context:turn", "revision:1")],
+            )],
+        )
+        .await
+        .unwrap();
+
+    struct FailureCase {
+        name: &'static str,
+        workspace: &'static str,
+        source_thread: &'static str,
+        invalid_id: &'static str,
+        invalid_scope: &'static str,
+        invalid_version: &'static str,
+        insert_invalid: bool,
+    }
+    let cases = [
+        FailureCase {
+            name: "missing",
+            workspace: "ws",
+            source_thread: "thread",
+            invalid_id: "actually-missing",
+            invalid_scope: "context:turn",
+            invalid_version: "revision:1",
+            insert_invalid: false,
+        },
+        FailureCase {
+            name: "wrong-revision",
+            workspace: "ws",
+            source_thread: "thread",
+            invalid_id: "wrong-revision-source",
+            invalid_scope: "context:turn",
+            invalid_version: "revision:2",
+            insert_invalid: true,
+        },
+        FailureCase {
+            name: "wrong-source-thread",
+            workspace: "ws",
+            source_thread: "different-thread",
+            invalid_id: "wrong-thread-source",
+            invalid_scope: "context:turn",
+            invalid_version: "revision:1",
+            insert_invalid: true,
+        },
+        FailureCase {
+            name: "wrong-scope",
+            workspace: "ws",
+            source_thread: "thread",
+            invalid_id: "wrong-scope-source",
+            invalid_scope: "context:different-turn",
+            invalid_version: "revision:1",
+            insert_invalid: true,
+        },
+        FailureCase {
+            name: "wrong-workspace",
+            workspace: "different-workspace",
+            source_thread: "thread",
+            invalid_id: "wrong-workspace-source",
+            invalid_scope: "context:turn",
+            invalid_version: "revision:1",
+            insert_invalid: true,
+        },
+    ];
+    for (offset, case) in cases.into_iter().enumerate() {
+        let valid_id = format!("valid-before-{}", case.name);
+        db.execute_raw(insert(&valid_id, 10 + offset as i64 * 2))
+            .await
+            .unwrap();
+        if case.insert_invalid {
+            db.execute_raw(insert(case.invalid_id, 11 + offset as i64 * 2))
+                .await
+                .unwrap();
+        }
+        let candidate = message(
+            case.name,
+            case.source_thread,
+            vec![
+                reference(&valid_id, "context:turn", "revision:1"),
+                reference(case.invalid_id, case.invalid_scope, case.invalid_version),
+            ],
+        );
+        assert!(
+            store
+                .compaction_retain_frozen_context_sources(
+                    case.workspace,
+                    std::slice::from_ref(&candidate),
+                )
+                .await
+                .is_err(),
+            "{} must fail validation",
+            case.name
+        );
+        assert_eq!(
+            frozen_revision(&store, &valid_id).await,
+            None,
+            "{} must roll back the valid marker in its batch",
+            case.name
+        );
+        if case.insert_invalid {
+            assert_eq!(frozen_revision(&store, case.invalid_id).await, None);
+        }
+        assert_eq!(
+            frozen_revision(&store, "already-retained").await,
+            Some(1),
+            "a failed later batch must not remove prior retention",
+        );
+    }
+}
+
+#[tokio::test]
+async fn frozen_context_retention_commits_only_complete_successful_batches() {
+    use pioneer_compaction::frozen::FrozenMessageRef;
+
+    let store = store().await;
+    let db = store.database_connection();
+    let mut sources = Vec::new();
+    for sequence in 0_i64..129 {
+        let id = format!("batch-source-{sequence:03}");
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_llm_context(id,turn_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES (?,'turn',?,'non_whitelist','{}','{}',CURRENT_TIMESTAMP)",
+            [id.clone().into(), (sequence + 1).into()],
+        ))
+        .await
+        .unwrap();
+        sources.push(SourceRef {
+            scope: "context:turn".into(),
+            id,
+            version: "revision:1".into(),
+        });
+    }
+    sources.push(SourceRef {
+        scope: "context:turn".into(),
+        id: "zz-missing-after-first-batch".into(),
+        version: "revision:1".into(),
+    });
+    let message = FrozenMessageRef {
+        logical_turn_id: None,
+        source_thread: "thread".into(),
+        context_thread: None,
+        unit_id: "multiple-retention-batches".into(),
+        sources,
+        event_input_role: None,
+        source_aliases: Vec::new(),
+        ambiguous_input_aliases: Vec::new(),
+        publication_aliases: None,
+        inherited: false,
+        complete: true,
+        protected_input: false,
+        wire_sha256: "d".repeat(64),
+        replay_source: None,
+        tool_item_id: None,
+        tool_call_id: None,
+        tool_name: None,
+    };
+    assert!(
+        store
+            .compaction_retain_frozen_context_sources("ws", &[message])
+            .await
+            .is_err()
+    );
+    for (id, expected) in [
+        ("batch-source-000", Some(1_i64)),
+        ("batch-source-127", Some(1)),
+        ("batch-source-128", None),
+    ] {
+        let marker: Option<i64> = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT frozen_revision FROM compaction_source_revision WHERE source_id=?",
+                [id.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "frozen_revision")
+            .unwrap();
+        assert_eq!(
+            marker, expected,
+            "unexpected marker after a later batch failed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn migration_backfills_preexisting_frozen_context_across_database_reopen() {
+    use pioneer_compaction::frozen::FrozenMessageRef;
+    use sea_orm::ConnectOptions;
+
+    let directory = std::env::current_dir()
+        .unwrap()
+        .join("target/compaction-tests");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!(
+        "legacy-frozen-retention-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let mut options = ConnectOptions::new(url.clone());
+    options.max_connections(1).min_connections(1);
+    let database = Database::connect(options).await.unwrap();
+    Migrator::up(&database, Some((Migrator::migrations().len() - 1) as u32))
+        .await
+        .unwrap();
+    database
+        .execute_unprepared(
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('legacy-ws','fixture',1,1); \
+             INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('legacy-thread','legacy-ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP); \
+             INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('legacy-turn','legacy-thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP); \
+             INSERT INTO turn_llm_context(id,turn_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('legacy-context','legacy-turn',1,'unknown-production-source','legacy payload','{}',CURRENT_TIMESTAMP); \
+             INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,ready) VALUES ('legacy-manifest','legacy-ws','legacy-thread','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,1,1)",
+        )
+        .await
+        .unwrap();
+    let reference = FrozenMessageRef {
+        logical_turn_id: None,
+        source_thread: "legacy-thread".into(),
+        context_thread: None,
+        unit_id: "legacy-unit".into(),
+        sources: vec![SourceRef {
+            scope: "context:legacy-turn".into(),
+            id: "legacy-context".into(),
+            version: "revision:1".into(),
+        }],
+        event_input_role: None,
+        source_aliases: Vec::new(),
+        ambiguous_input_aliases: Vec::new(),
+        publication_aliases: None,
+        inherited: false,
+        complete: true,
+        protected_input: false,
+        wire_sha256: "b".repeat(64),
+        replay_source: None,
+        tool_item_id: None,
+        tool_call_id: None,
+        tool_name: None,
+    };
+    let json = serde_json::to_string(&reference).unwrap();
+    database
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ('legacy-manifest',0,?,?)",
+            [json.clone().into(), (json.len() as i64).into()],
+        ))
+        .await
+        .unwrap();
+
+    Migrator::up(&database, None).await.unwrap();
+    let frozen_revision: Option<i64> = database
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT frozen_revision FROM compaction_source_revision WHERE source_id='legacy-context'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "frozen_revision")
+        .unwrap();
+    assert_eq!(frozen_revision, Some(1));
+    database.close().await.unwrap();
+
+    let mut options = ConnectOptions::new(url);
+    options.max_connections(1).min_connections(1);
+    let reopened = Database::connect(options).await.unwrap();
+    let store = CrudStore::new(reopened).with_maintenance_access();
+    assert_eq!(
+        store
+            .delete_turn_llm_context_for_terminal_turns()
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .compaction_reference_payload("legacy-ws", "legacy-thread", &reference.sources[0])
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("legacy payload")
+    );
+    drop(store);
+    std::fs::remove_file(&path).unwrap();
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
 }
 
 #[tokio::test]

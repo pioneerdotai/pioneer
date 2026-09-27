@@ -223,7 +223,7 @@ async fn repair_thread_foreground_statuses(connection: impl Into<SqliteDatabase>
 }
 
 async fn cleanup_turn_llm_context(connection: impl Into<SqliteDatabase>) -> Result<(u64, u64)> {
-    let store = pioneer_crud::CrudStore::new(connection);
+    let store = pioneer_crud::CrudStore::new(connection).with_maintenance_access();
     let terminal = store
         .delete_turn_llm_context_for_terminal_turns()
         .await
@@ -309,6 +309,7 @@ mod tests {
         repair_terminal_turn_execution_windows, repair_turns_completed_after_final_agent_message,
     };
     use migration::{Migrator, MigratorTrait};
+    use pioneer_compaction::{SourceRef, frozen::FrozenMessageRef};
     use pioneer_crud::{
         CrudStore, NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, NewTurnRuntimeSnapshot,
     };
@@ -320,7 +321,8 @@ mod tests {
     };
     use sea_orm::sea_query::Expr;
     use sea_orm::{
-        ActiveModelTrait, ColumnTrait, Database, EntityTrait, QueryFilter, QueryOrder, Set,
+        ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, EntityTrait, QueryFilter,
+        QueryOrder, Set,
     };
 
     const DEFAULT_WORKSPACE_ID_LEN: usize = 21;
@@ -500,6 +502,14 @@ mod tests {
     #[tokio::test]
     async fn cleanup_removes_llm_context_for_terminal_turns() {
         let connection = setup_workspace_database().await;
+        connection
+            .execute_unprepared(
+                "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('workspace_1','fixture',1,1); \
+                 INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) \
+                 VALUES ('thread_1','workspace_1','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            )
+            .await
+            .expect("cleanup scope should insert");
         let now = chrono::Utc::now().fixed_offset();
         turn::ActiveModel {
             id: Set("terminal_turn".to_owned()),
@@ -563,19 +573,62 @@ mod tests {
             })
             .await
             .expect("expired llm context insert should succeed");
+        let retained = store
+            .insert_turn_llm_context(NewTurnLlmContextEntry {
+                turn_id: "terminal_turn".to_owned(),
+                item_id: Some("item_retained".to_owned()),
+                attempt_id: None,
+                sequence: 2,
+                source: "provider_observation_outside_legacy_whitelist".to_owned(),
+                tool_name: None,
+                payload: "retained".to_owned(),
+                output_policy_snapshot: "{}".to_owned(),
+                created_at: now,
+                expires_at: None,
+            })
+            .await
+            .expect("retained context insert should succeed");
+        store
+            .compaction_retain_frozen_context_sources(
+                "workspace_1",
+                &[FrozenMessageRef {
+                    logical_turn_id: None,
+                    source_thread: "thread_1".to_owned(),
+                    context_thread: None,
+                    unit_id: "startup-retained".to_owned(),
+                    sources: vec![SourceRef {
+                        scope: "context:terminal_turn".to_owned(),
+                        id: retained.id.clone(),
+                        version: "revision:1".to_owned(),
+                    }],
+                    event_input_role: None,
+                    source_aliases: Vec::new(),
+                    ambiguous_input_aliases: Vec::new(),
+                    publication_aliases: None,
+                    inherited: false,
+                    complete: true,
+                    protected_input: false,
+                    wire_sha256: "a".repeat(64),
+                    replay_source: None,
+                    tool_item_id: None,
+                    tool_call_id: None,
+                    tool_name: None,
+                }],
+            )
+            .await
+            .expect("frozen context retention should succeed");
 
         let (deleted_terminal, deleted_expired) = cleanup_turn_llm_context(&connection)
             .await
             .expect("cleanup should succeed");
         assert_eq!(deleted_terminal, 1);
         assert_eq!(deleted_expired, 0);
-        assert!(
-            store
-                .list_turn_llm_context("terminal_turn")
-                .await
-                .expect("context list should succeed")
-                .is_empty()
-        );
+        let terminal_context = store
+            .list_turn_llm_context("terminal_turn")
+            .await
+            .expect("context list should succeed");
+        assert_eq!(terminal_context.len(), 1);
+        assert_eq!(terminal_context[0].id, retained.id);
         let active_context = store
             .list_turn_llm_context("active_turn")
             .await

@@ -14,6 +14,7 @@ pub struct Model {
     pub revision: i64,
     pub present: i64,
     pub capture_order: i64,
+    pub frozen_revision: Option<i64>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

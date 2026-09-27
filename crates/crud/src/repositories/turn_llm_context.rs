@@ -1,9 +1,12 @@
 use anyhow::{Context, Result};
-use pioneer_entity::{turn, turn_llm_context};
+use pioneer_entity::{compaction_source_revision, turn, turn_llm_context};
 use pioneer_protocol::{TurnStatus, generate_id};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
+    Set,
+};
 
 use crate::convention::turn_status_to_db;
 
@@ -183,6 +186,7 @@ pub async fn delete_turn_llm_context_for_turn<C: ConnectionTrait>(
 ) -> Result<u64> {
     let deleted = turn_llm_context::Entity::delete_many()
         .filter(turn_llm_context::Column::Source.is_not_in(["assistant_round", "tool_result_v2"]))
+        .filter(unretained_frozen_context())
         .filter(turn_llm_context::Column::TurnId.eq(turn_id.to_owned()))
         .exec(db)
         .await
@@ -193,6 +197,7 @@ pub async fn delete_turn_llm_context_for_turn<C: ConnectionTrait>(
 pub async fn delete_expired_turn_llm_context<C: ConnectionTrait>(db: &C) -> Result<u64> {
     let deleted = turn_llm_context::Entity::delete_many()
         .filter(turn_llm_context::Column::Source.is_not_in(["assistant_round", "tool_result_v2"]))
+        .filter(unretained_frozen_context())
         .filter(turn_llm_context::Column::ExpiresAt.is_not_null())
         .filter(turn_llm_context::Column::ExpiresAt.lte(chrono::Utc::now().fixed_offset()))
         .exec(db)
@@ -210,25 +215,54 @@ pub async fn delete_turn_llm_context_for_terminal_turns<C: ConnectionTrait>(db: 
     ];
 
     let terminal_turn_ids = turn::Entity::find()
+        .select_only()
+        .column(turn::Column::Id)
         .filter(turn::Column::Status.is_in(terminal_statuses))
-        .all(db)
-        .await
-        .context("failed to list terminal turns for turn_llm_context cleanup")?
-        .into_iter()
-        .map(|turn| turn.id)
-        .collect::<Vec<_>>();
-
-    if terminal_turn_ids.is_empty() {
-        return Ok(0);
-    }
+        .into_query();
 
     let deleted = turn_llm_context::Entity::delete_many()
         .filter(turn_llm_context::Column::Source.is_not_in(["assistant_round", "tool_result_v2"]))
-        .filter(turn_llm_context::Column::TurnId.is_in(terminal_turn_ids))
+        .filter(unretained_frozen_context())
+        .filter(turn_llm_context::Column::TurnId.in_subquery(terminal_turn_ids))
         .exec(db)
         .await
         .context("failed to delete terminal turn_llm_context rows")?;
     Ok(deleted.rows_affected)
+}
+
+fn unretained_frozen_context() -> sea_orm::sea_query::SimpleExpr {
+    let retained = Query::select()
+        .expr(Expr::val(1_i64))
+        .from_as(compaction_source_revision::Entity, "retained_revision")
+        .and_where(
+            Expr::col((
+                "retained_revision",
+                compaction_source_revision::Column::SourceId,
+            ))
+            .eq(Expr::col((
+                turn_llm_context::Entity,
+                turn_llm_context::Column::Id,
+            ))),
+        )
+        .and_where(
+            Expr::col((
+                "retained_revision",
+                compaction_source_revision::Column::Present,
+            ))
+            .eq(1_i64),
+        )
+        .and_where(
+            Expr::col((
+                "retained_revision",
+                compaction_source_revision::Column::FrozenRevision,
+            ))
+            .eq(Expr::col((
+                "retained_revision",
+                compaction_source_revision::Column::Revision,
+            ))),
+        )
+        .to_owned();
+    Expr::exists(retained).not()
 }
 
 fn entry_from_model(model: turn_llm_context::Model) -> TurnLlmContextEntry {

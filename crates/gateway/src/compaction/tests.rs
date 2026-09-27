@@ -16950,15 +16950,91 @@ async fn completed_task_output_excludes_later_turns_before_decoding_and_survives
             .collect::<Vec<_>>(),
         ["own previous work", "own final result"]
     );
+    let provider_message =
+        pioneer_provider::ChatMessage::assistant("provider-only context outside whitelist");
+    let provider_payload =
+        serde_json::to_string(&pioneer_provider::CanonicalProviderRoundEnvelope {
+            version: 1,
+            round_id: "retained-provider-round".into(),
+            termination: ProviderTermination::Complete,
+            message: provider_message.clone(),
+            calls: vec![],
+        })
+        .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn_llm_context(id,turn_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('retained-provider-context','turn',99,'provider_observation_outside_legacy_whitelist',?,'{}',CURRENT_TIMESTAMP)",
+        [provider_payload.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let capture_fence = store.compaction_history_read_fence().await.unwrap();
+    let messages_before_capture =
+        super::history::load_task_output_history(&store, "ws", "thread", "turn", &capture_fence)
+            .await
+            .unwrap();
+    let expected_provider_observation =
+        format!("Legacy provider observation; outcome is not inferred:\n{provider_payload}");
+    assert_eq!(
+        messages_before_capture
+            .last()
+            .map(|message| message.content.as_str()),
+        Some(expected_provider_observation.as_str()),
+        "an unknown context source must use the cold-history legacy renderer"
+    );
     assert!(
         super::history::load_task_output_history(&store, "ws", "thread", "missing", &fence)
             .await
             .is_err()
     );
-    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
-    let frozen = super::frozen::capture(&store, "ws", "thread", &allowed, &messages)
+    db.execute_unprepared(
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal) VALUES ('retention-task','ws','thread','thread','agent','running','Retention','fixture'); \
+         INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('retention-run','retention-task','retention-run',1,1,'running','agent'); \
+         INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('retention-run-turn','retention-task','retention-run','thread','turn','initial',0,1,'candidate_created',CURRENT_TIMESTAMP)",
+    )
+    .await
+    .unwrap();
+    let task_turn = store
+        .get_task_run_turn("retention-run-turn")
+        .await
+        .unwrap()
+        .unwrap();
+    let output = super::frozen::capture_task_output(&store, "ws", &task_turn)
         .await
         .unwrap();
+    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+    let messages = super::frozen::restore(&store, "ws", &allowed, &output.history)
+        .await
+        .unwrap();
+    assert_eq!(messages, messages_before_capture);
+    assert_eq!(
+        messages.last().map(|message| message.content.as_str()),
+        Some(expected_provider_observation.as_str())
+    );
+    assert_eq!(
+        store
+            .delete_turn_llm_context_for_turn("turn")
+            .await
+            .unwrap(),
+        0,
+        "completed-turn reconciliation cleanup must retain frozen context sources"
+    );
+    assert_eq!(
+        store
+            .delete_turn_llm_context_for_turn("turn")
+            .await
+            .unwrap(),
+        0,
+        "repeated reconciliation cleanup must remain idempotent"
+    );
+    assert!(
+        store
+            .list_turn_llm_context("turn")
+            .await
+            .unwrap()
+            .iter()
+            .any(|entry| entry.id == "retained-provider-context")
+    );
     assert!(
         crate::database::compress_history_payloads_for_test(&store)
             .await
@@ -16966,7 +17042,15 @@ async fn completed_task_output_excludes_later_turns_before_decoding_and_survives
             > 0
     );
     assert_eq!(
-        super::frozen::restore(&store, "ws", &allowed, &frozen)
+        store
+            .delete_turn_llm_context_for_turn("turn")
+            .await
+            .unwrap(),
+        0,
+        "cleanup after compression must preserve the retained exact revision"
+    );
+    assert_eq!(
+        super::frozen::restore(&store, "ws", &allowed, &output.history)
             .await
             .unwrap(),
         messages
@@ -16979,6 +17063,451 @@ async fn completed_task_output_excludes_later_turns_before_decoding_and_survives
             .is_err()
     );
     assert!(f.provider.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn frozen_context_capture_and_cleanup_have_deterministic_retention_ordering() {
+    async fn prepare(store: &CrudStore) -> pioneer_protocol::TaskRunTurn {
+        let db = store.database_connection();
+        db.execute_unprepared(
+            "DELETE FROM turn_event WHERE id='source'; \
+             UPDATE turn SET status='completed' WHERE id='turn'; \
+             INSERT INTO turn_llm_context(id,turn_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('race-context','turn',1,'outside_cleanup_whitelist','race payload','{}',CURRENT_TIMESTAMP); \
+             INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal) VALUES ('race-task','ws','thread','thread','agent','running','Race','fixture'); \
+             INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('race-run','race-task','race-run',1,1,'running','agent'); \
+             INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('race-run-turn','race-task','race-run','thread','turn','initial',0,1,'candidate_created',CURRENT_TIMESTAMP)",
+        )
+        .await
+        .unwrap();
+        store
+            .get_task_run_turn("race-run-turn")
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    let before_retention = fixture("unused", vec![], true, false).await;
+    let store = before_retention.store.with_maintenance_access();
+    let task_turn = prepare(&store).await;
+    let mut hook = arm_publication_test_hook(
+        &store,
+        "frozen-context-retention",
+        PublicationTestPause::BeforeWriter,
+    );
+    let capture_store = store.clone();
+    let capture_turn = task_turn.clone();
+    let capture = tokio::spawn(async move {
+        super::frozen::capture_task_output(&capture_store, "ws", &capture_turn).await
+    });
+    hook.reached().await;
+    assert_eq!(
+        store
+            .delete_turn_llm_context_for_turn("turn")
+            .await
+            .unwrap(),
+        1,
+        "cleanup before retention must still remove an unprotected source"
+    );
+    hook.release();
+    assert!(capture.await.unwrap().is_err());
+    assert!(
+        store
+            .compaction_task_output("ws", "race-run-turn")
+            .await
+            .unwrap()
+            .is_none(),
+        "failed capture must not publish a Task output"
+    );
+    let ready: i64 = store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS count FROM compaction_frozen_history WHERE ready=1",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "count")
+        .unwrap();
+    assert_eq!(ready, 0, "failed capture must not publish a ready manifest");
+
+    let before_cleanup = fixture("unused", vec![], true, false).await;
+    let store = before_cleanup.store.with_maintenance_access();
+    let task_turn = prepare(&store).await;
+    let expected = "Legacy provider observation; outcome is not inferred:\nrace payload";
+    let output = super::frozen::capture_task_output(&store, "ws", &task_turn)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .delete_turn_llm_context_for_turn("turn")
+            .await
+            .unwrap(),
+        0,
+        "cleanup after retention must preserve the exact source revision"
+    );
+    let restored = super::frozen::restore(
+        &store,
+        "ws",
+        &std::collections::BTreeSet::from(["thread".to_owned()]),
+        &output.history,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].content, expected);
+}
+
+#[tokio::test]
+async fn migration_retains_restorable_legacy_context_manifests_including_shared_ranges() {
+    use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
+    use sea_orm::ConnectOptions;
+    use sha2::{Digest, Sha256};
+
+    fn wire(message: &pioneer_provider::ChatMessage) -> String {
+        hex::encode(Sha256::digest(serde_json::to_vec(message).unwrap()))
+    }
+    fn descriptor(id: &str, reference: &FrozenMessageRef) -> FrozenHistoryRef {
+        let bytes = serde_json::to_vec(reference).unwrap();
+        let mut digest = Sha256::new();
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+        FrozenHistoryRef {
+            format: 1,
+            manifest_id: id.into(),
+            messages: 1,
+            identity_sha256: hex::encode(digest.finalize()),
+        }
+    }
+    fn context_reference(
+        unit: &str,
+        source_id: &str,
+        version: &str,
+        message: &pioneer_provider::ChatMessage,
+    ) -> FrozenMessageRef {
+        FrozenMessageRef {
+            logical_turn_id: None,
+            source_thread: "legacy-thread".into(),
+            context_thread: None,
+            unit_id: unit.into(),
+            sources: vec![SourceRef {
+                scope: "context:legacy-turn".into(),
+                id: source_id.into(),
+                version: version.into(),
+            }],
+            event_input_role: None,
+            source_aliases: Vec::new(),
+            ambiguous_input_aliases: Vec::new(),
+            publication_aliases: None,
+            inherited: false,
+            complete: true,
+            protected_input: false,
+            wire_sha256: wire(message),
+            replay_source: None,
+            tool_item_id: None,
+            tool_call_id: None,
+            tool_name: None,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("legacy-frozen-context.sqlite");
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let mut options = ConnectOptions::new(url.clone());
+    options
+        .max_connections(1)
+        .min_connections(1)
+        .sqlx_logging(false);
+    let database = Database::connect(options).await.unwrap();
+    Migrator::up(&database, Some((Migrator::migrations().len() - 1) as u32))
+        .await
+        .unwrap();
+    database
+        .execute_unprepared(
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('legacy-ws','fixture',1,1); \
+             INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('legacy-thread','legacy-ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP); \
+             INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('legacy-turn','legacy-thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        )
+        .await
+        .unwrap();
+    let replay_message = pioneer_provider::ChatMessage::assistant("replayed exact provider result");
+    let replay_payload = serde_json::to_string(&pioneer_tools::ToolResultView::Json {
+        value: serde_json::to_value(&replay_message).unwrap(),
+        truncated: false,
+    })
+    .unwrap();
+    for (sequence, id, payload) in [
+        (1_i64, "legacy-direct", "direct payload".to_owned()),
+        (2, "legacy-replay", replay_payload),
+        (3, "legacy-shared", "shared payload".to_owned()),
+        (4, "legacy-incomplete", "incomplete payload".to_owned()),
+        (5, "legacy-stale", "stale payload".to_owned()),
+    ] {
+        database
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO turn_llm_context(id,turn_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES (?,'legacy-turn',?,'unknown_legacy_source',?,'{}',CURRENT_TIMESTAMP)",
+                [id.into(), sequence.into(), payload.into()],
+            ))
+            .await
+            .unwrap();
+    }
+
+    let item = pioneer_protocol::TurnItem::AgentMessage {
+        id: "legacy-item-id".into(),
+        text: "item projection must not satisfy the replay wire hash".into(),
+        phase: Default::default(),
+        markdown: None,
+        markdown_version: None,
+    };
+    let item_payload = serde_json::to_string(&item).unwrap();
+    database
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES ('legacy-item-row','legacy-turn','legacy-item-id','agent_message','completed',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            [item_payload.into()],
+        ))
+        .await
+        .unwrap();
+
+    let legacy_message = |payload: &str| {
+        pioneer_provider::ChatMessage::user(format!(
+            "Legacy provider observation; outcome is not inferred:\n{payload}"
+        ))
+    };
+    let direct_message = legacy_message("direct payload");
+    let shared_message = legacy_message("shared payload");
+    let incomplete_message = legacy_message("incomplete payload");
+    let stale_message = legacy_message("stale payload");
+    let missing_message = legacy_message("missing payload");
+    let direct = context_reference("direct", "legacy-direct", "revision:1", &direct_message);
+    let shared = context_reference("shared", "legacy-shared", "revision:1", &shared_message);
+    let incomplete = context_reference(
+        "incomplete",
+        "legacy-incomplete",
+        "revision:1",
+        &incomplete_message,
+    );
+    let stale = context_reference("stale", "legacy-stale", "revision:2", &stale_message);
+    let missing = context_reference("missing", "legacy-missing", "revision:1", &missing_message);
+    let replay = FrozenMessageRef {
+        logical_turn_id: None,
+        source_thread: "legacy-thread".into(),
+        context_thread: None,
+        unit_id: "replay".into(),
+        sources: vec![SourceRef {
+            scope: "item:legacy-turn".into(),
+            id: "legacy-item-row".into(),
+            version: "item-revision:1".into(),
+        }],
+        event_input_role: None,
+        source_aliases: Vec::new(),
+        ambiguous_input_aliases: Vec::new(),
+        publication_aliases: None,
+        inherited: false,
+        complete: true,
+        protected_input: false,
+        wire_sha256: wire(&replay_message),
+        replay_source: Some(SourceRef {
+            scope: "context:legacy-turn".into(),
+            id: "legacy-replay".into(),
+            version: "revision:1".into(),
+        }),
+        tool_item_id: Some("legacy-item-id".into()),
+        tool_call_id: None,
+        tool_name: None,
+    };
+    let direct_descriptor = descriptor("legacy-direct-manifest", &direct);
+    let replay_descriptor = descriptor("legacy-replay-manifest", &replay);
+    let shared_descriptor = descriptor("legacy-shared-manifest", &shared);
+    let shared_storage_descriptor = descriptor("legacy-shared-storage", &shared);
+    let incomplete_descriptor = descriptor("legacy-incomplete-manifest", &incomplete);
+    let stale_descriptor = descriptor("legacy-stale-manifest", &stale);
+    let missing_descriptor = descriptor("legacy-missing-manifest", &missing);
+
+    for (history, reference, ready, data_manifest) in [
+        (&direct_descriptor, &direct, 1_i64, "legacy-direct-manifest"),
+        (&replay_descriptor, &replay, 1, "legacy-replay-manifest"),
+        (
+            &shared_storage_descriptor,
+            &shared,
+            1,
+            "legacy-shared-storage",
+        ),
+        (
+            &incomplete_descriptor,
+            &incomplete,
+            0,
+            "legacy-incomplete-manifest",
+        ),
+        (&stale_descriptor, &stale, 1, "legacy-stale-manifest"),
+        (&missing_descriptor, &missing, 1, "legacy-missing-manifest"),
+    ] {
+        database
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,ready) VALUES (?,'legacy-ws','legacy-thread',?,1,1,?)",
+                [history.manifest_id.clone().into(), history.identity_sha256.clone().into(), ready.into()],
+            ))
+            .await
+            .unwrap();
+        let json = serde_json::to_string(reference).unwrap();
+        database
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES (?,0,?,?)",
+                [data_manifest.into(), json.clone().into(), (json.len() as i64).into()],
+            ))
+            .await
+            .unwrap();
+    }
+    database
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,ready) VALUES (?,'legacy-ws','legacy-thread',?,1,1,1)",
+            [shared_descriptor.manifest_id.clone().into(), shared_descriptor.identity_sha256.clone().into()],
+        ))
+        .await
+        .unwrap();
+    database
+        .execute_unprepared(
+            "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES ('legacy-shared-storage',0,1,0); \
+             INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES ('legacy-shared-manifest',0,1,0); \
+             INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES ('legacy-shared-manifest',0,0,1,'legacy-shared-storage')",
+        )
+        .await
+        .unwrap();
+
+    Migrator::up(&database, None).await.unwrap();
+    database.close().await.unwrap();
+
+    let mut options = ConnectOptions::new(url);
+    options
+        .max_connections(1)
+        .min_connections(1)
+        .sqlx_logging(false);
+    let reopened = Database::connect(options).await.unwrap();
+    let store = CrudStore::new(reopened).with_maintenance_access();
+    let allowed = std::collections::BTreeSet::from(["legacy-thread".to_owned()]);
+
+    assert!(
+        super::frozen::restore(&store, "legacy-ws", &allowed, &stale_descriptor)
+            .await
+            .is_err(),
+        "a still-present source at the wrong revision must be rejected"
+    );
+    assert!(
+        super::frozen::restore(&store, "legacy-ws", &allowed, &missing_descriptor)
+            .await
+            .is_err(),
+        "a genuinely missing source must be rejected"
+    );
+    for id in [
+        "legacy-direct",
+        "legacy-replay",
+        "legacy-shared",
+        "legacy-incomplete",
+    ] {
+        let row = store
+            .database_connection()
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT frozen_revision,present FROM compaction_source_revision WHERE source_id=?",
+                [id.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.try_get::<Option<i64>>("", "frozen_revision").unwrap(),
+            Some(1)
+        );
+        assert_eq!(row.try_get::<i64>("", "present").unwrap(), 1);
+    }
+    let stale_marker = store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT frozen_revision FROM compaction_source_revision WHERE source_id='legacy-stale'",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stale_marker
+            .try_get::<Option<i64>>("", "frozen_revision")
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .delete_turn_llm_context_for_terminal_turns()
+            .await
+            .unwrap(),
+        1,
+        "only the unretained stale-revision payload is eligible for cleanup"
+    );
+    let remaining = store.list_turn_llm_context("legacy-turn").await.unwrap();
+    for id in [
+        "legacy-direct",
+        "legacy-replay",
+        "legacy-shared",
+        "legacy-incomplete",
+    ] {
+        assert!(
+            remaining
+                .iter()
+                .any(|row| row.id == id && !row.payload.is_empty())
+        );
+    }
+    assert!(!remaining.iter().any(|row| row.id == "legacy-stale"));
+
+    let restored_direct = super::frozen::restore(&store, "legacy-ws", &allowed, &direct_descriptor)
+        .await
+        .unwrap();
+    assert_eq!(restored_direct.len(), 1);
+    assert_eq!(restored_direct[0].role, direct_message.role);
+    assert_eq!(restored_direct[0].content, direct_message.content);
+    let restored_replay = super::frozen::restore(&store, "legacy-ws", &allowed, &replay_descriptor)
+        .await
+        .unwrap();
+    assert_eq!(restored_replay.len(), 1);
+    assert_eq!(restored_replay[0].role, replay_message.role);
+    assert_eq!(restored_replay[0].content, replay_message.content);
+    let restored_shared = super::frozen::restore(&store, "legacy-ws", &allowed, &shared_descriptor)
+        .await
+        .unwrap();
+    assert_eq!(restored_shared.len(), 1);
+    assert_eq!(restored_shared[0].role, shared_message.role);
+    assert_eq!(restored_shared[0].content, shared_message.content);
+    assert!(
+        super::frozen::restore(&store, "legacy-ws", &allowed, &incomplete_descriptor)
+            .await
+            .is_err(),
+        "migration must not publish an unfinished manifest"
+    );
+    let incomplete_ready: i64 = store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT ready FROM compaction_frozen_history WHERE id='legacy-incomplete-manifest'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "ready")
+        .unwrap();
+    assert_eq!(incomplete_ready, 0);
+    assert!(
+        super::frozen::restore(&store, "legacy-ws", &allowed, &stale_descriptor)
+            .await
+            .is_err()
+    );
+    assert!(
+        super::frozen::restore(&store, "legacy-ws", &allowed, &missing_descriptor)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

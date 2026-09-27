@@ -3,11 +3,114 @@
 use super::compaction::*;
 use crate::CrudStore;
 use anyhow::{Result, ensure};
-use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
+use pioneer_compaction::{
+    SourceRef,
+    frozen::{FrozenHistoryRef, FrozenMessageRef},
+};
 use pioneer_entity::{compaction_frozen_history, compaction_frozen_message, thread};
 use sea_orm::sea_query::{Expr, ExprTrait, OnConflict, Query};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
-use sea_orm::{ConnectionTrait, TransactionTrait};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    TransactionTrait,
+};
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct FrozenContextRetention {
+    source_thread: String,
+    source: SourceRef,
+}
+
+/// Retain every provider-context revision that is about to enter a frozen
+/// manifest. Each bounded UPDATE both validates exact scope/ownership/version
+/// and records retention, so cleanup cannot interleave between those actions.
+pub(crate) async fn compaction_retain_frozen_context_sources(
+    store: &CrudStore,
+    workspace: &str,
+    messages: &[FrozenMessageRef],
+) -> Result<()> {
+    let mut unique = std::collections::BTreeSet::new();
+    for message in messages {
+        message.validate()?;
+        for source in message.sources.iter().chain(message.replay_source.iter()) {
+            if source.scope.starts_with("context:") {
+                unique.insert((message.source_thread.clone(), source.clone()));
+            }
+        }
+    }
+    let retained = unique
+        .into_iter()
+        .map(|(source_thread, source)| FrozenContextRetention {
+            source_thread,
+            source,
+        })
+        .collect::<Vec<_>>();
+
+    let mut start = 0;
+    while start < retained.len() {
+        let mut end = start;
+        let mut encoded = Vec::new();
+        while end < retained.len() && end - start < SOURCE_PAGE_ROWS as usize {
+            let candidate = serde_json::to_vec(&retained[start..=end])?;
+            if candidate.len() > SOURCE_PAGE_BYTES {
+                ensure!(
+                    end > start,
+                    "single frozen context retention identity exceeds byte bound"
+                );
+                break;
+            }
+            encoded = candidate;
+            end += 1;
+        }
+        let payload = String::from_utf8(encoded)?;
+        let statement = sqlite_specific_sql(
+            r#"
+WITH wanted AS (
+    SELECT json_extract(value, '$.source_thread') AS source_thread,
+           json_extract(value, '$.source.scope') AS source_scope,
+           json_extract(value, '$.source.id') AS source_id,
+           json_extract(value, '$.source.version') AS source_version
+      FROM json_each(?)
+)
+UPDATE compaction_source_revision AS revision
+   SET frozen_revision = revision.revision
+ WHERE revision.present = 1
+   AND revision.source_id IN (SELECT source_id FROM wanted)
+   AND EXISTS (
+       SELECT 1
+         FROM wanted
+         JOIN turn_llm_context AS context_source
+           ON context_source.id = revision.source_id
+          AND context_source.turn_id = revision.turn_id
+         JOIN turn AS context_turn ON context_turn.id = revision.turn_id
+         JOIN thread AS context_thread ON context_thread.id = context_turn.thread_id
+        WHERE context_thread.workspace_id = ?
+          AND context_thread.id = wanted.source_thread
+          AND wanted.source_scope = 'context:' || revision.turn_id
+          AND wanted.source_id = revision.source_id
+          AND wanted.source_version = 'revision:' || revision.revision
+   )
+"#,
+            [payload.into(), workspace.into()],
+        );
+        let expected = u64::try_from(end - start)?;
+        let transaction = store.connection.begin().await?;
+        let updated = match transaction.execute_raw(statement).await {
+            Ok(updated) => updated,
+            Err(error) => {
+                transaction.rollback().await?;
+                return Err(error.into());
+            }
+        };
+        if updated.rows_affected() != expected {
+            transaction.rollback().await?;
+            anyhow::bail!("frozen context source changed before retention");
+        }
+        transaction.commit().await?;
+        start = end;
+    }
+    Ok(())
+}
 
 pub(crate) async fn compaction_begin_frozen_history(
     store: &CrudStore,

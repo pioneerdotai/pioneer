@@ -2403,6 +2403,20 @@ async fn capture_with_imports_prepared_using_renderer(
         );
         verified_messages.extend(restored.into_iter().flatten());
     }
+    #[cfg(test)]
+    pioneer_crud::compaction::trigger_publication_test_hook(
+        store,
+        "frozen-context-retention",
+        pioneer_crud::compaction::PublicationTestPause::BeforeWriter,
+    )
+    .await;
+    // Pin exact context revisions only after hydration proves their hashes and
+    // scopes, but before any manifest can be reused or published. The bounded
+    // writer statement revalidates identity and ownership atomically with the
+    // retention marker, closing the capture/cleanup race.
+    store
+        .compaction_retain_frozen_context_sources(workspace, &references)
+        .await?;
     let accepted_scopes = prepared_manifest_scopes(
         store,
         workspace,
