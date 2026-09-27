@@ -5860,9 +5860,12 @@ async fn agent_tool_loop_replays_provider_state_when_display_reasoning_is_empty(
         })
         .expect("second provider request must replay the assistant tool-call round");
     assert!(assistant_round.reasoning_content.is_none());
+    // The response is bound to the execution model before the next round.
+    let mut expected_replay_state = replay_state;
+    expected_replay_state.model = Some("test-model".to_owned());
     assert_eq!(
         assistant_round.provider_replay_state.as_ref(),
-        Some(&replay_state)
+        Some(&expected_replay_state)
     );
 }
 
