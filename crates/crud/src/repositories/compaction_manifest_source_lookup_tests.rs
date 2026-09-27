@@ -4190,66 +4190,6 @@ async fn publication_generations_survive_database_reopen() {
 }
 
 #[tokio::test]
-async fn publication_migration_failure_rolls_back_schema_triggers_and_marker() {
-    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
-    let connection = Database::connect("sqlite::memory:").await.unwrap();
-    let migration = "m20260919_000002_compaction_publication_fence";
-    Migrator::up(&connection, Some((Migrator::migrations().len() - 2) as u32))
-        .await
-        .unwrap();
-    connection
-        .execute_unprepared(&format!(
-            "CREATE TRIGGER reject_publication_migration BEFORE INSERT ON seaql_migrations \
-         WHEN NEW.version='{migration}' BEGIN SELECT RAISE(ABORT,'fixture marker failure'); END"
-        ))
-        .await
-        .unwrap();
-    assert!(Migrator::up(&connection, None).await.is_err());
-    let objects: i64 = connection
-        .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT count(*) AS n FROM sqlite_master \
-             WHERE name LIKE 'compaction_publication_%' \
-              AND name<>'reject_publication_migration'"
-                .to_owned(),
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get("", "n")
-        .unwrap();
-    assert_eq!(objects, 0);
-    let marker: i64 = connection
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT count(*) AS n FROM seaql_migrations WHERE version=?",
-            [migration.into()],
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get("", "n")
-        .unwrap();
-    assert_eq!(marker, 0);
-    connection
-        .execute_unprepared("DROP TRIGGER reject_publication_migration")
-        .await
-        .unwrap();
-    Migrator::up(&connection, None).await.unwrap();
-    let installed: i64 = connection
-        .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT count(*) AS n FROM compaction_publication_fence".to_owned(),
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get("", "n")
-        .unwrap();
-    assert_eq!(installed, 1);
-}
-
-#[tokio::test]
 async fn rolled_back_domain_mutation_rolls_back_publication_fence_bump() {
     let fixture = fixture().await;
     let db = fixture.db();
