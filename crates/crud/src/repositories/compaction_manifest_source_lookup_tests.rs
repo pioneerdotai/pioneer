@@ -2643,8 +2643,11 @@ async fn bind_reference_checkpoint_dag(fixture: &Fixture, operation: &str, retai
     .unwrap();
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "DELETE FROM compaction_coverage WHERE checkpoint_id=?",
-        [format!("{operation}-checkpoint").into()],
+        "DELETE FROM compaction_coverage WHERE checkpoint_id=? AND source_id=?",
+        [
+            format!("{operation}-checkpoint").into(),
+            format!("{operation}-source-0").into(),
+        ],
     ))
     .await
     .unwrap();
@@ -2688,8 +2691,11 @@ async fn bind_reference_checkpoint_chain(fixture: &Fixture, operation: &str, nod
     .unwrap();
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "DELETE FROM compaction_coverage WHERE checkpoint_id=?",
-        [format!("{operation}-checkpoint").into()],
+        "DELETE FROM compaction_coverage WHERE checkpoint_id=? AND source_id=?",
+        [
+            format!("{operation}-checkpoint").into(),
+            format!("{operation}-source-0").into(),
+        ],
     ))
     .await
     .unwrap();
@@ -3048,7 +3054,9 @@ async fn delete_reinsert_task_basis_and_coverage_races_retry_then_revalidate() {
 
     let basis_shape_fixture = fixture().await;
     let operation = "publication-task-basis-race";
-    let state = publication_candidate(&basis_shape_fixture, operation, 1).await;
+    // Keep an independent compact leaf while the first manifest entry becomes
+    // reference-only: a publishable checkpoint must retain historical coverage.
+    let state = publication_candidate(&basis_shape_fixture, operation, 2).await;
     basis_shape_fixture
         .db()
         .execute_unprepared(
@@ -3057,7 +3065,8 @@ async fn delete_reinsert_task_basis_and_coverage_races_retry_then_revalidate() {
           source_version='task-basis-revision:1' \
          WHERE operation_id='publication-task-basis-race' AND ordinal=0; \
          DELETE FROM compaction_coverage \
-          WHERE checkpoint_id='publication-task-basis-race-checkpoint'",
+          WHERE checkpoint_id='publication-task-basis-race-checkpoint' \
+            AND source_id='publication-task-basis-race-source-0'",
         )
         .await
         .unwrap();
@@ -3093,7 +3102,7 @@ async fn delete_reinsert_task_basis_and_coverage_races_retry_then_revalidate() {
 
     let basis_revision_fixture = fixture().await;
     let operation = "publication-task-basis-revision-race";
-    let state = publication_candidate(&basis_revision_fixture, operation, 1).await;
+    let state = publication_candidate(&basis_revision_fixture, operation, 2).await;
     basis_revision_fixture
         .db()
         .execute_unprepared(
@@ -3102,7 +3111,8 @@ async fn delete_reinsert_task_basis_and_coverage_races_retry_then_revalidate() {
           source_version='task-basis-revision:1' \
          WHERE operation_id='publication-task-basis-revision-race' AND ordinal=0; \
          DELETE FROM compaction_coverage \
-          WHERE checkpoint_id='publication-task-basis-revision-race-checkpoint'",
+          WHERE checkpoint_id='publication-task-basis-revision-race-checkpoint' \
+            AND source_id='publication-task-basis-revision-race-source-0'",
         )
         .await
         .unwrap();
@@ -3256,7 +3266,7 @@ async fn historical_checkpoint_mutations_retry_fence_without_staling_published_r
         ),
     ] {
         let fixture = fixture().await;
-        let state = publication_candidate(&fixture, operation, 1).await;
+        let state = publication_candidate(&fixture, operation, 2).await;
         bind_reference_checkpoint_dag(&fixture, operation, retained).await;
         assert_positive_publication_preflight(&fixture, operation, &state).await;
         let mut hook = fixture.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
@@ -3630,7 +3640,7 @@ async fn writer_publication_boundary_has_no_heavy_checks_as_manifest_and_dag_gro
 
     for (operation, nodes) in [("publication-dag-small", 1), ("publication-dag-large", 257)] {
         let fixture = fixture().await;
-        let state = publication_candidate(&fixture, operation, 1).await;
+        let state = publication_candidate(&fixture, operation, 2).await;
         bind_reference_checkpoint_chain(&fixture, operation, nodes).await;
         assert_positive_publication_preflight(&fixture, operation, &state).await;
         reset_publication_test_metrics(operation);

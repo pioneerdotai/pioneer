@@ -24808,8 +24808,11 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
     });
     let result = create_task_for_test(&processor, params).await.unwrap();
     let run = result.run.unwrap();
+    // This barrier follows projection of more than 8 MiB of accepted history.
+    // A concurrent workspace test run can spend well over ten seconds there;
+    // keep the test wait bounded without imposing an unrelated product deadline.
     timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(180),
         processor.wait_for_completed_history_preparation_barrier(),
     )
     .await

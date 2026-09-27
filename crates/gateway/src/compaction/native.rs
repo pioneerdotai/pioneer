@@ -442,8 +442,13 @@ async fn prepare_native_projection_with_prepared(
             &mut checkpoint_graphs,
         )
         .await?;
-        super::history::normalize_task_input_copies(&store, workspace, &mut request.messages)
-            .await?;
+        super::history::normalize_task_input_copies_with_resolver(
+            &store,
+            workspace,
+            &mut request.messages,
+            &mut checkpoint_graphs,
+        )
+        .await?;
         super::origins::validate_message_origins(&store, workspace, &request.messages).await?;
         if request.messages.iter().any(|message| {
             message.content_parts.iter().any(|part| match part {

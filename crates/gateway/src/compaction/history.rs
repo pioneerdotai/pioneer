@@ -902,12 +902,21 @@ pub(crate) async fn normalize_task_input_copies(
     workspace: &str,
     messages: &mut Vec<ChatMessage>,
 ) -> Result<()> {
+    let mut graphs = super::coverage::CheckpointGraphResolver::default();
+    normalize_task_input_copies_with_resolver(store, workspace, messages, &mut graphs).await
+}
+
+pub(crate) async fn normalize_task_input_copies_with_resolver(
+    store: &CrudStore,
+    workspace: &str,
+    messages: &mut Vec<ChatMessage>,
+    graphs: &mut super::coverage::CheckpointGraphResolver,
+) -> Result<()> {
     // A raw representative may already have been replaced by a published
     // summary. Its exact input-leaf proof is carried by the summary's frozen
     // provenance, not by the checkpoint source itself. Validate that leaf
     // against the published graph before suppressing a visible copy.
     let mut checkpoint_evidence = ExactInputClaims::default();
-    let mut graphs = super::coverage::CheckpointGraphResolver::default();
     for message in messages.iter() {
         let Some(origin) = &message.provenance else {
             continue;
