@@ -73,34 +73,16 @@ impl ProgressIndicatorView {
                     .outer_radius(prepaint.outer_radius);
 
                 arc.paint(
-                    &ArcData {
-                        data: &(),
-                        index: 0,
-                        value: 100.0,
-                        start_angle: 0.0,
-                        end_angle: TAU,
-                        pad_angle: 0.0,
-                    },
+                    &ArcData::new(&(), 0, 100.0, 0.0, TAU),
                     color.opacity(0.2),
-                    None,
-                    None,
                     &prepaint.bounds,
                     window,
                 );
 
                 if prepaint.value > 0.0 {
                     arc.paint(
-                        &ArcData {
-                            data: &(),
-                            index: 1,
-                            value: prepaint.value,
-                            start_angle: 0.0,
-                            end_angle: prepaint.value / 100.0 * TAU,
-                            pad_angle: 0.0,
-                        },
+                        &ArcData::new(&(), 1, prepaint.value, 0.0, prepaint.value / 100.0 * TAU),
                         color,
-                        None,
-                        None,
                         &prepaint.bounds,
                         window,
                     );
