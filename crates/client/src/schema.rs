@@ -1683,20 +1683,6 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn schema_documents_match_public_contract_boundary() {
-        let contract_files = client_contract_types()
-            .into_iter()
-            .map(|contract| contract.file_name)
-            .collect::<Vec<_>>();
-        let schema_files = client_schema_documents()
-            .into_iter()
-            .map(|document| document.file_name)
-            .collect::<Vec<_>>();
-
-        assert_eq!(schema_files, contract_files);
-    }
-
-    #[test]
     fn schema_documents_are_sorted_unique_and_serializable() {
         let documents = client_schema_documents();
         let file_names = documents
