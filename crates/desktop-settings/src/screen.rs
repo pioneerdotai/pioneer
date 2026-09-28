@@ -612,13 +612,9 @@ impl SettingsSidebarView {
             ),
         ];
         if self.allowed {
-            items.extend([
-                (SettingsContentView::Memory, SETTINGS_CONTENT_MEMORY_NODE_ID),
-                (
-                    SettingsContentView::SelfImprovement,
-                    SETTINGS_CONTENT_SELF_IMPROVEMENT_NODE_ID,
-                ),
-            ]);
+            items.push((SettingsContentView::Memory, SETTINGS_CONTENT_MEMORY_NODE_ID));
+            // Temporarily hide SelfImprovement until the feature is ready;
+            // its route and settings page remain implemented.
         }
         let selected = items.iter().position(|(route, _)| *route == self.route);
         self.settings_tree_state.update(cx, |state, cx| {
