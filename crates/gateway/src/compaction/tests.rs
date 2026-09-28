@@ -25,6 +25,246 @@ use std::{
 };
 
 #[tokio::test]
+async fn frozen_task_delivery_orders_execution_without_changing_literal_import_ordinals() {
+    let f = fixture("Q1", vec![], true, false).await;
+    let db = f.store.database_connection();
+    db.execute_unprepared(
+        "UPDATE turn SET status='completed',created_at='2026-01-01T00:00:00+00:00' WHERE id='turn'",
+    )
+    .await
+    .unwrap();
+    for statement in [
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('causal-d1','thread','completed','conversation','system','2026-01-01T00:01:00+00:00',CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('causal-q2','thread','completed','conversation','user','2026-01-01T00:02:00+00:00',CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('causal-q3','thread','completed','conversation','user','2026-01-01T00:03:00+00:00',CURRENT_TIMESTAMP)",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('causal-child','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('causal-child','thread','thread',1,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('causal-work','causal-child','completed','conversation','system','2026-01-01T00:00:30+00:00',CURRENT_TIMESTAMP)",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('causal-task','ws','thread','thread','thread','turn','agent','running','Synthetic task','fixture')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('causal-run','causal-task','causal-run',1,1,'succeeded','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('causal-rt','causal-task','causal-run','causal-child','causal-work','initial',0,1,'candidate_created',CURRENT_TIMESTAMP)",
+        "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES ('causal-candidate','causal-task','causal-run','causal-rt','causal-child','causal-work',0,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES ('causal-delivery','ws','causal-task','causal-run','causal-delivery','thread','origin_thread','thread','delivered',1,1,'causal-d1')",
+    ] {
+        db.execute_unprepared(statement).await.unwrap();
+    }
+    for (thread, turn, id, text) in [
+        ("thread", "causal-q2", "causal-question-2", "Q2"),
+        ("thread", "causal-q3", "causal-question-3", "Q3"),
+        ("causal-child", "causal-work", "causal-answer-1", "A1"),
+    ] {
+        f.store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item: pioneer_protocol::TurnItem::AgentMessage {
+                        id: id.into(),
+                        text: text.into(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+    }
+    let task_turn = f
+        .store
+        .get_task_run_turn("causal-rt")
+        .await
+        .unwrap()
+        .unwrap();
+    let output = super::frozen::capture_task_output(&f.store, "ws", &task_turn)
+        .await
+        .unwrap();
+    db.execute_unprepared("INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES ('causal-delivery','causal-candidate','causal-rt')")
+        .await
+        .unwrap();
+    f.store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "causal-d1".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: pioneer_protocol::task_delivery_result_item_id("causal-delivery"),
+                    text: "A1".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    super::history::prepare_history(&f.store, "ws", "thread")
+        .await
+        .unwrap();
+    let acknowledgement = f
+        .store
+        .compaction_source_page("ws", "thread", "causal-d1", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    let allowed = std::collections::BTreeSet::from(["thread".into(), "causal-child".into()]);
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let parent = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+        .await
+        .unwrap();
+    let mut old_order = ["Q1", "Q2", "Q3"]
+        .into_iter()
+        .map(|text| {
+            parent
+                .iter()
+                .find(|message| message.content == text)
+                .unwrap()
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    let mut child = super::frozen::restore(
+        &f.store,
+        "ws",
+        &std::collections::BTreeSet::from(["causal-child".into()]),
+        &output.history,
+    )
+    .await
+    .unwrap();
+    assert_eq!(child.len(), 1);
+    let mut answer = child.remove(0);
+    let origin = answer.provenance.as_mut().unwrap();
+    origin.context_thread = Some("thread".into());
+    origin.inherited = false;
+    let source = SourceRef {
+        scope: origin.sources[0].scope.clone(),
+        id: origin.sources[0].id.clone(),
+        version: origin.sources[0].version.clone(),
+    };
+    let import = f
+        .store
+        .compaction_prepare_frozen_import(
+            "ws",
+            "thread",
+            "causal-delivery",
+            &acknowledgement,
+            0,
+            "causal-child",
+            &source,
+        )
+        .await
+        .unwrap();
+    old_order.push(answer);
+    let frozen = super::frozen::capture_with_imports_prepared(
+        &f.store,
+        "ws",
+        "thread",
+        &allowed,
+        &old_order,
+        &std::collections::BTreeMap::from([(
+            ScopedHistorySource {
+                thread: "causal-child".into(),
+                source,
+            },
+            vec![import],
+        )]),
+        super::coverage::CheckpointGraphResolver::default(),
+    )
+    .await
+    .unwrap();
+    let literal = super::frozen::restore(&f.store, "ws", &allowed, &frozen.descriptor)
+        .await
+        .unwrap();
+    assert_eq!(
+        literal
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        ["Q1", "Q2", "Q3", "A1"]
+    );
+    let imports = f
+        .store
+        .compaction_frozen_import_page("ws", "thread", &frozen.descriptor.manifest_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(imports.len(), 1);
+    assert_eq!(imports[0].message_ordinal, 3);
+    assert_eq!(imports[0].acknowledgement, acknowledgement);
+    let operations_before = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) AS n FROM compaction_operation",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    for _ in 0..2 {
+        let execution = super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            Some("thread"),
+            "thread",
+            &allowed,
+            &serde_json::to_string(&frozen.descriptor).unwrap(),
+        )
+        .await
+        .unwrap()
+        .messages;
+        assert_eq!(
+            execution
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            ["Q1", "A1", "Q2", "Q3"]
+        );
+        let mut summary_only = execution.clone();
+        super::frozen::select_task_history(
+            &mut summary_only,
+            &pioneer_protocol::TaskAgentContextPolicy {
+                mode: pioneer_protocol::TaskAgentContextMode::SummaryOnly,
+                ..super::frozen::default_task_context_policy()
+            },
+        )
+        .unwrap();
+        assert!(summary_only.is_empty());
+        let mut last = execution;
+        super::frozen::select_task_history(
+            &mut last,
+            &pioneer_protocol::TaskAgentContextPolicy {
+                max_turns: Some(1),
+                ..super::frozen::default_task_context_policy()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            last.iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            ["Q3"]
+        );
+    }
+    let operations_after = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) AS n FROM compaction_operation",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(operations_after, operations_before);
+    assert!(f.provider.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn compaction_observer_heartbeat_reaches_the_live_progress_lane() {
     let lifecycle_store = CrudStore::new(Database::connect("sqlite::memory:").await.unwrap());
     let hub = Arc::new(ExecutionEventHub::new());
@@ -8235,6 +8475,18 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
             .iter()
             .all(|r| r.model == "summary-model" && r.tools.is_none() && r.reasoning.is_none())
     );
+    let operations_before_reuse = f
+        .store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) AS n FROM compaction_operation",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
     let again = super::test_support::prepare_native_request(
         &f.store,
         &providers,
@@ -8268,6 +8520,19 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
     .unwrap();
     assert_eq!(restored.request.messages, again.request.messages);
     assert_eq!(f.provider.calls.lock().unwrap().len(), count);
+    let operations_after_reuse = f
+        .store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) AS n FROM compaction_operation",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(operations_after_reuse, operations_before_reuse);
 
     // An already projected head must not bypass coverage normalization. Keep
     // equal-source originals out of the request and re-read the durable summary

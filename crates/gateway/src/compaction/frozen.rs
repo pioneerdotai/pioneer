@@ -506,6 +506,9 @@ async fn read_accepted_imports(
                 "accepted own import no longer matches its frozen message"
             );
             let entry = accepted.entry(index).or_default();
+            entry
+                .acknowledgements
+                .insert(record.acknowledgement.clone());
             if let Some(target) = checkpoint_target {
                 if let Some(existing) = &entry.checkpoint_target {
                     ensure!(
@@ -564,6 +567,27 @@ struct AcceptedMessageImports {
     sources: BTreeSet<ScopedHistorySource>,
     import_ordinals: Vec<u64>,
     checkpoint_target: Option<ScopedHistorySource>,
+    acknowledgements: BTreeSet<SourceRef>,
+}
+
+fn accepted_causal_candidates(
+    references: &[FrozenMessageRef],
+    accepted: &BTreeMap<usize, AcceptedMessageImports>,
+) -> BTreeMap<ScopedHistorySource, BTreeSet<SourceRef>> {
+    let mut candidates = BTreeMap::<ScopedHistorySource, BTreeSet<SourceRef>>::new();
+    for (ordinal, imports) in accepted {
+        let reference = &references[*ordinal];
+        for source in &reference.sources {
+            candidates
+                .entry(ScopedHistorySource {
+                    thread: reference.source_thread.clone(),
+                    source: source.clone(),
+                })
+                .or_default()
+                .extend(imports.acknowledgements.iter().cloned());
+        }
+    }
+    candidates
 }
 
 fn wire_digest(message: &ChatMessage) -> Result<String> {
@@ -1121,6 +1145,10 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
                 &mut checkpoint_graphs,
             )
             .await?;
+            ensure!(
+                restored.messages.len() == restored.original_ordinals.len(),
+                "accepted execution lost its source ordinal mapping"
+            );
             retained_imports = Some(restored.retained_imports);
             projected_imports = restored.projected_imports;
             external_input_evidence = Some(restored.external_evidence);
@@ -1245,6 +1273,7 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
         .await?;
     }
     let mut own_outputs = BTreeMap::<ScopedHistorySource, (usize, u64)>::new();
+    let mut causal_outputs = BTreeMap::<ScopedHistorySource, BTreeSet<SourceRef>>::new();
     // Only roots produced while projecting a delivered output may consume its
     // delivery grants. Parent summaries and accepted-basis checkpoints have
     // independent provenance, even when their historical leaves overlap.
@@ -1308,6 +1337,10 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
                         own_outputs
                             .entry(key.clone())
                             .or_insert((branch_index, boundary_original_ordinals[*index]));
+                        causal_outputs
+                            .entry(key)
+                            .or_default()
+                            .insert(branch.acknowledgement.clone());
                     }
                 }
             }
@@ -1380,6 +1413,35 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
             )
             .await?;
         }
+    }
+    if let Some(outputs) = outputs {
+        for (root, branches) in &delivery_replacements {
+            if let Some((&branch_index, _)) = (branches.len() == 1)
+                .then(|| branches.first_key_value())
+                .flatten()
+            {
+                causal_outputs
+                    .entry(root.clone())
+                    .or_default()
+                    .insert(outputs.branches[branch_index].acknowledgement.clone());
+            }
+        }
+    }
+    if !causal_outputs.is_empty() {
+        messages = order_verified_deliveries(
+            &store,
+            workspace,
+            thread,
+            messages
+                .into_iter()
+                .map(|message| (None, message))
+                .collect(),
+            &causal_outputs,
+        )
+        .await?
+        .into_iter()
+        .map(|(_, message)| message)
+        .collect();
     }
     if includes_parent_summary
         && let Some(head) = projection_head.as_ref().and_then(|head| head.clone())
@@ -1880,6 +1942,140 @@ pub(crate) fn default_task_context_policy() -> pioneer_protocol::TaskAgentContex
         include_artifacts: false,
         custom_context: None,
     }
+}
+
+/// Delivery grants identify the child source and its acknowledged parent
+/// event. The latter supplies the availability boundary even when the
+/// transport copy was removed from the model projection. Turn creation order
+/// is used only after that exact relationship has been verified.
+async fn order_verified_deliveries(
+    store: &CrudStore,
+    workspace: &str,
+    destination: &str,
+    messages: Vec<(Option<usize>, ChatMessage)>,
+    candidates: &BTreeMap<ScopedHistorySource, BTreeSet<SourceRef>>,
+) -> Result<Vec<(Option<usize>, ChatMessage)>> {
+    use pioneer_agent::compaction::composition::{
+        CausalPlacement, ExactMessageSource, order_causal_units,
+    };
+
+    if candidates.is_empty() || messages.is_empty() {
+        return Ok(messages);
+    }
+    let acknowledgements = candidates
+        .values()
+        .filter(|acks| acks.len() == 1)
+        .filter_map(|acks| acks.first())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut commands = BTreeMap::new();
+    for acknowledgement in acknowledgements {
+        if let Some(turn) = acknowledgement.scope.strip_prefix("event:")
+            && let Some(command) = store
+                .compaction_task_delivery_command(workspace, destination, &acknowledgement)
+                .await?
+        {
+            let delivery_turn = turn.to_owned();
+            commands.insert(acknowledgement, (command, delivery_turn));
+        }
+    }
+    if commands.is_empty() {
+        return Ok(messages);
+    }
+    let mut selected = BTreeSet::new();
+    for (_, message) in &messages {
+        if let Some(origin) = &message.provenance
+            && origin.thread_id == destination
+        {
+            for source in &origin.sources {
+                if !source.scope.starts_with("checkpoint:")
+                    && let Some((_, turn)) = source.scope.split_once(':')
+                {
+                    selected.insert(turn.to_owned());
+                }
+            }
+        }
+    }
+    for (command, delivery) in commands.values() {
+        selected.insert(command.clone());
+        selected.insert(delivery.clone());
+    }
+    let fence = store.compaction_history_read_fence().await?;
+    let selected = selected.into_iter().collect::<Vec<_>>();
+    let mut turns = Vec::new();
+    let mut batch = Vec::new();
+    let mut bytes = 0_usize;
+    for id in selected {
+        ensure!(
+            id.len() <= pioneer_crud::compaction::SOURCE_PAGE_BYTES,
+            "causal turn ID exceeds metadata page bound"
+        );
+        if !batch.is_empty()
+            && (batch.len() == 64
+                || bytes.saturating_add(id.len()) > pioneer_crud::compaction::SOURCE_PAGE_BYTES)
+        {
+            turns.extend(
+                store
+                    .compaction_history_selected_turn_page(workspace, destination, &batch, &fence)
+                    .await?,
+            );
+            batch.clear();
+            bytes = 0;
+        }
+        bytes += id.len();
+        batch.push(id);
+    }
+    if !batch.is_empty() {
+        turns.extend(
+            store
+                .compaction_history_selected_turn_page(workspace, destination, &batch, &fence)
+                .await?,
+        );
+    }
+    turns.sort_by(|a, b| {
+        (
+            &a.created_at,
+            a.creation_order,
+            a.legacy_creation_order,
+            &a.id,
+        )
+            .cmp(&(
+                &b.created_at,
+                b.creation_order,
+                b.legacy_creation_order,
+                &b.id,
+            ))
+    });
+    let order = turns
+        .into_iter()
+        .enumerate()
+        .map(|(index, turn)| (turn.id, index))
+        .collect::<BTreeMap<_, _>>();
+    let mut delivered = BTreeMap::<ExactMessageSource, CausalPlacement>::new();
+    for (source, acks) in candidates {
+        let Some(ack) = (acks.len() == 1).then(|| acks.first()).flatten() else {
+            continue;
+        };
+        let Some((command, delivery_turn)) = commands.get(ack) else {
+            continue;
+        };
+        let (Some(&command_rank), Some(&delivery_rank)) =
+            (order.get(command), order.get(delivery_turn))
+        else {
+            continue;
+        };
+        if delivery_rank < command_rank {
+            continue;
+        }
+        delivered.insert(
+            (source.thread.clone(), runtime_source(&source.source)),
+            CausalPlacement {
+                command_turn: command.clone(),
+                available_at: delivery_rank,
+            },
+        );
+    }
+    order_causal_units(workspace, destination, messages, &order, &delivered)
 }
 
 pub(super) fn select_task_history(
@@ -3016,6 +3212,30 @@ struct RestoredFrozenSelection {
     model_ordinals: Vec<usize>,
 }
 
+fn model_ordinals_from_originals(
+    original_ordinals: &[u64],
+    boundary_original_ordinals: &[u64],
+) -> Result<Vec<usize>> {
+    let boundary = boundary_original_ordinals
+        .iter()
+        .enumerate()
+        .map(|(index, ordinal)| (*ordinal, index))
+        .collect::<BTreeMap<_, _>>();
+    ensure!(
+        boundary.len() == boundary_original_ordinals.len(),
+        "Task output boundary repeats an immutable ordinal"
+    );
+    original_ordinals
+        .iter()
+        .map(|ordinal| {
+            boundary
+                .get(ordinal)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("Task output model lost its boundary ordinal"))
+        })
+        .collect()
+}
+
 struct FrozenCoverageSelection<'a> {
     sources: &'a BTreeSet<ScopedHistorySource>,
     event_input_evidence: &'a BTreeMap<ScopedHistorySource, String>,
@@ -3037,7 +3257,7 @@ async fn restore_frozen_excluding_coverage(
     let (_, references) =
         frozen_manifest_references(store, workspace, Some(owner), descriptor, Some(allowed))
             .await?;
-    let _accepted = read_accepted_imports(
+    let accepted = read_accepted_imports(
         store,
         workspace,
         owner,
@@ -3047,6 +3267,7 @@ async fn restore_frozen_excluding_coverage(
         checkpoint_graphs,
     )
     .await?;
+    let causal_imports = accepted_causal_candidates(&references, &accepted);
     let mut selected = BTreeSet::new();
     if !coverage.sources.is_empty() {
         for (ordinal, reference) in references.iter().enumerate() {
@@ -3127,6 +3348,27 @@ async fn restore_frozen_excluding_coverage(
             }
         }
     }
+    if !causal_imports.is_empty() {
+        let ordered = order_verified_deliveries(
+            store,
+            workspace,
+            owner,
+            original_ordinals
+                .into_iter()
+                .map(|ordinal| Some(ordinal as usize))
+                .zip(messages)
+                .collect(),
+            &causal_imports,
+        )
+        .await?;
+        original_ordinals = ordered
+            .iter()
+            .map(|(ordinal, _)| ordinal.expect("restored message has original ordinal") as u64)
+            .collect();
+        model_ordinals =
+            model_ordinals_from_originals(&original_ordinals, &boundary_original_ordinals)?;
+        messages = ordered.into_iter().map(|(_, message)| message).collect();
+    }
     Ok(RestoredFrozenSelection {
         original_ordinals,
         messages,
@@ -3142,6 +3384,8 @@ async fn restore_frozen_excluding_coverage(
 /// rewritten and literal `restore` retains its original contract.
 struct RestoredExecutionBasis {
     messages: Vec<ChatMessage>,
+    /// The execution order never changes the verified manifest ordinal.
+    original_ordinals: Vec<Option<usize>>,
     // Source accounting is inspected by restoration regression tests only.
     #[cfg(test)]
     direct_sources: Vec<ScopedHistorySource>,
@@ -3280,6 +3524,7 @@ async fn restore_accepted_execution_basis_prepared(
         checkpoint_graphs,
     )
     .await?;
+    let mut causal_imports = accepted_causal_candidates(&references, &accepted);
     let effective = |ordinal: usize, reference: &FrozenMessageRef| {
         if accepted.contains_key(&ordinal) {
             (false, execution_thread.to_owned())
@@ -4381,6 +4626,28 @@ async fn restore_accepted_execution_basis_prepared(
             checkpoint_graphs,
         )
         .await?;
+        if !projection.selected.is_empty()
+            && projection
+                .selected
+                .iter()
+                .all(|ordinal| accepted.contains_key(ordinal))
+            && let Some(origin) = message.provenance.as_ref()
+            && let [source] = origin.sources.as_slice()
+        {
+            let acknowledgements = projection
+                .selected
+                .iter()
+                .flat_map(|ordinal| &accepted[ordinal].acknowledgements)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            causal_imports
+                .entry(ScopedHistorySource {
+                    thread: origin.thread_id.clone(),
+                    source: self::source(source),
+                })
+                .or_default()
+                .extend(acknowledgements);
+        }
         let mut aliases = Vec::new();
         let mut ambiguous = Vec::new();
         for ordinal in &projection.selected {
@@ -4433,8 +4700,18 @@ async fn restore_accepted_execution_basis_prepared(
         origin.ambiguous_input_aliases = evidence.ambiguous;
         replacements.push((projection.anchor, projection.checkpoint, message));
     }
+    let ordered = order_verified_deliveries(
+        store,
+        workspace,
+        parent,
+        order_execution_projection_entries(retained, replacements),
+        &causal_imports,
+    )
+    .await?;
+    let (original_ordinals, messages) = ordered.into_iter().unzip();
     Ok(RestoredExecutionBasis {
-        messages: order_execution_projection(retained, replacements),
+        messages,
+        original_ordinals,
         #[cfg(test)]
         direct_sources: direct_sources.into_iter().collect(),
         excluded_following,
@@ -4444,6 +4721,7 @@ async fn restore_accepted_execution_basis_prepared(
     })
 }
 
+#[cfg(test)]
 fn order_execution_projection(
     retained: Vec<(usize, ChatMessage)>,
     replacements: Vec<(usize, String, ChatMessage)>,
@@ -4539,6 +4817,10 @@ pub(crate) async fn restore_accepted_history_for_execution(
             &mut checkpoint_graphs,
         )
         .await?;
+        ensure!(
+            restored.messages.len() == restored.original_ordinals.len(),
+            "accepted execution lost its source ordinal mapping"
+        );
         super::history::normalize_task_input_copies(store, workspace, &mut restored.messages)
             .await?;
         return Ok(RestoredAcceptedHistory {
@@ -4624,6 +4906,7 @@ async fn restore_accepted_execution_projection_without_checkpoint(
         &mut checkpoint_graphs,
     )
     .await?;
+    let causal_imports = accepted_causal_candidates(&references, &accepted);
     let mut state = FrozenExecutionRestoreState::from_references(
         store,
         workspace,
@@ -4680,9 +4963,14 @@ async fn restore_accepted_execution_projection_without_checkpoint(
                     source,
                 }
             }));
-            messages.push(message);
+            messages.push((Some(page_start + page_ordinal), message));
         }
     }
+    let messages = order_verified_deliveries(store, workspace, owner, messages, &causal_imports)
+        .await?
+        .into_iter()
+        .map(|(_, message)| message)
+        .collect();
     Ok(RestoredAcceptedHistory {
         messages,
         #[cfg(test)]
@@ -4813,7 +5101,7 @@ async fn restore_model_with_resolver(
     let (owner, references) =
         frozen_manifest_references(store, workspace, None, descriptor, Some(allowed_threads))
             .await?;
-    let _ = read_accepted_imports(
+    let accepted = read_accepted_imports(
         store,
         workspace,
         &owner,
@@ -4823,6 +5111,7 @@ async fn restore_model_with_resolver(
         checkpoint_graphs,
     )
     .await?;
+    let causal_imports = accepted_causal_candidates(&references, &accepted);
     let mut state = FrozenExecutionRestoreState::from_references(
         store,
         workspace,
@@ -4832,7 +5121,10 @@ async fn restore_model_with_resolver(
     )
     .await?;
     let mut messages = Vec::with_capacity(references.len());
-    for page in references.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
+    for (page_index, page) in references
+        .chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize)
+        .enumerate()
+    {
         messages.extend(
             restore_execution_entries_page(
                 store,
@@ -4844,10 +5136,27 @@ async fn restore_model_with_resolver(
             )
             .await?
             .into_iter()
-            .flatten(),
+            .enumerate()
+            .filter_map(|(index, message)| {
+                message.map(|message| {
+                    (
+                        Some(
+                            page_index * pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize
+                                + index,
+                        ),
+                        message,
+                    )
+                })
+            }),
         );
     }
-    Ok(messages)
+    Ok(
+        order_verified_deliveries(store, workspace, &owner, messages, &causal_imports)
+            .await?
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect(),
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5541,6 +5850,24 @@ async fn finish_restored_entry(
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+
+    #[test]
+    fn model_boundary_ordinals_follow_execution_order_without_rewriting_sources() {
+        let boundary_original_ordinals = [0, 1, 2, 3, 4];
+        // Ordinal 2 is hidden from the model. The delivered block at 3 moves
+        // between 0 and 1, while every boundary and import ordinal stays put.
+        let execution_original_ordinals = [0, 3, 1, 4];
+        assert_eq!(
+            model_ordinals_from_originals(
+                &execution_original_ordinals,
+                &boundary_original_ordinals
+            )
+            .unwrap(),
+            [0, 3, 1, 4]
+        );
+        assert_eq!(boundary_original_ordinals, [0, 1, 2, 3, 4]);
+        assert!(model_ordinals_from_originals(&[5], &boundary_original_ordinals).is_err());
+    }
 
     #[test]
     fn legacy_frozen_command_hash_is_verified_before_model_upgrade() {
