@@ -82,32 +82,29 @@ fn policy_refresh_keeps_members_dialog_open_before_and_after_result(cx: &mut Tes
 fn desktop_window_constructs_gateway_views_before_first_frame(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     cx.update(crate::client_runtime::DesktopRuntimeCoordinator::install_for_test);
-    let window = cx.update(|cx| {
-        cx.open_window(Default::default(), |window, cx| {
-            crate::client_runtime::DesktopRuntimeCoordinator::install(cx);
-            let registrar = cx
-                .global::<crate::client_runtime::DesktopRuntimeCoordinator>()
-                .registrar();
-            let navigation =
-                crate::desktop_navigation::DesktopNavigationStore::new(registrar.as_ref());
-            let layout = cx.new(|cx| crate::shell_state::ShellStateStore::new(window, cx));
-
-            let shell = cx.new(|cx| {
-                crate::desktop_shell::DesktopShellView::new(navigation, layout, window, cx)
-            });
-            cx.new(|cx| Root::new(shell, window, cx))
+    let (handle, desktop) = crate::client_runtime::DesktopRuntimeCoordinator::open_window(
+        Default::default(),
+        &mut cx.to_async(),
+    )
+    .unwrap();
+    handle
+        .update(cx, |root, window, cx| {
+            let root = root.downcast::<Root>().unwrap();
+            assert_eq!(
+                root.read(cx).view().entity_id(),
+                desktop.upgrade().unwrap().entity_id(),
+            );
+            window.open_dialog(cx, |dialog, _, _| dialog);
+            assert!(window.has_active_dialog(cx));
+            window.close_dialog(cx);
+            assert!(!window.has_active_dialog(cx));
         })
-        .unwrap()
-    });
-    let root = window.root(cx).unwrap();
-    root.read_with(cx, |root, _| {
-        assert!(
-            root.view()
-                .clone()
-                .downcast::<crate::desktop_shell::DesktopShellView>()
-                .is_ok()
-        );
-    });
+        .unwrap();
+    handle
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    assert!(desktop.upgrade().is_none());
 }
 impl Render for FocusOwner {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -118,32 +115,30 @@ impl Render for FocusOwner {
 #[gpui_kit::test]
 fn root_nested_overlays_restore_the_retained_trigger(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    let (root, cx) = cx.add_window_view(|window, cx| {
-        let child = cx.new(|cx| FocusOwner {
-            focus: cx.focus_handle(),
-        });
-        Root::new(child, window, cx)
+    let (handle, owner) = cx.update(|cx| {
+        gpui_kit::open_window(Default::default(), cx, |_, cx| {
+            cx.new(|cx| FocusOwner {
+                focus: cx.focus_handle(),
+            })
+        })
+        .unwrap()
     });
-    cx.update(|window, cx| {
-        let owner = root
-            .read(cx)
-            .view()
-            .clone()
-            .downcast::<FocusOwner>()
-            .unwrap();
-        let focus = owner.read(cx).focus.clone();
-        focus.focus(window, cx);
-        window.open_dialog(cx, |dialog, _, _| dialog);
-        let first_dialog = window.focused(cx).unwrap();
-        window.open_dialog(cx, |dialog, _, _| dialog);
-        window.close_dialog(cx);
-        assert_eq!(window.focused(cx), Some(first_dialog));
-        window.close_dialog(cx);
-        assert_eq!(window.focused(cx), Some(focus.clone()));
-        window.open_sheet(cx, |sheet, _, _| sheet);
-        window.close_sheet(cx);
-        assert_eq!(window.focused(cx), Some(focus));
-    });
+    handle
+        .update(cx, |_, window, cx| {
+            let focus = owner.read(cx).focus.clone();
+            focus.focus(window, cx);
+            window.open_dialog(cx, |dialog, _, _| dialog);
+            let first_dialog = window.focused(cx).unwrap();
+            window.open_dialog(cx, |dialog, _, _| dialog);
+            window.close_dialog(cx);
+            assert_eq!(window.focused(cx), Some(first_dialog));
+            window.close_dialog(cx);
+            assert_eq!(window.focused(cx), Some(focus.clone()));
+            window.open_sheet(cx, |sheet, _, _| sheet);
+            window.close_sheet(cx);
+            assert_eq!(window.focused(cx), Some(focus));
+        })
+        .unwrap();
 }
 
 struct ActionOwner {

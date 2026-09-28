@@ -278,6 +278,7 @@ impl ThreadSidebarView {
         };
 
         Popover::new("workspace-switcher-popover")
+            .trigger_style(StyleRefinement::default().w_full())
             .anchor(Anchor::TopRight)
             .p_0()
             .trigger(WorkspaceSelectorTrigger::new(

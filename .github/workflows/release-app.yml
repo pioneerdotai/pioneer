@@ -5,15 +5,6 @@ on:
   push:
     tags:
       - "*"
-  pull_request:
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/desktop/**"
-      - "crates/desktop-updater/**"
-      - "crates/cli/**"
-      - "scripts/packaging/desktop/**"
-      - ".github/workflows/release-app.yml"
 
 permissions:
   contents: write

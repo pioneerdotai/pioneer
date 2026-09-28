@@ -30,30 +30,25 @@ impl DesktopRuntimeCoordinator {
         options: gpui_kit::WindowOptions,
         cx: &mut gpui_kit::AsyncApp,
     ) -> anyhow::Result<(
-        gpui_kit::WindowHandle<gpui_kit::component::Root>,
+        gpui_kit::AnyWindowHandle,
         gpui_kit::WeakEntity<crate::desktop_shell::DesktopShellView>,
     )> {
-        use gpui_kit::AppContext;
-        use gpui_kit::component::Root;
-        let mut desktop = None;
-        let handle = cx.open_window(options, |window, cx| {
-            Self::install(cx);
-            let registrar = cx.global::<Self>().registrar();
-            let navigation =
-                crate::desktop_navigation::DesktopNavigationStore::new(registrar.as_ref());
-            Self::deliver_pending(cx);
-            let layout = cx.new(|cx| crate::shell_state::ShellStateStore::new(window, cx));
-            let shell = cx.new(|cx| {
-                crate::desktop_shell::DesktopShellView::new(navigation, layout, window, cx)
-            });
-            desktop = Some(shell.downgrade());
-            shell.update(cx, |shell, cx| shell.start_desktop_update(window, cx));
-            cx.new(|cx| Root::new(shell, window, cx))
+        let (handle, desktop) = cx.update(|cx| {
+            gpui_kit::open_window(options, cx, |window, cx| {
+                Self::install(cx);
+                let registrar = cx.global::<Self>().registrar();
+                let navigation =
+                    crate::desktop_navigation::DesktopNavigationStore::new(registrar.as_ref());
+                Self::deliver_pending(cx);
+                let layout = cx.new(|cx| crate::shell_state::ShellStateStore::new(window, cx));
+                let shell = cx.new(|cx| {
+                    crate::desktop_shell::DesktopShellView::new(navigation, layout, window, cx)
+                });
+                shell.update(cx, |shell, cx| shell.start_desktop_update(window, cx));
+                shell
+            })
         })?;
-        Ok((
-            handle,
-            desktop.expect("window construction creates its shell"),
-        ))
+        Ok((handle, desktop.downgrade()))
     }
 
     #[cfg(test)]

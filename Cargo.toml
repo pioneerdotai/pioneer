@@ -151,7 +151,7 @@ scraper = "0.27"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
 xcap = "0.9"
-xa11y = "0.14"
+xa11y = "0.15"
 tempfile = "3"
 fs4 = "1.1"
 lazy_static = "1.5"
@@ -204,5 +204,5 @@ rusqlite = { version = "0.39", default-features = false, features = ["functions"
 zstd = { version = "0.14", features = ["experimental"] }
 
 # MCP
-rmcp = { version = "3.3", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+rmcp = { version = "3.5", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 process-wrap = { version = "10", features = ["tokio1"] }

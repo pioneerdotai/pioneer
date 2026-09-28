@@ -422,7 +422,13 @@ impl Render for GatewaySetupScreenView {
             );
         } else if value.mode.allow_local() {
             actions = actions
-                .child(Separator::horizontal().label(t!("common.or").to_string()))
+                .child(
+                    Separator::horizontal()
+                        // The label's auto margins already center it; Taffy 0.13
+                        // also applies justify-center's offset, shifting it right.
+                        .justify_start()
+                        .label(t!("common.or").to_string()),
+                )
                 .child(
                     default_outline_button(
                         if matches!(value.mode, GatewaySetupMode::AddGateway { .. }) {

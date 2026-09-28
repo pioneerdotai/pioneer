@@ -28,12 +28,14 @@ pub fn init(cx: &mut App) {
         let light_theme = ThemeRegistry::global(cx).themes().get(&light).cloned();
         let dark_theme = ThemeRegistry::global(cx).themes().get(&dark).cloned();
 
-        if let Some(theme) = light_theme {
-            Theme::global_mut(cx).apply_config(&theme);
-        }
-        if let Some(theme) = dark_theme {
-            Theme::global_mut(cx).apply_config(&theme);
-        }
+        Theme::update(cx, |theme| {
+            if let Some(config) = light_theme {
+                theme.apply_config(&config);
+            }
+            if let Some(config) = dark_theme {
+                theme.apply_config(&config);
+            }
+        });
 
         apply_theme_preference(cx);
     }) {

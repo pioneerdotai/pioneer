@@ -339,8 +339,8 @@ fn desktop_shell_is_composition_only() {
     let main = source("desktop/src/main.rs");
     assert!(main.contains("DesktopRuntimeCoordinator::open_window"));
     assert!(main.contains("gpui_kit::init(cx)"));
-    assert!(bootstrap.contains("Root::new(shell, window, cx)"));
-    assert_eq!(bootstrap.matches("Root::new(").count(), 1);
+    assert_eq!(bootstrap.matches("gpui_kit::open_window(").count(), 1);
+    assert!(!bootstrap.contains("Root::new("));
     assert!(bootstrap.contains("DesktopShellView::new"));
     for name in ["sheet", "dialog", "notification"] {
         assert_eq!(

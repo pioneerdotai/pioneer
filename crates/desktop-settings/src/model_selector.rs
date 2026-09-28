@@ -654,6 +654,7 @@ impl ModelSelectorDialog {
                     .relative()
                     .child(
                         Popover::new("model-provider-popover")
+                            .trigger_style(StyleRefinement::default().w_full())
                             .anchor(Anchor::TopLeft)
                             .p_0()
                             .trigger(SelectorPopoverTrigger::new(
@@ -846,6 +847,7 @@ impl ModelSelectorDialog {
                     .relative()
                     .child(
                         Popover::new("model-model-popover")
+                            .trigger_style(StyleRefinement::default().w_full())
                             .anchor(Anchor::TopLeft)
                             .p_0()
                             .trigger(
@@ -901,6 +903,7 @@ impl ModelSelectorDialog {
                         .relative()
                         .child(
                             Popover::new("model-reasoning-effort-popover")
+                                .trigger_style(StyleRefinement::default().w_full())
                                 .anchor(Anchor::TopLeft)
                                 .p_0()
                                 .trigger(SelectorPopoverTrigger::new(
