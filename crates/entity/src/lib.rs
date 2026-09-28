@@ -57,8 +57,10 @@ pub mod compaction_delivery_output;
 pub mod compaction_event_revision;
 pub mod compaction_execution_stop;
 pub mod compaction_frozen_history;
-pub mod compaction_frozen_import;
-pub mod compaction_frozen_message;
+pub mod compaction_frozen_import_data;
+pub mod compaction_frozen_layout;
+pub mod compaction_frozen_message_data;
+pub mod compaction_frozen_span;
 pub mod compaction_history_check;
 pub mod compaction_history_preparation;
 pub mod compaction_input_revision;
@@ -67,6 +69,8 @@ pub mod compaction_manifest;
 pub mod compaction_operation;
 pub mod compaction_operation_projection;
 pub mod compaction_projection_epoch;
+pub mod compaction_publication_fence;
+pub mod compaction_publication_source_fence;
 pub mod compaction_runner_plan;
 pub mod compaction_runner_state;
 pub mod compaction_source_revision;
@@ -149,6 +153,7 @@ pub mod thread_read_cursor;
 pub mod thread_sandox_policy;
 pub mod thread_timeline_block;
 pub mod thread_timeline_projection_meta;
+pub mod tool_output_chunk;
 pub mod turn;
 pub mod turn_admission;
 pub mod turn_cli_runtime_attempt;
@@ -180,13 +185,3 @@ pub mod turn_work_projection;
 pub mod user_notification_outbox;
 pub mod workspace;
 pub mod workspace_membership;
-
-pub mod tool_output_chunk;
-
-pub mod compaction_frozen_message_data;
-
-pub mod compaction_frozen_import_data;
-
-pub mod compaction_frozen_layout;
-
-pub mod compaction_frozen_span;

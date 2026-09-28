@@ -23347,17 +23347,16 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         delivered_agent_messages, 1,
         "background result must be delivered to the parent exactly once"
     );
-    let delivered_message_index = delivered_items
+    let (delivered_message_index, delivered_message_id) = delivered_items
         .events
         .iter()
-        .position(|event| {
-            matches!(
-                &event.payload,
-                TurnItemEventPayload::ItemCompleted {
-                    item: TurnItem::AgentMessage { text, .. },
-                    ..
-                } if text.contains("immediate background result")
-            )
+        .enumerate()
+        .find_map(|(index, event)| match &event.payload {
+            TurnItemEventPayload::ItemCompleted {
+                item: TurnItem::AgentMessage { id, text, .. },
+                ..
+            } if text.contains("immediate background result") => Some((index, id.as_str())),
+            _ => None,
         })
         .expect("delivered AgentMessage event should exist");
     let completed_card_index = delivered_items
@@ -23378,12 +23377,28 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         "the complete AgentMessage must be committed before the parent Task card becomes completed"
     );
     let ingestion_calls = delivery_ingestor.calls.lock().await;
+    // Child events may still be indexed after the recorder is installed.
+    // Only calls for the committed parent message belong to this assertion.
+    let delivered_calls: Vec<_> = ingestion_calls
+        .iter()
+        .filter(|call| {
+            call.thread_id == parent_thread_id
+                && call.turn_id == run.id
+                && call.item_id == delivered_message_id
+        })
+        .collect();
     assert_eq!(
-        ingestion_calls.len(),
+        delivered_calls.len(),
         1,
-        "repeated delivery polling must index the parent result exactly once"
+        "repeated delivery polling must index the parent result exactly once; \
+         expected {parent_thread_id}/{}/{delivered_message_id}, observed {:?}",
+        run.id,
+        ingestion_calls
+            .iter()
+            .map(|call| (&call.thread_id, &call.turn_id, &call.item_id))
+            .collect::<Vec<_>>()
     );
-    let delivered_call = &ingestion_calls[0];
+    let delivered_call = delivered_calls[0];
     assert_eq!(delivered_call.workspace_id, workspace_id);
     assert_eq!(delivered_call.thread_id, parent_thread_id);
     assert_eq!(delivered_call.turn_id, run.id);

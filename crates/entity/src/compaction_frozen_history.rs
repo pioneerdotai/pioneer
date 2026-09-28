@@ -24,9 +24,11 @@ pub struct Model {
     pub ready: i64,
     pub storage_registered: i64,
     #[sea_orm(has_many)]
-    pub compaction_frozen_imports: HasMany<super::compaction_frozen_import::Entity>,
+    pub compaction_frozen_import_data: HasMany<super::compaction_frozen_import_data::Entity>,
     #[sea_orm(has_many)]
-    pub compaction_frozen_messages: HasMany<super::compaction_frozen_message::Entity>,
+    pub compaction_frozen_layouts: HasMany<super::compaction_frozen_layout::Entity>,
+    #[sea_orm(has_many)]
+    pub compaction_frozen_message_data: HasMany<super::compaction_frozen_message_data::Entity>,
     #[sea_orm(has_many)]
     pub compaction_operation_projections: HasMany<super::compaction_operation_projection::Entity>,
     #[sea_orm(has_many)]

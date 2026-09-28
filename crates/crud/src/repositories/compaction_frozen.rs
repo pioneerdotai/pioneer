@@ -1,10 +1,11 @@
 //! Frozen-history manifests are populated in bounded restart-safe quanta. An
 //! incomplete manifest cannot be referenced by a started execution snapshot.
 use super::compaction::*;
+use super::compaction_frozen_views::message as compaction_frozen_message;
 use crate::CrudStore;
 use anyhow::{Result, ensure};
 use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
-use pioneer_entity::{compaction_frozen_history, compaction_frozen_message, thread};
+use pioneer_entity::{compaction_frozen_history, compaction_frozen_message_data, thread};
 use sea_orm::sea_query::{Expr, ExprTrait, OnConflict, Query};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use sea_orm::{ConnectionTrait, TransactionTrait};
@@ -158,8 +159,8 @@ pub(crate) async fn compaction_append_frozen_history(
         if !ready && *ordinal >= next {
             let source =
                 super::compaction_frozen_storage::append_source(&tx, manifest, 0, *ordinal).await?;
-            pioneer_entity::compaction_frozen_message_data::Entity::insert(
-                pioneer_entity::compaction_frozen_message_data::ActiveModel {
+            compaction_frozen_message_data::Entity::insert(
+                compaction_frozen_message_data::ActiveModel {
                     manifest_id: sea_orm::Set(source),
                     ordinal: sea_orm::Set(*ordinal),
                     reference_json: sea_orm::Set((json.clone()).to_owned()),
@@ -168,8 +169,8 @@ pub(crate) async fn compaction_append_frozen_history(
             )
             .on_conflict(
                 OnConflict::columns([
-                    compaction_frozen_message::Column::ManifestId,
-                    compaction_frozen_message::Column::Ordinal,
+                    compaction_frozen_message_data::Column::ManifestId,
+                    compaction_frozen_message_data::Column::Ordinal,
                 ])
                 .do_nothing()
                 .to_owned(),

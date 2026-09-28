@@ -21,6 +21,7 @@ pub mod compaction;
 pub(crate) mod compaction_background;
 pub(crate) mod compaction_frozen;
 pub(crate) mod compaction_frozen_import;
+mod compaction_frozen_views;
 pub(crate) mod compaction_history;
 pub(crate) mod compaction_lifecycle;
 pub(crate) mod compaction_preparation;

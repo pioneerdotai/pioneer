@@ -1,11 +1,11 @@
 //! Immutable shared ranges. A range addresses physical rows directly: reads
 //! never traverse parent snapshots. Publication preserves the logical views.
+use super::compaction_frozen_views::{import, message};
 use crate::CrudStore;
 use anyhow::{Result, ensure};
 use pioneer_entity::{
-    compaction_frozen_history as history, compaction_frozen_import as import,
-    compaction_frozen_import_data as import_data, compaction_frozen_layout as layout,
-    compaction_frozen_message as message, compaction_frozen_message_data as message_data,
+    compaction_frozen_history as history, compaction_frozen_import_data as import_data,
+    compaction_frozen_layout as layout, compaction_frozen_message_data as message_data,
     compaction_frozen_span as span,
 };
 use sea_orm::sea_query::{Expr, ExprTrait, OnConflict};
