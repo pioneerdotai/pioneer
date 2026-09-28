@@ -14,7 +14,7 @@ use pioneer_protocol::{ProviderFailureClass, ProviderModelInfo};
 use std::fmt;
 
 const PROVIDER_NAME: &str = "deepseek";
-const BASE_URL: &str = "https://api.deepseek.com";
+pub(crate) const BASE_URL: &str = "https://api.deepseek.com";
 
 /// DeepSeek uses the OpenAI-compatible transport, but its thinking models
 /// impose an additional replay contract on assistant tool-call messages.
@@ -58,10 +58,14 @@ impl std::error::Error for MissingDeepSeekReasoningResponse {}
 
 impl DeepSeekProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
+        Self::with_base_url(api_key, BASE_URL)
+    }
+
+    fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
             transport: OpenAiCompatibleProvider::new(
                 PROVIDER_NAME,
-                BASE_URL,
+                base_url,
                 api_key,
                 AuthStyle::Bearer,
             ),
@@ -73,6 +77,14 @@ impl DeepSeekProvider {
         timeout_policy: ProviderTimeoutPolicy,
     ) -> Self {
         Self::new(api_key).with_transport_timeout_policy(timeout_policy)
+    }
+
+    pub fn with_base_url_and_timeout_policy(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        timeout_policy: ProviderTimeoutPolicy,
+    ) -> Self {
+        Self::with_base_url(api_key, base_url).with_transport_timeout_policy(timeout_policy)
     }
 
     pub fn with_input_capabilities(mut self, input_types: ProviderInputCapabilities) -> Self {

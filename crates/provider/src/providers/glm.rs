@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
 
-const DEFAULT_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
+pub(crate) const DEFAULT_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
 
 pub struct GlmProvider {
     api_key: String,
@@ -332,7 +332,7 @@ impl GlmProvider {
     ) -> Self {
         Self {
             api_key: api_key.into(),
-            base_url: base_url.into(),
+            base_url: base_url.into().trim_end_matches('/').to_owned(),
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
         }
@@ -932,6 +932,19 @@ mod tests {
     fn creates_with_custom_base_url() {
         let provider = GlmProvider::with_base_url("key", "http://localhost:8080");
         assert_eq!(provider.base_url, "http://localhost:8080");
+    }
+
+    #[test]
+    fn custom_gateway_prefix_routes_chat_and_models_without_double_slashes() {
+        let provider = GlmProvider::with_base_url("key", "http://localhost:8080/team/v4/");
+        assert_eq!(
+            provider.chat_completions_url(),
+            "http://localhost:8080/team/v4/chat/completions"
+        );
+        assert_eq!(
+            provider.models_url(),
+            "http://localhost:8080/team/v4/models"
+        );
     }
 
     #[test]

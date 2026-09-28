@@ -240,6 +240,7 @@ impl ProviderCatalogView {
         let previous_scope = (
             self.visible(),
             self.active_workspace_id().map(str::to_owned),
+            self.gateway.endpoint_id.clone(),
             self.gateway.ws_connection_id,
             self.gateway.capabilities.can_manage_capabilities,
         );
@@ -272,6 +273,7 @@ impl ProviderCatalogView {
             != (
                 self.visible(),
                 self.active_workspace_id().map(str::to_owned),
+                self.gateway.endpoint_id.clone(),
                 self.gateway.ws_connection_id,
                 self.gateway.capabilities.can_manage_capabilities,
             )
@@ -450,11 +452,16 @@ struct ProviderPresentation {
 mod tests {
     use super::{ProviderCatalogConfig, ProviderCatalogView};
     use crate::ports::*;
-    use gpui_kit::component::Root;
-    use gpui_kit::{App, TestAppContext, Window};
+    use gpui_kit::component::{Root, input::InputState};
+    use gpui_kit::{App, AppContext, TestAppContext, Window};
     use pioneer_client::{
-        core::{ClientCore, ClientScope},
+        core::{
+            ClientCore, ClientMutationAuthority, ClientRevisions, ClientScope, ContentRevision,
+            DomainRevision, PresentationRevision, ScopedRevision,
+        },
+        gateway::session_controller::GatewaySessionPublication,
         navigation::{NavigationIntent, SemanticDestination},
+        providers::credentials::provider_credential_read_for_test,
         providers::selectors::ProviderFilter,
     };
     use pioneer_desktop_foundation::{
@@ -570,6 +577,30 @@ mod tests {
             view.providers.toggle_cli_runtime_expanded("codex".into());
             view.providers.login_message = Some("synthetic login instruction".into());
         });
+        let (lease, read, late_reply) = provider_credential_read_for_test();
+        let (url_input, url_form) = cx.update(|window, cx| {
+            let input = cx.new(|cx| {
+                let mut input = InputState::new(window, cx);
+                input.set_value("https://old.example/private", window, cx);
+                input
+            });
+            let form = crate::credential_form::ProxyForm::new_with_pending_for_test(
+                input.clone(),
+                (lease, read),
+                Some("https://old.example/private".into()),
+                window,
+                cx,
+            );
+            let weak = form.downgrade();
+            let guard = crate::dialog_lifetime::DialogLifetime::new(
+                move |window, cx| {
+                    let _ = weak.update(cx, |form, cx| form.clear(window, cx));
+                },
+                cx,
+            );
+            view.update(cx, |view, _| view.dialogs.push(guard));
+            (input, form)
+        });
         core.navigate(
             NavigationIntent::SelectWorkspace {
                 workspace_id: Some("two".into()),
@@ -577,6 +608,10 @@ mod tests {
             None,
         );
         cx.update(|window, cx| view.update(cx, |view, cx| view.sync_publications(window, cx)));
+        let _ = late_reply.send(Ok(Some("https://late.example/private".into())));
+        cx.run_until_parked();
+        assert!(url_input.read_with(cx, |input, _| input.value().is_empty()));
+        assert!(url_form.read_with(cx, |form, _| form.original().is_none()));
         assert_ne!(
             identity,
             view.read_with(cx, |view, _| view.ui_id("openai", "configure"))
@@ -585,6 +620,60 @@ mod tests {
             view.providers.expanded_cli_runtime_ids().is_empty()
                 && view.providers.login_message.is_none()
         }));
+        let publish_gateway = |endpoint: &str, revision: u64| {
+            let mut session = GatewaySessionPublication::default();
+            session.startup.endpoint_id = Some(endpoint.into());
+            session.startup.connection_id = Some(revision);
+            core.publish(
+                &ClientMutationAuthority::for_test(),
+                ClientScope::Session,
+                ClientRevisions::new(
+                    DomainRevision::new(revision),
+                    PresentationRevision::new(revision),
+                    ContentRevision::new(revision),
+                    ScopedRevision::new(revision),
+                ),
+                Arc::new(session),
+                vec![],
+            );
+        };
+        let first_gateway_revision = core
+            .snapshot(&ClientScope::Session)
+            .map_or(1, |publication| publication.revisions().scoped().get() + 1);
+        publish_gateway("gateway-a", first_gateway_revision);
+        cx.update(|window, cx| view.update(cx, |view, cx| view.sync_publications(window, cx)));
+        let (gateway_lease, gateway_read, gateway_reply) = provider_credential_read_for_test();
+        let (gateway_input, gateway_form) = cx.update(|window, cx| {
+            let input = cx.new(|cx| {
+                let mut state = InputState::new(window, cx);
+                state.set_value("https://gateway-a.example/private", window, cx);
+                state
+            });
+            let form = crate::credential_form::ProxyForm::new_with_pending_for_test(
+                input.clone(),
+                (gateway_lease, gateway_read),
+                Some("https://gateway-a.example/private".into()),
+                window,
+                cx,
+            );
+            let weak = form.downgrade();
+            view.update(cx, |view, cx| {
+                view.own_dialog(
+                    move |window, cx| {
+                        let _ = weak.update(cx, |form, cx| form.clear(window, cx));
+                    },
+                    window,
+                    cx,
+                );
+            });
+            (input, form)
+        });
+        publish_gateway("gateway-b", first_gateway_revision + 1);
+        cx.update(|window, cx| view.update(cx, |view, cx| view.sync_publications(window, cx)));
+        let _ = gateway_reply.send(Ok(Some("https://late.example/private".into())));
+        cx.run_until_parked();
+        assert!(gateway_input.read_with(cx, |input, _| input.value().is_empty()));
+        assert!(gateway_form.read_with(cx, |form, _| form.original().is_none()));
         core.navigate(
             NavigationIntent::Navigate {
                 destination: SemanticDestination::Threads,
@@ -598,5 +687,94 @@ mod tests {
                 | ClientScope::Session
                 | ClientScope::Administration { workspace_id: None }
         )));
+    }
+
+    #[gpui_kit::test]
+    fn permission_revocation_clears_base_url_form_and_retires_pending_read(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let core = pioneer_client::catalog_test_support::settings_client();
+        core.navigate(
+            NavigationIntent::SelectWorkspace {
+                workspace_id: Some("one".into()),
+            },
+            None,
+        );
+        core.navigate(
+            NavigationIntent::Navigate {
+                destination: SemanticDestination::Providers {
+                    filter: ProviderFilter::Api,
+                },
+            },
+            None,
+        );
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::new(
+                ProviderCatalogView::new(
+                    ProviderCatalogConfig::new(
+                        core.clone(),
+                        Arc::new(Registrar(Rc::new(RefCell::new(HashSet::new())))),
+                        Arc::new(Ports),
+                        Arc::new(Ports),
+                        Arc::new(Ports),
+                    ),
+                    window,
+                    cx,
+                ),
+                window,
+                cx,
+            )
+        });
+        let view = root.read_with(cx, |root, _| {
+            root.view()
+                .clone()
+                .downcast::<ProviderCatalogView>()
+                .unwrap()
+        });
+        assert!(view.read_with(cx, |view, _| {
+            view.gateway.capabilities.can_manage_capabilities
+        }));
+        let (lease, read, reply) = provider_credential_read_for_test();
+        let (input, form) = cx.update(|window, cx| {
+            let input = cx.new(|cx| {
+                let mut state = InputState::new(window, cx);
+                state.set_value("https://old.example/private", window, cx);
+                state
+            });
+            let form = crate::credential_form::ProxyForm::new_with_pending_for_test(
+                input.clone(),
+                (lease, read),
+                Some("https://old.example/private".into()),
+                window,
+                cx,
+            );
+            let weak = form.downgrade();
+            view.update(cx, |view, cx| {
+                let guard = view.own_dialog(
+                    move |window, cx| {
+                        let _ = weak.update(cx, |form, cx| form.clear(window, cx));
+                    },
+                    window,
+                    cx,
+                );
+                guard.update(cx, |guard, cx| guard.track_form(&form, cx));
+            });
+            (input, form)
+        });
+        let mut capabilities = core.authorization_snapshot(None, None).unwrap();
+        capabilities.authorization_revision += 1;
+        capabilities.global.can_manage_capabilities = false;
+        let (generation, connection) = core.current_auth_ticket();
+        core.accept_authorization_projection(generation, connection, capabilities);
+        cx.update(|window, cx| view.update(cx, |view, cx| view.sync_publications(window, cx)));
+        let _ = reply.send(Ok(Some("https://late.example/private".into())));
+        cx.run_until_parked();
+        assert!(input.read_with(cx, |input, _| input.value().is_empty()));
+        assert!(form.read_with(cx, |form, _| form.original().is_none()));
+        assert_eq!(
+            form.read_with(cx, |form, cx| form.mutation(cx)),
+            (None, false)
+        );
     }
 }

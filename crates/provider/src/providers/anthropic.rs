@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
 
-const BASE_URL: &str = "https://api.anthropic.com";
+pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 
@@ -280,7 +280,7 @@ impl AnthropicProvider {
     ) -> Self {
         Self {
             api_key: api_key.into(),
-            base_url: base_url.into(),
+            base_url: base_url.into().trim_end_matches('/').to_owned(),
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
         }
@@ -1198,6 +1198,15 @@ mod tests {
     fn creates_with_custom_base_url() {
         let provider = AnthropicProvider::with_base_url("key", "http://localhost:9090");
         assert_eq!(provider.base_url, "http://localhost:9090");
+    }
+
+    #[test]
+    fn custom_base_url_keeps_prefix_without_double_slash() {
+        let provider = AnthropicProvider::with_base_url("key", "http://localhost:9090/gateway/");
+        assert_eq!(
+            provider.models_url(),
+            "http://localhost:9090/gateway/v1/models"
+        );
     }
 
     #[test]

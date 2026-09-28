@@ -975,13 +975,10 @@ impl MessageProcessor {
         })
     }
 
-    async fn perform_api_provider_warmup(
+    pub(super) fn api_warmup_provider_names(
         &self,
         workspace_id: &str,
-        trace: &GatewayProviderWarmupTrace,
-        provider_concurrency: &Arc<Semaphore>,
-    ) -> anyhow::Result<bool> {
-        let api_catalog_stage = trace.stage(GatewayProviderWarmupStage::ApiCatalogLoad);
+    ) -> anyhow::Result<BTreeSet<String>> {
         let mut provider_names = BTreeSet::from(["local".to_owned()]);
         provider_names.extend(
             self.gateway_secrets
@@ -993,6 +990,28 @@ impl MessageProcessor {
                 .into_iter()
                 .map(|(provider, _)| provider),
         );
+        provider_names.extend(
+            self.gateway_secrets
+                .list_workspace_provider_base_urls(workspace_id)?
+                .into_iter()
+                .filter(|(provider, _)| {
+                    pioneer_provider::provider_definition(provider).is_some_and(|definition| {
+                        pioneer_provider::provider_is_available(false, false, true, definition)
+                    })
+                })
+                .map(|(provider, _)| provider),
+        );
+        Ok(provider_names)
+    }
+
+    async fn perform_api_provider_warmup(
+        &self,
+        workspace_id: &str,
+        trace: &GatewayProviderWarmupTrace,
+        provider_concurrency: &Arc<Semaphore>,
+    ) -> anyhow::Result<bool> {
+        let api_catalog_stage = trace.stage(GatewayProviderWarmupStage::ApiCatalogLoad);
+        let provider_names = self.api_warmup_provider_names(workspace_id)?;
         api_catalog_stage.succeed();
 
         let api_warmup_stage = trace.stage(GatewayProviderWarmupStage::ApiInstancesWarmup);
@@ -1029,9 +1048,11 @@ impl MessageProcessor {
                                 provider_stage.succeed();
                                 Ok((provider_kind, outcome))
                             }
-                            Ok(Err(error)) => {
-                                Err((provider_kind, provider_name, format!("{error:#}")))
-                            }
+                            Ok(Err(_error)) => Err((
+                                provider_kind,
+                                provider_name,
+                                "provider warm-up failed".to_owned(),
+                            )),
                             Err(_) => Err((
                                 provider_kind,
                                 provider_name,
@@ -1039,7 +1060,11 @@ impl MessageProcessor {
                             )),
                         }
                     }
-                    Err(error) => Err(("unknown".to_owned(), provider_name, format!("{error:#}"))),
+                    Err(_error) => Err((
+                        "unknown".to_owned(),
+                        provider_name,
+                        "provider instance unavailable".to_owned(),
+                    )),
                 }
             }
         });

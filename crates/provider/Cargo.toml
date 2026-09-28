@@ -35,3 +35,4 @@ mp4parse = "0.17"
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 flate2.workspace = true
+tracing-subscriber.workspace = true

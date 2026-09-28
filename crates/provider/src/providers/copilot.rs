@@ -23,10 +23,11 @@ use serde::{Deserialize, Serialize};
 
 use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
 
-const BASE_URL: &str = "https://api.githubcopilot.com";
+pub(crate) const BASE_URL: &str = "https://api.githubcopilot.com";
 
 pub struct CopilotProvider {
     api_key: String,
+    base_url: String,
     timeout_policy: ProviderTimeoutPolicy,
     client: Client,
 }
@@ -317,8 +318,17 @@ impl CopilotProvider {
         api_key: impl Into<String>,
         timeout_policy: ProviderTimeoutPolicy,
     ) -> Self {
+        Self::with_base_url_and_timeout_policy(api_key, BASE_URL, timeout_policy)
+    }
+
+    pub fn with_base_url_and_timeout_policy(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        timeout_policy: ProviderTimeoutPolicy,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
+            base_url: base_url.into().trim_end_matches('/').to_owned(),
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
         }
@@ -507,11 +517,11 @@ impl CopilotProvider {
     }
 
     fn chat_completions_url(&self) -> String {
-        format!("{}/chat/completions", BASE_URL)
+        format!("{}/chat/completions", self.base_url)
     }
 
     fn models_url(&self) -> String {
-        format!("{}/models", BASE_URL)
+        format!("{}/models", self.base_url)
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
@@ -937,6 +947,20 @@ mod tests {
             provider.chat_completions_url(),
             "https://api.githubcopilot.com/chat/completions"
         );
+    }
+
+    #[test]
+    fn custom_gateway_prefix_routes_chat_and_models() {
+        let provider = CopilotProvider::with_base_url_and_timeout_policy(
+            "key",
+            "http://localhost:8080/team/",
+            ProviderTimeoutPolicy::default(),
+        );
+        assert_eq!(
+            provider.chat_completions_url(),
+            "http://localhost:8080/team/chat/completions"
+        );
+        assert_eq!(provider.models_url(), "http://localhost:8080/team/models");
     }
 
     #[test]

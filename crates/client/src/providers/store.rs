@@ -2,7 +2,8 @@
 use super::list;
 use crate::core::*;
 use pioneer_protocol::{
-    ProviderListModelsResponse, ProviderListResponse, ProviderModelInfo, ProviderSummary,
+    ProviderDefinition, ProviderListModelsResponse, ProviderListResponse, ProviderModelInfo,
+    ProviderSummary,
 };
 use std::{
     collections::BTreeMap,
@@ -129,6 +130,7 @@ pub struct ProviderCollectionPublication {
     revision: u64,
     request: ProviderLoadState,
     providers: Vec<Arc<ProviderCatalogRow>>,
+    definitions: Vec<ProviderDefinition>,
     models: Vec<Arc<ProviderModelRow>>,
     #[serde(skip)]
     runtime_models: Option<Arc<pioneer_protocol::CLIRuntimeListModelsResponse>>,
@@ -146,6 +148,9 @@ impl ProviderCollectionPublication {
     pub fn providers(&self) -> &[Arc<ProviderCatalogRow>] {
         &self.providers
     }
+    pub fn definitions(&self) -> &[ProviderDefinition] {
+        &self.definitions
+    }
     pub fn models(&self) -> &[Arc<ProviderModelRow>] {
         &self.models
     }
@@ -161,6 +166,7 @@ impl ProviderCollectionPublication {
                 .iter()
                 .map(|row| row.provider.clone())
                 .collect(),
+            definitions: self.definitions.clone(),
         })
     }
     pub fn runtime_models_response(
@@ -414,6 +420,7 @@ impl ClientCore {
                     revision: 0,
                     request: ProviderLoadState::Idle,
                     providers: vec![],
+                    definitions: vec![],
                     models: vec![],
                     runtime_models: None,
                 }),
@@ -436,6 +443,7 @@ impl ClientCore {
             let mut next = (*state.publication).clone();
             next.request = ProviderLoadState::Forbidden;
             next.providers.clear();
+            next.definitions.clear();
             next.models.clear();
             next.runtime_models = None;
             return self.publish_provider_collection(state, next);
@@ -588,12 +596,14 @@ impl ClientCore {
         if !allowed {
             next.request = ProviderLoadState::Forbidden;
             next.providers.clear();
+            next.definitions.clear();
             next.models.clear();
             next.runtime_models = None;
         } else {
             next.request = ProviderLoadState::Failed;
             match (result, &request.key.collection) {
                 (Ok(Response::Catalog(response)), ProviderCollection::Catalog) => {
+                    next.definitions = response.definitions;
                     let mut ids = std::collections::BTreeSet::new();
                     if response
                         .providers
@@ -603,9 +613,9 @@ impl ClientCore {
                         next.providers = response
                             .providers
                             .into_iter()
-                            .map(|mut provider| {
-                                provider.proxy_url =
-                                    super::credentials::public_proxy(provider.proxy_url.take());
+                            .map(|provider| {
+                                let provider =
+                                    super::credentials::public_provider_summary(provider);
                                 let previous =
                                     next.providers.iter().find(|row| row.id == provider.name);
                                 if let Some(row) =
@@ -674,6 +684,7 @@ impl ClientCore {
             state.request = None;
             let mut next = (*state.publication).clone();
             next.providers.clear();
+            next.definitions.clear();
             next.models.clear();
             next.runtime_models = None;
             next.request = ProviderLoadState::Cancelled;
@@ -809,7 +820,10 @@ mod tests {
         (core, receiver)
     }
     fn catalog(names: &[&str]) -> Response {
-        Response::Catalog(ProviderListResponse { providers: names.iter().map(|name| serde_json::from_value(serde_json::json!({"name": name, "capabilities": {}, "api_key_configured": true})).unwrap()).collect() })
+        Response::Catalog(ProviderListResponse {
+            providers: names.iter().map(|name| serde_json::from_value(serde_json::json!({"name": name, "capabilities": {}, "api_key_configured": true})).unwrap()).collect(),
+            definitions: vec![],
+        })
     }
     fn models(provider: &str, names: &[&str]) -> Response {
         Response::Models(ProviderListModelsResponse { provider: provider.into(), models: names.iter().map(|id| serde_json::from_value(serde_json::json!({"id":id,"name":id,"provider":provider,"limits":{},"capabilities":{}})).unwrap()).collect() })
@@ -1103,15 +1117,19 @@ mod tests {
         )
         .unwrap();
         provider.proxy_url = Some("http://synthetic-user:synthetic-password@localhost:8080".into());
+        provider.base_url = Some("https://synthetic-user:synthetic-password@api.example.test/private-path?token=synthetic-token#fragment".into());
         core.complete_provider_collection(
             requests.try_recv().unwrap(),
             Ok(Response::Catalog(ProviderListResponse {
                 providers: vec![provider],
+                definitions: vec![],
             })),
         );
         let json = serde_json::to_string(&read.wait().unwrap()).unwrap();
         assert!(!json.contains("synthetic-user"));
         assert!(!json.contains("synthetic-password"));
+        assert!(!json.contains("private-path"));
+        assert!(!json.contains("synthetic-token"));
         for subscription in subscriptions {
             assert!(subscription.try_next().is_none());
         }
@@ -1139,6 +1157,7 @@ impl ProviderCollectionPublication {
                     })
                 })
                 .collect(),
+            definitions: vec![],
             models: models
                 .into_iter()
                 .map(|model| {

@@ -63,6 +63,25 @@ impl MessageProcessor {
                 return;
             }
         };
+        let provider_base_urls = match self
+            .gateway_secrets
+            .list_workspace_provider_base_urls(workspace_id.as_str())
+        {
+            Ok(provider_base_urls) => provider_base_urls,
+            Err(error) => {
+                let message = if member {
+                    "provider catalog is unavailable".to_owned()
+                } else {
+                    format!("failed to list provider base urls: {error:#}")
+                };
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+                )
+                .await;
+                return;
+            }
+        };
 
         let mut provider_configs = std::collections::BTreeMap::new();
         for name in provider_names {
@@ -71,19 +90,29 @@ impl MessageProcessor {
             // must remain true for a Member, otherwise the shared clients
             // correctly filter the provider out as unusable. Secret-bearing
             // proxy configuration remains redacted below.
-            provider_configs.insert(name, (true, None));
+            provider_configs.insert(name, (true, None, None));
         }
         for (name, proxy_url) in provider_proxies {
             provider_configs
                 .entry(name)
-                .and_modify(|(_, existing_proxy)| *existing_proxy = Some(proxy_url.clone()))
-                .or_insert((false, Some(proxy_url)));
+                .and_modify(|entry: &mut (bool, Option<String>, Option<String>)| {
+                    entry.1 = Some(proxy_url.clone())
+                })
+                .or_insert((false, Some(proxy_url), None));
+        }
+        for (name, base_url) in provider_base_urls {
+            provider_configs
+                .entry(name)
+                .and_modify(|entry: &mut (bool, Option<String>, Option<String>)| {
+                    entry.2 = Some(base_url.clone())
+                })
+                .or_insert((false, None, Some(base_url)));
         }
 
         // Local is built in, so there is no workspace secret or proxy from which to discover it.
         provider_configs
             .entry("local".to_owned())
-            .or_insert((false, None));
+            .or_insert((false, None, None));
 
         let providers = provider_configs
             .into_iter()
@@ -94,9 +123,16 @@ impl MessageProcessor {
                     name.as_str(),
                 )
             })
-            .map(|(name, (api_key_configured, proxy_url))| {
-                let operationally_configured =
-                    api_key_configured || proxy_url.is_some() || name == "local";
+            .map(|(name, (api_key_configured, proxy_url, base_url))| {
+                let operationally_configured = pioneer_provider::provider_definition(&name)
+                    .is_some_and(|definition| {
+                        pioneer_provider::provider_is_available(
+                            api_key_configured,
+                            proxy_url.is_some(),
+                            base_url.is_some(),
+                            definition,
+                        )
+                    });
                 let capabilities = self
                     .provider_registry
                     .get_or_create_for_workspace(workspace_id.as_str(), name.as_str())
@@ -126,12 +162,31 @@ impl MessageProcessor {
                     } else {
                         api_key_configured
                     },
+                    available: Some(operationally_configured),
                     proxy_url: if member { None } else { proxy_url },
+                    base_url: if member { None } else { base_url },
                 }
             })
             .collect::<Vec<_>>();
 
-        let result = ProviderListResponse { providers };
+        let definitions = pioneer_provider::provider_definitions()
+            .filter(|definition| {
+                crate::authorization::AuthorizationService::new().provider_allowed(
+                    request_context.principal().kind,
+                    request_context.principal().role_key.as_ref(),
+                    definition.name,
+                )
+            })
+            .map(|definition| ProviderDefinition {
+                name: definition.name.to_owned(),
+                default_base_url: definition.default_base_url.map(str::to_owned),
+                supports_base_url_override: definition.supports_base_url_override,
+            })
+            .collect();
+        let result = ProviderListResponse {
+            providers,
+            definitions,
+        };
 
         let response = match JsonRpcResponse::from_result(request_id, &result) {
             Ok(response) => response,
@@ -288,8 +343,9 @@ impl MessageProcessor {
                     "provider model catalog is unavailable".to_owned()
                 } else {
                     format!(
-                        "failed to list models for provider `{}`: {error:#}",
-                        params.provider
+                        "failed to list models for provider `{}`: {}",
+                        params.provider,
+                        self.safe_provider_error(&error)
                     )
                 };
                 self.send_error(
@@ -430,8 +486,9 @@ impl MessageProcessor {
                     "provider model catalog is unavailable".to_owned()
                 } else {
                     format!(
-                        "failed to list embedding models for provider `{}`: {error:#}",
-                        params.provider
+                        "failed to list embedding models for provider `{}`: {}",
+                        params.provider,
+                        self.safe_provider_error(&error)
                     )
                 };
                 self.send_error(
@@ -572,8 +629,9 @@ impl MessageProcessor {
                     "provider model catalog is unavailable".to_owned()
                 } else {
                     format!(
-                        "failed to list transcription models for provider `{}`: {error:#}",
-                        params.provider
+                        "failed to list transcription models for provider `{}`: {}",
+                        params.provider,
+                        self.safe_provider_error(&error)
                     )
                 };
                 self.send_error(
@@ -656,6 +714,22 @@ impl MessageProcessor {
             return;
         }
 
+        if params.clear_base_url && params.base_url.is_some() {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid params for `{}`: `base_url` and `clear_base_url` cannot both be set",
+                        methods::PROVIDER_CONFIGURE
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
         let api_key = match params.api_key {
             Some(api_key) => {
                 let trimmed = api_key.trim().to_owned();
@@ -699,6 +773,28 @@ impl MessageProcessor {
             },
             None => None,
         };
+        let base_url = match params.base_url {
+            Some(base_url) => {
+                let trimmed = base_url.trim().to_owned();
+                if trimmed.is_empty() {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_PARAMS_CODE,
+                            format!(
+                                "invalid params for `{}`: `base_url` must not be empty when provided",
+                                methods::PROVIDER_CONFIGURE
+                            ),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                Some(trimmed)
+            }
+            None => None,
+        };
 
         let raw_provider = params.provider;
         let mut normalized_provider = match self
@@ -722,6 +818,35 @@ impl MessageProcessor {
                 return;
             }
         };
+        let raw_provider = normalized_provider.clone();
+        let reconcile_partial = || {
+            self.provider_registry
+                .invalidate_workspace_provider(workspace_id.as_str(), raw_provider.as_str());
+            self.request_api_provider_warmup(workspace_id.clone());
+        };
+        let base_url = match base_url {
+            Some(value) => {
+                match pioneer_provider::validate_provider_base_url(&raw_provider, &value) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request_id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error:#}",
+                                    methods::PROVIDER_CONFIGURE
+                                ),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            None => None,
+        };
         let mut api_key_updated = false;
         if let Some(api_key) = api_key {
             match self.gateway_secrets.set_workspace_provider_api_key(
@@ -734,6 +859,7 @@ impl MessageProcessor {
                     api_key_updated = true;
                 }
                 Err(error) => {
+                    reconcile_partial();
                     self.send_error(
                         connection_id,
                         JsonRpcErrorResponse::new(
@@ -767,12 +893,20 @@ impl MessageProcessor {
                     response_proxy_url = Some(proxy_url);
                 }
                 Err(error) => {
+                    reconcile_partial();
                     self.send_error(
                         connection_id,
                         JsonRpcErrorResponse::new(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
-                            format!("failed to save provider proxy: {error:#}"),
+                            format!(
+                                "failed to save provider proxy: {error:#}{}",
+                                if api_key_updated {
+                                    "; API key was saved"
+                                } else {
+                                    ""
+                                }
+                            ),
                         ),
                     )
                     .await;
@@ -790,12 +924,20 @@ impl MessageProcessor {
                     response_proxy_url = None;
                 }
                 Err(error) => {
+                    reconcile_partial();
                     self.send_error(
                         connection_id,
                         JsonRpcErrorResponse::new(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
-                            format!("failed to delete provider proxy: {error:#}"),
+                            format!(
+                                "failed to delete provider proxy: {error:#}{}",
+                                if api_key_updated {
+                                    "; API key was saved"
+                                } else {
+                                    ""
+                                }
+                            ),
                         ),
                     )
                     .await;
@@ -804,7 +946,80 @@ impl MessageProcessor {
             }
         }
 
-        if api_key_updated || proxy_updated || proxy_deleted {
+        let mut base_url_updated = false;
+        let mut base_url_deleted = false;
+        let mut response_base_url = self
+            .gateway_secrets
+            .get_workspace_provider_base_url(workspace_id.as_str(), raw_provider.as_str())
+            .ok()
+            .flatten();
+        if let Some(base_url) = base_url {
+            match self.gateway_secrets.set_workspace_provider_base_url(
+                workspace_id.as_str(),
+                raw_provider.as_str(),
+                base_url.as_str(),
+            ) {
+                Ok(provider) => {
+                    normalized_provider = provider;
+                    base_url_updated = true;
+                    response_base_url = Some(base_url);
+                }
+                Err(error) => {
+                    reconcile_partial();
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!(
+                                "failed to save provider base url: {error:#}{}",
+                                if api_key_updated || proxy_updated || proxy_deleted {
+                                    "; earlier fields were saved"
+                                } else {
+                                    ""
+                                }
+                            ),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else if params.clear_base_url {
+            match self
+                .gateway_secrets
+                .delete_workspace_provider_base_url(workspace_id.as_str(), raw_provider.as_str())
+            {
+                Ok((provider, deleted)) => {
+                    normalized_provider = provider;
+                    base_url_deleted = deleted;
+                    response_base_url = None;
+                }
+                Err(error) => {
+                    reconcile_partial();
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!(
+                                "failed to delete provider base url: {error:#}{}",
+                                if api_key_updated || proxy_updated || proxy_deleted {
+                                    "; earlier fields were saved"
+                                } else {
+                                    ""
+                                }
+                            ),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+
+        if api_key_updated || proxy_updated || proxy_deleted || base_url_updated || base_url_deleted
+        {
             self.provider_registry
                 .invalidate_workspace_provider(workspace_id.as_str(), normalized_provider.as_str());
             self.request_api_provider_warmup(workspace_id.clone());
@@ -816,6 +1031,9 @@ impl MessageProcessor {
             proxy_updated,
             proxy_deleted,
             proxy_url: response_proxy_url,
+            base_url_updated,
+            base_url_deleted,
+            base_url: response_base_url,
         };
         let response = match JsonRpcResponse::from_result(request_id, &response) {
             Ok(response) => response,
@@ -1030,6 +1248,9 @@ impl MessageProcessor {
         {
             Ok(result) => result,
             Err(error) => {
+                self.provider_registry
+                    .invalidate_workspace_provider(workspace_id.as_str(), raw_provider.as_str());
+                self.request_api_provider_warmup(workspace_id.clone());
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -1159,20 +1380,39 @@ impl MessageProcessor {
         Some(workspace_id)
     }
 
-    fn member_provider_is_configured(&self, workspace_id: &str, provider: &str) -> bool {
+    fn safe_provider_error(&self, error: &anyhow::Error) -> String {
+        // A provider constructed with an endpoint override redacts its errors
+        // before returning them. Reading the current keystore here would be
+        // racy with a reset while the failed request is still in flight.
+        format!("{error:#}")
+    }
+
+    pub(super) fn member_provider_is_configured(&self, workspace_id: &str, provider: &str) -> bool {
         let Ok(provider) = self.gateway_secrets.normalize_provider_name(provider) else {
             return false;
         };
-        if provider == "local" {
-            return true;
-        }
-        self.gateway_secrets
-            .list_configured_workspace_provider_names(workspace_id)
-            .is_ok_and(|providers| providers.into_iter().any(|name| name == provider))
-            || self
-                .gateway_secrets
-                .list_workspace_provider_proxies(workspace_id)
-                .is_ok_and(|proxies| proxies.into_iter().any(|(name, _)| name == provider))
+        let Some(definition) = pioneer_provider::provider_definition(&provider) else {
+            return false;
+        };
+        let api_key = self
+            .gateway_secrets
+            .get_workspace_provider_api_key(workspace_id, &provider)
+            .ok()
+            .flatten()
+            .is_some();
+        let proxy = self
+            .gateway_secrets
+            .get_workspace_provider_proxy(workspace_id, &provider)
+            .ok()
+            .flatten()
+            .is_some();
+        let base_url = self
+            .gateway_secrets
+            .get_workspace_provider_base_url(workspace_id, &provider)
+            .ok()
+            .flatten()
+            .is_some();
+        pioneer_provider::provider_is_available(api_key, proxy, base_url, definition)
     }
 }
 

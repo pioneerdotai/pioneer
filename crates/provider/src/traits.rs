@@ -49,7 +49,7 @@ pub trait Provider: Send + Sync {
     ///
     /// Returning `None` is always safe: unknown request rejections are not
     /// retried, while transport/HTTP transient failures are classified by the
-    /// agent's provider-neutral fallback.
+    /// shared provider-neutral fallback before endpoint errors are redacted.
     fn classify_failure(&self, _error: &anyhow::Error) -> Option<ProviderFailureClassification> {
         None
     }

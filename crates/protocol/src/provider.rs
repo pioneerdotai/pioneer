@@ -15,6 +15,18 @@ pub struct ProviderListParams {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderListResponse {
     pub providers: Vec<ProviderSummary>,
+    /// Gateway-owned endpoint definitions, including providers without credentials.
+    #[serde(default)]
+    pub definitions: Vec<ProviderDefinition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ProviderDefinition {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_base_url: Option<String>,
+    #[serde(default)]
+    pub supports_base_url_override: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -24,8 +36,13 @@ pub struct ProviderSummary {
     pub capabilities: ProviderSummaryCapabilities,
     #[serde(default, skip_serializing_if = "is_false")]
     pub api_key_configured: bool,
+    /// The gateway can construct this provider in the selected workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -154,6 +171,10 @@ pub struct ProviderConfigureParams {
     pub proxy_url: Option<String>,
     #[serde(default)]
     pub clear_proxy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub clear_base_url: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -167,6 +188,12 @@ pub struct ProviderConfigureResponse {
     pub proxy_deleted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub base_url_updated: bool,
+    #[serde(default)]
+    pub base_url_deleted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -335,5 +362,46 @@ mod tests {
                 "trusted field leaked into schema: {trusted_field}"
             );
         }
+    }
+
+    #[test]
+    fn provider_summary_and_configure_round_trip_base_url() {
+        let summary: ProviderSummary = serde_json::from_value(json!({
+            "name": "openai",
+            "base_url": "https://api.example.com/v1"
+        }))
+        .expect("summary should decode");
+        assert_eq!(
+            summary.base_url.as_deref(),
+            Some("https://api.example.com/v1")
+        );
+        assert_eq!(summary.available, None);
+        let legacy_list: ProviderListResponse = serde_json::from_value(json!({
+            "providers": [{"name": "openai", "api_key_configured": true}]
+        }))
+        .expect("old gateway list should decode");
+        assert!(legacy_list.definitions.is_empty());
+        assert_eq!(legacy_list.providers[0].available, None);
+
+        let configure: ProviderConfigureParams = serde_json::from_value(json!({
+            "workspace_id": "ws_default",
+            "provider": "openai",
+            "base_url": "https://api.example.com/v1",
+            "clear_base_url": false
+        }))
+        .expect("configure params should decode");
+        assert_eq!(
+            configure.base_url.as_deref(),
+            Some("https://api.example.com/v1")
+        );
+        assert!(!configure.clear_base_url);
+
+        let legacy_configure: ProviderConfigureParams = serde_json::from_value(json!({
+            "workspace_id": "ws_default",
+            "provider": "openai"
+        }))
+        .expect("legacy configure params should decode");
+        assert!(legacy_configure.base_url.is_none());
+        assert!(!legacy_configure.clear_base_url);
     }
 }
