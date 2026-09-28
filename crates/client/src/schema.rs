@@ -270,10 +270,6 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::state::snapshot::ActiveThreadSnapshot
         ),
         schema_doc!(
-            "active_thread_status_snapshot.json",
-            crate::state::snapshot::ActiveThreadStatusSnapshot
-        ),
-        schema_doc!(
             "artifact_action_status.json",
             crate::artifacts::actions::ArtifactActionStatus
         ),

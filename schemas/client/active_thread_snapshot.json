@@ -21,9 +21,6 @@
     "phase": {
       "$ref": "#/$defs/ActiveThreadPhaseSnapshot"
     },
-    "status": {
-      "$ref": "#/$defs/ActiveThreadStatusSnapshot"
-    },
     "thread_id": {
       "type": [
         "string",
@@ -41,8 +38,7 @@
     "is_draft",
     "history_loading",
     "history_loaded",
-    "phase",
-    "status"
+    "phase"
   ],
   "$defs": {
     "ActiveThreadPhaseSnapshot": {
@@ -57,44 +53,6 @@
         "Failed",
         "Blocked",
         "Cancelled"
-      ]
-    },
-    "ActiveThreadStatusSnapshot": {
-      "oneOf": [
-        {
-          "type": "string",
-          "enum": [
-            "GatewayDisconnected",
-            "StartingThread",
-            "FinishingTurn",
-            "PreviousTurnFailed",
-            "TurnCancelled",
-            "TurnCompleted",
-            "Ready",
-            "StartingTurn",
-            "AgentProcessing"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "TurnRunning": {
-              "type": "object",
-              "properties": {
-                "turn_id": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "turn_id"
-              ]
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "TurnRunning"
-          ]
-        }
       ]
     }
   }

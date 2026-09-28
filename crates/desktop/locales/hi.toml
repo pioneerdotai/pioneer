@@ -1428,18 +1428,6 @@ empty_audit = "अभी कोई ऑडिट इवेंट नहीं."
 source = "स्रोत"
 trust = "विश्वास"
 
-[bottom_bar]
-gateway_disconnected = "गेटवे डिस्कनेक्ट है"
-starting_thread = "थ्रेड शुरू हो रहा है..."
-finishing_turn = "टर्न पूरा किया जा रहा है..."
-turn_running = "टर्न `%{turn_id}` चल रहा है"
-previous_turn_failed = "पिछला टर्न विफल हुआ। आप नया संदेश भेज सकते हैं।"
-turn_cancelled = "टर्न रद्द हुआ। आप नया संदेश भेज सकते हैं।"
-turn_completed = "टर्न पूरा हुआ। अगला संदेश भेजने के लिए तैयार।"
-ready = "तैयार"
-starting_turn = "टर्न शुरू हो रहा है..."
-agent_processing = "एजेंट संसाधित कर रहा है..."
-
 [timeline.empty]
 start_thread = "यह थ्रेड शुरू करने के लिए संदेश भेजें"
 

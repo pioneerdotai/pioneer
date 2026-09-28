@@ -1428,18 +1428,6 @@ system = "Системная"
 light = "Светлая"
 dark = "Тёмная"
 
-[bottom_bar]
-gateway_disconnected = "Шлюз отключён"
-starting_thread = "Запуск треда..."
-finishing_turn = "Завершаю ход..."
-turn_running = "Ход `%{turn_id}` выполняется"
-previous_turn_failed = "Предыдущий ход завершился ошибкой. Можно отправить новое сообщение."
-turn_cancelled = "Ход отменён. Можно отправить новое сообщение."
-turn_completed = "Ход завершён. Можно отправить следующее сообщение."
-ready = "Готово"
-starting_turn = "Запуск хода..."
-agent_processing = "Агент обрабатывает..."
-
 [timeline.empty]
 start_thread = "Отправьте сообщение, чтобы начать этот тред"
 

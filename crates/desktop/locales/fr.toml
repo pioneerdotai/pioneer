@@ -1428,18 +1428,6 @@ empty_audit = "Aucun événement d'audit pour le moment."
 source = "Source"
 trust = "Confiance"
 
-[bottom_bar]
-gateway_disconnected = "Passerelle déconnectée"
-starting_thread = "Démarrage du fil..."
-finishing_turn = "Finalisation du tour..."
-turn_running = "Le tour `%{turn_id}` est en cours"
-previous_turn_failed = "Le tour précédent a échoué. Vous pouvez envoyer un nouveau message."
-turn_cancelled = "Tour annulé. Vous pouvez envoyer un nouveau message."
-turn_completed = "Tour terminé. Prêt pour le message suivant."
-ready = "Prêt"
-starting_turn = "Démarrage du tour..."
-agent_processing = "L’agent traite..."
-
 [timeline.empty]
 start_thread = "Envoyez un message pour démarrer ce fil"
 

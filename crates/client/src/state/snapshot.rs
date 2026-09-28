@@ -48,7 +48,6 @@ pub struct ActiveThreadSnapshot {
     pub history_loaded: bool,
     pub in_flight_turn_id: Option<String>,
     pub phase: ActiveThreadPhaseSnapshot,
-    pub status: ActiveThreadStatusSnapshot,
 }
 
 impl Default for ActiveThreadSnapshot {
@@ -61,7 +60,6 @@ impl Default for ActiveThreadSnapshot {
             history_loaded: false,
             in_flight_turn_id: None,
             phase: ActiveThreadPhaseSnapshot::Idle,
-            status: ActiveThreadStatusSnapshot::Ready,
         }
     }
 }
@@ -73,8 +71,6 @@ impl ActiveThreadSnapshot {
         thread_id: Option<&str>,
         coordinator: Option<&ThreadCoordinator>,
         is_draft: bool,
-        gateway_connected: bool,
-        has_in_flight_thread_start: bool,
     ) -> Self {
         let coordinator = coordinator.filter(|_| thread_id.is_some());
         let conversation = coordinator.map(|value| &value.conversation);
@@ -87,12 +83,6 @@ impl ActiveThreadSnapshot {
             in_flight_turn_id: conversation
                 .and_then(|value| value.in_flight_turn_id().map(str::to_owned)),
             phase: selectors::active_thread_phase_snapshot(conversation),
-            status: selectors::active_thread_status_snapshot(
-                gateway_connected,
-                thread_id,
-                has_in_flight_thread_start,
-                conversation,
-            ),
         }
     }
 
@@ -124,21 +114,6 @@ pub enum ActiveThreadPhaseSnapshot {
     Cancelled,
 }
 
-#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub enum ActiveThreadStatusSnapshot {
-    GatewayDisconnected,
-    StartingThread,
-    FinishingTurn,
-    TurnRunning { turn_id: String },
-    PreviousTurnFailed,
-    TurnCancelled,
-    TurnCompleted,
-    Ready,
-    StartingTurn,
-    AgentProcessing,
-}
-
 #[derive(Clone, Copy)]
 pub struct ClientSnapshotInput<'a> {
     pub active_thread_id: Option<&'a str>,
@@ -152,7 +127,6 @@ pub struct ClientSnapshotInput<'a> {
     pub thread_start_in_progress: bool,
     pub pending_thread_id: Option<&'a str>,
     pub coordinators: &'a HashMap<String, ThreadCoordinator>,
-    pub gateway_connected: bool,
 }
 
 impl ClientSnapshot {
@@ -169,7 +143,6 @@ impl ClientSnapshot {
             thread_start_in_progress: state.threads.start.in_progress,
             pending_thread_id: state.threads.start.pending_thread_id.as_deref(),
             coordinators: &state.threads.coordinators,
-            gateway_connected: state.gateway.ws_connection_id.is_some(),
         })
     }
 
@@ -219,8 +192,6 @@ impl ClientSnapshot {
                     .active_thread_id
                     .and_then(|id| input.coordinators.get(id)),
                 input.active_thread_id == input.draft_thread_id,
-                input.gateway_connected,
-                has_in_flight_thread_start,
             ),
             has_in_flight_thread_start,
             has_any_in_flight_turn,
@@ -294,15 +265,11 @@ mod tests {
                 pending_request_id: "request_a".into(),
                 mode: ThreadMode::Agent,
             });
-        let running = ActiveThreadSnapshot::from_coordinator(
-            Some("thread_a"),
-            Some(&coordinator),
-            false,
-            true,
-            false,
-        );
+        let running =
+            ActiveThreadSnapshot::from_coordinator(Some("thread_a"), Some(&coordinator), false);
         assert_eq!(running.phase, ActiveThreadPhaseSnapshot::Running);
         assert!(running.can_request_turn_cancel(true));
+        assert!(!running.can_request_turn_cancel(false));
         assert!(running.history_loading && running.history_loaded);
         coordinator
             .conversation
@@ -310,29 +277,11 @@ mod tests {
                 thread_id: "thread_a".into(),
                 turn_id: "turn_a".into(),
             });
-        let cancelling = ActiveThreadSnapshot::from_coordinator(
-            Some("thread_a"),
-            Some(&coordinator),
-            false,
-            true,
-            false,
-        );
+        let cancelling =
+            ActiveThreadSnapshot::from_coordinator(Some("thread_a"), Some(&coordinator), false);
         assert!(cancelling.is_cancelling_turn());
         assert!(!cancelling.can_request_turn_cancel(true));
-        let disconnected = ActiveThreadSnapshot::from_coordinator(
-            Some("thread_a"),
-            Some(&coordinator),
-            false,
-            false,
-            false,
-        );
-        assert_eq!(
-            disconnected.status,
-            ActiveThreadStatusSnapshot::GatewayDisconnected
-        );
-        let unmounted =
-            ActiveThreadSnapshot::from_coordinator(None, Some(&coordinator), true, true, true);
-        assert_eq!(unmounted.status, ActiveThreadStatusSnapshot::StartingThread);
+        let unmounted = ActiveThreadSnapshot::from_coordinator(None, Some(&coordinator), true);
         assert_eq!(unmounted.workspace_id, None);
         assert!(!unmounted.has_in_flight_turn());
         assert!(!unmounted.is_draft);
@@ -375,7 +324,6 @@ mod tests {
             thread_start_in_progress: false,
             pending_thread_id: None,
             coordinators: &coordinators,
-            gateway_connected: true,
         });
 
         assert_eq!(
@@ -390,10 +338,6 @@ mod tests {
         assert_eq!(
             snapshot.active_thread.phase,
             ActiveThreadPhaseSnapshot::Idle
-        );
-        assert_eq!(
-            snapshot.active_thread.status,
-            ActiveThreadStatusSnapshot::Ready
         );
         assert!(!snapshot.active_thread.has_in_flight_turn());
         assert!(!snapshot.active_thread.can_request_turn_cancel(true));

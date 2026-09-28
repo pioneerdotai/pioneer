@@ -519,13 +519,6 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
-            "active_thread_status_snapshot.json",
-            crate::state::snapshot::ActiveThreadStatusSnapshot,
-            Domain::Root,
-            Kind::Snapshot,
-            Stability::Stable
-        ),
-        contract_type!(
             "activate_gateway_registry_plan.json",
             crate::gateway::setup::ActivateGatewayRegistryPlan,
             Domain::Connection,

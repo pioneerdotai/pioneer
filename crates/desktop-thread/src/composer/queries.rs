@@ -45,8 +45,6 @@ impl ComposerView {
             Some(&self.thread_id),
             thread.as_deref(),
             self.is_draft(),
-            self.connection_state == GatewayConnectionState::Connected,
-            self.client.thread_start_requested(),
         )
     }
     fn is_draft(&self) -> bool {

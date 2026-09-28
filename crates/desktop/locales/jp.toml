@@ -1428,18 +1428,6 @@ empty_audit = "監査イベントはまだありません。"
 source = "ソース"
 trust = "信頼"
 
-[bottom_bar]
-gateway_disconnected = "ゲートウェイは切断されています"
-starting_thread = "スレッドを開始しています..."
-finishing_turn = "ターンを完了しています..."
-turn_running = "ターン `%{turn_id}` は実行中です"
-previous_turn_failed = "前のターンが失敗しました。新しいメッセージを送信できます。"
-turn_cancelled = "ターンはキャンセルされました。新しいメッセージを送信できます。"
-turn_completed = "ターンが完了しました。次のメッセージを送信できます。"
-ready = "準備完了"
-starting_turn = "ターンを開始しています..."
-agent_processing = "エージェントが処理しています..."
-
 [timeline.empty]
 start_thread = "このスレッドを開始するにはメッセージを送信してください"
 

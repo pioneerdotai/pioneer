@@ -1428,18 +1428,6 @@ empty_audit = "尚无审计事件。"
 source = "来源"
 trust = "信任"
 
-[bottom_bar]
-gateway_disconnected = "网关已断开"
-starting_thread = "正在启动线程..."
-finishing_turn = "正在结束回合..."
-turn_running = "回合 `%{turn_id}` 正在运行"
-previous_turn_failed = "上一个回合失败。你可以发送新消息。"
-turn_cancelled = "回合已取消。你可以发送新消息。"
-turn_completed = "回合已完成。可以发送下一条消息。"
-ready = "就绪"
-starting_turn = "正在启动回合..."
-agent_processing = "智能体正在处理..."
-
 [timeline.empty]
 start_thread = "发送消息以开始此线程"
 

@@ -10,7 +10,7 @@ use crate::{
     conversation::{Conversation, state_machine::TurnFlowState},
     state::{
         client_state::{ClientState, ThreadAgentsDocSummaryKey, WorkspaceThreadState},
-        snapshot::{ActiveThreadPhaseSnapshot, ActiveThreadStatusSnapshot},
+        snapshot::ActiveThreadPhaseSnapshot,
     },
     threads::{coordinator::ThreadCoordinator, tree as thread_tree},
     workspaces::selectors as workspace_selectors,
@@ -325,45 +325,6 @@ pub fn active_thread_phase_snapshot(
         Some(TurnFlowState::Blocked { .. }) => ActiveThreadPhaseSnapshot::Blocked,
         Some(TurnFlowState::Cancelled { .. }) => ActiveThreadPhaseSnapshot::Cancelled,
         Some(TurnFlowState::Idle) | None => ActiveThreadPhaseSnapshot::Idle,
-    }
-}
-
-pub fn active_thread_status_snapshot(
-    gateway_connected: bool,
-    active_thread_id: Option<&str>,
-    has_in_flight_thread_start: bool,
-    conversation: Option<&Conversation>,
-) -> ActiveThreadStatusSnapshot {
-    if !gateway_connected {
-        return ActiveThreadStatusSnapshot::GatewayDisconnected;
-    }
-
-    if active_thread_id.is_none() && has_in_flight_thread_start {
-        return ActiveThreadStatusSnapshot::StartingThread;
-    }
-
-    let phase = active_thread_phase_snapshot(conversation);
-
-    if phase == ActiveThreadPhaseSnapshot::Completing {
-        return ActiveThreadStatusSnapshot::FinishingTurn;
-    }
-
-    if let Some(turn_id) = conversation.and_then(Conversation::in_flight_turn_id) {
-        return ActiveThreadStatusSnapshot::TurnRunning {
-            turn_id: turn_id.to_owned(),
-        };
-    }
-
-    match phase {
-        ActiveThreadPhaseSnapshot::Failed => ActiveThreadStatusSnapshot::PreviousTurnFailed,
-        ActiveThreadPhaseSnapshot::Cancelled => ActiveThreadStatusSnapshot::TurnCancelled,
-        ActiveThreadPhaseSnapshot::Completed => ActiveThreadStatusSnapshot::TurnCompleted,
-        ActiveThreadPhaseSnapshot::Starting => ActiveThreadStatusSnapshot::StartingTurn,
-        ActiveThreadPhaseSnapshot::Running => ActiveThreadStatusSnapshot::AgentProcessing,
-        ActiveThreadPhaseSnapshot::Idle
-        | ActiveThreadPhaseSnapshot::Cancelling
-        | ActiveThreadPhaseSnapshot::Completing
-        | ActiveThreadPhaseSnapshot::Blocked => ActiveThreadStatusSnapshot::Ready,
     }
 }
 
@@ -732,22 +693,6 @@ mod tests {
     }
 
     #[test]
-    fn active_thread_status_snapshot_is_ui_neutral() {
-        assert_eq!(
-            active_thread_status_snapshot(false, Some("thread_a"), false, None),
-            ActiveThreadStatusSnapshot::GatewayDisconnected
-        );
-        assert_eq!(
-            active_thread_status_snapshot(true, None, true, None),
-            ActiveThreadStatusSnapshot::StartingThread
-        );
-        assert_eq!(
-            active_thread_status_snapshot(true, None, false, None),
-            ActiveThreadStatusSnapshot::Ready
-        );
-    }
-
-    #[test]
     fn active_thread_phase_snapshot_tracks_turn_lifecycle_without_string_matching() {
         let mut conversation = Conversation::new("thread_a");
         assert_eq!(
@@ -778,13 +723,6 @@ mod tests {
             active_thread_phase_snapshot(Some(&conversation)),
             ActiveThreadPhaseSnapshot::Running
         );
-        assert_eq!(
-            active_thread_status_snapshot(true, Some("thread_a"), false, Some(&conversation)),
-            ActiveThreadStatusSnapshot::TurnRunning {
-                turn_id: "turn_a".to_owned(),
-            }
-        );
-
         conversation.apply(ConversationEvent::LocalTurnCancelRequested {
             thread_id: "thread_a".to_owned(),
             turn_id: "turn_a".to_owned(),

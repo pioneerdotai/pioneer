@@ -105,7 +105,6 @@ impl ThreadView {
         self.composer
             .update(cx, |view, cx| view.set_visible(visible, window, cx));
         self.header.read(cx).set_visible(visible);
-        self.footer.read(cx).set_visible(visible);
         self.panels
             .update(cx, |view, cx| view.set_route_visible(visible, cx));
         if !visible {
@@ -217,15 +216,7 @@ impl ThreadView {
         );
         let panels =
             cx.new(|cx| ThreadSidePanelHostView::new(layout.clone(), artifacts, members, cx));
-        let footer = cx.new(|cx| {
-            ThreadFooterView::new(
-                config.client.clone(),
-                config.thread_id.clone(),
-                config.registrar.clone(),
-                layout.clone(),
-                cx,
-            )
-        });
+        let footer = cx.new(|cx| ThreadFooterView::new(layout.clone(), cx));
         cx.new(|cx: &mut Context<Self>| {
             let subscriptions = vec![
                 cx.observe_in(&layout, window, |view, _, window, cx| {

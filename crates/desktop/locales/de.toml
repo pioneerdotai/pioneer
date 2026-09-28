@@ -1428,18 +1428,6 @@ empty_audit = "Noch keine Prüfereignisse."
 source = "Quelle"
 trust = "Vertrauen"
 
-[bottom_bar]
-gateway_disconnected = "Gateway ist getrennt"
-starting_thread = "Thread wird gestartet..."
-finishing_turn = "Durchlauf wird abgeschlossen..."
-turn_running = "Durchlauf `%{turn_id}` läuft"
-previous_turn_failed = "Der vorherige Durchlauf ist fehlgeschlagen. Du kannst eine neue Nachricht senden."
-turn_cancelled = "Durchlauf abgebrochen. Du kannst eine neue Nachricht senden."
-turn_completed = "Durchlauf abgeschlossen. Bereit für die nächste Nachricht."
-ready = "Bereit"
-starting_turn = "Durchlauf wird gestartet..."
-agent_processing = "Agent verarbeitet..."
-
 [timeline.empty]
 start_thread = "Sende eine Nachricht, um diesen Thread zu starten"
 

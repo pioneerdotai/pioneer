@@ -1428,18 +1428,6 @@ empty_audit = "Aún no hay eventos de auditoría."
 source = "Fuente"
 trust = "Confianza"
 
-[bottom_bar]
-gateway_disconnected = "Pasarela desconectada"
-starting_thread = "Iniciando hilo..."
-finishing_turn = "Finalizando turno..."
-turn_running = "El turno `%{turn_id}` está en ejecución"
-previous_turn_failed = "El turno anterior falló. Puedes enviar un nuevo mensaje."
-turn_cancelled = "Turno cancelado. Puedes enviar un nuevo mensaje."
-turn_completed = "Turno completado. Listo para el siguiente mensaje."
-ready = "Listo"
-starting_turn = "Iniciando turno..."
-agent_processing = "El agente está procesando..."
-
 [timeline.empty]
 start_thread = "Envía un mensaje para iniciar este hilo"
 
