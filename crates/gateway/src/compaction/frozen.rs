@@ -5329,8 +5329,19 @@ async fn restore_entry_from_payloads(
             if let Some(message) = super::history::pre_commentary_event_message(event.clone())? {
                 candidates.push(FrozenModelCandidate::exact(message));
             }
+            if let Some(message) = super::history::pre_service_filter_event_message(event.clone())?
+            {
+                candidates.push(FrozenModelCandidate::exact(message));
+            }
             if let Some(message) =
                 super::history::pre_commentary_event_message_suppressing_input_copy_media(
+                    event.clone(),
+                )?
+            {
+                candidates.push(FrozenModelCandidate::exact(message));
+            }
+            if let Some(message) =
+                super::history::pre_service_filter_event_message_suppressing_input_copy_media(
                     event.clone(),
                 )?
             {

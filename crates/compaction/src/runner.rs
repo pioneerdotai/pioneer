@@ -10,6 +10,9 @@ pub const PORTABLE_CONTEXT_SOURCE_TEXT_PROJECTION_VERSION: u32 = 2;
 pub const PORTABLE_TASK_BASIS_SOURCE_TEXT_PROJECTION_VERSION: u32 = 3;
 /// Adds typed commentary projection while preserving every earlier cursor representation.
 pub const COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION: u32 = 4;
+/// Excludes service events from newly admitted material. Existing operations
+/// keep their v0-v4 manifest and cursor semantics for their whole lifetime.
+pub const SERVICE_EVENT_SOURCE_TEXT_PROJECTION_VERSION: u32 = 5;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SourceCursor {
@@ -149,7 +152,7 @@ impl RunnerState {
             retries: 0,
             corrections: 0,
             target_tokens,
-            source_text_projection_version: COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION,
+            source_text_projection_version: SERVICE_EVENT_SOURCE_TEXT_PROJECTION_VERSION,
             cursor: SourceCursor::default(),
             previous_checkpoint,
             phase: RunnerPhase::Ready {

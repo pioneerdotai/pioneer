@@ -28,7 +28,8 @@ pub use events::{
 };
 pub use model_history::{
     CanonicalEventModelProjection, canonical_event_model_projection,
-    canonical_item_model_projection, portable_commentary_text,
+    canonical_event_model_projection_before_service_filter, canonical_item_model_projection,
+    canonical_item_model_projection_before_service_filter, portable_commentary_text,
 };
 pub use repositories::administrative_audit::{
     NewAdministrativeAuditEvent, audit_action_to_db, audit_domain_to_db, audit_target_kind_to_db,
