@@ -80,6 +80,8 @@ struct RetainedProviderHistoryRow {
     sequence: i64,
     source: String,
     item_id: Option<String>,
+    // Retained only so test fixtures can reinsert the original context rows.
+    #[cfg(test)]
     tool_name: Option<String>,
     payload: String,
 }
@@ -3903,6 +3905,7 @@ impl RecoveryCoordinator {
                     sequence: row.sequence,
                     source: row.source_type,
                     item_id: row.item_id,
+                    #[cfg(test)]
                     tool_name: row.tool_name,
                     payload,
                 });

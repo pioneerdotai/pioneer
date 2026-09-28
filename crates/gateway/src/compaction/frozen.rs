@@ -3142,6 +3142,8 @@ async fn restore_frozen_excluding_coverage(
 /// rewritten and literal `restore` retains its original contract.
 struct RestoredExecutionBasis {
     messages: Vec<ChatMessage>,
+    // Source accounting is inspected by restoration regression tests only.
+    #[cfg(test)]
     direct_sources: Vec<ScopedHistorySource>,
     excluded_following: BTreeSet<usize>,
     retained_imports: Vec<RetainedAcceptedImports>,
@@ -4221,11 +4223,14 @@ async fn restore_accepted_execution_basis_prepared(
             "changed accepted source has no complete current projection"
         );
     }
-    let mut direct_sources = BTreeSet::new();
-    direct_sources.extend(projections.iter().map(|projection| ScopedHistorySource {
-        thread: projection.source_thread.clone(),
-        source: projection.checkpoint_source.clone(),
-    }));
+    #[cfg(test)]
+    let mut direct_sources = projections
+        .iter()
+        .map(|projection| ScopedHistorySource {
+            thread: projection.source_thread.clone(),
+            source: projection.checkpoint_source.clone(),
+        })
+        .collect::<BTreeSet<_>>();
     let mut messages = Vec::with_capacity(retained.len().saturating_add(projections.len()));
     let mut original_ordinals = Vec::with_capacity(retained.len());
     let proof_references = references
@@ -4276,19 +4281,21 @@ async fn restore_accepted_execution_basis_prepared(
             restored.len() == page.len(),
             "frozen history count mismatch"
         );
-        for ((ordinal, reference), message) in page.iter().zip(restored) {
+        for ((ordinal, _reference), message) in page.iter().zip(restored) {
             let Some(message) = message else {
                 continue;
             };
-            direct_sources.extend(reference.sources.iter().cloned().map(|source| {
+            #[cfg(test)]
+            direct_sources.extend(_reference.sources.iter().cloned().map(|source| {
                 ScopedHistorySource {
-                    thread: reference.source_thread.clone(),
+                    thread: _reference.source_thread.clone(),
                     source,
                 }
             }));
-            direct_sources.extend(reference.replay_source.iter().cloned().map(|source| {
+            #[cfg(test)]
+            direct_sources.extend(_reference.replay_source.iter().cloned().map(|source| {
                 ScopedHistorySource {
-                    thread: reference.source_thread.clone(),
+                    thread: _reference.source_thread.clone(),
                     source,
                 }
             }));
@@ -4343,7 +4350,7 @@ async fn restore_accepted_execution_basis_prepared(
                 .map(move |message| (anchor, message))
         }))
         .collect::<Vec<_>>();
-    let mut direct_sources = direct_sources;
+    #[cfg(test)]
     for (_, message) in &retained {
         if let Some(origin) = message.provenance.as_ref() {
             direct_sources.extend(origin.sources.iter().cloned().map(|source| {
@@ -4428,6 +4435,7 @@ async fn restore_accepted_execution_basis_prepared(
     }
     Ok(RestoredExecutionBasis {
         messages: order_execution_projection(retained, replacements),
+        #[cfg(test)]
         direct_sources: direct_sources.into_iter().collect(),
         excluded_following,
         retained_imports,
@@ -4473,11 +4481,14 @@ fn order_execution_projection_entries(
 /// before raw payload reads.
 pub(crate) struct RestoredAcceptedHistory {
     pub(crate) messages: Vec<ChatMessage>,
+    /// Manifest ownership exposed for restoration assertions.
+    #[cfg(test)]
     pub(crate) manifest_owner: Option<String>,
     /// Exact canonical sources visible to this execution projection. This is
     /// deliberately distinct from the immutable accepted boundary: a later
     /// compatible checkpoint can replace covered raw entries without changing
     /// the TaskRun/runtime snapshot that granted access to them.
+    #[cfg(test)]
     pub(crate) direct_sources: Vec<ScopedHistorySource>,
 }
 
@@ -4495,7 +4506,9 @@ pub(crate) async fn restore_accepted_history_for_execution(
                 .context("invalid legacy conversation history")?,
             // Legacy arrays have no immutable direct-reference proof and are
             // therefore never eligible for a provider continuity receipt.
+            #[cfg(test)]
             direct_sources: Vec::new(),
+            #[cfg(test)]
             manifest_owner: None,
         });
     }
@@ -4530,11 +4543,13 @@ pub(crate) async fn restore_accepted_history_for_execution(
             .await?;
         return Ok(RestoredAcceptedHistory {
             messages: restored.messages,
+            #[cfg(test)]
             direct_sources: restored.direct_sources,
+            #[cfg(test)]
             manifest_owner: Some(owner.to_owned()),
         });
     }
-    let (messages, direct_sources) = if let Some(owner) = owner.as_deref() {
+    if let Some(owner) = owner.as_deref() {
         restore_accepted_execution_projection_without_checkpoint(
             store,
             workspace,
@@ -4543,19 +4558,20 @@ pub(crate) async fn restore_accepted_history_for_execution(
             &descriptor,
             None,
         )
-        .await?
+        .await
     } else {
         // Preserve the established missing-manifest diagnostic. There is no
         // owner to substitute with the execution thread or to authorize a
         // typed execution projection.
         let messages = restore(store, workspace, allowed, &descriptor).await?;
-        (messages, Vec::new())
-    };
-    Ok(RestoredAcceptedHistory {
-        messages,
-        direct_sources,
-        manifest_owner: owner,
-    })
+        Ok(RestoredAcceptedHistory {
+            messages,
+            #[cfg(test)]
+            direct_sources: Vec::new(),
+            #[cfg(test)]
+            manifest_owner: None,
+        })
+    }
 }
 
 /// Project the exact snapshot won by insert-if-absent for execution. The
@@ -4574,7 +4590,7 @@ pub(crate) async fn restore_accepted_snapshot_for_execution_without_checkpoint(
     let descriptor: FrozenHistoryRef = serde_json::from_str(history_json)?;
     let mut allowed = accepted_history_scopes(store, workspace, parent, history_json).await?;
     allowed.insert(execution_thread.to_owned());
-    let (messages, _) = restore_accepted_execution_projection_without_checkpoint(
+    let restored = restore_accepted_execution_projection_without_checkpoint(
         store,
         workspace,
         parent,
@@ -4583,7 +4599,7 @@ pub(crate) async fn restore_accepted_snapshot_for_execution_without_checkpoint(
         Some(execution_thread),
     )
     .await?;
-    Ok(messages)
+    Ok(restored.messages)
 }
 
 async fn restore_accepted_execution_projection_without_checkpoint(
@@ -4593,7 +4609,7 @@ async fn restore_accepted_execution_projection_without_checkpoint(
     allowed: &BTreeSet<String>,
     descriptor: &FrozenHistoryRef,
     execution_thread: Option<&str>,
-) -> Result<(Vec<ChatMessage>, Vec<ScopedHistorySource>)> {
+) -> Result<RestoredAcceptedHistory> {
     let (_, references) =
         frozen_manifest_references(store, workspace, Some(owner), descriptor, Some(allowed))
             .await?;
@@ -4617,6 +4633,7 @@ async fn restore_accepted_execution_projection_without_checkpoint(
     )
     .await?;
     let mut messages = Vec::with_capacity(references.len());
+    #[cfg(test)]
     let mut direct_sources = BTreeSet::new();
     for (page_index, page) in references
         .chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize)
@@ -4636,7 +4653,7 @@ async fn restore_accepted_execution_projection_without_checkpoint(
             "frozen history count mismatch"
         );
         let page_start = page_index * pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize;
-        for (page_ordinal, (reference, message)) in page.iter().zip(restored).enumerate() {
+        for (page_ordinal, (_reference, message)) in page.iter().zip(restored).enumerate() {
             let Some(mut message) = message else {
                 continue;
             };
@@ -4649,22 +4666,30 @@ async fn restore_accepted_execution_projection_without_checkpoint(
                     execution_thread,
                 )?;
             }
-            direct_sources.extend(reference.sources.iter().cloned().map(|source| {
+            #[cfg(test)]
+            direct_sources.extend(_reference.sources.iter().cloned().map(|source| {
                 ScopedHistorySource {
-                    thread: reference.source_thread.clone(),
+                    thread: _reference.source_thread.clone(),
                     source,
                 }
             }));
-            direct_sources.extend(reference.replay_source.iter().cloned().map(|source| {
+            #[cfg(test)]
+            direct_sources.extend(_reference.replay_source.iter().cloned().map(|source| {
                 ScopedHistorySource {
-                    thread: reference.source_thread.clone(),
+                    thread: _reference.source_thread.clone(),
                     source,
                 }
             }));
             messages.push(message);
         }
     }
-    Ok((messages, direct_sources.into_iter().collect()))
+    Ok(RestoredAcceptedHistory {
+        messages,
+        #[cfg(test)]
+        direct_sources: direct_sources.into_iter().collect(),
+        #[cfg(test)]
+        manifest_owner: Some(owner.to_owned()),
+    })
 }
 
 pub(crate) async fn frozen_history_direct_sources(

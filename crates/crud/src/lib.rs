@@ -187,7 +187,7 @@ pub use repositories::user_notification_outbox::{
     insert_task_notification_idempotent, list_user_notifications_for_recipient,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactBindingSummary, ArtifactProjectionKind,
     ArtifactProjectionStatus, ArtifactRole, ArtifactStatus, ArtifactSummary, GatewayId,
@@ -11814,7 +11814,7 @@ impl CrudStore {
                     .filter(pioneer_entity::turn::Column::Id.eq(turn_id))
                     .exec(&transaction)
                     .await?;
-                ensure!(updated.rows_affected == 1, "replacement Turn is missing");
+                anyhow::ensure!(updated.rows_affected == 1, "replacement Turn is missing");
                 transaction.commit().await?;
                 Ok(())
             }

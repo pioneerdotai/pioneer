@@ -27,7 +27,6 @@ pub(crate) use background_history::{HistoryCheckDeadline, prepare_completed_hist
 pub(crate) use background_history::{
     observe_completed_history_preflight, prepare_completed_history,
 };
-pub(crate) use history::provider_observation;
 #[cfg(test)]
 pub(crate) use history::{event_message, load_line_history, load_task_line_history};
 #[cfg(test)]
