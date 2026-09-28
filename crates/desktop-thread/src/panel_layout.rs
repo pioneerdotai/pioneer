@@ -144,11 +144,6 @@ impl Render for ThreadPanelControlsView {
         let layout = self.layout.read(cx);
         let artifacts = layout.is_visible(ThreadPanelKind::Artifacts);
         let members = layout.is_visible(ThreadPanelKind::Members);
-        let artifact_icon = if artifacts {
-            IconName::PanelRightClose
-        } else {
-            IconName::PanelRightOpen
-        };
         h_flex()
             .items_center()
             .gap_1()
@@ -182,7 +177,7 @@ impl Render for ThreadPanelControlsView {
                     .compact()
                     .tooltip(t!("artifacts.title").to_string())
                     .child(
-                        Icon::new(artifact_icon)
+                        Icon::new(IconName::File)
                             .size_3p5()
                             .opacity(0.6)
                             .when(artifacts, |icon| {
