@@ -55,8 +55,10 @@ pub use super::compaction_delivery_output::Entity as CompactionDeliveryOutput;
 pub use super::compaction_event_revision::Entity as CompactionEventRevision;
 pub use super::compaction_execution_stop::Entity as CompactionExecutionStop;
 pub use super::compaction_frozen_history::Entity as CompactionFrozenHistory;
-pub use super::compaction_frozen_import::Entity as CompactionFrozenImport;
-pub use super::compaction_frozen_message::Entity as CompactionFrozenMessage;
+pub use super::compaction_frozen_import_data::Entity as CompactionFrozenImportData;
+pub use super::compaction_frozen_layout::Entity as CompactionFrozenLayout;
+pub use super::compaction_frozen_message_data::Entity as CompactionFrozenMessageData;
+pub use super::compaction_frozen_span::Entity as CompactionFrozenSpan;
 pub use super::compaction_history_check::Entity as CompactionHistoryCheck;
 pub use super::compaction_history_preparation::Entity as CompactionHistoryPreparation;
 pub use super::compaction_input_revision::Entity as CompactionInputRevision;
@@ -65,6 +67,8 @@ pub use super::compaction_manifest::Entity as CompactionManifest;
 pub use super::compaction_operation::Entity as CompactionOperation;
 pub use super::compaction_operation_projection::Entity as CompactionOperationProjection;
 pub use super::compaction_projection_epoch::Entity as CompactionProjectionEpoch;
+pub use super::compaction_publication_fence::Entity as CompactionPublicationFence;
+pub use super::compaction_publication_source_fence::Entity as CompactionPublicationSourceFence;
 pub use super::compaction_runner_plan::Entity as CompactionRunnerPlan;
 pub use super::compaction_runner_state::Entity as CompactionRunnerState;
 pub use super::compaction_source_revision::Entity as CompactionSourceRevision;
@@ -147,6 +151,7 @@ pub use super::thread_read_cursor::Entity as ThreadReadCursor;
 pub use super::thread_sandox_policy::Entity as ThreadSandoxPolicy;
 pub use super::thread_timeline_block::Entity as ThreadTimelineBlock;
 pub use super::thread_timeline_projection_meta::Entity as ThreadTimelineProjectionMeta;
+pub use super::tool_output_chunk::Entity as ToolOutputChunk;
 pub use super::turn::Entity as Turn;
 pub use super::turn_admission::Entity as TurnAdmission;
 pub use super::turn_cli_runtime_attempt::Entity as TurnCliRuntimeAttempt;
@@ -178,13 +183,3 @@ pub use super::turn_work_projection::Entity as TurnWorkProjection;
 pub use super::user_notification_outbox::Entity as UserNotificationOutbox;
 pub use super::workspace::Entity as Workspace;
 pub use super::workspace_membership::Entity as WorkspaceMembership;
-
-pub use super::tool_output_chunk::Entity as ToolOutputChunk;
-
-pub use super::compaction_frozen_message_data::Entity as CompactionFrozenMessageData;
-
-pub use super::compaction_frozen_import_data::Entity as CompactionFrozenImportData;
-
-pub use super::compaction_frozen_layout::Entity as CompactionFrozenLayout;
-
-pub use super::compaction_frozen_span::Entity as CompactionFrozenSpan;

@@ -66,6 +66,8 @@ pub struct Model {
     pub native_terminal_effect_outboxes: HasMany<super::native_terminal_effect_outbox::Entity>,
     #[sea_orm(has_many)]
     pub thread_read_cursors: HasMany<super::thread_read_cursor::Entity>,
+    #[sea_orm(has_many)]
+    pub tool_output_chunks: HasMany<super::tool_output_chunk::Entity>,
     #[sea_orm(
         self_ref,
         relation_enum = "SelfRef",

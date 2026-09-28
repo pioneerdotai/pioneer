@@ -2,14 +2,16 @@
 //! Preparation decodes reference metadata outside database capacity. Publication
 //! is fenced by the manifest's declared import count and independent digest.
 use super::compaction::*;
+use super::compaction_frozen_views::{
+    import as compaction_frozen_import, message as compaction_frozen_message,
+};
 use crate::CrudStore;
 use anyhow::{Result, ensure};
 use pioneer_compaction::SourceRef;
 use pioneer_compaction::frozen::FrozenMessageRef;
 use pioneer_entity::{
     compaction_delivery_output, compaction_event_revision, compaction_frozen_history,
-    compaction_frozen_import, compaction_frozen_message, compaction_task_output, task_delivery,
-    turn_event,
+    compaction_frozen_import_data, compaction_task_output, task_delivery, turn_event,
 };
 use sea_orm::sea_query::{Alias, BinOper, Expr, ExprTrait, JoinType, OnConflict};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
@@ -1367,8 +1369,8 @@ pub(crate) async fn compaction_append_frozen_imports(
                 let source =
                     super::compaction_frozen_storage::append_source(&tx, manifest, 1, *ordinal)
                         .await?;
-                pioneer_entity::compaction_frozen_import_data::Entity::insert(
-                    pioneer_entity::compaction_frozen_import_data::ActiveModel {
+                compaction_frozen_import_data::Entity::insert(
+                    compaction_frozen_import_data::ActiveModel {
                         manifest_id: sea_orm::Set(source),
                         ordinal: sea_orm::Set(*ordinal),
                         message_ordinal: sea_orm::Set(i64::try_from(record.message_ordinal)?),
@@ -1382,8 +1384,8 @@ pub(crate) async fn compaction_append_frozen_imports(
                 )
                 .on_conflict(
                     OnConflict::columns([
-                        compaction_frozen_import::Column::ManifestId,
-                        compaction_frozen_import::Column::Ordinal,
+                        compaction_frozen_import_data::Column::ManifestId,
+                        compaction_frozen_import_data::Column::Ordinal,
                     ])
                     .do_nothing()
                     .to_owned(),

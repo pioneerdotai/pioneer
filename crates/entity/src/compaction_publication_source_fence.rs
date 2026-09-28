@@ -5,17 +5,12 @@ use serde::{Deserialize, Serialize};
 
 #[sea_orm::model]
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
-#[sea_orm(table_name = "native_event_cleanup_job")]
+#[sea_orm(table_name = "compaction_publication_source_fence")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub turn_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub state: String,
-    pub available_at: i64,
-    pub last_served_at: i64,
-    pub revision: i64,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub last_error: Option<String>,
+    pub workspace_id: String,
+    pub mutation_generation: i64,
+    pub insert_generation: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}
