@@ -9,16 +9,20 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use futures_util::stream::BoxStream;
+use futures_util::{StreamExt, stream::BoxStream};
 use sha2::{Digest, Sha256};
 
 use crate::factory::create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority;
+use crate::failure::{
+    classify_http_error_body_too_large, classify_provider_failure_class, extract_provider_code,
+    extract_retry_after_ms,
+};
 use crate::traits::{Provider, ProviderWarmupOutcome};
 use crate::types::{
     ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, ProviderCapabilities,
     ProviderFailureClassification, ProviderTimeoutPolicy, StreamChunk,
 };
-use pioneer_protocol::ProviderModelInfo;
+use pioneer_protocol::{ProviderFailureClass, ProviderFailureStage, ProviderModelInfo};
 
 const PROVIDER_AUTHORITY_FINGERPRINT_VERSION: &str = "pioneer-provider-authority-v1";
 const DEFAULT_PROVIDER_CACHE_MAX_ENTRIES: usize = 256;
@@ -149,6 +153,97 @@ struct AuthorityBoundProvider {
     inner: Arc<dyn Provider>,
     authority_fingerprint: ProviderAuthorityFingerprint,
     revoked: Arc<AtomicBool>,
+    redact_endpoint_errors: bool,
+}
+
+/// The request's endpoint can contain a secret path. Never retain a raw
+/// adapter/transport error in an error returned from that provider instance.
+#[derive(Debug)]
+struct RedactedEndpointError {
+    message: &'static str,
+    classification: ProviderFailureClassification,
+}
+
+impl Display for RedactedEndpointError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self.classification.http_status {
+            Some(status) => write!(f, "{} (HTTP {status})", self.message),
+            None => f.write_str(self.message),
+        }
+    }
+}
+
+impl Error for RedactedEndpointError {}
+
+fn endpoint_error_status(error: &anyhow::Error) -> Option<u16> {
+    if let Some(status) = error.downcast_ref::<crate::types::ProviderHttpErrorBodyTooLarge>() {
+        return Some(status.status);
+    }
+    for cause in error.chain() {
+        if let Some(request) = cause.downcast_ref::<reqwest::Error>()
+            && let Some(status) = request.status()
+        {
+            return Some(status.as_u16());
+        }
+    }
+    // The supported adapters format non-success responses as `API error
+    // (429 Too Many Requests): ...`. Parse only that fixed prefix, never an
+    // arbitrary three-digit sequence in a provider-controlled body or URL.
+    let message = format!("{error:#}");
+    let rest = message.split_once("API error (")?.1;
+    let status = rest.get(..3)?.parse::<u16>().ok()?;
+    (100..600).contains(&status).then_some(status)
+}
+
+fn redacted_endpoint_error(
+    inner: &dyn Provider,
+    error: anyhow::Error,
+    stage: ProviderFailureStage,
+) -> anyhow::Error {
+    if error.is::<RedactedEndpointError>() {
+        return error;
+    }
+    // Adapters can supply structured status even when their error does not
+    // contain a reqwest source or the usual `API error (...)` prefix.
+    let adapter_classification = inner.classify_failure(&error);
+    let status = adapter_classification
+        .as_ref()
+        .and_then(|classification| classification.http_status)
+        .or_else(|| endpoint_error_status(&error));
+    let is_network = error.chain().any(|cause| cause.is::<reqwest::Error>());
+    let raw_message = format!("{error:#}");
+    let lower = raw_message.to_ascii_lowercase();
+    let provider_code = extract_provider_code(&raw_message);
+    let mut class =
+        classify_provider_failure_class(&lower, stage, status, provider_code.as_deref());
+    if let Some(oversized) = error.downcast_ref::<crate::types::ProviderHttpErrorBodyTooLarge>() {
+        class = classify_http_error_body_too_large(oversized.status).class;
+    } else if error.is::<crate::types::ProviderResponseTooLarge>() {
+        class = ProviderFailureClass::ProviderRejected;
+    } else if class == ProviderFailureClass::Unknown && is_network {
+        class = ProviderFailureClass::NetworkTransient;
+    }
+    let mut classification =
+        adapter_classification.unwrap_or_else(|| ProviderFailureClassification::new(class));
+    classification.http_status = classification.http_status.or(status);
+    // `retry-after` is useful for recovery. Retain only the numeric interval.
+    classification.retry_after_ms = classification
+        .retry_after_ms
+        .or_else(|| extract_retry_after_ms(&lower));
+    // Provider-supplied codes may themselves contain the endpoint path.
+    classification.provider_code = None;
+    let message = if is_network {
+        "provider network request failed"
+    } else if status.is_some() {
+        "provider HTTP request failed"
+    } else {
+        "provider request failed"
+    };
+    RedactedEndpointError {
+        message,
+        classification,
+    }
+    .into()
 }
 
 impl AuthorityBoundProvider {
@@ -157,6 +252,16 @@ impl AuthorityBoundProvider {
             return Err(ProviderAuthorityRevoked.into());
         }
         Ok(())
+    }
+
+    fn public_result<T>(&self, result: Result<T>) -> Result<T> {
+        if self.redact_endpoint_errors {
+            result.map_err(|error| {
+                redacted_endpoint_error(self.inner.as_ref(), error, ProviderFailureStage::Connect)
+            })
+        } else {
+            result
+        }
     }
 }
 
@@ -182,6 +287,9 @@ impl Provider for AuthorityBoundProvider {
     }
 
     fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
+        if let Some(redacted) = error.downcast_ref::<RedactedEndpointError>() {
+            return Some(redacted.classification.clone());
+        }
         self.inner.classify_failure(error)
     }
 
@@ -190,20 +298,24 @@ impl Provider for AuthorityBoundProvider {
         request: ChatRequest,
     ) -> Result<crate::attachments::PreparedInputBudget> {
         self.ensure_not_revoked()?;
-        crate::attachments::runtime::with_async_authority_scope(
-            self.authority_fingerprint.as_str().to_owned(),
-            self.inner.prepare_input_budget(request),
+        self.public_result(
+            crate::attachments::runtime::with_async_authority_scope(
+                self.authority_fingerprint.as_str().to_owned(),
+                self.inner.prepare_input_budget(request),
+            )
+            .await,
         )
-        .await
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         self.ensure_not_revoked()?;
-        crate::attachments::runtime::with_async_authority_scope(
-            self.authority_fingerprint.as_str().to_owned(),
-            self.inner.chat(request),
+        self.public_result(
+            crate::attachments::runtime::with_async_authority_scope(
+                self.authority_fingerprint.as_str().to_owned(),
+                self.inner.chat(request),
+            )
+            .await,
         )
-        .await
     }
 
     async fn stream_chat(
@@ -211,39 +323,51 @@ impl Provider for AuthorityBoundProvider {
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
         self.ensure_not_revoked()?;
-        crate::attachments::runtime::with_async_authority_scope(
-            self.authority_fingerprint.as_str().to_owned(),
-            self.inner.stream_chat(request),
-        )
-        .await
+        let stream = self.public_result(
+            crate::attachments::runtime::with_async_authority_scope(
+                self.authority_fingerprint.as_str().to_owned(),
+                self.inner.stream_chat(request),
+            )
+            .await,
+        )?;
+        if self.redact_endpoint_errors {
+            let inner = self.inner.clone();
+            Ok(Box::pin(stream.map(move |result| {
+                result.map_err(|error| {
+                    redacted_endpoint_error(inner.as_ref(), error, ProviderFailureStage::MidStream)
+                })
+            })))
+        } else {
+            Ok(stream)
+        }
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
         self.ensure_not_revoked()?;
         let catalog = crate::catalog::model_catalog()?;
-        let mut models = self.inner.list_models().await?;
+        let mut models = self.public_result(self.inner.list_models().await)?;
         catalog.enrich(self.inner.name(), &mut models);
         Ok(models)
     }
 
     async fn list_embedding_models(&self) -> Result<Vec<ProviderModelInfo>> {
         self.ensure_not_revoked()?;
-        self.inner.list_embedding_models().await
+        self.public_result(self.inner.list_embedding_models().await)
     }
 
     async fn list_transcription_models(&self) -> Result<Vec<ProviderModelInfo>> {
         self.ensure_not_revoked()?;
-        self.inner.list_transcription_models().await
+        self.public_result(self.inner.list_transcription_models().await)
     }
 
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
         self.ensure_not_revoked()?;
-        self.inner.embed(request).await
+        self.public_result(self.inner.embed(request).await)
     }
 
     async fn warmup(&self) -> Result<ProviderWarmupOutcome> {
         self.ensure_not_revoked()?;
-        self.inner.warmup().await
+        self.public_result(self.inner.warmup().await)
     }
 }
 
@@ -620,6 +744,7 @@ impl ProviderRegistry {
             inner: provider,
             authority_fingerprint,
             revoked: revoked.clone(),
+            redact_endpoint_errors: base_url.is_some(),
         });
         if !cache.make_room_for_insert(self.limits.max_cached_instances) {
             return Err(ProviderRegistryCapacityExceeded {
@@ -741,6 +866,7 @@ impl ProviderRegistry {
             inner: provider,
             authority_fingerprint: authority_fingerprint.clone(),
             revoked: revoked.clone(),
+            redact_endpoint_errors: false,
         });
         cache.prune_expired(now, self.limits.idle_ttl);
         if cache.make_room_for_insert(self.limits.max_cached_instances) {
@@ -879,7 +1005,9 @@ impl ProviderRegistry {
 }
 
 fn normalize_provider_name(provider_name: &str) -> String {
-    provider_name.trim().to_ascii_lowercase()
+    crate::definition::provider_definition(provider_name)
+        .map(|definition| definition.name.to_owned())
+        .unwrap_or_else(|| provider_name.trim().to_ascii_lowercase())
 }
 
 /// Create a registry with a single pre-seeded provider. For tests.
@@ -1596,28 +1724,507 @@ mod tests {
         assert!(!cache_debug.contains(PROXY));
     }
 
-    #[test]
-    fn cache_identity_incorporates_custom_base_url() {
+    #[tokio::test]
+    async fn cache_identity_incorporates_custom_base_url() {
+        for name in ["openai", "ollama"] {
+            let endpoint = Arc::new(Mutex::new(None::<String>));
+            let registry =
+                ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+                    |_, _| Ok("sk-key".to_owned()),
+                    |_, _| Ok(None),
+                    {
+                        let endpoint = endpoint.clone();
+                        move |workspace, _| {
+                            Ok(if workspace == Some("ws_a") {
+                                endpoint.lock().expect("endpoint lock").clone()
+                            } else {
+                                None
+                            })
+                        }
+                    },
+                    ProviderTimeoutPolicy::default(),
+                );
+            let old_a = registry.get_or_create_for_workspace("ws_a", name).unwrap();
+            let b = registry.get_or_create_for_workspace("ws_b", name).unwrap();
+            let fp_default = registry
+                .authority_fingerprint_for_workspace("ws_a", name)
+                .expect("default fingerprint");
+            *endpoint.lock().expect("endpoint lock") = Some("https://custom.api.com/v1".to_owned());
+            let fp_custom = registry
+                .authority_fingerprint_for_workspace("ws_a", name)
+                .expect("custom fingerprint");
+            assert_ne!(fp_default, fp_custom);
+            let revoked = old_a
+                .chat(chat_request())
+                .await
+                .expect_err("old authority revoked");
+            assert!(revoked.downcast_ref::<ProviderAuthorityRevoked>().is_some());
+            assert!(Arc::ptr_eq(
+                &b,
+                &registry.get_or_create_for_workspace("ws_b", name).unwrap()
+            ));
+            let new_a = registry.get_or_create_for_workspace("ws_a", name).unwrap();
+            assert_eq!(new_a.authority_fingerprint(), Some(fp_custom.as_str()));
+            *endpoint.lock().expect("endpoint lock") = None;
+            let fp_reset = registry
+                .authority_fingerprint_for_workspace("ws_a", name)
+                .expect("reset fingerprint");
+            assert_eq!(
+                fp_reset, fp_default,
+                "{name} reset must select default authority"
+            );
+            let reset_a = registry.get_or_create_for_workspace("ws_a", name).unwrap();
+            assert_eq!(reset_a.authority_fingerprint(), Some(fp_default.as_str()));
+            let revoked = new_a
+                .chat(chat_request())
+                .await
+                .expect_err("updated authority revoked");
+            assert!(revoked.downcast_ref::<ProviderAuthorityRevoked>().is_some());
+            assert!(Arc::ptr_eq(
+                &b,
+                &registry.get_or_create_for_workspace("ws_b", name).unwrap()
+            ));
+            assert_eq!(registry.invalidate_workspace_provider("ws_a", name), 1);
+            assert!(Arc::ptr_eq(
+                &b,
+                &registry.get_or_create_for_workspace("ws_b", name).unwrap()
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_base_urls_route_real_requests_to_their_own_servers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn server(body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/gateway/v1/", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = vec![0u8; 8192];
+                let count = stream.read(&mut bytes).await.unwrap();
+                let line = String::from_utf8_lossy(&bytes[..count])
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_owned();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                line
+            });
+            (url, task)
+        }
+
+        for (name, body, expected_path) in [
+            (
+                "vllm",
+                r#"{"choices":[{"message":{"content":"fixture reply"}}]}"#,
+                "POST /gateway/v1/chat/completions HTTP/1.1",
+            ),
+            (
+                "ollama",
+                r#"{"message":{"content":"fixture reply"},"done":true}"#,
+                "POST /gateway/v1/api/chat HTTP/1.1",
+            ),
+        ] {
+            let (url_a, server_a) = server(body).await;
+            let (url_b, server_b) = server(body).await;
+            let registry =
+                ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+                    |_, _| Ok(String::new()),
+                    |_, _| Ok(None),
+                    move |workspace, _| {
+                        Ok(Some(if workspace == Some("ws_a") {
+                            url_a.clone()
+                        } else {
+                            url_b.clone()
+                        }))
+                    },
+                    ProviderTimeoutPolicy::default(),
+                );
+            let a = registry.get_or_create_for_workspace("ws_a", name).unwrap();
+            let b = registry.get_or_create_for_workspace("ws_b", name).unwrap();
+            assert_eq!(a.chat(chat_request()).await.unwrap().text, "fixture reply");
+            assert_eq!(b.chat(chat_request()).await.unwrap().text, "fixture reply");
+            assert_eq!(server_a.await.unwrap(), expected_path);
+            assert_eq!(server_b.await.unwrap(), expected_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn old_in_flight_override_error_stays_redacted_after_reset() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secret = "private-path-token";
+        let url = format!("http://{}/{secret}/v1", listener.local_addr().unwrap());
+        let current = Arc::new(Mutex::new(Some(url.clone())));
+        let registry = Arc::new(
+            ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+                |_, _| Ok("key".into()),
+                |_, _| Ok(None),
+                {
+                    let current = current.clone();
+                    move |_, _| Ok(current.lock().unwrap().clone())
+                },
+                ProviderTimeoutPolicy::default(),
+            ),
+        );
+        let provider = registry.get_or_create_for_workspace("a", "openai").unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let response_url = url.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            stream.read(&mut request).await.unwrap();
+            accepted_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            let body = format!("{{\"error\":\"rate limit at {response_url}; retry-after: 3\"}}");
+            stream.write_all(format!("HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let request_provider = provider.clone();
+        let request = tokio::spawn(async move { request_provider.chat(chat_request()).await });
+        accepted_rx.await.unwrap();
+        *current.lock().unwrap() = None;
+        registry.invalidate_workspace_provider("a", "openai");
+        release_tx.send(()).unwrap();
+        let error = request.await.unwrap().unwrap_err();
+        server.await.unwrap();
+        assert!(!format!("{error:#?}").contains(secret));
+        assert!(!format!("{error:#}").contains(secret));
+        let classification = provider.classify_failure(&error).unwrap();
+        assert_eq!(classification.class, ProviderFailureClass::RateLimit);
+        assert_eq!(classification.http_status, Some(429));
+        assert_eq!(classification.retry_after_ms, Some(3000));
+    }
+
+    #[tokio::test]
+    async fn stream_response_read_error_does_not_expose_override_path() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/stream-private-token/v1",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 128\r\nConnection: close\r\n\r\ndata: {",
+                )
+                .await
+                .unwrap();
+        });
         let registry = ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
-            |_, _| Ok("sk-key".to_owned()),
+            |_, _| Ok("key".into()),
             |_, _| Ok(None),
-            |workspace, _| match workspace {
-                Some("ws_custom") => Ok(Some("https://custom.api.com/v1".to_owned())),
-                _ => Ok(None),
-            },
+            move |_, _| Ok(Some(url.clone())),
             ProviderTimeoutPolicy::default(),
         );
+        let provider = registry.get_or_create_for_workspace("a", "openai").unwrap();
+        let mut stream = provider.stream_chat(chat_request()).await.unwrap();
+        let error = loop {
+            match stream.next().await {
+                Some(Err(error)) => break error,
+                Some(Ok(_)) => continue,
+                None => panic!("truncated response should fail"),
+            }
+        };
+        server.await.unwrap();
+        assert!(!format!("{error:#?}").contains("stream-private-token"));
+        assert!(provider.classify_failure(&error).is_some());
+    }
 
-        let fp_default = registry
-            .authority_fingerprint_for_workspace("ws_default", "openai")
-            .expect("default fingerprint");
-        let fp_custom = registry
-            .authority_fingerprint_for_workspace("ws_custom", "openai")
-            .expect("custom fingerprint");
+    #[tokio::test]
+    async fn gemini_override_errors_hide_endpoint_and_key_for_chat_and_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
 
-        assert_ne!(
-            fp_default, fp_custom,
-            "custom base_url must yield a different authority fingerprint"
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/gemini-private-path/v1beta",
+            listener.local_addr().unwrap()
         );
+        let echoed_url = url.clone();
+        let server = tokio::spawn(async move {
+            for (status, detail) in [
+                ("429 Too Many Requests", "rate limit"),
+                ("400 Bad Request", "this model does not support streaming"),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 8192];
+                socket.read(&mut request).await.unwrap();
+                let body = format!("{detail} at {echoed_url}?key=gemini-private-key");
+                socket.write_all(format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        let registry = ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+            |_, _| Ok("gemini-private-key".into()),
+            |_, _| Ok(None),
+            move |_, _| Ok(Some(url.clone())),
+            ProviderTimeoutPolicy::default(),
+        );
+        let provider = registry.get_or_create_for_workspace("a", "gemini").unwrap();
+        for (streaming, expected_class, expected_status) in [
+            (false, ProviderFailureClass::RateLimit, 429),
+            (true, ProviderFailureClass::UnsupportedStreaming, 400),
+        ] {
+            let error = if streaming {
+                provider
+                    .stream_chat(chat_request())
+                    .await
+                    .err()
+                    .expect("stream request fails")
+            } else {
+                provider.chat(chat_request()).await.unwrap_err()
+            };
+            let public = format!("{error:#} {error:#?}");
+            assert!(!public.contains("gemini-private-path"));
+            assert!(!public.contains("gemini-private-key"));
+            let classification = provider.classify_failure(&error).unwrap();
+            assert_eq!(classification.class, expected_class);
+            assert_eq!(classification.http_status, Some(expected_status));
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auxiliary_embedding_error_keeps_class_without_exposing_endpoint() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secret = "embedding-private-token";
+        let url = format!("http://{}/{secret}/v1", listener.local_addr().unwrap());
+        let echoed_url = url.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            socket.read(&mut request).await.unwrap();
+            let body = serde_json::json!({
+                "error": {"message": format!("maximum context length exceeded at {echoed_url}")}
+            })
+            .to_string();
+            socket.write_all(format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ).as_bytes()).await.unwrap();
+        });
+        let registry = ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+            |_, _| Ok("key".into()),
+            |_, _| Ok(None),
+            move |_, _| Ok(Some(url.clone())),
+            ProviderTimeoutPolicy::default(),
+        );
+        let provider = registry.get_or_create_for_workspace("a", "openai").unwrap();
+        let error = provider
+            .embed(EmbeddingRequest::new("fixture", vec!["hello".into()]))
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(!format!("{error:#?}").contains(secret));
+        let classification = provider.classify_failure(&error).unwrap();
+        assert_eq!(classification.class, ProviderFailureClass::ContextTooLarge);
+        assert_eq!(classification.http_status, Some(400));
+    }
+
+    #[tokio::test]
+    async fn openai_upload_errors_are_safe_before_observability_and_keep_http_classification() {
+        use base64::Engine;
+        use std::io::Write;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        struct TraceWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for TraceWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        for (status, echo_url, class, attempts, retry_after_ms) in [
+            (
+                None,
+                false,
+                ProviderFailureClass::NetworkTransient,
+                0usize,
+                None,
+            ),
+            (
+                Some(400),
+                true,
+                ProviderFailureClass::ProviderRejected,
+                1,
+                None,
+            ),
+            (
+                Some(429),
+                false,
+                ProviderFailureClass::RateLimit,
+                3,
+                Some(3000),
+            ),
+            (Some(503), false, ProviderFailureClass::Provider5xx, 3, None),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let secret = "openai-upload-private-token";
+            let url = format!("http://{}/{secret}/v1", listener.local_addr().unwrap());
+            let echoed_url = url.clone();
+            let assertion_url = url.clone();
+            let server = match status {
+                Some(status) => Some(tokio::spawn(async move {
+                    let mut paths = Vec::new();
+                    for _ in 0..attempts {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let mut request = Vec::new();
+                        let header_end = loop {
+                            if let Some(index) =
+                                request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                            {
+                                break index + 4;
+                            }
+                            let mut chunk = [0u8; 8192];
+                            let count = socket.read(&mut chunk).await.unwrap();
+                            assert!(count > 0, "upload request headers ended early");
+                            request.extend_from_slice(&chunk[..count]);
+                        };
+                        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                        paths.push(headers.lines().next().unwrap().to_owned());
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.split_once(':')
+                                    .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                                    .map(|(_, value)| value)
+                            })
+                            .unwrap()
+                            .trim()
+                            .parse::<usize>()
+                            .unwrap();
+                        while request.len() < header_end + content_length {
+                            let mut chunk = [0u8; 8192];
+                            let count = socket.read(&mut chunk).await.unwrap();
+                            assert!(count > 0, "upload request body ended early");
+                            request.extend_from_slice(&chunk[..count]);
+                        }
+                        let body = if echo_url {
+                            format!("bad request at {echoed_url}/files")
+                        } else {
+                            String::new()
+                        };
+                        let retry_after = if status == 429 {
+                            "Retry-After: 3\r\n"
+                        } else {
+                            ""
+                        };
+                        socket.write_all(format!(
+                            "HTTP/1.1 {status} Failure\r\n{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        ).as_bytes()).await.unwrap();
+                    }
+                    paths
+                })),
+                None => {
+                    drop(listener);
+                    None
+                }
+            };
+            let registry =
+                ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+                    |_, _| Ok("key".into()),
+                    |_, _| Ok(None),
+                    move |_, _| Ok(Some(url.clone())),
+                    ProviderTimeoutPolicy::default(),
+                );
+            let provider = registry
+                .get_or_create_for_workspace("upload-workspace", "openai")
+                .unwrap();
+            let mut request = chat_request();
+            // The normal planner uploads files at or above its default threshold.
+            let bytes = vec![b'x'; 512 * 1024];
+            request.messages = vec![crate::ChatMessage::user_parts(vec![
+                crate::MessageContentPart::file(crate::MessageAttachment {
+                    mime_type: "application/octet-stream".into(),
+                    name: Some("payload.bin".into()),
+                    size_bytes: Some(bytes.len() as u64),
+                    sha256: None,
+                    source: crate::AttachmentDataSource::Bytes {
+                        base64_data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    },
+                    artifact: None,
+                }),
+            ])];
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let output = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(move || TraceWriter(output.clone()))
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let error = provider.chat(request).await.unwrap_err();
+            let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+            assert!(logs.contains("attachment.upload.fail"), "{logs}");
+            assert!(logs.contains("upload_file"), "{logs}");
+            assert!(logs.contains("ATTACHMENT_OPERATION_FAILED"), "{logs}");
+            assert!(logs.contains(&format!("{:?}", class)), "{logs}");
+            assert_eq!(
+                logs.matches("attachment.upload.retry").count(),
+                if status.is_some() {
+                    attempts.saturating_sub(1)
+                } else {
+                    2
+                }
+            );
+            assert!(!logs.contains(secret), "{logs}");
+            assert!(!logs.contains(&assertion_url));
+            for representation in [
+                format!("{error}"),
+                format!("{error:#}"),
+                format!("{error:?}"),
+                format!("{error:#?}"),
+            ] {
+                assert!(!representation.contains(secret), "{representation}");
+            }
+            assert!(
+                !error
+                    .chain()
+                    .any(|cause| format!("{cause:?}").contains(secret))
+            );
+            let classification = provider.classify_failure(&error).unwrap();
+            assert_eq!(classification.class, class);
+            assert_eq!(classification.http_status, status);
+            assert_eq!(classification.retry_after_ms, retry_after_ms);
+            if let Some(server) = server {
+                let paths = tokio::time::timeout(Duration::from_secs(10), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    paths,
+                    vec![format!("POST /{secret}/v1/files HTTP/1.1"); attempts]
+                );
+                assert!(
+                    logs.contains(&format!("HTTP {}", status.unwrap())),
+                    "{logs}"
+                );
+            }
+        }
     }
 }

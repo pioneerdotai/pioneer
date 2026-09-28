@@ -6060,6 +6060,44 @@ fn test_gateway_secrets_with_store() -> (Arc<GatewaySecrets>, Arc<MemorySecretSt
     )
 }
 
+struct FailOneBaseUrlWrite {
+    inner: Arc<MemorySecretStore>,
+    fail_next_base_url: std::sync::atomic::AtomicBool,
+}
+
+impl SecretStore for FailOneBaseUrlWrite {
+    fn get_string(&self, id: &SecretId) -> pioneer_keystore::Result<Option<String>> {
+        self.inner.get_string(id)
+    }
+    fn put_string(
+        &self,
+        id: &SecretId,
+        value: &str,
+        meta: pioneer_keystore::SecretMeta,
+    ) -> pioneer_keystore::Result<()> {
+        if meta.kind == SecretKind::ProviderBaseUrl
+            && self.fail_next_base_url.swap(false, Ordering::SeqCst)
+        {
+            return Err(pioneer_keystore::KeystoreError::WriteFailed(
+                "synthetic base URL write failure".into(),
+            ));
+        }
+        self.inner.put_string(id, value, meta)
+    }
+    fn delete(&self, id: &SecretId) -> pioneer_keystore::Result<bool> {
+        self.inner.delete(id)
+    }
+    fn exists(&self, id: &SecretId) -> pioneer_keystore::Result<bool> {
+        self.inner.exists(id)
+    }
+    fn list(
+        &self,
+        filter: SecretFilter,
+    ) -> pioneer_keystore::Result<Vec<pioneer_keystore::SecretEntryMeta>> {
+        self.inner.list(filter)
+    }
+}
+
 async fn setup_provider_api_key_processor(
     case_id: &str,
 ) -> (
@@ -6078,18 +6116,35 @@ async fn setup_provider_api_key_processor(
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let secret_store = Arc::new(MemorySecretStore::new());
     let gateway_secrets = Arc::new(GatewaySecrets::new(secret_store.clone()));
-    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::new_scoped({
-        let gateway_secrets = gateway_secrets.clone();
-        move |workspace_id, provider_name| {
-            workspace_id
-                .and_then(|workspace_id| {
-                    gateway_secrets
-                        .get_workspace_provider_api_key(workspace_id, provider_name)
-                        .expect("test provider key lookup")
-                })
-                .unwrap_or_default()
-        }
-    }));
+    let provider_registry = Arc::new(
+        pioneer_provider::ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+            {
+                let gateway_secrets = gateway_secrets.clone();
+                move |workspace_id, provider_name| {
+                    Ok(workspace_id
+                        .map(|workspace_id| gateway_secrets.get_workspace_provider_api_key(workspace_id, provider_name))
+                        .transpose()?
+                        .flatten()
+                        .unwrap_or_default())
+                }
+            },
+            {
+                let gateway_secrets = gateway_secrets.clone();
+                move |workspace_id, provider_name| {
+                    workspace_id.map(|workspace_id| gateway_secrets.get_workspace_provider_proxy(workspace_id, provider_name))
+                        .transpose().map(Option::flatten)
+                }
+            },
+            {
+                let gateway_secrets = gateway_secrets.clone();
+                move |workspace_id, provider_name| {
+                    workspace_id.map(|workspace_id| gateway_secrets.get_workspace_provider_base_url(workspace_id, provider_name))
+                        .transpose().map(Option::flatten)
+                }
+            },
+            pioneer_provider::ProviderTimeoutPolicy::default(),
+        ),
+    );
     let base_dir = unique_temp_dir(case_id);
     std::fs::create_dir_all(&base_dir).expect("create settings dir");
     let settings_path = base_dir.join("gateway-settings.toml");
@@ -6526,6 +6581,9 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
 
 #[tokio::test]
 async fn provider_configure_and_list_round_trips_custom_base_url() {
+    crate::compaction::load_test_catalog();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     let (
         processor,
         _secret_store,
@@ -6537,6 +6595,60 @@ async fn provider_configure_and_list_round_trips_custom_base_url() {
     ) = setup_provider_api_key_processor("provider_configure_base_url").await;
     let request_context =
         registered_request_context(&processor, connection_id, "provider/test").await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let custom_url = format!("http://{}/api/prefix/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut bytes = [0u8; 8192];
+        let count = stream.read(&mut bytes).await.unwrap();
+        let line = String::from_utf8_lossy(&bytes[..count])
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned();
+        let body = r#"{"data":[{"id":"fixture-model"}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        line
+    });
+
+    let before_id =
+        pioneer_protocol::RequestId::new(generate_test_request_id("provider", "before"))
+            .expect("valid request id");
+    processor
+        .provider_list(
+            &request_context,
+            before_id.clone(),
+            ProviderListParams {
+                workspace_id: workspace_id.clone(),
+            },
+        )
+        .await;
+    let before: ProviderListResponse = serde_json::from_value(
+        recv_response_by_id(&mut rx, before_id.as_str())
+            .await
+            .result,
+    )
+    .unwrap();
+    assert!(
+        before
+            .providers
+            .iter()
+            .all(|provider| provider.name != "openai")
+    );
+    let definition = before
+        .definitions
+        .iter()
+        .find(|definition| definition.name == "openai")
+        .unwrap();
+    assert_eq!(
+        definition.default_base_url.as_deref(),
+        Some("https://api.openai.com/v1")
+    );
+    assert!(definition.supports_base_url_override);
 
     let configure_req_id =
         pioneer_protocol::RequestId::new(generate_test_request_id("provider", "cfg_1"))
@@ -6551,7 +6663,7 @@ async fn provider_configure_and_list_round_trips_custom_base_url() {
                 api_key: Some("sk-openai-custom".to_owned()),
                 proxy_url: None,
                 clear_proxy: false,
-                base_url: Some("https://api.custom-ai.com/v1".to_owned()),
+                base_url: Some(custom_url.clone()),
                 clear_base_url: false,
             },
         )
@@ -6565,7 +6677,7 @@ async fn provider_configure_and_list_round_trips_custom_base_url() {
     assert!(!cfg_payload.base_url_deleted);
     assert_eq!(
         cfg_payload.base_url.as_deref(),
-        Some("https://api.custom-ai.com/v1")
+        Some(custom_url.trim_end_matches('/'))
     );
 
     let list_req_id =
@@ -6590,8 +6702,14 @@ async fn provider_configure_and_list_round_trips_custom_base_url() {
         .expect("openai provider should be in list");
     assert_eq!(
         openai_summary.base_url.as_deref(),
-        Some("https://api.custom-ai.com/v1")
+        Some(custom_url.trim_end_matches('/'))
     );
+    let provider = processor
+        .provider_registry
+        .get_or_create_for_workspace(workspace_id.as_str(), "openai")
+        .unwrap();
+    assert_eq!(provider.list_models().await.unwrap()[0].id, "fixture-model");
+    assert_eq!(server.await.unwrap(), "GET /api/prefix/models HTTP/1.1");
 
     let clear_req_id =
         pioneer_protocol::RequestId::new(generate_test_request_id("provider", "cfg_2"))
@@ -6638,6 +6756,272 @@ async fn provider_configure_and_list_round_trips_custom_base_url() {
         .find(|p| p.name == "openai")
         .expect("openai provider should be in list");
     assert!(openai_summary2.base_url.is_none());
+}
+
+#[tokio::test]
+async fn provider_configure_rejects_invalid_or_unsupported_base_url_before_any_write() {
+    let (processor, _, mut rx, connection_id, _, workspace_id, _) =
+        setup_provider_api_key_processor("provider_invalid_base_url").await;
+    let context = registered_request_context(&processor, connection_id, "provider/test").await;
+    for (index, provider, base_url, clear) in [
+        (0, "openai", "ftp://example.test/v1", false),
+        (1, "openai", "https://example.test/v1?token=private", false),
+        (2, "openai", "https://user:password@example.test/v1", false),
+        (3, "openai", "https://example.test/v1#private", false),
+        (4, "bedrock", "https://example.test/v1", false),
+        (5, "openai", "https://example.test/v1", true),
+    ] {
+        let id = pioneer_protocol::RequestId::new(generate_test_request_id(
+            "provider",
+            &format!("invalid_{index}"),
+        ))
+        .unwrap();
+        processor
+            .provider_configure(
+                &context,
+                id.clone(),
+                ProviderConfigureParams {
+                    workspace_id: workspace_id.clone(),
+                    provider: provider.to_owned(),
+                    api_key: Some("sk-must-not-be-written".to_owned()),
+                    proxy_url: None,
+                    clear_proxy: false,
+                    base_url: Some(base_url.to_owned()),
+                    clear_base_url: clear,
+                },
+            )
+            .await;
+        let error = recv_error_by_id(&mut rx, id.as_str()).await;
+        assert_eq!(error.error.code, pioneer_protocol::INVALID_PARAMS_CODE);
+        assert!(
+            processor
+                .gateway_secrets
+                .get_workspace_provider_api_key(&workspace_id, provider)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            processor
+                .gateway_secrets
+                .get_workspace_provider_base_url(&workspace_id, provider)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn api_key_save_while_base_url_read_is_pending_preserves_override() {
+    let (processor, _, mut rx, connection_id, _, workspace_id, _) =
+        setup_provider_api_key_processor("base_url_pending_read_save").await;
+    let base_url = "http://127.0.0.1:30000/private/v1";
+    processor
+        .gateway_secrets
+        .set_workspace_provider_base_url(&workspace_id, "openai", base_url)
+        .unwrap();
+    let context = registered_request_context(&processor, connection_id, "provider/test").await;
+    let id = pioneer_protocol::RequestId::new(generate_test_request_id("provider", "keysaveread"))
+        .unwrap();
+    processor
+        .provider_configure(
+            &context,
+            id.clone(),
+            ProviderConfigureParams {
+                workspace_id: workspace_id.clone(),
+                provider: "openai".into(),
+                api_key: Some("new-key".into()),
+                proxy_url: None,
+                clear_proxy: false,
+                base_url: None,
+                clear_base_url: false,
+            },
+        )
+        .await;
+    let response: ProviderConfigureResponse =
+        serde_json::from_value(recv_response_by_id(&mut rx, id.as_str()).await.result).unwrap();
+    assert!(response.api_key_updated);
+    assert_eq!(
+        processor
+            .gateway_secrets
+            .get_workspace_provider_base_url(&workspace_id, "openai")
+            .unwrap()
+            .as_deref(),
+        Some(base_url)
+    );
+}
+
+#[tokio::test]
+async fn partial_base_url_write_failure_reconciles_only_its_workspace_authority() {
+    let (mut processor, _, mut rx, connection_id, _, workspace_id, _) =
+        setup_provider_api_key_processor("partial_base_url_failure").await;
+    let store = Arc::new(FailOneBaseUrlWrite {
+        inner: Arc::new(MemorySecretStore::new()),
+        fail_next_base_url: std::sync::atomic::AtomicBool::new(false),
+    });
+    let secrets = Arc::new(GatewaySecrets::new(store.clone()));
+    secrets
+        .set_workspace_provider_api_key(&workspace_id, "openai", "old-key")
+        .unwrap();
+    secrets
+        .set_workspace_provider_api_key("workspace-b", "openai", "other-key")
+        .unwrap();
+    secrets
+        .set_workspace_provider_base_url("workspace-b", "openai", "http://127.0.0.1:11002/v1")
+        .unwrap();
+    processor.provider_registry = Arc::new(pioneer_provider::ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+        {
+            let secrets = secrets.clone();
+            move |workspace, provider| Ok(workspace.map(|workspace| secrets.get_workspace_provider_api_key(workspace, provider)).transpose()?.flatten().unwrap_or_default())
+        },
+        |_, _| Ok(None),
+        {
+            let secrets = secrets.clone();
+            move |workspace, provider| workspace.map(|workspace| secrets.get_workspace_provider_base_url(workspace, provider)).transpose().map(Option::flatten)
+        },
+        pioneer_provider::ProviderTimeoutPolicy::default(),
+    ));
+    processor.gateway_secrets = secrets.clone();
+    let old_a = processor
+        .provider_registry
+        .get_or_create_for_workspace(&workspace_id, "openai")
+        .unwrap();
+    let b = processor
+        .provider_registry
+        .get_or_create_for_workspace("workspace-b", "openai")
+        .unwrap();
+    store.fail_next_base_url.store(true, Ordering::SeqCst);
+    let context = registered_request_context(&processor, connection_id, "provider/test").await;
+    let id = pioneer_protocol::RequestId::new(generate_test_request_id("provider", "partialwrite"))
+        .unwrap();
+    processor
+        .provider_configure(
+            &context,
+            id.clone(),
+            ProviderConfigureParams {
+                workspace_id: workspace_id.clone(),
+                provider: "openai".into(),
+                api_key: Some("new-key".into()),
+                proxy_url: None,
+                clear_proxy: false,
+                base_url: Some("http://127.0.0.1:11001/private/v1".into()),
+                clear_base_url: false,
+            },
+        )
+        .await;
+    let error = recv_error_by_id(&mut rx, id.as_str()).await;
+    assert!(error.error.message.contains("earlier fields were saved"));
+    assert_eq!(
+        secrets
+            .get_workspace_provider_api_key(&workspace_id, "openai")
+            .unwrap()
+            .as_deref(),
+        Some("new-key")
+    );
+    assert_eq!(
+        secrets
+            .get_workspace_provider_base_url(&workspace_id, "openai")
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        secrets
+            .get_workspace_provider_base_url("workspace-b", "openai")
+            .unwrap()
+            .as_deref(),
+        Some("http://127.0.0.1:11002/v1")
+    );
+    assert!(
+        old_a
+            .chat(pioneer_provider::ChatRequest {
+                model: "fixture".into(),
+                messages: vec![pioneer_provider::ChatMessage::user("hello")],
+                temperature: None,
+                max_tokens: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                compiled_prompt: None,
+            })
+            .await
+            .unwrap_err()
+            .downcast_ref::<pioneer_provider::ProviderAuthorityRevoked>()
+            .is_some()
+    );
+    let new_a = processor
+        .provider_registry
+        .get_or_create_for_workspace(&workspace_id, "openai")
+        .unwrap();
+    assert!(!Arc::ptr_eq(&old_a, &new_a));
+    assert_ne!(old_a.authority_fingerprint(), new_a.authority_fingerprint());
+    assert!(Arc::ptr_eq(
+        &b,
+        &processor
+            .provider_registry
+            .get_or_create_for_workspace("workspace-b", "openai")
+            .unwrap()
+    ));
+}
+
+#[tokio::test]
+async fn base_url_only_compatible_provider_is_available_without_authenticating_others() {
+    let (processor, _, mut rx, connection_id, _, workspace_id, _) =
+        setup_provider_api_key_processor("provider_base_url_only").await;
+    let context = registered_request_context(&processor, connection_id, "provider/test").await;
+    processor
+        .gateway_secrets
+        .set_workspace_provider_base_url(&workspace_id, "vllm", "http://127.0.0.1:30000/v1")
+        .unwrap();
+    processor
+        .gateway_secrets
+        .set_workspace_provider_base_url(&workspace_id, "ollama", "http://127.0.0.1:11434")
+        .unwrap();
+    // An endpoint alone does not grant access to a keyed cloud provider.
+    processor
+        .gateway_secrets
+        .set_workspace_provider_base_url(&workspace_id, "gemini", "http://127.0.0.1:30000/v1")
+        .unwrap();
+    let id =
+        pioneer_protocol::RequestId::new(generate_test_request_id("provider", "url_only")).unwrap();
+    processor
+        .provider_list(
+            &context,
+            id.clone(),
+            ProviderListParams {
+                workspace_id: workspace_id.clone(),
+            },
+        )
+        .await;
+    let list: ProviderListResponse =
+        serde_json::from_value(recv_response_by_id(&mut rx, id.as_str()).await.result).unwrap();
+    let vllm = list
+        .providers
+        .iter()
+        .find(|provider| provider.name == "vllm")
+        .unwrap();
+    assert_eq!(vllm.available, Some(true));
+    assert!(!vllm.api_key_configured);
+    let ollama = list
+        .providers
+        .iter()
+        .find(|provider| provider.name == "ollama")
+        .unwrap();
+    assert_eq!(ollama.available, Some(true));
+    assert!(!ollama.api_key_configured);
+    let gemini = list
+        .providers
+        .iter()
+        .find(|provider| provider.name == "gemini")
+        .unwrap();
+    assert_eq!(gemini.available, Some(false));
+    assert!(!gemini.api_key_configured);
+    assert!(processor.member_provider_is_configured(&workspace_id, "vllm"));
+    assert!(processor.member_provider_is_configured(&workspace_id, "ollama"));
+    assert!(!processor.member_provider_is_configured(&workspace_id, "gemini"));
+    let warmup = processor.api_warmup_provider_names(&workspace_id).unwrap();
+    assert!(warmup.contains("vllm"));
+    assert!(warmup.contains("ollama"));
+    assert!(!warmup.contains("gemini"));
 }
 
 #[tokio::test]
@@ -14680,6 +15064,8 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
     const MEMBER_ID: &str = "P0000000000000000000A";
     const MEMBER_WORKSPACE_ID: &str = "W0000000000000000000A";
 
+    crate::compaction::load_test_catalog();
+
     let (workspace_manager, crud_store, global_default_id) = setup_workspace_manager().await;
     workspace_manager
         .create_workspace(MEMBER_WORKSPACE_ID, Some("Member workspace"))
@@ -14741,9 +15127,66 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
             "https://member-provider-proxy.invalid/v1",
         )
         .expect("configure a proxy-backed provider for the Member workspace");
+    let model_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_url = format!(
+        "http://{}/member-private-path/v1",
+        model_listener.local_addr().unwrap()
+    );
+    gateway_secrets
+        .set_workspace_provider_base_url(MEMBER_WORKSPACE_ID, "vllm", &local_url)
+        .unwrap();
+    let model_server = tokio::spawn(async move {
+        let (mut stream, _) = model_listener.accept().await.unwrap();
+        let mut bytes = [0u8; 8192];
+        let count = stream.read(&mut bytes).await.unwrap();
+        let request = String::from_utf8_lossy(&bytes[..count])
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned();
+        let body = r#"{"data":[{"id":"member-local-model"}]}"#;
+        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        request
+    });
+    let ollama_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ollama_url = format!(
+        "http://{}/member-ollama-private/api/",
+        ollama_listener.local_addr().unwrap()
+    );
+    gateway_secrets
+        .set_workspace_provider_base_url(MEMBER_WORKSPACE_ID, "ollama", &ollama_url)
+        .unwrap();
+    let ollama_server = tokio::spawn(async move {
+        let (mut stream, _) = ollama_listener.accept().await.unwrap();
+        let mut bytes = [0u8; 8192];
+        let count = stream.read(&mut bytes).await.unwrap();
+        let request = String::from_utf8_lossy(&bytes[..count])
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned();
+        let body = r#"{"models":[{"name":"member-ollama-model"}]}"#;
+        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        request
+    });
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+        {
+            let secrets = gateway_secrets.clone();
+            move |workspace, provider| Ok(workspace.map(|workspace| secrets.get_workspace_provider_api_key(workspace, provider)).transpose()?.flatten().unwrap_or_default())
+        },
+        {
+            let secrets = gateway_secrets.clone();
+            move |workspace, provider| workspace.map(|workspace| secrets.get_workspace_provider_proxy(workspace, provider)).transpose().map(Option::flatten)
+        },
+        {
+            let secrets = gateway_secrets.clone();
+            move |workspace, provider| workspace.map(|workspace| secrets.get_workspace_provider_base_url(workspace, provider)).transpose().map(Option::flatten)
+        },
+        pioneer_provider::ProviderTimeoutPolicy::default(),
+    ));
     let processor = MessageProcessor::new(
         Arc::new(ThreadManager::new("o4-mini", "openai")),
-        test_provider(),
+        provider_registry,
         session_manager.clone(),
         workspace_manager.clone(),
         crud_store,
@@ -14932,6 +15375,96 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
     assert!(anthropic.proxy_url.is_none());
     assert!(!serialized_providers.contains("member-test-secret"));
     assert!(!serialized_providers.contains("member-provider-proxy"));
+    let vllm = providers
+        .providers
+        .iter()
+        .find(|provider| provider.name == "vllm")
+        .unwrap();
+    assert_eq!(vllm.available, Some(true));
+    assert!(vllm.base_url.is_none());
+    assert!(!serialized_providers.contains("member-private-path"));
+    let ollama = providers
+        .providers
+        .iter()
+        .find(|provider| provider.name == "ollama")
+        .unwrap();
+    assert_eq!(ollama.available, Some(true));
+    // Member summaries expose this legacy field as an availability bit.
+    assert!(ollama.api_key_configured);
+    assert!(
+        processor
+            .gateway_secrets
+            .get_workspace_provider_api_key(MEMBER_WORKSPACE_ID, "ollama")
+            .unwrap()
+            .is_none()
+    );
+    assert!(ollama.base_url.is_none());
+    assert!(!serialized_providers.contains("member-ollama-private"));
+
+    let models_id = generate_test_request_id("memberws", "urlmodels");
+    processor
+        .process_request_for_connection(
+            member_connection_id,
+            &json!({
+                "jsonrpc":"2.0", "id":models_id, "method":"provider/models/list",
+                "params":{"workspace_id":MEMBER_WORKSPACE_ID,"provider":"vllm"}
+            })
+            .to_string(),
+        )
+        .await;
+    let models = recv_response_by_id(&mut member_rx, models_id.as_str()).await;
+    let models: ProviderListModelsResponse = serde_json::from_value(models.result).unwrap();
+    assert!(
+        models
+            .models
+            .iter()
+            .any(|model| model.id == "member-local-model")
+    );
+    assert_eq!(
+        model_server.await.unwrap(),
+        "GET /member-private-path/v1/models HTTP/1.1"
+    );
+
+    let ollama_models_id = generate_test_request_id("memberws", "ollamamodels");
+    processor
+        .process_request_for_connection(
+            member_connection_id,
+            &json!({
+                "jsonrpc":"2.0", "id":ollama_models_id, "method":"provider/models/list",
+                "params":{"workspace_id":MEMBER_WORKSPACE_ID,"provider":"ollama"}
+            })
+            .to_string(),
+        )
+        .await;
+    let ollama_models = recv_response_by_id(&mut member_rx, ollama_models_id.as_str()).await;
+    let ollama_models: ProviderListModelsResponse =
+        serde_json::from_value(ollama_models.result).unwrap();
+    assert!(
+        ollama_models
+            .models
+            .iter()
+            .any(|model| model.id == "member-ollama-model")
+    );
+    assert_eq!(
+        ollama_server.await.unwrap(),
+        "GET /member-ollama-private/api/tags HTTP/1.1"
+    );
+
+    let configure_id = generate_test_request_id("memberws", "urlconfigure");
+    processor.process_request_for_connection(member_connection_id, &json!({
+        "jsonrpc":"2.0", "id":configure_id, "method":"provider/configure",
+        "params":{"workspace_id":MEMBER_WORKSPACE_ID,"provider":"vllm","base_url":"http://127.0.0.1:9000/v1"}
+    }).to_string()).await;
+    let denied = recv_error_by_id(&mut member_rx, configure_id.as_str()).await;
+    assert!(!denied.error.message.contains("member-private-path"));
+    assert_eq!(
+        processor
+            .gateway_secrets
+            .get_workspace_provider_base_url(MEMBER_WORKSPACE_ID, "vllm")
+            .unwrap()
+            .as_deref(),
+        Some(local_url.as_str())
+    );
 
     let skills_id = generate_test_request_id("memberws", "skills");
     processor

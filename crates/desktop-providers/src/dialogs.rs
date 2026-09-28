@@ -40,7 +40,7 @@ impl ProviderCatalogView {
         let namespace = self.ui_id(provider.id, "configuration-dialog");
         let provider_title = provider.title();
         let provider_description = provider.description();
-        let is_configured = self.providers.is_configured(provider.id);
+        let has_api_key = self.providers.provider_has_api_key(provider.id);
         let current_proxy_url = self
             .providers
             .provider_proxy_url(provider.id)
@@ -95,10 +95,22 @@ impl ProviderCatalogView {
             }
             state
         });
+        let base_url_form = crate::credential_form::ProxyForm::new(
+            base_url_input_state.clone(),
+            &self.client,
+            self.active_workspace_id().unwrap_or_default().to_owned(),
+            pioneer_client::providers::credentials::ProviderCredentialTarget::ApiBaseUrl(
+                provider.id.to_owned(),
+            ),
+            current_base_url.clone(),
+            window,
+            cx,
+        );
         let lifetime = self.own_dialog(
             {
                 let key = api_key_input_state.downgrade();
                 let proxy = proxy_form.downgrade();
+                let base_url = base_url_form.downgrade();
                 move |window, cx| {
                     let _ = key.update(cx, |input, cx| {
                         if !input.value().is_empty() {
@@ -106,12 +118,14 @@ impl ProviderCatalogView {
                         }
                     });
                     let _ = proxy.update(cx, |form, cx| form.clear(window, cx));
+                    let _ = base_url.update(cx, |form, cx| form.clear(window, cx));
                 }
             },
             window,
             cx,
         );
         lifetime.update(cx, |owner, cx| owner.track_form(&proxy_form, cx));
+        lifetime.update(cx, |owner, cx| owner.track_form(&base_url_form, cx));
         let attach = lifetime.clone();
         let desktop_entity = cx.weak_entity();
         let initial_focus_input = api_key_input_state.clone();
@@ -120,30 +134,17 @@ impl ProviderCatalogView {
             let desktop_entity = desktop_entity.clone();
             let provider_id = provider.id.to_owned();
             let api_key_input_state = api_key_input_state.clone();
-            let proxy_input_state = proxy_input_state.clone();
             let proxy_form = proxy_form.clone();
-            let base_url_input_state = base_url_input_state.clone();
-            let current_base_url = current_base_url.clone();
+            let base_url_form = base_url_form.clone();
             let lifetime = lifetime.clone();
             move |cx| {
                 if !lifetime.read(cx).valid() {
                     return false;
                 }
                 let api_key = api_key_input_state.read(cx).value().trim().to_owned();
-                let proxy_url = proxy_input_state.read(cx).value().trim().to_owned();
-                let base_url = base_url_input_state.read(cx).value().trim().to_owned();
                 let api_key = (!api_key.is_empty()).then_some(api_key);
-
-                let current_proxy_url = proxy_form.read(cx).original();
-                let proxy_changed = current_proxy_url != Some(proxy_url.as_str());
-                let proxy_url = (proxy_changed && !proxy_url.is_empty()).then_some(proxy_url);
-                let clear_proxy =
-                    proxy_changed && proxy_url.is_none() && current_proxy_url.is_some();
-
-                let base_url_changed = current_base_url.as_deref() != Some(base_url.as_str());
-                let base_url = (base_url_changed && !base_url.is_empty()).then_some(base_url);
-                let clear_base_url =
-                    base_url_changed && base_url.is_none() && current_base_url.is_some();
+                let (proxy_url, clear_proxy) = proxy_form.read(cx).mutation(cx);
+                let (base_url, clear_base_url) = base_url_form.read(cx).mutation(cx);
 
                 if api_key.is_none()
                     && proxy_url.is_none()
@@ -170,7 +171,7 @@ impl ProviderCatalogView {
             }
         });
 
-        let delete_provider_id = is_configured.then(|| provider.id.to_owned());
+        let delete_provider_id = has_api_key.then(|| provider.id.to_owned());
 
         window.open_dialog(cx, move |dialog, _window, cx| {
             dialog
@@ -244,7 +245,11 @@ impl ProviderCatalogView {
                             .on_click({
                                 let desktop_entity = desktop_entity.clone();
                                 let provider_id = provider_id.clone();
+                                let lifetime = lifetime.clone();
                                 move |_, window, cx| {
+                                    if !lifetime.read(cx).valid() {
+                                        return;
+                                    }
                                     if desktop_entity
                                         .update(cx, |view, cx| {
                                             view.delete_provider_api_key(provider_id.clone(), cx)

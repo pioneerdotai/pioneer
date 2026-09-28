@@ -1,3 +1,4 @@
+use crate::definition::{provider_definition, validate_provider_base_url};
 use crate::providers::{
     AnthropicProvider, AuthStyle, AzureOpenAiProvider, BedrockProvider, CopilotProvider,
     DeepSeekProvider, GeminiProvider, GlmProvider, LocalProvider, OllamaProvider,
@@ -5,7 +6,7 @@ use crate::providers::{
 };
 use crate::traits::Provider;
 use crate::types::{InputTypeSupport, ProviderInputCapabilities, ProviderTimeoutPolicy};
-use anyhow::{Result, bail};
+use anyhow::Result;
 use sha2::{Digest, Sha256};
 
 pub fn create_provider(provider_name: &str, api_key: &str) -> Result<Box<dyn Provider>> {
@@ -55,12 +56,15 @@ pub(crate) fn create_provider_with_timeout_policy_and_proxy_and_base_url_and_aut
     authority_fingerprint: &str,
 ) -> Result<Box<dyn Provider>> {
     let proxy_url = proxy_url.map(crate::http::validate_proxy_url).transpose()?;
+    let base_url = base_url
+        .map(|url| validate_provider_base_url(provider_name, url))
+        .transpose()?;
     crate::http::with_provider_proxy(proxy_url.as_deref(), || {
         create_provider_with_timeout_policy_inner(
             provider_name,
             api_key,
             timeout_policy,
-            base_url,
+            base_url.as_deref(),
             authority_fingerprint,
         )
     })
@@ -83,12 +87,6 @@ pub(crate) fn create_provider_with_timeout_policy_and_proxy_and_authority(
     )
 }
 
-/// Returns the authoritative built-in default base URL for the given provider,
-/// or `None` if the provider has no static URL endpoint.
-pub fn default_provider_base_url(provider_name: &str) -> Option<&'static str> {
-    pioneer_protocol::default_provider_base_url(provider_name)
-}
-
 fn create_provider_with_timeout_policy_inner(
     provider_name: &str,
     api_key: &str,
@@ -96,13 +94,16 @@ fn create_provider_with_timeout_policy_inner(
     base_url: Option<&str>,
     authority_fingerprint: &str,
 ) -> Result<Box<dyn Provider>> {
-    let compat = |name: &str, api_key: &str| {
-        let default_url = default_provider_base_url(name).unwrap_or("http://localhost:8000/v1");
-        let effective_base_url = base_url.unwrap_or(default_url);
-        compat_provider(name, effective_base_url, api_key).with_timeout_policy(timeout_policy)
+    let definition =
+        provider_definition(provider_name).ok_or_else(|| anyhow::anyhow!("unknown provider"))?;
+    let endpoint = base_url.or(definition.default_base_url);
+    let compat = |api_key: &str| {
+        let effective_base_url = endpoint.expect("compatible provider endpoint definition");
+        compat_provider(definition.name, effective_base_url, api_key)
+            .with_timeout_policy(timeout_policy)
     };
 
-    match provider_name {
+    match definition.name {
         // ── Primary providers with custom implementations ────────────────
         "openrouter" => {
             if let Some(base_url) = base_url {
@@ -155,99 +156,74 @@ fn create_provider_with_timeout_policy_inner(
             }
         }
         "local" => Ok(Box::new(LocalProvider::new())),
-        "gemini" | "google" | "google-gemini" => Ok(Box::new(GeminiProvider::with_timeout_policy(
+        "gemini" => Ok(Box::new(GeminiProvider::with_base_url_and_timeout_policy(
             api_key,
+            endpoint.expect("Gemini endpoint definition"),
             timeout_policy,
         ))),
-        "ollama" => Ok(Box::new(OllamaProvider::with_timeout_policy(
+        "ollama" => Ok(Box::new(OllamaProvider::with_base_url_and_timeout_policy(
+            endpoint.expect("Ollama endpoint definition"),
             timeout_policy,
         ))),
-        "telnyx" => Ok(Box::new(TelnyxProvider::with_timeout_policy(
+        "telnyx" => Ok(Box::new(TelnyxProvider::with_base_url_and_timeout_policy(
             api_key,
+            endpoint.expect("Telnyx endpoint definition"),
             timeout_policy,
         ))),
-        "copilot" | "github-copilot" => Ok(Box::new(CopilotProvider::with_timeout_policy(
+        "copilot" => Ok(Box::new(CopilotProvider::with_base_url_and_timeout_policy(
             api_key,
+            endpoint.expect("Copilot endpoint definition"),
             timeout_policy,
         ))),
-        "bedrock" | "aws-bedrock" => Ok(Box::new(
+        "bedrock" => Ok(Box::new(
             BedrockProvider::from_env_with_timeout_policy(timeout_policy).unwrap_or_else(|_| {
                 BedrockProvider::with_timeout_policy(api_key, "", "us-east-1", timeout_policy)
             }),
         )),
 
         // ── GLM / Zhipu ─────────────────────────────────────────────────
-        "glm" | "zhipu" | "bigmodel" | "glm-global" | "zhipu-global" | "glm-cn" | "zhipu-cn" => Ok(
-            Box::new(GlmProvider::with_timeout_policy(api_key, timeout_policy)),
-        ),
+        "glm" => Ok(Box::new(GlmProvider::with_base_url_and_timeout_policy(
+            api_key,
+            endpoint.expect("GLM endpoint definition"),
+            timeout_policy,
+        ))),
 
         // ── Azure OpenAI ────────────────────────────────────────────────
-        "azure_openai" | "azure-openai" | "azure" => {
+        "azure-openai" => {
             // Azure requires resource_name and deployment_name; for the
             // simple factory we pass api_key as the key and expect env
             // configuration for the rest.
             let resource = std::env::var("AZURE_OPENAI_RESOURCE").unwrap_or_default();
             let deployment = std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or_default();
-            Ok(Box::new(AzureOpenAiProvider::with_timeout_policy(
-                api_key,
-                resource,
-                deployment,
-                timeout_policy,
-            )))
+            if let Some(base_url) = base_url {
+                Ok(Box::new(
+                    AzureOpenAiProvider::with_base_url_and_timeout_policy(
+                        api_key,
+                        resource,
+                        deployment,
+                        base_url,
+                        timeout_policy,
+                    ),
+                ))
+            } else {
+                Ok(Box::new(AzureOpenAiProvider::with_timeout_policy(
+                    api_key,
+                    resource,
+                    deployment,
+                    timeout_policy,
+                )))
+            }
         }
 
-        // ── OpenAI-compatible providers ─────────────────────────────────
-        "groq" => Ok(Box::new(compat("groq", api_key))),
-        "mistral" => Ok(Box::new(compat("mistral", api_key))),
-        "xai" | "grok" => Ok(Box::new(compat("xai", api_key))),
         "deepseek" => Ok(Box::new(
-            DeepSeekProvider::with_timeout_policy(api_key, timeout_policy)
-                .with_input_capabilities(compat_input_capabilities()),
+            DeepSeekProvider::with_base_url_and_timeout_policy(
+                api_key,
+                endpoint.expect("DeepSeek endpoint definition"),
+                timeout_policy,
+            )
+            .with_input_capabilities(compat_input_capabilities()),
         )),
-        "together" | "together-ai" => Ok(Box::new(compat("together", api_key))),
-        "fireworks" | "fireworks-ai" => Ok(Box::new(compat("fireworks", api_key))),
-        "novita" => Ok(Box::new(compat("novita", api_key))),
-        "perplexity" => Ok(Box::new(compat("perplexity", api_key))),
-        "cohere" => Ok(Box::new(compat("cohere", api_key))),
-        "venice" => Ok(Box::new(compat("venice", api_key))),
-        "cerebras" => Ok(Box::new(compat("cerebras", api_key))),
-        "sambanova" => Ok(Box::new(compat("sambanova", api_key))),
-        "hyperbolic" => Ok(Box::new(compat("hyperbolic", api_key))),
-        "deepinfra" | "deep-infra" => Ok(Box::new(compat("deepinfra", api_key))),
-        "huggingface" | "hf" => Ok(Box::new(compat("huggingface", api_key))),
-        "ai21" | "ai21-labs" => Ok(Box::new(compat("ai21", api_key))),
-        "reka" => Ok(Box::new(compat("reka", api_key))),
-        "baseten" => Ok(Box::new(compat("baseten", api_key))),
-        "nscale" => Ok(Box::new(compat("nscale", api_key))),
-        "anyscale" => Ok(Box::new(compat("anyscale", api_key))),
-        "nebius" => Ok(Box::new(compat("nebius", api_key))),
-        "friendli" | "friendliai" => Ok(Box::new(compat("friendli", api_key))),
-        "lepton" | "lepton-ai" => Ok(Box::new(compat("lepton", api_key))),
-        "siliconflow" | "silicon-flow" => Ok(Box::new(compat("siliconflow", api_key))),
-        "aihubmix" => Ok(Box::new(compat("aihubmix", api_key))),
-        "astrai" => Ok(Box::new(compat("astrai", api_key))),
-        "stepfun" | "step" => Ok(Box::new(compat("stepfun", api_key))),
-        "baichuan" => Ok(Box::new(compat("baichuan", api_key))),
-        "yi" | "01ai" | "lingyiwanwu" => Ok(Box::new(compat("yi", api_key))),
-        "hunyuan" | "tencent" => Ok(Box::new(compat("hunyuan", api_key))),
-        "ovhcloud" | "ovh" => Ok(Box::new(compat("ovhcloud", api_key))),
-        "nvidia" | "nvidia-nim" => Ok(Box::new(compat("nvidia", api_key))),
-        "synthetic" => Ok(Box::new(compat("synthetic", api_key))),
-        "doubao" | "volcengine" | "ark" => Ok(Box::new(compat("doubao", api_key))),
-        "qianfan" | "baidu" => Ok(Box::new(compat("qianfan", api_key))),
-
-        // ── Local inference servers ─────────────────────────────────────
-        "lmstudio" | "lm-studio" => Ok(Box::new(compat("lmstudio", api_key))),
-        "llamacpp" | "llama.cpp" => Ok(Box::new(compat("llamacpp", api_key))),
-        "sglang" => Ok(Box::new(compat("sglang", api_key))),
-        "vllm" => Ok(Box::new(compat("vllm", api_key))),
-        "osaurus" => Ok(Box::new(compat("osaurus", api_key))),
-        "litellm" | "lite-llm" => Ok(Box::new(compat("litellm", api_key))),
-        "custom" | "compatible" | "openai-compatible" => {
-            Ok(Box::new(compat(provider_name, api_key)))
-        }
-
-        _ => bail!("unknown provider: {provider_name}"),
+        _ => Ok(Box::new(compat(api_key))),
     }
 }
 
@@ -641,19 +617,49 @@ mod tests {
         }
     }
 
-    #[test]
-    fn factory_supports_custom_base_url_for_openai_and_compatible() {
+    #[tokio::test]
+    async fn factory_supports_custom_base_url_for_openai_and_compatible() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        async fn server() -> (String, tokio::task::JoinHandle<String>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/gateway/v1/", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = [0u8; 8192];
+                let count = stream.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..count])
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_owned();
+                let body = r#"{"data":[{"id":"fixture-model"}]}"#;
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                request
+            });
+            (url, task)
+        }
+        let (openai_url, openai_server) = server().await;
+        let (compat_url, compat_server) = server().await;
         let custom_openai =
             create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
                 "openai",
                 "sk-custom",
                 ProviderTimeoutPolicy::default(),
                 None,
-                Some("https://api.example.com/v1/"),
+                Some(&openai_url),
                 "fp-test-1",
             )
             .expect("create custom openai provider");
         assert_eq!(custom_openai.name(), "openai");
+        assert_eq!(
+            custom_openai.list_models().await.unwrap()[0].id,
+            "fixture-model"
+        );
+        assert_eq!(
+            openai_server.await.unwrap(),
+            "GET /gateway/v1/models HTTP/1.1"
+        );
 
         let custom_compat =
             create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
@@ -661,10 +667,281 @@ mod tests {
                 "sk-custom",
                 ProviderTimeoutPolicy::default(),
                 None,
-                Some("https://custom.endpoint.com/v1"),
+                Some(&compat_url),
                 "fp-test-2",
             )
             .expect("create custom-compatible provider");
         assert_eq!(custom_compat.name(), "custom");
+        assert_eq!(
+            custom_compat.list_models().await.unwrap()[0].id,
+            "fixture-model"
+        );
+        assert_eq!(
+            compat_server.await.unwrap(),
+            "GET /gateway/v1/models HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_routes_special_provider_discovery_to_custom_endpoints() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        for (name, expected_path, body) in [
+            (
+                "ollama",
+                "/gateway/api/tags",
+                r#"{"models":[{"name":"fixture"}]}"#,
+            ),
+            (
+                "glm",
+                "/gateway/api/models",
+                r#"{"data":[{"id":"fixture"}]}"#,
+            ),
+            (
+                "deepseek",
+                "/gateway/api/models",
+                r#"{"data":[{"id":"fixture"}]}"#,
+            ),
+            (
+                "gemini",
+                "/gateway/api/models?key=key",
+                r#"{"models":[{"name":"models/fixture"}]}"#,
+            ),
+            (
+                "telnyx",
+                "/gateway/api/models",
+                r#"{"data":[{"id":"fixture"}]}"#,
+            ),
+            (
+                "copilot",
+                "/gateway/api/models",
+                r#"{"data":[{"id":"fixture"}]}"#,
+            ),
+            (
+                "azure-openai",
+                "/gateway/api/openai/models?api-version=2024-08-01-preview",
+                r#"{"data":[{"id":"fixture"}]}"#,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}/gateway/api/", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = [0u8; 8192];
+                let count = stream.read(&mut bytes).await.unwrap();
+                let request_line = String::from_utf8_lossy(&bytes[..count])
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_owned();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                request_line
+            });
+            let provider =
+                create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
+                    name,
+                    if name == "ollama" { "" } else { "key" },
+                    ProviderTimeoutPolicy::default(),
+                    None,
+                    Some(&base_url),
+                    "fixture-authority",
+                )
+                .unwrap();
+            let models = provider.list_models().await.unwrap();
+            assert!(!models.is_empty(), "{name}");
+            assert_eq!(
+                server.await.unwrap(),
+                format!("GET {expected_path} HTTP/1.1"),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn special_provider_overrides_route_chat_and_complete_streams() {
+        use crate::types::ChatRequest;
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let openai_reply =
+            r#"{"choices":[{"message":{"content":"fixture reply"},"finish_reason":"stop"}]}"#;
+        let openai_stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"fixture reply\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let gemini_reply = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"fixture reply"}]},"finishReason":"STOP"}]}"#;
+        let gemini_stream = concat!(
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"fixture reply\"}]},\"finishReason\":\"STOP\"}]}\n\n"
+        );
+
+        for name in [
+            "ollama",
+            "glm",
+            "deepseek",
+            "gemini",
+            "telnyx",
+            "copilot",
+            "azure-openai",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!(
+                "http://{}/secret-gateway/api/",
+                listener.local_addr().unwrap()
+            );
+            let (chat_reply, stream_reply) = match name {
+                "ollama" => (
+                    r#"{"message":{"content":"fixture reply"},"done":true}"#,
+                    concat!(
+                        "{\"message\":{\"content\":\"fixture reply\"},\"done\":false}\n",
+                        "{\"message\":{},\"done\":true}\n"
+                    ),
+                ),
+                "gemini" => (gemini_reply, gemini_stream),
+                _ => (openai_reply, openai_stream),
+            };
+            let server = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                for reply in [chat_reply, stream_reply] {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    loop {
+                        let count = socket.read(&mut buffer).await.unwrap();
+                        assert!(count > 0, "request ended before its body");
+                        bytes.extend_from_slice(&buffer[..count]);
+                        if let Some(header_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|value| value.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if bytes.len() >= header_end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    requests.push(String::from_utf8(bytes).unwrap());
+                    let content_type = if reply.starts_with("data:") {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    };
+                    socket.write_all(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()
+                    ).as_bytes()).await.unwrap();
+                }
+                requests
+            });
+            // The simple factory gets Azure's deployment from the process environment.
+            // Use the same adapter constructor with an explicit fixture deployment here.
+            let provider: Box<dyn Provider> = if name == "azure-openai" {
+                Box::new(AzureOpenAiProvider::with_base_url_and_timeout_policy(
+                    "key",
+                    "unused-resource",
+                    "fixture-deployment",
+                    &base_url,
+                    ProviderTimeoutPolicy::default(),
+                ))
+            } else {
+                create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
+                    name,
+                    if name == "ollama" { "" } else { "key" },
+                    ProviderTimeoutPolicy::default(),
+                    None,
+                    Some(&base_url),
+                    "fixture-authority",
+                )
+                .unwrap()
+            };
+            let request = || ChatRequest {
+                model: "fixture".to_owned(),
+                messages: vec![ChatMessage::user("hello")],
+                temperature: None,
+                max_tokens: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                compiled_prompt: None,
+            };
+            let (chat, chunks) = crate::attachments::runtime::with_async_authority_scope(
+                "fixture-authority".to_owned(),
+                async {
+                    let chat = provider.chat(request()).await;
+                    let chunks = provider
+                        .stream_chat(request())
+                        .await?
+                        .collect::<Vec<_>>()
+                        .await;
+                    Ok::<_, anyhow::Error>((chat?, chunks))
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(chat.text, "fixture reply", "{name}");
+            let chunks: Vec<_> = chunks.into_iter().collect::<Result<_, _>>().unwrap();
+            assert_eq!(
+                chunks.iter().map(|c| c.delta.as_str()).collect::<String>(),
+                "fixture reply",
+                "{name}"
+            );
+            assert!(
+                chunks.iter().any(|c| c.is_final),
+                "{name} stream never finished"
+            );
+
+            let requests = server.await.unwrap();
+            let expected_path = match name {
+                "ollama" => "/secret-gateway/api/chat".to_owned(),
+                "gemini" => "/secret-gateway/api/models/fixture:generateContent?key=key".to_owned(),
+                "azure-openai" => "/secret-gateway/api/openai/deployments/fixture-deployment/chat/completions?api-version=2024-08-01-preview".to_owned(),
+                _ => "/secret-gateway/api/chat/completions".to_owned(),
+            };
+            let expected_stream_path = if name == "gemini" {
+                "/secret-gateway/api/models/fixture:streamGenerateContent?alt=sse&key=key"
+                    .to_owned()
+            } else {
+                expected_path.clone()
+            };
+            for (index, expected) in [expected_path, expected_stream_path].iter().enumerate() {
+                assert!(
+                    requests[index].starts_with(&format!("POST {expected} HTTP/1.1")),
+                    "{name}: {}",
+                    requests[index].lines().next().unwrap()
+                );
+                let lower = requests[index].to_ascii_lowercase();
+                if name == "azure-openai" {
+                    assert!(lower.contains("api-key: key\r\n"), "{name}");
+                } else if !matches!(name, "ollama" | "gemini") {
+                    assert!(lower.contains("authorization: bearer key\r\n"), "{name}");
+                } else {
+                    assert!(!lower.contains("authorization:"), "{name}");
+                }
+                if name == "copilot" {
+                    assert!(lower.contains("editor-version: pioneer/0.1.0\r\n"));
+                }
+                let body = requests[index].split_once("\r\n\r\n").unwrap().1;
+                let json: serde_json::Value = serde_json::from_str(body).unwrap();
+                if name != "gemini" {
+                    assert_eq!(json["stream"], index == 1, "{name}");
+                }
+            }
+        }
     }
 }

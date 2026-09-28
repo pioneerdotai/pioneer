@@ -13,10 +13,16 @@ use std::collections::{HashMap, HashSet};
 
 pub const CLI_RUNTIME_PROVIDER_PREFIX: &str = "cli_runtime:";
 
+pub fn provider_is_selectable(provider: &ProviderSummary) -> bool {
+    provider.available.unwrap_or_else(|| {
+        provider.api_key_configured || provider.proxy_url.is_some() || provider.name == "local"
+    })
+}
+
 pub fn configured_provider_names_from_list(providers: &[ProviderSummary]) -> HashSet<String> {
     providers
         .iter()
-        .filter(|provider| provider.api_key_configured)
+        .filter(|provider| provider_is_selectable(provider))
         .map(|provider| catalog::canonical_provider_id(provider.name.as_str()))
         .collect()
 }
@@ -29,20 +35,6 @@ pub fn provider_proxy_urls_from_list(providers: &[ProviderSummary]) -> HashMap<S
                 (
                     catalog::canonical_provider_id(provider.name.as_str()),
                     proxy_url.clone(),
-                )
-            })
-        })
-        .collect()
-}
-
-pub fn provider_base_urls_from_list(providers: &[ProviderSummary]) -> HashMap<String, String> {
-    providers
-        .iter()
-        .filter_map(|provider| {
-            provider.base_url.as_ref().map(|base_url| {
-                (
-                    catalog::canonical_provider_id(provider.name.as_str()),
-                    base_url.clone(),
                 )
             })
         })
@@ -215,6 +207,7 @@ impl ProviderModelSelectorState {
         let mut rows = self
             .providers
             .iter()
+            .filter(|provider| provider_is_selectable(provider))
             .filter(|provider| match self.mode {
                 ProviderModelSelectorMode::Chat => provider.name != "local",
                 ProviderModelSelectorMode::SelfImprovement => {
@@ -291,7 +284,11 @@ impl ProviderModelSelectorState {
     }
 
     pub fn apply_provider_list_success(&mut self, response: ProviderListResponse) {
-        self.providers = response.providers;
+        self.providers = response
+            .providers
+            .into_iter()
+            .map(super::credentials::public_provider_summary)
+            .collect();
         self.loading_providers = false;
         self.error = None;
     }
@@ -619,6 +616,7 @@ mod tests {
                 api_key_configured: true,
                 proxy_url: None,
                 base_url: None,
+                available: None,
             },
             ProviderSummary {
                 name: "lm_studio".to_owned(),
@@ -626,6 +624,7 @@ mod tests {
                 api_key_configured: true,
                 proxy_url: None,
                 base_url: None,
+                available: None,
             },
         ];
 
@@ -633,6 +632,76 @@ mod tests {
 
         assert!(configured.contains("bedrock"));
         assert!(configured.contains("lmstudio"));
+    }
+
+    #[test]
+    fn explicit_gateway_availability_controls_base_url_only_providers() {
+        let providers: Vec<ProviderSummary> = serde_json::from_value(serde_json::json!([
+            {"name":"vllm", "available":true, "base_url":""},
+            {"name":"gemini", "available":false, "base_url":""}
+        ]))
+        .unwrap();
+        let configured = configured_provider_names_from_list(&providers);
+        assert!(configured.contains("vllm"));
+        assert!(!configured.contains("gemini"));
+        let mut selector = ProviderModelSelectorState::new(None, None);
+        selector.apply_provider_list_success(ProviderListResponse {
+            providers,
+            definitions: vec![],
+        });
+        let rows = selector.provider_rows();
+        assert!(rows.iter().any(|row| row.id == "vllm"));
+        assert!(!rows.iter().any(|row| row.id == "gemini"));
+    }
+
+    #[test]
+    fn legacy_proxy_only_provider_remains_selectable_but_explicit_denial_wins() {
+        let legacy: ProviderListResponse = serde_json::from_value(serde_json::json!({
+            "providers": [{"name":"openai", "proxy_url":"http://127.0.0.1:8080"}]
+        }))
+        .unwrap();
+        assert!(legacy.definitions.is_empty());
+        assert_eq!(legacy.providers[0].available, None);
+        assert!(configured_provider_names_from_list(&legacy.providers).contains("openai"));
+        let mut selector = ProviderModelSelectorState::new(None, None);
+        selector.apply_provider_list_success(legacy);
+        assert!(
+            selector
+                .provider_rows()
+                .iter()
+                .any(|row| row.id == "openai")
+        );
+
+        let denied: ProviderListResponse = serde_json::from_value(serde_json::json!({
+            "providers": [{"name":"openai", "available":false, "proxy_url":"http://127.0.0.1:8080", "api_key_configured":true}],
+            "definitions": []
+        })).unwrap();
+        assert!(!configured_provider_names_from_list(&denied.providers).contains("openai"));
+        selector.apply_provider_list_success(denied);
+        assert!(
+            !selector
+                .provider_rows()
+                .iter()
+                .any(|row| row.id == "openai")
+        );
+    }
+
+    #[test]
+    fn selector_publication_does_not_retain_raw_base_url() {
+        let provider = serde_json::from_value(serde_json::json!({
+            "name":"vllm", "available":true,
+            "base_url":"https://user:password@example.test/private-key?token=secret#fragment"
+        }))
+        .unwrap();
+        let mut selector = ProviderModelSelectorState::new(None, None);
+        selector.apply_provider_list_success(ProviderListResponse {
+            providers: vec![provider],
+            definitions: vec![],
+        });
+        let json = serde_json::to_string(&selector).unwrap();
+        assert!(!json.contains("password"));
+        assert!(!json.contains("private-key"));
+        assert!(!json.contains("secret"));
     }
 
     #[test]
@@ -696,7 +765,9 @@ mod tests {
                 api_key_configured: true,
                 proxy_url: None,
                 base_url: None,
+                available: None,
             }],
+            definitions: vec![],
         });
         assert!(state.loading_providers());
         state.apply_cli_runtime_list_success(CLIRuntimeListResponse {
@@ -776,7 +847,9 @@ mod tests {
                 api_key_configured: true,
                 proxy_url: None,
                 base_url: None,
+                available: None,
             }],
+            definitions: vec![],
         });
         state.apply_cli_runtime_list_success(CLIRuntimeListResponse {
             revision: 1,
@@ -829,7 +902,10 @@ mod tests {
         let provider_key = cli_runtime_provider_key("codex_work");
         let mut state =
             ProviderModelSelectorState::new(Some(provider_key.clone()), Some("gpt-5".to_owned()));
-        state.apply_provider_list_success(ProviderListResponse { providers: vec![] });
+        state.apply_provider_list_success(ProviderListResponse {
+            providers: vec![],
+            definitions: vec![],
+        });
         state.apply_cli_runtime_list_success(CLIRuntimeListResponse {
             revision: 1,
             runtimes: vec![runtime_summary(
@@ -878,6 +954,7 @@ mod tests {
                     api_key_configured: true,
                     proxy_url: None,
                     base_url: None,
+                    available: None,
                 },
                 ProviderSummary {
                     name: "local".to_owned(),
@@ -888,8 +965,10 @@ mod tests {
                     api_key_configured: false,
                     proxy_url: None,
                     base_url: None,
+                    available: None,
                 },
             ],
+            definitions: vec![],
         });
         state.apply_cli_runtime_list_success(CLIRuntimeListResponse {
             revision: 1,
@@ -932,6 +1011,7 @@ mod tests {
                     api_key_configured: true,
                     proxy_url: None,
                     base_url: None,
+                    available: None,
                 },
                 ProviderSummary {
                     name: "anthropic".to_owned(),
@@ -939,8 +1019,10 @@ mod tests {
                     api_key_configured: true,
                     proxy_url: None,
                     base_url: None,
+                    available: None,
                 },
             ],
+            definitions: vec![],
         });
         assert!(!state.loading_providers());
         state.apply_cli_runtime_list_success(CLIRuntimeListResponse {
@@ -1006,6 +1088,7 @@ mod tests {
                     api_key_configured: false,
                     proxy_url: None,
                     base_url: None,
+                    available: None,
                 },
                 ProviderSummary {
                     name: "remote-transcription".to_owned(),
@@ -1017,6 +1100,7 @@ mod tests {
                     api_key_configured: true,
                     proxy_url: None,
                     base_url: None,
+                    available: None,
                 },
                 ProviderSummary {
                     name: "openai".to_owned(),
@@ -1028,8 +1112,10 @@ mod tests {
                     api_key_configured: true,
                     proxy_url: None,
                     base_url: None,
+                    available: None,
                 },
             ],
+            definitions: vec![],
         });
         state.apply_cli_runtime_list_success(CLIRuntimeListResponse {
             revision: 1,
@@ -1120,6 +1206,7 @@ mod tests {
                 api_key_configured: true,
                 proxy_url: None,
                 base_url: None,
+                available: None,
             },
             ProviderSummary {
                 name: "local".to_owned(),
@@ -1131,12 +1218,14 @@ mod tests {
                 api_key_configured: false,
                 proxy_url: None,
                 base_url: None,
+                available: None,
             },
         ];
 
         let mut chat = ProviderModelSelectorState::new(None, None);
         chat.apply_provider_list_success(ProviderListResponse {
             providers: providers.clone(),
+            definitions: vec![],
         });
         let chat_rows = chat.provider_rows();
         assert!(chat_rows.iter().any(|row| row.id == "openai"));
@@ -1147,7 +1236,10 @@ mod tests {
             None,
             ProviderModelSelectorMode::Embeddings,
         );
-        embeddings.apply_provider_list_success(ProviderListResponse { providers });
+        embeddings.apply_provider_list_success(ProviderListResponse {
+            providers,
+            definitions: vec![],
+        });
         let embedding_rows = embeddings.provider_rows();
         assert!(embedding_rows.iter().any(|row| row.id == "openai"));
         assert!(embedding_rows.iter().any(|row| row.id == "local"));

@@ -93,6 +93,7 @@ pub fn filter_model_selector_providers(
             query.is_empty() || provider.name.to_lowercase().contains(query.as_str())
         })
         .cloned()
+        .map(super::credentials::public_provider_summary)
         .collect()
 }
 
@@ -410,6 +411,7 @@ mod tests {
             api_key_configured: true,
             proxy_url: None,
             base_url: None,
+            available: None,
         }
     }
 

@@ -1108,6 +1108,10 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         ),
         schema_doc!("provider_summary.json", pioneer_protocol::ProviderSummary),
         schema_doc!(
+            "provider_definition.json",
+            pioneer_protocol::ProviderDefinition
+        ),
+        schema_doc!(
             "reasoning_capability_source.json",
             pioneer_protocol::ReasoningCapabilitySource
         ),

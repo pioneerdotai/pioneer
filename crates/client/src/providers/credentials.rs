@@ -17,6 +17,26 @@ pub struct ProviderCredentialRead {
     receiver: mpsc::Receiver<anyhow::Result<Option<String>>>,
     demand: Weak<()>,
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn provider_credential_read_for_test() -> (
+    ProviderCredentialLease,
+    ProviderCredentialRead,
+    mpsc::SyncSender<anyhow::Result<Option<String>>>,
+) {
+    let token = Arc::new(());
+    let (sender, receiver) = mpsc::sync_channel(1);
+    (
+        ProviderCredentialLease {
+            _token: token.clone(),
+        },
+        ProviderCredentialRead {
+            receiver,
+            demand: Arc::downgrade(&token),
+        },
+        sender,
+    )
+}
 impl ProviderCredentialRead {
     pub fn wait(self) -> anyhow::Result<Option<String>> {
         loop {
@@ -152,7 +172,10 @@ impl ClientCore {
                             .and_then(|r| {
                                 r.providers
                                     .into_iter()
-                                    .find(|p| &p.name == provider)
+                                    .find(|p| {
+                                        super::catalog::canonical_provider_id(&p.name)
+                                            == super::catalog::canonical_provider_id(provider)
+                                    })
                                     .map(|p| p.proxy_url)
                                     .ok_or_else(|| {
                                         anyhow::anyhow!("provider_credential_unavailable")
@@ -163,7 +186,10 @@ impl ClientCore {
                             .and_then(|r| {
                                 r.providers
                                     .into_iter()
-                                    .find(|p| &p.name == provider)
+                                    .find(|p| {
+                                        super::catalog::canonical_provider_id(&p.name)
+                                            == super::catalog::canonical_provider_id(provider)
+                                    })
                                     .map(|p| p.base_url)
                                     .ok_or_else(|| {
                                         anyhow::anyhow!("provider_credential_unavailable")
@@ -225,6 +251,20 @@ pub(super) fn public_proxy(value: Option<String>) -> Option<String> {
         parsed.set_fragment(None);
         parsed.to_string()
     })
+}
+
+/// A custom endpoint can carry secrets even in its path. Publish only the fact
+/// that an override exists; the form reads the original under a short lease.
+pub(super) fn public_base_url(value: Option<String>) -> Option<String> {
+    value.map(|_| String::new())
+}
+
+pub(super) fn public_provider_summary(
+    mut provider: pioneer_protocol::ProviderSummary,
+) -> pioneer_protocol::ProviderSummary {
+    provider.proxy_url = public_proxy(provider.proxy_url.take());
+    provider.base_url = public_base_url(provider.base_url.take());
+    provider
 }
 
 #[cfg(test)]

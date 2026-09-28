@@ -27,7 +27,7 @@ use pioneer_protocol::{
     ProviderModelReasoningCapabilities, ReasoningCapabilitySource,
 };
 
-const BASE_URL: &str = "https://openrouter.ai/api/v1";
+pub(crate) const BASE_URL: &str = "https://openrouter.ai/api/v1";
 const APP_REFERER: &str = "https://getpioneer.dev";
 const APP_TITLE: &str = "Pioneer";
 const APP_CATEGORIES: &str = "personal-agent,general-chat";
@@ -411,7 +411,7 @@ impl OpenRouterProvider {
     ) -> Self {
         Self {
             api_key: api_key.into(),
-            base_url: base_url.into(),
+            base_url: base_url.into().trim_end_matches('/').to_owned(),
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
         }
@@ -1481,6 +1481,15 @@ mod tests {
     fn creates_with_custom_base_url() {
         let provider = OpenRouterProvider::with_base_url("key", "http://localhost:8080");
         assert_eq!(provider.base_url, "http://localhost:8080");
+    }
+
+    #[test]
+    fn custom_base_url_keeps_prefix_without_double_slash() {
+        let provider = OpenRouterProvider::with_base_url("key", "http://localhost:8080/gateway/");
+        assert_eq!(
+            provider.models_url(),
+            "http://localhost:8080/gateway/models"
+        );
     }
 
     #[test]

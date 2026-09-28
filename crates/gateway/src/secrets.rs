@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
     sync::Arc,
@@ -97,10 +97,12 @@ impl GatewaySecrets {
     }
 
     pub(crate) fn normalize_provider_name(&self, provider: &str) -> Result<String> {
-        Ok(SecretId::provider_api_key(provider)
+        let normalized = SecretId::provider_api_key(provider)
             .context("invalid provider name")?
             .user()
-            .to_owned())
+            .to_owned();
+        Ok(pioneer_provider::provider_definition(&normalized)
+            .map_or(normalized.clone(), |definition| definition.name.to_owned()))
     }
 
     pub(crate) fn get_provider_api_key(&self, provider: &str) -> Result<Option<String>> {
@@ -115,11 +117,38 @@ impl GatewaySecrets {
         workspace_id: &str,
         provider: &str,
     ) -> Result<Option<String>> {
-        let id = SecretId::workspace_provider_api_key(workspace_id, provider)
-            .context("invalid workspace provider api key id")?;
-        self.store
+        let id = SecretId::workspace_provider_api_key(
+            workspace_id,
+            self.normalize_provider_name(provider)?.as_str(),
+        )
+        .context("invalid workspace provider api key id")?;
+        self.get_workspace_provider_value(workspace_id, provider, SecretKind::ProviderApiKey, &id)
+    }
+
+    fn get_workspace_provider_value(
+        &self,
+        workspace_id: &str,
+        provider: &str,
+        kind: SecretKind,
+        id: &SecretId,
+    ) -> Result<Option<String>> {
+        let value = self
+            .store
             .get_string(&id)
-            .context("failed to read workspace provider api key from keystore")
+            .context("failed to read workspace provider secret from keystore")?;
+        if value.is_some() {
+            return Ok(value);
+        }
+        for legacy_id in self.legacy_workspace_provider_ids(workspace_id, provider, kind)? {
+            if let Some(value) = self
+                .store
+                .get_string(&legacy_id)
+                .context("failed to read legacy workspace provider secret from keystore")?
+            {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) fn get_workspace_provider_proxy(
@@ -127,11 +156,12 @@ impl GatewaySecrets {
         workspace_id: &str,
         provider: &str,
     ) -> Result<Option<String>> {
-        let id = SecretId::workspace_provider_proxy(workspace_id, provider)
-            .context("invalid workspace provider proxy id")?;
-        self.store
-            .get_string(&id)
-            .context("failed to read workspace provider proxy from keystore")
+        let id = SecretId::workspace_provider_proxy(
+            workspace_id,
+            self.normalize_provider_name(provider)?.as_str(),
+        )
+        .context("invalid workspace provider proxy id")?;
+        self.get_workspace_provider_value(workspace_id, provider, SecretKind::ProviderProxy, &id)
     }
 
     pub(crate) fn get_workspace_provider_base_url(
@@ -139,11 +169,12 @@ impl GatewaySecrets {
         workspace_id: &str,
         provider: &str,
     ) -> Result<Option<String>> {
-        let id = SecretId::workspace_provider_base_url(workspace_id, provider)
-            .context("invalid workspace provider base url id")?;
-        self.store
-            .get_string(&id)
-            .context("failed to read workspace provider base url from keystore")
+        let id = SecretId::workspace_provider_base_url(
+            workspace_id,
+            self.normalize_provider_name(provider)?.as_str(),
+        )
+        .context("invalid workspace provider base url id")?;
+        self.get_workspace_provider_value(workspace_id, provider, SecretKind::ProviderBaseUrl, &id)
     }
 
     pub(crate) fn get_workspace_cli_runtime_proxy(
@@ -237,8 +268,11 @@ impl GatewaySecrets {
             bail!("provider api key must not be empty");
         }
 
-        let id = SecretId::workspace_provider_api_key(workspace_id, provider)
-            .context("invalid workspace provider api key id")?;
+        let id = SecretId::workspace_provider_api_key(
+            workspace_id,
+            self.normalize_provider_name(provider)?.as_str(),
+        )
+        .context("invalid workspace provider api key id")?;
         let normalized_provider = Self::provider_name_from_workspace_provider_id(&id)
             .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
         let now = current_unix_i64()?;
@@ -273,8 +307,11 @@ impl GatewaySecrets {
             bail!("provider proxy URL must not be empty");
         }
 
-        let id = SecretId::workspace_provider_proxy(workspace_id, provider)
-            .context("invalid workspace provider proxy id")?;
+        let id = SecretId::workspace_provider_proxy(
+            workspace_id,
+            self.normalize_provider_name(provider)?.as_str(),
+        )
+        .context("invalid workspace provider proxy id")?;
         let normalized_provider = Self::provider_name_from_workspace_provider_id(&id)
             .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
         let now = current_unix_i64()?;
@@ -309,8 +346,11 @@ impl GatewaySecrets {
             bail!("provider base URL must not be empty");
         }
 
-        let id = SecretId::workspace_provider_base_url(workspace_id, provider)
-            .context("invalid workspace provider base url id")?;
+        let id = SecretId::workspace_provider_base_url(
+            workspace_id,
+            self.normalize_provider_name(provider)?.as_str(),
+        )
+        .context("invalid workspace provider base url id")?;
         let normalized_provider = Self::provider_name_from_workspace_provider_id(&id)
             .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
         let now = current_unix_i64()?;
@@ -387,13 +427,20 @@ impl GatewaySecrets {
         workspace_id: &str,
         provider: &str,
     ) -> Result<(String, bool)> {
-        let id = SecretId::workspace_provider_api_key(workspace_id, provider)
-            .context("invalid workspace provider api key id")?;
+        let id = SecretId::workspace_provider_api_key(
+            workspace_id,
+            self.normalize_provider_name(provider)?.as_str(),
+        )
+        .context("invalid workspace provider api key id")?;
         let normalized_provider = Self::provider_name_from_workspace_provider_id(&id)
             .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
         let deleted = self
-            .store
-            .delete(&id)
+            .delete_workspace_provider_secret_and_aliases(
+                workspace_id,
+                provider,
+                SecretKind::ProviderApiKey,
+                &id,
+            )
             .context("failed to delete workspace provider api key from keystore")?;
         Ok((normalized_provider, deleted))
     }
@@ -403,13 +450,20 @@ impl GatewaySecrets {
         workspace_id: &str,
         provider: &str,
     ) -> Result<(String, bool)> {
-        let id = SecretId::workspace_provider_proxy(workspace_id, provider)
-            .context("invalid workspace provider proxy id")?;
+        let id = SecretId::workspace_provider_proxy(
+            workspace_id,
+            self.normalize_provider_name(provider)?.as_str(),
+        )
+        .context("invalid workspace provider proxy id")?;
         let normalized_provider = Self::provider_name_from_workspace_provider_id(&id)
             .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
         let deleted = self
-            .store
-            .delete(&id)
+            .delete_workspace_provider_secret_and_aliases(
+                workspace_id,
+                provider,
+                SecretKind::ProviderProxy,
+                &id,
+            )
             .context("failed to delete workspace provider proxy from keystore")?;
         Ok((normalized_provider, deleted))
     }
@@ -419,13 +473,20 @@ impl GatewaySecrets {
         workspace_id: &str,
         provider: &str,
     ) -> Result<(String, bool)> {
-        let id = SecretId::workspace_provider_base_url(workspace_id, provider)
-            .context("invalid workspace provider base url id")?;
+        let id = SecretId::workspace_provider_base_url(
+            workspace_id,
+            self.normalize_provider_name(provider)?.as_str(),
+        )
+        .context("invalid workspace provider base url id")?;
         let normalized_provider = Self::provider_name_from_workspace_provider_id(&id)
             .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
         let deleted = self
-            .store
-            .delete(&id)
+            .delete_workspace_provider_secret_and_aliases(
+                workspace_id,
+                provider,
+                SecretKind::ProviderBaseUrl,
+                &id,
+            )
             .context("failed to delete workspace provider base url from keystore")?;
         Ok((normalized_provider, deleted))
     }
@@ -477,10 +538,9 @@ impl GatewaySecrets {
                 continue;
             }
 
-            names.insert(
-                Self::provider_name_from_workspace_provider_id(&entry.id)
-                    .unwrap_or_else(|| entry.label.unwrap_or_else(|| entry.id.user().to_owned())),
-            );
+            let name = Self::provider_name_from_workspace_provider_id(&entry.id)
+                .unwrap_or_else(|| entry.label.unwrap_or_else(|| entry.id.user().to_owned()));
+            names.insert(self.normalize_provider_name(&name)?);
         }
 
         Ok(names.into_iter().collect())
@@ -496,7 +556,7 @@ impl GatewaySecrets {
             .list(SecretFilter::Kind(SecretKind::ProviderProxy))
             .context("failed to list provider proxies from keystore")?;
 
-        let mut proxies = Vec::new();
+        let mut proxies = BTreeMap::new();
         for entry in entries {
             if !entry.id.user().starts_with(prefix.as_str()) {
                 continue;
@@ -508,12 +568,14 @@ impl GatewaySecrets {
             else {
                 continue;
             };
-            let provider_name = Self::provider_name_from_workspace_provider_id(&entry.id)
+            let stored_name = Self::provider_name_from_workspace_provider_id(&entry.id)
                 .unwrap_or_else(|| entry.label.unwrap_or_else(|| entry.id.user().to_owned()));
-            proxies.push((provider_name, proxy_url));
+            let provider_name = self.normalize_provider_name(&stored_name)?;
+            if stored_name == provider_name || !proxies.contains_key(&provider_name) {
+                proxies.insert(provider_name, proxy_url);
+            }
         }
-        proxies.sort_by(|left, right| left.0.cmp(&right.0));
-        Ok(proxies)
+        Ok(proxies.into_iter().collect())
     }
 
     pub(crate) fn list_workspace_provider_base_urls(
@@ -526,7 +588,7 @@ impl GatewaySecrets {
             .list(SecretFilter::Kind(SecretKind::ProviderBaseUrl))
             .context("failed to list provider base urls from keystore")?;
 
-        let mut base_urls = Vec::new();
+        let mut base_urls = BTreeMap::new();
         for entry in entries {
             if !entry.id.user().starts_with(prefix.as_str()) {
                 continue;
@@ -538,12 +600,14 @@ impl GatewaySecrets {
             else {
                 continue;
             };
-            let provider_name = Self::provider_name_from_workspace_provider_id(&entry.id)
+            let stored_name = Self::provider_name_from_workspace_provider_id(&entry.id)
                 .unwrap_or_else(|| entry.label.unwrap_or_else(|| entry.id.user().to_owned()));
-            base_urls.push((provider_name, base_url));
+            let provider_name = self.normalize_provider_name(&stored_name)?;
+            if stored_name == provider_name || !base_urls.contains_key(&provider_name) {
+                base_urls.insert(provider_name, base_url);
+            }
         }
-        base_urls.sort_by(|left, right| left.0.cmp(&right.0));
-        Ok(base_urls)
+        Ok(base_urls.into_iter().collect())
     }
 
     #[cfg(test)]
@@ -635,7 +699,7 @@ impl GatewaySecrets {
 
             let provider_id = SecretId::provider_api_key(entry.id.user())
                 .with_context(|| format!("invalid legacy provider key `{}`", entry.id.user()))?;
-            let provider_name = provider_id.user().to_owned();
+            let provider_name = self.normalize_provider_name(provider_id.user())?;
             let target_id =
                 SecretId::workspace_provider_api_key(workspace_id.as_str(), provider_name.as_str())
                     .context("invalid workspace provider key id")?;
@@ -731,6 +795,59 @@ impl GatewaySecrets {
             .strip_suffix(SENTINEL_PROVIDER)
             .unwrap_or(id.user())
             .to_owned())
+    }
+
+    // Credentials saved before canonical provider IDs were enforced remain
+    // readable only from their original workspace. New writes use canonical IDs.
+    fn legacy_workspace_provider_ids(
+        &self,
+        workspace_id: &str,
+        provider: &str,
+        kind: SecretKind,
+    ) -> Result<Vec<SecretId>> {
+        let canonical = self.normalize_provider_name(provider)?;
+        let prefix = match kind {
+            SecretKind::ProviderApiKey => {
+                Self::workspace_provider_secret_user_prefix(workspace_id)?
+            }
+            SecretKind::ProviderProxy => Self::workspace_provider_proxy_user_prefix(workspace_id)?,
+            SecretKind::ProviderBaseUrl => {
+                Self::workspace_provider_base_url_user_prefix(workspace_id)?
+            }
+            _ => bail!("unsupported provider secret kind"),
+        };
+        let mut ids = self
+            .store
+            .list(SecretFilter::Kind(kind))?
+            .into_iter()
+            .filter(|entry| entry.id.user().starts_with(&prefix))
+            .filter(|entry| {
+                Self::provider_name_from_workspace_provider_id(&entry.id).is_some_and(|name| {
+                    name != canonical
+                        && self
+                            .normalize_provider_name(&name)
+                            .is_ok_and(|resolved| resolved == canonical)
+                })
+            })
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        Ok(ids)
+    }
+
+    fn delete_workspace_provider_secret_and_aliases(
+        &self,
+        workspace_id: &str,
+        provider: &str,
+        kind: SecretKind,
+        id: &SecretId,
+    ) -> Result<bool> {
+        let legacy_ids = self.legacy_workspace_provider_ids(workspace_id, provider, kind)?;
+        let mut deleted = self.store.delete(id)?;
+        for legacy_id in legacy_ids {
+            deleted |= self.store.delete(&legacy_id)?;
+        }
+        Ok(deleted)
     }
 
     fn provider_name_from_workspace_provider_id(id: &SecretId) -> Option<String> {
@@ -1322,6 +1439,181 @@ mod tests {
                 .get_workspace_provider_base_url("ws_default", "openai")
                 .expect("read deleted base url"),
             None
+        );
+    }
+
+    #[test]
+    fn provider_base_url_override_survives_reopen_and_reset_is_workspace_local() {
+        let home = tempfile::tempdir().unwrap();
+        {
+            let secrets = GatewaySecrets::open(home.path()).unwrap();
+            secrets
+                .set_workspace_provider_base_url("a", "openai", "http://127.0.0.1:11001/v1")
+                .unwrap();
+            secrets
+                .set_workspace_provider_base_url("b", "openai", "http://127.0.0.1:11002/v1")
+                .unwrap();
+        }
+        {
+            let reopened = GatewaySecrets::open(home.path()).unwrap();
+            assert_eq!(
+                reopened
+                    .get_workspace_provider_base_url("a", "openai")
+                    .unwrap()
+                    .as_deref(),
+                Some("http://127.0.0.1:11001/v1")
+            );
+            assert_eq!(
+                reopened
+                    .get_workspace_provider_base_url("b", "openai")
+                    .unwrap()
+                    .as_deref(),
+                Some("http://127.0.0.1:11002/v1")
+            );
+            reopened
+                .delete_workspace_provider_base_url("a", "openai")
+                .unwrap();
+            assert!(
+                reopened
+                    .get_workspace_provider_base_url("a", "openai")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                reopened
+                    .get_workspace_provider_base_url("b", "openai")
+                    .unwrap()
+                    .as_deref(),
+                Some("http://127.0.0.1:11002/v1")
+            );
+        }
+        let reopened = GatewaySecrets::open(home.path()).unwrap();
+        assert!(
+            reopened
+                .get_workspace_provider_base_url("a", "openai")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            reopened
+                .get_workspace_provider_base_url("b", "openai")
+                .unwrap()
+                .as_deref(),
+            Some("http://127.0.0.1:11002/v1")
+        );
+    }
+
+    #[test]
+    fn legacy_alias_secrets_resolve_and_clear_only_within_their_workspace() {
+        let store = Arc::new(MemorySecretStore::new());
+        let secrets = GatewaySecrets::new(store.clone());
+        for (id, kind, value) in [
+            (
+                SecretId::workspace_provider_api_key("a", "grok").unwrap(),
+                SecretKind::ProviderApiKey,
+                "legacy-key",
+            ),
+            (
+                SecretId::workspace_provider_proxy("a", "grok").unwrap(),
+                SecretKind::ProviderProxy,
+                "http://127.0.0.1:11111",
+            ),
+        ] {
+            store
+                .put_string(
+                    &id,
+                    value,
+                    SecretMeta {
+                        kind,
+                        label: Some("grok".into()),
+                        created_at_unix: 1,
+                        updated_at_unix: 1,
+                    },
+                )
+                .unwrap();
+        }
+        let legacy_a = SecretId::workspace_provider_base_url("a", "grok").unwrap();
+        let legacy_b = SecretId::workspace_provider_base_url("b", "grok").unwrap();
+        for (id, value) in [
+            (&legacy_a, "http://127.0.0.1:11001/v1"),
+            (&legacy_b, "http://127.0.0.1:11002/v1"),
+        ] {
+            store
+                .put_string(
+                    id,
+                    value,
+                    SecretMeta {
+                        kind: SecretKind::ProviderBaseUrl,
+                        label: Some("grok".into()),
+                        created_at_unix: 1,
+                        updated_at_unix: 1,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            secrets.list_workspace_provider_base_urls("a").unwrap(),
+            vec![("xai".into(), "http://127.0.0.1:11001/v1".into())]
+        );
+        assert_eq!(
+            secrets
+                .list_configured_workspace_provider_names("a")
+                .unwrap(),
+            vec!["xai"]
+        );
+        assert_eq!(
+            secrets
+                .get_workspace_provider_api_key("a", "xai")
+                .unwrap()
+                .as_deref(),
+            Some("legacy-key")
+        );
+        assert_eq!(
+            secrets.list_workspace_provider_proxies("a").unwrap(),
+            vec![("xai".into(), "http://127.0.0.1:11111".into())]
+        );
+        assert_eq!(
+            secrets
+                .get_workspace_provider_proxy("a", "xai")
+                .unwrap()
+                .as_deref(),
+            Some("http://127.0.0.1:11111")
+        );
+        assert_eq!(
+            secrets
+                .get_workspace_provider_base_url("a", "xai")
+                .unwrap()
+                .as_deref(),
+            Some("http://127.0.0.1:11001/v1")
+        );
+        assert_eq!(
+            secrets
+                .delete_workspace_provider_base_url("a", "xai")
+                .unwrap(),
+            ("xai".into(), true)
+        );
+        assert_eq!(
+            secrets.get_workspace_provider_base_url("a", "xai").unwrap(),
+            None
+        );
+        secrets
+            .delete_workspace_provider_api_key("a", "xai")
+            .unwrap();
+        secrets.delete_workspace_provider_proxy("a", "xai").unwrap();
+        assert_eq!(
+            secrets.get_workspace_provider_api_key("a", "xai").unwrap(),
+            None
+        );
+        assert_eq!(
+            secrets.get_workspace_provider_proxy("a", "xai").unwrap(),
+            None
+        );
+        assert_eq!(
+            secrets
+                .get_workspace_provider_base_url("b", "xai")
+                .unwrap()
+                .as_deref(),
+            Some("http://127.0.0.1:11002/v1")
         );
     }
 

@@ -24,15 +24,9 @@ impl ProviderInput {
         self.catalog
             .iter()
             .flat_map(|p| p.providers().iter())
-            .filter(|row| row.provider().api_key_configured)
+            .filter(|row| pioneer_client::providers::list::provider_is_selectable(row.provider()))
             .map(|row| pioneer_client::providers::catalog::canonical_provider_id(row.id()))
             .collect()
-    }
-    pub(crate) fn is_configured(&self, id: &str) -> bool {
-        self.catalog.iter().flat_map(|p| p.providers()).any(|row| {
-            pioneer_client::providers::catalog::canonical_provider_id(row.id()) == id
-                && row.provider().api_key_configured
-        })
     }
     pub(crate) fn provider_proxy_url(&self, id: &str) -> Option<&str> {
         self.catalog
@@ -54,11 +48,31 @@ impl ProviderInput {
             .base_url
             .as_deref()
     }
-    pub(crate) fn provider_default_base_url(&self, id: &str) -> Option<&'static str> {
-        pioneer_client::providers::catalog::default_provider_base_url(id)
+    pub(crate) fn provider_has_api_key(&self, id: &str) -> bool {
+        self.catalog.iter().flat_map(|p| p.providers()).any(|row| {
+            pioneer_client::providers::catalog::canonical_provider_id(row.id()) == id
+                && row.provider().api_key_configured
+        })
+    }
+    pub(crate) fn provider_default_base_url(&self, id: &str) -> Option<&str> {
+        self.catalog
+            .as_ref()?
+            .definitions()
+            .iter()
+            .find(|definition| definition.name == id)?
+            .default_base_url
+            .as_deref()
     }
     pub(crate) fn provider_supports_base_url_override(&self, id: &str) -> bool {
-        pioneer_client::providers::catalog::provider_supports_base_url_override(id)
+        self.catalog
+            .as_ref()
+            .and_then(|catalog| {
+                catalog
+                    .definitions()
+                    .iter()
+                    .find(|definition| definition.name == id)
+            })
+            .is_some_and(|definition| definition.supports_base_url_override)
     }
     pub(crate) fn cli_runtimes(&self) -> Vec<RuntimeSummary> {
         self.runtimes
@@ -115,7 +129,7 @@ pub(crate) fn provider_base_url_field_visible(
     configured: Option<&str>,
     supports_override: bool,
 ) -> bool {
-    supports_override || configured.is_some_and(|value| !value.trim().is_empty())
+    supports_override || configured.is_some()
 }
 
 pub(crate) fn provider_base_url_placeholder(default: Option<&str>, generic: &str) -> String {

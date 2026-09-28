@@ -9,6 +9,16 @@
         "null"
       ]
     },
+    "base_url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "clear_base_url": {
+      "type": "boolean",
+      "default": false
+    },
     "clear_proxy": {
       "type": "boolean",
       "default": false

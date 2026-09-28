@@ -7,7 +7,9 @@
 
 pub mod attachments;
 pub mod catalog;
+pub mod definition;
 pub mod factory;
+pub mod failure;
 pub mod file_tools;
 mod http;
 pub mod providers;
@@ -28,7 +30,11 @@ pub use attachments::{
     set_default_attachment_pipeline_config, store_uploaded_reference_for_authority,
     upload_registry_key_for_authority,
 };
-pub use factory::{create_provider, default_provider_base_url};
+pub use definition::{
+    ProviderEndpointDefinition, provider_definition, provider_definitions, provider_is_available,
+    validate_provider_base_url,
+};
+pub use factory::create_provider;
 pub use file_tools::{
     NATIVE_FILE_TOOL_SCHEMA_VERSION, NativeFileToolCapability, NativePatchPayload,
     NativePatchWireShape, apply_patch_tool_schema, read_file_tool_schema,

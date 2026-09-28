@@ -7,6 +7,20 @@
       "type": "boolean",
       "default": false
     },
+    "base_url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "base_url_deleted": {
+      "type": "boolean",
+      "default": false
+    },
+    "base_url_updated": {
+      "type": "boolean",
+      "default": false
+    },
     "provider": {
       "type": "string"
     },

@@ -12,9 +12,9 @@ use crate::{
     tools::stream::{IncrementalLineDecoder, sse_data},
     types::{
         ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, InputContentType,
-        InputTypeSupport, ProviderCapabilities, ProviderInputCapabilities, ProviderTermination,
-        ProviderTimeoutPolicy, ReasoningConfig, Role, StreamChunk, TokenUsage, ToolChoice,
-        ToolDefinition,
+        InputTypeSupport, ProviderCapabilities, ProviderFailureClassification,
+        ProviderInputCapabilities, ProviderTermination, ProviderTimeoutPolicy, ReasoningConfig,
+        Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -28,9 +28,12 @@ use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
-use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
+use pioneer_protocol::{
+    ProviderFailureClass, ProviderFailureStage, ProviderModelCapabilities, ProviderModelInfo,
+    ProviderModelLimits,
+};
 
-const BASE_URL: &str = "https://api.openai.com/v1";
+pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 
 #[derive(Clone, Copy)]
 struct OpenAiEmbeddingModelDefinition {
@@ -363,6 +366,74 @@ struct OpenAiFileUploadResponse {
     id: String,
 }
 
+/// Upload failures enter attachment observability before the registry can
+/// redact an endpoint override. Keep only classified, safe data here.
+#[derive(Debug)]
+struct OpenAiFileUploadError {
+    classification: ProviderFailureClassification,
+}
+
+impl OpenAiFileUploadError {
+    fn new(class: ProviderFailureClass, status: Option<u16>, retry_after_ms: Option<u64>) -> Self {
+        let mut classification = ProviderFailureClassification::new(class);
+        classification.http_status = status;
+        classification.retry_after_ms = retry_after_ms;
+        Self { classification }
+    }
+
+    fn http(status: reqwest::StatusCode, body: &str, retry_after_ms: Option<u64>) -> Self {
+        let lower = body.to_ascii_lowercase();
+        let code = crate::failure::extract_provider_code(body);
+        let class = crate::failure::classify_provider_failure_class(
+            lower.as_str(),
+            ProviderFailureStage::Connect,
+            Some(status.as_u16()),
+            code.as_deref(),
+        );
+        Self::new(
+            class,
+            Some(status.as_u16()),
+            retry_after_ms.or_else(|| crate::failure::extract_retry_after_ms(&lower)),
+        )
+    }
+
+    fn transport(error: &reqwest::Error) -> Self {
+        let status = error.status().map(|status| status.as_u16());
+        let class = crate::failure::classify_provider_failure_class(
+            "",
+            ProviderFailureStage::Connect,
+            status,
+            None,
+        );
+        let class = if class == ProviderFailureClass::Unknown {
+            ProviderFailureClass::NetworkTransient
+        } else {
+            class
+        };
+        Self::new(class, status, None)
+    }
+
+    fn response() -> Self {
+        Self::new(ProviderFailureClass::Unknown, None, None)
+    }
+}
+
+impl std::fmt::Display for OpenAiFileUploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "OpenAI file upload failed ({:?}",
+            self.classification.class
+        )?;
+        if let Some(status) = self.classification.http_status {
+            write!(f, ", HTTP {status}")?;
+        }
+        f.write_str(")")
+    }
+}
+
+impl std::error::Error for OpenAiFileUploadError {}
+
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl OpenAiProvider {
@@ -471,7 +542,13 @@ impl OpenAiProvider {
                     let file_part = Part::bytes(payload)
                         .file_name(file_name)
                         .mime_str(mime_type.as_str())
-                        .map_err(AttachmentOperationError::non_retryable)?;
+                        .map_err(|_| {
+                            AttachmentOperationError::non_retryable(OpenAiFileUploadError::new(
+                                ProviderFailureClass::ProviderRejected,
+                                None,
+                                None,
+                            ))
+                        })?;
                     let form = Form::new()
                         .text("purpose", "user_data")
                         .part("file", file_part);
@@ -488,6 +565,12 @@ impl OpenAiProvider {
 
                     let status = response.status();
                     if !status.is_success() {
+                        let retry_after_ms = response
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|value| value.trim().parse::<u64>().ok())
+                            .map(|seconds| seconds.saturating_mul(1000));
                         let body = match crate::http::read_response_text_bounded(
                             response,
                             16 * 1024,
@@ -496,11 +579,13 @@ impl OpenAiProvider {
                         .await
                         {
                             Ok(body) => body,
-                            Err(error) => {
-                                return Err(AttachmentOperationError::non_retryable(error));
+                            Err(_) => {
+                                return Err(AttachmentOperationError::non_retryable(
+                                    OpenAiFileUploadError::http(status, "", retry_after_ms),
+                                ));
                             }
                         };
-                        let error = anyhow!("OpenAI file upload error ({status}): {body}");
+                        let error = OpenAiFileUploadError::http(status, &body, retry_after_ms);
                         if status == reqwest::StatusCode::TOO_MANY_REQUESTS
                             || status.is_server_error()
                         {
@@ -516,7 +601,11 @@ impl OpenAiProvider {
                             "provider_response",
                         )
                         .await
-                        .map_err(AttachmentOperationError::non_retryable)?;
+                        .map_err(|_| {
+                            AttachmentOperationError::non_retryable(
+                                OpenAiFileUploadError::response(),
+                            )
+                        })?;
                     Ok(uploaded.id)
                 }
             },
@@ -595,13 +684,16 @@ impl OpenAiProvider {
     }
 
     fn classify_upload_reqwest_error(error: reqwest::Error) -> AttachmentOperationError {
-        if error.is_timeout() {
-            return AttachmentOperationError::retryable(error);
+        let retryable = error.is_timeout()
+            || error.is_connect()
+            || error.is_request()
+            || error.is_body()
+            || error.is_decode();
+        let safe = OpenAiFileUploadError::transport(&error);
+        if retryable {
+            return AttachmentOperationError::retryable(safe);
         }
-        if error.is_connect() || error.is_request() || error.is_body() || error.is_decode() {
-            return AttachmentOperationError::retryable(error);
-        }
-        AttachmentOperationError::non_retryable(error)
+        AttachmentOperationError::non_retryable(safe)
     }
 
     fn audio_format_from_mime(mime: &str) -> Result<&'static str> {
@@ -881,6 +973,12 @@ impl crate::traits::Provider for OpenAiProvider {
                 video: InputTypeSupport::disabled(),
             },
         }
+    }
+
+    fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
+        error
+            .downcast_ref::<OpenAiFileUploadError>()
+            .map(|upload| upload.classification.clone())
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {

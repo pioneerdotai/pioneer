@@ -6,6 +6,10 @@ use pioneer_protocol::{
     ItemStartedNotification, ProviderFailureClass, ProviderFailureDetails, ProviderFailureStage,
     ProviderTransportKind, TurnItem, TurnItemType,
 };
+use pioneer_provider::failure::{
+    classify_http_error_body_too_large, classify_provider_failure_class, extract_provider_code,
+    extract_retry_after_ms,
+};
 use pioneer_provider::{
     ChatRequest, Provider, ProviderFailureClassification, ProviderResponseLimits,
     ProviderResponseTooLarge, ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall,
@@ -932,14 +936,7 @@ fn adapter_error_for_target(
     let classification = if let Some(http_error) =
         error.downcast_ref::<pioneer_provider::ProviderHttpErrorBodyTooLarge>()
     {
-        let class = match http_error.status {
-            429 => ProviderFailureClass::RateLimit,
-            500..=599 => ProviderFailureClass::Provider5xx,
-            _ => ProviderFailureClass::ProviderRejected,
-        };
-        let mut classification = ProviderFailureClassification::new(class);
-        classification.http_status = Some(http_error.status);
-        Some(classification)
+        Some(classify_http_error_body_too_large(http_error.status))
     } else if error.downcast_ref::<ProviderResponseTooLarge>().is_some() {
         Some(ProviderFailureClassification::new(
             ProviderFailureClass::ProviderRejected,
@@ -1325,182 +1322,6 @@ pub(crate) fn classify_provider_failure_message(
     classify_provider_failure_class(lower.as_str(), stage, http_status, provider_code.as_deref())
 }
 
-fn classify_provider_failure_class(
-    message_lower: &str,
-    stage: ProviderFailureStage,
-    http_status: Option<u16>,
-    provider_code: Option<&str>,
-) -> ProviderFailureClass {
-    if matches!(
-        stage,
-        ProviderFailureStage::FirstChunk | ProviderFailureStage::MidStream
-    ) && message_lower.contains("stream stall")
-    {
-        return ProviderFailureClass::StreamStall;
-    }
-    if message_lower.contains("stream truncated") {
-        return ProviderFailureClass::StreamTruncated;
-    }
-    if message_lower.contains("max_output_tokens")
-        || message_lower.contains("maximum output tokens")
-        || message_lower.contains("output token limit")
-    {
-        return ProviderFailureClass::MaxOutputTokens;
-    }
-    if message_lower.contains("prompt too long")
-        || message_lower.contains("context length")
-        || message_lower.contains("maximum context")
-        || message_lower.contains("context too long")
-        || message_lower.contains("context window")
-        || http_status == Some(413)
-    {
-        return ProviderFailureClass::ContextTooLarge;
-    }
-    if http_status == Some(429) || message_lower.contains("rate limit") {
-        return ProviderFailureClass::RateLimit;
-    }
-    if http_status.is_some_and(|status| (500..600).contains(&status)) {
-        return ProviderFailureClass::Provider5xx;
-    }
-    if http_status == Some(401)
-        || (http_status == Some(403)
-            && (message_lower.contains("token expired")
-                || message_lower.contains("token revoked")
-                || message_lower.contains("unauthorized")
-                || message_lower.contains("authentication")))
-        || provider_code
-            .map(|value| {
-                value.contains("invalid_api_key")
-                    || value.contains("auth")
-                    || value.contains("token_expired")
-            })
-            .unwrap_or(false)
-    {
-        return ProviderFailureClass::AuthExpired;
-    }
-    if is_image_input_capability_mismatch(message_lower) {
-        return ProviderFailureClass::UnsupportedImageInput;
-    }
-    if is_tool_calling_capability_mismatch(message_lower) {
-        return ProviderFailureClass::UnsupportedToolCalling;
-    }
-    if is_streaming_capability_mismatch(message_lower) {
-        return ProviderFailureClass::UnsupportedStreaming;
-    }
-    if is_unsupported_parameter(message_lower, provider_code) {
-        return ProviderFailureClass::UnsupportedParameter;
-    }
-    if is_generic_capability_mismatch(message_lower) {
-        return ProviderFailureClass::UnsupportedCapability;
-    }
-    if http_status == Some(404)
-        || message_lower.contains("model not found")
-        || message_lower.contains("unknown model")
-        || message_lower.contains("no such model")
-    {
-        return ProviderFailureClass::ModelNotFound;
-    }
-    if http_status == Some(403)
-        || message_lower.contains("permission denied")
-        || message_lower.contains("forbidden")
-    {
-        return ProviderFailureClass::AuthOrPermission;
-    }
-    if is_malformed_provider_request(message_lower, provider_code) {
-        return ProviderFailureClass::MalformedProviderRequest;
-    }
-    if http_status == Some(400)
-        || message_lower.contains("invalid request")
-        || message_lower.contains("bad request")
-    {
-        return ProviderFailureClass::ProviderRejected;
-    }
-    if message_lower.contains("error sending request")
-        || message_lower.contains("connection")
-        || message_lower.contains("dns")
-        || message_lower.contains("timed out")
-        || message_lower.contains("tunnel error")
-        || message_lower.contains("unexpected end of file")
-        || message_lower.contains("connection reset")
-        || message_lower.contains("broken pipe")
-    {
-        return ProviderFailureClass::NetworkTransient;
-    }
-    if matches!(
-        stage,
-        ProviderFailureStage::FirstChunk | ProviderFailureStage::MidStream
-    ) {
-        return ProviderFailureClass::StreamStall;
-    }
-    ProviderFailureClass::Unknown
-}
-
-fn is_image_input_capability_mismatch(message_lower: &str) -> bool {
-    message_lower.contains("image input")
-        && (message_lower.contains("no endpoints found")
-            || message_lower.contains("does not support")
-            || message_lower.contains("not support")
-            || message_lower.contains("unsupported"))
-}
-
-fn is_tool_calling_capability_mismatch(message_lower: &str) -> bool {
-    (message_lower.contains("tool call")
-        || message_lower.contains("tool use")
-        || message_lower.contains("function call")
-        || message_lower.contains("tools"))
-        && (message_lower.contains("does not support")
-            || message_lower.contains("not support")
-            || message_lower.contains("unsupported")
-            || message_lower.contains("no endpoints found"))
-}
-
-fn is_streaming_capability_mismatch(message_lower: &str) -> bool {
-    message_lower.contains("stream")
-        && (message_lower.contains("does not support")
-            || message_lower.contains("not support")
-            || message_lower.contains("unsupported")
-            || message_lower.contains("streaming disabled"))
-}
-
-fn is_unsupported_parameter(message_lower: &str, provider_code: Option<&str>) -> bool {
-    provider_code
-        .map(|value| {
-            value.contains("unsupported_parameter")
-                || value.contains("unknown_parameter")
-                || value.contains("unrecognized_parameter")
-        })
-        .unwrap_or(false)
-        || message_lower.contains("unsupported parameter")
-        || message_lower.contains("unknown parameter")
-        || message_lower.contains("unrecognized parameter")
-        || message_lower.contains("unrecognized request argument")
-        || message_lower.contains("extra inputs are not permitted")
-}
-
-fn is_generic_capability_mismatch(message_lower: &str) -> bool {
-    (message_lower.contains("does not support")
-        || message_lower.contains("not support")
-        || message_lower.contains("unsupported"))
-        && (message_lower.contains("capability")
-            || message_lower.contains("feature")
-            || message_lower.contains("modality")
-            || message_lower.contains("endpoint"))
-}
-
-fn is_malformed_provider_request(message_lower: &str, provider_code: Option<&str>) -> bool {
-    provider_code
-        .map(|value| {
-            value.contains("invalid_request_error")
-                || value.contains("invalid_request")
-                || value.contains("bad_request")
-        })
-        .unwrap_or(false)
-        && (message_lower.contains("schema")
-            || message_lower.contains("malformed")
-            || message_lower.contains("invalid json")
-            || message_lower.contains("parse"))
-}
-
 fn extract_http_status(message: &str) -> Option<u16> {
     let bytes = message.as_bytes();
     for window in bytes.windows(3) {
@@ -1514,30 +1335,253 @@ fn extract_http_status(message: &str) -> Option<u16> {
     None
 }
 
-fn extract_provider_code(message: &str) -> Option<String> {
-    let marker = "\"code\":\"";
-    let start = message.find(marker)?;
-    let rest = &message[start + marker.len()..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_owned())
-}
-
-fn extract_retry_after_ms(message_lower: &str) -> Option<u64> {
-    let marker = "retry-after";
-    let index = message_lower.find(marker)?;
-    let rest = &message_lower[index + marker.len()..];
-    let seconds = rest
-        .chars()
-        .skip_while(|ch| !ch.is_ascii_digit())
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    let secs = seconds.parse::<u64>().ok()?;
-    Some(secs.saturating_mul(1000))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn failure_from_overridden_endpoint(
+        provider_name: &'static str,
+        status: u16,
+        message: &'static str,
+        stream_request: bool,
+    ) -> ProviderFailureDetails {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secret = "override-private-token";
+        let url = format!("http://{}/{secret}/v1", listener.local_addr().unwrap());
+        let echoed_url = url.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            stream.read(&mut request).await.unwrap();
+            let body = serde_json::json!({
+                "error": {"message": format!("{message} at {echoed_url}")}
+            })
+            .to_string();
+            stream.write_all(format!(
+                "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ).as_bytes()).await.unwrap();
+        });
+        let registry = pioneer_provider::ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+            |_, _| Ok("key".into()), |_, _| Ok(None),
+            move |_, _| Ok(Some(url.clone())), ProviderTimeoutPolicy::default(),
+        );
+        let provider = registry
+            .get_or_create_for_workspace("fixture-workspace", provider_name)
+            .unwrap();
+        let request = ChatRequest {
+            model: "fixture".into(),
+            messages: vec![pioneer_provider::ChatMessage::user("hello")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        let error = if stream_request {
+            provider.stream_chat(request).await.err().unwrap()
+        } else {
+            provider.chat(request).await.err().unwrap()
+        };
+        server.await.unwrap();
+        assert!(!format!("{error:#?}").contains(secret));
+        assert!(
+            !error
+                .chain()
+                .any(|cause| format!("{cause:?}").contains(secret))
+        );
+        let ChatTurnError::ProviderFailure { failure, .. } = adapter_error_for_target(
+            FailureTarget::new("item", TurnItemType::Reasoning),
+            provider.as_ref(),
+            "fixture",
+            if stream_request {
+                ProviderTransportKind::Stream
+            } else {
+                ProviderTransportKind::NonStream
+            },
+            ProviderFailureStage::Connect,
+            "provider request failed",
+            &error,
+        ) else {
+            panic!("expected provider failure")
+        };
+        assert!(!serde_json::to_string(&failure).unwrap().contains(secret));
+        failure
+    }
+
+    #[tokio::test]
+    async fn overridden_endpoint_preserves_recovery_classification_and_hides_raw_url() {
+        for (provider, status, message, stream, class, recoverable) in [
+            (
+                "openai",
+                400,
+                "maximum context length exceeded",
+                false,
+                ProviderFailureClass::ContextTooLarge,
+                true,
+            ),
+            (
+                "openrouter",
+                404,
+                "No endpoints found that support image input",
+                true,
+                ProviderFailureClass::UnsupportedImageInput,
+                true,
+            ),
+            (
+                "openai",
+                400,
+                "this model does not support streaming",
+                true,
+                ProviderFailureClass::UnsupportedStreaming,
+                true,
+            ),
+            (
+                "openai",
+                400,
+                "ordinary bad request",
+                false,
+                ProviderFailureClass::ProviderRejected,
+                false,
+            ),
+            (
+                "openai",
+                429,
+                "rate limit; retry-after: 3",
+                false,
+                ProviderFailureClass::RateLimit,
+                true,
+            ),
+        ] {
+            let failure = failure_from_overridden_endpoint(provider, status, message, stream).await;
+            assert_eq!(failure.class, class, "{provider}: {message}");
+            assert_eq!(failure.http_status, Some(status));
+            assert_eq!(failure.is_recoverable_hint, recoverable);
+            if status == 429 {
+                assert_eq!(failure.retry_after_ms, Some(3000));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_http_stream_error_keeps_capability_class_without_endpoint() {
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secret = "stream-capability-private-token";
+        let url = format!("http://{}/{secret}/v1", listener.local_addr().unwrap());
+        let echoed_url = url.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            socket.read(&mut request).await.unwrap();
+            let event = format!(
+                "data: {}\n\n",
+                serde_json::json!({"error": {"message": format!(
+                    "this model does not support streaming at {echoed_url}"
+                )}})
+            );
+            socket.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{event}",
+                event.len()
+            ).as_bytes()).await.unwrap();
+        });
+        let registry = pioneer_provider::ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+            |_, _| Ok(String::new()), |_, _| Ok(None),
+            move |_, _| Ok(Some(url.clone())), ProviderTimeoutPolicy::default(),
+        );
+        let provider = registry.get_or_create_for_workspace("a", "vllm").unwrap();
+        let mut chunks = provider
+            .stream_chat(ChatRequest {
+                model: "fixture".into(),
+                messages: vec![pioneer_provider::ChatMessage::user("hello")],
+                temperature: None,
+                max_tokens: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                compiled_prompt: None,
+            })
+            .await
+            .unwrap();
+        let error = chunks.next().await.unwrap().unwrap_err();
+        server.await.unwrap();
+        assert!(!format!("{error:#?}").contains(secret));
+        let ChatTurnError::ProviderFailure { failure, .. } = adapter_error_for_target(
+            FailureTarget::new("item", TurnItemType::Reasoning),
+            provider.as_ref(),
+            "fixture",
+            ProviderTransportKind::Stream,
+            ProviderFailureStage::MidStream,
+            "provider stream failed",
+            &error,
+        ) else {
+            panic!("expected provider failure")
+        };
+        assert_eq!(failure.class, ProviderFailureClass::UnsupportedStreaming);
+        assert!(failure.is_recoverable_hint);
+        assert!(!serde_json::to_string(&failure).unwrap().contains(secret));
+    }
+
+    #[tokio::test]
+    async fn endpoint_path_is_absent_from_durable_failure_details() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secret = "durable-private-path";
+        let url = format!("http://{}/{secret}/v1", listener.local_addr().unwrap());
+        let echoed_url = url.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            stream.read(&mut request).await.unwrap();
+            let body = format!("{{\"error\":\"rate limit at {echoed_url}\"}}");
+            stream.write_all(format!("HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let registry = pioneer_provider::ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+            |_, _| Ok("key".into()), |_, _| Ok(None),
+            move |_, _| Ok(Some(url.clone())), ProviderTimeoutPolicy::default(),
+        );
+        let provider = registry.get_or_create_for_workspace("a", "openai").unwrap();
+        let error = provider
+            .chat(ChatRequest {
+                model: "fixture".into(),
+                messages: vec![pioneer_provider::ChatMessage::user("hello")],
+                temperature: None,
+                max_tokens: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                compiled_prompt: None,
+            })
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        let ChatTurnError::ProviderFailure { failure, .. } = adapter_error_for_target(
+            FailureTarget::new("item", TurnItemType::Reasoning),
+            provider.as_ref(),
+            "fixture",
+            ProviderTransportKind::NonStream,
+            ProviderFailureStage::Connect,
+            "provider request failed",
+            &error,
+        ) else {
+            panic!("expected provider failure")
+        };
+        assert!(!serde_json::to_string(&failure).unwrap().contains(secret));
+        assert_eq!(failure.class, ProviderFailureClass::RateLimit);
+        assert_eq!(failure.http_status, Some(429));
+        assert!(failure.is_recoverable_hint);
+    }
 
     #[test]
     fn openrouter_image_input_endpoint_error_is_recoverable_capability_rejection() {

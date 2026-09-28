@@ -292,13 +292,13 @@ pub use patch_history::{
     TurnPatchStepsPageResponse,
 };
 pub use provider::{
-    ProviderConfigureParams, ProviderConfigureResponse, ProviderDeleteApiKeyParams,
-    ProviderDeleteApiKeyResponse, ProviderListModelsParams, ProviderListModelsResponse,
-    ProviderListParams, ProviderListResponse, ProviderModelCapabilities, ProviderModelInfo,
-    ProviderModelLimits, ProviderModelPricing, ProviderModelReasoningCapabilities,
-    ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderSummary,
-    ProviderSummaryCapabilities, ProviderTranscriptionModelMetadata, ReasoningCapabilitySource,
-    default_provider_base_url, provider_supports_base_url_override,
+    ProviderConfigureParams, ProviderConfigureResponse, ProviderDefinition,
+    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderListModelsParams,
+    ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
+    ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits, ProviderModelPricing,
+    ProviderModelReasoningCapabilities, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
+    ProviderSummary, ProviderSummaryCapabilities, ProviderTranscriptionModelMetadata,
+    ReasoningCapabilitySource,
 };
 pub use public_error::{PUBLIC_ERROR_VERSION, PublicError, PublicErrorCode, PublicErrorStage};
 pub use settings::{
