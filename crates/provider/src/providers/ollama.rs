@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
 
-const DEFAULT_BASE_URL: &str = "http://localhost:11434";
+pub(crate) const DEFAULT_BASE_URL: &str = "http://localhost:11434";
 
 pub struct OllamaProvider {
     base_url: String,
@@ -741,6 +741,13 @@ mod tests {
     fn chat_url_with_custom_base() {
         let provider = OllamaProvider::with_base_url("http://remote:9999");
         assert_eq!(provider.chat_url(), "http://remote:9999/api/chat");
+    }
+
+    #[test]
+    fn custom_gateway_prefix_routes_chat_and_tags() {
+        let provider = OllamaProvider::with_base_url("http://localhost:11434/team/api/");
+        assert_eq!(provider.chat_url(), "http://localhost:11434/team/api/chat");
+        assert_eq!(provider.tags_url(), "http://localhost:11434/team/api/tags");
     }
 
     #[test]

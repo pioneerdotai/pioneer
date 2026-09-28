@@ -358,6 +358,13 @@ impl ClientCore {
             self.provider_runtime_intent(ProviderRuntimeIntent::Refresh {
                 workspace_id: identity.workspace_id.clone(),
             });
+        } else if identity.kind == ProviderActionKind::Configure {
+            // The keystore has no multi-secret transaction. A later write can
+            // fail after an earlier field was saved, so reconcile the catalog.
+            self.refresh_provider_models(&identity.workspace_id, &identity.target);
+            self.provider_collection_intent(ProviderCollectionIntent::Refresh {
+                key: ProviderCollectionKey::catalog(&identity.workspace_id),
+            });
         }
         result.map_err(|_| anyhow::anyhow!("provider_action_failed"))
     }
@@ -552,6 +559,8 @@ mod tests {
             api_key: Some("synthetic-form-value".into()),
             proxy_url: None,
             clear_proxy: false,
+            base_url: None,
+            clear_base_url: false,
         })
     }
     #[test]

@@ -4,6 +4,7 @@ use crate::{KeystoreError, Result};
 
 pub const PROVIDER_API_KEY_SERVICE: &str = "pioneer.gateway.provider_api_key";
 pub const PROVIDER_PROXY_SERVICE: &str = "pioneer.gateway.provider_proxy";
+pub const PROVIDER_BASE_URL_SERVICE: &str = "pioneer.gateway.provider_base_url";
 pub const CLI_RUNTIME_PROXY_SERVICE: &str = "pioneer.gateway.cli_runtime_proxy";
 pub const MODEL_CATALOG_PROXY_SERVICE: &str = "pioneer.gateway.model_catalog_proxy";
 pub const MCP_SECRET_SERVICE: &str = "pioneer.gateway.mcp_secret";
@@ -43,6 +44,15 @@ impl SecretId {
         let provider = validate_user("provider", provider)?.to_ascii_lowercase();
         Self::from_service_user(
             PROVIDER_PROXY_SERVICE,
+            format!("workspace:{workspace_id}:provider:{provider}"),
+        )
+    }
+
+    pub fn workspace_provider_base_url(workspace_id: &str, provider: &str) -> Result<Self> {
+        let workspace_id = validate_user("workspace id", workspace_id)?;
+        let provider = validate_user("provider", provider)?.to_ascii_lowercase();
+        Self::from_service_user(
+            PROVIDER_BASE_URL_SERVICE,
             format!("workspace:{workspace_id}:provider:{provider}"),
         )
     }
@@ -120,6 +130,7 @@ impl SecretId {
 pub enum SecretKind {
     ProviderApiKey,
     ProviderProxy,
+    ProviderBaseUrl,
     CliRuntimeProxy,
     ModelCatalogProxy,
     McpSecret,
@@ -135,6 +146,7 @@ impl SecretKind {
         match self {
             SecretKind::ProviderApiKey => PROVIDER_API_KEY_SERVICE,
             SecretKind::ProviderProxy => PROVIDER_PROXY_SERVICE,
+            SecretKind::ProviderBaseUrl => PROVIDER_BASE_URL_SERVICE,
             SecretKind::CliRuntimeProxy => CLI_RUNTIME_PROXY_SERVICE,
             SecretKind::ModelCatalogProxy => MODEL_CATALOG_PROXY_SERVICE,
             SecretKind::McpSecret => MCP_SECRET_SERVICE,
@@ -150,6 +162,7 @@ impl SecretKind {
         match service {
             PROVIDER_API_KEY_SERVICE => Some(SecretKind::ProviderApiKey),
             PROVIDER_PROXY_SERVICE => Some(SecretKind::ProviderProxy),
+            PROVIDER_BASE_URL_SERVICE => Some(SecretKind::ProviderBaseUrl),
             CLI_RUNTIME_PROXY_SERVICE => Some(SecretKind::CliRuntimeProxy),
             MODEL_CATALOG_PROXY_SERVICE => Some(SecretKind::ModelCatalogProxy),
             MCP_SECRET_SERVICE => Some(SecretKind::McpSecret),
@@ -280,6 +293,19 @@ mod tests {
 
         assert_eq!(id.service(), PROVIDER_PROXY_SERVICE);
         assert_eq!(id.user(), "workspace:ws_1:provider:openrouter");
+    }
+
+    #[test]
+    fn workspace_provider_base_url_id_is_scoped_by_workspace() {
+        let id =
+            SecretId::workspace_provider_base_url("  ws_1  ", "  OpenAI  ").expect("base url id");
+
+        assert_eq!(id.service(), PROVIDER_BASE_URL_SERVICE);
+        assert_eq!(id.user(), "workspace:ws_1:provider:openai");
+        assert_eq!(
+            SecretKind::from_service(id.service()),
+            Some(SecretKind::ProviderBaseUrl)
+        );
     }
 
     #[test]

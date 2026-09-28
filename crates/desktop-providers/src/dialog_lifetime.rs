@@ -8,7 +8,7 @@ pub(crate) struct DialogLifetime {
     focus: Option<FocusHandle>,
     clear: Box<dyn Fn(&mut Window, &mut App)>,
     _focus: Option<Subscription>,
-    _form: Option<Subscription>,
+    _forms: Vec<Subscription>,
 }
 impl DialogLifetime {
     pub(crate) fn new(
@@ -21,11 +21,11 @@ impl DialogLifetime {
             focus: None,
             clear: Box::new(clear),
             _focus: None,
-            _form: None,
+            _forms: Vec::new(),
         })
     }
     pub(crate) fn track_form<T: 'static>(&mut self, form: &Entity<T>, cx: &mut Context<Self>) {
-        self._form = Some(cx.observe_release(form, |owner, _, _| {
+        self._forms.push(cx.observe_release(form, |owner, _, _| {
             owner.open = false;
             owner.valid = false;
         }));
@@ -88,6 +88,7 @@ mod tests {
         AppContext, Context, Entity, Focusable, IntoElement, ParentElement, Render, TestAppContext,
         Window,
     };
+    use pioneer_client::providers::credentials::provider_credential_read_for_test;
     use std::{cell::Cell, rc::Rc};
     struct Host {
         input: Entity<InputState>,
@@ -96,6 +97,128 @@ mod tests {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             gpui_kit::div().child(Input::new(&self.input))
         }
+    }
+    #[gpui_kit::test]
+    fn scope_or_permission_invalidation_clears_open_form_once(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| InputState::new(window, cx));
+            let host = cx.new(|_| Host { input });
+            Root::new(host, window, cx)
+        });
+        let clears = Rc::new(Cell::new(0));
+        let count = clears.clone();
+        let guard =
+            cx.update(|_, cx| DialogLifetime::new(move |_, _| count.set(count.get() + 1), cx));
+        cx.update(|window, cx| {
+            guard.update(cx, |guard, cx| {
+                guard.invalidate(window, cx);
+                guard.invalidate(window, cx);
+                assert!(!guard.valid());
+            });
+        });
+        assert_eq!(clears.get(), 1);
+    }
+    #[gpui_kit::test]
+    fn base_url_input_ignores_late_read_and_builds_user_mutation(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (lease, read, sender) = provider_credential_read_for_test();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| InputState::new(window, cx));
+            let host = cx.new(|_| Host { input });
+            Root::new(host, window, cx)
+        });
+        let host = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<Host>().unwrap()
+        });
+        let input = host.read_with(cx, |host, _| host.input.clone());
+        let (form, guard) = cx.update(|window, cx| {
+            let form = crate::credential_form::ProxyForm::new_with_pending_for_test(
+                input.clone(),
+                (lease, read),
+                Some(String::new()),
+                window,
+                cx,
+            );
+            let weak = form.downgrade();
+            let guard = DialogLifetime::new(
+                move |window, cx| {
+                    let _ = weak.update(cx, |form, cx| form.clear(window, cx));
+                },
+                cx,
+            );
+            (form, guard)
+        });
+        // Saving an API key while the URL lease is pending must leave the
+        // existing override untouched; the publication contains only a marker.
+        assert_eq!(
+            form.read_with(cx, |form, cx| form.mutation(cx)),
+            (None, false)
+        );
+        // replace_all emits InputEvent::Change without waiting for the pending lease task.
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.replace_all("https://new.example/v1", window, cx)
+            });
+        });
+        sender
+            .send(Ok(Some("https://old.example/private".into())))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert_eq!(input.read(cx).value().as_ref(), "https://new.example/v1");
+            assert_eq!(
+                form.read(cx).mutation(cx),
+                (Some("https://new.example/v1".into()), false)
+            );
+            input.update(cx, |input, cx| input.replace_all("", window, cx));
+            assert_eq!(form.read(cx).mutation(cx), (None, true));
+            guard.update(cx, |guard, cx| guard.invalidate(window, cx));
+            form.update(cx, |form, cx| {
+                form.apply_loaded_for_test(Some("https://late.example/private".into()), window, cx)
+            });
+            assert!(input.read(cx).value().is_empty());
+            assert_eq!(form.read(cx).mutation(cx), (None, false));
+        });
+    }
+    #[gpui_kit::test]
+    fn clearing_base_url_before_lease_reply_remains_a_reset(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (lease, read, sender) = provider_credential_read_for_test();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| InputState::new(window, cx));
+            Root::new(cx.new(|_| Host { input }), window, cx)
+        });
+        let host = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<Host>().unwrap()
+        });
+        let input = host.read_with(cx, |host, _| host.input.clone());
+        let form = cx.update(|window, cx| {
+            crate::credential_form::ProxyForm::new_with_pending_for_test(
+                input.clone(),
+                (lease, read),
+                Some(String::new()),
+                window,
+                cx,
+            )
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| input.replace_all("x", window, cx));
+            input.update(cx, |input, cx| input.replace_all("", window, cx));
+        });
+        assert_eq!(
+            form.read_with(cx, |form, cx| form.mutation(cx)),
+            (None, true)
+        );
+        sender
+            .send(Ok(Some("https://old.example/private".into())))
+            .unwrap();
+        cx.run_until_parked();
+        assert!(input.read_with(cx, |input, _| input.value().is_empty()));
+        assert_eq!(
+            form.read_with(cx, |form, cx| form.mutation(cx)),
+            (None, true)
+        );
     }
     #[gpui_kit::test]
     fn stock_dialog_dismissal_restores_trigger_and_invalidates_form_once(cx: &mut TestAppContext) {

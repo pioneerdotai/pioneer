@@ -25,10 +25,11 @@ use pioneer_protocol::{
     ProviderModelReasoningCapabilities, ReasoningCapabilitySource,
 };
 
-const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+pub(crate) const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
 pub struct GeminiProvider {
     api_key: String,
+    base_url: String,
     timeout_policy: ProviderTimeoutPolicy,
     client: Client,
 }
@@ -231,8 +232,17 @@ impl GeminiProvider {
         api_key: impl Into<String>,
         timeout_policy: ProviderTimeoutPolicy,
     ) -> Self {
+        Self::with_base_url_and_timeout_policy(api_key, BASE_URL, timeout_policy)
+    }
+
+    pub fn with_base_url_and_timeout_policy(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        timeout_policy: ProviderTimeoutPolicy,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
+            base_url: base_url.into().trim_end_matches('/').to_owned(),
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
         }
@@ -241,19 +251,19 @@ impl GeminiProvider {
     fn generate_content_url(&self, model: &str) -> String {
         format!(
             "{}/models/{}:generateContent?key={}",
-            BASE_URL, model, self.api_key
+            self.base_url, model, self.api_key
         )
     }
 
     fn stream_generate_content_url(&self, model: &str) -> String {
         format!(
             "{}/models/{}:streamGenerateContent?alt=sse&key={}",
-            BASE_URL, model, self.api_key
+            self.base_url, model, self.api_key
         )
     }
 
     fn list_models_url(&self) -> String {
-        format!("{}/models?key={}", BASE_URL, self.api_key)
+        format!("{}/models?key={}", self.base_url, self.api_key)
     }
 
     #[cfg(test)]
@@ -1119,6 +1129,27 @@ mod tests {
         assert_eq!(
             url,
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=my-key"
+        );
+    }
+
+    #[test]
+    fn custom_base_url_routes_generate_stream_and_models_without_repeating_api_prefix() {
+        let provider = GeminiProvider::with_base_url_and_timeout_policy(
+            "key",
+            "http://localhost:8080/team/v1beta/",
+            ProviderTimeoutPolicy::default(),
+        );
+        assert_eq!(
+            provider.generate_content_url("fixture"),
+            "http://localhost:8080/team/v1beta/models/fixture:generateContent?key=key"
+        );
+        assert_eq!(
+            provider.stream_generate_content_url("fixture"),
+            "http://localhost:8080/team/v1beta/models/fixture:streamGenerateContent?alt=sse&key=key"
+        );
+        assert_eq!(
+            provider.list_models_url(),
+            "http://localhost:8080/team/v1beta/models?key=key"
         );
     }
 

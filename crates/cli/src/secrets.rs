@@ -112,6 +112,11 @@ pub(crate) fn format_status_human(report: &SecretsStatusReport) -> String {
     let _ = writeln!(output, "Provider proxies: {}", report.counts.provider_proxy);
     let _ = writeln!(
         output,
+        "Provider base URLs: {}",
+        report.counts.provider_base_url
+    );
+    let _ = writeln!(
+        output,
         "CLI runtime proxies: {}",
         report.counts.cli_runtime_proxy
     );
@@ -367,6 +372,7 @@ mod tests {
             counts: SecretKindCounts {
                 provider_api_key: 1,
                 provider_proxy: 1,
+                provider_base_url: 0,
                 cli_runtime_proxy: 1,
                 model_catalog_proxy: 1,
                 mcp_secret: 2,

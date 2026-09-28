@@ -7,7 +7,9 @@
 
 pub mod attachments;
 pub mod catalog;
+pub mod definition;
 pub mod factory;
+pub mod failure;
 pub mod file_tools;
 pub mod history;
 mod http;
@@ -28,6 +30,10 @@ pub use attachments::{
     lookup_uploaded_reference_with_artifact_for_authority, set_artifact_external_ref_cache_backend,
     set_default_attachment_pipeline_config, store_uploaded_reference_for_authority,
     upload_registry_key_for_authority,
+};
+pub use definition::{
+    ProviderEndpointDefinition, provider_definition, provider_definitions, provider_is_available,
+    validate_provider_base_url,
 };
 pub use factory::create_provider;
 pub use file_tools::{

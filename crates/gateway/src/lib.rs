@@ -441,7 +441,7 @@ async fn run_gateway_until_shutdown_inner(
     );
 
     let provider_registry = Arc::new(
-        ProviderRegistry::new_scoped_fallible_with_timeout_policy_and_proxy(
+        ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
             {
                 let gateway_secrets = gateway_secrets.clone();
                 move |workspace_id, provider_name| {
@@ -465,6 +465,18 @@ async fn run_gateway_until_shutdown_inner(
                         .map(|workspace_id| {
                             gateway_secrets
                                 .get_workspace_provider_proxy(workspace_id, provider_name)
+                        })
+                        .transpose()
+                        .map(Option::flatten)
+                }
+            },
+            {
+                let gateway_secrets = gateway_secrets.clone();
+                move |workspace_id, provider_name| {
+                    workspace_id
+                        .map(|workspace_id| {
+                            gateway_secrets
+                                .get_workspace_provider_base_url(workspace_id, provider_name)
                         })
                         .transpose()
                         .map(Option::flatten)

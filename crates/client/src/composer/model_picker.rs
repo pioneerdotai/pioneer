@@ -909,8 +909,12 @@ mod tests {
         ModelPickerResult::Providers(Ok(ProviderListResponse {
             providers: vec!["provider", "other"]
                 .into_iter()
-                .map(|name| serde_json::from_value(serde_json::json!({"name":name})).unwrap())
+                .map(|name| {
+                    serde_json::from_value(serde_json::json!({"name":name,"available":true}))
+                        .unwrap()
+                })
                 .collect(),
+            definitions: vec![],
         }))
     }
     fn models(provider: &str) -> ModelPickerResult {

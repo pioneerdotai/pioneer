@@ -29,6 +29,7 @@ const DEFAULT_API_VERSION: &str = "2024-08-01-preview";
 pub struct AzureOpenAiProvider {
     api_key: String,
     resource_name: String,
+    base_url: Option<String>,
     deployment_name: String,
     api_version: String,
     timeout_policy: ProviderTimeoutPolicy,
@@ -344,6 +345,19 @@ impl AzureOpenAiProvider {
         )
     }
 
+    pub fn with_base_url_and_timeout_policy(
+        api_key: impl Into<String>,
+        resource_name: impl Into<String>,
+        deployment_name: impl Into<String>,
+        base_url: impl Into<String>,
+        timeout_policy: ProviderTimeoutPolicy,
+    ) -> Self {
+        let mut provider =
+            Self::with_timeout_policy(api_key, resource_name, deployment_name, timeout_policy);
+        provider.base_url = Some(base_url.into().trim_end_matches('/').to_owned());
+        provider
+    }
+
     pub fn with_api_version(
         api_key: impl Into<String>,
         resource_name: impl Into<String>,
@@ -369,6 +383,7 @@ impl AzureOpenAiProvider {
         Self {
             api_key: api_key.into(),
             resource_name: resource_name.into(),
+            base_url: None,
             deployment_name: deployment_name.into(),
             api_version: api_version.into(),
             timeout_policy,
@@ -617,16 +632,25 @@ impl AzureOpenAiProvider {
 
     fn chat_completions_url(&self) -> String {
         format!(
-            "https://{}.openai.azure.com/openai/deployments/{}/chat/completions?api-version={}",
-            self.resource_name, self.deployment_name, self.api_version
+            "{}/openai/deployments/{}/chat/completions?api-version={}",
+            self.endpoint_root(),
+            self.deployment_name,
+            self.api_version
         )
     }
 
     fn models_url(&self) -> String {
         format!(
-            "https://{}.openai.azure.com/openai/models?api-version={}",
-            self.resource_name, self.api_version
+            "{}/openai/models?api-version={}",
+            self.endpoint_root(),
+            self.api_version
         )
+    }
+
+    fn endpoint_root(&self) -> String {
+        self.base_url
+            .clone()
+            .unwrap_or_else(|| format!("https://{}.openai.azure.com", self.resource_name))
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
@@ -1117,6 +1141,27 @@ mod tests {
                 "https://my-resource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version={}",
                 DEFAULT_API_VERSION
             )
+        );
+    }
+
+    #[test]
+    fn custom_gateway_root_routes_chat_and_models_without_resource_name() {
+        let provider = AzureOpenAiProvider::with_base_url_and_timeout_policy(
+            "key",
+            "unused-resource",
+            "deployment",
+            "http://localhost:8080/team/",
+            ProviderTimeoutPolicy::default(),
+        );
+        assert_eq!(
+            provider.chat_completions_url(),
+            format!(
+                "http://localhost:8080/team/openai/deployments/deployment/chat/completions?api-version={DEFAULT_API_VERSION}"
+            )
+        );
+        assert_eq!(
+            provider.models_url(),
+            format!("http://localhost:8080/team/openai/models?api-version={DEFAULT_API_VERSION}")
         );
     }
 

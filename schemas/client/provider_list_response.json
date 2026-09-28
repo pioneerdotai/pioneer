@@ -3,6 +3,14 @@
   "title": "ProviderListResponse",
   "type": "object",
   "properties": {
+    "definitions": {
+      "description": "Gateway-owned endpoint definitions, including providers without credentials.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ProviderDefinition"
+      }
+    },
     "providers": {
       "type": "array",
       "items": {
@@ -14,11 +22,45 @@
     "providers"
   ],
   "$defs": {
+    "ProviderDefinition": {
+      "type": "object",
+      "properties": {
+        "default_base_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "supports_base_url_override": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
     "ProviderSummary": {
       "type": "object",
       "properties": {
         "api_key_configured": {
           "type": "boolean"
+        },
+        "available": {
+          "description": "The gateway can construct this provider in the selected workspace.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "base_url": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "capabilities": {
           "$ref": "#/$defs/ProviderSummaryCapabilities",
