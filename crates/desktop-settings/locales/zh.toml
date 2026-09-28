@@ -156,7 +156,6 @@ description = "选择默认用于打开文件的应用。"
 [settings.option.keepawake]
 label = "防止空闲睡眠"
 description = "网关运行时，防止系统因空闲进入睡眠。合上笔记本电脑盖子时不保证继续运行；这种场景请使用闭盖模式，或把网关运行在常开机器上。"
-tooltip = "仅防止空闲睡眠。合盖运行需要闭盖模式或常开机器。"
 
 [settings.option.telemetry]
 label = "发送遥测数据"

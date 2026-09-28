@@ -54,7 +54,6 @@ pub(crate) struct DesktopShellView {
     can_notify: bool,
     setup_required: bool,
     gateway_switcher: Option<AnyView>,
-    general_actions: Option<AnyView>,
     onboarding: Option<Entity<pioneer_desktop_onboarding::OnboardingView>>,
     settings: Option<Entity<pioneer_desktop_settings::SettingsView>>,
     administration: Option<Entity<pioneer_desktop_administration::AdministrationView>>,
@@ -283,41 +282,25 @@ impl DesktopShellView {
                                 div().into_any_element()
                             })
                             .child(
-                                h_flex()
-                                    .gap_1()
-                                    .child(if !is_gateway_setup_required {
-                                        self.general_actions
-                                            .as_ref()
-                                            .expect("mounted general actions")
-                                            .clone()
-                                            .into_any_element()
-                                    } else {
-                                        div().into_any_element()
-                                    })
-                                    .child(
-                                        Button::new("toggle-theme")
-                                            .ghost()
-                                            .small()
-                                            .compact()
-                                            .child(Icon::new(theme_icon).size_3p5().opacity(0.6))
-                                            .on_click(|_, window, cx| {
-                                                let (mode, theme_preference) = if cx
-                                                    .theme()
-                                                    .mode
-                                                    .is_dark()
-                                                {
-                                                    (ThemeMode::Light, WindowThemePreference::Light)
-                                                } else {
-                                                    (ThemeMode::Dark, WindowThemePreference::Dark)
-                                                };
-                                                Theme::change(mode, Some(window), cx);
-                                                window::persist_theme_preference(
-                                                    window,
-                                                    theme_preference,
-                                                    cx,
-                                                );
-                                            }),
-                                    ),
+                                Button::new("toggle-theme")
+                                    .ghost()
+                                    .small()
+                                    .compact()
+                                    .child(Icon::new(theme_icon).size_3p5().opacity(0.6))
+                                    .on_click(|_, window, cx| {
+                                        let (mode, theme_preference) = if cx.theme().mode.is_dark()
+                                        {
+                                            (ThemeMode::Light, WindowThemePreference::Light)
+                                        } else {
+                                            (ThemeMode::Dark, WindowThemePreference::Dark)
+                                        };
+                                        Theme::change(mode, Some(window), cx);
+                                        window::persist_theme_preference(
+                                            window,
+                                            theme_preference,
+                                            cx,
+                                        );
+                                    }),
                             ),
                     ),
             )
@@ -564,7 +547,6 @@ impl DesktopShellView {
                 .unwrap_or(true)
         });
         let gateway_switcher = Some(onboarding.read(cx).gateway_switcher_surface());
-        let general_actions = Some(settings.read(cx).general_actions_surface());
         let mut view = Self {
             thread: None,
             thread_events: None,
@@ -578,7 +560,6 @@ impl DesktopShellView {
             can_notify: false,
             setup_required: client.onboarding_setup_required(),
             gateway_switcher,
-            general_actions,
             onboarding: Some(onboarding),
             settings: Some(settings),
             providers: Some(providers),
@@ -795,7 +776,6 @@ impl DesktopShellView {
         self.identity_task.take();
         self.identity.take();
         self.gateway_switcher.take();
-        self.general_actions.take();
         self.sync_activity(false, cx);
         self.agents_document.take();
         self.onboarding.take();

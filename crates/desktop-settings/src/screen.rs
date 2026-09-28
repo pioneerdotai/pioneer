@@ -62,7 +62,6 @@ impl SettingsConfig {
 }
 pub struct SettingsView {
     config: SettingsConfig,
-    general_actions: Entity<crate::general_actions::GeneralActionsView>,
     pages: Vec<Entity<SettingsScreenView>>,
     sidebar: Entity<SettingsSidebarView>,
     route: SettingsContentView,
@@ -98,10 +97,6 @@ impl SettingsView {
             .collect();
             let sidebar = SettingsSidebarView::new(config.clone(), cx);
             Self {
-                general_actions: crate::general_actions::GeneralActionsView::new(
-                    config.clone(),
-                    cx,
-                ),
                 route: config.client.navigation_snapshot().settings_route(),
                 workspace_id: config
                     .client
@@ -116,9 +111,6 @@ impl SettingsView {
                 _task: task,
             }
         })
-    }
-    pub fn general_actions_surface(&self) -> AnyView {
-        self.general_actions.clone().into()
     }
     pub fn sidebar_surface(&self) -> AnyView {
         self.sidebar.clone().into()

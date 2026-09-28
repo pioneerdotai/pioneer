@@ -156,7 +156,6 @@ description = "फ़ाइलें खोलने के लिए डिफ�
 [settings.option.keepawake]
 label = "Idle sleep रोकें"
 description = "जब gateway चल रहा हो, तो सिस्टम को idle sleep में जाने से रोकता है। Laptop lid बंद करने पर यह काम जारी रहने की गारंटी नहीं देता; ऐसे उपयोग के लिए clamshell mode या always-on machine चाहिए."
-tooltip = "सिर्फ idle sleep रोकता है। Lid बंद रखने के लिए clamshell mode या always-on machine चाहिए."
 
 [settings.option.telemetry]
 label = "टेलीमेट्री भेजें"

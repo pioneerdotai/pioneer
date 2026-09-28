@@ -198,7 +198,6 @@ artifact_preview = { owner = "Client ArtifactRegistry", source = "client/src/art
 "desktop-settings:ProfileEditor" = ["Render", "SettingsView", "TUI-39"]
 "desktop-settings:SettingsScreenView" = ["Render", "SettingsView", "TUI-39"]
 "desktop-settings:SettingsSidebarView" = ["Render", "SettingsView", "TUI-39"]
-"desktop-settings:GeneralActionsView" = ["Render", "SettingsView", "TUI-39"]
 "desktop-settings:ModelSelectorOwner" = ["Render", "SettingsView", "TUI-39"]
 "desktop-settings:SelectorPopoverTrigger" = ["RenderOnce", "SettingsView", "TUI-39"]
 "desktop-settings:CredentialPresentationForm" = ["RenderOnce", "SettingsView", "TUI-40"]

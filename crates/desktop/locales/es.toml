@@ -975,7 +975,6 @@ description = "Elige la aplicación predeterminada para abrir archivos."
 [settings.option.keepawake]
 label = "Evitar reposo por inactividad"
 description = "Evita que el equipo entre en reposo por inactividad mientras el gateway está en ejecución. No garantiza que siga funcionando al cerrar la tapa del portátil; para eso usa el modo clamshell o una máquina siempre encendida."
-tooltip = "Solo evita el reposo por inactividad. Con la tapa cerrada necesitas modo clamshell o una máquina siempre encendida."
 
 [settings.option.telemetry]
 label = "Enviar telemetría"

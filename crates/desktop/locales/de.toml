@@ -975,7 +975,6 @@ description = "Wählen Sie die Standard-App zum Öffnen von Dateien."
 [settings.option.keepawake]
 label = "Ruhezustand bei Inaktivität verhindern"
 description = "Verhindert, dass der Computer bei Inaktivität in den Ruhezustand wechselt, solange das Gateway läuft. Beim Zuklappen eines Laptops ist das nicht garantiert; dafür brauchen Sie den Clamshell-Modus oder einen dauerhaft laufenden Rechner."
-tooltip = "Verhindert nur den Ruhezustand bei Inaktivität. Für zugeklappte Laptops brauchen Sie den Clamshell-Modus oder einen dauerhaft laufenden Rechner."
 
 [settings.option.telemetry]
 label = "Telemetrie senden"

@@ -22,7 +22,6 @@ mod actions;
 mod assets;
 mod device_activation_form;
 mod file_openers;
-mod general_actions;
 
 mod file_opener_types;
 mod preferences_types;
