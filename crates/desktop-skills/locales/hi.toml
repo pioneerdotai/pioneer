@@ -1,4 +1,5 @@
 [buttons]
+back = "वापस"
 ok = "OK"
 add = "जोड़ें"
 cancel = "रद्द करें"

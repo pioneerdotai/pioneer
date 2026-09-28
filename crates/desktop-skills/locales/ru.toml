@@ -1,4 +1,5 @@
 [buttons]
+back = "Назад"
 ok = "OK"
 add = "Добавить"
 cancel = "Отмена"

@@ -1,4 +1,5 @@
 [buttons]
+back = "Back"
 ok = "OK"
 add = "Add"
 cancel = "Cancel"

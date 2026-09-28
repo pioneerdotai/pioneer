@@ -1,4 +1,5 @@
 [buttons]
+back = "返回"
 ok = "OK"
 add = "添加"
 cancel = "取消"

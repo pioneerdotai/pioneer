@@ -1,4 +1,5 @@
 [buttons]
+back = "戻る"
 ok = "OK"
 add = "追加"
 cancel = "キャンセル"

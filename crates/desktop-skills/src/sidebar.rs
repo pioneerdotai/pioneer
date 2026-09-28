@@ -190,7 +190,7 @@ impl CatalogSidebar {
                                         div()
                                             .line_height(relative(1.))
                                             .opacity(SIDEBAR_MENU_ITEM_OPACITY)
-                                            .child(t!("settings.sidebar.back").to_string()),
+                                            .child(t!("buttons.back").to_string()),
                                     )
                             })
                             .on_click({
