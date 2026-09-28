@@ -425,3 +425,140 @@ async fn replacing_input_preserves_its_other_saved_copies_without_expanding_cove
     );
     assert_eq!(messages[1], s.tail);
 }
+
+#[tokio::test]
+async fn overlapping_original_and_task_copy_summaries_keep_the_covering_checkpoint() {
+    let s = scenario().await;
+    let source = &s.original.provenance.as_ref().unwrap().sources[0];
+    let original_source = SourceRef {
+        scope: source.scope.clone(),
+        id: source.id.clone(),
+        version: source.version.clone(),
+    };
+    let original_checkpoint = publish_projection_checkpoint(
+        &s.f,
+        "thread",
+        "original-summary",
+        &[("thread".into(), original_source)],
+        pioneer_compaction::CoverageDomain::WorkingContext,
+    )
+    .await;
+    let original_context = || checkpoint::ProjectionContext {
+        workspace: "ws",
+        context_thread: "thread",
+        source_thread: "thread",
+        owner: &original_checkpoint.owner,
+        allowed: &s.allowed,
+        allow_historical_gaps: false,
+    };
+    for reverse in [false, true] {
+        let mut messages = vec![s.original.clone(), s.work.clone(), s.tail.clone()];
+        let mut old_frozen = None;
+        if reverse {
+            project(&s, &mut messages).await.unwrap();
+            checkpoint::project_checkpoint_with_resolver(
+                &s.f.store,
+                original_context(),
+                &original_checkpoint.id,
+                &mut messages,
+                &mut coverage::CheckpointGraphResolver::default(),
+            )
+            .await
+            .unwrap();
+        } else {
+            checkpoint::project_checkpoint_with_resolver(
+                &s.f.store,
+                original_context(),
+                &original_checkpoint.id,
+                &mut messages,
+                &mut coverage::CheckpointGraphResolver::default(),
+            )
+            .await
+            .unwrap();
+            old_frozen = Some((
+                frozen::capture(&s.f.store, "ws", "thread", &s.allowed, &messages[..1])
+                    .await
+                    .unwrap(),
+                messages[0].clone(),
+            ));
+            let accepted_basis =
+                frozen::capture(&s.f.store, "ws", "thread", &s.allowed, &messages[..2])
+                    .await
+                    .unwrap();
+            let recovered = frozen::restore_accepted_history_for_execution(
+                &s.f.store,
+                "ws",
+                Some("thread"),
+                "thread",
+                &s.allowed,
+                &serde_json::to_string(&accepted_basis).unwrap(),
+            )
+            .await
+            .unwrap()
+            .messages;
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(
+                recovered[0].provenance.as_ref().unwrap().sources[0].id,
+                s.checkpoint.id
+            );
+            project(&s, &mut messages).await.unwrap();
+        }
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].provenance.as_ref().unwrap().sources[0].id,
+            s.checkpoint.id
+        );
+        assert_eq!(messages[1], s.tail);
+        assert!(
+            messages[0]
+                .provenance
+                .as_ref()
+                .unwrap()
+                .source_aliases
+                .iter()
+                .any(|alias| alias.source.id == "original" && alias.represented_source == s.copy)
+        );
+        let saved_original =
+            s.f.store
+                .compaction_checkpoint(&original_checkpoint.id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(saved_original.coverage.len(), 1);
+        if let Some((descriptor, old_summary)) = old_frozen {
+            assert_eq!(
+                frozen::restore(&s.f.store, "ws", &s.allowed, &descriptor)
+                    .await
+                    .unwrap(),
+                vec![old_summary]
+            );
+        }
+        let original_ref =
+            s.f.store
+                .compaction_checkpoint_source("ws", "thread", &original_checkpoint.id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            coverage::CheckpointGraphResolver::default()
+                .resolve(&s.f.store, "ws", Some(&s.allowed), &original_ref)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let frozen_summary =
+            frozen::capture(&s.f.store, "ws", "thread", &s.allowed, &messages[..1])
+                .await
+                .unwrap();
+        assert_eq!(
+            frozen::restore(&s.f.store, "ws", &s.allowed, &frozen_summary)
+                .await
+                .unwrap(),
+            messages[..1]
+        );
+        let once = messages.clone();
+        project(&s, &mut messages).await.unwrap();
+        assert_eq!(messages, once);
+    }
+    assert!(s.f.provider.calls.lock().unwrap().is_empty());
+}

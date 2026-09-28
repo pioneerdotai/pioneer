@@ -8325,6 +8325,18 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
             .iter()
             .all(|r| r.model == "summary-model" && r.tools.is_none() && r.reasoning.is_none())
     );
+    let operations_before_reuse = f
+        .store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) AS total FROM compaction_operation",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "total")
+        .unwrap();
     let again = super::test_support::prepare_native_request(
         &f.store,
         &providers,
@@ -8382,6 +8394,19 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
     .unwrap();
     assert_eq!(normalized.request.messages, restored.request.messages);
     assert_eq!(f.provider.calls.lock().unwrap().len(), count);
+    let operations_after_reuse = f
+        .store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) AS total FROM compaction_operation",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "total")
+        .unwrap();
+    assert_eq!(operations_after_reuse, operations_before_reuse);
 
     let mut earlier_boundary = raw_request.clone();
     earlier_boundary.messages.remove(0);

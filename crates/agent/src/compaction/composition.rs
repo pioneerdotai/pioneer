@@ -29,6 +29,7 @@ struct Unit {
     input_aliases: ExactInputClaims,
     own: bool,
     checkpoint: bool,
+    checkpoint_inherited: Option<bool>,
 }
 
 pub type ExactMessageSource = (String, MessageSourceRef);
@@ -98,6 +99,176 @@ impl ExactInputClaims {
             })
             .collect()
     }
+}
+
+fn exact_message_source(source: &ScopedHistorySource) -> ExactMessageSource {
+    (
+        source.thread.clone(),
+        MessageSourceRef {
+            scope: source.source.scope.clone(),
+            id: source.source.id.clone(),
+            version: source.source.version.clone(),
+        },
+    )
+}
+
+/// Compare representations of published leaves. This does not change either
+/// checkpoint's canonical coverage or authorize access to another thread.
+fn equivalent_input(
+    left: &ScopedHistorySource,
+    right: &ScopedHistorySource,
+    claims: &ExactInputClaims,
+) -> bool {
+    if left == right {
+        return true;
+    }
+    if !left.source.scope.starts_with("input:")
+        || !right.source.scope.starts_with("input:")
+        || left.source.version != right.source.version
+    {
+        return false;
+    }
+    let left = exact_message_source(left);
+    let right = exact_message_source(right);
+    let proven = |copy: &ExactMessageSource, owner: &ExactMessageSource| {
+        !claims.ambiguous.contains(copy)
+            && claims
+                .owners
+                .get(copy)
+                .is_some_and(|owners| owners.len() == 1 && owners.contains(owner))
+    };
+    proven(&left, &right) || proven(&right, &left)
+}
+
+pub fn summary_covers(
+    covering: &BTreeSet<ScopedHistorySource>,
+    covered: &BTreeSet<ScopedHistorySource>,
+    claims: &ExactInputClaims,
+) -> bool {
+    covered.is_subset(&summary_comparison_leaves(covering, claims))
+}
+
+/// The extra leaves are temporary comparison keys, never checkpoint coverage.
+pub fn summary_comparison_leaves(
+    covering: &BTreeSet<ScopedHistorySource>,
+    claims: &ExactInputClaims,
+) -> BTreeSet<ScopedHistorySource> {
+    let mut comparable = covering.clone();
+    for (copy, owners) in &claims.owners {
+        if claims.ambiguous.contains(copy) || owners.len() != 1 {
+            continue;
+        }
+        let owner = owners.iter().next().expect("one owner");
+        if !copy.1.scope.starts_with("input:")
+            || !owner.1.scope.starts_with("input:")
+            || copy.1.version != owner.1.version
+        {
+            continue;
+        }
+        let scoped = |(thread, source): &ExactMessageSource| ScopedHistorySource {
+            thread: thread.clone(),
+            source: SourceRef {
+                scope: source.scope.clone(),
+                id: source.id.clone(),
+                version: source.version.clone(),
+            },
+        };
+        let copy = scoped(copy);
+        let owner = scoped(owner);
+        if covering.contains(&copy) {
+            comparable.insert(owner.clone());
+        }
+        if covering.contains(&owner) {
+            comparable.insert(copy);
+        }
+    }
+    comparable
+}
+
+/// A proven child copy is the later input representation when two summaries
+/// cover exactly the same history through that original/copy relation.
+pub fn summary_copy_preference(
+    leaves: &BTreeSet<ScopedHistorySource>,
+    claims: &ExactInputClaims,
+) -> usize {
+    leaves
+        .iter()
+        .filter(|leaf| {
+            let copy = exact_message_source(leaf);
+            !claims.ambiguous.contains(&copy)
+                && claims.owners.get(&copy).is_some_and(|owners| {
+                    owners.len() == 1
+                        && owners.iter().next().is_some_and(|owner| {
+                            owner.1.scope.starts_with("input:")
+                                && copy.1.scope.starts_with("input:")
+                                && owner.1.version == copy.1.version
+                        })
+                })
+        })
+        .count()
+}
+
+/// Attach the proof of an absorbed summary to leaves represented by the
+/// surviving summary. The absorbed checkpoint and its saved proof stay intact.
+pub fn rebase_summary_input_claims(
+    covering: &BTreeSet<ScopedHistorySource>,
+    absorbed: &BTreeSet<ScopedHistorySource>,
+    claims: &ExactInputClaims,
+) -> ExactInputClaims {
+    let mut result = ExactInputClaims {
+        ambiguous: claims.ambiguous.clone(),
+        ..Default::default()
+    };
+    let target = |source: &ScopedHistorySource| {
+        if covering.contains(source) {
+            return Some(exact_message_source(source));
+        }
+        let mut matches = covering
+            .iter()
+            .filter(|leaf| equivalent_input(source, leaf, claims));
+        let one = matches.next()?;
+        matches.next().is_none().then(|| exact_message_source(one))
+    };
+    for (copy, owners) in &claims.owners {
+        if owners.len() != 1 || claims.ambiguous.contains(copy) {
+            result.ambiguous.insert(copy.clone());
+            continue;
+        }
+        let owner = owners.iter().next().expect("one owner");
+        let owner_source = ScopedHistorySource {
+            thread: owner.0.clone(),
+            source: SourceRef {
+                scope: owner.1.scope.clone(),
+                id: owner.1.id.clone(),
+                version: owner.1.version.clone(),
+            },
+        };
+        if !covering.contains(&owner_source) && !absorbed.contains(&owner_source) {
+            continue;
+        }
+        if let Some(represented) = target(&owner_source) {
+            if *copy != represented {
+                result.add(copy.clone(), represented);
+            }
+        } else {
+            result.ambiguous.insert(copy.clone());
+        }
+    }
+    for source in absorbed {
+        if covering.contains(source) || !source.source.scope.starts_with("input:") {
+            continue;
+        }
+        if let Some(represented) = target(source) {
+            let copy = exact_message_source(source);
+            if copy != represented {
+                result.add(copy, represented);
+            }
+        } else {
+            result.ambiguous.insert(exact_message_source(source));
+        }
+    }
+    result.mark_competing_owners();
+    result
 }
 
 fn collect_raw_source_aliases(
@@ -380,9 +551,32 @@ pub fn compose_context(
                 input_aliases.mark_competing_owners();
                 apply_raw_source_aliases(&mut incoming_messages, &input_aliases)?;
             }
+            let checkpoint_inherited = checkpoint.then(|| {
+                incoming_messages[0]
+                    .1
+                    .provenance
+                    .as_ref()
+                    .expect("accepted origin")
+                    .inherited
+            });
+            if let Some(inherited) = checkpoint_inherited {
+                ensure!(
+                    incoming_messages.iter().all(|(_, message)| message
+                        .provenance
+                        .as_ref()
+                        .is_some_and(|origin| origin.inherited == inherited)),
+                    "checkpoint unit mixes coverage domains"
+                );
+            }
             let mut duplicate = None;
             let mut replaced = Vec::new();
             for (index, previous) in units.iter().enumerate() {
+                if checkpoint
+                    && previous.checkpoint
+                    && checkpoint_inherited != previous.checkpoint_inherited
+                {
+                    continue;
+                }
                 if previous.identities.is_disjoint(&identities) {
                     continue;
                 }
@@ -440,6 +634,7 @@ pub fn compose_context(
                     input_aliases,
                     own,
                     checkpoint,
+                    checkpoint_inherited,
                 };
                 if unit.checkpoint {
                     apply_checkpoint_aliases(&mut unit)?;
@@ -449,8 +644,64 @@ pub fn compose_context(
         }
         branch_offset += branch.messages.len();
     }
+    // All accepted claims must be present before comparing aliases. A later
+    // branch can supply a competing owner for an otherwise unique copy.
+    let mut claims = ExactInputClaims::default();
+    for unit in &units {
+        claims.merge(unit.input_aliases.clone());
+    }
+    let mut keep = vec![true; units.len()];
+    let mut absorbed = vec![BTreeSet::new(); units.len()];
+    for left in 0..units.len() {
+        if !keep[left] || !units[left].checkpoint {
+            continue;
+        }
+        for right in left + 1..units.len() {
+            if !keep[right]
+                || !units[right].checkpoint
+                || units[left].checkpoint_inherited != units[right].checkpoint_inherited
+            {
+                continue;
+            }
+            let left_covers = summary_covers(&units[left].leaves, &units[right].leaves, &claims);
+            let right_covers = summary_covers(&units[right].leaves, &units[left].leaves, &claims);
+            let survivor = match (left_covers, right_covers) {
+                (true, false) => left,
+                (false, true) => right,
+                (true, true) => {
+                    if summary_copy_preference(&units[left].leaves, &claims)
+                        > summary_copy_preference(&units[right].leaves, &claims)
+                    {
+                        left
+                    } else {
+                        right
+                    }
+                }
+                (false, false) => continue,
+            };
+            let removed = if survivor == left { right } else { left };
+            let removed_leaves = units[removed].leaves.clone();
+            let earlier_absorbed = absorbed[removed].clone();
+            absorbed[survivor].extend(earlier_absorbed);
+            absorbed[survivor].extend(removed_leaves);
+            keep[removed] = false;
+            if removed == left {
+                break;
+            }
+        }
+    }
+    for (index, unit) in units.iter_mut().enumerate() {
+        if keep[index] && !absorbed[index].is_empty() {
+            unit.input_aliases =
+                rebase_summary_input_claims(&unit.leaves, &absorbed[index], &claims);
+            apply_checkpoint_aliases(unit)?;
+        }
+    }
     let mut messages = Vec::new();
-    for unit in units {
+    for (unit, keep) in units.into_iter().zip(keep) {
+        if !keep {
+            continue;
+        }
         for (index, mut message) in unit.messages {
             let origin = message
                 .provenance
@@ -1304,6 +1555,327 @@ mod tests {
         assert_eq!(
             composed[1].provenance.as_ref().unwrap().sources[0].id,
             "summary-b"
+        );
+    }
+
+    fn alias_summary(
+        id: &str,
+        thread: &str,
+        leaves: BTreeSet<ScopedHistorySource>,
+        alias: bool,
+        inherited: bool,
+    ) -> (
+        ChatMessage,
+        BTreeMap<ScopedHistorySource, BTreeSet<ScopedHistorySource>>,
+    ) {
+        let mut summary = message(thread, id, inherited);
+        let origin = summary.provenance.as_mut().unwrap();
+        origin.sources[0].scope = format!("checkpoint:{thread}");
+        origin.unit_id = format!("checkpoint:{thread}:{id}");
+        if alias {
+            origin.source_aliases.push(MessageSourceAlias {
+                represented_thread_id: "parent".into(),
+                represented_source: input_source("original-turn", "original", 1),
+                thread_id: "task".into(),
+                source: input_source("task-turn", "copy", 1),
+            });
+        }
+        let source = &origin.sources[0];
+        let reference = ScopedHistorySource {
+            thread: thread.into(),
+            source: SourceRef {
+                scope: source.scope.clone(),
+                id: source.id.clone(),
+                version: source.version.clone(),
+            },
+        };
+        (summary, BTreeMap::from([(reference, leaves)]))
+    }
+
+    #[test]
+    fn confirmed_original_and_task_copy_leave_one_covering_summary_in_both_orders() {
+        let original = ScopedHistorySource {
+            thread: "parent".into(),
+            source: SourceRef {
+                scope: "input:original-turn".into(),
+                id: "original".into(),
+                version: "input-revision:1".into(),
+            },
+        };
+        let copy = ScopedHistorySource {
+            thread: "task".into(),
+            source: SourceRef {
+                scope: "input:task-turn".into(),
+                id: "copy".into(),
+                version: "input-revision:1".into(),
+            },
+        };
+        let work = ScopedHistorySource {
+            thread: "task".into(),
+            source: SourceRef {
+                scope: "event:task-turn".into(),
+                id: "work".into(),
+                version: "event-revision:1".into(),
+            },
+        };
+        let old = alias_summary(
+            "old",
+            "parent",
+            BTreeSet::from([original.clone(), work.clone()]),
+            true,
+            true,
+        );
+        let new = alias_summary(
+            "new",
+            "task",
+            BTreeSet::from([copy.clone(), work.clone()]),
+            false,
+            true,
+        );
+        for reverse in [false, true] {
+            let branches = if reverse { [&new, &old] } else { [&old, &new] };
+            let composed = compose_context(
+                "ws",
+                "consumer",
+                &branches.map(|(message, closure)| AcceptedContextBranch {
+                    thread: &message.provenance.as_ref().unwrap().thread_id,
+                    messages: std::slice::from_ref(message),
+                    checkpoints: closure,
+                }),
+            )
+            .unwrap();
+            assert_eq!(composed.len(), 1);
+            let origin = composed[0].provenance.as_ref().unwrap();
+            assert_eq!(origin.sources[0].id, "new");
+            let repeated = compose_context(
+                "ws",
+                "consumer",
+                &[AcceptedContextBranch {
+                    thread: &origin.thread_id,
+                    messages: &composed,
+                    checkpoints: if origin.sources[0].id == "old" {
+                        &old.1
+                    } else {
+                        &new.1
+                    },
+                }],
+            )
+            .unwrap();
+            assert_eq!(repeated, composed);
+        }
+    }
+
+    #[test]
+    fn alias_coverage_keeps_partial_history_and_requires_exact_unambiguous_proof() {
+        let original = ScopedHistorySource {
+            thread: "parent".into(),
+            source: SourceRef {
+                scope: "input:original-turn".into(),
+                id: "original".into(),
+                version: "input-revision:1".into(),
+            },
+        };
+        let copy = ScopedHistorySource {
+            thread: "task".into(),
+            source: SourceRef {
+                scope: "input:task-turn".into(),
+                id: "copy".into(),
+                version: "input-revision:1".into(),
+            },
+        };
+        let unique = ScopedHistorySource {
+            thread: "parent".into(),
+            source: SourceRef {
+                scope: "event:original-turn".into(),
+                id: "unique".into(),
+                version: "event-revision:1".into(),
+            },
+        };
+        let alias = MessageSourceAlias {
+            represented_thread_id: "parent".into(),
+            represented_source: input_source("original-turn", "original", 1),
+            thread_id: "task".into(),
+            source: input_source("task-turn", "copy", 1),
+        };
+        let mut claims = ExactInputClaims::default();
+        claims.add_alias(&alias);
+        assert!(summary_covers(
+            &BTreeSet::from([copy.clone()]),
+            &BTreeSet::from([original.clone()]),
+            &claims
+        ));
+        assert!(!summary_covers(
+            &BTreeSet::from([copy.clone()]),
+            &BTreeSet::from([original.clone(), unique]),
+            &claims
+        ));
+        assert!(!summary_covers(
+            &BTreeSet::from([copy.clone()]),
+            &BTreeSet::from([original.clone()]),
+            &ExactInputClaims::default()
+        ));
+        claims
+            .ambiguous
+            .insert(("task".into(), alias.source.clone()));
+        assert!(!summary_covers(
+            &BTreeSet::from([copy.clone()]),
+            &BTreeSet::from([original.clone()]),
+            &claims
+        ));
+        claims.ambiguous.clear();
+        let changed = ScopedHistorySource {
+            source: SourceRef {
+                version: "input-revision:2".into(),
+                ..copy.source.clone()
+            },
+            ..copy.clone()
+        };
+        assert!(!summary_covers(
+            &BTreeSet::from([changed]),
+            &BTreeSet::from([original.clone()]),
+            &claims
+        ));
+        claims.add(
+            ("task".into(), alias.source),
+            ("other".into(), input_source("other-turn", "other", 1)),
+        );
+        claims.mark_competing_owners();
+        assert!(!summary_covers(
+            &BTreeSet::from([copy]),
+            &BTreeSet::from([original]),
+            &claims
+        ));
+    }
+
+    #[test]
+    fn equal_summary_text_does_not_override_missing_proof_or_different_domain() {
+        let original = ScopedHistorySource {
+            thread: "parent".into(),
+            source: SourceRef {
+                scope: "input:original-turn".into(),
+                id: "original".into(),
+                version: "input-revision:1".into(),
+            },
+        };
+        let copy = ScopedHistorySource {
+            thread: "task".into(),
+            source: SourceRef {
+                scope: "input:task-turn".into(),
+                id: "copy".into(),
+                version: "input-revision:1".into(),
+            },
+        };
+        for (proof, same_domain) in [(false, true), (true, false)] {
+            let old = alias_summary(
+                "old",
+                "parent",
+                BTreeSet::from([original.clone()]),
+                proof,
+                true,
+            );
+            let new = alias_summary(
+                "new",
+                "task",
+                BTreeSet::from([copy.clone()]),
+                false,
+                same_domain,
+            );
+            let composed = compose_context(
+                "ws",
+                "consumer",
+                &[
+                    AcceptedContextBranch {
+                        thread: "parent",
+                        messages: std::slice::from_ref(&old.0),
+                        checkpoints: &old.1,
+                    },
+                    AcceptedContextBranch {
+                        thread: "task",
+                        messages: std::slice::from_ref(&new.0),
+                        checkpoints: &new.1,
+                    },
+                ],
+            )
+            .unwrap();
+            assert_eq!(composed.len(), 2);
+        }
+    }
+
+    #[test]
+    fn alias_overlap_keeps_both_summaries_and_uncovered_history_when_partial() {
+        let original = ScopedHistorySource {
+            thread: "parent".into(),
+            source: SourceRef {
+                scope: "input:original-turn".into(),
+                id: "original".into(),
+                version: "input-revision:1".into(),
+            },
+        };
+        let copy = ScopedHistorySource {
+            thread: "task".into(),
+            source: SourceRef {
+                scope: "input:task-turn".into(),
+                id: "copy".into(),
+                version: "input-revision:1".into(),
+            },
+        };
+        let event = |thread: &str, id: &str| ScopedHistorySource {
+            thread: thread.into(),
+            source: SourceRef {
+                scope: format!("event:{thread}-turn"),
+                id: id.into(),
+                version: "event-revision:1".into(),
+            },
+        };
+        let old = alias_summary(
+            "old",
+            "parent",
+            BTreeSet::from([original, event("parent", "old-only")]),
+            true,
+            true,
+        );
+        let new = alias_summary(
+            "new",
+            "task",
+            BTreeSet::from([copy, event("task", "new-only")]),
+            false,
+            true,
+        );
+        let tail = message("task", "uncovered-tail", true);
+        let task = [new.0.clone(), tail.clone()];
+        let composed = compose_context(
+            "ws",
+            "consumer",
+            &[
+                AcceptedContextBranch {
+                    thread: "parent",
+                    messages: std::slice::from_ref(&old.0),
+                    checkpoints: &old.1,
+                },
+                AcceptedContextBranch {
+                    thread: "task",
+                    messages: &task,
+                    checkpoints: &new.1,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(composed.len(), 3);
+        assert!(
+            composed
+                .iter()
+                .any(|message| message.provenance.as_ref().unwrap().sources[0].id == "old")
+        );
+        assert!(
+            composed
+                .iter()
+                .any(|message| message.provenance.as_ref().unwrap().sources[0].id == "new")
+        );
+        assert!(
+            composed
+                .iter()
+                .any(|message| message.provenance.as_ref().unwrap().sources[0].id
+                    == "uncovered-tail")
         );
     }
 
