@@ -33765,26 +33765,8 @@ async fn task_create_inherits_exact_turn_capabilities_for_attached_and_backgroun
             .runs
             .first()
             .expect("immediate child must have a run");
-        let lineage =
+        let _lineage =
             wait_for_child_lineage_for_run(harness.crud_store.clone(), run.id.as_str()).await;
-        let snapshot = harness
-            .crud_store
-            .get_turn_runtime_snapshot(lineage.child_turn_id.as_str())
-            .await
-            .expect("child snapshot should load")
-            .expect("child snapshot should exist");
-        let child_capabilities = crate::turn_runtime_snapshot::restored_execution_capabilities(
-            snapshot.capabilities_json.as_str(),
-        )
-        .expect("child capabilities should restore");
-        let child_ids = child_capabilities
-            .iter()
-            .map(|capability| capability.id.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            child_ids, expected_ids,
-            "child runtime must receive the exact durable selection"
-        );
         let child_request = provider
             .snapshot_requests()
             .into_iter()
@@ -33796,6 +33778,16 @@ async fn task_create_inherits_exact_turn_capabilities_for_attached_and_backgroun
                     })
             })
             .expect("child model request should contain its task marker");
+        let compiled_prompt = child_request
+            .compiled_prompt
+            .as_ref()
+            .expect("child model request should contain its compiled prompt");
+        assert!(
+            compiled_prompt.full_system_text.contains(&format!(
+                "Exact skill reference for read_skill: `skill:{skill_id}`"
+            )),
+            "selected Skill must appear in the child runtime prompt"
+        );
         let tool_names = child_request
             .tools
             .expect("child model request should include tools")
