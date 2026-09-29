@@ -1590,10 +1590,22 @@ async fn select_captured_head_before_excluded_turn(
             candidate = next;
             continue;
         };
-        let graph = checkpoint_graphs
+        let graph = match checkpoint_graphs
             .resolve(store, workspace, None, &root)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("checkpoint root is unavailable"))?;
+            .await
+        {
+            Err(error)
+                if id != head
+                    && error
+                        .downcast_ref::<super::coverage::EmptyCheckpointCoverage>()
+                        .is_some() =>
+            {
+                candidate = next;
+                continue;
+            }
+            result => result?,
+        }
+        .ok_or_else(|| anyhow::anyhow!("checkpoint root is unavailable"))?;
         let crosses_excluded_turn = graph.leaves.iter().any(|leaf| {
             leaf.thread == thread
                 && leaf
@@ -3347,6 +3359,7 @@ async fn restore_accepted_execution_basis_prepared(
         );
         let owner = super::native::native_owner(workspace, &source_thread);
         let mut candidate = store.compaction_head(&owner).await?;
+        let head = candidate.clone();
         let mut seen = BTreeSet::new();
         while let Some(id) = candidate {
             ensure!(seen.insert(id.clone()), "cyclic checkpoint ancestry");
@@ -3369,10 +3382,22 @@ async fn restore_accepted_execution_basis_prepared(
                 candidate = next;
                 continue;
             };
-            let graph = checkpoint_graphs
+            let graph = match checkpoint_graphs
                 .resolve(store, workspace, Some(allowed), &root)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("checkpoint root is unavailable"))?;
+                .await
+            {
+                Err(error)
+                    if head.as_deref() != Some(id.as_str())
+                        && error
+                            .downcast_ref::<super::coverage::EmptyCheckpointCoverage>()
+                            .is_some() =>
+                {
+                    candidate = next;
+                    continue;
+                }
+                result => result?,
+            }
+            .ok_or_else(|| anyhow::anyhow!("checkpoint root is unavailable"))?;
             let metadata = checkpoint_graphs
                 .projection_metadata(store, workspace, &graph)
                 .await?;

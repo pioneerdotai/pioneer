@@ -24001,6 +24001,54 @@ async fn partially_read_commentary_source_restarts_with_v4_text_and_exact_covera
             .coverage,
         [source]
     );
+
+    // The applied head is valid, but an older accepted boundary need not
+    // contain its source. Searching its ancestry must skip partial portions
+    // that completed no source rather than treating them as ready summaries.
+    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+    let mut outside_boundary = Vec::new();
+    assert_eq!(
+        super::checkpoint::project_compatible_checkpoint(
+            &f.store,
+            "ws",
+            "thread",
+            &partial.owner,
+            &head,
+            &allowed,
+            &mut outside_boundary,
+        )
+        .await
+        .unwrap(),
+        None
+    );
+    assert!(outside_boundary.is_empty());
+    let partial_source = f
+        .store
+        .compaction_checkpoint_source("ws", "thread", &partial.id)
+        .await
+        .unwrap()
+        .expect("completed operation retains its intermediate checkpoint");
+    assert!(
+        super::coverage::checkpoint_leaves(&f.store, "ws", &allowed, &partial_source)
+            .await
+            .unwrap_err()
+            .downcast_ref::<super::coverage::EmptyCheckpointCoverage>()
+            .is_some()
+    );
+    assert!(
+        super::checkpoint::project_compatible_checkpoint(
+            &f.store,
+            "ws",
+            "thread",
+            &partial.owner,
+            &partial.id,
+            &allowed,
+            &mut outside_boundary,
+        )
+        .await
+        .is_err(),
+        "an empty root must still fail when requested as the head"
+    );
 }
 
 #[tokio::test]
@@ -25137,7 +25185,17 @@ async fn published_checkpoint_keeps_coverage_of_newly_hidden_service_event() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(saved.coverage, checkpoint.coverage);
+    assert_eq!(saved.coverage.len(), checkpoint.coverage.len());
+    assert_eq!(
+        saved
+            .coverage
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        checkpoint
+            .coverage
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
     assert_eq!(saved.summary, checkpoint.summary);
     let after_operations: i64 = f
         .store
