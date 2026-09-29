@@ -210,11 +210,10 @@ impl ComposerView {
     }
     pub(super) fn synchronize_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let payload = |scope: ClientScope| self.thread_bindings.publication(&scope);
-        self.composer_input = payload(ClientScope::Composer {
-            thread_id: self.thread_id.clone(),
-        })
-        .and_then(|p| p.typed::<ComposerPublication>())
-        .map(|p| p.payload());
+        // Native input commits to the client synchronously, while binding
+        // publications arrive asynchronously. An older echo must not replace
+        // newer typing and reset the textarea's selection via set_value.
+        self.composer_input = self.client.composer_snapshot(&self.thread_id);
         self.thread_member_input = payload(ClientScope::ThreadMember {
             thread_id: self.thread_id.clone(),
         })
