@@ -1083,6 +1083,17 @@ async fn exact_cross_domain_absorption_keeps_only_covered_input_evidence() {
         assert_eq!(survivor.sources[0].id, covering.id);
         assert!(survivor.ambiguous_input_aliases.contains(&conflict));
         assert!(survivor.source_aliases.contains(&valid));
+        let once = messages.clone();
+        checkpoint::project_checkpoint_with_resolver(
+            &s.f.store,
+            context("thread", &old, &allowed),
+            &old.id,
+            &mut messages,
+            &mut coverage::CheckpointGraphResolver::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(messages, once, "the nested summary must remain selected");
 
         let covering_source =
             s.f.store

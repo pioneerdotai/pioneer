@@ -14715,6 +14715,39 @@ async fn compaction_checkpoint_projects_accepted_foreign_own_dag_without_coverin
     .await
     .unwrap();
     assert_eq!(summarized, projected);
+    let once = summarized.clone();
+    super::checkpoint::project_checkpoint_with_resolver(
+        &f.store,
+        super::checkpoint::ProjectionContext {
+            workspace: "ws",
+            context_thread: "c",
+            source_thread: "thread",
+            owner: &a.owner,
+            allowed: &allowed,
+            allow_historical_gaps: false,
+        },
+        &a_id,
+        &mut summarized,
+        &mut super::coverage::CheckpointGraphResolver::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        summarized, once,
+        "A cannot replace its published descendant"
+    );
+    super::checkpoint::project_checkpoint(
+        &f.store,
+        "ws",
+        "c",
+        "c-owner",
+        &c.id,
+        &allowed,
+        &mut summarized,
+    )
+    .await
+    .unwrap();
+    assert_eq!(summarized, once);
     db.execute_unprepared("UPDATE turn_event SET payload='edited A' WHERE id='source'")
         .await
         .unwrap();
