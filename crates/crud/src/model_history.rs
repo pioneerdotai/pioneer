@@ -95,14 +95,6 @@ pub fn canonical_item_model_projection(item: &TurnItem) -> CanonicalEventModelPr
     item_model_projection(item, true)
 }
 
-/// The v0-v4 runner and frozen wire policy. Its text and character positions
-/// remain fixed even when the current model policy excludes more events.
-pub fn canonical_item_model_projection_before_service_filter(
-    item: &TurnItem,
-) -> CanonicalEventModelProjection {
-    item_model_projection(item, false)
-}
-
 fn item_model_projection(item: &TurnItem, service_filter: bool) -> CanonicalEventModelProjection {
     match item {
         TurnItem::Reasoning {
@@ -148,6 +140,7 @@ pub fn canonical_event_model_projection(
     event_model_projection(event, true)
 }
 
+/// Historical projection used only to authenticate frozen wire messages.
 pub fn canonical_event_model_projection_before_service_filter(
     event: &CanonicalTurnEventPayload,
 ) -> CanonicalEventModelProjection {
@@ -544,7 +537,6 @@ mod tests {
         ] {
             let item = system(code, Some(serde_json::json!({"synthetic": true})));
             assert!(canonical_item_model_projection(&item).is_omitted());
-            assert!(!canonical_item_model_projection_before_service_filter(&item).is_omitted());
             let started =
                 CanonicalTurnEventPayload::ItemStarted(pioneer_protocol::ItemStartedNotification {
                     workspace_id: "ws".into(),

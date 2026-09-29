@@ -385,8 +385,8 @@ pub(crate) async fn admit_operation(
     )?;
     ensure!(
         initial.source_text_projection_version
-            == pioneer_compaction::runner::SERVICE_EVENT_SOURCE_TEXT_PROJECTION_VERSION,
-        "runner and service-event source projections disagree"
+            == pioneer_compaction::runner::COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION,
+        "runner and commentary source projections disagree"
     );
     store
         .compaction_activate_runner(&snapshot.id, &initial)
