@@ -1431,6 +1431,7 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
             origin.ambiguous_input_aliases = merged.ambiguous;
         }
     }
+    order_history_by_creation(&store, workspace, &mut messages).await?;
     if let Some(policy) = policy {
         select_task_history(&mut messages, policy)?;
     }
@@ -1884,6 +1885,132 @@ async fn compose_frozen_basis_with_resolver(
     }
 }
 
+/// Order messages by the creation time of their original rows.
+/// A missing original (including an old checkpoint's removed leaves) keeps
+/// its recorded place; delivery and checkpoint publication times are not
+/// substitutes for source creation time.
+pub(super) async fn order_history_by_creation(
+    store: &CrudStore,
+    workspace: &str,
+    messages: &mut Vec<ChatMessage>,
+) -> Result<()> {
+    use pioneer_crud::compaction::PagedSource;
+
+    if messages.len() < 2 {
+        return Ok(());
+    }
+    let mut wanted = BTreeMap::<(String, String, &'static str), BTreeSet<String>>::new();
+    for message in messages.iter() {
+        let Some(origin) = message.provenance.as_ref() else {
+            continue;
+        };
+        for source in &origin.sources {
+            let Some((kind, turn)) = source.scope.split_once(':') else {
+                continue;
+            };
+            let kind = match kind {
+                "input" => "input",
+                "event" => "event",
+                "context" => "context",
+                _ => continue,
+            };
+            wanted
+                .entry((origin.thread_id.clone(), turn.to_owned(), kind))
+                .or_default()
+                .insert(source.id.clone());
+        }
+    }
+    let mut created = BTreeMap::new();
+    let delivery_item_prefix = pioneer_protocol::task_delivery_result_item_id("");
+    for ((thread, turn, kind), mut ids) in wanted {
+        let kind = match kind {
+            "input" => PagedSource::Input,
+            "event" => PagedSource::Event,
+            "context" => PagedSource::ProviderContext,
+            _ => unreachable!(),
+        };
+        let mut after = 0;
+        while !ids.is_empty() {
+            let page = store
+                .compaction_source_metadata_page(workspace, &thread, &turn, kind, after)
+                .await?;
+            if page.next_sequence <= after {
+                break;
+            }
+            after = page.next_sequence;
+            for row in page.entries {
+                // An unprojected event cannot yet be distinguished from a
+                // delivery copy without reading its body. Keep its old place.
+                if ids.remove(&row.reference.id)
+                    && (!matches!(kind, PagedSource::Event) || row.projection_kind.is_some())
+                    && row.projection_kind.as_deref() != Some("input_copy")
+                    && !row
+                        .item_id
+                        .as_deref()
+                        .is_some_and(|item| item.starts_with(&delivery_item_prefix))
+                {
+                    created.insert(
+                        (thread.clone(), row.reference.scope, row.reference.id),
+                        row.created_at,
+                    );
+                }
+            }
+        }
+    }
+    let missing_items = messages
+        .iter()
+        .filter_map(|message| message.provenance.as_ref())
+        .filter(|origin| {
+            !origin.sources.iter().any(|source| {
+                created.contains_key(&(
+                    origin.thread_id.clone(),
+                    source.scope.clone(),
+                    source.id.clone(),
+                ))
+            })
+        })
+        .flat_map(|origin| {
+            origin.sources.iter().filter_map(|source| {
+                source
+                    .scope
+                    .strip_prefix("item:")
+                    .map(|turn| (origin.thread_id.clone(), turn.to_owned(), source.id.clone()))
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    for (thread, turn, id) in missing_items {
+        if let Some(time) = store
+            .compaction_item_created_at(workspace, &thread, &turn, &id)
+            .await?
+        {
+            created.insert((thread, format!("item:{turn}"), id), time);
+        }
+    }
+    if created.is_empty() {
+        return Ok(());
+    }
+    let created_at = |message: &ChatMessage| {
+        message.provenance.as_ref().and_then(|origin| {
+            origin
+                .sources
+                .iter()
+                .filter_map(|source| {
+                    created.get(&(
+                        origin.thread_id.clone(),
+                        source.scope.clone(),
+                        source.id.clone(),
+                    ))
+                })
+                .min()
+                .cloned()
+        })
+    };
+    for span in messages.split_mut(|message| created_at(message).is_none()) {
+        span.sort_by_cached_key(&created_at);
+    }
+    Ok(())
+}
+
 pub(crate) fn default_task_context_policy() -> pioneer_protocol::TaskAgentContextPolicy {
     pioneer_protocol::TaskAgentContextPolicy {
         mode: pioneer_protocol::TaskAgentContextMode::LastNTurns,
@@ -2168,6 +2295,7 @@ async fn select_task_metadata_after_composition(
             })
             .collect::<BTreeSet<_>>()
     };
+    order_history_by_creation(store, workspace, &mut composed).await?;
     let all_sources = sources(&composed);
     select_task_history(&mut composed, policy)?;
     let selected_sources = sources(&composed);
@@ -4526,9 +4654,11 @@ pub(crate) async fn restore_accepted_history_for_execution(
     history_json: &str,
 ) -> Result<RestoredAcceptedHistory> {
     if history_json.trim_start().starts_with('[') {
+        let mut messages =
+            serde_json::from_str(history_json).context("invalid legacy conversation history")?;
+        order_history_by_creation(store, workspace, &mut messages).await?;
         return Ok(RestoredAcceptedHistory {
-            messages: serde_json::from_str(history_json)
-                .context("invalid legacy conversation history")?,
+            messages,
             // Legacy arrays have no immutable direct-reference proof and are
             // therefore never eligible for a provider continuity receipt.
             #[cfg(test)]
@@ -4566,6 +4696,7 @@ pub(crate) async fn restore_accepted_history_for_execution(
         .await?;
         super::history::normalize_task_input_copies(store, workspace, &mut restored.messages)
             .await?;
+        order_history_by_creation(store, workspace, &mut restored.messages).await?;
         return Ok(RestoredAcceptedHistory {
             messages: restored.messages,
             #[cfg(test)]
@@ -4610,7 +4741,10 @@ pub(crate) async fn restore_accepted_snapshot_for_execution_without_checkpoint(
     history_json: &str,
 ) -> Result<Vec<ChatMessage>> {
     if history_json.trim_start().starts_with('[') {
-        return serde_json::from_str(history_json).context("invalid legacy conversation history");
+        let mut messages =
+            serde_json::from_str(history_json).context("invalid legacy conversation history")?;
+        order_history_by_creation(store, workspace, &mut messages).await?;
+        return Ok(messages);
     }
     let descriptor: FrozenHistoryRef = serde_json::from_str(history_json)?;
     let mut allowed = accepted_history_scopes(store, workspace, parent, history_json).await?;
@@ -4708,6 +4842,7 @@ async fn restore_accepted_execution_projection_without_checkpoint(
             messages.push(message);
         }
     }
+    order_history_by_creation(store, workspace, &mut messages).await?;
     Ok(RestoredAcceptedHistory {
         messages,
         #[cfg(test)]

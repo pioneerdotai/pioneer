@@ -25,6 +25,350 @@ use std::{
 };
 
 #[tokio::test]
+async fn source_creation_order_keeps_child_tool_work_before_later_parent_input() {
+    use pioneer_agent::compaction::composition::{AcceptedContextBranch, compose_context};
+    use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef, ProviderToolCall};
+
+    let f = fixture("unrelated fixture event", vec![], true, false).await;
+    for sql in [
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('child','ws','','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('child-turn','child','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,payload,created_at) VALUES ('parent-tie','turn',0,'text','{}','2026-09-29T10:01:00Z')",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,payload,created_at) VALUES ('parent-later','turn',1,'text','{}','2026-09-29T10:01:00Z')",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,payload,created_at) VALUES ('parent-middle','turn',2,'text','{}','2026-09-29T09:59:30Z')",
+        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('child-call','child-turn','round',1,'assistant_round','{}','{}','2026-09-29T09:59:00Z')",
+        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('child-result','child-turn','result',2,'tool_result_v2','{}','{}','2026-09-29T10:00:00Z')",
+        "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES ('child-new','child-turn','new','agent_message','completed','{}','2026-09-29T10:00:30Z','2026-09-29T10:00:30Z')",
+    ] {
+        f.store
+            .database_connection()
+            .execute_unprepared(sql)
+            .await
+            .unwrap();
+    }
+    let with_origin = |mut message: ChatMessage, thread: &str, unit: &str, source: &str| {
+        message.provenance = Some(MessageProvenance {
+            logical_turn_id: None,
+            workspace_id: "ws".into(),
+            thread_id: thread.into(),
+            context_thread: Some("thread".into()),
+            unit_id: unit.into(),
+            sources: vec![MessageSourceRef {
+                scope: format!(
+                    "{}:{}",
+                    if source == "child-new" {
+                        "item"
+                    } else if thread == "child" {
+                        "context"
+                    } else {
+                        "input"
+                    },
+                    if thread == "child" {
+                        "child-turn"
+                    } else {
+                        "turn"
+                    }
+                ),
+                id: source.into(),
+                version: "revision:1".into(),
+            }],
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
+            complete: true,
+            protected_input: false,
+            inherited: thread == "child",
+        });
+        message
+    };
+    let tie = with_origin(
+        ChatMessage::user("parent tie"),
+        "thread",
+        "tie",
+        "parent-tie",
+    );
+    let parent = with_origin(
+        ChatMessage::user("parent later"),
+        "thread",
+        "later",
+        "parent-later",
+    );
+    let call = with_origin(
+        ChatMessage::assistant_tool_calls(
+            None::<String>,
+            vec![ProviderToolCall {
+                id: "call".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            }],
+        ),
+        "child",
+        "round",
+        "child-call",
+    );
+    let result = with_origin(
+        ChatMessage::tool_result("call", "lookup", "same result text"),
+        "child",
+        "round",
+        "child-result",
+    );
+    let new_result = with_origin(
+        ChatMessage::assistant("same result text"),
+        "child",
+        "new",
+        "child-new",
+    );
+    let middle = with_origin(
+        ChatMessage::user("parent middle"),
+        "thread",
+        "middle",
+        "parent-middle",
+    );
+    let branch = vec![
+        tie,
+        parent,
+        call.clone(),
+        middle,
+        result.clone(),
+        new_result,
+    ];
+    let duplicate = vec![call, result];
+    let checkpoints = std::collections::BTreeMap::new();
+    let mut history = compose_context(
+        "ws",
+        "thread",
+        &[
+            AcceptedContextBranch {
+                thread: "thread",
+                messages: &branch,
+                checkpoints: &checkpoints,
+            },
+            AcceptedContextBranch {
+                thread: "thread",
+                messages: &duplicate,
+                checkpoints: &checkpoints,
+            },
+        ],
+    )
+    .unwrap();
+    history.insert(0, ChatMessage::system("instructions"));
+    super::frozen::order_history_by_creation(&f.store, "ws", &mut history)
+        .await
+        .unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "instructions",
+            "",
+            "parent middle",
+            "same result text",
+            "same result text",
+            "parent tie",
+            "parent later"
+        ]
+    );
+    assert_eq!(history[1].tool_calls.as_ref().unwrap()[0].id, "call");
+    assert_eq!(history[3].tool_call_id.as_deref(), Some("call"));
+    let once = history.clone();
+    super::frozen::order_history_by_creation(&f.store, "ws", &mut history)
+        .await
+        .unwrap();
+    assert_eq!(history, once);
+    let missing = with_origin(
+        ChatMessage::user("missing original"),
+        "thread",
+        "missing",
+        "missing",
+    );
+    let mut with_missing = vec![history[3].clone(), missing, history[1].clone()];
+    let recorded = with_missing.clone();
+    super::frozen::order_history_by_creation(&f.store, "ws", &mut with_missing)
+        .await
+        .unwrap();
+    assert_eq!(with_missing, recorded);
+    let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+        "ws",
+        "thread",
+        &history,
+        &vec![1; history.len()],
+    )
+    .unwrap();
+    // The same order is needed both for selected sources and reference-only
+    // material. A call/result pair cannot close before its interleaved input.
+    for reference_only in [false, true] {
+        let mut plan = f.runner.snapshot.plan.clone();
+        if reference_only {
+            plan.retain = (0..layout.units.len()).collect();
+        } else {
+            plan.compact = (1..layout.units.len()).collect();
+            plan.retain = vec![0]; // Unattributed system instructions.
+        }
+        let manifest = super::admission::history_manifest(&history, &layout, &plan).unwrap();
+        assert_eq!(
+            manifest
+                .iter()
+                .map(|entry| entry.source.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "child-call",
+                "parent-middle",
+                "child-result",
+                "child-new",
+                "parent-tie",
+                "parent-later"
+            ],
+        );
+        assert!(
+            manifest
+                .iter()
+                .all(|entry| entry.reference_only == reference_only)
+        );
+        assert_eq!(manifest[0].unit, manifest[1].unit);
+        assert_eq!(manifest[1].unit, manifest[2].unit);
+        assert!(manifest[2].unit < manifest[3].unit);
+        assert!(
+            manifest
+                .windows(2)
+                .all(|pair| (pair[0].unit, pair[0].ordinal) < (pair[1].unit, pair[1].ordinal))
+        );
+    }
+    history.remove(0);
+    let mut last = history;
+    super::frozen::select_task_history(
+        &mut last,
+        &pioneer_protocol::TaskAgentContextPolicy {
+            max_turns: Some(1),
+            ..super::frozen::default_task_context_policy()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        last.iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec!["parent middle", "parent tie", "parent later"]
+    );
+}
+
+#[tokio::test]
+async fn prepared_history_and_execution_restore_use_source_creation_order() {
+    use pioneer_agent::compaction::request::NativeRequestProjection;
+
+    let f = fixture_with_canonical_payloads(
+        vec![
+            canonical_agent_message_event_payload("later", "created later"),
+            canonical_agent_message_event_payload("earlier", "created earlier"),
+        ],
+        vec![],
+        true,
+        false,
+    )
+    .await;
+    for sql in [
+        "UPDATE turn_event SET created_at='2026-09-29T10:01:00Z' WHERE id='source'",
+        "UPDATE turn_event SET created_at='2026-09-29T10:00:00Z' WHERE id='source-1'",
+    ] {
+        f.store
+            .database_connection()
+            .execute_unprepared(sql)
+            .await
+            .unwrap();
+    }
+    let prepared =
+        super::frozen::capture_execution_basis_prepared(&f.store, "ws", "thread", None, None, None)
+            .await
+            .unwrap();
+    let contents = |messages: &[pioneer_provider::ChatMessage]| {
+        messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        contents(&prepared.messages),
+        ["created earlier", "created later"]
+    );
+    let model = NativeRequestProjection::full(
+        ChatRequest {
+            model: "fixture-model".into(),
+            messages: prepared.messages.clone(),
+            temperature: None,
+            max_tokens: Some(128),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        },
+        vec![],
+        ModelBudget::new(Some(16_384), None, Some(128)),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        contents(&model.request.messages),
+        contents(&prepared.messages)
+    );
+    let old_messages = prepared.messages.iter().rev().cloned().collect::<Vec<_>>();
+    let old_descriptor = super::frozen::capture(
+        &f.store,
+        "ws",
+        "thread",
+        &std::collections::BTreeSet::from(["thread".into()]),
+        &old_messages,
+    )
+    .await
+    .unwrap();
+    let literal = super::frozen::restore(
+        &f.store,
+        "ws",
+        &std::collections::BTreeSet::from(["thread".into()]),
+        &old_descriptor,
+    )
+    .await
+    .unwrap();
+    assert_eq!(contents(&literal), contents(&old_messages));
+    let working = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("thread"),
+        "thread",
+        &std::collections::BTreeSet::from(["thread".into()]),
+        &serde_json::to_string(&old_descriptor).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(contents(&working.messages), contents(&prepared.messages));
+    // Older inline snapshots use the same working order, without rewriting
+    // their serialized array or granting them a continuity proof.
+    let legacy = serde_json::to_string(&old_messages).unwrap();
+    let working = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("thread"),
+        "thread",
+        &std::collections::BTreeSet::from(["thread".into()]),
+        &legacy,
+    )
+    .await
+    .unwrap();
+    assert_eq!(contents(&working.messages), contents(&prepared.messages));
+    assert!(working.direct_sources.is_empty());
+    let working = super::frozen::restore_accepted_snapshot_for_execution_without_checkpoint(
+        &f.store, "ws", "thread", "thread", &legacy,
+    )
+    .await
+    .unwrap();
+    assert_eq!(contents(&working), contents(&prepared.messages));
+    assert_eq!(
+        serde_json::from_str::<Vec<pioneer_provider::ChatMessage>>(&legacy).unwrap(),
+        old_messages
+    );
+}
+
+#[tokio::test]
 async fn compaction_observer_heartbeat_reaches_the_live_progress_lane() {
     let lifecycle_store = CrudStore::new(Database::connect("sqlite::memory:").await.unwrap());
     let hub = Arc::new(ExecutionEventHub::new());
@@ -4638,13 +4982,40 @@ async fn saved_candidate_survives_restart_without_regenerating() {
 
 #[tokio::test]
 async fn interrupted_portion_resumes_from_saved_summary_with_same_retry_budget() {
-    let f = fixture(
-        &"漢字🌍".repeat(4000),
+    let f = fixture_with_canonical_payloads(
+        vec![
+            canonical_agent_message_event_payload("call", &"漢字🌍".repeat(4000)),
+            canonical_agent_message_event_payload("middle", "interleaved input"),
+            canonical_agent_message_event_payload("result", "terminal result"),
+        ],
         vec![Reply::Success, Reply::Hang],
         true,
         false,
     )
     .await;
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let mut history = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 3);
+    let unit = history[0].provenance.as_ref().unwrap().unit_id.clone();
+    history[2].provenance.as_mut().unwrap().unit_id = unit;
+    let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+        "ws",
+        "thread",
+        &history,
+        &[1, 1, 1],
+    )
+    .unwrap();
+    let mut plan = f.runner.snapshot.plan.clone();
+    plan.compact = (0..layout.units.len()).collect();
+    let manifest = super::admission::history_manifest(&history, &layout, &plan).unwrap();
+    f.store
+        .database_connection()
+        .execute_unprepared("DELETE FROM compaction_manifest WHERE operation_id='operation'")
+        .await
+        .unwrap();
+    seed_active_manifest_entries(&f.store, &manifest).await;
     let task = tokio::spawn({
         let runner = f.runner.clone();
         async move { runner.run(CancellationToken::new()).await }
@@ -4678,6 +5049,28 @@ async fn interrupted_portion_resumes_from_saved_summary_with_same_retry_budget()
     assert_eq!(
         serde_json::to_value(interrupted).unwrap(),
         serde_json::to_value(resumed).unwrap()
+    );
+    let inputs = calls
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != 1) // The interrupted request is retried verbatim.
+        .map(|(_, call)| serde_json::from_str::<SummaryInput>(&call.messages[1].content).unwrap())
+        .collect::<Vec<_>>();
+    let parts = inputs
+        .iter()
+        .flat_map(|input| &input.compact_units)
+        .collect::<Vec<_>>();
+    let mut sources = parts
+        .iter()
+        .flat_map(|part| part.sources.iter().map(|source| source.id.as_str()))
+        .collect::<Vec<_>>();
+    sources.dedup();
+    assert_eq!(sources, ["source", "source-1", "source-2"]);
+    assert!(
+        parts
+            .iter()
+            .filter(|part| part.last_part)
+            .all(|part| part.sources.last().unwrap().id == "source-2")
     );
     drop(calls);
     let state = f

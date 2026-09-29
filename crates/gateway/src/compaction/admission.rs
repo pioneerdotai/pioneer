@@ -11,6 +11,68 @@ use pioneer_crud::compaction::{ManifestEntry, SOURCE_PAGE_BYTES};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
+/// Keep source order from the request, while retaining whole-round boundaries.
+/// Interleaved planner units share a runner unit: call A, input B, result A
+/// becomes one ordered portion, never a completed A before its result.
+pub(super) fn history_manifest(
+    messages: &[pioneer_provider::ChatMessage],
+    layout: &NativeHistoryLayout,
+    plan: &CompactionPlan,
+) -> Result<Vec<ManifestEntry>> {
+    let mut manifest = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (reference_only, units) in [(false, &plan.compact), (true, &plan.retain)] {
+        let ordered = units
+            .iter()
+            .flat_map(|unit| {
+                layout.message_indexes[*unit]
+                    .iter()
+                    .map(move |index| (*index, *unit))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut boundary = None;
+        let mut runner_unit = 0;
+        for (index, unit) in ordered {
+            if boundary.is_none_or(|end| index > end) {
+                runner_unit = unit as u64;
+            }
+            let last = *layout.message_indexes[unit]
+                .last()
+                .expect("nonempty history unit");
+            boundary = Some(boundary.map_or(last, |end: usize| end.max(last)));
+            let sources = match &messages[index].provenance {
+                Some(origin) => origin
+                    .sources
+                    .iter()
+                    .map(|source| SourceRef {
+                        scope: source.scope.clone(),
+                        id: source.id.clone(),
+                        version: source.version.clone(),
+                    })
+                    .collect(),
+                None => layout.units[unit].sources.clone(),
+            };
+            for source in sources {
+                // Unattributed retained instructions have no durable source.
+                let Some(thread_id) = layout.source_threads.get(&source) else {
+                    ensure!(reference_only, "selected history source owner is missing");
+                    continue;
+                };
+                if seen.insert(source.clone()) {
+                    manifest.push(ManifestEntry {
+                        ordinal: manifest.len() as u64,
+                        unit: runner_unit,
+                        reference_only,
+                        thread_id: thread_id.clone(),
+                        source,
+                    });
+                }
+            }
+        }
+    }
+    Ok(manifest)
+}
+
 /// Limit only aliases that would be published by this checkpoint. Frozen
 /// histories can combine independently accepted branches with many more exact
 /// aliases; retained and reference-only sources do not enter checkpoint edges.

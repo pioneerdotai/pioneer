@@ -133,6 +133,16 @@ impl CrudStore {
         )
         .await
     }
+    pub async fn compaction_item_created_at(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        id: &str,
+    ) -> Result<Option<sea_orm::prelude::DateTimeWithTimeZone>> {
+        repositories::compaction::compaction_item_created_at(self, workspace, thread, turn, id)
+            .await
+    }
     pub(crate) async fn compaction_source_page_inner(
         &self,
         workspace: &str,
