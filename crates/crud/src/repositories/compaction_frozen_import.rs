@@ -469,9 +469,9 @@ pub(crate) async fn compaction_prepare_accepted_checkpoint_import(
     Ok(prepared.pop().expect("one requested import"))
 }
 
-/// Prepare every immutable grant for one checkpoint projection. Historical
-/// metadata is traversed once for the target; individual ordinals are matched
-/// against the resulting exact, scoped member set.
+/// Prepare every immutable grant for one checkpoint projection. The combined
+/// grant frontier is checked first; distinct deliveries may instead each
+/// cover the target through their own exact frontier.
 pub(crate) async fn compaction_prepare_accepted_checkpoint_imports(
     store: &CrudStore,
     workspace: &str,
@@ -512,18 +512,49 @@ pub(crate) async fn compaction_prepare_accepted_checkpoint_imports(
             )
         })
         .collect::<std::collections::BTreeSet<_>>();
-    ensure!(
-        checkpoint_historically_contains(
-            store,
-            workspace,
-            checkpoint_thread,
-            checkpoint,
-            &wanted,
-            false,
-        )
-        .await?,
-        "accepted checkpoint replacement binding changed"
-    );
+    if !checkpoint_historically_contains(
+        store,
+        workspace,
+        checkpoint_thread,
+        checkpoint,
+        &wanted,
+        false,
+    )
+    .await?
+    {
+        // Separate deliveries can grant alternative complete frontiers for
+        // the same checkpoint, including the root itself and its inputs.
+        let mut by_delivery = std::collections::BTreeMap::<
+            (String, SourceRef),
+            std::collections::BTreeSet<(String, SourceRef)>,
+        >::new();
+        for import in &prepared {
+            by_delivery
+                .entry((
+                    import.record.delivery_id.clone(),
+                    import.record.acknowledgement.clone(),
+                ))
+                .or_default()
+                .insert((
+                    import.record.source_thread.clone(),
+                    import.record.source.clone(),
+                ));
+        }
+        for grants in by_delivery.values() {
+            ensure!(
+                checkpoint_historically_contains(
+                    store,
+                    workspace,
+                    checkpoint_thread,
+                    checkpoint,
+                    grants,
+                    false,
+                )
+                .await?,
+                "accepted checkpoint replacement binding changed"
+            );
+        }
+    }
     for import in &mut prepared {
         import.target_checkpoint = Some((checkpoint_thread.into(), checkpoint.clone()));
     }

@@ -3,9 +3,10 @@ use crate::compaction::{
     AcceptedTaskBasis, CanonicalFragment, CanonicalSource, CheckpointEdges, CheckpointMetadata,
     CommitOutcome, CompactionLifecycleRecovery, CompletedHistoryCheck, DeliveredTaskOutputPage,
     DeliveryCheckpointImportSource, FrozenImportRecord, HistoricalEventProjection,
-    HistoryCausalBoundary, HistoryReadFence, HistoryTurnBoundary, ManifestEntry, OperationRecord,
-    PagedSource, PreparedFrozenImport, RunnerPlanRecord, SourceAssertion, SourcePage,
-    TaskDeliveryOutputSnapshot, TaskInputCopyAlias, TaskOutputSnapshot,
+    HistoryCausalBoundary, HistoryCausalSource, HistoryReadFence, HistoryTurnBoundary,
+    ManifestEntry, OperationRecord, PagedSource, PreparedFrozenImport, RunnerPlanRecord,
+    SourceAssertion, SourcePage, TaskDeliveryOutputSnapshot, TaskInputCopyAlias,
+    TaskOutputSnapshot,
 };
 use crate::{CanonicalTurnEventPayload, CrudStore, repositories};
 use anyhow::Result;
@@ -1049,6 +1050,23 @@ impl CrudStore {
         fence: &HistoryReadFence,
     ) -> Result<Vec<HistoryTurnBoundary>> {
         repositories::compaction::history::compaction_history_selected_turn_page(
+            &self.connection,
+            workspace,
+            thread,
+            selected,
+            fence,
+        )
+        .await
+    }
+    /// Exact, payload-free positions for a bounded set of parent sources.
+    pub async fn compaction_history_causal_source_page(
+        &self,
+        workspace: &str,
+        thread: &str,
+        selected: &[SourceRef],
+        fence: &HistoryReadFence,
+    ) -> Result<Vec<HistoryCausalSource>> {
+        repositories::compaction::history::compaction_history_causal_source_page(
             &self.connection,
             workspace,
             thread,

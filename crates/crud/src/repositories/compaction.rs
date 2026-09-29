@@ -25,8 +25,8 @@ pub use frozen_import::{
     FrozenImportRecord, PreparedFrozenImport, frozen_import_identity,
 };
 pub use history::{
-    AcceptedTaskBasis, HistoryCausalBoundary, HistoryReadFence, HistoryTurnBoundary,
-    TaskInputCopyAlias, event_projection_metadata,
+    AcceptedTaskBasis, HistoryCausalBoundary, HistoryCausalSource, HistoryReadFence,
+    HistoryTurnBoundary, TaskInputCopyAlias, event_projection_metadata,
 };
 use pioneer_compaction::{
     Checkpoint, FORMAT_VERSION, OperationSnapshot, SourceRef,

@@ -33,25 +33,24 @@ struct Unit {
 
 pub type ExactMessageSource = (String, MessageSourceRef);
 
-/// A verified Task delivery makes this source available in the destination
-/// thread at `available_at`. The command identifies its logical turn; neither
-/// field is inferred from message text or a source ID's sort order.
+/// A verified Task delivery carries its logical command turn.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CausalPlacement {
     pub command_turn: String,
-    pub available_at: usize,
 }
 
-/// Order complete canonical units after delivery proofs have been checked.
-/// An unknown unit is a barrier: no message is moved across history whose
-/// availability cannot be established. The optional ordinal travels with its
-/// message so an execution projection never renumbers a frozen reference.
+pub type CausalUnitRelation =
+    dyn Fn(bool, &[ExactMessageSource], bool, &[ExactMessageSource]) -> Option<std::cmp::Ordering>;
+
+/// Move complete canonical units only across sources with a proven relation.
+/// An unknown pair keeps its original order. Each optional frozen ordinal
+/// travels with its message.
 pub fn order_causal_units(
     workspace: &str,
     destination: &str,
     messages: Vec<(Option<usize>, ChatMessage)>,
-    parent_turn_order: &BTreeMap<String, usize>,
     delivered: &BTreeMap<ExactMessageSource, CausalPlacement>,
+    relation: &CausalUnitRelation,
 ) -> Result<Vec<(Option<usize>, ChatMessage)>> {
     if messages.is_empty() || delivered.is_empty() {
         return Ok(messages);
@@ -65,37 +64,77 @@ pub fn order_causal_units(
     else {
         return Ok(messages);
     };
-    if layout
-        .message_indexes
-        .iter()
-        .any(|indexes| indexes.windows(2).any(|pair| pair[1] != pair[0] + 1))
-    {
-        return Ok(messages);
+    // A round may contain accepted steering between its call and result.
+    // Keep that whole interleaved span fixed, but still order independent
+    // regions on either side. Expand the span through every unit it touches
+    // so recursion never splits a canonical unit.
+    let mut fixed = vec![false; messages.len()];
+    for indexes in &layout.message_indexes {
+        if indexes.windows(2).any(|pair| pair[1] != pair[0] + 1) {
+            fixed[indexes[0]..=*indexes.last().expect("nonempty unit")].fill(true);
+        }
+    }
+    if fixed.iter().any(|fixed| *fixed) {
+        loop {
+            let mut changed = false;
+            for indexes in &layout.message_indexes {
+                if indexes.iter().any(|index| fixed[*index]) {
+                    for fixed in &mut fixed[indexes[0]..=*indexes.last().expect("nonempty unit")] {
+                        if !*fixed {
+                            *fixed = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut ordered = Vec::with_capacity(messages.len());
+        let mut index = 0;
+        while index < messages.len() {
+            if fixed[index] {
+                ordered.push(messages[index].clone());
+                index += 1;
+                continue;
+            }
+            let end = (index..messages.len())
+                .find(|next| fixed[*next])
+                .unwrap_or(messages.len());
+            ordered.extend(order_causal_units(
+                workspace,
+                destination,
+                messages[index..end].to_vec(),
+                delivered,
+                relation,
+            )?);
+            index = end;
+        }
+        return Ok(ordered);
     }
     let mut slots = messages.into_iter().map(Some).collect::<Vec<_>>();
     let mut units = Vec::with_capacity(layout.units.len());
     for (layout_unit, indexes) in layout.units.iter().zip(&layout.message_indexes) {
         let mut placement: Option<&CausalPlacement> = None;
-        let mut parent_turn: Option<&str> = None;
         let mut movable = layout_unit.complete && !layout_unit.protected_input;
-        let mut parent = true;
+        let mut exact_parent = true;
+        let mut sources = Vec::new();
         for index in indexes {
             let origin = plain[*index].provenance.as_ref().expect("canonical source");
             if origin.thread_id != destination {
-                parent = false;
+                exact_parent = false;
             }
             if origin.thread_id == destination || origin.inherited {
                 movable = false;
             }
+            if origin.inherited {
+                exact_parent = false;
+            }
             for source in &origin.sources {
-                let turn = source.scope.split_once(':').map(|(_, turn)| turn);
-                if source.scope.starts_with("checkpoint:")
-                    || turn.is_none()
-                    || parent_turn.is_some_and(|previous| Some(previous) != turn)
-                {
-                    parent = false;
-                } else {
-                    parent_turn = turn;
+                sources.push((origin.thread_id.clone(), source.clone()));
+                if source.scope.starts_with("checkpoint:") {
+                    exact_parent = false;
                 }
                 match delivered.get(&(origin.thread_id.clone(), source.clone())) {
                     Some(proof)
@@ -111,13 +150,6 @@ pub fn order_causal_units(
                 }
             }
         }
-        let rank = if movable {
-            placement.map(|proof| proof.available_at)
-        } else if parent {
-            parent_turn.and_then(|turn| parent_turn_order.get(turn).copied())
-        } else {
-            None
-        };
         let mut unit = indexes
             .iter()
             .map(|index| {
@@ -126,7 +158,7 @@ pub fn order_causal_units(
                     .expect("one canonical unit per message")
             })
             .collect::<Vec<_>>();
-        if movable && rank.is_some() {
+        if movable && placement.is_some() {
             let command = &placement.expect("movable source has proof").command_turn;
             for (_, message) in &mut unit {
                 message
@@ -136,33 +168,41 @@ pub fn order_causal_units(
                     .logical_turn_id = Some(command.clone());
             }
         }
-        units.push((rank, !movable, unit));
+        units.push((
+            !(movable && placement.is_some()),
+            exact_parent,
+            sources,
+            unit,
+        ));
     }
-    // Sort only runs of known parent turns and verified delivered units. A
-    // malformed parent order is left untouched rather than repaired by time.
-    let mut start = 0;
-    while start < units.len() {
-        if units[start].0.is_none() {
-            start += 1;
-            continue;
+    // Adjacent swaps cannot pass an unknown source, including a summary
+    // anchor or unrelated Task output.
+    for _ in 0..units.len() {
+        let mut changed = false;
+        for index in 1..units.len() {
+            let left = &units[index - 1];
+            let right = &units[index];
+            let left_delivery = !left.0;
+            let right_delivery = !right.0;
+            let left_known = left_delivery || left.1;
+            let right_known = right_delivery || right.1;
+            if left_known
+                && right_known
+                && (left_delivery || right_delivery)
+                && relation(left_delivery, &left.2, right_delivery, &right.2)
+                    == Some(std::cmp::Ordering::Greater)
+            {
+                units.swap(index - 1, index);
+                changed = true;
+            }
         }
-        let mut end = start + 1;
-        while end < units.len() && units[end].0.is_some() {
-            end += 1;
+        if !changed {
+            break;
         }
-        let parent_ranks = units[start..end]
-            .iter()
-            .filter(|(_, parent, _)| *parent)
-            .map(|(rank, _, _)| rank.expect("known parent rank"))
-            .collect::<Vec<_>>();
-        if parent_ranks.windows(2).all(|pair| pair[0] <= pair[1]) {
-            units[start..end].sort_by_key(|(rank, _, _)| rank.expect("known rank"));
-        }
-        start = end;
     }
     Ok(units
         .into_iter()
-        .flat_map(|(_, _, messages)| messages)
+        .flat_map(|(_, _, _, messages)| messages)
         .collect())
 }
 
@@ -1499,17 +1539,16 @@ mod tests {
         result
     }
 
-    fn causal_proof(
-        message: &ChatMessage,
-        command: &str,
-        available_at: usize,
-    ) -> (ExactMessageSource, CausalPlacement) {
+    fn causal_source(message: &ChatMessage) -> ExactMessageSource {
         let origin = message.provenance.as_ref().unwrap();
+        (origin.thread_id.clone(), origin.sources[0].clone())
+    }
+
+    fn causal_proof(message: &ChatMessage, command: &str) -> (ExactMessageSource, CausalPlacement) {
         (
-            (origin.thread_id.clone(), origin.sources[0].clone()),
+            causal_source(message),
             CausalPlacement {
                 command_turn: command.into(),
-                available_at,
             },
         )
     }
@@ -1521,6 +1560,55 @@ mod tests {
             .collect()
     }
 
+    fn causal_parent_sources(
+        messages: &[(Option<usize>, ChatMessage)],
+        turns: &BTreeMap<String, usize>,
+    ) -> BTreeMap<ExactMessageSource, usize> {
+        messages
+            .iter()
+            .filter_map(|(_, message)| message.provenance.as_ref())
+            .filter(|origin| origin.thread_id == "parent")
+            .flat_map(|origin| {
+                origin.sources.iter().filter_map(|source| {
+                    let turn = source.scope.split_once(':')?.1;
+                    let rank = *turns.get(turn)?;
+                    Some(((origin.thread_id.clone(), source.clone()), rank))
+                })
+            })
+            .collect()
+    }
+
+    fn order_fixture_causal_units(
+        messages: Vec<(Option<usize>, ChatMessage)>,
+        parent_turns: &BTreeMap<String, usize>,
+        arrivals: &[(&ChatMessage, usize)],
+        delivered: &BTreeMap<ExactMessageSource, CausalPlacement>,
+    ) -> Vec<(Option<usize>, ChatMessage)> {
+        let mut positions = causal_parent_sources(&messages, parent_turns);
+        positions.extend(
+            arrivals
+                .iter()
+                .map(|(message, position)| (causal_source(message), *position)),
+        );
+        let relation = move |left_delivery: bool,
+                             left: &[ExactMessageSource],
+                             right_delivery: bool,
+                             right: &[ExactMessageSource]| {
+            if !left_delivery && !right_delivery {
+                return None;
+            }
+            let position = |sources: &[ExactMessageSource]| {
+                let first = *positions.get(sources.first()?)?;
+                sources
+                    .iter()
+                    .all(|source| positions.get(source) == Some(&first))
+                    .then_some(first)
+            };
+            Some(position(left)?.cmp(&position(right)?))
+        };
+        order_causal_units("ws", "parent", messages, delivered, &relation).unwrap()
+    }
+
     #[test]
     fn sequential_task_answers_follow_their_questions_and_keep_source_ordinals() {
         let questions = ["q1", "q2", "q3"].map(|turn| causal_fixture("parent", turn, turn, turn));
@@ -1530,7 +1618,7 @@ mod tests {
             .chain(answers.clone())
             .enumerate()
             .map(|(index, message)| (Some(index), message))
-            .collect();
+            .collect::<Vec<_>>();
         let parent = BTreeMap::from([
             ("q1".into(), 0),
             ("d1".into(), 1),
@@ -1542,9 +1630,14 @@ mod tests {
         let delivered = answers
             .iter()
             .enumerate()
-            .map(|(index, answer)| causal_proof(answer, &format!("q{}", index + 1), index * 2 + 1))
+            .map(|(index, answer)| causal_proof(answer, &format!("q{}", index + 1)))
             .collect();
-        let ordered = order_causal_units("ws", "parent", messages, &parent, &delivered).unwrap();
+        let arrivals = answers
+            .iter()
+            .enumerate()
+            .map(|(index, answer)| (answer, index * 2 + 1))
+            .collect::<Vec<_>>();
+        let ordered = order_fixture_causal_units(messages, &parent, &arrivals, &delivered);
         assert_eq!(causal_text(&ordered), ["q1", "a1", "q2", "a2", "q3", "a3"]);
         assert_eq!(
             ordered
@@ -1582,25 +1675,28 @@ mod tests {
             ("d1".into(), 4),
         ]);
         let delivered = [
-            causal_proof(&a1, "q1", 4),
-            causal_proof(&a2, "q2", 2),
-            causal_proof(&nested, "q2", 2),
-            causal_proof(&sibling, "q2", 2),
+            causal_proof(&a1, "q1"),
+            causal_proof(&a2, "q2"),
+            causal_proof(&nested, "q2"),
+            causal_proof(&sibling, "q2"),
         ]
         .into_iter()
         .collect();
-        let ordered = order_causal_units(
-            "ws",
-            "parent",
-            vec![q1, q2, q3, a2, nested, sibling, a1]
-                .into_iter()
-                .enumerate()
-                .map(|(i, message)| (Some(i), message))
-                .collect(),
-            &parent,
-            &delivered,
-        )
-        .unwrap();
+        let arrivals = [(&a1, 4), (&a2, 2), (&nested, 2), (&sibling, 2)];
+        let messages = vec![
+            q1,
+            q2,
+            q3,
+            a2.clone(),
+            nested.clone(),
+            sibling.clone(),
+            a1.clone(),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, message)| (Some(i), message))
+        .collect::<Vec<_>>();
+        let ordered = order_fixture_causal_units(messages, &parent, &arrivals, &delivered);
         assert_eq!(
             causal_text(&ordered),
             ["q1", "q2", "a2", "nested a2", "a2 sibling", "q3", "a1 late"]
@@ -1627,8 +1723,9 @@ mod tests {
         let parent = BTreeMap::from([("q1".into(), 0), ("delivery".into(), 1), ("q2".into(), 2)]);
         let delivered = [&call, &result, &final_answer]
             .into_iter()
-            .map(|message| causal_proof(message, "q1", 1))
+            .map(|message| causal_proof(message, "q1"))
             .collect();
+        let arrivals = [(&call, 1), (&result, 1), (&final_answer, 1)];
         let inputs = vec![
             q1.clone(),
             q2.clone(),
@@ -1636,18 +1733,12 @@ mod tests {
             result.clone(),
             final_answer.clone(),
         ];
-        let ordered = order_causal_units(
-            "ws",
-            "parent",
-            inputs
-                .into_iter()
-                .enumerate()
-                .map(|(i, message)| (Some(i), message))
-                .collect(),
-            &parent,
-            &delivered,
-        )
-        .unwrap();
+        let input = inputs
+            .into_iter()
+            .enumerate()
+            .map(|(i, message)| (Some(i), message))
+            .collect::<Vec<_>>();
+        let ordered = order_fixture_causal_units(input, &parent, &arrivals, &delivered);
         assert_eq!(
             ordered
                 .iter()
@@ -1665,19 +1756,18 @@ mod tests {
         assert_eq!(causal_text(&ordered), ["q1", "", "result", "answer", "q2"]);
 
         let unknown = causal_fixture("unavailable", "work", "unknown", "unavailable");
-        let final_proof = causal_proof(&final_answer, "q1", 1);
-        let blocked = order_causal_units(
-            "ws",
-            "parent",
-            vec![q1, q2, unknown, final_answer]
-                .into_iter()
-                .enumerate()
-                .map(|(i, message)| (Some(i), message))
-                .collect(),
+        let final_proof = causal_proof(&final_answer, "q1");
+        let blocked_input = vec![q1, q2, unknown, final_answer.clone()]
+            .into_iter()
+            .enumerate()
+            .map(|(i, message)| (Some(i), message))
+            .collect::<Vec<_>>();
+        let blocked = order_fixture_causal_units(
+            blocked_input,
             &parent,
+            &[(&final_answer, 1)],
             &BTreeMap::from([final_proof]),
-        )
-        .unwrap();
+        );
         assert_eq!(causal_text(&blocked), ["q1", "q2", "unavailable", "answer"]);
     }
 
@@ -1687,15 +1777,15 @@ mod tests {
         summary.provenance.as_mut().unwrap().sources[0].scope = "checkpoint:parent".into();
         let q3 = causal_fixture("parent", "q3", "q3", "q3");
         let a3 = causal_fixture("child", "work-3", "work-3", "a3");
-        let proof = causal_proof(&a3, "q3", 2);
-        let input = vec![summary, q3, a3]
+        let proof = causal_proof(&a3, "q3");
+        let input = vec![summary, q3, a3.clone()]
             .into_iter()
             .enumerate()
             .map(|(index, message)| (Some(index), message))
-            .collect();
+            .collect::<Vec<_>>();
         let turns = BTreeMap::from([("q3".into(), 1), ("d3".into(), 2)]);
         let delivered = BTreeMap::from([proof]);
-        let ordered = order_causal_units("ws", "parent", input, &turns, &delivered).unwrap();
+        let ordered = order_fixture_causal_units(input, &turns, &[(&a3, 2)], &delivered);
         assert_eq!(causal_text(&ordered), ["saved summary", "q3", "a3"]);
         assert_eq!(
             ordered
@@ -1703,6 +1793,53 @@ mod tests {
                 .map(|(ordinal, _)| *ordinal)
                 .collect::<Vec<_>>(),
             [Some(0), Some(1), Some(2)]
+        );
+    }
+
+    #[test]
+    fn interleaved_round_stays_fixed_while_independent_tail_is_ordered() {
+        use pioneer_provider::ProviderToolCall;
+        let mut call = ChatMessage::assistant_tool_calls(
+            None::<String>,
+            vec![ProviderToolCall {
+                id: "call".into(),
+                name: "tool".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        call.provenance = causal_fixture("parent", "old", "round", "call").provenance;
+        let mut steering = ChatMessage::user("steering");
+        steering.provenance = causal_fixture("parent", "old", "steering", "steering").provenance;
+        steering.provenance.as_mut().unwrap().protected_input = true;
+        let mut result = ChatMessage::tool_result("call", "tool", "tool result");
+        result.provenance = causal_fixture("parent", "old", "round", "result").provenance;
+        let q1 = causal_fixture("parent", "q1", "q1", "q1");
+        let q2 = causal_fixture("parent", "q2", "q2", "q2");
+        let a1 = causal_fixture("child", "work", "work", "a1");
+        let proof = causal_proof(&a1, "q1");
+        let messages = vec![call, steering, result, q1, q2, a1.clone()]
+            .into_iter()
+            .enumerate()
+            .map(|(index, message)| (Some(index), message))
+            .collect::<Vec<_>>();
+        let parent = BTreeMap::from([
+            ("old".into(), 0),
+            ("q1".into(), 1),
+            ("delivery".into(), 2),
+            ("q2".into(), 3),
+        ]);
+        let ordered =
+            order_fixture_causal_units(messages, &parent, &[(&a1, 2)], &BTreeMap::from([proof]));
+        assert_eq!(
+            causal_text(&ordered),
+            ["", "steering", "tool result", "q1", "a1", "q2"]
+        );
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|(ordinal, _)| *ordinal)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1), Some(2), Some(3), Some(5), Some(4)]
         );
     }
 }

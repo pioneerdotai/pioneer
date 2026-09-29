@@ -519,10 +519,16 @@ async fn read_accepted_imports(
                     entry.checkpoint_target = Some(target);
                 }
             }
-            entry.sources.insert(ScopedHistorySource {
+            let granted_source = ScopedHistorySource {
                 thread: record.source_thread,
                 source: record.source,
-            });
+            };
+            entry
+                .delivery_sources
+                .entry((record.delivery_id, record.acknowledgement))
+                .or_default()
+                .insert(granted_source.clone());
+            entry.sources.insert(granted_source);
             entry.import_ordinals.push(ordinal);
             ordinal += 1;
             ensure!(ordinal <= count, "accepted Task import count mismatch");
@@ -552,12 +558,24 @@ async fn read_accepted_imports(
             checkpoint.scope.starts_with("checkpoint:"),
             "accepted own import no longer matches its frozen message"
         );
-        ensure!(
-            checkpoint_graphs
-                .authorized_by_historical_inputs(store, workspace, checkpoint, &imports.sources)
-                .await?,
-            "accepted checkpoint replacement exceeds its immutable grants"
-        );
+        if !checkpoint_graphs
+            .authorized_by_historical_inputs(store, workspace, checkpoint, &imports.sources)
+            .await?
+        {
+            // A direct grant for S and another delivery of S's inputs are
+            // separate complete frontiers, not one combined frontier.
+            for grants in imports.delivery_sources.values() {
+                if grants == &direct_sources {
+                    continue;
+                }
+                ensure!(
+                    checkpoint_graphs
+                        .authorized_by_historical_inputs(store, workspace, checkpoint, grants)
+                        .await?,
+                    "accepted checkpoint replacement exceeds its immutable grants"
+                );
+            }
+        }
     }
     Ok(accepted)
 }
@@ -565,6 +583,7 @@ async fn read_accepted_imports(
 #[derive(Default)]
 struct AcceptedMessageImports {
     sources: BTreeSet<ScopedHistorySource>,
+    delivery_sources: BTreeMap<(String, SourceRef), BTreeSet<ScopedHistorySource>>,
     import_ordinals: Vec<u64>,
     checkpoint_target: Option<ScopedHistorySource>,
     acknowledgements: BTreeSet<SourceRef>,
@@ -1042,6 +1061,7 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
                 .cloned(),
         );
     }
+    let mut causal_basis = BTreeMap::<ScopedHistorySource, BTreeSet<SourceRef>>::new();
     let mut messages = if omits_history {
         Vec::new()
     } else if covered_history.iter().any(|leaf| leaf.thread == thread)
@@ -1145,12 +1165,9 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
                 &mut checkpoint_graphs,
             )
             .await?;
-            ensure!(
-                restored.messages.len() == restored.original_ordinals.len(),
-                "accepted execution lost its source ordinal mapping"
-            );
             retained_imports = Some(restored.retained_imports);
             projected_imports = restored.projected_imports;
+            causal_basis = restored.causal_imports;
             external_input_evidence = Some(restored.external_evidence);
             messages = messages
                 .into_iter()
@@ -1272,8 +1289,8 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
         )
         .await?;
     }
-    let mut own_outputs = BTreeMap::<ScopedHistorySource, (usize, u64)>::new();
-    let mut causal_outputs = BTreeMap::<ScopedHistorySource, BTreeSet<SourceRef>>::new();
+    let mut own_outputs = BTreeMap::<ScopedHistorySource, BTreeSet<(usize, u64)>>::new();
+    let mut causal_outputs = causal_basis;
     // Only roots produced while projecting a delivered output may consume its
     // delivery grants. Parent summaries and accepted-basis checkpoints have
     // independent provenance, even when their historical leaves overlap.
@@ -1336,11 +1353,12 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
                         };
                         own_outputs
                             .entry(key.clone())
-                            .or_insert((branch_index, boundary_original_ordinals[*index]));
+                            .or_default()
+                            .insert((branch_index, boundary_original_ordinals[*index]));
                         causal_outputs
                             .entry(key)
                             .or_default()
-                            .insert(branch.acknowledgement.clone());
+                            .extend(branch.acknowledgements.iter().cloned());
                     }
                 }
             }
@@ -1416,32 +1434,12 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
     }
     if let Some(outputs) = outputs {
         for (root, branches) in &delivery_replacements {
-            if let Some((&branch_index, _)) = (branches.len() == 1)
-                .then(|| branches.first_key_value())
-                .flatten()
-            {
-                causal_outputs
-                    .entry(root.clone())
-                    .or_default()
-                    .insert(outputs.branches[branch_index].acknowledgement.clone());
-            }
+            causal_outputs.entry(root.clone()).or_default().extend(
+                branches
+                    .keys()
+                    .flat_map(|index| outputs.branches[*index].acknowledgements.iter().cloned()),
+            );
         }
-    }
-    if !causal_outputs.is_empty() {
-        messages = order_verified_deliveries(
-            &store,
-            workspace,
-            thread,
-            messages
-                .into_iter()
-                .map(|message| (None, message))
-                .collect(),
-            &causal_outputs,
-        )
-        .await?
-        .into_iter()
-        .map(|(_, message)| message)
-        .collect();
     }
     if includes_parent_summary
         && let Some(head) = projection_head.as_ref().and_then(|head| head.clone())
@@ -1493,6 +1491,22 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
             origin.ambiguous_input_aliases = merged.ambiguous;
         }
     }
+    if !causal_outputs.is_empty() {
+        messages = order_verified_deliveries(
+            &store,
+            workspace,
+            thread,
+            messages
+                .into_iter()
+                .map(|message| (None, message))
+                .collect(),
+            &causal_outputs,
+        )
+        .await?
+        .into_iter()
+        .map(|(_, message)| message)
+        .collect();
+    }
     if let Some(policy) = policy {
         select_task_history(&mut messages, policy)?;
     }
@@ -1514,24 +1528,41 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
                     thread: origin.thread_id.clone(),
                     source: source(reference),
                 };
-                if let Some(grant) = own_outputs.get(&key) {
-                    let (branch_index, ordinal) = *grant;
-                    let branch = &outputs.branches[branch_index];
-                    let prepared = store
-                        .compaction_prepare_frozen_import(
-                            workspace,
-                            thread,
-                            &branch.snapshot.delivery_id,
-                            &branch.acknowledgement,
-                            ordinal,
-                            &key.thread,
-                            &key.source,
-                        )
-                        .await?;
-                    imports.entry(key).or_default().push(prepared);
-                } else if let Some(branches) = delivery_replacements.get(&key)
-                    && !imports.contains_key(&key)
-                {
+                let mut prepared_grants = BTreeMap::new();
+                if let Some(grants) = own_outputs.get(&key) {
+                    for (branch_index, ordinal) in grants {
+                        let branch = &outputs.branches[*branch_index];
+                        for acknowledgement in branch
+                            .acknowledgements
+                            .iter()
+                            .cloned()
+                            .collect::<BTreeSet<_>>()
+                        {
+                            let prepared = store
+                                .compaction_prepare_frozen_import(
+                                    workspace,
+                                    thread,
+                                    &branch.snapshot.delivery_id,
+                                    &acknowledgement,
+                                    *ordinal,
+                                    &key.thread,
+                                    &key.source,
+                                )
+                                .await?;
+                            prepared_grants.insert(
+                                (
+                                    *branch_index,
+                                    acknowledgement.clone(),
+                                    *ordinal,
+                                    key.thread.clone(),
+                                    key.source.clone(),
+                                ),
+                                prepared,
+                            );
+                        }
+                    }
+                }
+                if let Some(branches) = delivery_replacements.get(&key) {
                     let graph = checkpoint_graphs
                         .resolve(&store, workspace, Some(&allowed), &key.source)
                         .await?
@@ -1540,7 +1571,7 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
                         !graph.leaves.is_empty(),
                         "checkpoint replacement has no delivered output leaves"
                     );
-                    let mut selected_branch = None;
+                    let mut covered = false;
                     for (branch_index, sources) in branches {
                         let mut represented = BTreeSet::new();
                         for grant in sources {
@@ -1561,28 +1592,53 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
                             }
                         }
                         if represented == graph.leaves {
-                            selected_branch = Some((*branch_index, sources));
-                            break;
+                            let branch = &outputs.branches[*branch_index];
+                            for acknowledgement in branch
+                                .acknowledgements
+                                .iter()
+                                .cloned()
+                                .collect::<BTreeSet<_>>()
+                            {
+                                let prepared = store
+                                    .compaction_prepare_delivery_checkpoint_imports(
+                                        workspace,
+                                        thread,
+                                        &branch.snapshot.delivery_id,
+                                        &acknowledgement,
+                                        sources,
+                                        &key.thread,
+                                        &key.source,
+                                    )
+                                    .await?;
+                                ensure!(
+                                    prepared.len() == sources.len(),
+                                    "checkpoint delivery lost an immutable output ordinal"
+                                );
+                                for (source, grant) in sources.iter().zip(prepared) {
+                                    prepared_grants
+                                        .entry((
+                                            *branch_index,
+                                            acknowledgement.clone(),
+                                            source.output_ordinal,
+                                            source.source_thread.clone(),
+                                            source.source.clone(),
+                                        ))
+                                        .or_insert(grant);
+                                }
+                            }
+                            covered = true;
                         }
                     }
-                    let (branch_index, sources) = selected_branch.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "checkpoint replacement exceeds each accepted Task delivery"
-                        )
-                    })?;
-                    let branch = &outputs.branches[branch_index];
-                    let prepared = store
-                        .compaction_prepare_delivery_checkpoint_imports(
-                            workspace,
-                            thread,
-                            &branch.snapshot.delivery_id,
-                            &branch.acknowledgement,
-                            sources,
-                            &key.thread,
-                            &key.source,
-                        )
-                        .await?;
-                    imports.entry(key).or_default().extend(prepared);
+                    ensure!(
+                        covered,
+                        "checkpoint replacement exceeds each accepted Task delivery"
+                    );
+                }
+                if !prepared_grants.is_empty() {
+                    imports
+                        .entry(key)
+                        .or_default()
+                        .extend(prepared_grants.into_values());
                 }
             }
         }
@@ -1945,10 +2001,9 @@ pub(crate) fn default_task_context_policy() -> pioneer_protocol::TaskAgentContex
 }
 
 /// Delivery grants identify the child source and its acknowledged parent
-/// event. The latter supplies the availability boundary even when the
-/// transport copy was removed from the model projection. Turn creation order
-/// is used only after that exact relationship has been verified.
-async fn order_verified_deliveries(
+/// event. The event's append position, not its occurrence Turn's creation,
+/// determines when the result could enter the parent's context.
+pub(super) async fn order_verified_deliveries(
     store: &CrudStore,
     workspace: &str,
     destination: &str,
@@ -1970,112 +2025,175 @@ async fn order_verified_deliveries(
         .collect::<BTreeSet<_>>();
     let mut commands = BTreeMap::new();
     for acknowledgement in acknowledgements {
-        if let Some(turn) = acknowledgement.scope.strip_prefix("event:")
+        if acknowledgement.scope.starts_with("event:")
             && let Some(command) = store
                 .compaction_task_delivery_command(workspace, destination, &acknowledgement)
                 .await?
         {
-            let delivery_turn = turn.to_owned();
-            commands.insert(acknowledgement, (command, delivery_turn));
+            commands.insert(acknowledgement, command);
         }
     }
     if commands.is_empty() {
         return Ok(messages);
     }
-    let mut selected = BTreeSet::new();
+    let mut selected = commands.keys().cloned().collect::<BTreeSet<_>>();
     for (_, message) in &messages {
         if let Some(origin) = &message.provenance
             && origin.thread_id == destination
+            && !origin.inherited
         {
-            for source in &origin.sources {
-                if !source.scope.starts_with("checkpoint:")
-                    && let Some((_, turn)) = source.scope.split_once(':')
-                {
-                    selected.insert(turn.to_owned());
-                }
-            }
+            selected.extend(origin.sources.iter().map(source));
         }
-    }
-    for (command, delivery) in commands.values() {
-        selected.insert(command.clone());
-        selected.insert(delivery.clone());
     }
     let fence = store.compaction_history_read_fence().await?;
     let selected = selected.into_iter().collect::<Vec<_>>();
-    let mut turns = Vec::new();
+    let mut points = BTreeMap::new();
     let mut batch = Vec::new();
     let mut bytes = 0_usize;
-    for id in selected {
+    for reference in selected {
+        let size = reference.scope.len() + reference.id.len() + reference.version.len();
         ensure!(
-            id.len() <= pioneer_crud::compaction::SOURCE_PAGE_BYTES,
-            "causal turn ID exceeds metadata page bound"
+            size <= pioneer_crud::compaction::SOURCE_PAGE_BYTES,
+            "causal source exceeds metadata page bound"
         );
         if !batch.is_empty()
             && (batch.len() == 64
-                || bytes.saturating_add(id.len()) > pioneer_crud::compaction::SOURCE_PAGE_BYTES)
+                || bytes.saturating_add(size) > pioneer_crud::compaction::SOURCE_PAGE_BYTES)
         {
-            turns.extend(
-                store
-                    .compaction_history_selected_turn_page(workspace, destination, &batch, &fence)
-                    .await?,
-            );
+            for point in store
+                .compaction_history_causal_source_page(workspace, destination, &batch, &fence)
+                .await?
+            {
+                points.insert(point.reference.clone(), point);
+            }
             batch.clear();
             bytes = 0;
         }
-        bytes += id.len();
-        batch.push(id);
+        bytes += size;
+        batch.push(reference);
     }
     if !batch.is_empty() {
-        turns.extend(
-            store
-                .compaction_history_selected_turn_page(workspace, destination, &batch, &fence)
-                .await?,
-        );
+        for point in store
+            .compaction_history_causal_source_page(workspace, destination, &batch, &fence)
+            .await?
+        {
+            points.insert(point.reference.clone(), point);
+        }
     }
-    turns.sort_by(|a, b| {
-        (
-            &a.created_at,
-            a.creation_order,
-            a.legacy_creation_order,
-            &a.id,
-        )
-            .cmp(&(
-                &b.created_at,
-                b.creation_order,
-                b.legacy_creation_order,
-                &b.id,
-            ))
-    });
-    let order = turns
-        .into_iter()
-        .enumerate()
-        .map(|(index, turn)| (turn.id, index))
-        .collect::<BTreeMap<_, _>>();
     let mut delivered = BTreeMap::<ExactMessageSource, CausalPlacement>::new();
+    let mut source_acknowledgements = BTreeMap::<ExactMessageSource, SourceRef>::new();
     for (source, acks) in candidates {
         let Some(ack) = (acks.len() == 1).then(|| acks.first()).flatten() else {
             continue;
         };
-        let Some((command, delivery_turn)) = commands.get(ack) else {
+        let Some(command) = commands.get(ack) else {
             continue;
         };
-        let (Some(&command_rank), Some(&delivery_rank)) =
-            (order.get(command), order.get(delivery_turn))
-        else {
-            continue;
-        };
-        if delivery_rank < command_rank {
+        if !points.contains_key(ack) {
             continue;
         }
+        let exact = (source.thread.clone(), runtime_source(&source.source));
+        source_acknowledgements.insert(exact.clone(), ack.clone());
         delivered.insert(
-            (source.thread.clone(), runtime_source(&source.source)),
+            exact,
             CausalPlacement {
                 command_turn: command.clone(),
-                available_at: delivery_rank,
             },
         );
     }
-    order_causal_units(workspace, destination, messages, &order, &delivered)
+    let relation = move |left_delivery: bool,
+                         left: &[ExactMessageSource],
+                         right_delivery: bool,
+                         right: &[ExactMessageSource]| {
+        match (left_delivery, right_delivery) {
+            (true, true) => {
+                let left_ack = causal_unit_ack(left, &source_acknowledgements)?;
+                let right_ack = causal_unit_ack(right, &source_acknowledgements)?;
+                (left_ack != right_ack)
+                    .then(|| causal_source_cmp(points.get(left_ack)?, points.get(right_ack)?))
+                    .flatten()
+            }
+            (false, true) => causal_parent_delivery_cmp(
+                left,
+                causal_unit_ack(right, &source_acknowledgements)?,
+                &points,
+            ),
+            (true, false) => causal_parent_delivery_cmp(
+                right,
+                causal_unit_ack(left, &source_acknowledgements)?,
+                &points,
+            )
+            .map(std::cmp::Ordering::reverse),
+            (false, false) => None,
+        }
+    };
+    order_causal_units(workspace, destination, messages, &delivered, &relation)
+}
+
+fn causal_unit_ack<'a>(
+    sources: &[pioneer_agent::compaction::composition::ExactMessageSource],
+    acknowledgements: &'a BTreeMap<
+        pioneer_agent::compaction::composition::ExactMessageSource,
+        SourceRef,
+    >,
+) -> Option<&'a SourceRef> {
+    let first = acknowledgements.get(sources.first()?)?;
+    sources
+        .iter()
+        .all(|source| acknowledgements.get(source) == Some(first))
+        .then_some(first)
+}
+
+fn causal_parent_delivery_cmp(
+    sources: &[pioneer_agent::compaction::composition::ExactMessageSource],
+    acknowledgement: &SourceRef,
+    points: &BTreeMap<SourceRef, pioneer_crud::compaction::HistoryCausalSource>,
+) -> Option<std::cmp::Ordering> {
+    let delivery = points.get(acknowledgement)?;
+    let mut direction = None;
+    for (_, reference) in sources {
+        let next = causal_source_cmp(points.get(&source(reference))?, delivery)?;
+        if direction.is_some_and(|previous| previous != next) {
+            return None;
+        }
+        direction = Some(next);
+    }
+    direction
+}
+
+fn causal_source_cmp(
+    left: &pioneer_crud::compaction::HistoryCausalSource,
+    right: &pioneer_crud::compaction::HistoryCausalSource,
+) -> Option<std::cmp::Ordering> {
+    let order = if left.event_turn_id == right.event_turn_id {
+        // Provider context sequence and event sequence belong to different
+        // tables. Only an exact event (or its atomic input projection) shares
+        // the acknowledgement's sequence clock.
+        (!left.lower_bound_only && left.sequence != right.sequence)
+            .then(|| left.sequence.cmp(&right.sequence))
+    } else {
+        match (left.native_append, right.native_append) {
+            (true, true) => (left.capture_order != right.capture_order)
+                .then(|| left.capture_order.cmp(&right.capture_order)),
+            (false, true) => Some(std::cmp::Ordering::Less),
+            (true, false) => Some(std::cmp::Ordering::Greater),
+            (false, false) => None,
+        }
+    };
+    if left.lower_bound_only {
+        // Preparation is a shared barrier even though event and provider
+        // capture counters are independent. Inside either side of it, the
+        // provider's TurnStarted event proves only a lower bound.
+        if !left.source_after_preparation && right.native_append {
+            return Some(std::cmp::Ordering::Less);
+        }
+        if left.source_after_preparation && !right.native_append {
+            return Some(std::cmp::Ordering::Greater);
+        }
+        order.filter(|order| *order == std::cmp::Ordering::Greater)
+    } else {
+        order
+    }
 }
 
 pub(super) fn select_task_history(
@@ -2278,11 +2396,12 @@ async fn select_task_metadata_after_composition(
     else {
         return Ok(None);
     };
+    let mut causal_candidates = BTreeMap::<ScopedHistorySource, BTreeSet<SourceRef>>::new();
     let mut output_allowed = allowed.clone();
     if let Some(outputs) = outputs {
         for branch in &outputs.branches {
             output_allowed.extend(branch.source_threads.iter().cloned());
-            let imported = restore_authorized_output_branch(
+            let restored = restore_authorized_output_branch(
                 store,
                 workspace,
                 execution_thread,
@@ -2294,8 +2413,37 @@ async fn select_task_metadata_after_composition(
                 },
                 checkpoint_graphs,
             )
-            .await?
-            .messages;
+            .await?;
+            let boundary = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+                workspace,
+                execution_thread,
+                &restored.boundary_messages,
+                &vec![0; restored.boundary_messages.len()],
+            )?;
+            for (unit, indexes) in boundary.units.iter().zip(&boundary.message_indexes) {
+                if unit.role != pioneer_compaction::SourceRole::Own
+                    || !unit.complete
+                    || unit.protected_input
+                {
+                    continue;
+                }
+                for index in indexes {
+                    let origin = restored.boundary_messages[*index]
+                        .provenance
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("output boundary lost its source"))?;
+                    for reference in &origin.sources {
+                        causal_candidates
+                            .entry(ScopedHistorySource {
+                                thread: origin.thread_id.clone(),
+                                source: self::source(reference),
+                            })
+                            .or_default()
+                            .extend(branch.acknowledgements.iter().cloned());
+                    }
+                }
+            }
+            let imported = restored.messages;
             composed = remove_delivered_projection_with_resolver(
                 store,
                 workspace,
@@ -2340,6 +2488,20 @@ async fn select_task_metadata_after_composition(
         )
         .await?;
     }
+    composed = order_verified_deliveries(
+        store,
+        workspace,
+        execution_thread,
+        composed
+            .into_iter()
+            .map(|message| (None, message))
+            .collect(),
+        &causal_candidates,
+    )
+    .await?
+    .into_iter()
+    .map(|(_, message)| message)
+    .collect();
     let sources = |messages: &[ChatMessage]| {
         messages
             .iter()
@@ -3384,8 +3546,7 @@ async fn restore_frozen_excluding_coverage(
 /// rewritten and literal `restore` retains its original contract.
 struct RestoredExecutionBasis {
     messages: Vec<ChatMessage>,
-    /// The execution order never changes the verified manifest ordinal.
-    original_ordinals: Vec<Option<usize>>,
+    causal_imports: BTreeMap<ScopedHistorySource, BTreeSet<SourceRef>>,
     // Source accounting is inspected by restoration regression tests only.
     #[cfg(test)]
     direct_sources: Vec<ScopedHistorySource>,
@@ -3829,6 +3990,29 @@ async fn restore_accepted_execution_basis_prepared(
         .iter()
         .flat_map(|projection| projection.selected.iter().copied())
         .collect::<BTreeSet<_>>();
+    for projection in &projections {
+        if projection.selected.is_empty()
+            || !projection
+                .selected
+                .iter()
+                .all(|ordinal| accepted.contains_key(ordinal))
+        {
+            continue;
+        }
+        let acknowledgements = projection
+            .selected
+            .iter()
+            .flat_map(|ordinal| &accepted[ordinal].acknowledgements)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        causal_imports
+            .entry(ScopedHistorySource {
+                thread: projection.source_thread.clone(),
+                source: projection.checkpoint_source.clone(),
+            })
+            .or_default()
+            .extend(acknowledgements);
+    }
     // Compose payload-free frozen provenance with already loaded own messages
     // before choosing the policy window. Exact duplicates keep their first
     // position, and checkpoint replacement follows production composition.
@@ -3853,7 +4037,7 @@ async fn restore_accepted_execution_basis_prepared(
             provenance.context_thread = Some(context_owner);
             provenance.inherited = inherited;
             message.provenance = Some(provenance);
-            retained_metadata.push((ordinal, message));
+            retained_metadata.push((ordinal, Some(ordinal), message));
         }
         let mut replacement_metadata = Vec::new();
         for projection in &projections {
@@ -3877,8 +4061,14 @@ async fn restore_accepted_execution_basis_prepared(
             });
             replacement_metadata.push((projection.anchor, projection.checkpoint.clone(), message));
         }
-        let ordered_metadata =
-            order_execution_projection_entries(retained_metadata, replacement_metadata);
+        let ordered_metadata = order_verified_deliveries(
+            store,
+            workspace,
+            parent,
+            order_execution_projection_entries(retained_metadata, replacement_metadata),
+            &causal_imports,
+        )
+        .await?;
         // Source metadata does not encode the wire role. Hydrate only the
         // unrelated non-input rows before projection; an exact input alias
         // stays payload-free until the selected representative is known.
@@ -3958,6 +4148,7 @@ async fn restore_accepted_execution_basis_prepared(
                     .ok_or_else(|| anyhow::anyhow!("hydrated Task metadata has no source"))?;
                 origin.context_thread = effective.context_thread.clone();
                 origin.inherited = effective.inherited;
+                origin.logical_turn_id = effective.logical_turn_id.clone();
                 metadata[*index] = message;
             }
         }
@@ -4587,16 +4778,19 @@ async fn restore_accepted_execution_basis_prepared(
     let retained = original_ordinals
         .into_iter()
         .zip(messages)
+        .map(|(ordinal, message)| (ordinal, Some(ordinal), message))
         .chain(revised_anchors.into_iter().flat_map(|(key, anchor)| {
             revised_messages
                 .remove(&key)
                 .unwrap_or_default()
                 .into_iter()
-                .map(move |message| (anchor, message))
+                // The anchor locates the current turn group; it does not
+                // identify any message in the immutable frozen manifest.
+                .map(move |message| (anchor, None, message))
         }))
         .collect::<Vec<_>>();
     #[cfg(test)]
-    for (_, message) in &retained {
+    for (_, _, message) in &retained {
         if let Some(origin) = message.provenance.as_ref() {
             direct_sources.extend(origin.sources.iter().cloned().map(|source| {
                 ScopedHistorySource {
@@ -4708,10 +4902,30 @@ async fn restore_accepted_execution_basis_prepared(
         &causal_imports,
     )
     .await?;
-    let (original_ordinals, messages) = ordered.into_iter().unzip();
+    let mut seen_ordinals = BTreeSet::new();
+    for (ordinal, message) in &ordered {
+        let Some(ordinal) = ordinal else { continue };
+        ensure!(
+            seen_ordinals.insert(*ordinal),
+            "execution repeated a frozen ordinal"
+        );
+        let reference = references
+            .get(*ordinal)
+            .ok_or_else(|| anyhow::anyhow!("execution lost a frozen ordinal"))?;
+        let origin = message
+            .provenance
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("execution lost a frozen source"))?;
+        ensure!(
+            origin.thread_id == reference.source_thread
+                && origin.sources.iter().map(self::source).collect::<Vec<_>>() == reference.sources,
+            "execution ordinal no longer identifies its frozen source"
+        );
+    }
+    let messages = ordered.into_iter().map(|(_, message)| message).collect();
     Ok(RestoredExecutionBasis {
         messages,
-        original_ordinals,
+        causal_imports,
         #[cfg(test)]
         direct_sources: direct_sources.into_iter().collect(),
         excluded_following,
@@ -4726,19 +4940,25 @@ fn order_execution_projection(
     retained: Vec<(usize, ChatMessage)>,
     replacements: Vec<(usize, String, ChatMessage)>,
 ) -> Vec<ChatMessage> {
-    order_execution_projection_entries(retained, replacements)
-        .into_iter()
-        .map(|(_, message)| message)
-        .collect()
+    order_execution_projection_entries(
+        retained
+            .into_iter()
+            .map(|(ordinal, message)| (ordinal, Some(ordinal), message))
+            .collect(),
+        replacements,
+    )
+    .into_iter()
+    .map(|(_, message)| message)
+    .collect()
 }
 
 fn order_execution_projection_entries(
-    retained: Vec<(usize, ChatMessage)>,
+    retained: Vec<(usize, Option<usize>, ChatMessage)>,
     replacements: Vec<(usize, String, ChatMessage)>,
 ) -> Vec<(Option<usize>, ChatMessage)> {
     let mut ordered = retained
         .into_iter()
-        .map(|(ordinal, message)| (ordinal, 1_u8, String::new(), Some(ordinal), message))
+        .map(|(anchor, ordinal, message)| (anchor, 1_u8, String::new(), ordinal, message))
         .collect::<Vec<_>>();
     ordered.extend(
         replacements
@@ -4817,10 +5037,6 @@ pub(crate) async fn restore_accepted_history_for_execution(
             &mut checkpoint_graphs,
         )
         .await?;
-        ensure!(
-            restored.messages.len() == restored.original_ordinals.len(),
-            "accepted execution lost its source ordinal mapping"
-        );
         super::history::normalize_task_input_copies(store, workspace, &mut restored.messages)
             .await?;
         return Ok(RestoredAcceptedHistory {
@@ -6217,6 +6433,37 @@ mod policy_tests {
         assert_eq!(ordered[0].provenance, before.provenance);
         assert_eq!(ordered[2].provenance, middle.provenance);
         assert_eq!(ordered[4].provenance, after.provenance);
+    }
+
+    #[test]
+    fn execution_projection_keeps_revised_group_anchor_separate_from_frozen_ordinals() {
+        let ordered = order_execution_projection_entries(
+            vec![
+                (
+                    3,
+                    Some(3),
+                    ordered_message("unchanged tail", "parent", "tail"),
+                ),
+                (
+                    1,
+                    None,
+                    ordered_message("revised question", "parent", "question"),
+                ),
+                (1, None, ordered_message("revised reply", "parent", "reply")),
+            ],
+            vec![],
+        );
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|(ordinal, message)| (*ordinal, message.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (None, "revised question"),
+                (None, "revised reply"),
+                (Some(3), "unchanged tail"),
+            ]
+        );
     }
 
     #[test]

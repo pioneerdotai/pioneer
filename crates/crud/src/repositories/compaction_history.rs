@@ -12,7 +12,7 @@ use pioneer_entity::{
 use pioneer_protocol::{TASK_COMPOSER_WORK_VERSION, TaskMetadata, UserInput};
 use sea_orm::sea_query::{Alias, BinOper, Expr, ExprTrait, Func, JoinType, Order, Query};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-use sea_orm::{ConnectionTrait, FromQueryResult};
+use sea_orm::{ConnectionTrait, FromQueryResult, Value};
 
 #[derive(Clone, Debug, FromQueryResult)]
 pub struct HistoryReadFence {
@@ -45,6 +45,210 @@ pub struct HistoryCausalBoundary {
     pub delegated_command: bool,
     pub task_transport: bool,
     pub delivered_outcome: bool,
+}
+/// An exact event point, a TurnStarted-backed input point, or the start bound
+/// of a provider source. Only event capture orders share one clock.
+#[derive(Clone, Debug)]
+pub struct HistoryCausalSource {
+    pub reference: SourceRef,
+    pub event_turn_id: String,
+    pub capture_order: i64,
+    pub sequence: i64,
+    pub native_append: bool,
+    /// A provider row is known to follow its TurnStarted event, but may have
+    /// been appended at any later point in that Turn.
+    pub lower_bound_only: bool,
+    /// The source itself, rather than its TurnStarted witness, was appended
+    /// after this thread's preparation barrier.
+    pub source_after_preparation: bool,
+}
+
+#[derive(FromQueryResult)]
+struct HistoryCausalSourceRow {
+    kind: String,
+    id: String,
+    turn_id: String,
+    sequence: i64,
+    revision: i64,
+    capture_order: i64,
+    prepared_order: i64,
+    source_after_preparation: i64,
+}
+
+/// Read at most one bounded page of causal witnesses without source bodies.
+/// A changed or unavailable exact revision has no usable placement metadata.
+pub(crate) async fn compaction_history_causal_source_page<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    thread: &str,
+    selected: &[SourceRef],
+    fence: &HistoryReadFence,
+) -> Result<Vec<HistoryCausalSource>> {
+    ensure!(selected.len() <= 64, "causal source page exceeds row bound");
+    ensure!(
+        selected
+            .iter()
+            .map(|source| source.scope.len() + source.id.len() + source.version.len())
+            .sum::<usize>()
+            <= SOURCE_PAGE_BYTES,
+        "causal source page exceeds byte bound"
+    );
+    let event_ids = selected
+        .iter()
+        .filter(|source| source.scope.starts_with("event:"))
+        .map(|source| source.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let input_ids = selected
+        .iter()
+        .filter(|source| source.scope.starts_with("input:"))
+        .map(|source| source.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let context_ids = selected
+        .iter()
+        .filter(|source| source.scope.starts_with("context:"))
+        .map(|source| source.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if event_ids.is_empty() && input_ids.is_empty() && context_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut rows = Vec::new();
+    if !event_ids.is_empty() {
+        let placeholders = std::iter::repeat_n("?", event_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT 'event' AS kind,s.id,s.turn_id,s.sequence,r.revision,r.capture_order,p.event_order AS prepared_order,0 AS source_after_preparation \
+             FROM turn_event s JOIN turn t ON t.id=s.turn_id AND t.thread_id=? \
+             JOIN thread th ON th.id=t.thread_id AND th.workspace_id=? \
+             JOIN compaction_event_revision r ON r.source_id=s.id AND r.turn_id=s.turn_id \
+             JOIN compaction_history_preparation p ON p.thread_id=t.thread_id AND p.ready=1 \
+             WHERE s.id IN ({placeholders}) AND r.present=1 AND r.revision=1 \
+             AND r.capture_order<=?"
+        );
+        let mut values = vec![Value::from(thread), Value::from(workspace)];
+        values.extend(event_ids.iter().cloned().map(Value::from));
+        values.push(Value::from(fence.event_order));
+        rows.extend(
+            HistoryCausalSourceRow::find_by_statement(sea_orm::Statement::from_sql_and_values(
+                db.get_database_backend(),
+                sql,
+                values,
+            ))
+            .all(db)
+            .await?,
+        );
+    }
+    if !input_ids.is_empty() {
+        let placeholders = std::iter::repeat_n("?", input_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        // TurnStarted projects its input rows atomically with the event. An
+        // edited input is never assigned the original start's position.
+        let sql = format!(
+            "SELECT 'input' AS kind,i.id,i.turn_id,e.sequence,ri.revision,er.capture_order,p.event_order AS prepared_order,0 AS source_after_preparation \
+             FROM turn_input i JOIN turn t ON t.id=i.turn_id AND t.thread_id=? \
+             JOIN thread th ON th.id=t.thread_id AND th.workspace_id=? \
+             JOIN compaction_input_revision ri ON ri.source_id=i.id AND ri.turn_id=i.turn_id \
+             JOIN turn_event e ON e.turn_id=i.turn_id AND e.thread_id=t.thread_id \
+                  AND e.event_type=? AND e.created_at=i.created_at \
+             JOIN compaction_event_revision er ON er.source_id=e.id AND er.turn_id=e.turn_id \
+             JOIN compaction_history_preparation p ON p.thread_id=t.thread_id AND p.ready=1 \
+             WHERE i.id IN ({placeholders}) AND ri.present=1 AND ri.revision=1 \
+               AND ri.capture_order<=? AND er.present=1 AND er.revision=1 AND er.capture_order<=? \
+               AND NOT EXISTS (SELECT 1 FROM turn_event mutation \
+                 WHERE mutation.turn_id=i.turn_id AND mutation.thread_id=t.thread_id \
+                 AND mutation.event_type IN (?,?)) LIMIT 65"
+        );
+        let mut values = vec![
+            Value::from(thread),
+            Value::from(workspace),
+            Value::from(pioneer_protocol::constants::events::TURN_STARTED),
+        ];
+        values.extend(input_ids.iter().cloned().map(Value::from));
+        values.extend([
+            Value::from(fence.input_order),
+            Value::from(fence.event_order),
+            Value::from(pioneer_protocol::constants::events::TURN_MESSAGE_EDITED),
+            Value::from(pioneer_protocol::constants::events::TURN_MESSAGE_DELETED),
+        ]);
+        let page = HistoryCausalSourceRow::find_by_statement(
+            sea_orm::Statement::from_sql_and_values(db.get_database_backend(), sql, values),
+        )
+        .all(db)
+        .await?;
+        if page.len() > 64 {
+            return Ok(Vec::new());
+        }
+        rows.extend(page);
+    }
+    if !context_ids.is_empty() {
+        let placeholders = std::iter::repeat_n("?", context_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT 'context' AS kind,c.id,c.turn_id,e.sequence,rc.revision,er.capture_order,p.event_order AS prepared_order,(rc.capture_order>p.context_order) AS source_after_preparation \
+             FROM turn_llm_context c JOIN turn t ON t.id=c.turn_id AND t.thread_id=? \
+             JOIN thread th ON th.id=t.thread_id AND th.workspace_id=? \
+             JOIN compaction_source_revision rc ON rc.source_id=c.id AND rc.turn_id=c.turn_id \
+             JOIN turn_event e ON e.turn_id=c.turn_id AND e.thread_id=t.thread_id AND e.event_type=? \
+             JOIN compaction_event_revision er ON er.source_id=e.id AND er.turn_id=e.turn_id \
+             JOIN compaction_history_preparation p ON p.thread_id=t.thread_id AND p.ready=1 \
+             WHERE c.id IN ({placeholders}) AND rc.present=1 AND rc.revision=1 \
+               AND rc.capture_order<=? AND er.present=1 AND er.revision=1 AND er.capture_order<=? LIMIT 65"
+        );
+        let mut values = vec![
+            Value::from(thread),
+            Value::from(workspace),
+            Value::from(pioneer_protocol::constants::events::TURN_STARTED),
+        ];
+        values.extend(context_ids.iter().cloned().map(Value::from));
+        values.extend([
+            Value::from(fence.context_order),
+            Value::from(fence.event_order),
+        ]);
+        let page = HistoryCausalSourceRow::find_by_statement(
+            sea_orm::Statement::from_sql_and_values(db.get_database_backend(), sql, values),
+        )
+        .all(db)
+        .await?;
+        if page.len() > 64 {
+            return Ok(Vec::new());
+        }
+        rows.extend(page);
+    }
+    let mut found = Vec::new();
+    for row in rows {
+        let lower_bound_only = row.kind == "context";
+        let reference = SourceRef {
+            scope: format!("{}:{}", row.kind, row.turn_id),
+            id: row.id,
+            version: if lower_bound_only {
+                format!("revision:{}", row.revision)
+            } else {
+                format!("{}-revision:{}", row.kind, row.revision)
+            },
+        };
+        if selected.contains(&reference) {
+            found.push(HistoryCausalSource {
+                reference,
+                event_turn_id: row.turn_id,
+                capture_order: row.capture_order,
+                sequence: row.sequence,
+                native_append: row.capture_order > row.prepared_order,
+                lower_bound_only,
+                source_after_preparation: row.source_after_preparation != 0,
+            });
+        }
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    let mut ambiguous = std::collections::BTreeSet::new();
+    for point in &found {
+        if !unique.insert(point.reference.clone()) {
+            ambiguous.insert(point.reference.clone());
+        }
+    }
+    found.retain(|point| !ambiguous.contains(&point.reference));
+    Ok(found)
 }
 /// The immutable basis accepted for one exact child execution. This is a
 /// storage locator plus its existing descriptor, not a new history copy.
