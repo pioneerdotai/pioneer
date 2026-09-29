@@ -203,32 +203,8 @@ impl RemoteAccessSupervisor {
             return Ok(None);
         };
 
-        let Some(service_name) = desired
-            .settings
-            .service_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-        else {
-            publish_status(
-                &self.status_tx,
-                GatewayRemoteAccessState::Failed,
-                Some(GatewayRemoteAccessErrorKind::InvalidSettings),
-                Some("remote access service name is not configured".to_owned()),
-            );
-            return Ok(None);
-        };
-
-        if let Err(error) = validate_rathole_service_name(service_name.as_str()) {
-            publish_status(
-                &self.status_tx,
-                GatewayRemoteAccessState::Failed,
-                Some(GatewayRemoteAccessErrorKind::InvalidSettings),
-                Some(format!("{error:#}")),
-            );
-            return Ok(None);
-        }
+        // This is a local client label. Relay selects the tunnel from the key.
+        let service_name = "pioneer_gateway".to_owned();
 
         Ok(Some(RemoteAccessRunConfig {
             generation,
@@ -441,22 +417,6 @@ fn is_stale_rathole_client_config(path: &Path) -> bool {
         return false;
     };
     file_name.starts_with("rathole-client-") && file_name.ends_with(".toml")
-}
-
-fn validate_rathole_service_name(service_name: &str) -> Result<()> {
-    if service_name.is_empty() {
-        bail!("remote access service name must not be empty");
-    }
-    if service_name.chars().count() > 80 {
-        bail!("remote access service name must be at most 80 characters");
-    }
-    if service_name
-        .chars()
-        .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.'))
-    {
-        bail!("remote access service name contains unsupported characters");
-    }
-    Ok(())
 }
 
 fn normalize_rathole_remote_addr(remote_addr: &str) -> Result<String> {
@@ -708,13 +668,6 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_service_name_is_rejected() {
-        assert!(validate_rathole_service_name("pioneer_gateway").is_ok());
-        assert!(validate_rathole_service_name("bad/service").is_err());
-        assert!(validate_rathole_service_name("").is_err());
-    }
-
-    #[test]
     fn remote_addr_accepts_host_or_ip_with_port() {
         for value in [
             "relay-eu-west-1.getpioneer.dev:2333",
@@ -746,6 +699,31 @@ mod tests {
                 normalize_rathole_remote_addr(value).is_err(),
                 "{value} should be invalid"
             );
+        }
+    }
+
+    #[test]
+    fn token_routing_does_not_require_a_user_service_name() {
+        for service_name in [
+            None,
+            Some("oskin1".to_owned()),
+            Some("bad/service".to_owned()),
+        ] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let supervisor =
+                RemoteAccessSupervisor::new(temp_dir.path(), GatewayRemoteAccessConfig::default())
+                    .unwrap();
+            let desired = RemoteAccessDesiredState {
+                settings: GatewayRemoteAccessSettings {
+                    enabled: true,
+                    service_name,
+                    has_key: true,
+                    ..GatewayRemoteAccessSettings::default()
+                },
+                key: Some("secret-token".to_owned()),
+            };
+            let run = supervisor.validate_run_config(1, desired).unwrap().unwrap();
+            assert_eq!(run.service_name, "pioneer_gateway");
         }
     }
 

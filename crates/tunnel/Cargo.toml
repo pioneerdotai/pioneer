@@ -16,4 +16,7 @@ toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+rathole = { workspace = true, features = ["server"] }
+sha2.workspace = true
+hex.workspace = true
 tempfile.workspace = true
