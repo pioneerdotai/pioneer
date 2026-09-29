@@ -2138,7 +2138,7 @@ impl ExecutionAuthorizationContext {
                 return Ok(Some(parent_turn_id.to_owned()));
             }
 
-            // A direct `agent_start` Turn has the same two-actor shape as a
+            // A direct `threads_turn_start` Turn has the same two-actor shape as a
             // Task child without a TaskRun: the canonical input author is the
             // parent AgentExecution, while the durable response binding and
             // runtime authority belong to the newly admitted child. Resolve

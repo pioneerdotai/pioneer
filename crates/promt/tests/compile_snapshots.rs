@@ -364,11 +364,12 @@ Prior visible assistant text: I drafted the outline and verified two files.
 
 ## Hidden Tool Domains
 Some tool domains and their tools are hidden until requested. If you need a hidden domain and its tools are not currently visible, call request_tools.
+A tool listed in more than one domain becomes visible when any of those domains is opened.
 
 Domains:
-- threads: threads_tools_result_read.
+- threads: threads_tools_result_read, threads_start_options, thread_message_send, thread_create, threads_turn_start.
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
-- task: task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
+- task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.
 - computer_use: computer_use.
 
@@ -414,11 +415,12 @@ Prior visible assistant text: I drafted the outline and verified two files.
 
 ## Hidden Tool Domains
 Some tool domains and their tools are hidden until requested. If you need a hidden domain and its tools are not currently visible, call request_tools.
+A tool listed in more than one domain becomes visible when any of those domains is opened.
 
 Domains:
-- threads: threads_tools_result_read.
+- threads: threads_tools_result_read, threads_start_options, thread_message_send, thread_create, threads_turn_start.
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
-- task: task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
+- task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.
 - computer_use: computer_use.
 

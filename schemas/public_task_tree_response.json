@@ -705,6 +705,16 @@
             }
           ]
         },
+        "execution": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicTaskRunExecutionObservation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "executorKind": {
           "$ref": "#/$defs/TaskExecutorKind"
         },
@@ -752,6 +762,44 @@
         "executorKind",
         "createdAt",
         "updatedAt"
+      ]
+    },
+    "PublicTaskRunExecutionObservation": {
+      "description": "A read-only observation of the execution belonging to this run. Timestamps\nare Unix seconds. A missing status means no execution row was observed.",
+      "type": "object",
+      "properties": {
+        "heartbeatAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "lastActivityAt": {
+          "description": "Confirmed task progress recorded for this execution attempt, if any.\nThis is distinct from a periodic heartbeat and does not promise a result.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "observedAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskRunExecutionStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "observedAt"
       ]
     },
     "PublicTaskTree": {
@@ -2251,6 +2299,20 @@
         "executorKind",
         "createdAt",
         "updatedAt"
+      ]
+    },
+    "TaskRunExecutionStatus": {
+      "type": "string",
+      "enum": [
+        "reserved",
+        "starting",
+        "running",
+        "waiting_review",
+        "succeeded",
+        "failed",
+        "blocked",
+        "cancelled",
+        "timed_out"
       ]
     },
     "TaskRunStatus": {

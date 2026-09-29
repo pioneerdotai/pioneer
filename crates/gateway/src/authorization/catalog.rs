@@ -201,7 +201,7 @@ const INTERNAL_TOOL_RECORDS: &[AuthorizationCatalogRecord] = &[
     ),
     record(
         AuthorizationCatalogSurface::InternalTool,
-        "agent_start_options",
+        "threads_start_options",
         "child_observe",
         "execution_agent_options",
         "not_found",
@@ -228,7 +228,7 @@ const INTERNAL_TOOL_RECORDS: &[AuthorizationCatalogRecord] = &[
     ),
     record(
         AuthorizationCatalogSurface::InternalTool,
-        "agent_start",
+        "threads_turn_start",
         "child_start|agent_turn_start",
         "execution_approved_agent_target",
         "not_found",

@@ -14,6 +14,8 @@ catalog-hide: true
 
 Durable tasks are product objects that can outlive the current turn. They have task state, run history, result snapshots, attempts, diagnostics, schedules, and delivery behavior.
 
+When observing a task with `task_get`, distinguish task, run, and execution status. A `running` run is unfinished; no result or unchanged `updatedAt` does not prove a stall. The execution heartbeat is periodic liveness, while `lastActivityAt` is confirmed activity only when recorded. Missing activity is unknown. Do not cancel or repeat work solely because it is taking time or repeated observations are unchanged. A `task_wait` timeout ends only that wait window and permits another wait for active attached work.
+
 Use this skill for future, recurring, background, or already-existing task work. For attached child agents created to help with the current turn, read `system:pioneer/subagents` instead.
 
 ## Product Model
@@ -30,7 +32,7 @@ Do not confuse "the task produced a result" with "the user saw the result in thi
 
 Before using durable task tools, decide what kind of task work this is.
 
-1. If work should run later or repeatedly, create a scheduled, interval, or cron task with self-contained future-run instructions.
+1. If work should run later or repeatedly, use `task_create` to create a scheduled, interval, or cron task with self-contained future-run instructions.
 2. If existing task behavior must change, inspect it first with `task_get` or `task_list`.
 3. If only the schedule changes, use `task_reschedule` when available.
 4. If delivery changes, patch only delivery and verify it.
@@ -64,6 +66,8 @@ If a needed task tool is hidden and `request_tools` is visible, request the task
 ```
 
 Do not request individual task tool names. Request the `task` domain.
+
+The `task` domain also exposes `threads_start_options`; opening `threads` separately is unnecessary to inspect task launch options. Call it when you need to choose an identity, execution profile, or permitted destination explicitly. For a task that inherits the parent's identity and profile in the current execution, omit `launch` and `targetOptionId`; no preliminary options call is required. Options do not grant permission to create or run a task. See `references/tool-schemas.md` for the exact fields.
 
 If the task domain cannot be opened, do not pretend the task was created, updated, rescheduled, paused, resumed, or inspected.
 

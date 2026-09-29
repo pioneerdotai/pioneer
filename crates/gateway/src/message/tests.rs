@@ -3280,6 +3280,7 @@ fn test_provider() -> Arc<pioneer_provider::ProviderRegistry> {
 struct SequencedToolProvider {
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     first_tool_calls: Vec<ProviderToolCall>,
+    tool_call_rounds: Option<Vec<Vec<ProviderToolCall>>>,
     second_text: String,
     next_index: AtomicUsize,
     native_file_provider: Option<String>,
@@ -5183,10 +5184,17 @@ impl SequencedToolProvider {
         Self {
             requests: std::sync::Mutex::new(Vec::new()),
             first_tool_calls,
+            tool_call_rounds: None,
             second_text: second_text.into(),
             next_index: AtomicUsize::new(0),
             native_file_provider: None,
         }
+    }
+
+    fn with_tool_call_rounds(mut self, rounds: Vec<Vec<ProviderToolCall>>) -> Self {
+        self.first_tool_calls = rounds.first().cloned().unwrap_or_default();
+        self.tool_call_rounds = Some(rounds);
+        self
     }
 
     fn with_native_file_provider(mut self, provider: impl Into<String>) -> Self {
@@ -6243,6 +6251,20 @@ impl Provider for SequencedToolProvider {
             .push(request);
 
         let index = self.next_index.fetch_add(1, Ordering::SeqCst);
+        if let Some(tool_calls) = self
+            .tool_call_rounds
+            .as_ref()
+            .and_then(|rounds| rounds.get(index))
+        {
+            return Ok(ChatResponse {
+                text: String::new(),
+                usage: None,
+                reasoning_content: None,
+                provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::ToolCalls,
+                tool_calls: tool_calls.clone(),
+            });
+        }
         if index == 0 {
             let termination = if self.first_tool_calls.is_empty() {
                 pioneer_provider::ProviderTermination::Complete
@@ -6308,8 +6330,8 @@ impl Provider for DirectAgentSandboxProvider {
                 test_turn_preflight_response_with_visible_tools(&["exec_command"])
             } else {
                 test_turn_preflight_response_with_visible_tools(&[
-                    "agent_start_options",
-                    "agent_start",
+                    "threads_start_options",
+                    "threads_turn_start",
                 ])
             });
         }
@@ -6347,7 +6369,7 @@ impl Provider for DirectAgentSandboxProvider {
                 termination: pioneer_provider::ProviderTermination::ToolCalls,
                 tool_calls: vec![ProviderToolCall {
                     id: "call_direct_agent_options".to_owned(),
-                    name: "agent_start_options".to_owned(),
+                    name: "threads_start_options".to_owned(),
                     arguments: json!({}).to_string(),
                 }],
             },
@@ -6355,7 +6377,7 @@ impl Provider for DirectAgentSandboxProvider {
                 let target_option_id = current_agent_target_option_from_request(&request)
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "agent_start_options output did not contain a current-thread target: {:#?}",
+                            "threads_start_options output did not contain a current-thread target: {:#?}",
                             request.messages
                         )
                     })?;
@@ -6367,7 +6389,7 @@ impl Provider for DirectAgentSandboxProvider {
                     termination: pioneer_provider::ProviderTermination::ToolCalls,
                     tool_calls: vec![ProviderToolCall {
                         id: "call_direct_agent_start".to_owned(),
-                        name: "agent_start".to_owned(),
+                        name: "threads_turn_start".to_owned(),
                         arguments: json!({
                             "targetOptionId": target_option_id,
                             "input": [{

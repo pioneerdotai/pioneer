@@ -7,12 +7,12 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Condition, Expr, OnConflict};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    QuerySelect, Set, Statement,
 };
 
 use crate::convention::{
     is_terminal_task_run_execution_status, task_executor_kind_to_db,
-    task_run_execution_status_to_db,
+    task_run_execution_status_from_db, task_run_execution_status_to_db,
 };
 use crate::util::{optional_typed_json_to_db, unix_to_datetime};
 
@@ -31,6 +31,65 @@ pub struct NewTaskRunExecution {
     pub error: Option<TaskError>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// Bounded public observation facts, keyed by the exact TaskRun. The resource
+/// state join selects the occurrence's current agent attempt, so a previous
+/// attempt's progress cannot appear as current activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRunExecutionObservationRecord {
+    pub run_id: String,
+    pub status: TaskRunExecutionStatus,
+    pub heartbeat_at: Option<i64>,
+    pub last_activity_at: Option<i64>,
+}
+
+pub async fn list_execution_observations_for_runs<C: ConnectionTrait>(
+    db: &C,
+    run_ids: &[String],
+) -> Result<Vec<TaskRunExecutionObservationRecord>> {
+    if run_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; run_ids.len()].join(", ");
+    let sql = format!(
+        "SELECT execution.task_run_id AS run_id, execution.status AS status, \
+                CASE WHEN execution.executor_kind = 'agent' \
+                     THEN resource.last_heartbeat_at ELSE execution.heartbeat_at END AS heartbeat_at, \
+                resource.last_progress_at AS last_activity_at \
+         FROM task_run_execution AS execution \
+         LEFT JOIN task_occurrence_contract AS occurrence \
+           ON occurrence.run_id = execution.task_run_id \
+          AND occurrence.agent_execution_id = execution.id \
+         LEFT JOIN agent_execution_resource_state AS resource \
+           ON resource.execution_id = execution.id \
+          AND resource.attempt_generation = occurrence.retry_attempt + 1 \
+         WHERE execution.task_run_id IN ({placeholders})"
+    );
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            sql,
+            run_ids.iter().cloned().map(sea_orm::Value::from),
+        ))
+        .await
+        .context("failed to observe task run executions")?;
+    rows.into_iter()
+        .map(|row| {
+            let status: String = row.try_get("", "status")?;
+            Ok(TaskRunExecutionObservationRecord {
+                run_id: row.try_get("", "run_id")?,
+                status: task_run_execution_status_from_db(status.as_str())
+                    .with_context(|| format!("unknown task run execution status `{status}`"))?,
+                heartbeat_at: row
+                    .try_get::<Option<DateTimeWithTimeZone>>("", "heartbeat_at")?
+                    .map(|value| value.timestamp()),
+                last_activity_at: row
+                    .try_get::<Option<DateTimeWithTimeZone>>("", "last_activity_at")?
+                    .map(|value| value.timestamp()),
+            })
+        })
+        .collect()
 }
 
 pub async fn insert_execution_if_absent<C: ConnectionTrait>(

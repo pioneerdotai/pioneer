@@ -1920,7 +1920,7 @@ pub(crate) async fn materialize(
     };
 
     // Target options are required by message as well as launch actions. The
-    // catalog still capability-filters agent_start_options/agent_start, while
+    // catalog still capability-filters threads_start_options/threads_turn_start, while
     // every projected mutation receives the same immutable opaque targets.
     let options = Some(binding.options.clone());
     let initiating_thread_id = Some(

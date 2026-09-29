@@ -95,11 +95,14 @@ Inspect:
 
 - task status;
 - latest run status;
+- execution status, heartbeat, activity, and observation time from `task_get`;
 - error snapshot;
 - task events;
 - delivery attempts;
 - schedule and next run state;
 - write locks and concurrency policy when relevant.
+
+Do not infer a stall from an unchanged `running` run, no result, stale `updatedAt`, or missing activity data. A heartbeat is periodic liveness, and recorded activity does not promise a result. For active attached work, `task_wait.timedOut` only ends that wait window; the run may still be working and can be waited on again. Use the run status and error to identify an actual run timeout or failure before choosing a recovery action.
 
 Then choose:
 

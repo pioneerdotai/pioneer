@@ -6,6 +6,7 @@ pub const REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_TITLE: &str = "Hidden Tool Domains
 pub fn render_request_tools_hidden_domain_catalog_prompt() -> String {
     let mut lines = vec![
         "Some tool domains and their tools are hidden until requested. If you need a hidden domain and its tools are not currently visible, call request_tools.".to_owned(),
+        "A tool listed in more than one domain becomes visible when any of those domains is opened.".to_owned(),
         String::new(),
         "Domains:".to_owned(),
     ];
