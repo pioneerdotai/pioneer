@@ -316,9 +316,8 @@ impl ApplyPatchHandler {
         let status = report.status;
         let committed_hunks = committed_hunk_count(&report, &authorized);
         operation_metric.set_report(&report, committed_hunks);
-        let outcome = report.into_outcome();
         patch_telemetry().record_authority(authority_name(source));
-        let mut parity = crate::apply_patch::project_apply_patch_outcome(&outcome);
+        let mut parity = crate::apply_patch::project_execution_report(report);
         parity.make_paths_absolute(&projection_root);
         // Serialize the canonical provider-neutral projection itself. Manual
         // reconstruction previously omitted its required v1 schema_version.
@@ -422,7 +421,7 @@ fn canonical_patch_output(
     execution_root: Option<&Path>,
 ) -> Result<Box<dyn ToolOutput>, ToolError> {
     let status = report.status;
-    let mut parity = crate::apply_patch::project_apply_patch_outcome(&report.into_outcome());
+    let mut parity = crate::apply_patch::project_execution_report(report);
     if let Some(execution_root) = execution_root {
         parity.make_paths_absolute(execution_root);
     }
@@ -1032,6 +1031,291 @@ mod tests {
             assert_eq!(payload["error"]["code"], expected_code);
             assert!(observer.record(&identity).unwrap().is_none());
             assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn syntax_rejection_exposes_every_detected_error_without_writing_valid_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("keep.txt"), "unchanged").unwrap();
+        let patch = "*** Begin Patch\n*** Add File: would-create.txt\n+valid\n*** Add File: broken.txt\nwrong\nalso wrong\n*** Delete File: keep.txt\n*** If-Match: bad\n*** End Patch";
+        let mut invocation = invocation(root.path(), patch);
+        let (_, preflight) = extract_permission_intent_with_preflight(&invocation);
+        assert!(matches!(
+            preflight.as_ref(),
+            Some(ApplyPatchPreflight::Rejected(_))
+        ));
+        invocation.apply_patch_preflight = preflight;
+        let identity =
+            InvocationIdentity::new("thread_reject", "turn_reject", "call_reject").unwrap();
+        let observer = InMemoryCommitObserver::new();
+        let trace = crate::events::ToolEventBus::default().start_trace(
+            "turn_reject",
+            "call_reject",
+            "apply_patch",
+        );
+        let output = ApplyPatchHandler
+            .handle_with_source_and_observer(
+                invocation,
+                trace,
+                PatchRequestSource::ManagedClaude,
+                &identity,
+                &observer,
+            )
+            .await
+            .unwrap();
+        let payload = output.raw_json();
+        assert_eq!(payload["status"], "rejected");
+        assert_eq!(payload["changed_files"], serde_json::json!([]));
+        assert_eq!(payload["validation"]["stage"], "syntax_and_guards");
+        assert_eq!(payload["validation"]["total_violations"], 3);
+        assert_eq!(payload["error"]["code"], "patch_syntax_error");
+        assert_eq!(
+            payload["validation"]["diagnostics"][0]["lines"][0],
+            serde_json::json!({"start": 5, "end": 6})
+        );
+        assert_eq!(
+            payload["validation"]["diagnostics"][1]["code"],
+            "invalid_source_guard"
+        );
+        assert_eq!(
+            payload["validation"]["diagnostics"][1]["operation_index"],
+            2
+        );
+        assert_eq!(
+            payload["validation"]["diagnostics"][1]["lines"][0],
+            serde_json::json!({"start": 8, "end": 8})
+        );
+        let model = output
+            .to_model_input_item("call_reject", "apply_patch")
+            .into_chat_message()
+            .content;
+        assert!(model.contains("missing_add_prefix"));
+        assert!(model.contains("invalid_source_guard"));
+        assert!(!root.path().join("would-create.txt").exists());
+        assert!(!root.path().join("broken.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("keep.txt")).unwrap(),
+            "unchanged"
+        );
+        assert!(observer.record(&identity).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn incomplete_directives_and_duplicate_values_reach_the_model_without_writes() {
+        let canonical = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:3";
+        let repeated_match = format!(
+            "*** Begin Patch\n*** Delete File: a.txt\n*** If-Match: {canonical}\n*** If-Match: bad\n*** End Patch"
+        );
+        let cases: [(&str, &[&str], &str, Option<u64>, Option<u64>); 5] = [
+            (
+                "*** Begin Patch\n*** Update File: a.txt\n*** If-Destination: absent\n*** Unknown: x\n*** Move to: b.txt\n*** End Patch",
+                &["unknown_directive"],
+                "patch_syntax_error",
+                None,
+                Some(4),
+            ),
+            (
+                "*** Begin Patch\n*** Update File: a.txt\n*** If-Destination: bad\n*** Unknown: x\n*** Move to: b.txt\n*** End Patch",
+                &["invalid_destination_guard", "unknown_directive"],
+                "invalid_version_token",
+                None,
+                Some(4),
+            ),
+            (
+                "*** Begin Patch\n*** Update File: a.txt\n*** If-Destination: absent\n*** If-Destination: bad\n*** Move to: b.txt\n*** End Patch",
+                &["duplicate_directive", "invalid_destination_guard"],
+                "patch_syntax_error",
+                Some(2),
+                None,
+            ),
+            (
+                "*** Begin Patch\n*** Update File: a.txt\n*** Move to: b.txt\n*** Move to:\n*** End Patch",
+                &["invalid_move_directive", "missing_path"],
+                "patch_syntax_error",
+                Some(2),
+                None,
+            ),
+            (
+                &repeated_match,
+                &["duplicate_directive", "invalid_source_guard"],
+                "patch_syntax_error",
+                Some(2),
+                None,
+            ),
+        ];
+        for (patch, expected_codes, primary_code, total, unchecked) in cases {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("a.txt"), "unchanged").unwrap();
+            let mut invocation = invocation(root.path(), patch);
+            let (_, preflight) = extract_permission_intent_with_preflight(&invocation);
+            assert!(matches!(
+                preflight.as_ref(),
+                Some(ApplyPatchPreflight::Rejected(_))
+            ));
+            invocation.apply_patch_preflight = preflight;
+            let identity = InvocationIdentity::new(
+                "thread_diagnostics",
+                "turn_diagnostics",
+                "call_diagnostics",
+            )
+            .unwrap();
+            let observer = InMemoryCommitObserver::new();
+            let trace = crate::events::ToolEventBus::default().start_trace(
+                "turn_diagnostics",
+                "call_diagnostics",
+                "apply_patch",
+            );
+            let output = ApplyPatchHandler
+                .handle_with_source_and_observer(
+                    invocation,
+                    trace,
+                    PatchRequestSource::ManagedClaude,
+                    &identity,
+                    &observer,
+                )
+                .await
+                .unwrap();
+            let payload = output.raw_json();
+            assert_eq!(payload["status"], "rejected");
+            assert_eq!(payload["error"]["code"], primary_code);
+            assert_eq!(payload["validation"]["total_violations"].as_u64(), total);
+            assert_eq!(
+                payload["validation"]["unchecked_from_line"].as_u64(),
+                unchecked
+            );
+            assert_eq!(
+                payload["validation"]["shown_violations"].as_u64(),
+                Some(expected_codes.len() as u64)
+            );
+            assert_eq!(payload["validation"]["display_truncated"], false);
+            let actual = payload["validation"]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|diagnostic| diagnostic["code"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected_codes.to_vec());
+            let model = output
+                .to_model_input_item("call_diagnostics", "apply_patch")
+                .into_chat_message()
+                .content;
+            for code in expected_codes {
+                assert!(model.contains(code), "model omitted {code}");
+            }
+            assert!(!model.contains("missing_hunk"));
+            assert!(!model.contains("inapplicable_guard"));
+            assert_eq!(model.contains("unchecked_from_line"), unchecked.is_some());
+            assert_eq!(payload["changed_files"], serde_json::json!([]));
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+                "unchanged"
+            );
+            assert!(!root.path().join("b.txt").exists());
+            assert!(observer.record(&identity).unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_body_boundary_does_not_project_false_empty_diagnostics_or_write_files() {
+        let cases: [(&str, &[&str], usize); 4] = [
+            (
+                "*** Begin Patch\n*** Add File: a.txt\n*** Unknown: x\n+content\n*** End Patch",
+                &["unknown_directive"],
+                3,
+            ),
+            (
+                "*** Begin Patch\n*** Replace File: a.txt\n*** Unknown: x\n+content\n*** End Patch",
+                &["unknown_directive"],
+                3,
+            ),
+            (
+                "*** Begin Patch\n*** Update File: a.txt\n@@\n*** Unknown: x\n-old\n+new\n*** End Patch",
+                &["unknown_directive"],
+                4,
+            ),
+            (
+                "*** Begin Patch\n*** Add File: a.txt\nwrong\n*** Unknown: x\n+content\n*** End Patch",
+                &["missing_add_prefix", "unknown_directive"],
+                4,
+            ),
+        ];
+        for (patch, expected_codes, unchecked_line) in cases {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("a.txt"), "unchanged").unwrap();
+            let mut invocation = invocation(root.path(), patch);
+            let (_, preflight) = extract_permission_intent_with_preflight(&invocation);
+            assert!(matches!(
+                preflight.as_ref(),
+                Some(ApplyPatchPreflight::Rejected(_))
+            ));
+            invocation.apply_patch_preflight = preflight;
+            let identity = InvocationIdentity::new(
+                "thread_empty_boundary",
+                "turn_empty_boundary",
+                "call_empty_boundary",
+            )
+            .unwrap();
+            let observer = InMemoryCommitObserver::new();
+            let trace = crate::events::ToolEventBus::default().start_trace(
+                "turn_empty_boundary",
+                "call_empty_boundary",
+                "apply_patch",
+            );
+            let output = ApplyPatchHandler
+                .handle_with_source_and_observer(
+                    invocation,
+                    trace,
+                    PatchRequestSource::ManagedClaude,
+                    &identity,
+                    &observer,
+                )
+                .await
+                .unwrap();
+            let payload = output.raw_json();
+            assert_eq!(payload["status"], "rejected");
+            assert_eq!(payload["error"]["code"], "patch_syntax_error");
+            assert_eq!(payload["validation"]["syntax_complete"], false);
+            assert_eq!(
+                payload["validation"]["unchecked_from_line"].as_u64(),
+                Some(unchecked_line as u64)
+            );
+            assert_eq!(payload["validation"]["stop_reason"], "ambiguous_structure");
+            assert!(payload["validation"]["total_violations"].is_null());
+            assert_eq!(
+                payload["validation"]["shown_violations"].as_u64(),
+                Some(expected_codes.len() as u64)
+            );
+            let actual = payload["validation"]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|diagnostic| diagnostic["code"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected_codes.to_vec());
+            let model = output
+                .to_model_input_item("call_empty_boundary", "apply_patch")
+                .into_chat_message()
+                .content;
+            for &code in expected_codes {
+                assert!(model.contains(code), "model omitted {code}");
+            }
+            for false_code in ["empty_add", "empty_replace", "invalid_hunk_line"] {
+                assert!(!model.contains(false_code), "model included {false_code}");
+            }
+            assert!(model.contains("unchecked_from_line"));
+            assert!(
+                !payload["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("empty hunk")
+            );
+            assert_eq!(payload["changed_files"], serde_json::json!([]));
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+                "unchanged"
+            );
+            assert!(observer.record(&identity).unwrap().is_none());
         }
     }
 

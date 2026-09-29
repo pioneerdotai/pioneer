@@ -351,6 +351,7 @@ mod tests {
 
     fn rejection(code: PatchErrorCode, guard_horizon: Option<GuardHorizon>) -> ExecutionReport {
         ExecutionReport {
+            validation: None,
             status: ExecutionStatus::Rejected,
             delta: AppliedPatchDelta::empty(),
             failure: Some(PatchDiagnostic {

@@ -3,8 +3,9 @@ use crate::apply_patch::file_mutation::{
     Retryability, TargetResolver, TargetRole,
 };
 use crate::apply_patch::{
-    ExecutionReport, OperationKind, PrepareOptions, TelemetryStage, ValidatedPatchDocument, parse,
-    patch_telemetry, resolve_patch, validate_guards,
+    ExecutionReport, OperationKind, PrepareOptions, TelemetryStage, ValidatedPatchDocument,
+    parse_validated, patch_telemetry, resolve_patch, validate_guard_candidates,
+    validate_guards_all,
 };
 use crate::context::ToolPayload;
 use crate::context::{ApplyPatchPreflight, ExecCommandArgs, ToolInvocation, WriteStdinArgs};
@@ -1282,7 +1283,7 @@ fn apply_patch_intent_with_preflight(
         }
     };
     let parse_started = Instant::now();
-    let document = match parse(&request, PatchLimits::default()) {
+    let document = match parse_validated(&request, PatchLimits::default()) {
         Ok(document) => document,
         Err(error) => {
             patch_telemetry().record_stage_latency(TelemetryStage::Parse, parse_started.elapsed());
@@ -1290,15 +1291,19 @@ fn apply_patch_intent_with_preflight(
                 "parse_status".to_owned(),
                 "invalid_patch_document".to_owned(),
             );
+            let guard_failure = validate_guard_candidates(&error.guard_candidates);
+            let report = if guard_failure.diagnostics.is_empty() {
+                ExecutionReport::rejected_parse_failure(&error)
+            } else {
+                ExecutionReport::rejected_syntax_and_guards(&error, &guard_failure)
+            };
             return (
                 invalid_patch_permission_intent(scope),
-                Some(ApplyPatchPreflight::Rejected(
-                    ExecutionReport::rejected_parse_error(&error),
-                )),
+                Some(ApplyPatchPreflight::Rejected(report)),
             );
         }
     };
-    let validated = match validate_guards(document) {
+    let validated = match validate_guards_all(document) {
         Ok(validated) => validated,
         Err(error) => {
             patch_telemetry().record_stage_latency(TelemetryStage::Parse, parse_started.elapsed());
@@ -1309,7 +1314,7 @@ fn apply_patch_intent_with_preflight(
             return (
                 invalid_patch_permission_intent(scope),
                 Some(ApplyPatchPreflight::Rejected(
-                    ExecutionReport::rejected_guard_error(&error),
+                    ExecutionReport::rejected_guard_failure(&error),
                 )),
             );
         }
