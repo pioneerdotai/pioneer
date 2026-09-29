@@ -941,9 +941,10 @@ mod tests {
         use super::super::{ComposerView, ThreadBindings, TimelineView};
         use super::workspace_capabilities;
         use gpui_kit::component::{Root, input::TextareaState};
+        use gpui_kit::test::TestWindowExt;
         use gpui_kit::{
-            AppContext, Context, Entity, EntityInputHandler, IntoElement, Keystroke, ParentElement,
-            Render, Styled, TestAppContext, VisualTestContext, Window, div,
+            AppContext, Context, Entity, EntityInputHandler, IntoElement, ParentElement, Render,
+            Styled, TestAppContext, VisualTestContext, Window, div,
         };
         use pioneer_client::{
             composer::{
@@ -1114,10 +1115,11 @@ mod tests {
             }
 
             fn press(&mut self, key: &str) {
+                // Kit dispatches command keys without simulated IME text insertion.
                 // Do not drain the executor here: a successful Enter queues a send task.
                 // These UI tests inspect its immutable operation plan before any I/O.
                 self.cx.update(|window, cx| {
-                    window.dispatch_keystroke(Keystroke::parse(key).unwrap(), cx);
+                    window.press(key, cx);
                 });
             }
 

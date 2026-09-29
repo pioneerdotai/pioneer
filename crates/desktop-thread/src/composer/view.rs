@@ -8,7 +8,7 @@ use crate::member_picker::MemberPicker;
 use crate::member_picker::member_picker_items;
 use gpui_kit::component::IconName;
 use gpui_kit::component::button::*;
-use gpui_kit::component::input::{Enter, Textarea};
+use gpui_kit::component::input::Textarea;
 use gpui_kit::component::menu::DropdownMenu;
 use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::theme::ActiveTheme;
@@ -213,17 +213,6 @@ impl ComposerView {
 
         h_flex()
             .debug_selector(|| "thread-composer".into())
-            .on_action(cx.listener(|view, action: &Enter, window, cx| {
-                // submit_on_enter emits PressEnter and propagates the action.
-                // Consume it here so native text input cannot append a newline
-                // after the subscription has started sending the message.
-                if action.shift
-                    || action.secondary
-                    || !view.composer_state.read(cx).focus_handle().is_focused(window)
-                {
-                    cx.propagate();
-                }
-            }))
             .w_full()
             .flex_none()
             .justify_center()
