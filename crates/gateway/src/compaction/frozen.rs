@@ -3286,6 +3286,7 @@ async fn restore_accepted_execution_basis_prepared(
         owner: String,
         checkpoint: String,
         checkpoint_source: SourceRef,
+        checkpoints: BTreeSet<SourceRef>,
         selected: BTreeSet<usize>,
         coverage: BTreeSet<ScopedHistorySource>,
         event_input_evidence: BTreeMap<ScopedHistorySource, String>,
@@ -3498,7 +3499,9 @@ async fn restore_accepted_execution_basis_prepared(
                 .map(historical_frozen_identity)
                 .collect::<BTreeSet<_>>();
             let mut represented = BTreeSet::new();
+            let mut input_alias_represented = BTreeSet::new();
             let mut leaves_by_ordinal = BTreeMap::new();
+            let mut cross_domain_summaries = BTreeSet::new();
             for (ordinal, reference) in references.iter().enumerate() {
                 if omitted.contains(&ordinal) {
                     continue;
@@ -3516,7 +3519,7 @@ async fn restore_accepted_execution_basis_prepared(
                 if !replaceable {
                     continue;
                 }
-                if reference
+                let same_domain = if reference
                     .sources
                     .iter()
                     .any(|source| source.scope.starts_with("checkpoint:"))
@@ -3528,15 +3531,23 @@ async fn restore_accepted_execution_basis_prepared(
                         .resolve(store, workspace, Some(allowed), source)
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("accepted checkpoint graph disappeared"))?;
-                    if checkpoint_graphs
+                    let same_domain = checkpoint_graphs
                         .projection_metadata(store, workspace, &referenced)
                         .await?
                         .coverage_domain
-                        != metadata.coverage_domain
+                        == metadata.coverage_domain;
+                    // A saved checkpoint can cross domains only when this
+                    // candidate contains that exact published source. An
+                    // accepted OWN import still needs its original grant.
+                    if !same_domain
+                        && (!graph.checkpoints.contains(source) || accepted.contains_key(&ordinal))
                     {
                         continue;
                     }
-                }
+                    same_domain
+                } else {
+                    true
+                };
                 let leaves = frozen_reference_leaves(
                     store,
                     workspace,
@@ -3545,12 +3556,20 @@ async fn restore_accepted_execution_basis_prepared(
                     checkpoint_graphs,
                 )
                 .await?;
+                if same_domain {
+                    input_alias_represented.extend(leaves.iter().cloned());
+                } else {
+                    cross_domain_summaries.insert(ordinal);
+                }
                 represented.extend(leaves.iter().cloned());
                 leaves_by_ordinal.insert(ordinal, leaves);
             }
             let mut represented_coverage = represented.clone();
             for (replay, covered_source) in &graph.replay_aliases {
-                if represented.contains(replay) {
+                if represented.contains(replay)
+                    && (!graph.input_replay_aliases.contains(replay)
+                        || input_alias_represented.contains(replay))
+                {
                     represented_coverage.insert(covered_source.clone());
                 }
             }
@@ -3563,11 +3582,14 @@ async fn restore_accepted_execution_basis_prepared(
                     continue;
                 }
                 compatible_summaries.insert(*ordinal);
-                let comparable = pioneer_agent::compaction::composition::summary_comparison_leaves(
-                    leaves,
-                    &candidate_claims,
-                );
-                represented_coverage.extend(required.intersection(&comparable).cloned());
+                if !cross_domain_summaries.contains(ordinal) {
+                    let comparable =
+                        pioneer_agent::compaction::composition::summary_comparison_leaves(
+                            leaves,
+                            &candidate_claims,
+                        );
+                    represented_coverage.extend(required.intersection(&comparable).cloned());
+                }
             }
             if required.difference(&represented_coverage).next().is_some() {
                 candidate = next;
@@ -3588,11 +3610,15 @@ async fn restore_accepted_execution_basis_prepared(
                         || exact_replay_aliases.contains(leaf)
                 };
                 let covered_summary = compatible_summaries.contains(ordinal)
-                    && pioneer_agent::compaction::composition::summary_covers(
-                        &required,
-                        leaves,
-                        &candidate_claims,
-                    );
+                    && (if cross_domain_summaries.contains(ordinal) {
+                        leaves.is_subset(&required)
+                    } else {
+                        pioneer_agent::compaction::composition::summary_covers(
+                            &required,
+                            leaves,
+                            &candidate_claims,
+                        )
+                    });
                 if !covered_summary
                     && (!leaves.iter().any(|leaf| covered_leaf(leaf))
                         || !leaves.iter().all(|leaf| covered_leaf(leaf)))
@@ -3662,6 +3688,7 @@ async fn restore_accepted_execution_basis_prepared(
                 owner,
                 checkpoint: id,
                 checkpoint_source: root,
+                checkpoints: graph.checkpoints.clone(),
                 selected,
                 coverage: graph.leaves.clone(),
                 event_input_evidence: graph.event_input_evidence.clone(),
@@ -3729,12 +3756,15 @@ async fn restore_accepted_execution_basis_prepared(
                 &projections[left].coverage,
                 &summary_claims,
             );
+            let right_contains_left = projections[right]
+                .checkpoints
+                .contains(&projections[left].checkpoint_source);
             if right_covers_left
                 && (projections[right].inherited
                     || projections[left]
                         .selected
                         .is_subset(&projections[right].selected))
-                && (!left_covers_right || prefer_right)
+                && (right_contains_left || !left_covers_right || prefer_right)
             {
                 let selected = projections[left].selected.clone();
                 projections[right].selected.extend(selected);
@@ -3743,6 +3773,7 @@ async fn restore_accepted_execution_basis_prepared(
                 break;
             }
             if left_covers_right
+                && !right_contains_left
                 && (projections[left].inherited
                     || projections[right]
                         .selected

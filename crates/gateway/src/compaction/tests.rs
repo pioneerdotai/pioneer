@@ -14356,6 +14356,333 @@ async fn accepted_working_context_projection_deduplicates_nested_summaries_in_bo
 }
 
 #[tokio::test]
+async fn accepted_frozen_restore_prefers_contained_working_checkpoint_with_equal_leaves() {
+    for child in ["aaa-equal-child", "zzz-equal-child"] {
+        let f = fixture("A source", vec![], true, false).await;
+        let a_leaf = f
+            .store
+            .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+            .await
+            .unwrap()
+            .entries[0]
+            .reference
+            .clone();
+        insert_projection_event(&f, child).await;
+        let a = publish_projection_checkpoint(
+            &f,
+            "thread",
+            &format!("equal-a-{child}"),
+            &[("thread".into(), a_leaf)],
+            pioneer_compaction::CoverageDomain::WorkingContext,
+        )
+        .await;
+        let a_source = f
+            .store
+            .compaction_checkpoint_source("ws", "thread", &a.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let allowed = std::collections::BTreeSet::from(["thread".into(), child.into()]);
+        let a_message = super::checkpoint::checkpoint_message_with_resolver(
+            &f.store,
+            super::checkpoint::ProjectionContext {
+                workspace: "ws",
+                context_thread: child,
+                source_thread: "thread",
+                owner: &a.owner,
+                allowed: &allowed,
+                allow_historical_gaps: false,
+            },
+            &a.id,
+            &mut super::coverage::CheckpointGraphResolver::default(),
+        )
+        .await
+        .unwrap();
+        let frozen = vec![a_message];
+        let descriptor = super::frozen::capture(&f.store, "ws", "thread", &allowed, &frozen)
+            .await
+            .unwrap();
+        let b = publish_projection_checkpoint(
+            &f,
+            child,
+            &format!("equal-b-{child}"),
+            &[("thread".into(), a_source.clone())],
+            pioneer_compaction::CoverageDomain::WorkingContext,
+        )
+        .await;
+        let b_source = f
+            .store
+            .compaction_checkpoint_source("ws", child, &b.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            super::frozen::restore(&f.store, "ws", &allowed, &descriptor)
+                .await
+                .unwrap(),
+            frozen
+        );
+        let restored = super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            Some("thread"),
+            child,
+            &allowed,
+            &serde_json::to_string(&descriptor).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.messages.len(), 1, "owner order: {child}");
+        assert_eq!(
+            restored.messages[0].provenance.as_ref().unwrap().sources[0].id,
+            b.id
+        );
+        assert_eq!(
+            restored.direct_sources,
+            vec![
+                pioneer_agent::compaction::composition::ScopedHistorySource {
+                    thread: child.into(),
+                    source: b_source,
+                }
+            ]
+        );
+        assert!(
+            super::coverage::CheckpointGraphResolver::default()
+                .resolve(&f.store, "ws", Some(&allowed), &a_source)
+                .await
+                .unwrap()
+                .is_some(),
+            "the exact old checkpoint reference must remain usable"
+        );
+    }
+}
+
+#[tokio::test]
+async fn accepted_frozen_restore_applies_working_checkpoint_containing_inherited_own_summary() {
+    let f = fixture("A source", vec![], true, false).await;
+    let a_leaf = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    insert_projection_event(&f, "nested-parent").await;
+    insert_projection_event(&f, "nested-child").await;
+    insert_projection_event(&f, "nested-child-alias").await;
+    insert_projection_event(&f, "nested-copy").await;
+    for (id, turn) in [
+        ("nested-original-input", "turn"),
+        ("nested-copy-input", "nested-copy-turn"),
+    ] {
+        f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES (?,?,0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+            [id.into(), turn.into()],
+        )).await.unwrap();
+    }
+    let a_input = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Input, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    let copy_input = f
+        .store
+        .compaction_source_page(
+            "ws",
+            "nested-copy",
+            "nested-copy-turn",
+            PagedSource::Input,
+            0,
+        )
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    assert_eq!(a_input.version, copy_input.version);
+    let a = publish_projection_checkpoint(
+        &f,
+        "thread",
+        "cross-domain-own-a",
+        &[
+            ("thread".into(), a_leaf),
+            ("thread".into(), a_input.clone()),
+        ],
+        pioneer_compaction::CoverageDomain::OwnContribution,
+    )
+    .await;
+    let a_source = f
+        .store
+        .compaction_checkpoint_source("ws", "thread", &a.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let allowed = std::collections::BTreeSet::from([
+        "thread".into(),
+        "nested-parent".into(),
+        "nested-child".into(),
+        "nested-child-alias".into(),
+        "nested-copy".into(),
+    ]);
+    let a_message = super::checkpoint::checkpoint_message_with_resolver(
+        &f.store,
+        super::checkpoint::ProjectionContext {
+            workspace: "ws",
+            context_thread: "thread",
+            source_thread: "thread",
+            owner: &a.owner,
+            allowed: &allowed,
+            allow_historical_gaps: false,
+        },
+        &a.id,
+        &mut super::coverage::CheckpointGraphResolver::default(),
+    )
+    .await
+    .unwrap();
+    let a_graph = super::coverage::CheckpointGraphResolver::default()
+        .resolve(&f.store, "ws", Some(&allowed), &a_source)
+        .await
+        .unwrap()
+        .unwrap();
+    let a_key = ScopedHistorySource {
+        thread: "thread".into(),
+        source: a_source.clone(),
+    };
+    let checkpoints = std::collections::BTreeMap::from([(a_key.clone(), a_graph.leaves.clone())]);
+    let domains = std::collections::BTreeMap::from([(
+        a_key,
+        pioneer_compaction::CoverageDomain::OwnContribution,
+    )]);
+    let mut inherited = pioneer_agent::compaction::composition::compose_context(
+        "ws",
+        "nested-parent",
+        &[
+            pioneer_agent::compaction::composition::AcceptedContextBranch {
+                thread: "nested-parent",
+                messages: &[a_message],
+                checkpoints: &checkpoints,
+                checkpoint_domains: &domains,
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(inherited.len(), 1);
+    assert!(inherited[0].provenance.as_ref().unwrap().inherited);
+    inherited[0]
+        .provenance
+        .as_mut()
+        .unwrap()
+        .source_aliases
+        .push(pioneer_provider::MessageSourceAlias {
+            represented_thread_id: "thread".into(),
+            represented_source: pioneer_provider::MessageSourceRef {
+                scope: a_input.scope,
+                id: a_input.id,
+                version: a_input.version,
+            },
+            thread_id: "nested-copy".into(),
+            source: pioneer_provider::MessageSourceRef {
+                scope: copy_input.scope.clone(),
+                id: copy_input.id.clone(),
+                version: copy_input.version.clone(),
+            },
+        });
+    let descriptor = super::frozen::capture(&f.store, "ws", "nested-parent", &allowed, &inherited)
+        .await
+        .unwrap();
+    let b = publish_projection_checkpoint(
+        &f,
+        "nested-child",
+        "cross-domain-working-b",
+        &[("thread".into(), a_source.clone())],
+        pioneer_compaction::CoverageDomain::WorkingContext,
+    )
+    .await;
+    let b_source = f
+        .store
+        .compaction_checkpoint_source("ws", "nested-child", &b.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        super::frozen::restore(&f.store, "ws", &allowed, &descriptor)
+            .await
+            .unwrap(),
+        inherited
+    );
+    let restored = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("nested-parent"),
+        "nested-child",
+        &allowed,
+        &serde_json::to_string(&descriptor).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.messages.len(), 1);
+    assert_eq!(
+        restored.messages[0].provenance.as_ref().unwrap().sources[0].id,
+        b.id
+    );
+    assert_eq!(
+        restored.direct_sources,
+        vec![
+            pioneer_agent::compaction::composition::ScopedHistorySource {
+                thread: "nested-child".into(),
+                source: b_source,
+            }
+        ]
+    );
+    assert!(
+        super::coverage::CheckpointGraphResolver::default()
+            .resolve(&f.store, "ws", Some(&allowed), &a_source)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let alias_candidate = publish_projection_checkpoint(
+        &f,
+        "nested-child-alias",
+        "cross-domain-alias-candidate",
+        &[
+            ("thread".into(), a_source.clone()),
+            ("nested-copy".into(), copy_input),
+        ],
+        pioneer_compaction::CoverageDomain::WorkingContext,
+    )
+    .await;
+    let bounded = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("nested-parent"),
+        "nested-child-alias",
+        &allowed,
+        &serde_json::to_string(&descriptor).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(bounded.messages.len(), 1);
+    assert_eq!(
+        bounded.messages[0].provenance.as_ref().unwrap().sources[0].id,
+        a.id,
+        "the alias cannot admit a checkpoint with an extra input outside the frozen boundary"
+    );
+    assert!(bounded.direct_sources.contains(&ScopedHistorySource {
+        thread: "thread".into(),
+        source: a_source,
+    }));
+    assert!(bounded.messages.iter().all(|message| {
+        message.provenance.as_ref().unwrap().sources[0].id != alias_candidate.id
+    }));
+}
+
+#[tokio::test]
 async fn accepted_checkpoint_projection_keeps_partial_and_independent_summaries() {
     use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
 
