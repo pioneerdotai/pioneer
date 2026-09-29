@@ -937,23 +937,32 @@ mod tests {
         );
     }
     mod interaction {
-        use super::super::*;
+        // A glob import would shadow the Rust #[test] emitted by GPUI's macro.
+        use super::super::{ComposerView, ThreadBindings, TimelineView};
         use super::workspace_capabilities;
-        use gpui_kit::component::Root;
-        use gpui_kit::{EntityInputHandler, Keystroke, VisualTestContext};
+        use gpui_kit::component::{Root, input::TextareaState};
+        use gpui_kit::{
+            AppContext, Context, Entity, EntityInputHandler, IntoElement, Keystroke, ParentElement,
+            Render, Styled, TestAppContext, VisualTestContext, Window, div,
+        };
         use pioneer_client::{
-            composer::state_machine::ComposerDomainState,
+            composer::{
+                state_machine::ComposerDomainState,
+                store::{ComposerIntent, ComposerOperationKind, ComposerOperationStatus},
+            },
             core::{
-                ClientMutationAuthority, ClientRevisions, ClientTransitionOutcome, ScopedRevision,
+                ClientCore, ClientMutationAuthority, ClientRevisions, ClientScope,
+                ClientTransitionOutcome, ScopedRevision,
             },
             gateway::session_controller::GatewaySessionPublication,
             state::{
-                client_state::GatewayStatusLevel,
+                client_state::{GatewayConnectionState, GatewayStatusLevel},
                 reducers::{GatewayStatusProjection, GatewayStatusTextUpdate},
             },
             timeline::{semantic::TopLevelPageMergeMode, types::ThreadMode},
         };
         use serde_json::json;
+        use std::sync::Arc;
 
         struct Host {
             composer: Entity<ComposerView>,
