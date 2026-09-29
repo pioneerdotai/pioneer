@@ -1102,9 +1102,9 @@ mod tests {
             assert_eq!(repeated, composed);
         }
         let (v2, v2_closure) = checkpoint("S_v2", "input-revision:2", true);
-        for (first, first_closure, second, second_closure, expected) in [
-            (&v1, &v1_closure, &v2, &v2_closure, 0),
-            (&v2, &v2_closure, &v1, &v1_closure, 1),
+        for (first, first_closure, second, second_closure) in [
+            (&v1, &v1_closure, &v2, &v2_closure),
+            (&v2, &v2_closure, &v1, &v1_closure),
         ] {
             let composed = compose_context(
                 "ws",
@@ -1125,15 +1125,18 @@ mod tests {
                 ],
             )
             .unwrap();
-            assert_eq!(composed.len(), 1);
+            // The checkpoints name different exact revisions of A. Neither
+            // can remove the other, and B's alias stays on A@v2 alone.
+            assert_eq!(composed.len(), 2);
             assert_eq!(
-                composed[0]
-                    .provenance
-                    .as_ref()
-                    .unwrap()
-                    .source_aliases
-                    .len(),
-                expected
+                composed
+                    .iter()
+                    .map(|message| {
+                        let origin = message.provenance.as_ref().unwrap();
+                        (origin.sources[0].id.clone(), origin.source_aliases.len())
+                    })
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([("S_v1".into(), 0), ("S_v2".into(), 1)])
             );
         }
     }
@@ -1727,7 +1730,7 @@ mod tests {
         assert_eq!(
             compose_summaries(&[
                 (&old, &["A", "unique"], working),
-                (&covering, &["B", "C"], working),
+                (&covering, &["B", "C", "other_unique"], working),
             ])
             .len(),
             2
