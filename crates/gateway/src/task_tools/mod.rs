@@ -1227,6 +1227,61 @@ impl ToolHandler for TaskToolHandler {
 }
 
 impl TaskToolHandler {
+    async fn merged_immediate_task_capabilities(
+        &self,
+        agent_launch: &pioneer_protocol::AgentLaunchSelection,
+    ) -> Result<Vec<pioneer_protocol::TurnCapability>, ToolError> {
+        let snapshot = self
+            .processor
+            .crud_store
+            .get_turn_runtime_snapshot(self.context.turn_id.as_str())
+            .await
+            .map_err(|error| {
+                ToolError::execution_failed(format!(
+                    "failed to load parent Turn capabilities: {error:#}"
+                ))
+            })?
+            .filter(|snapshot| {
+                snapshot.workspace_id == self.context.workspace_id
+                    && snapshot.thread_id == self.context.thread_id
+            })
+            .ok_or_else(|| {
+                ToolError::execution_failed("parent Turn capability snapshot is unavailable")
+            })?;
+        let mut capabilities = crate::turn_runtime_snapshot::restored_execution_capabilities(
+            snapshot.capabilities_json.as_str(),
+        )
+        .map_err(|error| {
+            ToolError::execution_failed(format!("parent Turn capabilities are invalid: {error:#}"))
+        })?;
+        let requested = crate::message::agent_action_tools::launch_selection_capabilities(
+            &agent_launch.execution,
+        )
+        .map_err(|error| {
+            ToolError::invalid_arguments(format!(
+                "invalid child Agent launch capabilities: {error:#}"
+            ))
+        })?;
+        capabilities = merge_task_capabilities(capabilities, requested);
+        if capabilities.len() > pioneer_protocol::TURN_EXECUTION_CAPABILITY_MAX_COUNT {
+            return Err(ToolError::invalid_arguments(
+                "immediate Task capabilities exceed the Turn limit",
+            ));
+        }
+        self.processor
+            .normalize_turn_skill_capabilities(
+                self.context.workspace_id.as_str(),
+                capabilities.as_slice(),
+            )
+            .await
+            .map(|normalized| normalized.execution)
+            .map_err(|error| {
+                ToolError::invalid_arguments(format!(
+                    "immediate Task capabilities are unavailable: {error}"
+                ))
+            })
+    }
+
     async fn handle_in_fresh_task(
         &self,
         invocation: ToolInvocation,
@@ -1285,6 +1340,29 @@ impl TaskToolHandler {
             other => Err(ToolError::NotFound(other.to_owned())),
         }
     }
+}
+
+fn merge_task_capabilities(
+    mut inherited: Vec<pioneer_protocol::TurnCapability>,
+    additional: Vec<pioneer_protocol::TurnCapability>,
+) -> Vec<pioneer_protocol::TurnCapability> {
+    inherited.extend(additional);
+    inherited.sort_by(|left, right| left.id.cmp(&right.id));
+    inherited.dedup_by(|left, right| left.id == right.id);
+    inherited
+}
+
+fn inherits_task_capabilities(
+    trigger_kind: TaskTriggerKind,
+    target: Option<&pioneer_protocol::AgentStartTarget>,
+) -> bool {
+    trigger_kind == TaskTriggerKind::Immediate
+        && matches!(
+            target,
+            Some(pioneer_protocol::AgentStartTarget::CurrentThread)
+                | Some(pioneer_protocol::AgentStartTarget::SameCapsuleThread { .. })
+                | None
+        )
 }
 
 impl TaskToolHandler {
@@ -1558,7 +1636,6 @@ impl TaskToolHandler {
             .agent_action_binding(self.context.turn_id.as_str())
             .await
             .ok_or_else(task_tool_authorization_error)?;
-        params.launch = Some(server_launch.clone());
         let nested_task = params.parent_task_id.is_some();
         let immediate_detached = trigger_kind == TaskTriggerKind::Immediate
             && params
@@ -1573,9 +1650,6 @@ impl TaskToolHandler {
                     .attachment
                 })
                 == TaskAttachmentMode::Detached;
-        let execution_admission = authorization
-            .authorize_execution_intent(self.processor.as_ref(), &params)
-            .await?;
         let mut create_context = pioneer_tasks::TaskCreateContext::default();
         // Agent-authored Task creation is bound to the exact execution that
         // owns this turn.  Do not reuse the initiating human principal as the
@@ -1626,7 +1700,6 @@ impl TaskToolHandler {
             create_context.work_graph_root_execution_id =
                 Some(creator_work_graph_root_execution_id);
         }
-        create_context.launch_selection = Some(server_launch.clone());
         let (identity, profile) = if matches!(
             server_launch.agent,
             pioneer_protocol::AgentIdentitySelection::ServerDerivedEphemeral { .. }
@@ -1732,6 +1805,28 @@ impl TaskToolHandler {
                     .map(|return_route_id| (route.route_id.clone(), return_route_id.clone()));
             }
         }
+        let inherit_capabilities =
+            inherits_task_capabilities(trigger_kind, prepared.normalized.target.as_ref());
+        let mut persisted_launch = server_launch.clone();
+        if inherit_capabilities {
+            let capabilities = self
+                .merged_immediate_task_capabilities(&server_launch)
+                .await?;
+            crate::message::agent_action_tools::pin_immediate_task_capabilities(
+                &mut persisted_launch,
+                &capabilities,
+            )
+            .map_err(|error| {
+                ToolError::invalid_arguments(format!(
+                    "invalid immediate Task capabilities: {error:#}"
+                ))
+            })?;
+        }
+        params.launch = Some(persisted_launch.clone());
+        create_context.launch_selection = Some(persisted_launch);
+        let execution_admission = authorization
+            .authorize_execution_intent(self.processor.as_ref(), &params)
+            .await?;
         let agent_action_projection = plan.projection;
         create_context.agent_action_commit = Some(plan.input);
         if let Some((ingress_route_id, return_route_id)) = routed_task_return {
@@ -3029,8 +3124,9 @@ struct TaskCreateToolInput {
     /// every occurrence; raw thread or route ids are never accepted here.
     target_option_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Optional child identity/profile selection from agent_start_options.
-    /// Omit to inherit the currently bound agent identity and profile.
+    /// Optional child identity/profile and additional Skill/MCP selection from
+    /// agent_start_options. Immediate tasks in the current capsule inherit the
+    /// current Turn's selected capabilities. Empty lists keep that inheritance.
     launch: Option<AgentToolLaunchSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Omit for an immediate attached subagent. Use this object directly; do not wrap it in spec, schedule, or triggerInput. For daily scheduled work choose the cron trigger kind and fill its leaf fields.
@@ -3788,7 +3884,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
     vec![
         task_tool_spec(
             TASK_CREATE_TOOL,
-            "Create a durable task or subagent. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and delivers the result to the origin thread. For scheduled, interval, and cron work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
+            "Create a durable task or subagent. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. The runtime carries the current Turn's selected Skills and MCP into immediate subagents in the same capsule, including background subagents; launch selections add to that set. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and delivers its result to the origin thread. For scheduled, interval, and cron work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
             task_create_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Arguments,
@@ -5508,6 +5604,125 @@ mod tests {
     use super::*;
     use sea_orm::ConnectionTrait;
     use std::path::PathBuf;
+
+    #[test]
+    fn attached_task_launch_keeps_exact_inherited_capabilities_across_nested_launches() {
+        use pioneer_protocol::{McpScopeKind, TurnCapability, TurnCapabilityKind};
+
+        let skill = |letter: &str| {
+            let skill_id = pioneer_protocol::SkillId::new(letter.repeat(21)).unwrap();
+            TurnCapability {
+                id: pioneer_protocol::skill_capability_key(&skill_id),
+                kind: TurnCapabilityKind::Skill {
+                    skill_id,
+                    pack_id: None,
+                },
+                label: None,
+            }
+        };
+        let tool = TurnCapability {
+            id: pioneer_protocol::mcp_tool_capability_key(
+                McpScopeKind::Workspace,
+                "resend",
+                "send",
+            ),
+            kind: TurnCapabilityKind::McpTool {
+                server_name: "resend".to_owned(),
+                raw_tool_name: "send".to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            },
+            label: None,
+        };
+        let server = TurnCapability {
+            id: pioneer_protocol::mcp_server_capability_key(McpScopeKind::Workspace, "resend"),
+            kind: TurnCapabilityKind::McpServer {
+                name: "resend".to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            },
+            label: None,
+        };
+        // The parent snapshot has already expanded a package to individual
+        // Skills. A repeated child selection must not expand it again.
+        let inherited = vec![skill("A"), skill("B"), tool.clone()];
+        assert_eq!(
+            merge_task_capabilities(inherited.clone(), Vec::new()),
+            merge_task_capabilities(Vec::new(), inherited.clone())
+        );
+        let merged =
+            merge_task_capabilities(inherited, vec![skill("B"), skill("C"), server.clone()]);
+        assert_eq!(merged.len(), 5);
+        let mut launch = AgentToolLaunchSelection {
+            identity: AgentToolIdentityChoice::InheritParent,
+            profile: AgentToolProfileChoice::InheritParent,
+            reasoning: None,
+            permission_profile: None,
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+        }
+        .into_server_selection();
+        crate::message::agent_action_tools::pin_immediate_task_capabilities(&mut launch, &merged)
+            .unwrap();
+        let persisted: pioneer_protocol::AgentLaunchSelection =
+            serde_json::from_str(&serde_json::to_string(&launch).unwrap()).unwrap();
+        let child = crate::message::agent_action_tools::task_launch_selection_capabilities(
+            &persisted.execution,
+        )
+        .unwrap();
+        assert_eq!(child, merged);
+        assert!(child.contains(&tool));
+        assert!(child.contains(&server));
+        assert_eq!(persisted.execution.mcp_server_ids, vec![server.id]);
+        assert_eq!(merge_task_capabilities(child.clone(), child), merged);
+        let mut invalid = persisted.execution;
+        invalid.mcp_server_ids.clear();
+        assert!(
+            crate::message::agent_action_tools::task_launch_selection_capabilities(&invalid)
+                .is_err(),
+            "a persisted exact tool must remain inside its authorized server grant"
+        );
+
+        let mut tool_only_launch = AgentToolLaunchSelection {
+            identity: AgentToolIdentityChoice::InheritParent,
+            profile: AgentToolProfileChoice::InheritParent,
+            reasoning: None,
+            permission_profile: None,
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+        }
+        .into_server_selection();
+        crate::message::agent_action_tools::pin_immediate_task_capabilities(
+            &mut tool_only_launch,
+            &[tool.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            crate::message::agent_action_tools::task_launch_selection_capabilities(
+                &tool_only_launch.execution
+            )
+            .unwrap(),
+            vec![tool]
+        );
+    }
+
+    #[test]
+    fn task_capability_inheritance_stays_with_immediate_same_capsule_work() {
+        assert!(inherits_task_capabilities(TaskTriggerKind::Immediate, None));
+        assert!(inherits_task_capabilities(
+            TaskTriggerKind::Immediate,
+            Some(&pioneer_protocol::AgentStartTarget::SameCapsuleThread {
+                thread_id: "sibling".to_owned(),
+            })
+        ));
+        assert!(!inherits_task_capabilities(TaskTriggerKind::Cron, None));
+        assert!(!inherits_task_capabilities(
+            TaskTriggerKind::Immediate,
+            Some(&pioneer_protocol::AgentStartTarget::RoutedThread {
+                route_id: pioneer_protocol::AgentDelegationRouteId::new("R12345678901234567890")
+                    .unwrap(),
+                thread_id: "other-capsule".to_owned(),
+            })
+        ));
+    }
 
     fn prior(timed_out: bool, terminal_count: u32) -> PriorWaitCall {
         PriorWaitCall {

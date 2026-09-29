@@ -221,6 +221,12 @@ impl ExecutionAdmissionRequest {
             execution_backend: launch.and_then(|launch| launch.execution_backend.clone()),
             capabilities: launch
                 .map(|launch| launch.capabilities.clone())
+                .or_else(|| {
+                    params
+                        .launch
+                        .as_ref()
+                        .map(|selection| selection.execution.selected_capabilities.clone())
+                })
                 .unwrap_or_default(),
             artifacts: input_sources.artifacts,
             has_local_attachment_sources: input_sources.has_local_paths,

@@ -307,7 +307,7 @@ fn execution_capabilities_json(capabilities: &[TurnCapability]) -> Result<String
     to_snapshot_json(capabilities, "turn capabilities")
 }
 
-fn restored_execution_capabilities(value: &str) -> Result<Vec<TurnCapability>> {
+pub(crate) fn restored_execution_capabilities(value: &str) -> Result<Vec<TurnCapability>> {
     let capabilities: Vec<TurnCapability> = from_snapshot_json(value, "turn capabilities")?;
     validate_execution_capabilities(&capabilities)?;
     Ok(capabilities)

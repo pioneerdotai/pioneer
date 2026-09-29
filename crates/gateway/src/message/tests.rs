@@ -8071,6 +8071,7 @@ async fn exact_cli_task_launch_for_test(
             permission_profile: None,
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),
+            selected_capabilities: Vec::new(),
         },
     })
 }
@@ -33507,6 +33508,315 @@ fn task_create_tool_idempotency_key_deduplicates_parallel_mutations() {
             task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl().await;
         },
     );
+}
+
+#[test]
+fn task_create_inherits_exact_turn_capabilities_for_attached_and_background_children() {
+    run_standard_stack_message_test(
+        "task_create exact capability inheritance",
+        task_create_inherits_exact_turn_capabilities_for_attached_and_background_children_impl(),
+    );
+}
+
+async fn task_create_inherits_exact_turn_capabilities_for_attached_and_background_children_impl() {
+    let base_dir = unique_temp_dir("task_create_capability_inheritance");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    for root in [&system_root, &user_root, &workspace_root, &registry_root] {
+        std::fs::create_dir_all(root).expect("create capability inheritance Skill root");
+    }
+    let skill_path = write_test_skill(
+        &user_root,
+        "inherited-capability",
+        "",
+        "Inherited capability instructions.",
+    );
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![
+            ProviderToolCall {
+                id: "call_inherit_attached".to_owned(),
+                name: "task_create".to_owned(),
+                arguments: json!({
+                    "title": "Inherited attached child",
+                    "goal": "CAPABILITY_INHERIT_CHILD_ATTACHED",
+                    "instructions": ["Return CAPABILITY_INHERIT_CHILD_ATTACHED."],
+                })
+                .to_string(),
+            },
+            ProviderToolCall {
+                id: "call_inherit_background".to_owned(),
+                name: "task_create".to_owned(),
+                arguments: json!({
+                    "title": "Inherited background child",
+                    "goal": "CAPABILITY_INHERIT_CHILD_BACKGROUND",
+                    "instructions": ["Return CAPABILITY_INHERIT_CHILD_BACKGROUND."],
+                    "background": true,
+                    "launch": {
+                        "identity": {"kind": "inherit_parent"},
+                        "profile": {"kind": "inherit_parent"},
+                        "skillIds": [],
+                        "mcpServerIds": []
+                    }
+                })
+                .to_string(),
+            },
+        ],
+        r#"<task_result>{"summary":"Capability inheritance complete."}</task_result>"#,
+    ));
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
+    ));
+    let mut harness = setup_memory_agent_e2e_harness_with_tool_loop_config(
+        "task_create_capability_inheritance",
+        provider_registry,
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
+    )
+    .await;
+    harness.processor.bind_task_bridge().await;
+    harness.processor.start_task_event_listener().await;
+    let skill_id = seed_test_skill_installation(
+        harness.crud_store.as_ref(),
+        'Q',
+        harness.workspace_id.as_str(),
+        "user",
+        skill_path.as_path(),
+        Some("tests"),
+        "inherited-capability",
+    )
+    .await;
+    seed_ready_fake_mcp_server(
+        harness.processor.as_ref(),
+        harness.crud_store.as_ref(),
+        harness.workspace_id.as_str(),
+    )
+    .await;
+
+    let parent_thread_id = "thr_task_create_exact_inheritance";
+    let parent_turn_id = "turn_task_create_exact_inheritance";
+    start_memory_e2e_thread(&mut harness, parent_thread_id, "Agent", "openai").await;
+    let selected = vec![
+        TurnCapability {
+            id: pioneer_protocol::skill_capability_key(&skill_id),
+            kind: TurnCapabilityKind::Skill {
+                skill_id: skill_id.clone(),
+                pack_id: None,
+            },
+            label: None,
+        },
+        TurnCapability {
+            id: pioneer_protocol::mcp_tool_capability_key(
+                McpScopeKind::Workspace,
+                "resend",
+                "send",
+            ),
+            kind: TurnCapabilityKind::McpTool {
+                server_name: "resend".to_owned(),
+                raw_tool_name: "send".to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            },
+            label: None,
+        },
+    ];
+    let (mut parent_launch, _) = super::agent_action_tools::resolve_workspace_task_launch(
+        harness.processor.as_ref(),
+        harness.workspace_id.as_str(),
+        "openai",
+        "gpt-5.4",
+        None,
+        None,
+        parent_turn_id,
+    )
+    .await
+    .expect("parent Agent launch should resolve");
+    parent_launch.execution.skill_ids = vec![skill_id.clone()];
+    parent_launch.execution.mcp_server_ids = vec![pioneer_protocol::mcp_server_capability_key(
+        McpScopeKind::Workspace,
+        "resend",
+    )];
+    let parent_turn = pioneer_protocol::TurnStartParams {
+        agent_delegation_routes: Vec::new(),
+        thread_id: parent_thread_id.to_owned(),
+        turn_id: parent_turn_id.to_owned(),
+        input: vec![UserInput::Text {
+            text: "Create the attached and background capability inheritance children.".to_owned(),
+            text_elements: Vec::new(),
+        }],
+        capabilities: selected.clone(),
+        model: Some("gpt-5.4".to_owned()),
+        model_provider: Some("openai".to_owned()),
+        sandbox_policy: None,
+        mode: Some(ThreadMode::Agent),
+        agent_launch: Some(parent_launch),
+        reply_to_turn_id: None,
+        mentioned_principal_ids: Vec::new(),
+        execution_backend: Some(AgentExecutionBackend::ApiProvider {
+            provider: "openai".to_owned(),
+        }),
+        reasoning: None,
+        permission_profile: None,
+        cli_runtime_options: None,
+    };
+    run_memory_e2e_turn_with_params(&mut harness, &parent_turn).await;
+
+    let tasks = harness
+        .processor
+        .task_runtime
+        .service()
+        .list_tasks(pioneer_protocol::TaskListParams {
+            workspace_id: harness.workspace_id.clone(),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .expect("task_create children should load");
+    assert_eq!(tasks.tasks.len(), 2, "both task_create calls must succeed");
+    let mut expected_ids = selected
+        .iter()
+        .map(|capability| capability.id.clone())
+        .collect::<Vec<_>>();
+    expected_ids.sort();
+    for (title, attachment, marker) in [
+        (
+            "Inherited attached child",
+            TaskAttachmentMode::Attached,
+            "CAPABILITY_INHERIT_CHILD_ATTACHED",
+        ),
+        (
+            "Inherited background child",
+            TaskAttachmentMode::Detached,
+            "CAPABILITY_INHERIT_CHILD_BACKGROUND",
+        ),
+    ] {
+        let task = tasks
+            .tasks
+            .iter()
+            .find(|task| task.title == title)
+            .expect("created child task");
+        assert_eq!(
+            task.lifecycle_policy
+                .as_ref()
+                .map(|policy| policy.attachment),
+            Some(attachment)
+        );
+        let contract = harness
+            .crud_store
+            .get_task_actor_contract(task.id.as_str())
+            .await
+            .expect("child actor contract should load")
+            .expect("child actor contract should be durable");
+        let launch = contract.launch.expect("child launch should be durable");
+        let persisted_ids = launch
+            .execution
+            .selected_capabilities
+            .iter()
+            .map(|capability| capability.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            persisted_ids, expected_ids,
+            "task_create must pin the exact parent selection"
+        );
+        assert!(
+            launch
+                .execution
+                .selected_capabilities
+                .iter()
+                .any(|capability| matches!(
+                    &capability.kind,
+                    TurnCapabilityKind::McpTool { server_name, raw_tool_name, .. }
+                        if server_name == "resend" && raw_tool_name == "send"
+                ))
+        );
+        assert!(
+            !launch
+                .execution
+                .selected_capabilities
+                .iter()
+                .any(|capability| matches!(&capability.kind, TurnCapabilityKind::McpServer { .. }))
+        );
+        assert!(
+            harness
+                .crud_store
+                .get_task_execution_admission(task.id.as_str())
+                .await
+                .expect("execution admission should load")
+                .is_some(),
+            "task_create must persist execution admission"
+        );
+
+        assert_eq!(
+            wait_for_task_status(
+                harness.crud_store.clone(),
+                task.id.as_str(),
+                TaskStatus::Completed
+            )
+            .await,
+            TaskStatus::Completed
+        );
+        let response = harness
+            .crud_store
+            .get_task(task.id.as_str())
+            .await
+            .expect("child task should reload")
+            .expect("child task should exist");
+        let run = response
+            .runs
+            .first()
+            .expect("immediate child must have a run");
+        let lineage =
+            wait_for_child_lineage_for_run(harness.crud_store.clone(), run.id.as_str()).await;
+        let snapshot = harness
+            .crud_store
+            .get_turn_runtime_snapshot(lineage.child_turn_id.as_str())
+            .await
+            .expect("child snapshot should load")
+            .expect("child snapshot should exist");
+        let child_capabilities = crate::turn_runtime_snapshot::restored_execution_capabilities(
+            snapshot.capabilities_json.as_str(),
+        )
+        .expect("child capabilities should restore");
+        let child_ids = child_capabilities
+            .iter()
+            .map(|capability| capability.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            child_ids, expected_ids,
+            "child runtime must receive the exact durable selection"
+        );
+        let child_request = provider
+            .snapshot_requests()
+            .into_iter()
+            .find(|request| {
+                request.tools.is_some()
+                    && request.messages.iter().any(|message| {
+                        message.role == pioneer_provider::Role::User
+                            && message.content.contains(marker)
+                    })
+            })
+            .expect("child model request should contain its task marker");
+        let tool_names = child_request
+            .tools
+            .expect("child model request should include tools")
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<HashSet<_>>();
+        assert!(
+            tool_names.contains("mcp_resend_send"),
+            "selected MCP tool must reach child runtime"
+        );
+        assert!(
+            !tool_names.contains("mcp_resend_domains"),
+            "other server tools must stay unselected"
+        );
+        assert!(
+            tool_names.contains("read_skill"),
+            "selected Skill must reach child runtime"
+        );
+    }
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+    let _ = std::fs::remove_dir_all(base_dir);
 }
 
 async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl() {
