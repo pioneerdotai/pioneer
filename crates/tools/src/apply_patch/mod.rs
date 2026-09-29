@@ -22,6 +22,7 @@ pub use executor::{
     Cancellation, ExecuteOptions, ExecutionReport, ExecutionStatus, NeverCancel, PatchExecutor,
     ValidationFailure, patch_telemetry,
 };
+pub(crate) use guards::validate_guard_candidates;
 pub use guards::{
     DestinationGuard, GuardError, GuardErrorCode, GuardFailure, ValidatedOperation,
     ValidatedPatchDocument, validate_guards, validate_guards_all,
@@ -33,13 +34,12 @@ pub use observer::{
     CommitAdmission, CommitObserver, DurableCommitObserver, InMemoryCommitObserver,
     ObserverAdmission, ObserverError, ObserverErrorCode,
 };
-pub use parser::{
-    AddFile, GuardSyntax, Hunk, HunkLine, Operation, OperationBody, OperationKind,
-    ParseError, ParseErrorCode, ParseFailure, ParseStopReason, PatchDocument, ReplaceFile,
-    UnverifiedRange, UpdateFile, parse, parse_validated,
-};
-pub(crate) use guards::validate_guard_candidates;
 pub(crate) use parser::GuardCandidate;
+pub use parser::{
+    AddFile, GuardSyntax, Hunk, HunkLine, Operation, OperationBody, OperationKind, ParseError,
+    ParseErrorCode, ParseFailure, ParseStopReason, PatchDocument, ReplaceFile, UnverifiedRange,
+    UpdateFile, parse, parse_validated,
+};
 pub use planner::{
     PlanError, PlanErrorCode, PlannedChange, PlannedPatch, PlannedSnapshot, VirtualFile,
     VirtualFileOrigin, VirtualWorkspace, plan, plan_with_candidate_limit, plan_with_limits,
