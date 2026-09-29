@@ -691,12 +691,21 @@ async fn projection_input_claims(
                 version: source.version.clone(),
             };
             if source.scope.starts_with("checkpoint:") {
-                let graph = resolver
+                let graph = match resolver
                     .resolve(store, workspace, Some(allowed), &source)
                     .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("accepted checkpoint input evidence is unavailable")
-                    })?;
+                {
+                    Some(graph) => graph,
+                    None => {
+                        if let Some(saved) = store
+                            .compaction_checkpoint_source(workspace, &origin.thread_id, &source.id)
+                            .await?
+                        {
+                            ensure!(saved == source, "checkpoint source revision changed");
+                        }
+                        anyhow::bail!("accepted checkpoint input evidence is unavailable");
+                    }
+                };
                 leaves.extend(graph.leaves.iter().cloned());
                 add_graph_input_claims(&mut claims, &graph);
             } else {
@@ -990,11 +999,10 @@ async fn project_checkpoint_with_input_claims(
         input_representative_replacements(context, &expanded, admitted_messages, &claims);
     let current_replacements =
         input_representative_replacements(context, &expanded, messages, &claims);
+    // A checkpoint can include another checkpoint's exact leaves across
+    // domains. Domain equality is required only for copy-alias comparison.
     let mut represented_coverage = admitted_leaves
         .values()
-        .filter(|(_, checkpoints, domain)| {
-            checkpoints.is_empty() || *domain == Some(expanded.coverage_domain)
-        })
         .flat_map(|(leaves, _, _)| leaves.iter().cloned())
         .collect::<BTreeSet<_>>();
     for (source, alias) in &admitted_replacements {
@@ -1028,12 +1036,18 @@ async fn project_checkpoint_with_input_claims(
             ProjectionBoundary("checkpoint exceeds the selected history boundary")
         );
     }
-    let existing_dominates = |leaves: &BTreeSet<ScopedHistorySource>| {
-        summary_covers(leaves, &expanded.leaves, &claims)
-            && (!summary_covers(&expanded.leaves, leaves, &claims)
-                || summary_copy_preference(leaves, &claims)
-                    >= summary_copy_preference(&expanded.leaves, &claims))
-    };
+    // Exact checkpoint containment is independent of coverage domain.
+    // A copy alias can establish dominance only within one domain.
+    let existing_dominates =
+        |leaves: &BTreeSet<ScopedHistorySource>,
+         domain: Option<pioneer_compaction::CoverageDomain>| {
+            (expanded.leaves.is_subset(leaves) && expanded.leaves != *leaves)
+                || (domain == Some(expanded.coverage_domain)
+                    && summary_covers(leaves, &expanded.leaves, &claims)
+                    && (!summary_covers(&expanded.leaves, leaves, &claims)
+                        || summary_copy_preference(leaves, &claims)
+                            >= summary_copy_preference(&expanded.leaves, &claims)))
+        };
     let candidate_dominates = |leaves: &BTreeSet<ScopedHistorySource>| {
         summary_covers(&expanded.leaves, leaves, &claims)
             && (!summary_covers(leaves, &expanded.leaves, &claims)
@@ -1054,15 +1068,12 @@ async fn project_checkpoint_with_input_claims(
         let mut selected = BTreeSet::new();
         let mut covered_by_other_checkpoint = false;
         for (index, (leaves, checkpoints, domain)) in leaves_by_message {
-            if !checkpoints.is_empty() && *domain != Some(expanded.coverage_domain) {
-                continue;
-            }
             // An applicable durable checkpoint already represents this
             // candidate. Its own stale copies still need replacement by the
             // current durable body.
             if !checkpoints.contains(&expanded.root)
                 && !checkpoints.is_empty()
-                && existing_dominates(leaves)
+                && existing_dominates(leaves, *domain)
             {
                 covered_by_other_checkpoint = true;
                 continue;
@@ -1073,7 +1084,9 @@ async fn project_checkpoint_with_input_claims(
                         || removable_replay_aliases.contains(leaf)
                         || replacements.contains_key(leaf)
                 };
-            let covered_summary = !checkpoints.is_empty() && candidate_dominates(leaves);
+            let covered_summary = !checkpoints.is_empty()
+                && *domain == Some(expanded.coverage_domain)
+                && candidate_dominates(leaves);
             if !covered_summary
                 && (!leaves.iter().any(covered_leaf) || !leaves.iter().all(covered_leaf))
             {
@@ -1213,7 +1226,7 @@ async fn project_checkpoint_with_input_claims(
             if !checkpoints.contains(&expanded.root)
                 && !checkpoints.is_empty()
                 && *domain == Some(expanded.coverage_domain)
-                && existing_dominates(leaves)
+                && existing_dominates(leaves, *domain)
             {
                 let origin = messages[*index]
                     .provenance
