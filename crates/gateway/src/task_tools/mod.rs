@@ -3024,12 +3024,12 @@ struct TaskCreateToolInput {
     /// Short concrete objective for the task executor. Put durable run instructions in instructions, task data in inputText/input, and result format in outputInstructions.
     goal: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Opaque destination from agent_start_options. Omit for the current
+    /// Opaque destination from threads_start_options. Omit for the current
     /// thread. A routed option is revalidated at Task commit and again for
     /// every occurrence; raw thread or route ids are never accepted here.
     target_option_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Optional child identity/profile selection from agent_start_options.
+    /// Optional child identity/profile selection from threads_start_options.
     /// Omit to inherit the currently bound agent identity and profile.
     launch: Option<AgentToolLaunchSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3788,7 +3788,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
     vec![
         task_tool_spec(
             TASK_CREATE_TOOL,
-            "Create a durable task or subagent. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and delivers the result to the origin thread. For scheduled, interval, and cron work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
+            "Create a durable task or attached subagent for delegation. threads_turn_start starts a thread turn without creating a task. For explicit launch or destination selection, call threads_start_options from the task domain; inherited launch needs no lookup. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and delivers the result to the origin thread. For scheduled, interval, and cron work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
             task_create_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Arguments,
@@ -5572,7 +5572,12 @@ mod tests {
 
         assert_eq!(
             actual.as_slice(),
-            pioneer_tools::BuiltinToolDomain::Task.tool_names()
+            pioneer_tools::BuiltinToolDomain::Task
+                .tool_names()
+                .iter()
+                .copied()
+                .filter(|name| name.starts_with("task_"))
+                .collect::<Vec<_>>()
         );
     }
 

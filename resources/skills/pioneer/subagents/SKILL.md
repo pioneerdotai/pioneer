@@ -35,8 +35,8 @@ Do not use this skill for scheduled, recurring, future, or long-running backgrou
 Before delegating, decide whether attached subagents improve the current answer.
 
 1. If the user needs one direct answer and the work is small, tightly coupled, or sequential, do it in the parent turn.
-2. If independent focused work improves speed, coverage, verification, or auditability, create attached subagents.
-3. Create all independent child tasks first.
+2. If independent focused work improves speed, coverage, verification, or auditability, use `task_create` to create attached subagents.
+3. Create all independent child tasks with `task_create` first.
 4. Call `task_wait` until the next child result is terminal or requires review.
 5. Review every returned terminal or review-required result immediately. Use the candidate's `reviewContent`; if it is truncated or no longer present in context, read the exact candidate again with `task_result`.
 6. Accept good candidates, revise close-but-incomplete candidates, cancel irrelevant or unsafe candidates, or detach work that should no longer block the parent.
@@ -69,6 +69,8 @@ If a needed task tool is hidden and `request_tools` is visible, request the task
 ```
 
 Do not request individual task tool names. Request the `task` domain.
+
+The `task` domain also exposes `threads_start_options`; opening `threads` separately is unnecessary to inspect task launch options. Call it when you need to choose an identity, execution profile, or permitted destination explicitly. For an ordinary attached task that inherits the parent's identity and profile, omit `launch` and `targetOptionId`; no preliminary options call is required. Options list permitted selections but do not grant execution rights. See `references/tool-schemas.md` for the exact fields.
 
 If the task domain cannot be opened, do not pretend a subagent was created, waited on, accepted, revised, cancelled, or detached.
 

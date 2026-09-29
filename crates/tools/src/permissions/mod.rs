@@ -575,10 +575,10 @@ fn extract_computer_use_permission_intent(invocation: &ToolInvocation) -> Option
 
 fn extract_agent_action_permission_intent(invocation: &ToolInvocation) -> Option<PermissionIntent> {
     let (operation, mutation) = match invocation.tool_name.as_str() {
-        "agent_start_options" => ("read agent start options", false),
+        "threads_start_options" => ("read agent start options", false),
         "thread_message_send" => ("send message to thread", true),
         "thread_create" => ("create thread", true),
-        "agent_start" => ("start agent", true),
+        "threads_turn_start" => ("start agent", true),
         _ => return None,
     };
 
@@ -2342,10 +2342,10 @@ mod tests {
         registered.insert("read_skill".to_owned());
         registered.extend(
             [
-                "agent_start_options",
+                "threads_start_options",
                 "thread_message_send",
                 "thread_create",
-                "agent_start",
+                "threads_turn_start",
             ]
             .map(str::to_owned),
         );
@@ -2408,10 +2408,10 @@ mod tests {
             ("threads_tools_result_read", PermissionActionKind::Internal),
             ("computer_use", PermissionActionKind::ComputerUse),
             ("read_skill", PermissionActionKind::Internal),
-            ("agent_start_options", PermissionActionKind::Internal),
+            ("threads_start_options", PermissionActionKind::Internal),
             ("thread_message_send", PermissionActionKind::AgentAction),
             ("thread_create", PermissionActionKind::AgentAction),
-            ("agent_start", PermissionActionKind::AgentAction),
+            ("threads_turn_start", PermissionActionKind::AgentAction),
         ]);
 
         let mut registered = crate::builtin_tool_specs()
@@ -2424,10 +2424,10 @@ mod tests {
         registered.insert("read_skill".to_owned());
         registered.extend(
             [
-                "agent_start_options",
+                "threads_start_options",
                 "thread_message_send",
                 "thread_create",
-                "agent_start",
+                "threads_turn_start",
             ]
             .map(str::to_owned),
         );
@@ -4022,7 +4022,7 @@ mod tests {
     fn agent_catalog_is_internal_but_agent_mutations_have_semantic_permissions() {
         let context = test_context(pioneer_protocol::TurnPermissionMode::Supervised);
         let options = invocation_for_tool(
-            "agent_start_options",
+            "threads_start_options",
             ToolPayload::Function {
                 arguments: serde_json::json!({}),
             },
@@ -4044,7 +4044,7 @@ mod tests {
                 serde_json::json!({ "optionId": "create_a" }),
             ),
             (
-                "agent_start",
+                "threads_turn_start",
                 serde_json::json!({ "targetOptionId": "target_a", "input": {}, "launch": {} }),
             ),
         ] {
@@ -4089,7 +4089,7 @@ mod tests {
                 serde_json::json!({ "title": "Second", "goal": "second-private-goal" }),
             ),
             (
-                "agent_start",
+                "threads_turn_start",
                 serde_json::json!({
                     "targetOptionId": "same-target",
                     "input": { "prompt": "first-private-agent-input" }
