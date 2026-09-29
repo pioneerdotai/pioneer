@@ -250,6 +250,44 @@ async fn source_creation_order_keeps_child_tool_work_before_later_parent_input()
             .collect::<Vec<_>>(),
         vec!["parent middle", "parent tie", "parent later"]
     );
+    // Production provider rounds retain fractions, but item events round to
+    // seconds. An outcome must not jump before its call within that second.
+    // Reused provider IDs in another round must not change this pairing.
+    for sql in [
+        "UPDATE turn_llm_context SET created_at='2026-09-29T10:00:00.250Z' WHERE id='child-call'",
+        "UPDATE turn_llm_context SET created_at='2026-09-29T10:00:00.750Z' WHERE id='child-result'",
+        "UPDATE turn_item SET created_at='2026-09-29T10:00:00Z' WHERE id='child-new'",
+    ] {
+        f.store
+            .database_connection()
+            .execute_unprepared(sql)
+            .await
+            .unwrap();
+    }
+    let call = once[1].clone();
+    let mut result = once[3].clone();
+    result.provenance.as_mut().unwrap().sources =
+        once[4].provenance.as_ref().unwrap().sources.clone();
+    let mut other_call = call.clone();
+    let origin = other_call.provenance.as_mut().unwrap();
+    origin.unit_id = "other-round".into();
+    origin.sources = once[3].provenance.as_ref().unwrap().sources.clone();
+    let expected = vec![call.clone(), result.clone(), other_call.clone()];
+    let mut mixed_precision = vec![other_call, call, result];
+    super::frozen::order_history_by_creation(&f.store, "ws", &mut mixed_precision)
+        .await
+        .unwrap();
+    assert_eq!(mixed_precision, expected);
+    super::frozen::order_history_by_creation(&f.store, "ws", &mut mixed_precision)
+        .await
+        .unwrap();
+    assert_eq!(mixed_precision, expected);
+    // A previously captured, incorrectly sorted snapshot must also recover.
+    mixed_precision.reverse();
+    super::frozen::order_history_by_creation(&f.store, "ws", &mut mixed_precision)
+        .await
+        .unwrap();
+    assert_eq!(mixed_precision, expected);
 }
 
 #[tokio::test]
@@ -341,8 +379,8 @@ async fn prepared_history_and_execution_restore_use_source_creation_order() {
     .await
     .unwrap();
     assert_eq!(contents(&working.messages), contents(&prepared.messages));
-    // Older inline snapshots use the same working order, without rewriting
-    // their serialized array or granting them a continuity proof.
+    // Inline arrays omit provenance, so they retain their recorded order and
+    // never gain a source identity or continuity proof from equal text.
     let legacy = serde_json::to_string(&old_messages).unwrap();
     let working = super::frozen::restore_accepted_history_for_execution(
         &f.store,
@@ -354,17 +392,23 @@ async fn prepared_history_and_execution_restore_use_source_creation_order() {
     )
     .await
     .unwrap();
-    assert_eq!(contents(&working.messages), contents(&prepared.messages));
+    assert_eq!(contents(&working.messages), contents(&old_messages));
     assert!(working.direct_sources.is_empty());
+    assert!(
+        working
+            .messages
+            .iter()
+            .all(|message| message.provenance.is_none())
+    );
     let working = super::frozen::restore_accepted_snapshot_for_execution_without_checkpoint(
         &f.store, "ws", "thread", "thread", &legacy,
     )
     .await
     .unwrap();
-    assert_eq!(contents(&working), contents(&prepared.messages));
+    assert_eq!(contents(&working), contents(&old_messages));
     assert_eq!(
         serde_json::from_str::<Vec<pioneer_provider::ChatMessage>>(&legacy).unwrap(),
-        old_messages
+        working
     );
 }
 
@@ -9694,7 +9738,16 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
         .execute_unprepared("UPDATE turn SET send_mode='agent' WHERE id='turn'")
         .await
         .unwrap();
+    let time = chrono::DateTime::parse_from_rfc3339("2026-09-29T10:00:00Z").unwrap();
+    f.store
+        .database_connection()
+        .execute_unprepared(
+            "UPDATE turn_input SET created_at='2026-09-29T09:59:00Z' WHERE turn_id='turn'",
+        )
+        .await
+        .unwrap();
     for (round, item, sequence) in [("round-one", "item-one", 1), ("round-two", "item-two", 3)] {
+        let round_time = time + chrono::Duration::seconds((sequence - 1) * 2);
         f.store
             .materialize_item_started(
                 ItemStartedNotification {
@@ -9707,7 +9760,7 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
                         content: vec![],
                     },
                 },
-                chrono::Utc::now().timestamp(),
+                round_time.timestamp(),
             )
             .await
             .unwrap();
@@ -9741,7 +9794,7 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
                 tool_name: None,
                 payload: serde_json::to_string(&envelope).unwrap(),
                 output_policy_snapshot: "{}".into(),
-                created_at: chrono::Utc::now().fixed_offset(),
+                created_at: round_time + chrono::Duration::seconds(1),
                 expires_at: None,
             })
             .await
@@ -9758,7 +9811,7 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
                         content: vec!["recorded reasoning".into()],
                     },
                 },
-                chrono::Utc::now().timestamp(),
+                (round_time + chrono::Duration::seconds(2)).timestamp(),
             )
             .await
             .unwrap();
@@ -9782,14 +9835,17 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
                     tool_name: Some("read_file".into()),
                     payload: serde_json::to_string(&view).unwrap(),
                     output_policy_snapshot: "{}".into(),
-                    created_at: chrono::Utc::now().fixed_offset(),
+                    created_at: round_time + chrono::Duration::seconds(3),
                     expires_at: None,
                 })
                 .await
                 .unwrap();
         }
     }
-    for id in ["observation-one", "observation-two"] {
+    for (index, id) in ["observation-one", "observation-two"]
+        .into_iter()
+        .enumerate()
+    {
         f.store
             .materialize_item_completed(
                 ItemCompletedNotification {
@@ -9804,7 +9860,7 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
                         markdown_version: None,
                     },
                 },
-                chrono::Utc::now().timestamp(),
+                (time + chrono::Duration::seconds(7 + index as i64)).timestamp(),
             )
             .await
             .unwrap();
@@ -9829,7 +9885,7 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
             tool_name: Some("read_file".into()),
             payload: serde_json::to_string(&view).unwrap(),
             output_policy_snapshot: "{}".into(),
-            created_at: chrono::Utc::now().fixed_offset(),
+            created_at: time + chrono::Duration::seconds(9),
             expires_at: None,
         })
         .await
@@ -9923,7 +9979,33 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
         .await
         .unwrap();
     assert_eq!(prepared.messages, restored_prepared);
-    assert_eq!(prepared.messages, current);
+    let mut remaining = current.clone();
+    for message in &prepared.messages {
+        let index = remaining
+            .iter()
+            .position(|original| original == message)
+            .expect("source ordering must preserve every canonical message exactly");
+        remaining.remove(index);
+    }
+    assert!(remaining.is_empty());
+    assert_eq!(
+        prepared
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "original request",
+            "",
+            "Reasoning recorded for a previous response:\nrecorded reasoning",
+            "first completed result",
+            "",
+            "Reasoning recorded for a previous response:\nrecorded reasoning",
+            "same observed text",
+            "same observed text",
+            "late result",
+        ]
+    );
     let prepared_scopes = super::frozen::accepted_history_scopes(
         &f.store,
         "ws",
@@ -10597,6 +10679,41 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
         )
         .await
         .unwrap();
+    let second_round_time = chrono::Utc::now().fixed_offset();
+    let second_assistant = ChatMessage::assistant_tool_calls(
+        None::<String>,
+        vec![ProviderToolCall {
+            id: "new-call".into(),
+            name: "exec_command".into(),
+            arguments: "{\"cmd\":\"printf new\"}".into(),
+        }],
+    );
+    let second_envelope = CanonicalProviderRoundEnvelope {
+        version: 1,
+        round_id: "new-round".into(),
+        termination: ProviderTermination::ToolCalls,
+        message: second_assistant,
+        calls: vec![ProviderCallIdentity {
+            provider_call_id: "new-call".into(),
+            turn_item_id: "covered-tool".into(),
+            ordinal: 0,
+        }],
+    };
+    f.store
+        .insert_turn_llm_context(NewTurnLlmContextEntry {
+            turn_id: second_turn.id.clone(),
+            item_id: Some("new-round".into()),
+            attempt_id: None,
+            sequence: 49,
+            source: "assistant_round".into(),
+            tool_name: None,
+            payload: serde_json::to_string(&second_envelope).unwrap(),
+            output_policy_snapshot: "{}".into(),
+            created_at: second_round_time,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
     let second_item = TurnItem::CommandExecution {
         id: "covered-tool".into(),
         tool_name: "exec_command".into(),
@@ -10638,7 +10755,7 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
                 turn_id: second_turn.id.clone(),
                 item: second_started_item,
             },
-            chrono::Utc::now().timestamp(),
+            (second_round_time + chrono::Duration::seconds(1)).timestamp(),
         )
         .await
         .unwrap();
@@ -10650,42 +10767,8 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
                 turn_id: second_turn.id.clone(),
                 item: second_item,
             },
-            chrono::Utc::now().timestamp(),
+            (second_round_time + chrono::Duration::seconds(2)).timestamp(),
         )
-        .await
-        .unwrap();
-    let second_assistant = ChatMessage::assistant_tool_calls(
-        None::<String>,
-        vec![ProviderToolCall {
-            id: "new-call".into(),
-            name: "exec_command".into(),
-            arguments: "{\"cmd\":\"printf new\"}".into(),
-        }],
-    );
-    let second_envelope = CanonicalProviderRoundEnvelope {
-        version: 1,
-        round_id: "new-round".into(),
-        termination: ProviderTermination::ToolCalls,
-        message: second_assistant,
-        calls: vec![ProviderCallIdentity {
-            provider_call_id: "new-call".into(),
-            turn_item_id: "covered-tool".into(),
-            ordinal: 0,
-        }],
-    };
-    f.store
-        .insert_turn_llm_context(NewTurnLlmContextEntry {
-            turn_id: second_turn.id.clone(),
-            item_id: Some("new-round".into()),
-            attempt_id: None,
-            sequence: 49,
-            source: "assistant_round".into(),
-            tool_name: None,
-            payload: serde_json::to_string(&second_envelope).unwrap(),
-            output_policy_snapshot: "{}".into(),
-            created_at: chrono::Utc::now().fixed_offset(),
-            expires_at: None,
-        })
         .await
         .unwrap();
     let second_replay = ChatMessage::tool_result("new-call", "exec_command", "new tool result");
@@ -10703,7 +10786,7 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
             tool_name: Some("exec_command".into()),
             payload: serde_json::to_string(&second_replay_view).unwrap(),
             output_policy_snapshot: "{}".into(),
-            created_at: chrono::Utc::now().fixed_offset(),
+            created_at: second_round_time + chrono::Duration::seconds(3),
             expires_at: None,
         })
         .await

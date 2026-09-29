@@ -29533,21 +29533,25 @@ async fn nested_cli_children_bootstrap_their_accepted_lineage_only_impl() {
         "editing an uncovered accepted ancestor must bridge into an isolated provider conversation"
     );
     let input = recovered.input.to_string();
-    let mut previous = input
+    let revised = input
         .find(revised_root_marker)
         .expect("the current accepted root revision must be restored");
     assert!(!input.contains(root_marker));
+    // Editing replaces the input with new source IDs and creation dates. Its
+    // current revision need not precede every already accepted child output.
+    let mut previous = None;
     for marker in &output_markers {
         let position = input
             .find(marker)
             .expect("each accepted nested output must be restored");
-        assert!(previous < position);
-        previous = position;
+        assert!(previous.is_none_or(|previous| previous < position));
+        previous = Some(position);
     }
     let current = input
         .find(current_marker)
         .expect("current question must be delivered once");
-    assert!(previous < current);
+    assert!(previous.unwrap() < current);
+    assert!(revised < current);
     assert_eq!(input.match_indices(current_marker).count(), 1);
     assert!(!input.contains(late_parent_marker));
     assert!(!input.contains(sibling_marker));
@@ -74590,6 +74594,14 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
                 .await
                 .unwrap();
         }
+        persist_test_execution_authorization_context_for_principal(
+            &harness.processor,
+            authenticated_test_superuser().as_ref(),
+            workspace,
+            thread_id,
+            current_turn,
+        )
+        .await;
         let settings = CompactionSettings {
             selection: Some(ModelSelection {
                 transport: Transport::Api,

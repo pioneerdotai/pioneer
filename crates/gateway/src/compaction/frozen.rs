@@ -2005,8 +2005,38 @@ pub(super) async fn order_history_by_creation(
                 .cloned()
         })
     };
+    let mut calls = BTreeMap::new();
+    for message in messages.iter() {
+        if let (Some(origin), Some(time)) = (&message.provenance, created_at(message)) {
+            for call in message.tool_calls.iter().flatten() {
+                calls.insert(
+                    (
+                        origin.thread_id.clone(),
+                        origin.unit_id.clone(),
+                        call.id.clone(),
+                    ),
+                    time,
+                );
+            }
+        }
+    }
+    let ordering_time = |message: &ChatMessage| {
+        let time = created_at(message)?;
+        // Item events have whole-second dates, while provider rounds retain
+        // fractions. That rounding cannot put an outcome before its own call.
+        if message.role == pioneer_provider::Role::Tool
+            && time.timestamp_subsec_nanos() == 0
+            && let (Some(origin), Some(id)) = (&message.provenance, &message.tool_call_id)
+            && let Some(call_time) =
+                calls.get(&(origin.thread_id.clone(), origin.unit_id.clone(), id.clone()))
+            && time.timestamp() == call_time.timestamp()
+        {
+            return Some((time.max(*call_time), time < *call_time));
+        }
+        Some((time, false))
+    };
     for span in messages.split_mut(|message| created_at(message).is_none()) {
-        span.sort_by_cached_key(&created_at);
+        span.sort_by_cached_key(&ordering_time);
     }
     Ok(())
 }
