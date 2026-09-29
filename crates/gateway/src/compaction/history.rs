@@ -2075,6 +2075,7 @@ async fn load_line_history_inner(
                         (use_input_rows || has_authoritative_event_input)
                             && row.projection_kind.as_deref() == Some("input_copy"),
                         true,
+                        false,
                     )?
                     else {
                         if row.projection_kind.as_deref() != Some("technical")
@@ -2206,24 +2207,34 @@ pub(super) fn historical_command_event_json(event: &Event) -> Result<Option<Stri
 /// Current canonical event renderer. Frozen restore also retains explicit
 /// digest-checked compatibility candidates for older manifests.
 pub(crate) fn event_message(event: Event) -> Result<Option<ChatMessage>> {
-    event_message_with_input_copy_policy(event, false, true)
+    event_message_with_input_copy_policy(event, false, true, false)
 }
 
 /// Exact pre-commentary renderer used only to validate older frozen wire hashes.
 pub(crate) fn pre_commentary_event_message(event: Event) -> Result<Option<ChatMessage>> {
-    event_message_with_input_copy_policy(event, false, false)
+    event_message_with_input_copy_policy(event, false, false, true)
+}
+
+pub(crate) fn pre_service_filter_event_message(event: Event) -> Result<Option<ChatMessage>> {
+    event_message_with_input_copy_policy(event, false, true, true)
 }
 
 pub(crate) fn pre_commentary_event_message_suppressing_input_copy_media(
     event: Event,
 ) -> Result<Option<ChatMessage>> {
-    event_message_with_input_copy_policy(event, true, false)
+    event_message_with_input_copy_policy(event, true, false, true)
+}
+
+pub(crate) fn pre_service_filter_event_message_suppressing_input_copy_media(
+    event: Event,
+) -> Result<Option<ChatMessage>> {
+    event_message_with_input_copy_policy(event, true, true, true)
 }
 
 pub(crate) fn event_message_suppressing_input_copy_media(
     event: Event,
 ) -> Result<Option<ChatMessage>> {
-    event_message_with_input_copy_policy(event, true, true)
+    event_message_with_input_copy_policy(event, true, true, false)
 }
 
 /// Wire-compatible renderer for frozen manifests written before typed
@@ -2285,9 +2296,15 @@ fn event_message_with_input_copy_policy(
     event: Event,
     suppress_non_artifact_input_copy_media: bool,
     project_commentary: bool,
+    historical_filter: bool,
 ) -> Result<Option<ChatMessage>> {
     use pioneer_crud::CanonicalEventModelProjection as Projection;
-    match pioneer_crud::canonical_event_model_projection(&event) {
+    let projection = if historical_filter {
+        pioneer_crud::canonical_event_model_projection_before_service_filter(&event)
+    } else {
+        pioneer_crud::canonical_event_model_projection(&event)
+    };
+    match projection {
         Projection::Omit => return Ok(None),
         Projection::Input => {
             return Ok(Some(match &event {

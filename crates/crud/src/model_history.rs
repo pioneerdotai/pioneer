@@ -37,12 +37,15 @@ fn meaningful_reasoning(summary: &[String], content: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn technical_system_event(item: &TurnItem) -> bool {
+fn technical_system_event(item: &TurnItem, service_filter: bool) -> bool {
     let TurnItem::SystemEvent { code, details, .. } = item else {
         return false;
     };
     match code.as_deref() {
         Some("agent_thread_status_changed") => true,
+        Some(
+            "agent_runtime_item_updated" | "cli_runtime_turn_steer" | "task.finalization.snapshot",
+        ) if service_filter => true,
         Some("agent_runtime_event") => {
             details
                 .as_ref()
@@ -89,6 +92,10 @@ fn system_event_text(item: &TurnItem) -> Option<String> {
 }
 
 pub fn canonical_item_model_projection(item: &TurnItem) -> CanonicalEventModelProjection {
+    item_model_projection(item, true)
+}
+
+fn item_model_projection(item: &TurnItem, service_filter: bool) -> CanonicalEventModelProjection {
     match item {
         TurnItem::Reasoning {
             summary, content, ..
@@ -103,7 +110,7 @@ pub fn canonical_item_model_projection(item: &TurnItem) -> CanonicalEventModelPr
                 ))
             }
         }
-        TurnItem::SystemEvent { .. } if technical_system_event(item) => {
+        TurnItem::SystemEvent { .. } if technical_system_event(item, service_filter) => {
             CanonicalEventModelProjection::Omit
         }
         TurnItem::SystemEvent { .. } => {
@@ -130,6 +137,20 @@ pub fn canonical_item_model_projection(item: &TurnItem) -> CanonicalEventModelPr
 pub fn canonical_event_model_projection(
     event: &CanonicalTurnEventPayload,
 ) -> CanonicalEventModelProjection {
+    event_model_projection(event, true)
+}
+
+/// Historical projection used only to authenticate frozen wire messages.
+pub fn canonical_event_model_projection_before_service_filter(
+    event: &CanonicalTurnEventPayload,
+) -> CanonicalEventModelProjection {
+    event_model_projection(event, false)
+}
+
+fn event_model_projection(
+    event: &CanonicalTurnEventPayload,
+    service_filter: bool,
+) -> CanonicalEventModelProjection {
     use CanonicalEventModelProjection as Projection;
     use CanonicalTurnEventPayload as Event;
     match event {
@@ -138,14 +159,17 @@ pub fn canonical_event_model_projection(
         Event::TurnStarted(_) | Event::TurnMessageEdited(_) | Event::TurnMessageDeleted(_) => {
             Projection::Omit
         }
-        Event::ItemStarted(value) if technical_system_event(&value.item) => Projection::Omit,
-        Event::ItemCompleted(value) => canonical_item_model_projection(&value.item),
+        Event::ItemStarted(value) if technical_system_event(&value.item, service_filter) => {
+            Projection::Omit
+        }
+        Event::ItemCompleted(value) => item_model_projection(&value.item, service_filter),
         Event::ItemUpdated(value) => match &value.item {
             // An update is not a completed assistant reply. Keep its historical
             // status envelope, while an empty update has no model body at all.
             TurnItem::AgentMessage { text, .. } if !text.trim().is_empty() => Projection::Default,
-            _ => canonical_item_model_projection(&value.item),
+            _ => item_model_projection(&value.item, service_filter),
         },
+        Event::ItemRetryAttemptStarted(_) if service_filter => Projection::Omit,
         Event::TurnExecutionWindowStarted(_)
         | Event::TurnExecutionWindowCheckpointed(_)
         | Event::TurnExecutionWindowContinued(_) => Projection::Omit,
@@ -166,6 +190,7 @@ pub fn canonical_event_model_projection(
             Projection::Omit
         }
         Event::TurnPermissionAudit(value) => Projection::User(permission_text(value)),
+        Event::TurnCompleted(_) if service_filter => Projection::Omit,
         Event::TurnCompleted(value) => {
             Projection::User(format!("Historical turn status: {:?}", value.turn.status))
         }
@@ -473,6 +498,84 @@ mod tests {
                 TurnPermissionProfileSource::Defaulted,
             ),
         }
+    }
+
+    #[test]
+    fn service_events_only_leave_the_current_model_projection() {
+        use pioneer_protocol::{
+            ItemRetryAttemptStartedNotification, TurnCompletedNotification, TurnItemType,
+        };
+
+        let completed_turn = CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn: turn(),
+        });
+        let retry = CanonicalTurnEventPayload::ItemRetryAttemptStarted(
+            ItemRetryAttemptStartedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item_id: "tool".into(),
+                item_type: TurnItemType::CommandExecution,
+                recovery_job_id: "recovery".into(),
+                attempt_number: 2,
+            },
+        );
+        for event in [completed_turn, retry] {
+            assert!(canonical_event_model_projection(&event).is_omitted());
+            assert!(!canonical_event_model_projection_before_service_filter(&event).is_omitted());
+            assert_eq!(
+                crate::compaction::event_projection_metadata(&event).1,
+                "technical"
+            );
+        }
+        for code in [
+            "agent_runtime_item_updated",
+            "cli_runtime_turn_steer",
+            "task.finalization.snapshot",
+        ] {
+            let item = system(code, Some(serde_json::json!({"synthetic": true})));
+            assert!(canonical_item_model_projection(&item).is_omitted());
+            let started =
+                CanonicalTurnEventPayload::ItemStarted(pioneer_protocol::ItemStartedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item: item.clone(),
+                });
+            assert!(canonical_event_model_projection(&started).is_omitted());
+            assert!(!canonical_event_model_projection_before_service_filter(&started).is_omitted());
+            for event in [
+                completed(item.clone()),
+                CanonicalTurnEventPayload::ItemUpdated(ItemUpdatedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item,
+                }),
+            ] {
+                assert!(canonical_event_model_projection(&event).is_omitted());
+                assert!(
+                    !canonical_event_model_projection_before_service_filter(&event).is_omitted()
+                );
+                assert_eq!(
+                    crate::compaction::event_projection_metadata(&event).1,
+                    "technical"
+                );
+            }
+        }
+        for code in ["diff_updated", "agent_plan_updated", "tool_result", "error"] {
+            assert!(!canonical_event_model_projection(&completed(system(code, None))).is_omitted());
+        }
+        assert!(
+            !canonical_event_model_projection(&completed(reasoning(&[], &["why it failed"])))
+                .is_omitted()
+        );
+        assert!(
+            !canonical_event_model_projection(&completed(agent_message("Final answer.")))
+                .is_omitted()
+        );
     }
 
     #[test]

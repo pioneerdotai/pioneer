@@ -111,6 +111,11 @@ pub(super) async fn project_compatible_checkpoint_with_resolver(
             match project_checkpoint_in_context(store, &context, &id, messages, resolver).await {
                 Ok(()) => return Ok(Some(id)),
                 Err(error) if error.downcast_ref::<ProjectionBoundary>().is_some() => {}
+                Err(error)
+                    if id != head
+                        && error
+                            .downcast_ref::<super::coverage::EmptyCheckpointCoverage>()
+                            .is_some() => {}
                 Err(error) => return Err(error),
             }
         }
@@ -265,6 +270,7 @@ pub(super) async fn project_accepted_checkpoints_with_boundary_evidence(
     }
     input_claims.mark_competing_owners();
     for (source_thread, owner, mut candidate) in candidates {
+        let head = candidate.clone();
         let mut seen = BTreeSet::new();
         while let Some(id) = candidate {
             ensure!(seen.insert(id.clone()), "cyclic checkpoint ancestry");
@@ -321,6 +327,11 @@ pub(super) async fn project_accepted_checkpoints_with_boundary_evidence(
                         break;
                     }
                     Err(error) if error.downcast_ref::<ProjectionBoundary>().is_some() => {}
+                    Err(error)
+                        if head.as_deref() != Some(id.as_str())
+                            && error
+                                .downcast_ref::<super::coverage::EmptyCheckpointCoverage>()
+                                .is_some() => {}
                     Err(error) => return Err(error),
                 }
             }

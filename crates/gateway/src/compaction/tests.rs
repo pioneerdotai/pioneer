@@ -353,6 +353,7 @@ async fn published_summary_stays_frozen_while_uncovered_commentary_uses_new_proj
         reasoning: None,
         compiled_prompt: None,
     };
+    let raw_request = request.clone();
     let settings = CompactionSettings {
         selection: Some(ModelSelection {
             transport: Transport::Api,
@@ -453,6 +454,95 @@ async fn published_summary_stays_frozen_while_uncovered_commentary_uses_new_proj
     assert_eq!(after.coverage, before.coverage);
     assert_eq!(after.previous, before.previous);
     assert_eq!(f.provider.calls.lock().unwrap().len(), calls_before);
+
+    let operations_before: i64 = f
+        .store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS count FROM compaction_operation".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "count")
+        .unwrap();
+    f.store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: pioneer_protocol::TurnItem::SystemEvent {
+                    id: "excluded-tail".into(),
+                    level: pioneer_protocol::SystemEventLevel::Info,
+                    message: "synthetic runtime update".into(),
+                    code: Some("agent_runtime_item_updated".into()),
+                    details: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    let repeated =
+        super::frozen::capture_execution_basis_prepared(&f.store, "ws", "thread", None, None, None)
+            .await
+            .unwrap();
+    assert_eq!(
+        repeated.descriptor.identity_sha256,
+        prepared.descriptor.identity_sha256
+    );
+    assert_eq!(repeated.messages, prepared.messages);
+    assert_eq!(
+        f.store
+            .compaction_head(&super::native_owner("ws", "thread"))
+            .await
+            .unwrap(),
+        Some(head)
+    );
+    assert_eq!(
+        serde_json::to_value(
+            f.store
+                .compaction_checkpoint(&after.id)
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&after).unwrap(),
+    );
+    let repeated_request = super::test_support::prepare_native_request(
+        &f.store,
+        &providers,
+        &settings,
+        &context,
+        raw_request,
+        None,
+        false,
+        f.observer.clone(),
+        f.clock.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        repeated_request.receipt.identity.checkpoint.as_deref(),
+        Some(after.id.as_str())
+    );
+    assert_eq!(f.provider.calls.lock().unwrap().len(), calls_before);
+    let operations_after: i64 = f
+        .store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS count FROM compaction_operation".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "count")
+        .unwrap();
+    assert_eq!(operations_after, operations_before);
 }
 
 #[test]
@@ -23911,6 +24001,54 @@ async fn partially_read_commentary_source_restarts_with_v4_text_and_exact_covera
             .coverage,
         [source]
     );
+
+    // The applied head is valid, but an older accepted boundary need not
+    // contain its source. Searching its ancestry must skip partial portions
+    // that completed no source rather than treating them as ready summaries.
+    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+    let mut outside_boundary = Vec::new();
+    assert_eq!(
+        super::checkpoint::project_compatible_checkpoint(
+            &f.store,
+            "ws",
+            "thread",
+            &partial.owner,
+            &head,
+            &allowed,
+            &mut outside_boundary,
+        )
+        .await
+        .unwrap(),
+        None
+    );
+    assert!(outside_boundary.is_empty());
+    let partial_source = f
+        .store
+        .compaction_checkpoint_source("ws", "thread", &partial.id)
+        .await
+        .unwrap()
+        .expect("completed operation retains its intermediate checkpoint");
+    assert!(
+        super::coverage::checkpoint_leaves(&f.store, "ws", &allowed, &partial_source)
+            .await
+            .unwrap_err()
+            .downcast_ref::<super::coverage::EmptyCheckpointCoverage>()
+            .is_some()
+    );
+    assert!(
+        super::checkpoint::project_compatible_checkpoint(
+            &f.store,
+            "ws",
+            "thread",
+            &partial.owner,
+            &partial.id,
+            &allowed,
+            &mut outside_boundary,
+        )
+        .await
+        .is_err(),
+        "an empty root must still fail when requested as the head"
+    );
 }
 
 #[tokio::test]
@@ -24420,4 +24558,657 @@ async fn legacy_task_basis_compact_and_reference_use_portable_source_text() {
     let reference_input: SummaryInput =
         serde_json::from_str(&reference_calls[0].messages[1].content).unwrap();
     assert_eq!(reference_input.reference_only[0].text, expected);
+}
+
+#[test]
+fn service_events_leave_current_summarizer_material() {
+    use pioneer_crud::CanonicalTurnEventPayload as Event;
+    use pioneer_protocol::{
+        ItemRetryAttemptStartedNotification, ItemUpdatedNotification, SystemEventLevel,
+        TurnCompletedNotification, TurnPermissionMode, TurnPermissionProfileSnapshot,
+        TurnPermissionProfileSource, TurnStatus,
+    };
+    let source = SourceRef {
+        scope: "event:turn".into(),
+        id: "synthetic-event".into(),
+        version: "event-revision:1".into(),
+    };
+    let system = |code: &str| pioneer_protocol::TurnItem::SystemEvent {
+        id: code.into(),
+        level: SystemEventLevel::Info,
+        message: "synthetic event".into(),
+        code: Some(code.into()),
+        details: None,
+    };
+    let mut excluded = Vec::new();
+    for code in [
+        "agent_runtime_item_updated",
+        "cli_runtime_turn_steer",
+        "task.finalization.snapshot",
+    ] {
+        excluded.push(Event::ItemStarted(
+            pioneer_protocol::ItemStartedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: system(code),
+            },
+        ));
+        excluded.push(Event::ItemCompleted(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: system(code),
+            },
+        ));
+        excluded.push(Event::ItemUpdated(ItemUpdatedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item: system(code),
+        }));
+    }
+    excluded.push(Event::TurnCompleted(TurnCompletedNotification {
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn: pioneer_protocol::Turn {
+            id: "turn".into(),
+            status: TurnStatus::Completed,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            mode: pioneer_protocol::ThreadMode::Chat,
+            author: None,
+            reply_to_turn_id: None,
+            mentions: vec![],
+            message_revision: 1,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::FullAccess,
+                TurnPermissionProfileSource::Defaulted,
+            ),
+        },
+    }));
+    excluded.push(Event::ItemRetryAttemptStarted(
+        ItemRetryAttemptStartedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item_id: "tool".into(),
+            item_type: TurnItemType::CommandExecution,
+            recovery_job_id: "recovery".into(),
+            attempt_number: 2,
+        },
+    ));
+    for event in excluded {
+        let payload = serde_json::to_string(&event).unwrap();
+        for version in 0..=COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION {
+            assert!(
+                model_source_payload_for_version(&source, payload.clone(), version)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            super::history::pre_service_filter_event_message(event.clone())
+                .unwrap()
+                .is_some()
+        );
+        assert!(super::history::event_message(event).unwrap().is_none());
+    }
+    for code in ["diff_updated", "agent_plan_updated", "tool_result", "error"] {
+        let event = Event::ItemCompleted(pioneer_protocol::ItemCompletedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item: system(code),
+        });
+        assert!(
+            model_source_payload_for_version(
+                &source,
+                serde_json::to_string(&event).unwrap(),
+                COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION,
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn cold_history_rechecks_old_cached_service_classification() {
+    let event = |item| {
+        serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item,
+            },
+        ))
+        .unwrap()
+    };
+    let service = event(pioneer_protocol::TurnItem::SystemEvent {
+        id: "service".into(),
+        level: pioneer_protocol::SystemEventLevel::Info,
+        message: "synthetic runtime update".into(),
+        code: Some("agent_runtime_item_updated".into()),
+        details: None,
+    });
+    let answer = event(pioneer_protocol::TurnItem::AgentMessage {
+        id: "answer".into(),
+        text: "meaningful answer".into(),
+        phase: Default::default(),
+        markdown: None,
+        markdown_version: None,
+    });
+    let f = fixture_with_canonical_payloads(vec![service, answer], vec![], true, false).await;
+    f.store.database_connection().execute_unprepared(
+        "UPDATE compaction_event_revision SET projection_revision=revision,projection_kind='observation' WHERE source_id='source'",
+    ).await.unwrap();
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let history = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].content, "meaningful answer");
+    let kind: String = f
+        .store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT projection_kind FROM compaction_event_revision WHERE source_id='source'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "projection_kind")
+        .unwrap();
+    assert_eq!(kind, "technical");
+}
+
+#[tokio::test]
+async fn new_admission_omits_service_sources_from_compact_and_reference_only() {
+    let event = |item| {
+        serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item,
+            },
+        ))
+        .unwrap()
+    };
+    let answer = |id: &str| pioneer_protocol::TurnItem::AgentMessage {
+        id: id.into(),
+        text: format!("meaningful {id}"),
+        phase: Default::default(),
+        markdown: None,
+        markdown_version: None,
+    };
+    let service = |id: &str, code: &str| pioneer_protocol::TurnItem::SystemEvent {
+        id: id.into(),
+        level: pioneer_protocol::SystemEventLevel::Info,
+        message: "synthetic runtime update".into(),
+        code: Some(code.into()),
+        details: None,
+    };
+    let f = fixture_with_canonical_payloads(
+        vec![
+            event(answer("compact-answer")),
+            event(service("compact-service", "agent_runtime_item_updated")),
+            event(answer("reference-answer")),
+            event(service("reference-service", "cli_runtime_turn_steer")),
+        ],
+        vec![],
+        true,
+        false,
+    )
+    .await;
+    let sources = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries;
+    let mut plan = f.runner.snapshot.plan.clone();
+    plan.fingerprint = "new-service-filter-plan".into();
+    let manifest = sources
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| ManifestEntry {
+            ordinal: index as u64,
+            unit: index as u64,
+            reference_only: index >= 2,
+            thread_id: "thread".into(),
+            source: entry.reference,
+        })
+        .collect();
+    let snapshot = admit_operation(
+        &f.store,
+        "ws",
+        "thread",
+        &CompactionSettings::default(),
+        &f.runner.snapshot.admission.selection,
+        None,
+        f.runner.summarizer.as_ref(),
+        PreparedOperation {
+            owner: "filtered-admission".into(),
+            execution_turn: "turn".into(),
+            source_projection: None,
+            expected_checkpoint: None,
+            summary_basis: None,
+            operation_deadline_ms: None,
+            projection_version: 0,
+            source_epochs: std::collections::BTreeMap::new(),
+            plan,
+            manifest,
+            target_identity: "filtered-target".into(),
+            target_tokens: 500,
+        },
+        10,
+    )
+    .await
+    .unwrap();
+    let compact = f
+        .store
+        .compaction_manifest_page(&snapshot.id, false, 0, 0)
+        .await
+        .unwrap();
+    let reference = f
+        .store
+        .compaction_manifest_page(&snapshot.id, true, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(compact.len(), 1);
+    assert_eq!(reference.len(), 1);
+    assert_eq!(compact[0].source.id, "source");
+    assert_eq!(reference[0].source.id, "source-2");
+    assert_eq!(compact[0].ordinal, 0);
+    assert_eq!(reference[0].ordinal, 1);
+}
+
+#[tokio::test]
+async fn frozen_service_event_authenticates_old_wire_before_execution_omits_it() {
+    use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
+    use pioneer_provider::ChatMessage;
+    use sha2::{Digest, Sha256};
+
+    let f = fixture("irrelevant", vec![], true, false).await;
+    f.store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+        .await
+        .unwrap();
+    let item = pioneer_protocol::TurnItem::SystemEvent {
+        id: "old-service-event".into(),
+        level: pioneer_protocol::SystemEventLevel::Info,
+        message: "synthetic runtime update".into(),
+        code: Some("agent_runtime_item_updated".into()),
+        details: None,
+    };
+    f.store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item,
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    let source = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.item_id.as_deref() == Some("old-service-event"))
+        .unwrap()
+        .reference;
+    let (_, mut turn) = f.store.get_turn("thread", "turn").await.unwrap().unwrap();
+    turn.status = pioneer_protocol::TurnStatus::Completed;
+    let mut extra = Vec::new();
+    for code in [
+        "agent_runtime_item_updated",
+        "cli_runtime_turn_steer",
+        "task.finalization.snapshot",
+    ] {
+        let item = pioneer_protocol::TurnItem::SystemEvent {
+            id: format!("service-{code}"),
+            level: pioneer_protocol::SystemEventLevel::Info,
+            message: "synthetic runtime update".into(),
+            code: Some(code.into()),
+            details: None,
+        };
+        extra.push(pioneer_crud::CanonicalTurnEventPayload::ItemStarted(
+            pioneer_protocol::ItemStartedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: item.clone(),
+            },
+        ));
+        if code != "agent_runtime_item_updated" {
+            extra.push(pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item: item.clone(),
+                },
+            ));
+        }
+        extra.push(pioneer_crud::CanonicalTurnEventPayload::ItemUpdated(
+            pioneer_protocol::ItemUpdatedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item,
+            },
+        ));
+    }
+    extra.push(pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(
+        pioneer_protocol::TurnCompletedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn,
+        },
+    ));
+    extra.push(
+        pioneer_crud::CanonicalTurnEventPayload::ItemRetryAttemptStarted(
+            pioneer_protocol::ItemRetryAttemptStartedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item_id: "tool".into(),
+                item_type: TurnItemType::CommandExecution,
+                recovery_job_id: "recovery".into(),
+                attempt_number: 2,
+            },
+        ),
+    );
+    for (index, event) in extra.iter().enumerate() {
+        f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','turn',?,?,?,CURRENT_TIMESTAMP)",
+            [
+                format!("synthetic-service-{index}").into(),
+                (100_i64 + index as i64).into(),
+                event.event_type().into(),
+                serde_json::to_string(event).unwrap().into(),
+            ],
+        )).await.unwrap();
+    }
+    let mut sources = vec![source];
+    sources.extend(
+        f.store
+            .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+            .await
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|entry| entry.reference.id.starts_with("synthetic-service-"))
+            .map(|entry| entry.reference),
+    );
+    let allowed = std::collections::BTreeSet::from(["thread".into()]);
+    for (source_index, source) in sources.into_iter().enumerate() {
+        let payload = f
+            .store
+            .compaction_reference_payload("ws", "thread", &source)
+            .await
+            .unwrap()
+            .unwrap();
+        let event: pioneer_crud::CanonicalTurnEventPayload =
+            serde_json::from_str(&payload).unwrap();
+        let old = super::history::pre_service_filter_event_message(event.clone())
+            .unwrap()
+            .unwrap();
+        let legacy = super::history::legacy_event_message(event)
+            .unwrap()
+            .unwrap();
+        let interrupted = ChatMessage::user(format!(
+            "Interrupted canonical round; some tool outcomes are unknown. Historical observation, not a new call:\n{}",
+            serde_json::to_string(&old).unwrap()
+        ));
+        for (index, wire) in [old, legacy, interrupted].into_iter().enumerate() {
+            let reference = FrozenMessageRef {
+                source_aliases: vec![],
+                ambiguous_input_aliases: vec![],
+                publication_aliases: None,
+                logical_turn_id: None,
+                source_thread: "thread".into(),
+                context_thread: None,
+                unit_id: format!("service-unit-{index}"),
+                sources: vec![source.clone()],
+                inherited: false,
+                complete: true,
+                protected_input: false,
+                wire_sha256: hex::encode(Sha256::digest(serde_json::to_vec(&wire).unwrap())),
+                replay_source: None,
+                tool_item_id: None,
+                tool_call_id: None,
+                tool_name: None,
+                event_input_role: None,
+            };
+            let bytes = serde_json::to_vec(&reference).unwrap();
+            let mut digest = Sha256::new();
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(&bytes);
+            let descriptor = FrozenHistoryRef {
+                format: pioneer_compaction::FORMAT_VERSION,
+                manifest_id: format!("old-service-manifest-{source_index}-{index}"),
+                messages: 1,
+                identity_sha256: hex::encode(digest.finalize()),
+            };
+            let corrupt_reference = (source_index == 0 && index == 0).then(|| {
+                let mut corrupt = reference.clone();
+                corrupt.wire_sha256 = "0".repeat(64);
+                corrupt
+            });
+            f.store
+                .compaction_begin_frozen_history("ws", "thread", &descriptor)
+                .await
+                .unwrap();
+            f.store
+                .compaction_append_frozen_history(
+                    "ws",
+                    "thread",
+                    &descriptor.manifest_id,
+                    0,
+                    &[reference],
+                )
+                .await
+                .unwrap();
+            assert!(
+                f.store
+                    .compaction_finish_frozen_history("ws", "thread", &descriptor)
+                    .await
+                    .unwrap()
+            );
+            let literal = super::frozen::restore(&f.store, "ws", &allowed, &descriptor)
+                .await
+                .unwrap();
+            assert_eq!(literal.len(), 1);
+            assert_eq!(literal[0].content, wire.content);
+            let execution = super::frozen::restore_accepted_history_for_execution(
+                &f.store,
+                "ws",
+                None,
+                "synthetic-execution",
+                &allowed,
+                &serde_json::to_string(&descriptor).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert!(execution.messages.is_empty());
+            if let Some(corrupt) = corrupt_reference {
+                let bytes = serde_json::to_vec(&corrupt).unwrap();
+                let mut digest = Sha256::new();
+                digest.update((bytes.len() as u64).to_be_bytes());
+                digest.update(&bytes);
+                let corrupt_descriptor = FrozenHistoryRef {
+                    format: pioneer_compaction::FORMAT_VERSION,
+                    manifest_id: "corrupt-service-manifest".into(),
+                    messages: 1,
+                    identity_sha256: hex::encode(digest.finalize()),
+                };
+                f.store
+                    .compaction_begin_frozen_history("ws", "thread", &corrupt_descriptor)
+                    .await
+                    .unwrap();
+                f.store
+                    .compaction_append_frozen_history(
+                        "ws",
+                        "thread",
+                        &corrupt_descriptor.manifest_id,
+                        0,
+                        &[corrupt],
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    f.store
+                        .compaction_finish_frozen_history("ws", "thread", &corrupt_descriptor)
+                        .await
+                        .unwrap()
+                );
+                assert!(
+                    super::frozen::restore(&f.store, "ws", &allowed, &corrupt_descriptor)
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    super::frozen::restore_accepted_history_for_execution(
+                        &f.store,
+                        "ws",
+                        None,
+                        "synthetic-execution",
+                        &allowed,
+                        &serde_json::to_string(&corrupt_descriptor).unwrap(),
+                    )
+                    .await
+                    .is_err()
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn published_checkpoint_keeps_coverage_of_newly_hidden_service_event() {
+    let f = fixture("meaningful source", vec![], true, false).await;
+    let event = pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+        pioneer_protocol::ItemCompletedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item: pioneer_protocol::TurnItem::SystemEvent {
+                id: "covered-service".into(),
+                level: pioneer_protocol::SystemEventLevel::Info,
+                message: "synthetic runtime update".into(),
+                code: Some("agent_runtime_item_updated".into()),
+                details: None,
+            },
+        },
+    );
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('covered-service','thread','turn',2,?,?,CURRENT_TIMESTAMP)",
+        [event.event_type().into(), serde_json::to_string(&event).unwrap().into()],
+    )).await.unwrap();
+    let sources = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries;
+    let covered = sources
+        .iter()
+        .map(|entry| ("thread".into(), entry.reference.clone()))
+        .collect::<Vec<(String, SourceRef)>>();
+    assert_eq!(covered.len(), 2);
+    let checkpoint = publish_projection_checkpoint(
+        &f,
+        "thread",
+        "service-covered-checkpoint",
+        &covered,
+        pioneer_compaction::CoverageDomain::OwnContribution,
+    )
+    .await;
+    assert_eq!(checkpoint.coverage.len(), 2);
+    let before_operations: i64 = f
+        .store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS count FROM compaction_operation",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "count")
+        .unwrap();
+    let first =
+        super::frozen::capture_execution_basis_prepared(&f.store, "ws", "thread", None, None, None)
+            .await
+            .unwrap();
+    let second =
+        super::frozen::capture_execution_basis_prepared(&f.store, "ws", "thread", None, None, None)
+            .await
+            .unwrap();
+    assert_eq!(
+        first.descriptor.identity_sha256,
+        second.descriptor.identity_sha256
+    );
+    assert_eq!(first.messages, second.messages);
+    let rendered = first
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<String>();
+    assert!(rendered.contains(&checkpoint.summary));
+    assert!(!rendered.contains("synthetic runtime update"));
+    assert_eq!(
+        f.store.compaction_head(&checkpoint.owner).await.unwrap(),
+        Some(checkpoint.id.clone())
+    );
+    let saved = f
+        .store
+        .compaction_checkpoint(&checkpoint.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.coverage.len(), checkpoint.coverage.len());
+    assert_eq!(
+        saved
+            .coverage
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        checkpoint
+            .coverage
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert_eq!(saved.summary, checkpoint.summary);
+    let after_operations: i64 = f
+        .store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS count FROM compaction_operation",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "count")
+        .unwrap();
+    assert_eq!(after_operations, before_operations);
+    assert!(f.provider.calls.lock().unwrap().is_empty());
 }

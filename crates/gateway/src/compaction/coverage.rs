@@ -13,6 +13,19 @@ const DEFAULT_GRAPH_CACHE_UNITS: usize = 4 * 1024;
 const DEFAULT_PAYLOAD_CACHE_BYTES: usize = 256 * 1024;
 const MAX_HISTORICAL_GRAPH_NODES: usize = 65_536;
 
+/// A retained runner portion may precede the first fully consumed source.
+/// It is not a standalone summary, but may occur in a published head's ancestry.
+#[derive(Debug)]
+pub(super) struct EmptyCheckpointCoverage;
+
+impl std::fmt::Display for EmptyCheckpointCoverage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("checkpoint has no historical coverage")
+    }
+}
+
+impl std::error::Error for EmptyCheckpointCoverage {}
+
 #[cfg(test)]
 static NEXT_RESOLVER_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
@@ -571,7 +584,6 @@ impl CheckpointGraphResolver {
                     .map(|covered| (covered.source, covered.source_thread, false)),
             );
         }
-        ensure!(!leaves.is_empty(), "checkpoint has no historical coverage");
         aliases.validate_targets(
             &leaves
                 .iter()
@@ -581,6 +593,7 @@ impl CheckpointGraphResolver {
                 })
                 .collect(),
         )?;
+        ensure!(!leaves.is_empty(), EmptyCheckpointCoverage);
         let (replay_aliases, ambiguous_input_aliases, input_replay_aliases) = aliases.into_parts();
         Ok(Some(Arc::new(ResolvedCheckpointGraph {
             leaves,
