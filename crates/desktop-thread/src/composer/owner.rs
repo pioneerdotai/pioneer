@@ -287,7 +287,11 @@ impl ComposerView {
         cx.notify();
     }
     pub(super) fn controlled_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.composer_editor_draft = self.composer_input.as_ref().map(|input| input.draft_id());
+        let draft_id = self.composer_input.as_ref().map(|input| input.draft_id());
+        let draft_switched = draft_id.is_some()
+            && self.composer_editor_draft.is_some()
+            && draft_id != self.composer_editor_draft;
+        self.composer_editor_draft = draft_id;
         let text = self
             .composer_input
             .as_ref()
@@ -295,6 +299,16 @@ impl ComposerView {
             .unwrap_or_default();
         self.composer_state.update(cx, |state, cx| {
             if state.value().as_str() != text {
+                // Marked IME edits reach the buffer without emitting
+                // InputEvent::Change, so the draft trails the value for the
+                // whole composition and every publication update would
+                // otherwise rewrite the buffer, cancel the composition and
+                // reset the caret. The commit's Change event re-syncs the
+                // draft, so the rewrite becomes a no-op. A genuine draft swap
+                // (edit mode, epoch fence) must still land.
+                if !draft_switched && state.marked_text_range(window, cx).is_some() {
+                    return;
+                }
                 state.set_value(text, window, cx);
             }
         });
@@ -757,6 +771,141 @@ mod tests {
             host.read_with(cx, |host, _| host.screen.downgrade())
                 .upgrade()
                 .is_some()
+        );
+    }
+
+    #[gpui_kit::test]
+    fn ime_marked_composition_survives_non_composer_publication(cx: &mut TestAppContext) {
+        use gpui_kit::EntityInputHandler as _;
+        use pioneer_client::{
+            core::{
+                ClientMutationAuthority, ClientRevisions, ClientTransitionOutcome, ScopedRevision,
+            },
+            gateway::session_controller::GatewaySessionPublication,
+            state::{
+                client_state::{GatewayConnectionState, GatewayStatusLevel},
+                reducers::{GatewayStatusProjection, GatewayStatusTextUpdate},
+            },
+        };
+        fn publish_session_connected(client: &ClientCore, authority: &ClientMutationAuthority) {
+            let scope = ClientScope::Session;
+            let previous = client
+                .snapshot(&scope)
+                .map(|p| p.revisions())
+                .unwrap_or_default();
+            let revisions = ClientRevisions::new(
+                previous.domain(),
+                previous.presentation(),
+                previous.content(),
+                ScopedRevision::new(previous.scoped().get() + 1),
+            );
+            let mut session = GatewaySessionPublication::default();
+            session.status = Some(GatewayStatusProjection {
+                status: GatewayStatusTextUpdate::KeepExisting,
+                status_level: GatewayStatusLevel::Neutral,
+                connection_state: GatewayConnectionState::Connected,
+                clear_gateway_error: false,
+            });
+            assert_eq!(
+                client
+                    .publish(authority, scope, revisions, Arc::new(session), vec![])
+                    .outcome(),
+                ClientTransitionOutcome::Changed
+            );
+        }
+        cx.update(gpui_kit::init);
+        let client = Arc::new(ClientCore::new());
+        crate::test_support::install_thread_timeline(&client, "a", "row");
+        client.composer_intent(ComposerIntent::Open {
+            thread_id: "a".into(),
+            defaults: Default::default(),
+        });
+        let (registrar, deliver) = crate::test_support::binding_router(client.clone());
+        let screen_binding = ThreadBindings::new(registrar.clone(), "a", vec![]);
+        let composer_binding = ThreadBindings::new(registrar, "a", vec![]);
+        deliver();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let ports = Arc::new(crate::test_support::ThreadPorts);
+            let screen = TimelineView::new(
+                client.clone(),
+                "a".into(),
+                screen_binding.clone(),
+                ports.clone(),
+                ports.clone(),
+                1,
+                window,
+                cx,
+            );
+            let composer = ComposerView::new(
+                client.clone(),
+                "a".into(),
+                composer_binding.clone(),
+                screen.downgrade(),
+                ports,
+                Arc::new(Audio(AtomicUsize::new(0))),
+                1,
+                window,
+                cx,
+            );
+            let host = cx.new(|_| Host {
+                composer: Some(composer),
+                screen,
+            });
+            Root::new(host, window, cx)
+        });
+        cx.run_until_parked();
+        let host = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<Host>().unwrap()
+        });
+        let composer = host.read_with(cx, |host, _| host.composer.clone().unwrap());
+        let input = composer.read_with(cx, |view, _| view.composer_state.clone());
+        cx.update(|window, cx| input.update(cx, |state, cx| state.focus(window, cx)));
+        cx.simulate_input("hello");
+        deliver();
+        cx.run_until_parked();
+        assert_eq!(client.composer_snapshot("a").unwrap().draft().text, "hello");
+
+        // The platform IME delivers marked text for an in-flight pinyin
+        // composition. Marked edits never emit InputEvent::Change, so the
+        // draft stays behind the buffer until the composition commits.
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_and_mark_text_in_range(None, "ni", Some(2..2), window, cx);
+            });
+        });
+        let mut marked_start: Option<usize> = None;
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                assert_eq!(state.value().to_string(), "helloni");
+                marked_start = state.marked_text_range(window, cx).map(|r| r.start);
+            });
+        });
+        assert!(
+            marked_start.is_some(),
+            "composition must be active before the publication lands"
+        );
+
+        // Any watched publication changes mid-composition (session status,
+        // streaming timeline, presence) and wakes the owner binding task.
+        let authority = ClientMutationAuthority::for_test();
+        publish_session_connected(&client, &authority);
+        deliver();
+        cx.run_until_parked();
+
+        let value_after = input.read_with(cx, |state, _| state.value().to_string());
+        assert_eq!(
+            value_after, "helloni",
+            "an unrelated publication must not rewrite the buffer mid-composition"
+        );
+        let mut marked_after: Option<usize> = None;
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                marked_after = state.marked_text_range(window, cx).map(|r| r.start);
+            });
+        });
+        assert_eq!(
+            marked_after, marked_start,
+            "the composition must survive the publication update"
         );
     }
 }
