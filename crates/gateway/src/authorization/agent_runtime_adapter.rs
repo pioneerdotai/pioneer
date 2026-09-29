@@ -1033,7 +1033,13 @@ pub(crate) fn action_id_for_call(call_id: &str) -> AgentActionId {
 pub(crate) fn idempotency_key_for_call(call_id: &str, tool: AgentModelToolName) -> String {
     let mut digest = Sha256::new();
     digest.update(b"pioneer:agent-runtime:model-tool:v1\0");
-    digest.update(tool.as_str().as_bytes());
+    // Keep keys for actions committed before the model-facing rename stable.
+    let stable_name = match tool {
+        AgentModelToolName::StartAgent => "agent_start",
+        AgentModelToolName::AgentStartOptions => "agent_start_options",
+        _ => tool.as_str(),
+    };
+    digest.update(stable_name.as_bytes());
     digest.update([0]);
     digest.update(call_id.as_bytes());
     hex::encode(digest.finalize())
@@ -1474,6 +1480,10 @@ mod tests {
         let key = idempotency_key_for_call("provider-call-1", AgentModelToolName::StartAgent);
         assert_eq!(key.len(), 64);
         assert!(!key.contains("provider-call-1"));
+        let mut original = Sha256::new();
+        original.update(b"pioneer:agent-runtime:model-tool:v1\0");
+        original.update(b"agent_start\0provider-call-1");
+        assert_eq!(key, hex::encode(original.finalize()));
     }
 
     #[test]

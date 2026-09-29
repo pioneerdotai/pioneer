@@ -6308,8 +6308,8 @@ impl Provider for DirectAgentSandboxProvider {
                 test_turn_preflight_response_with_visible_tools(&["exec_command"])
             } else {
                 test_turn_preflight_response_with_visible_tools(&[
-                    "agent_start_options",
-                    "agent_start",
+                    "threads_start_options",
+                    "threads_turn_start",
                 ])
             });
         }
@@ -6347,7 +6347,7 @@ impl Provider for DirectAgentSandboxProvider {
                 termination: pioneer_provider::ProviderTermination::ToolCalls,
                 tool_calls: vec![ProviderToolCall {
                     id: "call_direct_agent_options".to_owned(),
-                    name: "agent_start_options".to_owned(),
+                    name: "threads_start_options".to_owned(),
                     arguments: json!({}).to_string(),
                 }],
             },
@@ -6355,7 +6355,7 @@ impl Provider for DirectAgentSandboxProvider {
                 let target_option_id = current_agent_target_option_from_request(&request)
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "agent_start_options output did not contain a current-thread target: {:#?}",
+                            "threads_start_options output did not contain a current-thread target: {:#?}",
                             request.messages
                         )
                     })?;
@@ -6367,7 +6367,7 @@ impl Provider for DirectAgentSandboxProvider {
                     termination: pioneer_provider::ProviderTermination::ToolCalls,
                     tool_calls: vec![ProviderToolCall {
                         id: "call_direct_agent_start".to_owned(),
-                        name: "agent_start".to_owned(),
+                        name: "threads_turn_start".to_owned(),
                         arguments: json!({
                             "targetOptionId": target_option_id,
                             "input": [{

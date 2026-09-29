@@ -68,6 +68,8 @@ pub(crate) struct TurnPreflightToolsInput {
 pub(crate) struct TurnPreflightCandidateTool {
     pub name: String,
     pub domain: BuiltinToolDomain,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_domains: Vec<BuiltinToolDomain>,
     pub summary: String,
     pub mutation: bool,
 }
@@ -83,6 +85,7 @@ pub(crate) fn turn_preflight_tools_input_from_index(
             .map(|candidate| TurnPreflightCandidateTool {
                 name: candidate.name,
                 domain: candidate.domain,
+                additional_domains: candidate.additional_domains,
                 summary: candidate.summary,
                 mutation: candidate.mutation,
             })
@@ -2216,12 +2219,14 @@ mod tests {
                     TurnPreflightCandidateTool {
                         name: "memory_search".to_owned(),
                         domain: BuiltinToolDomain::Memory,
+                        additional_domains: Vec::new(),
                         summary: "Search durable memory for relevant facts.".to_owned(),
                         mutation: false,
                     },
                     TurnPreflightCandidateTool {
                         name: "memory_get".to_owned(),
                         domain: BuiltinToolDomain::Memory,
+                        additional_domains: Vec::new(),
                         summary: "Read one durable memory record by id.".to_owned(),
                         mutation: false,
                     },
@@ -2464,6 +2469,7 @@ mod tests {
             candidate_tools: vec![pioneer_tools::PreflightCandidateToolDescriptor {
                 name: "memory_search".to_owned(),
                 domain: BuiltinToolDomain::Memory,
+                additional_domains: Vec::new(),
                 summary: "Search durable memory.".to_owned(),
                 mutation: false,
             }],
@@ -2513,12 +2519,14 @@ mod tests {
                 pioneer_tools::PreflightCandidateToolDescriptor {
                     name: "memory_search".to_owned(),
                     domain: BuiltinToolDomain::Memory,
+                    additional_domains: Vec::new(),
                     summary: "Search durable memory.".to_owned(),
                     mutation: false,
                 },
                 pioneer_tools::PreflightCandidateToolDescriptor {
                     name: "task_create".to_owned(),
                     domain: BuiltinToolDomain::Task,
+                    additional_domains: Vec::new(),
                     summary: "Create a subtask.".to_owned(),
                     mutation: true,
                 },

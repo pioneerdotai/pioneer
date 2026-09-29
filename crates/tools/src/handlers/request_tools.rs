@@ -87,6 +87,7 @@ impl RequestToolsHandler {
         let mut already_visible = BTreeMap::new();
         let mut blocked = Vec::new();
         let mut unknown_or_unavailable = Vec::new();
+        let mut newly_added = BTreeSet::new();
         let blocked_tool_names = self
             .blocked_tool_names
             .read()
@@ -111,10 +112,11 @@ impl RequestToolsHandler {
                     continue;
                 }
 
-                if visible_tool_names.contains(*tool_name) {
+                if visible_tool_names.contains(*tool_name) || newly_added.contains(*tool_name) {
                     domain_already_visible.push((*tool_name).to_owned());
                 } else {
                     domain_added.push((*tool_name).to_owned());
+                    newly_added.insert(*tool_name);
                 }
             }
 
@@ -359,6 +361,111 @@ mod tests {
             unavailable.unknown_or_unavailable[0].tools,
             vec!["computer_use".to_owned()]
         );
+    }
+
+    #[tokio::test]
+    async fn shared_tool_is_added_once_across_domains_and_still_obeys_registration_and_policy() {
+        let catalog = [
+            "request_tools",
+            "threads_start_options",
+            "threads_turn_start",
+            "thread_create",
+            "thread_message_send",
+        ];
+        let snapshot = visibility(&catalog);
+        assert!(snapshot.contains_name("request_tools").await);
+        for name in &catalog[1..] {
+            assert!(!snapshot.contains_name(name).await);
+        }
+        let handler = RequestToolsHandler::new(
+            snapshot.clone(),
+            catalog[1..].iter().map(|name| (*name).to_owned()),
+        );
+
+        let task_only = handler
+            .resolve(&serde_json::json!({
+                "domains": ["task"], "reason": "Choose a task launch."
+            }))
+            .await
+            .expect("task domain resolves");
+        assert_eq!(
+            task_only.added.get("task"),
+            Some(&vec!["threads_start_options".to_owned()])
+        );
+        assert!(!task_only.added.values().flatten().any(|name| {
+            matches!(
+                name.as_str(),
+                "thread_create" | "thread_message_send" | "threads_turn_start"
+            )
+        }));
+        assert!(!snapshot.contains_name("threads_start_options").await);
+
+        let both = handler
+            .resolve(&serde_json::json!({
+                "domains": ["threads", "task", "threads"], "reason": "Use thread and task tools."
+            }))
+            .await
+            .expect("both domains resolve");
+        assert_eq!(both.added["threads"].len(), 4);
+        assert!(!both.added.contains_key("task"));
+        assert_eq!(
+            both.already_visible["task"],
+            vec!["threads_start_options".to_owned()]
+        );
+
+        snapshot
+            .set_visible_by_name(&[
+                "request_tools".to_owned(),
+                "threads_start_options".to_owned(),
+            ])
+            .await;
+        assert!(snapshot.contains_name("threads_start_options").await);
+        let repeated = handler
+            .resolve(&serde_json::json!({
+                "domains": ["task", "threads"], "reason": "Use both domains again."
+            }))
+            .await
+            .expect("repeated domains resolve");
+        assert!(
+            !repeated
+                .added
+                .values()
+                .flatten()
+                .any(|name| name == "threads_start_options")
+        );
+        assert_eq!(
+            repeated.already_visible["task"],
+            vec!["threads_start_options".to_owned()]
+        );
+        assert_eq!(
+            repeated.already_visible["threads"],
+            vec!["threads_start_options".to_owned()]
+        );
+
+        let restricted_visibility = visibility(&catalog);
+        let blocked =
+            RequestToolsHandler::new(restricted_visibility, ["threads_start_options".to_owned()])
+                .with_blocked_tool_names([(
+                    "threads_start_options".to_owned(),
+                    "blocked_by_host_policy".to_owned(),
+                )]);
+        let restricted = blocked
+            .resolve(&serde_json::json!({
+                "domains": ["threads", "task"], "reason": "Inspect restrictions."
+            }))
+            .await
+            .expect("restricted domains resolve");
+        assert!(restricted.added.is_empty());
+        assert_eq!(restricted.blocked.len(), 2);
+        assert!(
+            restricted
+                .blocked
+                .iter()
+                .all(|entry| { entry.tools == vec!["threads_start_options".to_owned()] })
+        );
+        assert!(restricted.unknown_or_unavailable.iter().any(|entry| {
+            entry.domain == "threads" && entry.tools.contains(&"thread_create".to_owned())
+        }));
     }
 
     #[tokio::test]

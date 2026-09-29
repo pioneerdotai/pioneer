@@ -8064,9 +8064,11 @@ mod tests {
     }
 
     fn all_lazy_domain_tool_names() -> Vec<&'static str> {
+        let mut seen = BTreeSet::new();
         pioneer_tools::builtin_tool_domain_map()
             .iter()
             .flat_map(|(_, tool_names)| tool_names.iter().copied())
+            .filter(|name| seen.insert(*name))
             .collect()
     }
 
@@ -8809,6 +8811,7 @@ mod tests {
         assert_eq!(
             BuiltinToolDomain::Task.tool_names(),
             [
+                "threads_start_options",
                 "task_create",
                 "task_wait",
                 "task_result",
