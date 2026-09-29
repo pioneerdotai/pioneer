@@ -20,11 +20,12 @@ pub use authorize::{
 };
 pub use executor::{
     Cancellation, ExecuteOptions, ExecutionReport, ExecutionStatus, NeverCancel, PatchExecutor,
-    patch_telemetry,
+    ValidationFailure, patch_telemetry,
 };
+pub(crate) use guards::validate_guard_candidates;
 pub use guards::{
-    DestinationGuard, GuardError, GuardErrorCode, ValidatedOperation, ValidatedPatchDocument,
-    validate_guards,
+    DestinationGuard, GuardError, GuardErrorCode, GuardFailure, ValidatedOperation,
+    ValidatedPatchDocument, validate_guards, validate_guards_all,
 };
 pub use matcher::{
     MatchError, MatchErrorCode, MatchResult, apply_update, apply_update_with_candidate_limit,
@@ -33,9 +34,11 @@ pub use observer::{
     CommitAdmission, CommitObserver, DurableCommitObserver, InMemoryCommitObserver,
     ObserverAdmission, ObserverError, ObserverErrorCode,
 };
+pub(crate) use parser::GuardCandidate;
 pub use parser::{
     AddFile, GuardSyntax, Hunk, HunkLine, Operation, OperationBody, OperationKind, ParseError,
-    ParseErrorCode, PatchDocument, ReplaceFile, UpdateFile, parse,
+    ParseErrorCode, ParseFailure, ParseStopReason, PatchDocument, ReplaceFile, UnverifiedRange,
+    UpdateFile, parse, parse_validated,
 };
 pub use planner::{
     PlanError, PlanErrorCode, PlannedChange, PlannedPatch, PlannedSnapshot, VirtualFile,
@@ -46,8 +49,9 @@ pub use prepare::{
     PreparedPatch, ResolvedPatch, prepare, prepare_resolved, resolve_patch,
 };
 pub use provider_adapter::{
-    NativePatchAdapterError, NativePatchChange, NativePatchError, NativePatchOutcome,
-    NativePatchTracking, NativePatchTrackingStatus, normalize_native_patch_payload,
-    project_apply_patch_outcome,
+    NativePatchAdapterError, NativePatchChange, NativePatchDiagnosticGroup, NativePatchError,
+    NativePatchLineRange, NativePatchOutcome, NativePatchTracking, NativePatchTrackingStatus,
+    NativePatchValidation, normalize_native_patch_payload, project_apply_patch_outcome,
+    project_execution_report,
 };
 pub use telemetry::{PatchTelemetry, PatchTelemetrySnapshot, TelemetryStage};

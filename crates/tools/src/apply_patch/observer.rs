@@ -444,6 +444,7 @@ impl CommitObserver for DurableCommitObserver {
             match intent.status {
                 crate::apply_patch::history::IntentStatus::AppliedNoChange => {
                     return Ok(Some(ExecutionReport {
+                        validation: None,
                         status: ExecutionStatus::Applied,
                         delta: AppliedPatchDelta::empty().with_exactness(true),
                         failure: None,
@@ -451,6 +452,7 @@ impl CommitObserver for DurableCommitObserver {
                 }
                 crate::apply_patch::history::IntentStatus::FailedNoChange => {
                     return Ok(Some(ExecutionReport {
+                        validation: None,
                         status: ExecutionStatus::Failed,
                         delta: AppliedPatchDelta::empty().with_exactness(true),
                         failure: Some(PatchDiagnostic {
@@ -467,6 +469,7 @@ impl CommitObserver for DurableCommitObserver {
                 }
                 crate::apply_patch::history::IntentStatus::Rejected => {
                     return Ok(Some(ExecutionReport {
+                        validation: None,
                         status: ExecutionStatus::Rejected,
                         delta: AppliedPatchDelta::empty().with_exactness(true),
                         failure: None,
@@ -571,6 +574,7 @@ impl CommitObserver for DurableCommitObserver {
                 crate::apply_patch::history::IntentStatus::AppliedNoChange => {
                     return Ok(ObserverAdmission::Existing {
                         report: ExecutionReport {
+                            validation: None,
                             status: ExecutionStatus::Applied,
                             delta: AppliedPatchDelta::empty().with_exactness(true),
                             failure: None,
@@ -580,6 +584,7 @@ impl CommitObserver for DurableCommitObserver {
                 crate::apply_patch::history::IntentStatus::FailedNoChange => {
                     return Ok(ObserverAdmission::Existing {
                         report: ExecutionReport {
+                            validation: None,
                             status: ExecutionStatus::Failed,
                             delta: AppliedPatchDelta::empty().with_exactness(true),
                             failure: Some(PatchDiagnostic {
@@ -598,6 +603,7 @@ impl CommitObserver for DurableCommitObserver {
                 crate::apply_patch::history::IntentStatus::Rejected => {
                     return Ok(ObserverAdmission::Existing {
                         report: ExecutionReport {
+                            validation: None,
                             status: ExecutionStatus::Rejected,
                             delta: AppliedPatchDelta::empty().with_exactness(true),
                             failure: None,
@@ -813,6 +819,7 @@ fn report_from_record(record: &crate::apply_patch::history::AppliedPatchRecord) 
     delta.side_effects = record.side_effects.clone();
     delta.exact &= delta.side_effects.exact;
     ExecutionReport {
+        validation: None,
         status,
         delta,
         failure,
@@ -1066,6 +1073,7 @@ mod tests {
 
     fn report() -> ExecutionReport {
         ExecutionReport {
+            validation: None,
             status: ExecutionStatus::Applied,
             delta: AppliedPatchDelta::empty(),
             failure: None,
@@ -1074,6 +1082,7 @@ mod tests {
 
     fn failed_without_delta() -> ExecutionReport {
         ExecutionReport {
+            validation: None,
             status: ExecutionStatus::Failed,
             delta: AppliedPatchDelta::empty(),
             failure: Some(PatchDiagnostic {

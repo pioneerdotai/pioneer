@@ -4,6 +4,7 @@ use crate::apply_patch::file_mutation::{
     PatchDiagnostic, PatchError, PatchErrorCode, PatchLimits, PatchRequest, PatchRequestSource,
 };
 use crate::apply_patch::history::{ApplyPatchOutcome, ChangeKind, PatchSideEffects};
+use crate::apply_patch::{ExecutionReport, ValidationFailure};
 use pioneer_provider::{NATIVE_FILE_TOOL_SCHEMA_VERSION, NativePatchPayload, NativePatchWireShape};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as JsonValue};
@@ -105,6 +106,8 @@ pub struct NativePatchOutcome {
     pub side_effects: PatchSideEffects,
     pub failed_stage: Option<String>,
     pub error: Option<NativePatchError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<NativePatchValidation>,
     pub tracking: NativePatchTracking,
 }
 
@@ -140,6 +143,21 @@ impl NativePatchOutcome {
                     .replace(old_path.as_str(), absolute_path.as_str());
             }
             error.path = Some(absolute_path);
+            if error.path.as_ref().is_some_and(|path| {
+                serde_json::to_vec(path)
+                    .map_or(true, |bytes| bytes.len() > MAX_VALIDATION_DISPLAY_BYTES / 4)
+            }) {
+                error.path = None;
+                error.path_truncated = true;
+            }
+        }
+        if let Some(validation) = self.validation.as_mut() {
+            for diagnostic in &mut validation.diagnostics {
+                if let Some(path) = diagnostic.path.as_mut() {
+                    *path = absolute_display_path(execution_root, path);
+                }
+            }
+            bound_validation_paths(validation);
         }
     }
 }
@@ -198,10 +216,56 @@ pub struct NativePatchError {
     pub message: String,
     pub operation_index: Option<u32>,
     pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub path_truncated: bool,
     pub guard_horizon: Option<String>,
     pub retryability: String,
     pub next_action: String,
     pub retry_same_patch: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativePatchValidation {
+    pub stage: String,
+    pub syntax_complete: bool,
+    pub later_stages_checked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unchecked_from_line: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unverified_ranges: Vec<NativePatchLineRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// Known only when the syntax scan completed. Later pipeline stages have
+    /// not run for a syntax rejection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_violations: Option<usize>,
+    pub observed_violations: usize,
+    pub shown_violations: usize,
+    pub display_truncated: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub details_truncated: bool,
+    pub diagnostics: Vec<NativePatchDiagnosticGroup>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativePatchDiagnosticGroup {
+    pub code: String,
+    pub column: usize,
+    pub operation_index: Option<u32>,
+    pub operation: Option<String>,
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub path_truncated: bool,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub message_truncated: bool,
+    pub lines: Vec<NativePatchLineRange>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativePatchLineRange {
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -310,13 +374,280 @@ pub fn project_apply_patch_outcome(outcome: &ApplyPatchOutcome) -> NativePatchOu
             message: diagnostic.message.clone(),
             operation_index: diagnostic.operation_index,
             path: diagnostic.path.clone(),
+            path_truncated: false,
             guard_horizon: diagnostic.guard_horizon.map(enum_name),
             retryability: enum_name(diagnostic.retryability),
             next_action: next_action_for(diagnostic),
             retry_same_patch: false,
         }),
+        validation: None,
         tracking: NativePatchTracking::default(),
     }
+}
+
+/// Project the canonical report before its legacy single-failure outcome is
+/// consumed. The validation collection is authoritative; `error` is its
+/// first-item compatibility view.
+pub fn project_execution_report(mut report: ExecutionReport) -> NativePatchOutcome {
+    let validation_failure = report.validation.take();
+    let mut projected = project_apply_patch_outcome(&report.into_outcome());
+    if let Some(failure) = &validation_failure {
+        let validation = render_validation(failure);
+        if let Some(error) = projected.error.as_mut() {
+            let (operation_index, path) = match failure {
+                ValidationFailure::Syntax(failure) => (
+                    failure.first().operation_index,
+                    failure.first().path.clone(),
+                ),
+                ValidationFailure::Guards(failure) => {
+                    let first = &failure.diagnostics[0];
+                    (
+                        Some(first.operation_index.try_into().unwrap_or(u32::MAX)),
+                        first.path.clone(),
+                    )
+                }
+                ValidationFailure::SyntaxAndGuards { syntax, guards } => {
+                    if guards.diagnostics[0].line < syntax.first().line {
+                        let first = &guards.diagnostics[0];
+                        (
+                            Some(first.operation_index.try_into().unwrap_or(u32::MAX)),
+                            first.path.clone(),
+                        )
+                    } else {
+                        (syntax.first().operation_index, syntax.first().path.clone())
+                    }
+                }
+            };
+            error.operation_index = operation_index;
+            error.path_truncated = path.as_ref().is_some_and(|path| {
+                serde_json::to_vec(path)
+                    .map_or(true, |bytes| bytes.len() > MAX_VALIDATION_DISPLAY_BYTES / 4)
+            });
+            error.path = if error.path_truncated { None } else { path };
+            error.next_action = if !validation.syntax_complete {
+                "Correct the listed syntax issues and inspect the unverified patch lines or reported limit. Later stages were not checked; submit a new patch.".to_owned()
+            } else if validation.display_truncated {
+                "Correct the listed issues; the display is truncated, so inspect the full patch for additional violations. Submit a new patch. Later stages were not checked.".to_owned()
+            } else {
+                "Correct every listed issue and submit a new patch. Later stages were not checked."
+                    .to_owned()
+            };
+        }
+        projected.validation = Some(validation);
+    }
+    projected
+}
+
+const MAX_VALIDATION_DISPLAY_BYTES: usize = 8 * 1024;
+
+fn bound_validation_paths(validation: &mut NativePatchValidation) {
+    while serde_json::to_vec(&validation.diagnostics).map_or(usize::MAX, |bytes| bytes.len())
+        > MAX_VALIDATION_DISPLAY_BYTES
+    {
+        if let Some(group) = validation
+            .diagnostics
+            .iter_mut()
+            .filter(|group| group.path.is_some())
+            .max_by_key(|group| group.path.as_ref().map_or(0, |path| path.len()))
+        {
+            group.path = None;
+            group.path_truncated = true;
+            validation.details_truncated = true;
+            continue;
+        }
+        let Some(last) = validation.diagnostics.last_mut() else {
+            break;
+        };
+        if last.lines.len() > 1 {
+            let range = last.lines.pop().expect("nonempty lines");
+            validation.shown_violations -= range.end - range.start + 1;
+        } else if validation.diagnostics.len() > 1 {
+            let group = validation.diagnostics.pop().expect("nonempty diagnostics");
+            validation.shown_violations -= group
+                .lines
+                .iter()
+                .map(|range| range.end - range.start + 1)
+                .sum::<usize>();
+        } else {
+            break;
+        }
+        validation.display_truncated = true;
+    }
+}
+
+fn render_validation(failure: &ValidationFailure) -> NativePatchValidation {
+    let mut grouped: Vec<NativePatchDiagnosticGroup> = Vec::new();
+    let (syntax, guards, stage) = match failure {
+        ValidationFailure::Syntax(syntax) => (Some(syntax), None, "syntax"),
+        ValidationFailure::Guards(guards) => (None, Some(guards), "guards"),
+        ValidationFailure::SyntaxAndGuards { syntax, guards } => {
+            (Some(syntax), Some(guards), "syntax_and_guards")
+        }
+    };
+    if let Some(syntax) = syntax {
+        for diagnostic in &syntax.diagnostics {
+            append_group(
+                &mut grouped,
+                enum_name(diagnostic.code),
+                diagnostic.operation_index,
+                diagnostic.operation.map(enum_name),
+                diagnostic.path.clone(),
+                diagnostic.message.clone(),
+                diagnostic.line,
+                diagnostic.column,
+            );
+        }
+    }
+    if let Some(guards) = guards {
+        for diagnostic in &guards.diagnostics {
+            append_group(
+                &mut grouped,
+                enum_name(diagnostic.code),
+                Some(diagnostic.operation_index.try_into().unwrap_or(u32::MAX)),
+                Some(enum_name(diagnostic.operation)),
+                diagnostic.path.clone(),
+                diagnostic.message.clone(),
+                diagnostic.line,
+                1,
+            );
+        }
+    }
+    grouped.sort_by_key(|group| group.lines[0].start);
+    let syntax_complete = syntax.is_none_or(|syntax| {
+        syntax.unchecked_from_line.is_none() && syntax.unverified_ranges.is_empty()
+    });
+    let unchecked_from_line = syntax.and_then(|syntax| syntax.unchecked_from_line);
+    let unverified_ranges = syntax.map_or_else(Vec::new, |syntax| {
+        syntax
+            .unverified_ranges
+            .iter()
+            .map(|range| NativePatchLineRange {
+                start: range.start,
+                end: range.end,
+            })
+            .collect()
+    });
+    let stop_reason = syntax.and_then(|syntax| syntax.stop_reason.map(enum_name));
+    let observed_violations = syntax.map_or(0, |syntax| syntax.diagnostics.len())
+        + guards.map_or(0, |guards| guards.diagnostics.len());
+
+    let mut diagnostics: Vec<NativePatchDiagnosticGroup> = Vec::new();
+    let mut used_bytes = 0usize;
+    let mut shown_violations = 0usize;
+    let mut details_truncated = false;
+    'groups: for group in grouped {
+        let mut visible = NativePatchDiagnosticGroup {
+            lines: Vec::new(),
+            ..group.clone()
+        };
+        for range in group.lines {
+            let before = serde_json::to_vec(&visible).map_or(0, |json| json.len());
+            visible.lines.push(range);
+            let mut after = serde_json::to_vec(&visible).map_or(usize::MAX, |json| json.len());
+            if used_bytes.saturating_add(if visible.lines.len() == 1 {
+                after
+            } else {
+                after.saturating_sub(before)
+            }) > MAX_VALIDATION_DISPLAY_BYTES
+                && visible.lines.len() == 1
+            {
+                // Keep the code, position and operation identity even when an
+                // escaped path or description would consume the whole budget.
+                if visible.path.take().is_some() {
+                    visible.path_truncated = true;
+                    details_truncated = true;
+                    after = serde_json::to_vec(&visible).map_or(usize::MAX, |json| json.len());
+                }
+                if used_bytes.saturating_add(after) > MAX_VALIDATION_DISPLAY_BYTES {
+                    visible.message = "Description omitted to fit response".to_owned();
+                    visible.message_truncated = true;
+                    details_truncated = true;
+                    after = serde_json::to_vec(&visible).map_or(usize::MAX, |json| json.len());
+                }
+            }
+            let extra = if visible.lines.len() == 1 {
+                after
+            } else {
+                after.saturating_sub(before)
+            };
+            if used_bytes.saturating_add(extra) > MAX_VALIDATION_DISPLAY_BYTES {
+                visible.lines.pop();
+                if !visible.lines.is_empty() {
+                    diagnostics.push(visible);
+                }
+                break 'groups;
+            }
+            used_bytes += extra;
+            shown_violations += range.end - range.start + 1;
+        }
+        diagnostics.push(visible);
+    }
+    let mut validation = NativePatchValidation {
+        stage: stage.to_owned(),
+        syntax_complete,
+        later_stages_checked: false,
+        unchecked_from_line,
+        unverified_ranges,
+        stop_reason,
+        total_violations: syntax_complete.then_some(observed_violations),
+        observed_violations,
+        shown_violations,
+        display_truncated: shown_violations < observed_violations,
+        details_truncated,
+        diagnostics,
+    };
+    bound_validation_paths(&mut validation);
+    validation
+}
+
+fn append_group(
+    grouped: &mut Vec<NativePatchDiagnosticGroup>,
+    code: String,
+    operation_index: Option<u32>,
+    operation: Option<String>,
+    path: Option<String>,
+    message: String,
+    line: usize,
+    column: usize,
+) {
+    if let Some(group) = grouped.iter_mut().find(|group| {
+        group.code == code
+            && group.column == column
+            && group.operation_index == operation_index
+            && group.operation == operation
+            && group.path == path
+            && group.message == message
+    }) {
+        if let Some(last) = group.lines.last_mut()
+            && last.end.checked_add(1) == Some(line)
+        {
+            last.end = line;
+        } else {
+            group.lines.push(NativePatchLineRange {
+                start: line,
+                end: line,
+            });
+        }
+    } else {
+        grouped.push(NativePatchDiagnosticGroup {
+            code,
+            column,
+            operation_index,
+            operation,
+            path,
+            path_truncated: false,
+            message,
+            message_truncated: false,
+            lines: vec![NativePatchLineRange {
+                start: line,
+                end: line,
+            }],
+        });
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn next_action_for(diagnostic: &PatchDiagnostic) -> String {
@@ -409,6 +740,9 @@ mod tests {
     use super::*;
     use crate::apply_patch::file_mutation::{
         GuardHorizon, PatchDiagnostic, PatchErrorCode, PatchStage, Retryability,
+    };
+    use crate::apply_patch::{
+        ExecutionReport, parse_validated, validate_guard_candidates, validate_guards_all,
     };
 
     #[test]
@@ -526,5 +860,173 @@ mod tests {
         let mut missing_tracking = value;
         missing_tracking.as_object_mut().unwrap().remove("tracking");
         assert!(serde_json::from_value::<NativePatchOutcome>(missing_tracking).is_err());
+    }
+
+    fn rejected_text(text: &str) -> NativePatchOutcome {
+        let request = PatchRequest::from_provider_text(
+            text,
+            PatchRequestSource::NativeFreeform,
+            PatchLimits::default(),
+        )
+        .unwrap();
+        let failure = parse_validated(&request, PatchLimits::default()).unwrap_err();
+        project_execution_report(ExecutionReport::rejected_parse_failure(&failure))
+    }
+
+    #[test]
+    fn projection_groups_adjacent_lines_and_keeps_all_small_diagnostics() {
+        let projected = rejected_text(
+            "*** Begin Patch\n*** Add File: a.txt\nwrong\nalso wrong\n+valid\nwrong again\n*** Add File: b.txt\nwrong\n*** End Patch",
+        );
+        let validation = projected.validation.unwrap();
+        assert_eq!(validation.stage, "syntax");
+        assert!(validation.syntax_complete);
+        assert!(!validation.later_stages_checked);
+        assert_eq!(validation.total_violations, Some(4));
+        assert_eq!(validation.shown_violations, 4);
+        assert!(!validation.display_truncated);
+        assert_eq!(validation.diagnostics.len(), 2);
+        assert_eq!(
+            validation.diagnostics[0].lines,
+            vec![
+                NativePatchLineRange { start: 3, end: 4 },
+                NativePatchLineRange { start: 6, end: 6 },
+            ]
+        );
+        assert_eq!(validation.diagnostics[1].path.as_deref(), Some("b.txt"));
+    }
+
+    #[test]
+    fn completed_scan_with_short_display_differs_from_stopped_scan() {
+        let mut patch = String::from("*** Begin Patch\n*** Add File: a.txt\n");
+        for _ in 0..600 {
+            patch.push_str("wrong\n+valid\n");
+        }
+        patch.push_str("*** End Patch");
+        let projected = rejected_text(&patch);
+        let validation = projected.validation.unwrap();
+        assert!(validation.syntax_complete);
+        assert_eq!(validation.total_violations, Some(600));
+        assert!(validation.display_truncated);
+        assert!(validation.shown_violations < 600);
+        assert_eq!(validation.stop_reason, None);
+
+        let stopped = rejected_text(
+            "*** Begin Patch\n*** Add File: a.txt\nwrong\n*** Unknown: x\n*** End Patch",
+        );
+        let validation = stopped.validation.unwrap();
+        assert!(!validation.syntax_complete);
+        assert_eq!(validation.total_violations, None);
+        assert_eq!(
+            validation.stop_reason.as_deref(),
+            Some("ambiguous_structure")
+        );
+        assert_eq!(validation.unchecked_from_line, Some(4));
+        assert!(!validation.display_truncated);
+    }
+
+    #[test]
+    fn guard_diagnostics_reach_the_same_model_projection() {
+        let request = PatchRequest::from_provider_text(
+            "*** Begin Patch\n*** Delete File: a.txt\n*** If-Match: bad\n*** Delete File: b.txt\n*** If-Match: bad\n*** End Patch",
+            PatchRequestSource::NativeFreeform, PatchLimits::default(),
+        ).unwrap();
+        let document = parse_validated(&request, PatchLimits::default()).unwrap();
+        let failure = validate_guards_all(document).unwrap_err();
+        let projected = project_execution_report(ExecutionReport::rejected_guard_failure(&failure));
+        let value = serde_json::to_value(&projected).unwrap();
+        assert_eq!(value["validation"]["stage"], "guards");
+        assert_eq!(value["validation"]["total_violations"], 2);
+        assert_eq!(
+            value["validation"]["diagnostics"][0]["code"],
+            "invalid_source_guard"
+        );
+        assert_eq!(value["validation"]["diagnostics"][1]["path"], "b.txt");
+        assert_eq!(value["error"]["code"], "invalid_version_token");
+    }
+
+    #[test]
+    fn mixed_validation_uses_earliest_position_for_compatibility_error() {
+        let request = PatchRequest::from_provider_text(
+            "*** Begin Patch\n*** Delete File: a.txt\n*** If-Match: bad\n*** Add File: b.txt\nwrong\n*** End Patch",
+            PatchRequestSource::NativeFreeform, PatchLimits::default(),
+        ).unwrap();
+        let syntax = parse_validated(&request, PatchLimits::default()).unwrap_err();
+        let guards = validate_guard_candidates(&syntax.guard_candidates);
+        let projected = project_execution_report(ExecutionReport::rejected_syntax_and_guards(
+            &syntax, &guards,
+        ));
+        assert_eq!(
+            projected.error.as_ref().unwrap().code,
+            "invalid_version_token"
+        );
+        let validation = projected.validation.unwrap();
+        assert_eq!(validation.stage, "syntax_and_guards");
+        assert_eq!(validation.total_violations, Some(2));
+        assert_eq!(validation.diagnostics[0].code, "invalid_source_guard");
+        assert_eq!(validation.diagnostics[1].code, "missing_add_prefix");
+    }
+
+    #[test]
+    fn resource_stop_never_claims_observed_examples_are_the_total() {
+        let limits = PatchLimits {
+            max_total_hunks: 1,
+            ..PatchLimits::default()
+        };
+        let request = PatchRequest::from_provider_text(
+            "*** Begin Patch\n*** Add File: a.txt\nwrong\nalso wrong\n*** End Patch",
+            PatchRequestSource::NativeFreeform,
+            limits,
+        )
+        .unwrap();
+        let failure = parse_validated(&request, limits).unwrap_err();
+        let value = serde_json::to_value(project_execution_report(
+            ExecutionReport::rejected_parse_failure(&failure),
+        ))
+        .unwrap();
+        assert_eq!(value["validation"]["stop_reason"], "resource_limit");
+        assert!(value["validation"].get("total_violations").is_none());
+        assert_eq!(value["validation"]["observed_violations"], 1);
+    }
+
+    #[test]
+    fn invalid_path_body_is_checked_without_claiming_later_stages() {
+        let projected = rejected_text(
+            "*** Begin Patch\n*** Add File:\nwrong\n*** Add File: next.txt\nwrong\n*** End Patch",
+        );
+        let validation = projected.validation.unwrap();
+        assert!(validation.syntax_complete);
+        assert_eq!(validation.unchecked_from_line, None);
+        assert!(validation.unverified_ranges.is_empty());
+        assert_eq!(validation.total_violations, Some(3));
+        assert_eq!(validation.observed_violations, 3);
+        assert!(!validation.later_stages_checked);
+    }
+
+    #[test]
+    fn escaped_path_cannot_hide_the_only_concrete_diagnostic() {
+        let path = "\"".repeat(PatchLimits::default().max_path_bytes as usize);
+        let patch = format!("*** Begin Patch\n*** Add File: {path}\nwrong\n*** End Patch");
+        let projected = rejected_text(&patch);
+        let validation = projected.validation.as_ref().unwrap();
+        assert_eq!(validation.total_violations, Some(1));
+        assert_eq!(validation.shown_violations, 1);
+        assert!(!validation.display_truncated);
+        assert!(validation.details_truncated);
+        assert_eq!(validation.diagnostics[0].code, "missing_add_prefix");
+        assert_eq!(validation.diagnostics[0].operation_index, Some(0));
+        assert_eq!(validation.diagnostics[0].operation.as_deref(), Some("add"));
+        assert_eq!(
+            validation.diagnostics[0].lines[0],
+            NativePatchLineRange { start: 3, end: 3 }
+        );
+        assert!(validation.diagnostics[0].path.is_none());
+        assert!(validation.diagnostics[0].path_truncated);
+        assert!(projected.error.as_ref().unwrap().path_truncated);
+        assert!(projected.error.as_ref().unwrap().path.is_none());
+        assert!(
+            serde_json::to_vec(&validation.diagnostics).unwrap().len()
+                <= MAX_VALIDATION_DISPLAY_BYTES
+        );
     }
 }

@@ -14,8 +14,9 @@ use crate::apply_patch::observer::{
     CommitAdmission, CommitObserver, ObserverAdmission, ObserverError,
 };
 use crate::apply_patch::{
-    AuthorizedPatch, GuardError, GuardErrorCode, ParseError, ParseErrorCode, PlanError,
-    PlanErrorCode, PlannedChange, PlannedPatch, PrepareError, PrepareErrorCode, PreparedPatch,
+    AuthorizedPatch, GuardError, GuardErrorCode, GuardFailure, ParseError, ParseErrorCode,
+    ParseFailure, PlanError, PlanErrorCode, PlannedChange, PlannedPatch, PrepareError,
+    PrepareErrorCode, PreparedPatch,
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -79,15 +80,29 @@ pub enum ExecutionStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "stage", content = "result")]
+pub enum ValidationFailure {
+    Syntax(ParseFailure),
+    Guards(GuardFailure),
+    SyntaxAndGuards {
+        syntax: ParseFailure,
+        guards: GuardFailure,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionReport {
     pub status: ExecutionStatus,
     pub delta: AppliedPatchDelta,
     pub failure: Option<PatchDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<ValidationFailure>,
 }
 
 impl ExecutionReport {
     pub fn rejected_patch_error(error: &PatchError) -> Self {
         Self {
+            validation: None,
             status: ExecutionStatus::Rejected,
             delta: AppliedPatchDelta::empty(),
             failure: Some(error.diagnostic.clone()),
@@ -95,6 +110,17 @@ impl ExecutionReport {
     }
 
     pub fn rejected_parse_error(error: &ParseError) -> Self {
+        Self::rejected_parse_failure(&ParseFailure {
+            diagnostics: vec![error.clone()],
+            unchecked_from_line: None,
+            unverified_ranges: Vec::new(),
+            stop_reason: None,
+            guard_candidates: Vec::new(),
+        })
+    }
+
+    pub fn rejected_parse_failure(failure: &ParseFailure) -> Self {
+        let error = failure.first();
         let code = match error.code {
             ParseErrorCode::EmptyInput => PatchErrorCode::PatchEmpty,
             ParseErrorCode::InputTooLarge => PatchErrorCode::InputTooLarge,
@@ -111,29 +137,39 @@ impl ExecutionReport {
             | ParseErrorCode::UnknownDirective
             | ParseErrorCode::MissingPath
             | ParseErrorCode::InvalidOperationBody
+            | ParseErrorCode::MissingAddPrefix
+            | ParseErrorCode::MissingReplacePrefix
+            | ParseErrorCode::DeleteHasBody
+            | ParseErrorCode::DuplicateDirective
+            | ParseErrorCode::InvalidMoveDirective
             | ParseErrorCode::MissingHunk
             | ParseErrorCode::InvalidHunkLine
             | ParseErrorCode::EmptyAdd
             | ParseErrorCode::EmptyReplace => PatchErrorCode::PatchSyntaxError,
         };
         Self {
+            validation: Some(ValidationFailure::Syntax(failure.clone())),
             status: ExecutionStatus::Rejected,
             delta: AppliedPatchDelta::empty(),
             failure: Some(diagnostic_at(
                 PatchStage::Parse,
                 code,
-                &format!(
-                    "{}. Valid form: *** Begin Patch, then one or more Add File, Update File, optional Move to, or Delete File operations, then *** End Patch. Add lines start with +; Update hunk lines start with space, -, or +",
-                    error
-                ),
-                None,
-                None,
+                &error.to_string(),
+                error.operation_index,
+                error.path.clone(),
                 None,
             )),
         }
     }
 
     pub fn rejected_guard_error(error: &GuardError) -> Self {
+        Self::rejected_guard_failure(&GuardFailure {
+            diagnostics: vec![error.clone()],
+        })
+    }
+
+    pub fn rejected_guard_failure(failure: &GuardFailure) -> Self {
+        let error = &failure.diagnostics[0];
         let code = match error.code {
             GuardErrorCode::MissingRequiredSourceGuard => PatchErrorCode::PreconditionRequired,
             GuardErrorCode::InvalidSourceGuard | GuardErrorCode::InvalidDestinationGuard => {
@@ -144,6 +180,7 @@ impl ExecutionReport {
             }
         };
         Self {
+            validation: Some(ValidationFailure::Guards(failure.clone())),
             status: ExecutionStatus::Rejected,
             delta: AppliedPatchDelta::empty(),
             failure: Some(diagnostic_at(
@@ -151,15 +188,31 @@ impl ExecutionReport {
                 code,
                 &error.to_string(),
                 Some(error.operation_index.try_into().unwrap_or(u32::MAX)),
-                None,
+                error.path.clone(),
                 None,
             )),
         }
     }
 
+    pub fn rejected_syntax_and_guards(syntax: &ParseFailure, guards: &GuardFailure) -> Self {
+        debug_assert!(!guards.diagnostics.is_empty());
+        let first_guard = &guards.diagnostics[0];
+        let mut report = if first_guard.line < syntax.first().line {
+            Self::rejected_guard_failure(guards)
+        } else {
+            Self::rejected_parse_failure(syntax)
+        };
+        report.validation = Some(ValidationFailure::SyntaxAndGuards {
+            syntax: syntax.clone(),
+            guards: guards.clone(),
+        });
+        report
+    }
+
     pub fn rejected_resolve_error(error: &PrepareError) -> Self {
         let code = prepare_error_code(error);
         Self {
+            validation: None,
             status: ExecutionStatus::Rejected,
             delta: AppliedPatchDelta::empty(),
             failure: Some(diagnostic_at(
@@ -445,6 +498,7 @@ impl PatchExecutor {
                     delta.exact &= side_effects.exact;
                     merge_delta_side_effects(&mut delta, &side_effects);
                     return ExecutionReport {
+                        validation: None,
                         status: ExecutionStatus::Failed,
                         delta,
                         failure: Some(mutation_diagnostic(
@@ -531,12 +585,14 @@ impl PatchExecutor {
                         );
                         return if delta.is_empty() {
                             ExecutionReport {
+                                validation: None,
                                 status: ExecutionStatus::Failed,
                                 delta,
                                 failure: Some(failure),
                             }
                         } else {
                             ExecutionReport {
+                                validation: None,
                                 status: ExecutionStatus::Partial,
                                 delta,
                                 failure: Some(failure),
@@ -564,6 +620,7 @@ impl PatchExecutor {
                         }
                         merge_delta_side_effects(&mut delta, &error_side_effects);
                         return ExecutionReport {
+                            validation: None,
                             status: ExecutionStatus::CommitStateUncertain,
                             delta: delta.with_exactness(false),
                             failure: Some(mutation_diagnostic(
@@ -577,6 +634,7 @@ impl PatchExecutor {
                 }
             }
             ExecutionReport {
+                validation: None,
                 status: ExecutionStatus::Applied,
                 delta,
                 failure: None,
@@ -614,6 +672,7 @@ impl PatchExecutor {
             };
             if current != observed.fingerprint {
                 return Err(ExecutionReport {
+                    validation: None,
                     status: ExecutionStatus::Rejected,
                     delta: AppliedPatchDelta::empty(),
                     failure: Some(diagnostic_at(
@@ -666,6 +725,7 @@ impl PatchExecutor {
                         .is_some_and(|operation| operation.source_guard.is_some()))
         }) {
             return Err(ExecutionReport {
+                validation: None,
                 status: ExecutionStatus::Rejected,
                 delta: AppliedPatchDelta::empty(),
                 failure: Some(diagnostic_at(
@@ -698,6 +758,7 @@ impl PatchExecutor {
                         Ok(snapshot) => snapshot,
                         Err(error) => {
                             return Err(ExecutionReport {
+                                validation: None,
                                 status: ExecutionStatus::Rejected,
                                 delta: AppliedPatchDelta::empty(),
                                 failure: Some(diagnostic(
@@ -724,6 +785,7 @@ impl PatchExecutor {
                         Some(total) if total <= prepared.max_total_snapshot_bytes => total,
                         _ => {
                             return Err(ExecutionReport {
+                                validation: None,
                                 status: ExecutionStatus::Rejected,
                                 delta: AppliedPatchDelta::empty(),
                                 failure: Some(diagnostic(
@@ -738,6 +800,7 @@ impl PatchExecutor {
                         Ok(bytes) => bytes,
                         Err(error) => {
                             return Err(ExecutionReport {
+                                validation: None,
                                 status: ExecutionStatus::Rejected,
                                 delta: AppliedPatchDelta::empty(),
                                 failure: Some(diagnostic(
@@ -763,6 +826,7 @@ impl PatchExecutor {
                 }
                 Ok(TargetKind::Directory | TargetKind::Symlink | TargetKind::Special) => {
                     return Err(ExecutionReport {
+                        validation: None,
                         status: ExecutionStatus::Rejected,
                         delta: AppliedPatchDelta::empty(),
                         failure: Some(diagnostic(
@@ -1160,6 +1224,7 @@ fn notify_committed(
 
 fn observer_rejection(error: ObserverError) -> ExecutionReport {
     ExecutionReport {
+        validation: None,
         status: ExecutionStatus::Rejected,
         delta: AppliedPatchDelta::empty(),
         failure: Some(diagnostic(
@@ -1173,6 +1238,7 @@ fn observer_rejection(error: ObserverError) -> ExecutionReport {
 fn observer_failure(delta: AppliedPatchDelta, error: ObserverError) -> ExecutionReport {
     if delta.is_empty() {
         ExecutionReport {
+            validation: None,
             status: ExecutionStatus::Failed,
             delta,
             failure: Some(diagnostic(
@@ -1186,6 +1252,7 @@ fn observer_failure(delta: AppliedPatchDelta, error: ObserverError) -> Execution
         }
     } else {
         ExecutionReport {
+            validation: None,
             status: ExecutionStatus::CommitStateUncertain,
             delta: delta.with_exactness(false),
             failure: Some(diagnostic(
@@ -1228,12 +1295,14 @@ fn partial_or_rejected(
 ) -> ExecutionReport {
     if delta.is_empty() {
         ExecutionReport {
+            validation: None,
             status: ExecutionStatus::Rejected,
             delta,
             failure: Some(diagnostic(stage, PatchErrorCode::InvalidRequest, message)),
         }
     } else {
         ExecutionReport {
+            validation: None,
             status: ExecutionStatus::Partial,
             delta,
             failure: Some(diagnostic(stage, PatchErrorCode::InvalidRequest, message)),
@@ -1243,6 +1312,7 @@ fn partial_or_rejected(
 
 fn rejected(stage: PatchStage, message: &str) -> ExecutionReport {
     ExecutionReport {
+        validation: None,
         status: ExecutionStatus::Rejected,
         delta: AppliedPatchDelta::empty(),
         failure: Some(diagnostic(stage, PatchErrorCode::InvalidRequest, message)),
@@ -1382,6 +1452,7 @@ fn prepare_rejection(error: &PrepareError) -> ExecutionReport {
         error.to_string()
     };
     ExecutionReport {
+        validation: None,
         status: ExecutionStatus::Rejected,
         delta: AppliedPatchDelta::empty(),
         failure: Some(diagnostic_at(
@@ -1467,6 +1538,7 @@ fn plan_rejection(error: PlanError, fallback: &str) -> ExecutionReport {
         _ => PatchErrorCode::InvalidRequest,
     };
     ExecutionReport {
+        validation: None,
         status: ExecutionStatus::Rejected,
         delta: AppliedPatchDelta::empty(),
         failure: Some(diagnostic_at(

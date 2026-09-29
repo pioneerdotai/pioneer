@@ -92,6 +92,7 @@ impl SqlitePatchObserver {
     ) -> ExecutionReport {
         let (status, failure) = replay_status_and_failure(&record.outcome);
         ExecutionReport {
+            validation: None,
             status,
             delta: delta.with_exactness(record.exactness.is_exact()),
             failure,
@@ -103,11 +104,13 @@ impl SqlitePatchObserver {
     ) -> std::result::Result<ExecutionReport, ObserverError> {
         match intent.status {
             IntentStatus::AppliedNoChange => Ok(ExecutionReport {
+                validation: None,
                 status: ExecutionStatus::Applied,
                 delta: AppliedPatchDelta::empty().with_exactness(true),
                 failure: None,
             }),
             IntentStatus::FailedNoChange => Ok(ExecutionReport {
+                validation: None,
                 status: ExecutionStatus::Failed,
                 delta: AppliedPatchDelta::empty().with_exactness(true),
                 failure: Some(replay_diagnostic(
@@ -117,11 +120,13 @@ impl SqlitePatchObserver {
                 )),
             }),
             IntentStatus::Rejected => Ok(ExecutionReport {
+                validation: None,
                 status: ExecutionStatus::Rejected,
                 delta: AppliedPatchDelta::empty().with_exactness(true),
                 failure: None,
             }),
             IntentStatus::Gap | IntentStatus::Pending => Ok(ExecutionReport {
+                validation: None,
                 status: ExecutionStatus::CommitStateUncertain,
                 delta: AppliedPatchDelta::empty().with_exactness(false),
                 failure: None,

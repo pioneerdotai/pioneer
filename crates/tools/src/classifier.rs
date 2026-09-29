@@ -282,6 +282,40 @@ fn classify_apply_patch_result(raw_output_json: &JsonValue, success: bool) -> To
         )
         .to_owned();
 
+    if let Some(validation) = raw_output_json.get("validation") {
+        let syntax_complete = validation
+            .get("syntax_complete")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        let reason = (!syntax_complete).then(|| {
+            let from_line = validation
+                .get("unchecked_from_line")
+                .and_then(JsonValue::as_u64)
+                .map(|line| format!("scan stopped at patch line {line}"));
+            let skipped = validation
+                .get("unverified_ranges")
+                .and_then(JsonValue::as_array)
+                .and_then(|ranges| ranges.first())
+                .and_then(|range| range.get("start"))
+                .and_then(JsonValue::as_u64)
+                .map(|line| {
+                    format!("operation body starting at patch line {line} was not checked")
+                });
+            let detail = from_line
+                .or(skipped)
+                .unwrap_or_else(|| "some patch lines were not checked".to_owned());
+            format!(
+                "apply_patch syntax validation incomplete: {detail}; later stages were not checked"
+            )
+        });
+        return ToolOutcome::recoverable(
+            ToolErrorClass::InvalidArguments,
+            next_action,
+            !syntax_complete,
+            reason,
+        );
+    }
+
     if matches!(status, "partial" | "commit_state_uncertain") {
         return ToolOutcome {
             status: ToolOutcomeStatus::PartialSuccess,
@@ -1315,6 +1349,41 @@ mod tests {
             Some("Read `/workspace/file.txt` and build a new hunk from its current contents.")
         );
         assert!(outcome.should_retry);
+    }
+
+    #[test]
+    fn apply_patch_validation_completeness_is_distinct_from_display_truncation() {
+        let complete = DefaultErrorClassifier.classify_result(
+            &invocation_for("apply_patch"),
+            &serde_json::json!({
+                "status": "rejected", "error": {"code": "patch_syntax_error", "next_action": "Fix lines 3-4."},
+                "validation": {"stage": "syntax", "syntax_complete": true, "display_truncated": true}
+            }), false,
+        );
+        assert_eq!(complete.status, ToolOutcomeStatus::RecoverableError);
+        assert!(!complete.incomplete);
+        assert_eq!(complete.retry_hint.as_deref(), Some("Fix lines 3-4."));
+
+        let stopped = DefaultErrorClassifier.classify_result(
+            &invocation_for("apply_patch"),
+            &serde_json::json!({
+                "status": "rejected", "error": {"code": "patch_syntax_error", "next_action": "Fix the boundary."},
+                "validation": {"stage": "syntax", "syntax_complete": false, "unchecked_from_line": 4}
+            }), false,
+        );
+        assert!(stopped.incomplete);
+        assert!(stopped.incomplete_reason.unwrap().contains("line 4"));
+
+        let skipped = DefaultErrorClassifier.classify_result(
+            &invocation_for("apply_patch"),
+            &serde_json::json!({
+                "status": "rejected", "error": {"code": "invalid_path", "next_action": "Fix the path."},
+                "validation": {"stage": "syntax", "syntax_complete": false,
+                    "unverified_ranges": [{"start": 3, "end": 3}]}
+            }), false,
+        );
+        assert!(skipped.incomplete);
+        assert!(skipped.incomplete_reason.unwrap().contains("line 3"));
     }
 
     #[test]

@@ -425,6 +425,12 @@ fn file_change_llm_view(input: &ToolProjectionInput<'_>) -> ToolResultView {
         );
     }
 
+    if input.tool_name == "apply_patch"
+        && let Some(validation) = raw.get("validation")
+    {
+        value.insert("validation".to_owned(), validation.clone());
+    }
+
     if let Some(side_effects) = raw.get("side_effects").and_then(compact_file_side_effects) {
         value.insert("side_effects".to_owned(), side_effects);
     }
@@ -467,6 +473,7 @@ fn compact_file_change_error(error: &JsonValue) -> Option<JsonValue> {
         "message",
         "operation_index",
         "path",
+        "path_truncated",
         "retryability",
         "next_action",
         "retry_same_patch",
@@ -1828,6 +1835,100 @@ mod tests {
         assert!(model.contains("retry_same_patch"));
         assert!(!model.contains("guard_horizon"));
         assert!(!model.contains("tracking"));
+    }
+
+    #[test]
+    fn apply_patch_projection_keeps_validation_codes_ranges_and_completeness() {
+        let payload = serde_json::json!({
+            "status": "rejected", "success": false, "changed_files": [], "changes": [],
+            "error": {"code": "patch_syntax_error", "stage": "parse", "message": "missing +",
+                "next_action": "Fix the listed lines.", "retry_same_patch": false},
+            "validation": {
+                "stage": "syntax", "syntax_complete": false, "later_stages_checked": false,
+                "unchecked_from_line": 7, "stop_reason": "ambiguous_structure",
+                "observed_violations": 2, "shown_violations": 2, "display_truncated": false,
+                "diagnostics": [{"code": "missing_add_prefix", "column": 1,
+                    "operation_index": 0, "operation": "add", "path": "a.txt",
+                    "message": "Add File lines must start with +", "lines": [{"start": 3, "end": 4}]}]
+            }
+        });
+        let outcome = ToolOutcome::recoverable(
+            ToolErrorClass::InvalidArguments,
+            "Fix the listed lines.",
+            true,
+            Some("syntax scan stopped at line 7".to_owned()),
+        );
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "call_validation",
+            tool_name: "apply_patch",
+            arguments: &serde_json::json!({"patch": "invalid"}),
+            raw_output_text: &payload.to_string(),
+            raw_output_json: &payload,
+            success: false,
+            outcome: &outcome,
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("apply_patch"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+        let model = envelope.llm_payload();
+        assert_eq!(
+            model["validation"]["diagnostics"][0]["code"],
+            "missing_add_prefix"
+        );
+        assert_eq!(model["validation"]["diagnostics"][0]["lines"][0]["end"], 4);
+        assert_eq!(model["validation"]["unchecked_from_line"], 7);
+        assert_eq!(model["tool_outcome"]["incomplete"], true);
+    }
+
+    #[test]
+    fn escaped_path_diagnostic_survives_the_model_projection() {
+        use crate::apply_patch::file_mutation::{PatchLimits, PatchRequest, PatchRequestSource};
+        use crate::apply_patch::{ExecutionReport, parse_validated, project_execution_report};
+
+        let path = "\"".repeat(PatchLimits::default().max_path_bytes as usize);
+        let patch = format!("*** Begin Patch\n*** Add File: {path}\nwrong\n*** End Patch");
+        let request = PatchRequest::from_provider_text(
+            &patch,
+            PatchRequestSource::NativeFreeform,
+            PatchLimits::default(),
+        )
+        .unwrap();
+        let failure = parse_validated(&request, PatchLimits::default()).unwrap_err();
+        let payload = serde_json::to_value(project_execution_report(
+            ExecutionReport::rejected_parse_failure(&failure),
+        ))
+        .unwrap();
+        let outcome = ToolOutcome::recoverable(
+            ToolErrorClass::InvalidArguments,
+            "Correct the listed issue.",
+            false,
+            None,
+        );
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "call_large_path",
+            tool_name: "apply_patch",
+            arguments: &serde_json::json!({"patch": "invalid"}),
+            raw_output_text: &payload.to_string(),
+            raw_output_json: &payload,
+            success: false,
+            outcome: &outcome,
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("apply_patch"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+        let model = envelope.llm_payload();
+        assert_eq!(
+            model["validation"]["diagnostics"][0]["code"],
+            "missing_add_prefix"
+        );
+        assert_eq!(
+            model["validation"]["diagnostics"][0]["lines"][0]["start"],
+            3
+        );
+        assert_eq!(model["validation"]["diagnostics"][0]["operation_index"], 0);
+        assert_eq!(
+            model["validation"]["diagnostics"][0]["path_truncated"],
+            true
+        );
+        assert_eq!(model["error"]["path_truncated"], true);
     }
 
     #[test]
