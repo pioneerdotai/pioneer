@@ -882,6 +882,354 @@ async fn absorbed_alias_conflict_survives_gateway_capture_and_restore() {
 }
 
 #[tokio::test]
+async fn exact_cross_domain_absorption_keeps_only_covered_input_evidence() {
+    use pioneer_agent::compaction::composition::{
+        AcceptedContextBranch, ScopedHistorySource, compose_context,
+    };
+    use pioneer_compaction::CoverageDomain;
+    use std::collections::BTreeMap;
+
+    for reverse in [false, true] {
+        let s = scenario().await;
+        for thread in ["cross-domain-cover", "cross-domain-copy", "cross-domain-x"] {
+            insert_projection_event(&s.f, thread).await;
+        }
+        for thread in ["cross-domain-copy", "cross-domain-x"] {
+            s.f.store
+                .database_connection()
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES (?,?,0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+                    [format!("{thread}-input").into(), format!("{thread}-turn").into()],
+                ))
+                .await
+                .unwrap();
+            history::prepare_history(&s.f.store, "ws", thread)
+                .await
+                .unwrap();
+        }
+        let a = s.original.provenance.as_ref().unwrap().sources[0].clone();
+        let a = SourceRef {
+            scope: a.scope,
+            id: a.id,
+            version: a.version,
+        };
+        let b = SourceRef {
+            scope: s.copy.scope.clone(),
+            id: s.copy.id.clone(),
+            version: s.copy.version.clone(),
+        };
+        let c =
+            s.f.store
+                .compaction_source_page(
+                    "ws",
+                    "cross-domain-copy",
+                    "cross-domain-copy-turn",
+                    PagedSource::Input,
+                    0,
+                )
+                .await
+                .unwrap()
+                .entries[0]
+                .reference
+                .clone();
+        let x =
+            s.f.store
+                .compaction_source_page(
+                    "ws",
+                    "cross-domain-x",
+                    "cross-domain-x-turn",
+                    PagedSource::Input,
+                    0,
+                )
+                .await
+                .unwrap()
+                .entries[0]
+                .reference
+                .clone();
+        assert_eq!(a.version, b.version);
+        assert_eq!(a.version, c.version);
+        assert_eq!(a.version, x.version);
+        let old = publish_projection_checkpoint(
+            &s.f,
+            "thread",
+            "cross-domain-small",
+            &[("thread".into(), a.clone())],
+            CoverageDomain::WorkingContext,
+        )
+        .await;
+        let old_source =
+            s.f.store
+                .compaction_checkpoint_source("ws", "thread", &old.id)
+                .await
+                .unwrap()
+                .unwrap();
+        let covering = publish_projection_checkpoint(
+            &s.f,
+            "cross-domain-cover",
+            "cross-domain-large",
+            &[
+                ("thread".into(), old_source),
+                ("copy-thread".into(), b.clone()),
+            ],
+            CoverageDomain::OwnContribution,
+        )
+        .await;
+        let competing = publish_projection_checkpoint(
+            &s.f,
+            "cross-domain-x",
+            "cross-domain-competing",
+            &[("cross-domain-x".into(), x.clone())],
+            CoverageDomain::OwnContribution,
+        )
+        .await;
+        let mut allowed = s.allowed.clone();
+        allowed.extend(
+            ["cross-domain-cover", "cross-domain-copy", "cross-domain-x"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        let source = |source: &SourceRef| MessageSourceRef {
+            scope: source.scope.clone(),
+            id: source.id.clone(),
+            version: source.version.clone(),
+        };
+        fn context<'a>(
+            thread: &'a str,
+            checkpoint: &'a Checkpoint,
+            allowed: &'a BTreeSet<String>,
+        ) -> checkpoint::ProjectionContext<'a> {
+            checkpoint::ProjectionContext {
+                workspace: "ws",
+                context_thread: "thread",
+                source_thread: thread,
+                owner: &checkpoint.owner,
+                allowed,
+                allow_historical_gaps: false,
+            }
+        }
+        let mut old_message = checkpoint::checkpoint_message_with_resolver(
+            &s.f.store,
+            context("thread", &old, &allowed),
+            &old.id,
+            &mut coverage::CheckpointGraphResolver::default(),
+        )
+        .await
+        .unwrap();
+        let valid = MessageSourceAlias {
+            represented_thread_id: "thread".into(),
+            represented_source: source(&a),
+            thread_id: "cross-domain-copy".into(),
+            source: source(&c),
+        };
+        let conflict = MessageSourceIdentity {
+            thread_id: "copy-thread".into(),
+            source: source(&b),
+        };
+        old_message
+            .provenance
+            .as_mut()
+            .unwrap()
+            .source_aliases
+            .push(valid.clone());
+        old_message
+            .provenance
+            .as_mut()
+            .unwrap()
+            .ambiguous_input_aliases
+            .push(conflict.clone());
+        let covering_message = checkpoint::checkpoint_message_with_resolver(
+            &s.f.store,
+            context("cross-domain-cover", &covering, &allowed),
+            &covering.id,
+            &mut coverage::CheckpointGraphResolver::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            covering_message
+                .provenance
+                .as_ref()
+                .unwrap()
+                .ambiguous_input_aliases
+                .is_empty()
+        );
+        let mut messages = if reverse {
+            vec![covering_message, old_message]
+        } else {
+            vec![old_message, covering_message]
+        };
+        let original = messages.clone();
+        let original_descriptor = frozen::capture(&s.f.store, "ws", "thread", &allowed, &original)
+            .await
+            .unwrap();
+        checkpoint::project_checkpoint_with_resolver(
+            &s.f.store,
+            context("thread", &old, &allowed),
+            &old.id,
+            &mut messages,
+            &mut coverage::CheckpointGraphResolver::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(messages.len(), 1, "summary order {reverse}");
+        assert_eq!(
+            frozen::restore(&s.f.store, "ws", &allowed, &original_descriptor)
+                .await
+                .unwrap(),
+            original
+        );
+        let survivor = messages[0].provenance.as_ref().unwrap();
+        assert_eq!(survivor.sources[0].id, covering.id);
+        assert!(survivor.ambiguous_input_aliases.contains(&conflict));
+        assert!(survivor.source_aliases.contains(&valid));
+
+        let covering_source =
+            s.f.store
+                .compaction_checkpoint_source("ws", "cross-domain-cover", &covering.id)
+                .await
+                .unwrap()
+                .unwrap();
+        let covering_graph = coverage::CheckpointGraphResolver::default()
+            .resolve(&s.f.store, "ws", Some(&allowed), &covering_source)
+            .await
+            .unwrap()
+            .unwrap();
+        let old_source =
+            s.f.store
+                .compaction_checkpoint_source("ws", "thread", &old.id)
+                .await
+                .unwrap()
+                .unwrap();
+        let old_graph = coverage::CheckpointGraphResolver::default()
+            .resolve(&s.f.store, "ws", Some(&allowed), &old_source)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(old_graph.leaves.is_subset(&covering_graph.leaves));
+        assert_ne!(old_graph.leaves, covering_graph.leaves);
+        assert!(
+            !covering_graph
+                .ambiguous_input_aliases
+                .contains(&ScopedHistorySource {
+                    thread: conflict.thread_id.clone(),
+                    source: b.clone(),
+                })
+        );
+        let outside = MessageSourceAlias {
+            represented_thread_id: "cross-domain-x".into(),
+            represented_source: source(&x),
+            thread_id: "copy-thread".into(),
+            source: source(&b),
+        };
+        let filtered = checkpoint::transferred_input_evidence(
+            &covering_graph.leaves,
+            [&valid, &outside],
+            [&conflict],
+        );
+        assert!(filtered.aliases.contains(&valid));
+        assert!(!filtered.aliases.contains(&outside));
+
+        let mut competing_message = checkpoint::checkpoint_message_with_resolver(
+            &s.f.store,
+            context("cross-domain-x", &competing, &allowed),
+            &competing.id,
+            &mut coverage::CheckpointGraphResolver::default(),
+        )
+        .await
+        .unwrap();
+        competing_message
+            .provenance
+            .as_mut()
+            .unwrap()
+            .source_aliases
+            .push(outside);
+        messages.push(competing_message);
+        let mut closures = BTreeMap::new();
+        for (thread, checkpoint) in [
+            ("cross-domain-cover", &covering),
+            ("cross-domain-x", &competing),
+        ] {
+            let checkpoint_source =
+                s.f.store
+                    .compaction_checkpoint_source("ws", thread, &checkpoint.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let graph = coverage::CheckpointGraphResolver::default()
+                .resolve(&s.f.store, "ws", Some(&allowed), &checkpoint_source)
+                .await
+                .unwrap()
+                .unwrap();
+            closures.insert(
+                ScopedHistorySource {
+                    thread: thread.into(),
+                    source: checkpoint_source,
+                },
+                graph.leaves.clone(),
+            );
+        }
+        let domains = closures
+            .keys()
+            .cloned()
+            .map(|source| (source, CoverageDomain::OwnContribution))
+            .collect::<BTreeMap<_, _>>();
+        let selected = compose_context(
+            "ws",
+            "child",
+            &[AcceptedContextBranch {
+                thread: "thread",
+                messages: &messages,
+                checkpoints: &closures,
+                checkpoint_domains: &domains,
+            }],
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 2, "disputed copy must not cover X");
+        assert!(
+            selected.iter().any(|message| {
+                message.provenance.as_ref().unwrap().sources[0].id == competing.id
+            })
+        );
+        let selected_again = compose_context(
+            "ws",
+            "grandchild",
+            &[AcceptedContextBranch {
+                thread: "child",
+                messages: &selected,
+                checkpoints: &closures,
+                checkpoint_domains: &domains,
+            }],
+        )
+        .unwrap();
+        assert_eq!(selected_again.len(), 2);
+
+        let descriptor = frozen::capture(&s.f.store, "ws", "thread", &allowed, &messages)
+            .await
+            .unwrap();
+        let literal = frozen::restore(&s.f.store, "ws", &allowed, &descriptor)
+            .await
+            .unwrap();
+        assert_eq!(literal, messages);
+        assert_eq!(
+            compose_context(
+                "ws",
+                "child",
+                &[AcceptedContextBranch {
+                    thread: "thread",
+                    messages: &literal,
+                    checkpoints: &closures,
+                    checkpoint_domains: &domains,
+                }],
+            )
+            .unwrap()
+            .len(),
+            2
+        );
+    }
+}
+
+#[tokio::test]
 async fn competing_checkpoint_candidate_cannot_remove_saved_summary() {
     use pioneer_compaction::CoverageDomain;
 

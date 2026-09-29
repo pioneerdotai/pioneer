@@ -1225,7 +1225,6 @@ async fn project_checkpoint_with_input_claims(
         for (index, (leaves, checkpoints, domain)) in &current_leaves {
             if !checkpoints.contains(&expanded.root)
                 && !checkpoints.is_empty()
-                && *domain == Some(expanded.coverage_domain)
                 && existing_dominates(leaves, *domain)
             {
                 let origin = messages[*index]
