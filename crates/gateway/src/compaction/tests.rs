@@ -24,6 +24,19 @@ use std::{
     },
 };
 
+fn test_checkpoint_domains(
+    checkpoints: &std::collections::BTreeMap<
+        ScopedHistorySource,
+        std::collections::BTreeSet<ScopedHistorySource>,
+    >,
+) -> std::collections::BTreeMap<ScopedHistorySource, pioneer_compaction::CoverageDomain> {
+    checkpoints
+        .keys()
+        .cloned()
+        .map(|source| (source, pioneer_compaction::CoverageDomain::WorkingContext))
+        .collect()
+}
+
 #[tokio::test]
 async fn compaction_observer_heartbeat_reaches_the_live_progress_lane() {
     let lifecycle_store = CrudStore::new(Database::connect("sqlite::memory:").await.unwrap());
@@ -20336,11 +20349,13 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
                 thread: "thread",
                 messages: &first_restored,
                 checkpoints: &no_checkpoints,
+                checkpoint_domains: &test_checkpoint_domains(&no_checkpoints),
             },
             pioneer_agent::compaction::composition::AcceptedContextBranch {
                 thread: "thread",
                 messages: &second_restored,
                 checkpoints: &no_checkpoints,
+                checkpoint_domains: &test_checkpoint_domains(&no_checkpoints),
             },
         ],
     )
@@ -21547,6 +21562,8 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
             .any(|alias| alias.source.id == "late-copy-input")
     );
     let mut late_descriptors = Vec::new();
+    let closure_domains = test_checkpoint_domains(&closures);
+    let empty_domains = test_checkpoint_domains(&empty_closures);
     for reverse in [false, true] {
         let raw_branch = [late_raw.clone()];
         let summary_branch = [summary.clone()];
@@ -21556,11 +21573,13 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
                     thread: "child-thread-three",
                     messages: &summary_branch,
                     checkpoints: &closures,
+                    checkpoint_domains: &closure_domains,
                 },
                 pioneer_agent::compaction::composition::AcceptedContextBranch {
                     thread: "thread",
                     messages: &raw_branch,
                     checkpoints: &empty_closures,
+                    checkpoint_domains: &empty_domains,
                 },
             ]
         } else {
@@ -21569,11 +21588,13 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
                     thread: "thread",
                     messages: &raw_branch,
                     checkpoints: &empty_closures,
+                    checkpoint_domains: &empty_domains,
                 },
                 pioneer_agent::compaction::composition::AcceptedContextBranch {
                     thread: "child-thread-three",
                     messages: &summary_branch,
                     checkpoints: &closures,
+                    checkpoint_domains: &closure_domains,
                 },
             ]
         };
@@ -22420,6 +22441,7 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
             conflict_graph.leaves.clone(),
         ),
     ]);
+    let absorbed_domains = test_checkpoint_domains(&absorbed_closures);
     for reverse in [false, true] {
         let earlier = [carried_summary.clone()];
         let later = [conflict_summary.clone()];
@@ -22429,11 +22451,13 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
                     thread: "child-thread-three",
                     messages: &later,
                     checkpoints: &absorbed_closures,
+                    checkpoint_domains: &absorbed_domains,
                 },
                 pioneer_agent::compaction::composition::AcceptedContextBranch {
                     thread: "child-thread-three",
                     messages: &earlier,
                     checkpoints: &absorbed_closures,
+                    checkpoint_domains: &absorbed_domains,
                 },
             ]
         } else {
@@ -22442,11 +22466,13 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
                     thread: "child-thread-three",
                     messages: &earlier,
                     checkpoints: &absorbed_closures,
+                    checkpoint_domains: &absorbed_domains,
                 },
                 pioneer_agent::compaction::composition::AcceptedContextBranch {
                     thread: "child-thread-three",
                     messages: &later,
                     checkpoints: &absorbed_closures,
+                    checkpoint_domains: &absorbed_domains,
                 },
             ]
         };
@@ -22499,6 +22525,7 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
             independent_graph.leaves.clone(),
         ),
     ]);
+    let checkpoint_domains = test_checkpoint_domains(&checkpoint_closures);
     for reverse in [false, true] {
         let earlier = [carried_summary.clone()];
         let later = [independent_summary.clone()];
@@ -22508,11 +22535,13 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
                     thread: "child-thread-three",
                     messages: &later,
                     checkpoints: &checkpoint_closures,
+                    checkpoint_domains: &checkpoint_domains,
                 },
                 pioneer_agent::compaction::composition::AcceptedContextBranch {
                     thread: "child-thread-three",
                     messages: &earlier,
                     checkpoints: &checkpoint_closures,
+                    checkpoint_domains: &checkpoint_domains,
                 },
             ]
         } else {
@@ -22521,11 +22550,13 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
                     thread: "child-thread-three",
                     messages: &earlier,
                     checkpoints: &checkpoint_closures,
+                    checkpoint_domains: &checkpoint_domains,
                 },
                 pioneer_agent::compaction::composition::AcceptedContextBranch {
                     thread: "child-thread-three",
                     messages: &later,
                     checkpoints: &checkpoint_closures,
+                    checkpoint_domains: &checkpoint_domains,
                 },
             ]
         };
@@ -22722,6 +22753,8 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
     let newer_raw = [newer_a];
     let old_summary = [carried_summary.clone()];
     let no_checkpoints = std::collections::BTreeMap::new();
+    let old_summary_domains = test_checkpoint_domains(&checkpoint_closures);
+    let no_checkpoint_domains = test_checkpoint_domains(&no_checkpoints);
     for reverse in [false, true] {
         let branches = if reverse {
             [
@@ -22729,11 +22762,13 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
                     thread: "child-thread-three",
                     messages: &old_summary,
                     checkpoints: &checkpoint_closures,
+                    checkpoint_domains: &old_summary_domains,
                 },
                 pioneer_agent::compaction::composition::AcceptedContextBranch {
                     thread: "thread",
                     messages: &newer_raw,
                     checkpoints: &no_checkpoints,
+                    checkpoint_domains: &no_checkpoint_domains,
                 },
             ]
         } else {
@@ -22742,11 +22777,13 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
                     thread: "thread",
                     messages: &newer_raw,
                     checkpoints: &no_checkpoints,
+                    checkpoint_domains: &no_checkpoint_domains,
                 },
                 pioneer_agent::compaction::composition::AcceptedContextBranch {
                     thread: "child-thread-three",
                     messages: &old_summary,
                     checkpoints: &checkpoint_closures,
+                    checkpoint_domains: &old_summary_domains,
                 },
             ]
         };

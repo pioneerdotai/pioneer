@@ -1792,6 +1792,7 @@ async fn compose_frozen_basis_with_resolver(
         AcceptedContextBranch, ScopedHistorySource, compose_context,
     };
     let mut checkpoints = BTreeMap::new();
+    let mut checkpoint_domains = BTreeMap::new();
     let mut checkpoint_evidence = BTreeMap::new();
     for message in inherited.iter().chain(own) {
         let origin = message.provenance.as_ref().ok_or_else(|| {
@@ -1809,6 +1810,10 @@ async fn compose_frozen_basis_with_resolver(
                         .resolve(store, workspace, Some(allowed), &source)
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("checkpoint root is unavailable"))?;
+                    let metadata = checkpoint_graphs
+                        .projection_metadata(store, workspace, &graph)
+                        .await?;
+                    checkpoint_domains.insert(key.clone(), metadata.coverage_domain);
                     checkpoints.insert(key.clone(), graph.leaves.clone());
                     checkpoint_evidence.insert(key, graph);
                 }
@@ -1843,11 +1848,13 @@ async fn compose_frozen_basis_with_resolver(
                     thread,
                     messages: &inherited,
                     checkpoints: &checkpoints,
+                    checkpoint_domains: &checkpoint_domains,
                 },
                 AcceptedContextBranch {
                     thread,
                     messages: &own,
                     checkpoints: &checkpoints,
+                    checkpoint_domains: &checkpoint_domains,
                 },
             ],
         );
@@ -2029,6 +2036,7 @@ async fn select_task_metadata_after_composition(
         checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
     ) -> Result<Option<Vec<ChatMessage>>> {
         let mut checkpoints = BTreeMap::new();
+        let mut checkpoint_domains = BTreeMap::new();
         for message in inherited.iter().chain(following) {
             let origin = message
                 .provenance
@@ -2050,6 +2058,10 @@ async fn select_task_metadata_after_composition(
                     .resolve(store, workspace, Some(allowed), &source)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("checkpoint source disappeared"))?;
+                let metadata = checkpoint_graphs
+                    .projection_metadata(store, workspace, &graph)
+                    .await?;
+                checkpoint_domains.insert(key.clone(), metadata.coverage_domain);
                 checkpoints.insert(key, graph.leaves.clone());
             }
         }
@@ -2061,11 +2073,13 @@ async fn select_task_metadata_after_composition(
                     thread: execution_thread,
                     messages: inherited,
                     checkpoints: &checkpoints,
+                    checkpoint_domains: &checkpoint_domains,
                 },
                 AcceptedContextBranch {
                     thread: execution_thread,
                     messages: following,
                     checkpoints: &checkpoints,
+                    checkpoint_domains: &checkpoint_domains,
                 },
             ],
         ) {
@@ -3358,6 +3372,30 @@ async fn restore_accepted_execution_basis_prepared(
             }
         }
     }
+    // Compare each candidate against the same exact input claims. A later
+    // owner's checkpoint may supply a competing alias even when its frozen
+    // reference did not carry that alias at capture time.
+    let mut candidate_heads = BTreeMap::new();
+    for source_thread in &source_threads {
+        ensure!(
+            allowed.contains(source_thread),
+            "checkpoint source scope is not accepted"
+        );
+        let owner = super::native::native_owner(workspace, source_thread);
+        let head = store.compaction_head(&owner).await?;
+        if let Some(head) = &head
+            && let Some(root) = store
+                .compaction_checkpoint_source(workspace, source_thread, head)
+                .await?
+        {
+            let graph = checkpoint_graphs
+                .resolve(store, workspace, Some(allowed), &root)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("checkpoint input evidence is unavailable"))?;
+            super::checkpoint::add_graph_input_claims(&mut boundary_claims, &graph);
+        }
+        candidate_heads.insert(source_thread.clone(), head);
+    }
     boundary_claims.mark_competing_owners();
     let mut omitted = BTreeSet::new();
     if !externally_covered.is_empty() {
@@ -3396,7 +3434,7 @@ async fn restore_accepted_execution_basis_prepared(
             "checkpoint source scope is not accepted"
         );
         let owner = super::native::native_owner(workspace, &source_thread);
-        let mut candidate = store.compaction_head(&owner).await?;
+        let mut candidate = candidate_heads.remove(&source_thread).flatten();
         let head = candidate.clone();
         let mut seen = BTreeSet::new();
         while let Some(id) = candidate {
@@ -3478,6 +3516,27 @@ async fn restore_accepted_execution_basis_prepared(
                 if !replaceable {
                     continue;
                 }
+                if reference
+                    .sources
+                    .iter()
+                    .any(|source| source.scope.starts_with("checkpoint:"))
+                {
+                    let [source] = reference.sources.as_slice() else {
+                        continue;
+                    };
+                    let referenced = checkpoint_graphs
+                        .resolve(store, workspace, Some(allowed), source)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("accepted checkpoint graph disappeared"))?;
+                    if checkpoint_graphs
+                        .projection_metadata(store, workspace, &referenced)
+                        .await?
+                        .coverage_domain
+                        != metadata.coverage_domain
+                    {
+                        continue;
+                    }
+                }
                 let leaves = frozen_reference_leaves(
                     store,
                     workspace,
@@ -3503,16 +3562,6 @@ async fn restore_accepted_execution_basis_prepared(
                 if !source.scope.starts_with("checkpoint:") {
                     continue;
                 }
-                let referenced = checkpoint_graphs
-                    .resolve(store, workspace, Some(allowed), source)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("accepted checkpoint graph disappeared"))?;
-                let referenced_metadata = checkpoint_graphs
-                    .projection_metadata(store, workspace, &referenced)
-                    .await?;
-                if referenced_metadata.coverage_domain != metadata.coverage_domain {
-                    continue;
-                }
                 compatible_summaries.insert(*ordinal);
                 let comparable = pioneer_agent::compaction::composition::summary_comparison_leaves(
                     leaves,
@@ -3526,6 +3575,14 @@ async fn restore_accepted_execution_basis_prepared(
             }
             let mut selected = BTreeSet::new();
             for (ordinal, leaves) in &leaves_by_ordinal {
+                if references[*ordinal]
+                    .sources
+                    .iter()
+                    .any(|source| source.scope.starts_with("checkpoint:"))
+                    && !compatible_summaries.contains(ordinal)
+                {
+                    continue;
+                }
                 let covered_leaf = |leaf: &ScopedHistorySource| {
                     covered.contains(&historical_frozen_identity(leaf))
                         || exact_replay_aliases.contains(leaf)
@@ -3634,21 +3691,11 @@ async fn restore_accepted_execution_basis_prepared(
             )
             .await?
             .ok_or_else(|| anyhow::anyhow!("selected checkpoint graph disappeared"))?;
-        let mut aliases = Vec::new();
-        let mut ambiguous = Vec::new();
-        super::checkpoint::append_graph_input_evidence(&graph, &mut aliases, &mut ambiguous);
-        for alias in &aliases {
-            summary_claims.add_alias(alias);
-        }
-        summary_claims.ambiguous.extend(
-            ambiguous
-                .into_iter()
-                .map(|marker| (marker.thread_id, marker.source)),
-        );
+        super::checkpoint::add_graph_input_claims(&mut summary_claims, &graph);
     }
     summary_claims.mark_competing_owners();
     let mut keep = vec![true; projections.len()];
-    let mut absorbed_into = vec![None; projections.len()];
+    let mut absorbed_by = vec![None; projections.len()];
     for left in 0..projections.len() {
         if !keep[left] {
             continue;
@@ -3658,10 +3705,8 @@ async fn restore_accepted_execution_basis_prepared(
                 continue;
             }
             if projections[left].checkpoint == projections[right].checkpoint {
-                let selected = projections[right].selected.clone();
-                projections[left].selected.extend(selected);
                 keep[right] = false;
-                absorbed_into[right] = Some(left);
+                absorbed_by[right] = Some(left);
                 continue;
             }
             if projections[left].inherited != projections[right].inherited {
@@ -3680,40 +3725,36 @@ async fn restore_accepted_execution_basis_prepared(
             let prefer_right = pioneer_agent::compaction::composition::summary_copy_preference(
                 &projections[right].coverage,
                 &summary_claims,
-            ) >= pioneer_agent::compaction::composition::summary_copy_preference(
+            ) > pioneer_agent::compaction::composition::summary_copy_preference(
                 &projections[left].coverage,
                 &summary_claims,
             );
-            if right_covers_left && (!left_covers_right || prefer_right) {
+            if right_covers_left
+                && (projections[right].inherited
+                    || projections[left]
+                        .selected
+                        .is_subset(&projections[right].selected))
+                && (!left_covers_right || prefer_right)
+            {
                 let selected = projections[left].selected.clone();
                 projections[right].selected.extend(selected);
                 keep[left] = false;
-                absorbed_into[left] = Some(right);
+                absorbed_by[left] = Some(right);
                 break;
             }
-            if left_covers_right {
+            if left_covers_right
+                && (projections[left].inherited
+                    || projections[right]
+                        .selected
+                        .is_subset(&projections[left].selected))
+            {
                 let selected = projections[right].selected.clone();
                 projections[left].selected.extend(selected);
                 keep[right] = false;
-                absorbed_into[right] = Some(left);
+                absorbed_by[right] = Some(left);
             }
         }
     }
-    let absorbed_candidates = projections
-        .iter()
-        .enumerate()
-        .filter_map(|(index, projection)| {
-            let mut survivor = absorbed_into[index]?;
-            while let Some(next) = absorbed_into[survivor] {
-                survivor = next;
-            }
-            Some((
-                projection.coverage.clone(),
-                projection.checkpoint_source.clone(),
-                projections[survivor].checkpoint_source.clone(),
-            ))
-        })
-        .collect::<Vec<_>>();
     let absorbed_imports = projections
         .iter()
         .zip(&keep)
@@ -3727,6 +3768,21 @@ async fn restore_accepted_execution_basis_prepared(
             })
         })
         .collect::<Vec<_>>();
+    let mut absorbed_candidates = Vec::new();
+    for (index, projection) in projections.iter().enumerate() {
+        if keep[index] {
+            continue;
+        }
+        let mut survivor = absorbed_by[index].expect("absorbed checkpoint has a recipient");
+        while let Some(next) = absorbed_by[survivor] {
+            survivor = next;
+        }
+        absorbed_candidates.push((
+            projection.coverage.clone(),
+            projection.checkpoint_source.clone(),
+            projections[survivor].checkpoint_source.clone(),
+        ));
+    }
     projections = projections
         .into_iter()
         .zip(keep)
@@ -4537,8 +4593,52 @@ async fn restore_accepted_execution_basis_prepared(
         .await?;
         let mut aliases = Vec::new();
         let mut ambiguous = Vec::new();
+        let mut replaced_alias_sources = BTreeSet::new();
+        let mut alias_replaced = BTreeSet::new();
         for ordinal in &projection.selected {
-            append_reference_input_evidence(&references[*ordinal], &mut aliases, &mut ambiguous);
+            if references[*ordinal]
+                .sources
+                .iter()
+                .any(|source| source.scope.starts_with("checkpoint:"))
+            {
+                let leaves = frozen_reference_leaves(
+                    store,
+                    workspace,
+                    allowed,
+                    &references[*ordinal],
+                    checkpoint_graphs,
+                )
+                .await?;
+                if !leaves.is_subset(&projection.coverage) {
+                    alias_replaced.insert(*ordinal);
+                }
+            }
+        }
+        for ordinal in &projection.selected {
+            let mut from_reference = Vec::new();
+            append_reference_input_evidence(
+                &references[*ordinal],
+                &mut from_reference,
+                &mut ambiguous,
+            );
+            replaced_alias_sources.extend(
+                from_reference
+                    .iter()
+                    .map(|alias| (alias.thread_id.clone(), alias.source.clone())),
+            );
+            if alias_replaced.contains(ordinal) {
+                from_reference.retain(|alias| {
+                    projection.coverage.contains(&ScopedHistorySource {
+                        thread: alias.represented_thread_id.clone(),
+                        source: SourceRef {
+                            scope: alias.represented_source.scope.clone(),
+                            id: alias.represented_source.id.clone(),
+                            version: alias.represented_source.version.clone(),
+                        },
+                    })
+                });
+            }
+            aliases.extend(from_reference);
         }
         // A selected checkpoint reference may have been frozen before graph
         // replay evidence was copied into message provenance. Read its durable
@@ -4553,18 +4653,36 @@ async fn restore_accepted_execution_basis_prepared(
                     .resolve(store, workspace, Some(allowed), source)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("selected checkpoint graph disappeared"))?;
+                let mut from_graph = Vec::new();
                 super::checkpoint::append_graph_input_evidence(
                     &graph,
-                    &mut aliases,
+                    &mut from_graph,
                     &mut ambiguous,
                 );
+                replaced_alias_sources.extend(
+                    from_graph
+                        .iter()
+                        .map(|alias| (alias.thread_id.clone(), alias.source.clone())),
+                );
+                if alias_replaced.contains(ordinal) {
+                    from_graph.retain(|alias| {
+                        projection.coverage.contains(&ScopedHistorySource {
+                            thread: alias.represented_thread_id.clone(),
+                            source: SourceRef {
+                                scope: alias.represented_source.scope.clone(),
+                                id: alias.represented_source.id.clone(),
+                                version: alias.represented_source.version.clone(),
+                            },
+                        })
+                    });
+                }
+                aliases.extend(from_graph);
             }
         }
         // The model keeps only the maximal projection, but its exact leaf
         // closure also represents any admitted candidate it absorbed. Carry
         // those candidates' graph claims (including conflicts) without adding
-        // their checkpoint payloads or coverage. Their import ordinals keep
-        // their original targets.
+        // their checkpoint payloads, coverage or imports.
         for (coverage, source, survivor) in &absorbed_candidates {
             if survivor != &projection.checkpoint_source
                 || !pioneer_agent::compaction::composition::summary_covers(
@@ -4579,47 +4697,46 @@ async fn restore_accepted_execution_basis_prepared(
                 .resolve(store, workspace, Some(allowed), source)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("absorbed checkpoint graph disappeared"))?;
-            super::checkpoint::append_graph_input_evidence(&graph, &mut aliases, &mut ambiguous);
+            let mut from_graph = Vec::new();
+            super::checkpoint::append_graph_input_evidence(&graph, &mut from_graph, &mut ambiguous);
+            replaced_alias_sources.extend(
+                from_graph
+                    .iter()
+                    .map(|alias| (alias.thread_id.clone(), alias.source.clone())),
+            );
+            aliases.extend(from_graph.into_iter().filter(|alias| {
+                projection.coverage.contains(&ScopedHistorySource {
+                    thread: alias.represented_thread_id.clone(),
+                    source: SourceRef {
+                        scope: alias.represented_source.scope.clone(),
+                        id: alias.represented_source.id.clone(),
+                        version: alias.represented_source.version.clone(),
+                    },
+                })
+            }));
         }
         let origin = message.provenance.as_ref().expect("checkpoint origin");
         aliases.extend(origin.source_aliases.iter().cloned());
         ambiguous.extend(origin.ambiguous_input_aliases.iter().cloned());
+        ambiguous.extend(summary_claims.conflicts().into_iter().filter(|marker| {
+            replaced_alias_sources.contains(&(marker.thread_id.clone(), marker.source.clone()))
+                || projection.coverage.contains(&ScopedHistorySource {
+                    thread: marker.thread_id.clone(),
+                    source: SourceRef {
+                        scope: marker.source.scope.clone(),
+                        id: marker.source.id.clone(),
+                        version: marker.source.version.clone(),
+                    },
+                })
+        }));
         let evidence = super::checkpoint::transferred_input_evidence(
             &projection.coverage,
             &aliases,
             &ambiguous,
         );
-        let absorbed_leaves = absorbed_candidates
-            .iter()
-            .filter(|(_, _, survivor)| survivor == &projection.checkpoint_source)
-            .flat_map(|(coverage, _, _)| coverage.iter().cloned())
-            .collect::<BTreeSet<_>>();
-        let mut evidence_claims = summary_claims.clone();
-        for alias in &aliases {
-            evidence_claims.add_alias(alias);
-        }
-        evidence_claims.ambiguous.extend(
-            ambiguous
-                .iter()
-                .map(|marker| (marker.thread_id.clone(), marker.source.clone())),
-        );
-        evidence_claims.mark_competing_owners();
-        let rebased = pioneer_agent::compaction::composition::rebase_summary_input_claims(
-            &projection.coverage,
-            &absorbed_leaves,
-            &evidence_claims,
-        );
         let origin = message.provenance.as_mut().expect("checkpoint origin");
-        origin.source_aliases = if absorbed_leaves.is_empty() {
-            evidence.aliases
-        } else {
-            rebased.aliases()
-        };
-        origin.ambiguous_input_aliases = if absorbed_leaves.is_empty() {
-            evidence.ambiguous
-        } else {
-            rebased.conflicts()
-        };
+        origin.source_aliases = evidence.aliases;
+        origin.ambiguous_input_aliases = evidence.ambiguous;
         replacements.push((projection.anchor, projection.checkpoint, message));
     }
     Ok(RestoredExecutionBasis {

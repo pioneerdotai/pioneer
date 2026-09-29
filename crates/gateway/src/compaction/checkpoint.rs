@@ -2,8 +2,8 @@
 //! never guesses that a count, timestamp, or equal text represents a source.
 use super::*;
 use pioneer_agent::compaction::composition::{
-    ExactInputClaims, ScopedHistorySource, rebase_summary_input_claims, summary_comparison_leaves,
-    summary_copy_preference, summary_covers,
+    ExactInputClaims, ScopedHistorySource, summary_comparison_leaves, summary_copy_preference,
+    summary_covers,
 };
 use pioneer_provider::{
     ChatMessage, MessageProvenance, MessageSourceAlias, MessageSourceIdentity, MessageSourceRef,
@@ -233,22 +233,11 @@ pub(super) async fn project_accepted_checkpoints_with_boundary_evidence(
                 .then(|| origin.thread_id.clone())
         })
         .collect();
-    // Freeze competing claims before the first replacement. Otherwise a later
-    // owner's checkpoint could reveal a conflict after its raw carrier is gone.
-    let needs_input_evidence = admitted_messages.iter().any(|message| {
-        message.provenance.as_ref().is_some_and(|origin| {
-            !origin.source_aliases.is_empty()
-                && origin
-                    .sources
-                    .iter()
-                    .any(|source| source.scope.starts_with("input:"))
-        })
-    });
-    let mut input_claims = if needs_input_evidence {
-        projection_input_claims(store, workspace, allowed, admitted_messages, resolver).await?
-    } else {
-        ExactInputClaims::default()
-    };
+    // Freeze competing claims before the first replacement, including when
+    // the accepted history still contains only raw inputs. A later owner's
+    // checkpoint may otherwise reveal a conflict after a summary is gone.
+    let mut input_claims =
+        projection_input_claims(store, workspace, allowed, admitted_messages, resolver).await?;
     let mut candidates = Vec::new();
     for source_thread in threads {
         ensure!(
@@ -257,7 +246,7 @@ pub(super) async fn project_accepted_checkpoints_with_boundary_evidence(
         );
         let owner = super::native::native_owner(workspace, &source_thread);
         let head = store.compaction_head(&owner).await?;
-        if needs_input_evidence && let Some(head) = &head {
+        if let Some(head) = &head {
             if let Some(source) = store
                 .compaction_checkpoint_source(workspace, &source_thread, head)
                 .await?
@@ -882,7 +871,19 @@ async fn project_checkpoint_with_input_claims(
                     })
             })
         });
-    let mut claims = if needs_replacement {
+    let needs_summary_comparison = admitted_messages
+        .iter()
+        .chain(messages.iter())
+        .any(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.scope.starts_with("checkpoint:"))
+            })
+        });
+    let needs_input_evidence = needs_replacement || needs_summary_comparison;
+    let mut claims = if needs_input_evidence {
         projection_input_claims(
             store,
             context.workspace,
@@ -894,7 +895,7 @@ async fn project_checkpoint_with_input_claims(
     } else {
         ExactInputClaims::default()
     };
-    if needs_replacement && boundary.is_some() {
+    if needs_input_evidence && boundary.is_some() {
         claims.merge(
             projection_input_claims(
                 store,
@@ -908,11 +909,11 @@ async fn project_checkpoint_with_input_claims(
     }
     if let Some(input_claims) = input_claims {
         claims.merge(input_claims.clone());
-    } else if needs_replacement {
+    } else if needs_input_evidence {
         // Local-head projection also runs before foreign checkpoint discovery.
-        // It must not consume a raw carrier before those competing claims are
-        // visible. Ordinary projections without representative changes skip
-        // this metadata-only preflight entirely.
+        // It must see competing claims before replacing a raw input or a
+        // summary through an input copy. Ordinary projections without either
+        // comparison skip this metadata-only preflight.
         let owners = admitted_messages
             .iter()
             .filter_map(|message| {
@@ -976,11 +977,7 @@ async fn project_checkpoint_with_input_claims(
             )
         }));
     claims.mark_competing_owners();
-    let admitted_replacements =
-        input_representative_replacements(context, &expanded, admitted_messages, &claims);
-    let current_replacements =
-        input_representative_replacements(context, &expanded, messages, &claims);
-    let (represented, admitted_leaves) =
+    let (_, admitted_leaves) =
         checkpoint_message_leaves(store, context, &expanded, admitted_messages, resolver).await?;
     let current_leaves = if boundary.is_some() {
         checkpoint_message_leaves(store, context, &expanded, messages, resolver)
@@ -989,36 +986,19 @@ async fn project_checkpoint_with_input_claims(
     } else {
         admitted_leaves.clone()
     };
-    if current_leaves
+    let admitted_replacements =
+        input_representative_replacements(context, &expanded, admitted_messages, &claims);
+    let current_replacements =
+        input_representative_replacements(context, &expanded, messages, &claims);
+    let mut represented_coverage = admitted_leaves
         .values()
-        .any(|(_, checkpoints, _)| !checkpoints.is_empty())
-    {
-        claims.merge(
-            projection_input_claims(
-                store,
-                context.workspace,
-                context.allowed,
-                messages,
-                resolver,
-            )
-            .await?,
-        );
-        if boundary.is_some() {
-            claims.merge(
-                projection_input_claims(
-                    store,
-                    context.workspace,
-                    context.allowed,
-                    admitted_messages,
-                    resolver,
-                )
-                .await?,
-            );
-        }
-    }
-    let mut represented_coverage = represented.clone();
+        .filter(|(_, checkpoints, domain)| {
+            checkpoints.is_empty() || *domain == Some(expanded.coverage_domain)
+        })
+        .flat_map(|(leaves, _, _)| leaves.iter().cloned())
+        .collect::<BTreeSet<_>>();
     for (source, alias) in &admitted_replacements {
-        if represented.contains(source) {
+        if represented_coverage.contains(source) {
             represented_coverage.insert(scoped_input(
                 &alias.represented_thread_id,
                 &alias.represented_source,
@@ -1026,7 +1006,7 @@ async fn project_checkpoint_with_input_claims(
         }
     }
     for (replay, source) in &expanded.replay_aliases {
-        if represented.contains(replay) {
+        if represented_coverage.contains(replay) {
             represented_coverage.insert(source.clone());
         }
     }
@@ -1074,11 +1054,14 @@ async fn project_checkpoint_with_input_claims(
         let mut selected = BTreeSet::new();
         let mut covered_by_other_checkpoint = false;
         for (index, (leaves, checkpoints, domain)) in leaves_by_message {
-            // A larger or preferred equivalent checkpoint is authoritative.
-            // The same root still refreshes its own stale cached body.
+            if !checkpoints.is_empty() && *domain != Some(expanded.coverage_domain) {
+                continue;
+            }
+            // An applicable durable checkpoint already represents this
+            // candidate. Its own stale copies still need replacement by the
+            // current durable body.
             if !checkpoints.contains(&expanded.root)
                 && !checkpoints.is_empty()
-                && *domain == Some(expanded.coverage_domain)
                 && existing_dominates(leaves)
             {
                 covered_by_other_checkpoint = true;
@@ -1090,9 +1073,7 @@ async fn project_checkpoint_with_input_claims(
                         || removable_replay_aliases.contains(leaf)
                         || replacements.contains_key(leaf)
                 };
-            let covered_summary = !checkpoints.is_empty()
-                && *domain == Some(expanded.coverage_domain)
-                && candidate_dominates(leaves);
+            let covered_summary = !checkpoints.is_empty() && candidate_dominates(leaves);
             if !covered_summary
                 && (!leaves.iter().any(covered_leaf) || !leaves.iter().all(covered_leaf))
             {
@@ -1143,11 +1124,11 @@ async fn project_checkpoint_with_input_claims(
     let summary_origin = summary.provenance.as_ref().expect("checkpoint origin");
     let mut aliases = summary_origin.source_aliases.clone();
     let mut ambiguous = summary_origin.ambiguous_input_aliases.clone();
-    let mut absorbed_leaves = BTreeSet::new();
+    let mut replaced_alias_sources = aliases
+        .iter()
+        .map(|alias| (alias.thread_id.clone(), alias.source.clone()))
+        .collect::<BTreeSet<_>>();
     for index in &selected {
-        if !current_leaves[index].1.is_empty() {
-            absorbed_leaves.extend(current_leaves[index].0.iter().cloned());
-        }
         if let Some(origin) = &messages[*index].provenance {
             let mut origin = origin.clone();
             if origin.sources.len() == 1
@@ -1192,35 +1173,41 @@ async fn project_checkpoint_with_input_claims(
                     merge_graph_input_evidence(&mut origin, &graph);
                 }
             }
+            replaced_alias_sources.extend(
+                origin
+                    .source_aliases
+                    .iter()
+                    .map(|alias| (alias.thread_id.clone(), alias.source.clone())),
+            );
+            if !current_leaves[index].1.is_empty()
+                && !current_leaves[index].0.is_subset(&expanded.leaves)
+            {
+                // This summary was selected through a copy claim. Its old
+                // aliases are still available on its published checkpoint;
+                // only claims rooted in the new leaf closure can be carried.
+                origin.source_aliases.retain(|alias| {
+                    expanded.leaves.contains(&scoped_input(
+                        &alias.represented_thread_id,
+                        &alias.represented_source,
+                    ))
+                });
+            }
             aliases.extend(origin.source_aliases);
             ambiguous.extend(origin.ambiguous_input_aliases);
         }
     }
+    ambiguous.extend(claims.conflicts().into_iter().filter(|marker| {
+        replaced_alias_sources.contains(&(marker.thread_id.clone(), marker.source.clone()))
+            || expanded
+                .leaves
+                .contains(&scoped_input(&marker.thread_id, &marker.source))
+    }));
     let evidence = transferred_input_evidence(&expanded.leaves, &aliases, &ambiguous);
-    let mut selected_claims = claims.clone();
-    for alias in &aliases {
-        selected_claims.add_alias(alias);
-    }
-    selected_claims.ambiguous.extend(
-        ambiguous
-            .iter()
-            .map(|marker| (marker.thread_id.clone(), marker.source.clone())),
-    );
-    selected_claims.mark_competing_owners();
-    let rebased = rebase_summary_input_claims(&expanded.leaves, &absorbed_leaves, &selected_claims);
     let origin = summary.provenance.as_mut().expect("checkpoint origin");
-    origin.source_aliases = if absorbed_leaves.is_empty() {
-        evidence.aliases
-    } else {
-        rebased.aliases()
-    };
-    origin.ambiguous_input_aliases = if absorbed_leaves.is_empty() {
-        evidence.ambiguous
-    } else {
-        rebased.conflicts()
-    };
-    // An absorbed checkpoint can hold exact input proof needed by the
-    // surviving summary.
+    origin.source_aliases = evidence.aliases;
+    origin.ambiguous_input_aliases = evidence.ambiguous;
+    // main's larger-summary suppression must retain the absorbed input proof,
+    // just as replacing a smaller selected checkpoint does.
     if covered_by_other_checkpoint {
         for (index, (leaves, checkpoints, domain)) in &current_leaves {
             if !checkpoints.contains(&expanded.root)
@@ -1232,10 +1219,29 @@ async fn project_checkpoint_with_input_claims(
                     .provenance
                     .as_mut()
                     .expect("checkpoint origin");
-                let retained =
-                    rebase_summary_input_claims(leaves, &expanded.leaves, &selected_claims);
-                origin.source_aliases = retained.aliases();
-                origin.ambiguous_input_aliases = retained.conflicts();
+                let retained = transferred_input_evidence(
+                    leaves,
+                    origin
+                        .source_aliases
+                        .iter()
+                        .chain(summary.provenance.as_ref().unwrap().source_aliases.iter())
+                        .filter(|alias| {
+                            leaves.contains(&scoped_input(
+                                &alias.represented_thread_id,
+                                &alias.represented_source,
+                            ))
+                        }),
+                    origin.ambiguous_input_aliases.iter().chain(
+                        summary
+                            .provenance
+                            .as_ref()
+                            .unwrap()
+                            .ambiguous_input_aliases
+                            .iter(),
+                    ),
+                );
+                origin.source_aliases = retained.aliases;
+                origin.ambiguous_input_aliases = retained.ambiguous;
             }
         }
     }
