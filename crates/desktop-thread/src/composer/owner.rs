@@ -87,17 +87,46 @@ impl ComposerView {
             let composer_state = cx.new(|cx| {
                 TextareaState::new(window, cx)
                     .auto_grow(2, 13)
+                    .submit_on_enter(true)
                     .placeholder(t!("chat.composer.placeholder").to_string())
             });
             let composer_mention_select = cx.new(|cx| new_member_picker_state(window, cx));
-            let input_subscription =
-                cx.subscribe(&composer_state, |view, input, event: &InputEvent, cx| {
-                    if matches!(event, InputEvent::Change)
-                        && view.composer_text_intent(input.read(cx).value().to_string())
-                    {
-                        cx.notify();
+            let input_subscription = cx.subscribe_in(
+                &composer_state,
+                window,
+                |view, input, event: &InputEvent, window, cx| match event {
+                    InputEvent::Change => {
+                        if view.composer_text_intent(input.read(cx).value().to_string()) {
+                            cx.notify();
+                        }
                     }
-                });
+                    InputEvent::PressEnter {
+                        secondary: false,
+                        shift: false,
+                    } => {
+                        if input.read(cx).value().trim().is_empty()
+                            || view.desktop_voice_context_locked()
+                            || view.composer_upload_in_progress()
+                            || view.message_mutation_pending()
+                            || input.update(cx, |state, cx| {
+                                state.marked_text_range(window, cx).is_some()
+                            })
+                        {
+                            return;
+                        }
+                        if let Some(target) = view.composer_edit_target() {
+                            if view.connection_state == GatewayConnectionState::Connected
+                                && !target.conflicted
+                            {
+                                view.submit_composer_message_edit(window, cx);
+                            }
+                        } else {
+                            view.submit_composer_message(window, cx);
+                        }
+                    }
+                    _ => {}
+                },
+            );
             let mention_subscription = cx.subscribe_in(
                 &composer_mention_select,
                 window,
