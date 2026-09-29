@@ -36,9 +36,7 @@ async fn cold_uncomparable_parent_blocks_only_its_own_delivery() {
     append_causal_delivery_ack(&f.store, "cold-first", "cold-q1").await;
     // Registering the already appended Q1, Q2 and A1 together does not
     // establish a cross-turn order for Q2 versus A1.
-    super::history::prepare_history(&f.store, "ws", "thread")
-        .await
-        .unwrap();
+    backfill_causal_turns(&f.store, &["cold-q1", "cold-q2"]).await;
     materialize_causal_user_question(&f.store, "thread", "turn", "cold-q3", "Q3").await;
     insert_causal_delivery_link(&f.store, "cold-second", "cold-q3").await;
     append_causal_delivery_ack(&f.store, "cold-second", "cold-q3").await;
@@ -67,17 +65,37 @@ async fn cold_uncomparable_parent_blocks_only_its_own_delivery() {
     };
     let first_ack = causal_ack_reference(&f.store, "cold-q1", "cold-first").await;
     let second_ack = causal_ack_reference(&f.store, "cold-q3", "cold-second").await;
+    let points = f
+        .store
+        .compaction_history_causal_source_page(
+            "ws",
+            "thread",
+            &[first_ack.clone(), second_ack.clone()],
+            &fence,
+        )
+        .await
+        .unwrap();
+    assert_eq!(points.len(), 2);
+    assert!(
+        points
+            .iter()
+            .any(|point| point.reference == first_ack && !point.native_append)
+    );
+    assert!(
+        points
+            .iter()
+            .any(|point| point.reference == second_ack && point.native_append)
+    );
     let first = causal_gateway_answer("cold-a1", "A1");
     let second = causal_gateway_answer("cold-a3", "A3");
     let tool_call = history
         .iter()
         .find(|message| {
             message.provenance.as_ref().is_some_and(|origin| {
-                origin.unit_id == "cold-round-cold-q2"
-                    && message
-                        .tool_calls
-                        .as_ref()
-                        .is_some_and(|calls| !calls.is_empty())
+                origin.thread_id == "thread"
+                    && message.tool_calls.as_ref().is_some_and(|calls| {
+                        calls.iter().any(|call| call.id == "cold-call-cold-q2")
+                    })
             })
         })
         .unwrap()
@@ -91,11 +109,10 @@ async fn cold_uncomparable_parent_blocks_only_its_own_delivery() {
         .iter()
         .find(|message| {
             message.provenance.as_ref().is_some_and(|origin| {
-                origin.unit_id == "cold-round-cold-q4"
-                    && message
-                        .tool_calls
-                        .as_ref()
-                        .is_some_and(|calls| !calls.is_empty())
+                origin.thread_id == "thread"
+                    && message.tool_calls.as_ref().is_some_and(|calls| {
+                        calls.iter().any(|call| call.id == "cold-call-cold-q4")
+                    })
             })
         })
         .unwrap()
@@ -159,9 +176,7 @@ async fn old_deliveries_keep_both_unproven_peer_orders() {
     insert_causal_delivery_link(&f.store, "peer-second", "peer-q2").await;
     append_causal_delivery_ack(&f.store, "peer-first", "peer-q1").await;
     append_causal_delivery_ack(&f.store, "peer-second", "peer-q2").await;
-    super::history::prepare_history(&f.store, "ws", "thread")
-        .await
-        .unwrap();
+    backfill_causal_turns(&f.store, &["peer-q1", "peer-q2"]).await;
     let fence = f.store.compaction_history_read_fence().await.unwrap();
     let history = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
         .await
@@ -175,15 +190,23 @@ async fn old_deliveries_keep_both_unproven_peer_orders() {
     };
     let first = causal_gateway_answer("peer-a1", "A1");
     let second = causal_gateway_answer("peer-a2", "A2");
+    let first_ack = causal_ack_reference(&f.store, "peer-q1", "peer-first").await;
+    let second_ack = causal_ack_reference(&f.store, "peer-q2", "peer-second").await;
+    let points = f
+        .store
+        .compaction_history_causal_source_page(
+            "ws",
+            "thread",
+            &[first_ack.clone(), second_ack.clone()],
+            &fence,
+        )
+        .await
+        .unwrap();
+    assert_eq!(points.len(), 2);
+    assert!(points.iter().all(|point| !point.native_append));
     let candidates = std::collections::BTreeMap::from([
-        causal_candidate(
-            &first,
-            causal_ack_reference(&f.store, "peer-q1", "peer-first").await,
-        ),
-        causal_candidate(
-            &second,
-            causal_ack_reference(&f.store, "peer-q2", "peer-second").await,
-        ),
+        causal_candidate(&first, first_ack),
+        causal_candidate(&second, second_ack),
     ]);
     for answers in [
         vec![second.clone(), first.clone()],
@@ -415,11 +438,10 @@ async fn provider_sequence_does_not_order_a_same_turn_delivery() {
         .iter()
         .find(|message| {
             message.provenance.as_ref().is_some_and(|origin| {
-                origin.unit_id == "cold-round-provider-q1"
-                    && message
-                        .tool_calls
-                        .as_ref()
-                        .is_some_and(|calls| !calls.is_empty())
+                origin.thread_id == "thread"
+                    && message.tool_calls.as_ref().is_some_and(|calls| {
+                        calls.iter().any(|call| call.id == "cold-call-provider-q1")
+                    })
             })
         })
         .cloned()
@@ -510,6 +532,33 @@ async fn append_causal_provider_round(store: &CrudStore, turn: &str, first_seque
             .await
             .unwrap();
     }
+}
+
+async fn backfill_causal_turns(store: &CrudStore, turns: &[&str]) {
+    let db = store.database_connection();
+    // These synthetic rows model sources that existed before preparation.
+    // Rebuild their journals through the same bounded legacy preparation path.
+    for turn in turns {
+        for table in [
+            "compaction_input_revision",
+            "compaction_event_revision",
+            "compaction_source_revision",
+        ] {
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                format!("DELETE FROM {table} WHERE turn_id=?"),
+                [(*turn).into()],
+            ))
+            .await
+            .unwrap();
+        }
+    }
+    db.execute_unprepared("DELETE FROM compaction_history_preparation WHERE thread_id='thread'")
+        .await
+        .unwrap();
+    super::history::prepare_history(store, "ws", "thread")
+        .await
+        .unwrap();
 }
 
 async fn causal_ack_reference(store: &CrudStore, turn: &str, suffix: &str) -> SourceRef {
@@ -1091,6 +1140,29 @@ async fn frozen_occurrence_delivery_uses_ack_event_and_keeps_literal_ordinals() 
                     }
                 }
             }
+            // The command has visible parent work, and deliveries go to a
+            // separate occurrence. Both belong in the selected Q4 turn.
+            f.store
+                .materialize_item_completed(
+                    pioneer_protocol::ItemCompletedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "causal-execution".into(),
+                        turn_id: "causal-exec-q4".into(),
+                        item: pioneer_protocol::TurnItem::AgentMessage {
+                            id: "causal-exec-q4-work".into(),
+                            text: "Q4 work".into(),
+                            phase: Default::default(),
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    },
+                    chrono::Utc::now().timestamp(),
+                )
+                .await
+                .unwrap();
+            db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('causal-exec-occurrence','causal-execution','in_progress','task_run','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")
+                .await
+                .unwrap();
             let first = append_causal_nested_output(&f, "first", "A4").await;
             let second = append_causal_nested_output(&f, "second", "B4").await;
             let output_threads = [
@@ -1150,9 +1222,9 @@ async fn frozen_occurrence_delivery_uses_ack_event_and_keeps_literal_ordinals() 
                     assert_eq!(
                         contents,
                         if count == 1 {
-                            vec!["Q4", "A4", "B4"]
+                            vec!["Q4", "Q4 work", "A4", "B4"]
                         } else {
-                            vec!["Q3", "Q4", "A4", "B4"]
+                            vec!["Q3", "Q4", "Q4 work", "A4", "B4"]
                         }
                     );
                 }
@@ -1180,7 +1252,7 @@ async fn frozen_occurrence_delivery_uses_ack_event_and_keeps_literal_ordinals() 
                 "Q5",
             )
             .await;
-            db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES ('causal-nested-repeat','ws','causal-nested-task-first','causal-nested-run-first','causal-nested-repeat','thread','origin_thread','causal-execution','delivered',1,1,'causal-exec-q4')")
+            db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES ('causal-nested-repeat','ws','causal-nested-task-first','causal-nested-run-first','causal-nested-repeat','thread','origin_thread','causal-execution','delivered',1,1,'causal-exec-occurrence')")
                 .await
                 .unwrap();
             db.execute_unprepared("INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES ('causal-nested-repeat','causal-nested-candidate-first','causal-nested-rt-first')")
@@ -1193,7 +1265,7 @@ async fn frozen_occurrence_delivery_uses_ack_event_and_keeps_literal_ordinals() 
                     pioneer_protocol::ItemCompletedNotification {
                         workspace_id: "ws".into(),
                         thread_id: "causal-execution".into(),
-                        turn_id: "causal-exec-q4".into(),
+                        turn_id: "causal-exec-occurrence".into(),
                         item: pioneer_protocol::TurnItem::AgentMessage {
                             id: repeated_item.clone(),
                             text: "A4 again".into(),
@@ -1211,7 +1283,7 @@ async fn frozen_occurrence_delivery_uses_ack_event_and_keeps_literal_ordinals() 
                 .compaction_source_page(
                     "ws",
                     "causal-execution",
-                    "causal-exec-q4",
+                    "causal-exec-occurrence",
                     PagedSource::Event,
                     0,
                 )
@@ -1230,7 +1302,7 @@ async fn frozen_occurrence_delivery_uses_ack_event_and_keeps_literal_ordinals() 
                     pioneer_protocol::ItemCompletedNotification {
                         workspace_id: "ws".into(),
                         thread_id: "causal-execution".into(),
-                        turn_id: "causal-exec-q4".into(),
+                        turn_id: "causal-exec-occurrence".into(),
                         item: pioneer_protocol::TurnItem::AgentMessage {
                             id: first_delivery_item.clone(),
                             text: "A4 acknowledged again".into(),
@@ -1248,7 +1320,7 @@ async fn frozen_occurrence_delivery_uses_ack_event_and_keeps_literal_ordinals() 
                 .compaction_source_page(
                     "ws",
                     "causal-execution",
-                    "causal-exec-q4",
+                    "causal-exec-occurrence",
                     PagedSource::Event,
                     0,
                 )
@@ -1686,7 +1758,7 @@ async fn append_causal_nested_output(
             "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES ('{candidate}','{task}','{run}','{run_turn}','{thread}','{turn}',0,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
         ),
         format!(
-            "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES ('{delivery}','ws','{task}','{run}','{delivery}','thread','origin_thread','causal-execution','delivered',1,1,'causal-exec-q4')"
+            "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES ('{delivery}','ws','{task}','{run}','{delivery}','thread','origin_thread','causal-execution','delivered',1,1,'causal-exec-occurrence')"
         ),
     ] {
         db.execute_unprepared(&statement).await.unwrap();
@@ -1724,7 +1796,7 @@ async fn append_causal_nested_output(
             pioneer_protocol::ItemCompletedNotification {
                 workspace_id: "ws".into(),
                 thread_id: "causal-execution".into(),
-                turn_id: "causal-exec-q4".into(),
+                turn_id: "causal-exec-occurrence".into(),
                 item: pioneer_protocol::TurnItem::AgentMessage {
                     id: item_id.clone(),
                     text: text.into(),
@@ -1745,7 +1817,7 @@ async fn append_causal_nested_output(
         .compaction_source_page(
             "ws",
             "causal-execution",
-            "causal-exec-q4",
+            "causal-exec-occurrence",
             PagedSource::Event,
             0,
         )
@@ -9899,8 +9971,10 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     .await
     .unwrap();
     for statement in [
-        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('rt-d-direct','task-d','run-d','context-d','turn-d','revision',1,2,'candidate_created',CURRENT_TIMESTAMP)",
-        "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES ('candidate-d-direct','task-d','run-d','rt-d-direct','context-d','turn-d',1,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn-d-direct','context-d','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('run-d-direct','task-d','run-d-direct',1,2,'succeeded','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('rt-d-direct','task-d','run-d-direct','context-d','turn-d-direct','initial',0,1,'candidate_created',CURRENT_TIMESTAMP)",
+        "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES ('candidate-d-direct','task-d','run-d-direct','rt-d-direct','context-d','turn-d-direct',0,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
     ] {
         db.execute_unprepared(statement).await.unwrap();
     }
@@ -9910,7 +9984,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         .await
         .unwrap();
     assert_eq!(direct_output.history, direct_history);
-    db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES ('delivery-d-direct','ws','task-d','run-d','delivery-d-direct','thread','origin_thread','thread','delivered',1,1,'delivery-turn-d')")
+    db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES ('delivery-d-direct','ws','task-d','run-d-direct','delivery-d-direct','thread','origin_thread','thread','delivered',1,1,'delivery-turn-d')")
         .await
         .unwrap();
     db.execute_unprepared("INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES ('delivery-d-direct','candidate-d-direct','rt-d-direct')")
