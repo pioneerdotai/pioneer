@@ -101,6 +101,7 @@ Rules:
 - Prefer `runIds` when `task_create` returned run ids.
 - Do not use singular `taskId` or `runId`.
 - A timeout does not cancel child work.
+- `timedOut:true` means this wait window expired. Active `taskIds` or `runIds` can be waited on again even when no counts changed. A run timeout appears separately in its run status and error.
 - Authorized reviewers receive `reviewContent` for each `reviewRequired` candidate. `summary` alone is not the full result.
 
 ## task_result
@@ -198,3 +199,5 @@ Use `task_list` or `task_get` when attached work must be inspected, recovered, o
   "taskId": "TASK_ID"
 }
 ```
+
+Each `task_get.runs[]` includes `execution` with `status`, `heartbeatAt`, `lastActivityAt`, and `observedAt` (Unix seconds). `status:null` means no execution row was observed. `heartbeatAt` is periodic liveness, not proof of meaningful progress. `lastActivityAt` is present only when the runtime recorded task activity for the current execution attempt; `null` means activity is unknown. `updatedAt` on a task or run is not a substitute for either timestamp.

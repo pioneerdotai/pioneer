@@ -2741,6 +2741,8 @@ pub struct PublicTaskRun {
     pub status: TaskRunStatus,
     pub executor_kind: TaskExecutorKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<PublicTaskRunExecutionObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<i64>,
@@ -2750,6 +2752,19 @@ pub struct PublicTaskRun {
     pub error: Option<PublicTaskFailure>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// A read-only observation of the execution belonging to this run. Timestamps
+/// are Unix seconds. A missing status means no execution row was observed.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskRunExecutionObservation {
+    pub status: Option<TaskRunExecutionStatus>,
+    pub heartbeat_at: Option<i64>,
+    /// Confirmed task progress recorded for this execution attempt, if any.
+    /// This is distinct from a periodic heartbeat and does not promise a result.
+    pub last_activity_at: Option<i64>,
+    pub observed_at: i64,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
