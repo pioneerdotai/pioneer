@@ -14,6 +14,8 @@ catalog-hide: true
 
 Durable tasks are product objects that can outlive the current turn. They have task state, run history, result snapshots, attempts, diagnostics, schedules, and delivery behavior.
 
+When observing a task with `task_get`, distinguish task, run, and execution status. A `running` run is unfinished; no result or unchanged `updatedAt` does not prove a stall. The execution heartbeat is periodic liveness, while `lastActivityAt` is confirmed activity only when recorded. Missing activity is unknown. Do not cancel or repeat work solely because it is taking time or repeated observations are unchanged. A `task_wait` timeout ends only that wait window and permits another wait for active attached work.
+
 Use this skill for future, recurring, background, or already-existing task work. For attached child agents created to help with the current turn, read `system:pioneer/subagents` instead.
 
 ## Product Model

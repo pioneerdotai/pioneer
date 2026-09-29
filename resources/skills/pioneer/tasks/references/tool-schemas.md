@@ -147,6 +147,8 @@ Use for exact current task state.
 
 Use before `task_update` when the update depends on preserving existing schedule, instructions, delivery, or revision.
 
+Each returned run has an `execution` observation: `status`, `heartbeatAt`, `lastActivityAt`, and `observedAt` (Unix seconds). `status:null` means no execution row was observed. A heartbeat is a periodic liveness mark, not meaningful work progress. `lastActivityAt` is confirmed task activity for the current execution attempt when recorded; `null` means unknown. Task and run `updatedAt` fields do not measure child activity.
+
 ## task_update
 
 Patch only fields that should change. Omitted fields keep their current value.
@@ -234,5 +236,7 @@ Rules:
 ## task_wait Caveat
 
 Do not call `task_wait` after creating scheduled future work unless the returned run is active and waitable.
+
+For active attached work, `timedOut:true` means only the requested wait window expired. It does not stop or diagnose a run; waiting again with `taskIds` or `runIds` is allowed. A run's own timeout is reported in its status and error.
 
 Scheduled, interval, and cron tasks often return `waitable:false` or `runId:null` at creation. Confirm the schedule instead of waiting.
