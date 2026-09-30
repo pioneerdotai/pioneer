@@ -141,6 +141,19 @@ fn record_error(
         *complete = false;
     }
     let pointer = format!("{instance_base}{}", error.instance_path);
+    if let Some(properties) =
+        grouped_false_schema_properties(&error, schema, schema_base, arguments, &pointer)
+    {
+        for (name, value) in properties {
+            record(Diagnostic {
+                path: safe_path(&format!("{pointer}/{}", escape(name)), arguments, &names),
+                code: "additionalProperties",
+                expected: "only properties allowed by schema".to_owned(),
+                actual_type: value_type(value),
+            });
+        }
+        return;
+    }
     // These library errors group independent unexpected properties/items.
     // Expand them without exposing model-authored dynamic property names.
     if let ValidationErrorKind::AdditionalProperties { unexpected }
@@ -199,13 +212,7 @@ fn selected_alternative(
     branch_validators: &mut BTreeMap<String, Arc<Validator>>,
     complete: &mut bool,
 ) -> Option<(String, Arc<Validator>)> {
-    let path = error.schema_path.to_string();
-    let path = if base.is_empty() {
-        path.as_str()
-    } else {
-        path.strip_prefix("/$ref")?
-    };
-    let pointer = schema_location(schema, base, path)?;
+    let pointer = validation_schema_location(schema, base, error)?;
     let alternatives = schema.pointer(&pointer)?.as_array()?;
     let mut candidates = Vec::new();
     for index in 0..alternatives.len() {
@@ -277,6 +284,50 @@ fn selected_alternative(
         }
     }
     selected
+}
+
+fn grouped_false_schema_properties<'a>(
+    error: &ValidationError<'_>,
+    schema: &Value,
+    schema_base: &str,
+    arguments: &'a Value,
+    pointer: &str,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    if !matches!(error.kind, ValidationErrorKind::FalseSchema) {
+        return None;
+    }
+    let location = validation_schema_location(schema, schema_base, error)?;
+    let (parent, keyword) = location.rsplit_once('/')?;
+    let definition = schema.pointer(parent)?;
+    if keyword != "additionalProperties"
+        || definition.get(keyword) != Some(&Value::Bool(false))
+        || definition.get("properties").is_some()
+        || definition.get("patternProperties").is_some()
+    {
+        return None;
+    }
+    let instance = arguments.pointer(pointer)?;
+    // jsonschema's no-properties shortcut reports the first property's value
+    // at its containing object's path. A genuine false schema reports the
+    // instance at that path; keep that error intact, including keyword-like names.
+    if instance == error.instance.as_ref() {
+        return None;
+    }
+    instance.as_object()
+}
+
+fn validation_schema_location(
+    schema: &Value,
+    base: &str,
+    error: &ValidationError<'_>,
+) -> Option<String> {
+    let path = error.schema_path.to_string();
+    let path = if base.is_empty() {
+        path.as_str()
+    } else {
+        path.strip_prefix("/$ref")?
+    };
+    schema_location(schema, base, path)
 }
 
 fn slice_validator(
@@ -737,6 +788,82 @@ mod tests {
         assert_eq!(result["diagnostics"].as_array().unwrap().len(), 2);
         assert!(!result.to_string().contains("private-key"));
         assert!(!result.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn forbidden_properties_expand_through_references_and_selected_alternatives() {
+        let schema = json!({
+            "$defs": {"empty/object": {"type": "object", "additionalProperties": false}},
+            "type": "object", "properties": {
+                "items": {"type": "array", "items": {"anyOf": [
+                    {"$ref": "#/$defs/empty~1object"}, {"type": "null"}
+                ]}}
+            }
+        });
+        let result = diagnostics(
+            json!({"items": [{"private-a": "secret", "private-b": false}]}),
+            schema.clone(),
+        );
+        let entries = result["diagnostics"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["actualType"], "string");
+        assert_eq!(entries[1]["actualType"], "boolean");
+        for entry in entries {
+            assert_eq!(entry["code"], "additionalProperties");
+            assert_eq!(entry["path"], "$/items/0/*");
+        }
+        assert_eq!(result["validationComplete"], true);
+        assert!(!result.to_string().contains("private-"));
+        assert!(!result.to_string().contains("secret"));
+        validate(
+            &json!({"items": [{}, null]}),
+            &schema,
+            &compile(&schema).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn genuine_false_schemas_are_not_expanded_into_property_errors() {
+        for (arguments, schema, path) in [
+            (json!({"a": 1, "b": 2}), json!(false), "$"),
+            (
+                json!({"additionalProperties": {"a": 1, "b": 2}}),
+                json!({"properties": {"additionalProperties": false}}),
+                "$/additionalProperties",
+            ),
+        ] {
+            let result = diagnostics(arguments, schema);
+            let entries = result["diagnostics"].as_array().unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0]["code"], "falseSchema");
+            assert_eq!(entries[0]["path"], path);
+            assert_eq!(entries[0]["actualType"], "object");
+        }
+    }
+
+    #[test]
+    fn forbidden_properties_keep_display_limits_and_hidden_counts() {
+        let arguments = Value::Object(
+            (0..40)
+                .map(|index| (format!("private-{index}"), json!(false)))
+                .collect(),
+        );
+        let result = diagnostics(
+            arguments,
+            json!({"type": "object", "additionalProperties": false}),
+        );
+        let entries = result["diagnostics"].as_array().unwrap();
+        assert_eq!(entries.len(), MAX_DIAGNOSTICS);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry["code"] == "additionalProperties")
+        );
+        assert_eq!(result["hiddenDiagnosticCount"], 8);
+        assert_eq!(result["diagnosticsTruncated"], true);
+        assert_eq!(result["validationComplete"], true);
+        assert!(!result.to_string().contains("private-"));
     }
 
     #[test]
