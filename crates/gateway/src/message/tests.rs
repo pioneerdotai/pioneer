@@ -76439,7 +76439,9 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
 fn recovery_failure_diagnostics_reach_task_consumers_in_all_delivery_paths() {
     run_standard_stack_message_test("recovery diagnostics through Task", async {
         for path in ["normal", "replay", "outbox"] {
-            recovery_failure_task_consumers_impl("provider", path).await;
+            for parent_is_task_run in [true, false] {
+                recovery_failure_task_consumers_impl("provider", path, parent_is_task_run).await;
+            }
         }
     });
 }
@@ -76448,15 +76450,23 @@ fn recovery_failure_diagnostics_reach_task_consumers_in_all_delivery_paths() {
 fn recovery_plan_and_start_refusals_reach_task_consumers() {
     run_standard_stack_message_test("recovery terminal refusals through Task", async {
         for path in ["normal", "outbox"] {
-            recovery_failure_task_consumers_impl("plan", path).await;
+            for parent_is_task_run in [true, false] {
+                recovery_failure_task_consumers_impl("plan", path, parent_is_task_run).await;
+            }
         }
         for path in ["normal", "replay", "outbox"] {
-            recovery_failure_task_consumers_impl("start", path).await;
+            for parent_is_task_run in [true, false] {
+                recovery_failure_task_consumers_impl("start", path, parent_is_task_run).await;
+            }
         }
     });
 }
 
-async fn recovery_failure_task_consumers_impl(scenario: &str, path: &str) {
+async fn recovery_failure_task_consumers_impl(
+    scenario: &str,
+    path: &str,
+    parent_is_task_run: bool,
+) {
     use pioneer_agent::TaskToolProvider;
     let provider = Arc::new(HangingChildProvider::new());
     let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
@@ -76475,8 +76485,13 @@ async fn recovery_failure_task_consumers_impl(scenario: &str, path: &str) {
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
-    let parent_thread = format!("thr_recovery_task_{scenario}_{path}");
-    let parent_turn = format!("turn_recovery_task_{scenario}_{path}");
+    let parent_kind = if parent_is_task_run {
+        "task_run"
+    } else {
+        "agent"
+    };
+    let parent_thread = format!("thr_recovery_task_{scenario}_{path}_{parent_kind}");
+    let parent_turn = format!("turn_recovery_task_{scenario}_{path}_{parent_kind}");
     let mut params = test_task_create_params(
         &workspace_id,
         &parent_thread,
@@ -76494,15 +76509,17 @@ async fn recovery_failure_task_consumers_impl(scenario: &str, path: &str) {
     });
     let created = create_task_for_test(&processor, params).await.unwrap();
     let run = created.run.unwrap();
-    // This visible Turn is the Task occurrence, which closes with its child.
-    store
-        .database_connection()
-        .execute_unprepared(&format!(
-            "UPDATE turn SET turn_kind = 'task_run' WHERE id = '{}'",
-            parent_turn
-        ))
-        .await
-        .unwrap();
+    if parent_is_task_run {
+        // A visible Task occurrence closes with its child; a delegating Agent Turn stays active.
+        store
+            .database_connection()
+            .execute_unprepared(&format!(
+                "UPDATE turn SET turn_kind = 'task_run' WHERE id = '{}'",
+                parent_turn
+            ))
+            .await
+            .unwrap();
+    }
     let lineage = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
     for _ in 0..100 {
         if provider.child_main_call_count() > 0 {
@@ -76777,26 +76794,33 @@ async fn recovery_failure_task_consumers_impl(scenario: &str, path: &str) {
         .await
         .unwrap();
     assert_eq!(card.error_preview.as_deref(), Some(expected.as_str()));
+    let (_, parent) = store
+        .get_turn(&parent_thread, &parent_turn)
+        .await
+        .unwrap()
+        .unwrap();
     let observations = crate::task_tools::GatewayTaskToolProvider::new(Arc::downgrade(&processor))
         .terminal_attached_task_observations(pioneer_agent::TaskTurnContext {
             workspace_id,
             thread_id: parent_thread.clone(),
             turn_id: parent_turn.clone(),
         })
-        .await
-        .unwrap();
-    assert!(
-        observations
-            .iter()
-            .any(|item| item.task_id == created.task.id
-                && item.error_message.as_deref() == Some(expected.as_str()))
-    );
-    let (_, parent) = store
-        .get_turn(&parent_thread, &parent_turn)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(parent.error.as_deref(), Some(expected.as_str()));
+        .await;
+    if parent_is_task_run {
+        assert_eq!(parent.status, TurnStatus::Failed);
+        assert_eq!(parent.error.as_deref(), Some(expected.as_str()));
+        assert!(observations.unwrap_err().contains("task_access_denied"));
+    } else {
+        assert_eq!(parent.status, TurnStatus::InProgress);
+        assert!(parent.error.is_none());
+        assert!(
+            observations
+                .unwrap()
+                .iter()
+                .any(|item| item.task_id == created.task.id
+                    && item.error_message.as_deref() == Some(expected.as_str()))
+        );
+    }
     let deliveries = store
         .list_task_deliveries(pioneer_protocol::TaskDeliveriesParams {
             workspace_id: created.task.workspace_id.clone(),
