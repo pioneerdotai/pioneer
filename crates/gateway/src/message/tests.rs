@@ -74486,6 +74486,8 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
             setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
         let store = &harness.crud_store;
         let workspace = &harness.workspace_id;
+        let principal = authenticated_test_superuser();
+        ensure_test_superuser_execution_authority(store).await;
         let thread_id = "creation-order";
         let historical_turn = "creation-history";
         let current_turn = "creation-current";
@@ -74502,7 +74504,7 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
                         text: input.into(),
                         text_elements: vec![],
                     }],
-                    pioneer_protocol::PersistedActorRef::System,
+                    pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
                 )
                 .await
                 .unwrap();
@@ -74578,7 +74580,7 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
                     text: format!("middle order marker {}", "middle detail ".repeat(12_000)),
                     text_elements: vec![],
                 }],
-                pioneer_protocol::PersistedActorRef::System,
+                pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
             )
             .await
             .unwrap();
@@ -74596,7 +74598,7 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
         }
         persist_test_execution_authorization_context_for_principal(
             &harness.processor,
-            authenticated_test_superuser().as_ref(),
+            principal.as_ref(),
             workspace,
             thread_id,
             current_turn,

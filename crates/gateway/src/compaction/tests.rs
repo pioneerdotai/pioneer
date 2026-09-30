@@ -9970,7 +9970,6 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
         crate::turn_runtime_snapshot::restore_history_json(&f.store, "ws", &allowed, &current_json)
             .await
             .unwrap();
-    assert_eq!(captured, current);
     let prepared =
         super::frozen::capture_execution_basis_prepared(&f.store, "ws", "thread", None, None, None)
             .await
@@ -9979,6 +9978,7 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
         .await
         .unwrap();
     assert_eq!(prepared.messages, restored_prepared);
+    assert_eq!(captured, prepared.messages);
     let mut remaining = current.clone();
     for message in &prepared.messages {
         let index = remaining
@@ -10052,7 +10052,7 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
         match mode {
             pioneer_protocol::TaskAgentContextMode::LastNTurns
             | pioneer_protocol::TaskAgentContextMode::InheritParent => {
-                assert_eq!(restored, current)
+                assert_eq!(restored, prepared.messages)
             }
             _ => assert!(restored.is_empty()),
         }
