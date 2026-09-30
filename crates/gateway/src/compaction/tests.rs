@@ -10153,7 +10153,11 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
         crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(&f.store, &stored)
             .await
             .unwrap();
-    assert_eq!(runtime_history, frozen);
+    // Working restore places the reasoning event (t+2) before the tool result
+    // (t+3); literal restore below must retain the frozen message order.
+    let mut expected_runtime_history = frozen.clone();
+    expected_runtime_history.swap(2, 3);
+    assert_eq!(runtime_history, expected_runtime_history);
     let legacy = serde_json::to_string(&vec![pioneer_provider::ChatMessage::user(
         "accepted legacy projection",
     )])
