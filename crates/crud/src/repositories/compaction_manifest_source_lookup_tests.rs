@@ -1105,6 +1105,20 @@ async fn inherited_input_alias_admits_only_exact_historical_checkpoint_coverage(
         "summary carrier proves its exact historical input alias",
     )
     .await;
+    let selection = serde_json::to_string(&ModelSelection {
+        transport: Transport::Api,
+        instance: "publication-fixture".into(),
+        model: "publication-model".into(),
+        effort: None,
+    })
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_checkpoint SET selection=? WHERE id IN ('source-checkpoint','original-summary')",
+        [selection.into()],
+    ))
+    .await
+    .unwrap();
     let old = f
         .store
         .compaction_checkpoint("source-checkpoint")
