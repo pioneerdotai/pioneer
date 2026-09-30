@@ -963,8 +963,15 @@ async fn inherited_input_alias_admits_only_exact_historical_checkpoint_coverage(
     let mut reference = serde_json::json!({
         "inherited": true, "complete": true, "protected_input": false,
         "source_thread": "foreign-thread",
+        "unit_id": "foreign-turn:original-input",
+        "wire_sha256": "a".repeat(64),
+        "replay_source": null, "tool_call_id": null, "tool_name": null,
         "sources": [{"scope":"input:foreign-turn","id":"original-input","version":"input-revision:1"}]
     });
+    serde_json::from_value::<pioneer_compaction::frozen::FrozenMessageRef>(reference.clone())
+        .unwrap()
+        .validate()
+        .unwrap();
     install_projection(&db, "input-alias-basis", &reference.to_string()).await;
     assert_manifest_current(
         &db,
@@ -1097,6 +1104,10 @@ async fn inherited_input_alias_admits_only_exact_historical_checkpoint_coverage(
         db.execute_unprepared(sql).await.unwrap();
     }
     reference["sources"] = serde_json::json!([{"scope":"checkpoint:original-owner","id":"original-summary","version":"original-version"}]);
+    serde_json::from_value::<pioneer_compaction::frozen::FrozenMessageRef>(reference.clone())
+        .unwrap()
+        .validate()
+        .unwrap();
     update(reference).await;
     assert_manifest_current(
         &db,
