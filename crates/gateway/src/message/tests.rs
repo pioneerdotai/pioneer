@@ -29556,21 +29556,25 @@ async fn nested_cli_children_bootstrap_their_accepted_lineage_only_impl() {
         "editing an uncovered accepted ancestor must bridge into an isolated provider conversation"
     );
     let input = recovered.input.to_string();
-    let mut previous = input
+    let revised = input
         .find(revised_root_marker)
         .expect("the current accepted root revision must be restored");
     assert!(!input.contains(root_marker));
+    // Editing replaces the input with new source IDs and creation dates. Its
+    // current revision need not precede every already accepted child output.
+    let mut previous = None;
     for marker in &output_markers {
         let position = input
             .find(marker)
             .expect("each accepted nested output must be restored");
-        assert!(previous < position);
-        previous = position;
+        assert!(previous.is_none_or(|previous| previous < position));
+        previous = Some(position);
     }
     let current = input
         .find(current_marker)
         .expect("current question must be delivered once");
-    assert!(previous < current);
+    assert!(previous.unwrap() < current);
+    assert!(revised < current);
     assert_eq!(input.match_indices(current_marker).count(), 1);
     assert!(!input.contains(late_parent_marker));
     assert!(!input.contains(sibling_marker));
@@ -74777,6 +74781,370 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
 #[tokio::test]
 async fn durable_completed_cli_owner_prepares_history_and_publishes_lifecycle() {
     check_completed_history(true, false, false, false, false).await;
+}
+
+#[tokio::test]
+async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
+    use pioneer_agent::compaction::{
+        controller::{NativeContext, NativeContextController},
+        history::{PendingOriginKind, pending_origin},
+    };
+    use pioneer_compaction::{CompactionSettings, ModelSelection, Transport};
+    use pioneer_provider::{
+        CanonicalProviderRoundEnvelope, ProviderCallIdentity, ProviderToolCall,
+    };
+
+    crate::compaction::load_test_catalog();
+    for background in [false, true] {
+        let summary = pioneer_compaction::summary::HEADINGS
+            .iter()
+            .map(|heading| format!("{heading}\nRetained facts."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let provider = Arc::new(
+            CaptureSummaryProvider::new(summary)
+                .named("openai")
+                .with_valid_summary_completion(),
+        );
+        let harness =
+            setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
+        let store = &harness.crud_store;
+        let workspace = &harness.workspace_id;
+        let principal = authenticated_test_superuser();
+        ensure_test_superuser_execution_authority(store).await;
+        let thread_id = "creation-order";
+        let historical_turn = "creation-history";
+        let current_turn = "creation-current";
+        for (turn_id, input) in [
+            (historical_turn, "initial input"),
+            (current_turn, "current input marker"),
+        ] {
+            store
+                .materialize_turn_start(
+                    &phase_13_test_thread(workspace, thread_id, phase_13_now_secs()),
+                    SandboxMode::FullAccess,
+                    &phase_13_turn(turn_id, TurnStatus::InProgress),
+                    &[UserInput::Text {
+                        text: input.into(),
+                        text_elements: vec![],
+                    }],
+                    pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+                )
+                .await
+                .unwrap();
+        }
+        let call = ChatMessage::assistant_tool_calls(
+            Some("call order marker"),
+            vec![ProviderToolCall {
+                id: "ordered-call".into(),
+                name: "read_file".into(),
+                arguments: json!({"query": "call detail ".repeat(12_000)}).to_string(),
+            }],
+        );
+        let envelope = CanonicalProviderRoundEnvelope {
+            version: 1,
+            round_id: "ordered-round".into(),
+            termination: pioneer_provider::ProviderTermination::ToolCalls,
+            message: call,
+            calls: vec![ProviderCallIdentity {
+                provider_call_id: "ordered-call".into(),
+                turn_item_id: "ordered-result".into(),
+                ordinal: 0,
+            }],
+        };
+        let result = pioneer_tools::ToolResultView::Json {
+            value: serde_json::to_value(ChatMessage::tool_result(
+                "ordered-call",
+                "read_file",
+                "result order marker",
+            ))
+            .unwrap(),
+            truncated: false,
+        };
+        for (item, sequence, source, payload, created_at) in [
+            (
+                "ordered-round",
+                1,
+                "assistant_round",
+                serde_json::to_string(&envelope).unwrap(),
+                "2026-09-29T10:00:00Z",
+            ),
+            (
+                "ordered-result",
+                2,
+                "tool_result_v2",
+                serde_json::to_string(&result).unwrap(),
+                "2026-09-29T10:02:00Z",
+            ),
+        ] {
+            store
+                .insert_turn_llm_context(pioneer_crud::NewTurnLlmContextEntry {
+                    turn_id: historical_turn.into(),
+                    item_id: Some(item.into()),
+                    attempt_id: None,
+                    sequence,
+                    source: source.into(),
+                    tool_name: (source == "tool_result_v2").then(|| "read_file".into()),
+                    payload,
+                    output_policy_snapshot: "{}".into(),
+                    created_at: chrono::DateTime::parse_from_rfc3339(created_at).unwrap(),
+                    expires_at: None,
+                })
+                .await
+                .unwrap();
+        }
+        // A separate user turn between the call and result must stay between
+        // them, although the planner selects the tool round as one unit.
+        store
+            .materialize_turn_start(
+                &phase_13_test_thread(workspace, thread_id, phase_13_now_secs()),
+                SandboxMode::FullAccess,
+                &phase_13_turn("creation-middle", TurnStatus::InProgress),
+                &[UserInput::Text {
+                    text: format!("middle order marker {}", "middle detail ".repeat(12_000)),
+                    text_elements: vec![],
+                }],
+                pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+            )
+            .await
+            .unwrap();
+        for sql in [
+            "UPDATE turn_input SET created_at='2026-09-29T09:59:00Z' WHERE turn_id='creation-history'",
+            "UPDATE turn_input SET created_at='2026-09-29T10:00:30Z' WHERE turn_id='creation-current'",
+            "UPDATE turn_input SET created_at='2026-09-29T10:01:00Z' WHERE turn_id='creation-middle'",
+            "UPDATE turn SET status='completed' WHERE id IN ('creation-history','creation-middle')",
+        ] {
+            store
+                .database_connection()
+                .execute_unprepared(sql)
+                .await
+                .unwrap();
+        }
+        persist_test_execution_authorization_context_for_principal(
+            &harness.processor,
+            principal.as_ref(),
+            workspace,
+            thread_id,
+            current_turn,
+        )
+        .await;
+        let settings = CompactionSettings {
+            selection: Some(ModelSelection {
+                transport: Transport::Api,
+                instance: "summary-capture".into(),
+                model: "gpt-4o".into(),
+                effort: None,
+            }),
+        };
+        harness
+            .processor
+            .apply_compaction_settings(settings.clone())
+            .unwrap();
+        if background {
+            store
+                .database_connection()
+                .execute_unprepared(
+                    "UPDATE turn SET status='completed' WHERE id='creation-current'",
+                )
+                .await
+                .unwrap();
+            let hub = Arc::new(pioneer_runtime_events::ExecutionEventHub::new());
+            let checkpoint = crate::compaction::prepare_completed_history(
+                &harness.processor,
+                workspace,
+                thread_id,
+                current_turn,
+                &ModelSelection {
+                    transport: Transport::Api,
+                    instance: "openai".into(),
+                    model: "gpt-4".into(),
+                    effort: None,
+                },
+                &settings,
+                None,
+                Arc::new(crate::compaction::HubCompactionObserver {
+                    hub: hub.clone(),
+                    processor: Arc::downgrade(&harness.processor),
+                    lifecycle_store: store.with_maintenance_access(),
+                    workspace: workspace.clone(),
+                    thread: thread_id.into(),
+                    turn: current_turn.into(),
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(checkpoint.is_some());
+            hub.shutdown_progress().await;
+        } else {
+            let context = NativeContext {
+                overflow_recovery: false,
+                recovery_deadline_ms: None,
+                workspace_id: workspace.clone(),
+                thread_id: thread_id.into(),
+                turn_id: current_turn.into(),
+                conversation_thread_id: None,
+                provider_instance: "openai".into(),
+                provider: provider.clone(),
+                events: Arc::new(pioneer_runtime_events::ExecutionEventHub::new()),
+                cancellation: tokio_util::sync::CancellationToken::new(),
+            };
+            let mut input = ChatMessage::user("current input marker");
+            input.provenance = Some(pending_origin(
+                workspace,
+                thread_id,
+                current_turn,
+                "input",
+                PendingOriginKind::Input,
+                "",
+            ));
+            let request = ChatRequest {
+                model: "gpt-4o".into(),
+                messages: vec![input],
+                temperature: None,
+                max_tokens: Some(512),
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                compiled_prompt: None,
+            };
+            let controller = crate::compaction::GatewayNativeContextController::new(
+                Arc::downgrade(&harness.processor),
+            );
+            let fitting = controller
+                .prepare(&context, request.clone(), None, false)
+                .await
+                .unwrap();
+            assert_eq!(provider.call_count(), 0);
+            let text = fitting
+                .request
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let positions = [
+                "call order marker",
+                "current input marker",
+                "middle order marker",
+                "result order marker",
+            ]
+            .map(|marker| text.find(marker).unwrap());
+            assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+            let compacted = controller
+                .prepare(
+                    &context,
+                    ChatRequest {
+                        model: "gpt-4".into(),
+                        ..request
+                    },
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+            assert!(compacted.receipt.identity.checkpoint.is_some());
+            let calls = provider.call_count();
+            let repeated = controller
+                .prepare(&context, compacted.request.clone(), None, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                repeated.receipt.identity.checkpoint,
+                compacted.receipt.identity.checkpoint
+            );
+            assert_eq!(
+                provider.call_count(),
+                calls,
+                "covered history was compacted again"
+            );
+            controller.stop(&context).await.unwrap();
+            context.events.shutdown_progress().await;
+        }
+        let inputs = provider
+            .snapshot_requests()
+            .into_iter()
+            .map(|request| {
+                serde_json::from_str::<pioneer_compaction::summary::SummaryInput>(
+                    &request.messages[1].content,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let parts = inputs
+            .iter()
+            .flat_map(|input| &input.compact_units)
+            .collect::<Vec<_>>();
+        let text = parts
+            .iter()
+            .map(|part| part.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let positions = [
+            "call order marker",
+            "middle order marker",
+            "result order marker",
+        ]
+        .map(|marker| text.find(marker).unwrap());
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "background={background}"
+        );
+        let call = parts
+            .iter()
+            .position(|part| part.text.contains("call order marker"))
+            .unwrap();
+        let result = parts
+            .iter()
+            .position(|part| part.text.contains("result order marker"))
+            .unwrap();
+        assert!(parts[call..result].iter().all(|part| !part.last_part));
+        assert!(parts[result].last_part);
+        assert!(
+            parts[call..=result]
+                .iter()
+                .all(|part| part.unit == parts[call].unit)
+        );
+        let captured = harness
+            .processor
+            .capture_current_context_basis_prepared(
+                &store.with_maintenance_access(),
+                workspace,
+                thread_id,
+                current_turn,
+                None,
+            )
+            .await
+            .unwrap();
+        let restored_text = captured
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for marker in [
+            "call order marker",
+            "middle order marker",
+            "result order marker",
+        ] {
+            assert!(
+                !restored_text.contains(marker),
+                "checkpoint rematerialized {marker}"
+            );
+        }
+        assert!(
+            captured
+                .messages
+                .iter()
+                .any(|message| message.provenance.as_ref().is_some_and(|origin| {
+                    origin
+                        .sources
+                        .iter()
+                        .any(|source| source.scope.starts_with("checkpoint:"))
+                }))
+        );
+    }
 }
 #[tokio::test]
 async fn durable_completed_cli_owner_resumes_same_operation_after_shutdown() {

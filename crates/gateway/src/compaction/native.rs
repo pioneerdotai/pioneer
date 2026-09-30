@@ -14,7 +14,6 @@ use pioneer_compaction::{
     CompactionMode, CompactionSettings, CoverageDomain, ModelBudget, ModelSelection, Transport,
     coverage_domain_for, effective_selection, plan_compaction,
 };
-use pioneer_crud::compaction::ManifestEntry;
 use pioneer_provider::{ChatRequest, MessageProvenance, MessageSourceRef, ProviderRegistry};
 use std::collections::BTreeSet;
 
@@ -450,6 +449,7 @@ async fn prepare_native_projection_with_prepared(
         )
         .await?;
         super::origins::validate_message_origins(&store, workspace, &request.messages).await?;
+        super::frozen::order_history_by_creation(&store, workspace, &mut request.messages).await?;
         if request.messages.iter().any(|message| {
             message.content_parts.iter().any(|part| match part {
                 pioneer_provider::MessageContentPart::File { file } => {
@@ -649,22 +649,7 @@ async fn prepare_native_projection_with_prepared(
             .ok_or_else(|| anyhow::anyhow!("empty native compaction plan"))?;
         let projection =
             NativeRequestProjection::new(full.request.clone(), indexes, media, budget, recovery)?;
-        let mut manifest = Vec::new();
-        for (reference_only, units) in [(false, &plan.compact), (true, &plan.retain)] {
-            for unit in units {
-                for source in &layout.units[*unit].sources {
-                    if let Some(thread_id) = layout.source_threads.get(source) {
-                        manifest.push(ManifestEntry {
-                            ordinal: manifest.len() as u64,
-                            unit: *unit as u64,
-                            reference_only,
-                            thread_id: thread_id.clone(),
-                            source: source.clone(),
-                        });
-                    }
-                }
-            }
-        }
+        let manifest = super::admission::history_manifest(&full.request.messages, &layout, &plan)?;
         let snapshot = admit_operation(
             &store,
             workspace,
