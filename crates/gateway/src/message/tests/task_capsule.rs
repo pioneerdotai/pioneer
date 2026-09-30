@@ -351,7 +351,7 @@ fn durable_task_management_survives_new_executions_and_runtime_reconstruction() 
             vec![call(
                 11,
                 "task_wait",
-                json!({"taskIds":[target],"timeoutMs":0}),
+                json!({"taskIds":[target],"timeoutMs":1}),
             )],
         )
         .await;
