@@ -662,6 +662,7 @@ async fn persist_task_reviewer_execution_graph(
         permission_profile: None,
         skill_ids: Vec::new(),
         mcp_server_ids: Vec::new(),
+        selected_capabilities: Vec::new(),
     };
     let policy = crate::authorization::AgentWorkResourcePolicy::default();
     let result = processor
@@ -1720,7 +1721,7 @@ impl TaskAgentExecutor {
         };
         let normalized_selected_capabilities = if let Some(selection) = launch_selection.as_ref() {
             let requested =
-                super::agent_action_tools::launch_selection_capabilities(&selection.execution)
+                super::agent_action_tools::task_launch_selection_capabilities(&selection.execution)
                     .context("persisted Task launch capabilities are invalid")?;
             Some(
                 processor
@@ -8993,7 +8994,7 @@ async fn resolved_task_execution_turn_settings(
     let capabilities = match launch {
         Some(launch) => {
             let requested =
-                super::agent_action_tools::launch_selection_capabilities(&launch.execution)
+                super::agent_action_tools::task_launch_selection_capabilities(&launch.execution)
                     .context("pinned Task launch capabilities are invalid")?;
             processor
                 .normalize_turn_skill_capabilities(task.workspace_id.as_str(), requested.as_slice())
