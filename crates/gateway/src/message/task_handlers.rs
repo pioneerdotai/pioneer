@@ -127,6 +127,18 @@ impl MessageProcessor {
             root_thread.model.as_str(),
             None,
         )?;
+        let contract = self
+            .crud_store
+            .get_task_actor_contract(task_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Agent Task actor contract is unavailable"))?;
+        let launch = contract
+            .launch
+            .ok_or_else(|| anyhow::anyhow!("Agent Task launch is unavailable"))?;
+        if !launch.execution.selected_capabilities.is_empty() {
+            request.capabilities =
+                super::agent_action_tools::task_launch_selection_capabilities(&launch.execution)?;
+        }
         request.capabilities = self
             .normalize_turn_skill_capabilities(
                 response.task.workspace_id.as_str(),

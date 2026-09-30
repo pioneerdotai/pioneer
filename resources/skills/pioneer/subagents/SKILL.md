@@ -119,6 +119,8 @@ An access or runtime error is not proof that a child stopped. Do not recreate wo
 
 For independent attached subagents, create them all first, then call `task_wait` with `taskIds` or `runIds`. Prefer `runIds` when available. By default, `task_wait` returns as soon as any target is terminal or requires review. Handle every returned result before calling `task_wait` again for the remaining active runs.
 
+The parent may also keep working and check a child with `task_get`. A `running` run has not finished; a missing result or unchanged `updatedAt` does not show that it is stuck. In `task_get`, `execution.heartbeatAt` is a liveness signal, while `execution.lastActivityAt` records confirmed task activity when available. Missing activity data is unknown. Do not cancel or repeat a child's work solely because time passed or repeated observations look the same. A `task_wait` `timedOut` result ends only that wait window; wait again for active attached work when needed.
+
 `task_wait` can return terminal results, pending work, or `reviewRequired`. A review-required candidate is not final. Inspect every candidate and accept only when it satisfies:
 
 - the original user request;

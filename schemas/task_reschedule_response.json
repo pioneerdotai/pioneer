@@ -146,6 +146,13 @@
             }
           ]
         },
+        "selectedCapabilities": {
+          "description": "Exact normalized capabilities for a durable Task launch. Legacy launches\nuse skill_ids and mcp_server_ids when this field is empty.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnCapability"
+          }
+        },
         "skillIds": {
           "type": "array",
           "items": {

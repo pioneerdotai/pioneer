@@ -473,6 +473,7 @@ pub(crate) fn project_run(run: &TaskRun) -> PublicTaskRun {
         run_number: run.run_number,
         status: run.status,
         executor_kind: run.executor_kind,
+        execution: None,
         started_at: run.started_at,
         completed_at: run.completed_at,
         result: run.result.as_ref().map(project_result),

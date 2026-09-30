@@ -41,7 +41,7 @@ pub(super) enum ApiProviderTurnAdmission {
 }
 
 #[derive(Debug)]
-pub(super) struct TurnStartFailure {
+pub(crate) struct TurnStartFailure {
     public_code: pioneer_protocol::PublicErrorCode,
     diagnostic: String,
 }
@@ -573,9 +573,9 @@ pub(super) fn new_turn_execution(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct NormalizedTurnCapabilities {
+pub(crate) struct NormalizedTurnCapabilities {
     pub(super) presentation: Vec<pioneer_protocol::TurnCapability>,
-    pub(super) execution: Vec<pioneer_protocol::TurnCapability>,
+    pub(crate) execution: Vec<pioneer_protocol::TurnCapability>,
     pub(super) pack_names: HashMap<pioneer_protocol::SkillPackId, String>,
 }
 
@@ -1116,7 +1116,7 @@ impl MessageProcessor {
         Ok(catalog)
     }
 
-    pub(super) async fn normalize_turn_skill_capabilities(
+    pub(crate) async fn normalize_turn_skill_capabilities(
         &self,
         workspace_id: &str,
         capabilities: &[pioneer_protocol::TurnCapability],
@@ -11202,6 +11202,7 @@ mod tests {
                     permission_profile: Some(permission_profile.clone()),
                     skill_ids,
                     mcp_server_ids,
+                    selected_capabilities: Vec::new(),
                 },
             }),
             reply_to_turn_id: None,

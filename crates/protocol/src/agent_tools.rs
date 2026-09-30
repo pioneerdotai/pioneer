@@ -243,6 +243,7 @@ impl AgentToolLaunchSelection {
                 permission_profile: self.permission_profile,
                 skill_ids: self.skill_ids,
                 mcp_server_ids: self.mcp_server_ids,
+                selected_capabilities: Vec::new(),
             },
         }
     }
