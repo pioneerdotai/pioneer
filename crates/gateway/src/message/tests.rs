@@ -68860,14 +68860,14 @@ async fn execute_memory_tool_error(
     call_id: &str,
     arguments: serde_json::Value,
 ) -> ToolError {
-    let call = tools
-        .router
-        .build_tool_call(RawToolCall {
-            call_id: call_id.to_owned(),
-            tool_name: tool_name.to_owned(),
-            arguments: arguments.to_string(),
-        })
-        .expect("memory tool call should parse");
+    let call = match tools.router.build_tool_call(RawToolCall {
+        call_id: call_id.to_owned(),
+        tool_name: tool_name.to_owned(),
+        arguments: arguments.to_string(),
+    }) {
+        Ok(call) => call,
+        Err(error) => return error,
+    };
     match tools.runtime.execute_tool_call(call).await {
         Ok(_) => panic!("memory tool should reject invalid args"),
         Err(error) => error,

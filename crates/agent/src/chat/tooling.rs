@@ -1400,6 +1400,277 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     #[tokio::test]
+    async fn builtin_schema_diagnostics_reach_model_message_before_handler_execution() {
+        use pioneer_protocol::{
+            AgentModelToolName, AgentToolCapability, AgentToolOptionsProjection,
+        };
+        use pioneer_tools::{
+            ConfiguredToolSpec, ExecutionClass, PayloadKind, RawToolCall, ToolEventBus,
+            ToolRegistry, ToolRouter, ToolSpec, ToolVisibilitySnapshot,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingHandler(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl pioneer_tools::ToolHandler for CountingHandler {
+            async fn handle(
+                &self,
+                _: pioneer_tools::ToolInvocation,
+                _: pioneer_tools::ToolEventTrace,
+            ) -> Result<Box<dyn pioneer_tools::ToolOutput>, pioneer_tools::ToolError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(pioneer_tools::FunctionToolOutput::new(
+                    "executed", true,
+                )))
+            }
+        }
+        let options = AgentToolOptionsProjection {
+            identities: vec![],
+            profiles: vec![],
+            inherit_parent_identity_available: true,
+            default_pioneer_identity_available: false,
+            derived_ephemeral_identity_available: false,
+            inherit_parent_profile_available: true,
+            allowed_skill_ids: vec![],
+            allowed_mcp_server_ids: vec![],
+            max_permission_profile: pioneer_protocol::task_permission_cap_for_mode(
+                Default::default(),
+            ),
+            thread_creation_options: vec![],
+            target_options: vec![],
+            generation_fingerprint: "fixture".into(),
+        };
+        let entry = pioneer_protocol::project_agent_model_tool_catalog(
+            &[AgentToolCapability::ChildStart].into_iter().collect(),
+            Some(&options),
+        )
+        .into_iter()
+        .find(|entry| entry.name == AgentModelToolName::StartAgent)
+        .unwrap();
+        let name = entry.name.as_str();
+        let spec = ConfiguredToolSpec::with_output_projection(
+            ToolSpec::new(
+                name,
+                entry.description,
+                entry.parameters,
+                PayloadKind::Function,
+            ),
+            ExecutionClass::Shared,
+            pioneer_tools::dynamic_unknown_output_policy(),
+            pioneer_tools::ToolOutputProjectionKind::DynamicGeneric,
+        );
+        let nullable = ConfiguredToolSpec::new(
+            ToolSpec::new(
+                "nullable",
+                "fixture",
+                serde_json::json!({"type": "object", "$defs": {
+                "value": {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "array"}}}
+            }, "properties": {"value": {"anyOf": [{"$ref": "#/$defs/value"}, {"type": "null"}]}}}),
+                PayloadKind::Function,
+            ),
+            ExecutionClass::Shared,
+            pioneer_tools::dynamic_unknown_output_policy(),
+        );
+        let ambiguous = ConfiguredToolSpec::new(
+            ToolSpec::new(
+                "ambiguous",
+                "fixture",
+                serde_json::json!({"type": "object", "properties": {
+                    "value": {"oneOf": [
+                        {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "array"}}},
+                        {"type": "object", "properties": {"a": {"type": "string"}}}
+                    ]}
+                }}),
+                PayloadKind::Function,
+            ),
+            ExecutionClass::Shared,
+            pioneer_tools::dynamic_unknown_output_policy(),
+        );
+        let shell = pioneer_tools::builtin_tool_specs()
+            .into_iter()
+            .find(|spec| spec.spec.name == "exec_command")
+            .unwrap();
+        let stdin = pioneer_tools::builtin_tool_specs()
+            .into_iter()
+            .find(|spec| spec.spec.name == "write_stdin")
+            .unwrap();
+        let specs = vec![spec, nullable, ambiguous, shell, stdin];
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut handlers: HashMap<String, Arc<dyn pioneer_tools::ToolHandler>> = HashMap::new();
+        for spec in &specs {
+            handlers.insert(
+                spec.spec.name.clone(),
+                Arc::new(CountingHandler(executions.clone())),
+            );
+        }
+        let visibility =
+            ToolVisibilitySnapshot::new(specs.iter().map(|spec| spec.spec.clone()).collect());
+        assert!(!visibility.contains_name(name).await);
+        visibility
+            .set_visible_by_name(
+                &specs
+                    .iter()
+                    .map(|spec| spec.spec.name.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await;
+        assert!(visibility.contains_name(name).await);
+        let router = ToolRouter::new(
+            specs,
+            ToolRegistry::new(handlers),
+            visibility,
+            ToolEventBus::default(),
+            "turn",
+        );
+        let error = router
+            .build_model_tool_call(RawToolCall {
+                call_id: "call".into(),
+                tool_name: name.into(),
+                arguments: serde_json::json!({"targetOptionId": "target", "input": {}, "launch": {
+                    "identity": {"kind": "inherit_parent"}, "profile": {"kind": "inherit_parent"},
+                    "skillIds": "secret-skill", "mcpServerIds": "secret-server"
+                }})
+                .to_string(),
+            })
+            .await
+            .unwrap_err();
+        let pioneer_tools::ToolError::InvalidArguments(details) = &error else {
+            panic!("expected argument error")
+        };
+        let details: serde_json::Value = serde_json::from_str(details).unwrap();
+        let diagnostics = details["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 3);
+        for diagnostic in diagnostics {
+            assert_eq!(diagnostic["code"], "type");
+            assert_eq!(diagnostic["expected"], "array");
+            assert_eq!(
+                diagnostic["actualType"],
+                if diagnostic["path"] == "$/input" {
+                    "object"
+                } else {
+                    "string"
+                }
+            );
+        }
+        let outcome = pioneer_tools::classify_tool_error(name, &error);
+        assert_eq!(
+            outcome.error_class,
+            Some(pioneer_tools::ToolErrorClass::InvalidArguments)
+        );
+        let message =
+            build_tool_error_message("call".into(), name.into(), error.to_string(), outcome);
+        for path in ["$/input", "$/launch/skillIds", "$/launch/mcpServerIds"] {
+            assert!(message.content.contains(path));
+        }
+        assert!(!message.content.contains("agent_action_not_allowed"));
+        assert!(!message.content.contains("secret-"));
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+        // All these requests pass through the same model-call boundary and
+        // failure-message builder; no handler can receive an invalid ToolCall.
+        for (tool, arguments, expected) in [
+            (
+                name,
+                serde_json::json!({"targetOptionId": "target", "input": [
+                {"type": "text", "text": false, "textElements": 42}
+            ], "launch": {"identity": {"kind": "inherit_parent"}, "profile": {"kind": "inherit_parent"}}}),
+                vec![
+                    ("$/input/0/text", "string", "boolean"),
+                    ("$/input/0/textElements", "array", "number"),
+                ],
+            ),
+            (
+                "nullable",
+                serde_json::json!({"value": {"a": false, "b": 42}}),
+                vec![
+                    ("$/value/a", "string", "boolean"),
+                    ("$/value/b", "array", "number"),
+                ],
+            ),
+        ] {
+            let error = router
+                .build_model_tool_call(RawToolCall {
+                    call_id: "detail".into(),
+                    tool_name: tool.into(),
+                    arguments: arguments.to_string(),
+                })
+                .await
+                .unwrap_err();
+            let pioneer_tools::ToolError::InvalidArguments(details) = &error else {
+                panic!("expected arguments error")
+            };
+            let details: serde_json::Value = serde_json::from_str(details).unwrap();
+            let diagnostics = details["diagnostics"].as_array().unwrap();
+            assert_eq!(diagnostics.len(), expected.len());
+            let message = build_tool_error_message(
+                "detail".into(),
+                tool.into(),
+                error.to_string(),
+                pioneer_tools::classify_tool_error(tool, &error),
+            );
+            for (path, expected_type, actual_type) in expected {
+                let diagnostic = diagnostics.iter().find(|d| d["path"] == path).unwrap();
+                assert_eq!(diagnostic["code"], "type");
+                assert_eq!(diagnostic["expected"], expected_type);
+                assert_eq!(diagnostic["actualType"], actual_type);
+                assert!(message.content.contains(path));
+            }
+            assert!(!message.content.contains("agent_action_not_allowed"));
+            assert_eq!(executions.load(Ordering::SeqCst), 0);
+        }
+        let error = router
+            .build_model_tool_call(RawToolCall {
+                call_id: "ambiguous".into(),
+                tool_name: "ambiguous".into(),
+                arguments: serde_json::json!({"value": {"a": false, "b": 42}}).to_string(),
+            })
+            .await
+            .unwrap_err();
+        let pioneer_tools::ToolError::InvalidArguments(details) = error else {
+            panic!("expected arguments error")
+        };
+        let details: serde_json::Value = serde_json::from_str(&details).unwrap();
+        assert_eq!(details["diagnostics"].as_array().unwrap().len(), 1);
+        assert_eq!(details["diagnostics"][0]["path"], "$/value");
+        assert_eq!(details["diagnostics"][0]["code"], "oneOf");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        for (tool, arguments) in [
+            (
+                "exec_command",
+                r#"{"command":["true"],"yield_time_ms":12345.0}"#,
+            ),
+            ("write_stdin", r#"{"session_id":12345.0}"#),
+        ] {
+            let error = router
+                .build_model_tool_call(RawToolCall {
+                    call_id: "residual".into(),
+                    tool_name: tool.into(),
+                    arguments: arguments.into(),
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                pioneer_tools::ToolError::InvalidArguments(_)
+            ));
+            let message = build_tool_error_message(
+                "residual".into(),
+                tool.into(),
+                error.to_string(),
+                pioneer_tools::classify_tool_error(tool, &error),
+            );
+            assert!(
+                message
+                    .content
+                    .contains("builtin_argument_deserialization_error")
+            );
+            assert!(!message.content.contains("12345"));
+            assert!(!message.content.contains("floating point"));
+            assert_eq!(executions.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn output_delta_cannot_synthesize_missing_durable_tool_start() {
         let event_tx = AgentEventHub::with_capacity(8, 8);
         let mut durable_rx = event_tx

@@ -1,5 +1,6 @@
 pub mod apply_patch;
 mod argument_normalizer;
+mod builtin_argument_validator;
 mod classifier;
 mod context;
 mod domain;
