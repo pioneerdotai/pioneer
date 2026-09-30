@@ -2367,14 +2367,10 @@ impl ToolHandler for AgentActionToolHandler {
                     ToolPayload::Function { arguments } => serde_json::from_value(arguments),
                     ToolPayload::Custom { input } => serde_json::from_str(input.as_str()),
                     _ => {
-                        return Err(ToolError::invalid_arguments(
-                            AgentPublicOutcome::AgentActionNotAllowed.as_str(),
-                        ));
+                        return Err(ToolError::invalid_arguments("agent_invalid_arguments"));
                     }
                 }
-                .map_err(|_| {
-                    ToolError::invalid_arguments(AgentPublicOutcome::AgentActionNotAllowed.as_str())
-                })?;
+                .map_err(|_| ToolError::invalid_arguments("agent_invalid_arguments"))?;
                 let options = self.options.as_ref().ok_or_else(|| {
                     ToolError::execution_failed("agent start options are unavailable")
                 })?;
@@ -3786,7 +3782,11 @@ pub(crate) async fn authorize_task_observations(
 
 pub(crate) fn adapter_tool_error(error: AgentToolAdapterError) -> ToolError {
     match error {
+        AgentToolAdapterError::InvalidArguments => {
+            ToolError::invalid_arguments("agent_invalid_arguments")
+        }
         AgentToolAdapterError::InvalidInput(_) => {
+            // Preserve the existing non-disclosing launch restriction outcome.
             ToolError::invalid_arguments(AgentPublicOutcome::AgentActionNotAllowed.as_str())
         }
         AgentToolAdapterError::OptionsUnavailable => {
@@ -3818,7 +3818,7 @@ pub(crate) fn adapter_tool_error(error: AgentToolAdapterError) -> ToolError {
 
 /// Model-facing tool failures must never echo database/provider errors, raw
 /// target identifiers, host metadata, or authored payloads. Preserve only the
-/// fixed agent domain outcome vocabulary produced by the canonical adapter;
+/// fixed agent domain outcomes and explicitly classified decoding errors;
 /// collapse every other detail at this final disclosure boundary.
 pub(crate) fn sanitize_agent_tool_error(error: ToolError) -> ToolError {
     fn stable_outcome(message: &str) -> Option<&'static str> {
@@ -3851,6 +3851,11 @@ pub(crate) fn sanitize_agent_tool_error(error: ToolError) -> ToolError {
     }
 
     match error {
+        // This exact public code is assigned at decoding boundaries. Unknown
+        // InvalidArguments also include semantic failures after decoding.
+        ToolError::InvalidArguments(message) if message == "agent_invalid_arguments" => {
+            ToolError::invalid_arguments("agent_invalid_arguments")
+        }
         ToolError::InvalidArguments(message) => ToolError::invalid_arguments(
             stable_outcome(message.as_str())
                 .unwrap_or(AgentPublicOutcome::AgentActionNotAllowed.as_str()),
@@ -3964,6 +3969,50 @@ mod tests {
             payload.to_string(),
             "tool execution failed: agent_action_payload_limit_exceeded"
         );
+    }
+
+    #[test]
+    fn decoding_errors_remain_arguments_while_authorization_denial_remains_denial() {
+        let invalid =
+            sanitize_agent_tool_error(adapter_tool_error(AgentToolAdapterError::InvalidArguments));
+        assert!(matches!(invalid, ToolError::InvalidArguments(_)));
+        assert_eq!(
+            invalid.to_string(),
+            "invalid arguments: agent_invalid_arguments"
+        );
+        let direct_decode =
+            sanitize_agent_tool_error(ToolError::invalid_arguments("agent_invalid_arguments"));
+        assert_eq!(
+            direct_decode.to_string(),
+            "invalid arguments: agent_invalid_arguments"
+        );
+        let denied = sanitize_agent_tool_error(adapter_tool_error(AgentToolAdapterError::Action(
+            crate::authorization::AgentActionServiceError::NotAuthorized("hidden policy detail"),
+        )));
+        assert_eq!(
+            denied.to_string(),
+            "tool execution failed: agent_action_not_allowed"
+        );
+    }
+
+    #[test]
+    fn semantic_argument_errors_keep_the_non_disclosing_fallback() {
+        let secret = "secret://workspace/private-skill/internal-data";
+        for message in [
+            format!("child Agent launch capabilities are unavailable: {secret}"),
+            format!("invalid child Agent launch capabilities: {secret}"),
+            "agent action idempotency key was reused with different input".to_owned(),
+            secret.to_owned(),
+            // Mentioning a public code inside raw text does not classify it.
+            format!("agent_invalid_arguments: {secret}"),
+        ] {
+            let public = sanitize_agent_tool_error(ToolError::invalid_arguments(message));
+            assert_eq!(
+                public.to_string(),
+                "invalid arguments: agent_action_not_allowed"
+            );
+            assert!(!public.to_string().contains(secret));
+        }
     }
 
     #[test]
