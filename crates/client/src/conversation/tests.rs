@@ -2425,6 +2425,173 @@ fn history_hydration_restores_recovery_events_without_terminal_duplicate() {
     );
 }
 
+fn recovery_failure_sequence(
+    from_history: bool,
+    recovery: Option<(&str, &str)>,
+    turn_error: &str,
+) -> Conversation {
+    let mut events = vec![ThreadHistoryEvent {
+        turn_id: TURN_ID.to_owned(),
+        sequence: 1,
+        created_at: 1_000,
+        payload: ThreadHistoryEventPayload::TurnStarted {
+            workspace_id: WORKSPACE_ID.to_owned(),
+            thread_id: THREAD_ID.to_owned(),
+            turn: turn_snapshot(TURN_ID, TurnStatus::InProgress, None),
+            input: vec![],
+        },
+    }];
+    if let Some((recovery_turn, message)) = recovery {
+        events.push(ThreadHistoryEvent {
+            turn_id: recovery_turn.to_owned(),
+            sequence: 2,
+            created_at: 1_100,
+            payload: ThreadHistoryEventPayload::ItemRecoveryExhausted {
+                workspace_id: WORKSPACE_ID.to_owned(),
+                thread_id: THREAD_ID.to_owned(),
+                turn_id: recovery_turn.to_owned(),
+                item_id: "item_recovery_failure".to_owned(),
+                item_type: TurnItemType::Reasoning,
+                recovery_job_id: "job_recovery_failure".to_owned(),
+                attempt_number: 2,
+                status: RecoveryJobStatus::Exhausted,
+                error_message: message.to_owned(),
+            },
+        });
+    }
+    events.push(ThreadHistoryEvent {
+        turn_id: TURN_ID.to_owned(),
+        sequence: 3,
+        created_at: 1_200,
+        payload: ThreadHistoryEventPayload::TurnFailed {
+            workspace_id: WORKSPACE_ID.to_owned(),
+            thread_id: THREAD_ID.to_owned(),
+            turn: turn_snapshot(TURN_ID, TurnStatus::Failed, Some(turn_error.to_owned())),
+        },
+    });
+    let mut conversation = Conversation::new(THREAD_ID);
+    if from_history {
+        conversation.hydrate_history(&events);
+    } else {
+        for event in events {
+            conversation.apply(match event.payload {
+                ThreadHistoryEventPayload::TurnStarted {
+                    thread_id, turn, ..
+                } => ConversationEvent::TurnStarted { thread_id, turn },
+                ThreadHistoryEventPayload::ItemRecoveryExhausted {
+                    thread_id,
+                    turn_id,
+                    item_id,
+                    item_type,
+                    recovery_job_id,
+                    attempt_number,
+                    status,
+                    error_message,
+                    ..
+                } => ConversationEvent::ItemRecoveryExhausted {
+                    thread_id,
+                    turn_id,
+                    item_id,
+                    item_type,
+                    recovery_job_id,
+                    attempt_number,
+                    status,
+                    error_message,
+                },
+                ThreadHistoryEventPayload::TurnFailed {
+                    thread_id, turn, ..
+                } => ConversationEvent::TurnFailed { thread_id, turn },
+                _ => unreachable!("fixture contains only recovery terminal events"),
+            });
+        }
+    }
+    conversation
+}
+
+#[test]
+fn matching_recovery_failure_has_one_system_event_live_and_from_history() {
+    for from_history in [false, true] {
+        for message in [
+            "Last provider request was denied due to authentication or permissions: HTTP 403. Recovery stopped: attempt limit exhausted.",
+            "An opaque terminal reason.",
+        ] {
+            let conversation =
+                recovery_failure_sequence(from_history, Some((TURN_ID, message)), message);
+            let system_events = conversation
+                .projection()
+                .items
+                .iter()
+                .filter(|item| matches!(item.item, TurnItem::SystemEvent { .. }))
+                .collect::<Vec<_>>();
+            assert_eq!(system_events.len(), 1);
+            assert!(matches!(&system_events[0].item,
+                TurnItem::SystemEvent { code: Some(code), details: Some(details), .. }
+                    if code == "item_recovery_exhausted"
+                        && details["error_message"].as_str() == Some(message)));
+            assert_eq!(
+                conversation.projection().last_error.as_deref(),
+                Some(message)
+            );
+        }
+    }
+}
+
+#[test]
+fn recovery_failure_keeps_distinct_and_standalone_turn_errors_live_and_from_history() {
+    let message =
+        "Last provider request failed: HTTP 403. Recovery stopped: attempt limit exhausted.";
+    for from_history in [false, true] {
+        for recovery in [
+            Some((TURN_ID, "another failure")),
+            Some(("turn_other_recovery", message)),
+            None,
+        ] {
+            let conversation = recovery_failure_sequence(from_history, recovery, message);
+            let system_events = conversation
+                .projection()
+                .items
+                .iter()
+                .filter(|item| matches!(item.item, TurnItem::SystemEvent { .. }))
+                .collect::<Vec<_>>();
+            assert_eq!(system_events.len(), if recovery.is_some() { 2 } else { 1 });
+            let turn_failure = system_events
+                .iter()
+                .find(|item| {
+                    item.turn_id == TURN_ID
+                        && matches!(&item.item,
+                    TurnItem::SystemEvent { code: Some(code), .. } if code == "turn_failed")
+                })
+                .expect("a distinct or standalone Turn failure must remain visible");
+            assert_eq!(turn_failure.partial_text, message);
+        }
+    }
+}
+
+#[test]
+fn matching_error_on_another_system_event_code_does_not_suppress_turn_failure() {
+    let message = "Last provider request failed. Recovery failed.";
+    let mut conversation = Conversation::new(THREAD_ID);
+    apply_in_progress_turn(&mut conversation);
+    conversation.apply(ConversationEvent::ItemCompleted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::SystemEvent {
+            id: "system_other_failure".to_owned(),
+            level: SystemEventLevel::Error,
+            message: message.to_owned(),
+            code: Some("another_failure".to_owned()),
+            details: Some(serde_json::json!({"error_message": message})),
+        },
+    });
+    conversation.apply(ConversationEvent::TurnFailed {
+        thread_id: THREAD_ID.to_owned(),
+        turn: turn_snapshot(TURN_ID, TurnStatus::Failed, Some(message.to_owned())),
+    });
+    assert!(conversation.projection().items.iter().any(|item| matches!(
+        &item.item, TurnItem::SystemEvent { code: Some(code), .. } if code == "turn_failed"
+    )));
+}
+
 #[test]
 fn foreign_thread_events_do_not_modify_local_projection() {
     let mut conversation = Conversation::new("thr_local");

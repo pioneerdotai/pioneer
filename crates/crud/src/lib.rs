@@ -1944,6 +1944,8 @@ impl RepairSummary {
 
 #[derive(Debug, Clone)]
 pub struct RecoveryJobRecord {
+    pub last_failure_attempt_id: Option<String>,
+    pub diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
     pub id: String,
     pub turn_id: String,
     pub item_id: String,
@@ -16450,7 +16452,11 @@ impl CrudStore {
                     .map(|policy| policy.mode)
                     .unwrap_or(pioneer_protocol::TaskDeliveryMode::None),
                 result_preview: result.and_then(|result| result.summary.clone()),
-                error_preview: error.map(|error| bounded_preview(error.message.as_str(), 240)),
+                error_preview: error.map(|error| {
+                    error
+                        .recovery_public_message()
+                        .unwrap_or_else(|| bounded_preview(error.message.as_str(), 240))
+                }),
                 task,
                 trigger: Some(trigger),
                 latest_run,
@@ -23849,6 +23855,7 @@ impl CrudStore {
             let row = recovery_job::enqueue_recovery_job(
                 &self.connection,
                 recovery_job::NewRecoveryJob {
+                    diagnostic_json: None,
                     turn_id: turn_id.clone(),
                     item_id: item_id.clone(),
                     item_type,
@@ -23897,6 +23904,47 @@ impl CrudStore {
         policy_snapshot: serde_json::Value,
         now_unix: i64,
     ) -> Result<AtomicRecoveryJobEnqueueOutcome> {
+        self.enqueue_recovery_job_with_diagnostic_if_no_unresolved(
+            turn_id,
+            item_id,
+            item_type,
+            source_attempt_id,
+            trigger,
+            action,
+            reason,
+            error_class,
+            transport_stage,
+            retry_after_ms,
+            provider_attempt_number,
+            max_attempts,
+            policy_json,
+            policy_snapshot,
+            None,
+            now_unix,
+        )
+        .await
+    }
+
+    pub async fn enqueue_recovery_job_with_diagnostic_if_no_unresolved(
+        &self,
+        turn_id: String,
+        item_id: String,
+        item_type: TurnItemType,
+        source_attempt_id: Option<String>,
+        trigger: RecoveryTrigger,
+        action: RecoveryAction,
+        reason: Option<String>,
+        error_class: Option<ProviderFailureClass>,
+        transport_stage: Option<ProviderFailureStage>,
+        retry_after_ms: Option<i64>,
+        provider_attempt_number: i64,
+        max_attempts: i64,
+        policy_json: serde_json::Value,
+        policy_snapshot: serde_json::Value,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        now_unix: i64,
+    ) -> Result<AtomicRecoveryJobEnqueueOutcome> {
+        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         self.run_serialized_write(|| async {
             let tx = self
                 .connection
@@ -23924,6 +23972,7 @@ impl CrudStore {
                 let row = recovery_job::enqueue_recovery_job(
                     &tx,
                     recovery_job::NewRecoveryJob {
+                        diagnostic_json: diagnostic_json.clone(),
                         turn_id: turn_id.clone(),
                         item_id: item_id.clone(),
                         item_type,
@@ -24028,6 +24077,35 @@ impl CrudStore {
         .await
     }
 
+    /// Only the diagnostic that actually produced this failed Turn may cross into Task.
+    /// A pending/resumed job, unrelated failure or legacy raw text cannot qualify.
+    pub async fn get_failed_turn_recovery_diagnostic(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<pioneer_protocol::RecoveryDiagnostic>> {
+        let row = self
+            .connection
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "SELECT j.diagnostic, t.error FROM recovery_job j JOIN turn t ON t.id = j.turn_id \
+             WHERE j.turn_id = ? AND t.status = 'failed' AND j.status IN ('failed', 'exhausted') \
+             ORDER BY j.updated_at DESC, j.id DESC LIMIT 1",
+                [turn_id.into()],
+            ))
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let diagnostic: Option<String> = row.try_get("", "diagnostic")?;
+        let error: Option<String> = row.try_get("", "error")?;
+        let diagnostic = diagnostic.as_deref().and_then(|value| {
+            serde_json::from_str::<pioneer_protocol::RecoveryDiagnostic>(value).ok()
+        });
+        Ok(diagnostic.filter(|value| {
+            value.stop_reason.is_some() && error.as_deref() == Some(value.public_message().as_str())
+        }))
+    }
+
     pub async fn get_recovery_job(&self, job_id: &str) -> Result<Option<RecoveryJobRecord>> {
         self.run_serialized_write(|| async {
             Ok(recovery_job::find_job_by_id(&self.connection, job_id)
@@ -24046,6 +24124,29 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
+        self.mark_recovery_job_retrying_with_diagnostic(
+            job_id,
+            active_attempt_id,
+            next_run_at_unix,
+            budget_origin_after_cooldown_unix,
+            last_error,
+            None,
+            now_unix,
+        )
+        .await
+    }
+
+    pub async fn mark_recovery_job_retrying_with_diagnostic(
+        &self,
+        job_id: &str,
+        active_attempt_id: &str,
+        next_run_at_unix: i64,
+        budget_origin_after_cooldown_unix: Option<i64>,
+        last_error: Option<String>,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        now_unix: i64,
+    ) -> Result<bool> {
+        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         let last_error_value = last_error.clone();
         self.run_serialized_write(|| async {
             recovery_job::mark_job_retrying(
@@ -24055,6 +24156,7 @@ impl CrudStore {
                 unix_to_datetime(next_run_at_unix),
                 budget_origin_after_cooldown_unix.map(unix_to_datetime),
                 last_error_value.clone(),
+                diagnostic_json.clone(),
                 unix_to_datetime(now_unix),
             )
             .await
@@ -24170,6 +24272,22 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
+        self.mark_due_pending_recovery_job_terminal_if_turn_idle_with_diagnostic(
+            job_id, action, status, last_error, None, now_unix,
+        )
+        .await
+    }
+
+    pub async fn mark_due_pending_recovery_job_terminal_if_turn_idle_with_diagnostic(
+        &self,
+        job_id: &str,
+        action: RecoveryAction,
+        status: RecoveryJobStatus,
+        last_error: Option<String>,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        now_unix: i64,
+    ) -> Result<bool> {
+        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         let last_error_value = last_error.clone();
         self.run_serialized_write(|| async {
             let tx = self
@@ -24193,6 +24311,11 @@ impl CrudStore {
                     return Err(error);
                 }
             };
+            if affected {
+                if let Some(value) = &diagnostic_json {
+                    recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
+                }
+            }
             if affected
                 && let Err(error) = enqueue_recovery_terminalization_if_required(
                     &tx,
@@ -24220,6 +24343,27 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
+        self.mark_claimed_recovery_job_terminal_with_diagnostic(
+            job_id,
+            claim_token,
+            status,
+            last_error,
+            None,
+            now_unix,
+        )
+        .await
+    }
+
+    pub async fn mark_claimed_recovery_job_terminal_with_diagnostic(
+        &self,
+        job_id: &str,
+        claim_token: &str,
+        status: RecoveryJobStatus,
+        last_error: Option<String>,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        now_unix: i64,
+    ) -> Result<bool> {
+        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         let last_error_value = last_error.clone();
         self.run_serialized_write(|| async {
             let tx = self
@@ -24237,6 +24381,9 @@ impl CrudStore {
             )
             .await?;
             if affected {
+                if let Some(value) = &diagnostic_json {
+                    recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
+                }
                 enqueue_recovery_terminalization_if_required(
                     &tx,
                     job_id,
@@ -24297,6 +24444,21 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
+        self.mark_malformed_active_recovery_job_terminal_with_diagnostic(
+            job_id, status, last_error, None, now_unix,
+        )
+        .await
+    }
+
+    pub async fn mark_malformed_active_recovery_job_terminal_with_diagnostic(
+        &self,
+        job_id: &str,
+        status: RecoveryJobStatus,
+        last_error: Option<String>,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        now_unix: i64,
+    ) -> Result<bool> {
+        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         let last_error_value = last_error.clone();
         self.run_serialized_write(|| async {
             let tx = self
@@ -24313,6 +24475,9 @@ impl CrudStore {
             )
             .await?;
             if affected {
+                if let Some(value) = &diagnostic_json {
+                    recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
+                }
                 enqueue_recovery_terminalization_if_required(
                     &tx,
                     job_id,
@@ -24336,6 +24501,27 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
+        self.mark_recovery_job_terminal_after_attempt_with_diagnostic(
+            job_id,
+            active_attempt_id,
+            status,
+            last_error,
+            None,
+            now_unix,
+        )
+        .await
+    }
+
+    pub async fn mark_recovery_job_terminal_after_attempt_with_diagnostic(
+        &self,
+        job_id: &str,
+        active_attempt_id: &str,
+        status: RecoveryJobStatus,
+        last_error: Option<String>,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        now_unix: i64,
+    ) -> Result<bool> {
+        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         let last_error_value = last_error.clone();
         self.run_serialized_write(|| async {
             let tx = self
@@ -24353,6 +24539,9 @@ impl CrudStore {
             )
             .await?;
             if affected {
+                if let Some(value) = &diagnostic_json {
+                    recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
+                }
                 enqueue_recovery_terminalization_if_required(
                     &tx,
                     job_id,
@@ -25599,21 +25788,14 @@ impl CrudStore {
                 )
             }
         } else {
-            let status_label = match job_status {
-                RecoveryJobStatus::Exhausted => "exhausted",
-                RecoveryJobStatus::Failed => "failed",
-                RecoveryJobStatus::Blocked => unreachable!("handled above"),
-                RecoveryJobStatus::Pending
-                | RecoveryJobStatus::Active
-                | RecoveryJobStatus::Succeeded
-                | RecoveryJobStatus::Cancelled => {
-                    unreachable!("non-terminal recovery status was rejected before terminalization")
-                }
-            };
-            format!(
-                "recovery {status_label} for item `{}`: {}",
-                record.item_id, record.error_message
-            )
+            job.diagnostic
+                .as_deref()
+                .and_then(|value| {
+                    serde_json::from_str::<pioneer_protocol::RecoveryDiagnostic>(value).ok()
+                })
+                .filter(|value| value.stop_reason.is_some())
+                .unwrap_or_default()
+                .public_message()
         };
         let already_terminal = current_status == desired_status;
         let cleanup_reason = terminal_error.chars().take(4_096).collect::<String>();
@@ -25682,7 +25864,7 @@ impl CrudStore {
                 mentions: collaboration.mentions,
                 message_revision: collaboration.message_revision,
                 message_deleted: collaboration.message_deleted,
-                error: Some(terminal_error),
+                error: Some(terminal_error.clone()),
                 prompt_manifest,
                 permission_profile,
             })
@@ -25710,7 +25892,7 @@ impl CrudStore {
                 terminalize_turn_item_payload(
                     &mut item,
                     TurnItemTerminalState::Failed {
-                        reason: Some(record.error_message.clone()),
+                        reason: Some(terminal_error.clone()),
                     },
                 );
                 let notification = pioneer_protocol::ItemCompletedNotification {
@@ -31029,6 +31211,11 @@ fn infer_timeout_reason(
 
 fn recovery_job_record_from_model(model: pioneer_entity::recovery_job::Model) -> RecoveryJobRecord {
     RecoveryJobRecord {
+        last_failure_attempt_id: model.last_failure_attempt_id,
+        diagnostic: model
+            .diagnostic
+            .as_deref()
+            .and_then(|value| serde_json::from_str(value).ok()),
         id: model.id,
         turn_id: model.turn_id,
         item_id: model.item_id,
@@ -35022,6 +35209,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_diagnostic_rolls_back_with_outbox_and_survives_restart() {
+        use pioneer_protocol::{
+            ProviderFailureClass, ProviderFailureStage, ProviderTransportKind, RecoveryDiagnostic,
+            RecoveryProviderFailure, RecoveryStopReason,
+        };
+        let (store, _, _) =
+            test_store_with_started_turn("ws_diag_atomic", "thr_diag_atomic", "turn_diag_atomic")
+                .await;
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: "ws_diag_atomic".to_owned(),
+                    thread_id: "thr_diag_atomic".to_owned(),
+                    turn_id: "turn_diag_atomic".to_owned(),
+                    item: safe_web_fetch_item("tool_diag_atomic"),
+                },
+                1_700_000_001,
+            )
+            .await
+            .unwrap();
+        let initial = RecoveryDiagnostic {
+            last_failure: Some(RecoveryProviderFailure {
+                class: ProviderFailureClass::StreamTruncated,
+                stage: ProviderFailureStage::MidStream,
+                transport: ProviderTransportKind::Stream,
+                http_status: None,
+                retry_after_ms: None,
+            }),
+            stop_reason: None,
+        };
+        let job = match store
+            .enqueue_recovery_job_with_diagnostic_if_no_unresolved(
+                "turn_diag_atomic".to_owned(),
+                "tool_diag_atomic".to_owned(),
+                TurnItemType::WebFetch,
+                None,
+                RecoveryTrigger::ProviderError,
+                RecoveryAction::RetryWithBackoff,
+                Some("raw initial secret".to_owned()),
+                Some(ProviderFailureClass::StreamTruncated),
+                Some(ProviderFailureStage::MidStream),
+                None,
+                0,
+                2,
+                serde_json::json!({}),
+                serde_json::json!({}),
+                Some(initial.clone()),
+                1_700_000_002,
+            )
+            .await
+            .unwrap()
+        {
+            AtomicRecoveryJobEnqueueOutcome::Created(job) => job,
+            _ => panic!("new job expected"),
+        };
+        let claimed = store
+            .claim_due_recovery_jobs(1_700_000_003, 45, 1)
+            .await
+            .unwrap();
+        store
+            .mark_claimed_recovery_job_active(
+                &job.id,
+                claimed[0].claim_token.as_deref().unwrap(),
+                "diag_attempt",
+                1_700_000_003,
+            )
+            .await
+            .unwrap();
+        let final_diagnostic = RecoveryDiagnostic {
+            last_failure: Some(RecoveryProviderFailure {
+                class: ProviderFailureClass::AuthOrPermission,
+                stage: ProviderFailureStage::Connect,
+                transport: ProviderTransportKind::NonStream,
+                http_status: Some(403),
+                retry_after_ms: None,
+            }),
+            stop_reason: Some(RecoveryStopReason::AttemptsExhausted),
+        };
+        let raw = "raw body credential=secret https://secret.example /private/key HTTP 401";
+        assert!(
+            !store
+                .mark_recovery_job_terminal_after_attempt_with_diagnostic(
+                    &job.id,
+                    "stale_attempt",
+                    RecoveryJobStatus::Exhausted,
+                    Some(raw.to_owned()),
+                    Some(final_diagnostic.clone()),
+                    1_700_000_004
+                )
+                .await
+                .unwrap()
+        );
+        store.connection.execute_unprepared("CREATE TRIGGER reject_diag_outbox BEFORE INSERT ON recovery_terminalization_outbox BEGIN SELECT RAISE(ABORT, 'test outbox failure'); END;").await.unwrap();
+        assert!(
+            store
+                .mark_recovery_job_terminal_after_attempt_with_diagnostic(
+                    &job.id,
+                    "diag_attempt",
+                    RecoveryJobStatus::Exhausted,
+                    Some(raw.to_owned()),
+                    Some(final_diagnostic.clone()),
+                    1_700_000_004
+                )
+                .await
+                .is_err()
+        );
+        let rolled_back = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(rolled_back.status, RecoveryJobStatus::Active);
+        assert_eq!(rolled_back.run_count, 0);
+        assert_eq!(rolled_back.diagnostic, Some(initial));
+        assert!(rolled_back.last_failure_attempt_id.is_none());
+        store
+            .connection
+            .execute_unprepared("DROP TRIGGER reject_diag_outbox")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .mark_recovery_job_terminal_after_attempt_with_diagnostic(
+                    &job.id,
+                    "diag_attempt",
+                    RecoveryJobStatus::Exhausted,
+                    Some(raw.to_owned()),
+                    Some(final_diagnostic.clone()),
+                    1_700_000_004
+                )
+                .await
+                .unwrap()
+        );
+        let restarted = CrudStore::new(store.database_connection());
+        let terminal = restarted.get_recovery_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(terminal.diagnostic.as_ref(), Some(&final_diagnostic));
+        assert_eq!(
+            terminal.error_class,
+            Some(ProviderFailureClass::StreamTruncated)
+        );
+        let claims = restarted
+            .claim_due_recovery_terminalizations(1_700_000_005, 45, 10)
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        let applied = restarted
+            .apply_claimed_recovery_terminalization(
+                &claims[0],
+                None,
+                RecoveryTerminalCleanupPlan {
+                    runtime_generation: 77,
+                    runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
+                },
+                1_700_000_005,
+            )
+            .await
+            .unwrap();
+        let RecoveryTerminalizationApplyOutcome::Applied(applied) = applied else {
+            panic!("terminalization expected");
+        };
+        let expected = final_diagnostic.public_message();
+        assert_eq!(
+            applied.newly_terminal_turn.unwrap().error.as_deref(),
+            Some(expected.as_str())
+        );
+        let serialized = serde_json::to_string(&applied.final_item.unwrap()).unwrap();
+        assert!(serialized.contains("HTTP 403"));
+        for secret in ["credential", "secret.example", "/private", "HTTP 401"] {
+            assert!(!serialized.contains(secret));
+        }
+        assert_eq!(
+            restarted
+                .get_failed_turn_recovery_diagnostic("turn_diag_atomic")
+                .await
+                .unwrap(),
+            Some(final_diagnostic)
+        );
+        assert!(
+            restarted
+                .claim_due_recovery_terminalizations(1_700_000_100, 45, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !restarted
+                .mark_recovery_job_terminal_after_attempt_with_diagnostic(
+                    &job.id,
+                    "diag_attempt",
+                    RecoveryJobStatus::Exhausted,
+                    Some("duplicate".to_owned()),
+                    None,
+                    1_700_000_100
+                )
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_recovery_job_outbox_atomically_closes_item_and_turn_after_restart() {
         let (store, _, _) = test_store_with_started_turn(
             "ws_recovery_terminal_outbox",
@@ -35130,6 +35513,15 @@ mod tests {
             .expect("turn lookup should succeed")
             .expect("turn should exist");
         assert_eq!(terminal.status, TurnStatus::Failed);
+        assert_eq!(terminal.error.as_deref(), Some("Recovery failed."));
+        assert!(
+            restarted
+                .get_failed_turn_recovery_diagnostic("turn_recovery_outbox")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
         let item = turn::find_turn_item(
             &restarted.connection,
             "turn_recovery_outbox",

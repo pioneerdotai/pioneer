@@ -117,6 +117,7 @@ impl PreparedTaskProjection {
             }
             TaskEventPayload::RunCancelled { run_id, reason, .. } => {
                 let error = reason.as_ref().map(|reason| TaskError {
+                    recovery_diagnostic: None,
                     code: "task_run_cancelled".to_owned(),
                     message: reason.clone(),
                     class: TaskErrorClass::Cancelled,
@@ -143,6 +144,7 @@ impl PreparedTaskProjection {
             }
             TaskEventPayload::TaskCancelled { reason, .. } => {
                 let error = reason.as_ref().map(|reason| TaskError {
+                    recovery_diagnostic: None,
                     code: "task_cancelled".to_owned(),
                     message: reason.clone(),
                     class: TaskErrorClass::Cancelled,
@@ -193,6 +195,7 @@ impl PreparedTaskProjection {
                 ..
             } => {
                 let error = TaskError {
+                    recovery_diagnostic: None,
                     code: "task_depth_limit_exceeded".to_owned(),
                     message: format!("task depth {depth} exceeds max depth {max_depth}"),
                     class: TaskErrorClass::Policy,

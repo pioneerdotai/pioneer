@@ -354,8 +354,18 @@ impl TaskToolProvider for GatewayTaskToolProvider {
                         }),
                     error_message: run
                         .and_then(|run| run.error.as_ref())
-                        .map(|error| error.message.clone())
-                        .or_else(|| item.task.error.as_ref().map(|error| error.message.clone())),
+                        .map(|error| {
+                            error
+                                .recovery_public_message()
+                                .unwrap_or_else(|| error.message.clone())
+                        })
+                        .or_else(|| {
+                            item.task.error.as_ref().map(|error| {
+                                error
+                                    .recovery_public_message()
+                                    .unwrap_or_else(|| error.message.clone())
+                            })
+                        }),
                     child_thread_id: item.child_thread_id.clone(),
                     child_turn_id: item.child_turn_id.clone(),
                 }
@@ -560,13 +570,17 @@ impl TaskToolProvider for GatewayTaskToolProvider {
                     }),
                 error_message: run
                     .and_then(|run| run.error.as_ref())
-                    .map(|error| error.message.clone())
+                    .map(|error| {
+                        error
+                            .recovery_public_message()
+                            .unwrap_or_else(|| error.message.clone())
+                    })
                     .or_else(|| {
-                        response
-                            .task
-                            .error
-                            .as_ref()
-                            .map(|error| error.message.clone())
+                        response.task.error.as_ref().map(|error| {
+                            error
+                                .recovery_public_message()
+                                .unwrap_or_else(|| error.message.clone())
+                        })
                     }),
                 child_thread_id: child_anchor.child_thread_id,
                 child_turn_id: child_anchor.child_turn_id,
@@ -5363,6 +5377,9 @@ fn result_preview(result: Option<&TaskResult>) -> Option<String> {
 
 fn error_preview(error: Option<&TaskError>) -> Option<String> {
     error.map(|error| {
+        if let Some(message) = error.recovery_public_message() {
+            return message;
+        }
         match error.class {
             pioneer_protocol::TaskErrorClass::Cancelled => "Task was cancelled.",
             pioneer_protocol::TaskErrorClass::Timeout => "Task execution timed out.",
@@ -6157,6 +6174,7 @@ mod tests {
             }),
             extraction_error: (status == TaskResultCandidateStatus::ExtractionFailed).then(|| {
                 TaskError {
+                    recovery_diagnostic: None,
                     code: "extraction_failed".to_owned(),
                     message: "could not extract task result".to_owned(),
                     class: pioneer_protocol::TaskErrorClass::Validation,

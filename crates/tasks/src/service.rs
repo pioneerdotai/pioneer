@@ -2513,6 +2513,7 @@ impl TaskService {
                 cancelled_executions.push((
                     execution.id,
                     Some(TaskError {
+                        recovery_diagnostic: None,
                         code: "task_run_cancelled".to_owned(),
                         message: reason.clone(),
                         class: TaskErrorClass::Cancelled,
@@ -4607,6 +4608,7 @@ impl TaskService {
             cancelled_executions.push((
                 execution.id,
                 Some(TaskError {
+                    recovery_diagnostic: None,
                     code: "task_run_cancelled".to_owned(),
                     message: reason.to_owned(),
                     class: TaskErrorClass::Cancelled,
@@ -6031,6 +6033,7 @@ pub(crate) fn task_error(
     failed_run_id: Option<String>,
 ) -> TaskError {
     TaskError {
+        recovery_diagnostic: None,
         code: code.into(),
         message: message.into(),
         class,

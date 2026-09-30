@@ -1471,6 +1471,9 @@ fn delivery_result_item(delivery: &TaskDelivery) -> TurnItem {
 }
 
 fn task_delivery_failure_message(error: &pioneer_protocol::TaskError) -> String {
+    if let Some(message) = error.recovery_public_message() {
+        return message;
+    }
     match error.code.as_str() {
         "task_executor_start_failed" => "Scheduled task could not start.".to_owned(),
         _ => "Scheduled task failed.".to_owned(),
@@ -1537,5 +1540,59 @@ fn is_private_ip(ip: IpAddr) -> bool {
                 || matches!(ip.segments()[0] & 0xffc0, 0xfe80)
                 || ip == Ipv6Addr::LOCALHOST
         }
+    }
+}
+
+#[cfg(test)]
+mod recovery_failure_tests {
+    #[test]
+    fn existing_delivery_turn_uses_typed_recovery_reason_and_keeps_fallback() {
+        let mut error = pioneer_protocol::TaskError {
+            code: "child_turn_failed".to_owned(),
+            message: "private response /secret HTTP 401".to_owned(),
+            class: pioneer_protocol::TaskErrorClass::Unknown,
+            details: None,
+            failed_run_id: None,
+            recovery_diagnostic: None,
+        };
+        assert_eq!(
+            super::task_delivery_failure_message(&error),
+            "Scheduled task failed."
+        );
+        let diagnostic = pioneer_protocol::RecoveryDiagnostic {
+            last_failure: Some(pioneer_protocol::RecoveryProviderFailure {
+                class: pioneer_protocol::ProviderFailureClass::AuthOrPermission,
+                stage: pioneer_protocol::ProviderFailureStage::Connect,
+                transport: pioneer_protocol::ProviderTransportKind::NonStream,
+                http_status: Some(403),
+                retry_after_ms: None,
+            }),
+            stop_reason: Some(pioneer_protocol::RecoveryStopReason::AttemptsExhausted),
+        };
+        error.recovery_diagnostic = Some(diagnostic.clone());
+        assert_eq!(
+            super::task_delivery_failure_message(&error),
+            diagnostic.public_message()
+        );
+        let public = crate::task_projection::project_error(&error);
+        assert_eq!(public.error.message, diagnostic.public_message());
+        assert_eq!(public.class, pioneer_protocol::TaskErrorClass::Unknown);
+        assert_eq!(
+            public.error.code,
+            pioneer_protocol::PublicErrorCode::Internal
+        );
+        assert!(!public.error.retryable);
+        assert!(!serde_json::to_string(&public).unwrap().contains("/secret"));
+        error.recovery_diagnostic.as_mut().unwrap().stop_reason = None;
+        assert_eq!(
+            super::task_delivery_failure_message(&error),
+            "Scheduled task failed."
+        );
+        assert!(
+            !crate::task_projection::project_error(&error)
+                .error
+                .message
+                .contains("HTTP")
+        );
     }
 }

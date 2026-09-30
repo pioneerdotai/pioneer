@@ -38193,12 +38193,10 @@ async fn invalid_request_provider_failure_is_terminal_without_retry() {
         .expect("turn should load")
         .expect("turn should exist");
     assert_eq!(turn.status, TurnStatus::Failed);
-    assert!(
-        turn.error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("bad request")
-    );
+    let error = turn.error.as_deref().unwrap_or_default();
+    assert!(error.contains("HTTP 400"));
+    assert!(error.contains("final under the recovery policy"));
+    assert!(!error.contains("bad request"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -76435,4 +76433,608 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
         .try_get("", "payload")
         .unwrap();
     assert_eq!(saved, canonical);
+}
+
+#[test]
+fn recovery_failure_diagnostics_reach_task_consumers_in_all_delivery_paths() {
+    run_standard_stack_message_test("recovery diagnostics through Task", async {
+        for path in ["normal", "replay", "outbox"] {
+            recovery_failure_task_consumers_impl("provider", path).await;
+        }
+    });
+}
+
+#[test]
+fn recovery_plan_and_start_refusals_reach_task_consumers() {
+    run_standard_stack_message_test("recovery terminal refusals through Task", async {
+        for path in ["normal", "outbox"] {
+            recovery_failure_task_consumers_impl("plan", path).await;
+        }
+        for path in ["normal", "replay", "outbox"] {
+            recovery_failure_task_consumers_impl("start", path).await;
+        }
+    });
+}
+
+async fn recovery_failure_task_consumers_impl(scenario: &str, path: &str) {
+    use pioneer_agent::TaskToolProvider;
+    let provider = Arc::new(HangingChildProvider::new());
+    let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
+    ));
+    let (workspace_manager, store, workspace_id) = setup_workspace_manager().await;
+    let processor = Arc::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("test-model", "openai")),
+        registry,
+        Arc::new(SessionManager::new()),
+        workspace_manager,
+        store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    processor.bind_task_bridge().await;
+    let parent_thread = format!("thr_recovery_task_{scenario}_{path}");
+    let parent_turn = format!("turn_recovery_task_{scenario}_{path}");
+    let mut params = test_task_create_params(
+        &workspace_id,
+        &parent_thread,
+        &parent_turn,
+        "Recovery task",
+        3,
+    );
+    params.delivery_policy = Some(TaskDeliveryPolicy {
+        mode: TaskDeliveryMode::Thread,
+        thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
+        thread_id: Some(parent_thread.clone()),
+        webhook_url: None,
+        include_result: true,
+        format: TaskDeliveryFormat::Summary,
+    });
+    let created = create_task_for_test(&processor, params).await.unwrap();
+    let run = created.run.unwrap();
+    // This visible Turn is the Task occurrence, which closes with its child.
+    store
+        .database_connection()
+        .execute_unprepared(&format!(
+            "UPDATE turn SET turn_kind = 'task_run' WHERE id = '{}'",
+            parent_turn
+        ))
+        .await
+        .unwrap();
+    let lineage = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
+    for _ in 0..100 {
+        if provider.child_main_call_count() > 0 {
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert!(provider.child_main_call_count() > 0);
+    let now = super::now_timestamp_secs();
+    let private = "private-response-body https://secret.example?token=credential /private/provider-key HTTP 401";
+    let mut initial = ProviderFailureDetails {
+        provider: "test-provider".to_owned(),
+        model: "test-model".to_owned(),
+        transport: ProviderTransportKind::Stream,
+        class: ProviderFailureClass::StreamTruncated,
+        stage: ProviderFailureStage::MidStream,
+        http_status: None,
+        provider_code: None,
+        retry_after_ms: None,
+        is_recoverable_hint: true,
+        message: Some(private.to_owned()),
+    };
+    if scenario == "plan" {
+        initial.class = ProviderFailureClass::UnsupportedStreaming;
+        initial.transport = ProviderTransportKind::NonStream;
+        initial.stage = ProviderFailureStage::Connect;
+    }
+    let initial_diagnostic = pioneer_protocol::RecoveryDiagnostic::provider(&initial);
+    let job = processor
+        .recovery_coordinator
+        .enqueue_provider_failure_job(
+            &crate::resilience::ProviderFailureCandidate {
+                turn_id: lineage.child_turn_id.clone(),
+                item_id: "diagnostic_reasoning".to_owned(),
+                item_type: TurnItemType::Reasoning,
+                failure: initial,
+            },
+            now,
+        )
+        .await
+        .unwrap()
+        .into_job();
+    if scenario == "plan" {
+        assert_eq!(
+            job.action,
+            pioneer_protocol::RecoveryAction::DisableStreaming
+        );
+    }
+    let last = ProviderFailureDetails {
+        class: ProviderFailureClass::AuthOrPermission,
+        stage: ProviderFailureStage::Connect,
+        http_status: Some(403),
+        provider_code: Some(private.to_owned()),
+        ..ProviderFailureDetails {
+            provider: private.to_owned(),
+            model: private.to_owned(),
+            transport: ProviderTransportKind::NonStream,
+            class: ProviderFailureClass::Unknown,
+            stage: ProviderFailureStage::Finalize,
+            http_status: None,
+            provider_code: None,
+            retry_after_ms: None,
+            is_recoverable_hint: true,
+            message: Some(private.to_owned()),
+        }
+    };
+    let mut terminal_events = Vec::new();
+    let mut due = now;
+    if scenario == "plan" {
+        let mut claimed = store.claim_due_recovery_jobs(due, 45, 1).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        terminal_events = processor
+            .recovery_coordinator
+            .run_claimed_recovery_job_for_test(claimed.remove(0), due)
+            .await
+            .unwrap();
+    } else {
+        for attempt in ["diagnostic_attempt_1", "diagnostic_attempt_2"] {
+            let claimed = store.claim_due_recovery_jobs(due, 45, 1).await.unwrap();
+            assert_eq!(claimed.len(), 1);
+            assert!(matches!(
+                store
+                    .mark_claimed_recovery_job_active(
+                        &job.id,
+                        claimed[0].claim_token.as_deref().unwrap(),
+                        attempt,
+                        due
+                    )
+                    .await
+                    .unwrap(),
+                pioneer_crud::ClaimedRecoveryActivation::Activated
+            ));
+            terminal_events = if scenario == "start" && attempt == "diagnostic_attempt_2" {
+                let active = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+                processor
+                    .recovery_coordinator
+                    .handle_recovery_start_error_for_test(
+                        active,
+                        attempt.to_owned(),
+                        pioneer_agent::AgentControlError::TurnMismatch,
+                        due + 1,
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                processor
+                    .recovery_coordinator
+                    .record_recovery_provider_failure(&job.id, attempt, last.clone(), due + 1)
+                    .await
+                    .unwrap()
+            };
+            let applied = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+            if attempt == "diagnostic_attempt_1" {
+                assert!(matches!(
+                    terminal_events.as_slice(),
+                    [crate::resilience::RecoveryCoordinatorEvent::RetryScheduled { .. }]
+                ));
+                assert_eq!(applied.status, pioneer_protocol::RecoveryJobStatus::Pending);
+                assert_eq!(applied.run_count, 1);
+                assert_eq!(applied.last_failure_attempt_id.as_deref(), Some(attempt));
+                let diagnostic = applied.diagnostic.as_ref().unwrap();
+                assert_eq!(
+                    diagnostic.last_failure,
+                    Some(pioneer_protocol::RecoveryProviderFailure::from(&last))
+                );
+                assert!(diagnostic.stop_reason.is_none());
+            }
+            due = applied.next_run_at_unix;
+        }
+    }
+    let terminal = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+    let expected_diagnostic = terminal.diagnostic.unwrap();
+    let expected = expected_diagnostic.public_message();
+    assert_eq!(terminal.policy_snapshot, job.policy_snapshot);
+    assert_eq!(terminal.action, job.action);
+    assert_eq!(terminal.error_class, job.error_class);
+    let expected_stop = match scenario {
+        "plan" => {
+            assert_eq!(terminal.status, pioneer_protocol::RecoveryJobStatus::Failed);
+            assert_eq!(terminal.run_count, 0);
+            assert!(terminal.claim_token.is_none());
+            assert!(terminal.active_attempt_id.is_none());
+            assert!(terminal.last_failure_attempt_id.is_none());
+            assert_eq!(
+                expected_diagnostic.last_failure,
+                initial_diagnostic.last_failure
+            );
+            pioneer_protocol::RecoveryStopReason::PolicyRejected
+        }
+        "start" => {
+            assert_eq!(terminal.status, pioneer_protocol::RecoveryJobStatus::Failed);
+            assert_eq!(terminal.run_count, 2);
+            assert_eq!(
+                terminal.last_failure_attempt_id.as_deref(),
+                Some("diagnostic_attempt_2")
+            );
+            assert_eq!(
+                expected_diagnostic.last_failure,
+                Some(pioneer_protocol::RecoveryProviderFailure::from(&last))
+            );
+            assert!(expected.contains("HTTP 403"));
+            pioneer_protocol::RecoveryStopReason::TerminalFailure
+        }
+        _ => {
+            assert!(expected.contains("HTTP 403"));
+            assert!(expected.contains("attempt limit exhausted"));
+            pioneer_protocol::RecoveryStopReason::AttemptsExhausted
+        }
+    };
+    assert_eq!(expected_diagnostic.stop_reason, Some(expected_stop));
+    assert!(matches!(terminal_events.as_slice(),
+        [crate::resilience::RecoveryCoordinatorEvent::RecoveryExhausted(outcome)]
+        if outcome.error_message == expected));
+    match path {
+        "normal" => {
+            for event in terminal_events {
+                assert!(processor.handle_recovery_event(event, due + 1).await);
+            }
+        }
+        "replay" => assert!(
+            processor
+                .handle_provider_failure_detected(
+                    lineage.child_thread_id.clone(),
+                    lineage.child_turn_id.clone(),
+                    job.item_id.clone(),
+                    job.item_type,
+                    last.clone(),
+                    Some(pioneer_protocol::RecoveryAttemptContext {
+                        job_id: job.id.clone(),
+                        attempt_id: "diagnostic_attempt_2".to_owned(),
+                    })
+                )
+                .await
+        ),
+        "outbox" => {
+            // No coordinator event is delivered. Recreate the store and deliver the durable handoff.
+            let restarted = pioneer_crud::CrudStore::new(store.database_connection());
+            let claims = restarted
+                .claim_due_recovery_terminalizations(due + 2, 45, 10)
+                .await
+                .unwrap();
+            assert_eq!(claims.len(), 1);
+            restarted
+                .apply_claimed_recovery_terminalization(
+                    &claims[0],
+                    None,
+                    pioneer_crud::RecoveryTerminalCleanupPlan {
+                        runtime_generation: 77,
+                        runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
+                    },
+                    due + 2,
+                )
+                .await
+                .unwrap();
+        }
+        _ => unreachable!(),
+    }
+    let (_, child) = store
+        .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.status, TurnStatus::Failed);
+    assert_eq!(child.error.as_deref(), Some(expected.as_str()));
+    assert!(
+        processor
+            .task_agent_executor
+            .reconcile_child_turn_failed(
+                &lineage.child_thread_id,
+                &lineage.child_turn_id,
+                "untrusted reconciliation text",
+                super::TaskChildReconciliationOrigin::Live
+            )
+            .await
+            .unwrap()
+    );
+    let response = store.get_task(&created.task.id).await.unwrap().unwrap();
+    let error = response.task.error.as_ref().unwrap();
+    assert_eq!(error.code, "child_turn_failed");
+    assert_eq!(error.class, pioneer_protocol::TaskErrorClass::Unknown);
+    assert_eq!(
+        error.recovery_diagnostic.as_ref(),
+        Some(&expected_diagnostic)
+    );
+    assert_eq!(
+        response.runs[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .recovery_diagnostic
+            .as_ref(),
+        Some(&expected_diagnostic)
+    );
+    let get = crate::task_projection::project_task_get(&response, false);
+    assert_eq!(get.task.error.as_ref().unwrap().error.message, expected);
+    let wait = wait_tasks_for_test(
+        &processor,
+        TaskWaitParams {
+            task_ids: vec![created.task.id.clone()],
+            timeout_ms: Some(100),
+            return_completed: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let public_wait = crate::task_projection::project_task_wait(&wait);
+    let serialized = serde_json::to_string(&public_wait).unwrap();
+    assert!(serialized.contains(&expected));
+    assert!(!serialized.contains("private-response-body"));
+    let card = crate::task_tools::task_turn_item_from_response(&processor, &response)
+        .await
+        .unwrap();
+    assert_eq!(card.error_preview.as_deref(), Some(expected.as_str()));
+    let observations = crate::task_tools::GatewayTaskToolProvider::new(Arc::downgrade(&processor))
+        .terminal_attached_task_observations(pioneer_agent::TaskTurnContext {
+            workspace_id,
+            thread_id: parent_thread.clone(),
+            turn_id: parent_turn.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        observations
+            .iter()
+            .any(|item| item.task_id == created.task.id
+                && item.error_message.as_deref() == Some(expected.as_str()))
+    );
+    let (_, parent) = store
+        .get_turn(&parent_thread, &parent_turn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(parent.error.as_deref(), Some(expected.as_str()));
+    let deliveries = store
+        .list_task_deliveries(pioneer_protocol::TaskDeliveriesParams {
+            workspace_id: created.task.workspace_id.clone(),
+            task_id: Some(created.task.id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .deliveries;
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(
+        deliveries[0]
+            .error_snapshot
+            .as_ref()
+            .unwrap()
+            .recovery_diagnostic
+            .as_ref(),
+        Some(&expected_diagnostic)
+    );
+    assert_eq!(
+        crate::task_projection::project_delivery(&deliveries[0])
+            .error
+            .unwrap()
+            .error
+            .message,
+        expected
+    );
+    let events_before = store
+        .get_task_events(&created.task.id, None)
+        .await
+        .unwrap()
+        .events
+        .len();
+    assert!(
+        processor
+            .task_agent_executor
+            .reconcile_child_turn_failed(
+                &lineage.child_thread_id,
+                &lineage.child_turn_id,
+                "duplicate",
+                super::TaskChildReconciliationOrigin::Live
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .get_task_events(&created.task.id, None)
+            .await
+            .unwrap()
+            .events
+            .len(),
+        events_before
+    );
+    assert!(
+        !processor
+            .handle_provider_failure_detected(
+                lineage.child_thread_id,
+                lineage.child_turn_id,
+                job.item_id,
+                job.item_type,
+                last,
+                Some(pioneer_protocol::RecoveryAttemptContext {
+                    job_id: job.id,
+                    attempt_id: "stale_attempt".to_owned()
+                })
+            )
+            .await
+    );
+}
+
+#[test]
+fn provider_replay_is_fenced_after_retryable_recovery_start_error() {
+    run_standard_stack_message_test("provider replay after recovery start error", async {
+        let thread = "thr_replay_after_start_error";
+        let turn = "turn_replay_after_start_error";
+        let (processor, store, _) = setup_execution_window_terminal_turn(thread, turn).await;
+        let now = super::now_timestamp_secs();
+        let failure = ProviderFailureDetails {
+            provider: "test-provider".to_owned(),
+            model: "test-model".to_owned(),
+            transport: ProviderTransportKind::Stream,
+            class: ProviderFailureClass::StreamTruncated,
+            stage: ProviderFailureStage::MidStream,
+            http_status: None,
+            provider_code: None,
+            retry_after_ms: None,
+            is_recoverable_hint: true,
+            message: Some("private provider text".to_owned()),
+        };
+        let job = processor
+            .recovery_coordinator
+            .enqueue_provider_failure_job(
+                &crate::resilience::ProviderFailureCandidate {
+                    turn_id: turn.to_owned(),
+                    item_id: "replay_reasoning".to_owned(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: failure.clone(),
+                },
+                now,
+            )
+            .await
+            .unwrap()
+            .into_job();
+        let mut due = now;
+        for attempt in ["provider_attempt_A", "start_attempt_B"] {
+            let claims = store.claim_due_recovery_jobs(due, 45, 1).await.unwrap();
+            assert_eq!(claims.len(), 1);
+            assert!(matches!(
+                store
+                    .mark_claimed_recovery_job_active(
+                        &job.id,
+                        claims[0].claim_token.as_deref().unwrap(),
+                        attempt,
+                        due,
+                    )
+                    .await
+                    .unwrap(),
+                pioneer_crud::ClaimedRecoveryActivation::Activated
+            ));
+            if attempt == "provider_attempt_A" {
+                let events = processor
+                    .recovery_coordinator
+                    .record_recovery_provider_failure(&job.id, attempt, failure.clone(), due + 1)
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    events.as_slice(),
+                    [crate::resilience::RecoveryCoordinatorEvent::RetryScheduled { .. }]
+                ));
+                // The already applied current provider event remains replayable.
+                for _ in 0..2 {
+                    assert!(
+                        processor
+                            .handle_provider_failure_detected(
+                                thread.to_owned(),
+                                turn.to_owned(),
+                                job.item_id.clone(),
+                                job.item_type,
+                                failure.clone(),
+                                Some(pioneer_protocol::RecoveryAttemptContext {
+                                    job_id: job.id.clone(),
+                                    attempt_id: attempt.to_owned(),
+                                }),
+                            )
+                            .await
+                    );
+                }
+                assert_eq!(
+                    store
+                        .get_recovery_job(&job.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .run_count,
+                    1
+                );
+            } else {
+                let active = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+                // The old owner cannot apply a new runtime failure transition.
+                assert!(
+                    processor
+                        .recovery_coordinator
+                        .handle_recovery_start_error_for_test(
+                            active.clone(),
+                            "provider_attempt_A".to_owned(),
+                            pioneer_agent::AgentControlError::Internal(
+                                "private runtime error".to_owned()
+                            ),
+                            due + 1,
+                        )
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                let events = processor
+                    .recovery_coordinator
+                    .handle_recovery_start_error_for_test(
+                        active,
+                        attempt.to_owned(),
+                        pioneer_agent::AgentControlError::Internal(
+                            "private runtime error".to_owned(),
+                        ),
+                        due + 1,
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    events.as_slice(),
+                    [crate::resilience::RecoveryCoordinatorEvent::RetryScheduled { .. }]
+                ));
+            }
+            due = store
+                .get_recovery_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .next_run_at_unix;
+        }
+        let before = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(before.status, pioneer_protocol::RecoveryJobStatus::Pending);
+        assert_eq!(before.run_count, 2);
+        assert_eq!(
+            before.last_failure_attempt_id.as_deref(),
+            Some("start_attempt_B")
+        );
+        assert_eq!(
+            before.diagnostic,
+            Some(pioneer_protocol::RecoveryDiagnostic::provider(&failure))
+        );
+        // Coordinator rejects A, then gateway must also reject its separate replay fallback.
+        assert!(
+            !processor
+                .handle_provider_failure_detected(
+                    thread.to_owned(),
+                    turn.to_owned(),
+                    job.item_id.clone(),
+                    job.item_type,
+                    failure,
+                    Some(pioneer_protocol::RecoveryAttemptContext {
+                        job_id: job.id.clone(),
+                        attempt_id: "provider_attempt_A".to_owned(),
+                    }),
+                )
+                .await
+        );
+        let after = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(after.diagnostic, before.diagnostic);
+        assert_eq!(
+            after.last_failure_attempt_id,
+            before.last_failure_attempt_id
+        );
+        assert_eq!(after.run_count, before.run_count);
+        assert_eq!(after.next_run_at_unix, before.next_run_at_unix);
+        assert_eq!(after.updated_at_unix, before.updated_at_unix);
+        assert_eq!(after.last_error, before.last_error);
+        let (_, saved_turn) = store.get_turn(thread, turn).await.unwrap().unwrap();
+        assert_eq!(saved_turn.status, TurnStatus::InProgress);
+        assert!(saved_turn.error.is_none());
+    });
 }

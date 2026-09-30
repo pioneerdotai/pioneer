@@ -493,6 +493,7 @@ impl TaskExecutionHandle {
                 .await?;
         }
         let error = reason.as_ref().map(|message| TaskError {
+            recovery_diagnostic: None,
             code: "task_run_cancelled".to_owned(),
             message: message.clone(),
             class: TaskErrorClass::Cancelled,
@@ -503,6 +504,7 @@ impl TaskExecutionHandle {
             .await?;
         self.append_and_publish(events, cancelled_at).await?;
         let terminal_error = reason.as_ref().map(|message| TaskError {
+            recovery_diagnostic: None,
             code: "task_run_cancelled".to_owned(),
             message: message.clone(),
             class: TaskErrorClass::Cancelled,

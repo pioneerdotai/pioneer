@@ -842,6 +842,8 @@ pub struct TaskResult {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskError {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_diagnostic: Option<crate::RecoveryDiagnostic>,
     pub code: String,
     pub message: String,
     pub class: TaskErrorClass,
@@ -849,6 +851,15 @@ pub struct TaskError {
     pub details: Option<TaskValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_run_id: Option<String>,
+}
+
+impl TaskError {
+    pub fn recovery_public_message(&self) -> Option<String> {
+        self.recovery_diagnostic
+            .as_ref()
+            .filter(|value| value.stop_reason.is_some())
+            .map(crate::RecoveryDiagnostic::public_message)
+    }
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]

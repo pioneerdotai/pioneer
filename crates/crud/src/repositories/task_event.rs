@@ -737,6 +737,7 @@ mod tests {
 
     fn cancelled_error() -> TaskError {
         TaskError {
+            recovery_diagnostic: None,
             code: "task_cli_runtime_start_superseded".to_owned(),
             message: "task run became terminal before activation".to_owned(),
             class: TaskErrorClass::Cancelled,

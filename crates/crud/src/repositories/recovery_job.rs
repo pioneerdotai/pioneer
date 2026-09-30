@@ -38,6 +38,7 @@ pub enum ClaimedJobActivation {
 
 #[derive(Debug, Clone)]
 pub struct NewRecoveryJob {
+    pub diagnostic_json: Option<String>,
     pub turn_id: String,
     pub item_id: String,
     pub item_type: TurnItemType,
@@ -88,6 +89,8 @@ pub async fn enqueue_recovery_job<C: ConnectionTrait>(
         run_count: Set(0),
         max_attempts: Set(job.max_attempts),
         last_error: Set(None),
+        diagnostic: Set(job.diagnostic_json),
+        last_failure_attempt_id: Set(None),
         scheduled_at: Set(job.scheduled_at),
         next_run_at: Set(job.next_run_at),
         claim_token: Set(None),
@@ -266,6 +269,10 @@ pub async fn resume_blocked_job<C: ConnectionTrait>(
             sea_orm::sea_query::Expr::value(now),
         )
         .col_expr(
+            recovery_job::Column::LastFailureAttemptId,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
             recovery_job::Column::LastError,
             sea_orm::sea_query::Expr::value(Option::<String>::None),
         )
@@ -312,6 +319,7 @@ pub async fn mark_job_retrying<C: ConnectionTrait>(
     next_run_at: DateTimeWithTimeZone,
     budget_origin_after_cooldown: Option<DateTimeWithTimeZone>,
     last_error: Option<String>,
+    diagnostic_json: Option<String>,
     now: DateTimeWithTimeZone,
 ) -> Result<bool> {
     let pending = recovery_job_status_to_db(RecoveryJobStatus::Pending);
@@ -362,6 +370,18 @@ pub async fn mark_job_retrying<C: ConnectionTrait>(
             recovery_job::Column::ActiveAttemptStartedAt,
             sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
         );
+    // Fence replay to the last applied failure transition, even when a runtime
+    // start error supplies no new provider facts.
+    update = update.col_expr(
+        recovery_job::Column::LastFailureAttemptId,
+        sea_orm::sea_query::Expr::value(Some(active_attempt_id.to_owned())),
+    );
+    if let Some(value) = diagnostic_json {
+        update = update.col_expr(
+            recovery_job::Column::Diagnostic,
+            sea_orm::sea_query::Expr::value(Some(value)),
+        );
+    }
     if let Some(budget_origin_after_cooldown) = budget_origin_after_cooldown {
         // Provider-declared cooldown is not execution time. Shift the budget
         // origin by exactly the cooldown while preserving time already spent
@@ -957,6 +977,10 @@ pub async fn mark_job_terminal_after_attempt<C: ConnectionTrait>(
             sea_orm::sea_query::Expr::value(last_error),
         )
         .col_expr(
+            recovery_job::Column::LastFailureAttemptId,
+            sea_orm::sea_query::Expr::value(Some(active_attempt_id.to_owned())),
+        )
+        .col_expr(
             recovery_job::Column::UpdatedAt,
             sea_orm::sea_query::Expr::value(now),
         )
@@ -1143,4 +1167,18 @@ pub async fn list_active_jobs<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to load active recovery jobs")
+}
+
+/// Called only inside the transaction of a successful fenced transition.
+pub async fn set_diagnostic<C: ConnectionTrait>(db: &C, job_id: &str, value: String) -> Result<()> {
+    recovery_job::Entity::update_many()
+        .col_expr(
+            recovery_job::Column::Diagnostic,
+            sea_orm::sea_query::Expr::value(Some(value)),
+        )
+        .filter(recovery_job::Column::Id.eq(job_id.to_owned()))
+        .exec(db)
+        .await
+        .context("failed to persist recovery diagnostic")?;
+    Ok(())
 }

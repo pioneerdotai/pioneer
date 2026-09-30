@@ -121,6 +121,7 @@ impl TaskExecutor for FailingSystemExecutor {
         handle
             .fail_run(
                 Some(TaskError {
+                    recovery_diagnostic: None,
                     code: "test_failure".to_owned(),
                     message: "test failure".to_owned(),
                     class: TaskErrorClass::Internal,
@@ -322,6 +323,7 @@ impl TaskExecutor for CancellationFailingSystemExecutor {
         handle
             .fail_run(
                 Some(TaskError {
+                    recovery_diagnostic: None,
                     code: "child_turn_cancelled".to_owned(),
                     message: "task cancelled".to_owned(),
                     class: TaskErrorClass::Cancelled,
@@ -1119,6 +1121,7 @@ async fn create_waiting_review_agent_task_with_policy(
         }),
         extraction_error: (candidate_status == TaskResultCandidateStatus::ExtractionFailed).then(
             || TaskError {
+                recovery_diagnostic: None,
                 code: "extraction_failed".to_owned(),
                 message: "candidate extraction failed".to_owned(),
                 class: TaskErrorClass::Validation,
@@ -5267,6 +5270,7 @@ async fn blocked_agent_task_requires_readmission_and_resumes_atomically() {
             TaskEventPayload::TaskBlocked {
                 task_id: response.task.id.clone(),
                 error: Some(TaskError {
+                    recovery_diagnostic: None,
                     code: "authorization_missing".to_owned(),
                     message: "execution admission is missing".to_owned(),
                     class: TaskErrorClass::Policy,
@@ -7253,6 +7257,7 @@ async fn projector_does_not_regress_cancelled_task_after_late_failure_events() {
             task_id: task_id.clone(),
             run_id: run_id.clone(),
             error: Some(TaskError {
+                recovery_diagnostic: None,
                 code: "child_turn_cancelled".to_owned(),
                 message: "task cancelled".to_owned(),
                 class: TaskErrorClass::Cancelled,
@@ -7264,6 +7269,7 @@ async fn projector_does_not_regress_cancelled_task_after_late_failure_events() {
         TaskEventPayload::TaskFailed {
             task_id: task_id.clone(),
             error: Some(TaskError {
+                recovery_diagnostic: None,
                 code: "child_turn_cancelled".to_owned(),
                 message: "task cancelled".to_owned(),
                 class: TaskErrorClass::Cancelled,
@@ -7340,6 +7346,7 @@ async fn projector_replay_run_started_after_terminal_run_is_noop() {
                 task_id: task_id.clone(),
                 run_id: run_id.clone(),
                 error: Some(TaskError {
+                    recovery_diagnostic: None,
                     code: "late_failure".to_owned(),
                     message: "late failure".to_owned(),
                     class: TaskErrorClass::Internal,

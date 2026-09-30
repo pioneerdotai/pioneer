@@ -31,6 +31,11 @@ pub struct Model {
     pub max_attempts: i64,
     #[sea_orm(column_type = "Text", nullable)]
     pub last_error: Option<String>,
+    #[serde(default)]
+    #[sea_orm(column_type = "Text", nullable)]
+    pub diagnostic: Option<String>,
+    #[serde(default)]
+    pub last_failure_attempt_id: Option<String>,
     pub scheduled_at: DateTimeWithTimeZone,
     pub next_run_at: DateTimeWithTimeZone,
     pub claim_token: Option<String>,
