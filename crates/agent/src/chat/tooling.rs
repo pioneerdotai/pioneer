@@ -1505,6 +1505,16 @@ mod tests {
         }
         let visibility =
             ToolVisibilitySnapshot::new(specs.iter().map(|spec| spec.spec.clone()).collect());
+        assert!(!visibility.contains_name(name).await);
+        visibility
+            .set_visible_by_name(
+                &specs
+                    .iter()
+                    .map(|spec| spec.spec.name.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await;
+        assert!(visibility.contains_name(name).await);
         let router = ToolRouter::new(
             specs,
             ToolRegistry::new(handlers),

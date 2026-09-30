@@ -2964,16 +2964,34 @@ impl AgentMemoryProvider for StatefulMemoryProvider {
         let handler: Arc<dyn ToolHandler> = Arc::new(StatefulMemoryToolHandler {
             stored_content: self.stored_content.clone(),
         });
+        let mut bundle = fake_memory_tool_bundle_for_names(
+            &[
+                "memory_search",
+                "memory_get",
+                "memory_remember",
+                "memory_forget",
+            ],
+            handler,
+        );
+        let remember_spec = bundle
+            .specs
+            .iter_mut()
+            .find(|spec| spec.spec.name == "memory_remember")
+            .expect("stateful memory bundle should include memory_remember");
+        remember_spec.spec.parameters = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "content": {"type": "string"},
+                "category": {"type": "string"},
+                "scope": {"type": "string"},
+                "key": {"type": "string"},
+                "source": {"type": "string"}
+            },
+            "required": ["content"],
+            "additionalProperties": false
+        });
         Ok(MemoryToolMaterialization {
-            bundles: vec![fake_memory_tool_bundle_for_names(
-                &[
-                    "memory_search",
-                    "memory_get",
-                    "memory_remember",
-                    "memory_forget",
-                ],
-                handler,
-            )],
+            bundles: vec![bundle],
             diagnostics: Vec::new(),
         })
     }
@@ -11554,7 +11572,7 @@ async fn remembered_memory_is_recalled_in_new_thread_and_forget_suppresses_it() 
     ));
     let manager = AgentManager::new(registry.clone(), test_tool_loop_config());
     let memory_provider = Arc::new(StatefulMemoryProvider::default());
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider;
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
     manager
         .set_memory_provider(Some(memory_trait_provider))
         .await;
@@ -11571,6 +11589,14 @@ async fn remembered_memory_is_recalled_in_new_thread_and_forget_suppresses_it() 
     )
     .await;
     assert_turn_completed(&observed);
+    assert_eq!(
+        memory_provider
+            .stored_content
+            .lock()
+            .expect("stateful memory lock poisoned")
+            .as_deref(),
+        Some("User's name is Alexander.")
+    );
 
     let recall_provider = Arc::new(CaptureAgentProvider::with_preflight_response(
         memory_read_preflight_response(),
