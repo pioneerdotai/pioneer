@@ -101,6 +101,7 @@ async fn run_with_batch_size(store: &CrudStore, batch_size: u64) -> Result<Integ
                     pioneer_protocol::TaskEventPayload::TaskBlocked {
                         task_id: record.task_id.clone(),
                         error: Some(pioneer_protocol::TaskError {
+                            recovery_diagnostic: None,
                             code: "execution_authority_integrity".to_owned(),
                             message: QUARANTINE_REASON.to_owned(),
                             class: pioneer_protocol::TaskErrorClass::Policy,

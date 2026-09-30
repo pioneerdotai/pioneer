@@ -440,13 +440,17 @@ pub(crate) fn project_result(result: &TaskResult) -> PublicTaskResult {
 }
 
 pub(crate) fn project_error(error: &TaskError) -> PublicTaskFailure {
+    let mut public_error = crate::public_error::map_agent_failure(
+        task_public_error_code(error.class),
+        PublicErrorStage::Execution,
+        error.message.as_str(),
+    );
+    if let Some(message) = error.recovery_public_message() {
+        public_error.message = message;
+    }
     PublicTaskFailure {
         class: error.class,
-        error: crate::public_error::map_agent_failure(
-            task_public_error_code(error.class),
-            PublicErrorStage::Execution,
-            error.message.as_str(),
-        ),
+        error: public_error,
     }
 }
 
@@ -780,6 +784,7 @@ mod tests {
                     completed_by_run_id: None,
                 }),
                 error: Some(TaskError {
+                    recovery_diagnostic: None,
                     code: "internal".to_owned(),
                     message: canary_error.to_owned(),
                     class: TaskErrorClass::Internal,

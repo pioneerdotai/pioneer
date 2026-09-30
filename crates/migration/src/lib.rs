@@ -8,6 +8,7 @@ mod m20260914_000004_history_check_outcomes;
 mod m20260919_000001_native_event_cleanup_queue;
 mod m20260919_000002_compaction_publication_fence;
 mod m20260920_000001_independent_compaction_summaries;
+mod m20260930_000001_recovery_diagnostic;
 pub use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
@@ -152,6 +153,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260919_000001_native_event_cleanup_queue::Migration),
             Box::new(m20260919_000002_compaction_publication_fence::Migration),
             Box::new(m20260920_000001_independent_compaction_summaries::Migration),
+            Box::new(m20260930_000001_recovery_diagnostic::Migration),
         ]
     }
 }

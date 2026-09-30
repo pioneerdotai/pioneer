@@ -589,6 +589,7 @@ mod tests {
             Some("Child output did not contain a valid task_result block.".to_owned());
         candidate.result = None;
         candidate.extraction_error = Some(TaskError {
+            recovery_diagnostic: None,
             code: "task_result_extraction_failed".to_owned(),
             message: "No valid task_result block was found.".to_owned(),
             class: TaskErrorClass::Validation,

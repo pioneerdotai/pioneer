@@ -1125,6 +1125,7 @@ mod tests {
                         task_id: "task_1".to_owned(),
                         run_id: "run_1".to_owned(),
                         error: Some(TaskError {
+                            recovery_diagnostic: None,
                             code: "late_failure".to_owned(),
                             message: "late failure".to_owned(),
                             class: TaskErrorClass::Internal,
