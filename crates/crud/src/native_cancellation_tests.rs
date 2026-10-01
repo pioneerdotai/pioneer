@@ -1162,9 +1162,32 @@ async fn native_cancellation_owner_change_and_health_restore_cannot_clear_fence(
     );
 }
 
+// Use the scoped writer transaction's SeaORM executor without exposing a pool.
+// Both successful migration writes and failed down guards release the reservation
+// before the caller inspects durable state.
+async fn migrate_fixture(
+    db: &pioneer_sqlite::SqliteDatabase,
+    steps: Option<u32>,
+    down: bool,
+) -> std::result::Result<(), sea_orm::DbErr> {
+    let transaction = db.begin().await?;
+    let result = if down {
+        Migrator::down(&*transaction, steps).await
+    } else {
+        Migrator::up(&*transaction, steps).await
+    };
+    match result {
+        Ok(()) => transaction.commit().await,
+        Err(error) => {
+            transaction.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
 #[tokio::test]
 async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_event_index() {
-    use sea_orm_migration::SchemaManager;
+    use pioneer_migration::SchemaManager;
     for compressed in [false, true] {
         if compressed {
             pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
@@ -1174,11 +1197,12 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
         );
         // Apply the pre-change schema, optionally install the real logical view,
         // then traverse the new migration. No migration runs in this work session.
-        Migrator::up(&db, Some((Migrator::migrations().len() - 1) as u32))
+        migrate_fixture(&db, Some((Migrator::migrations().len() - 1) as u32), false)
             .await
             .unwrap();
+        let transaction = db.begin().await.unwrap();
         assert!(
-            SchemaManager::new(&db)
+            SchemaManager::new(&*transaction)
                 .has_index(
                     "native_terminal_effect_outbox",
                     "uidx_native_terminal_effect_turn_kind"
@@ -1186,9 +1210,10 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
                 .await
                 .unwrap()
         );
+        transaction.rollback().await.unwrap();
         if compressed {
             let config = serde_json::json!({"table":"turn_event","column":"payload","compression_level":3,"dict_chooser":"'[nodict]'"});
-            db.query_one_raw(Statement::from_sql_and_values(
+            db.query_one_write_raw(Statement::from_sql_and_values(
                 DatabaseBackend::Sqlite,
                 "SELECT zstd_enable_transparent(?) AS value",
                 [config.to_string().into()],
@@ -1196,8 +1221,9 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
             .await
             .unwrap();
         }
-        Migrator::up(&db, None).await.unwrap();
-        let schema = SchemaManager::new(&db);
+        migrate_fixture(&db, None, false).await.unwrap();
+        let transaction = db.begin().await.unwrap();
+        let schema = SchemaManager::new(&*transaction);
         for column in [
             "context_json",
             "context_sha256",
@@ -1237,7 +1263,7 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
         );
         assert!(
             pioneer_entity::native_cancellation_context::Entity::find()
-                .all(&db)
+                .all(&*transaction)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1260,10 +1286,12 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
                 .await
                 .unwrap()
         );
+        transaction.rollback().await.unwrap();
         // Empty down is safe and retryable; durable rows/markers are covered separately.
-        Migrator::down(&db, Some(1)).await.unwrap();
+        migrate_fixture(&db, Some(1), true).await.unwrap();
+        let transaction = db.begin().await.unwrap();
         assert!(
-            SchemaManager::new(&db)
+            SchemaManager::new(&*transaction)
                 .has_index(
                     "native_terminal_effect_outbox",
                     "uidx_native_terminal_effect_turn_kind"
@@ -1271,16 +1299,25 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
                 .await
                 .unwrap()
         );
-        Migrator::up(&db, None).await.unwrap();
+        transaction.rollback().await.unwrap();
+        migrate_fixture(&db, None, false).await.unwrap();
     }
 }
 
 #[tokio::test]
 async fn native_cancellation_migration_down_preserves_context_and_terminal_markers() {
     let (store, turn, plan) = fixture("down_guard").await;
-    assert!(Migrator::down(&store.connection, Some(1)).await.is_err());
+    assert!(
+        migrate_fixture(&store.connection, Some(1), true)
+            .await
+            .is_err()
+    );
     cancel(&store, &turn, &plan, "cancel").await.unwrap();
-    assert!(Migrator::down(&store.connection, Some(1)).await.is_err());
+    assert!(
+        migrate_fixture(&store.connection, Some(1), true)
+            .await
+            .is_err()
+    );
     assert!(
         store
             .native_cancellation_was_accepted(&turn.id)
@@ -1431,7 +1468,11 @@ async fn native_cancellation_migration_down_rejects_marker_without_context() {
             .unwrap()
             .is_none()
     );
-    assert!(Migrator::down(&store.connection, Some(1)).await.is_err());
+    assert!(
+        migrate_fixture(&store.connection, Some(1), true)
+            .await
+            .is_err()
+    );
     assert!(
         repositories::turn_event_projection_stream_state::has_accepted_terminal(
             &store.connection,
