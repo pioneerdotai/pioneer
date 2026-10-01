@@ -77118,5 +77118,8 @@ fn provider_replay_is_fenced_after_retryable_recovery_start_error() {
     });
 }
 
+#[path = "tests_task_delivery_cancellation.rs"]
+mod task_delivery_cancellation;
+
 #[path = "tests/memory_post_turn_recovery.rs"]
 mod memory_post_turn_recovery;

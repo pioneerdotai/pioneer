@@ -7,7 +7,11 @@ mod memory;
 mod model_history;
 mod projector;
 mod repositories;
+mod task_delivery_lifecycle;
 mod task_events;
+#[cfg(any(test, feature = "test-support"))]
+pub use task_delivery_lifecycle::TaskDeliveryCommitTestKind;
+pub use task_delivery_lifecycle::{TaskDeliveryTransition, TaskDeliveryTransitionOutcome};
 mod task_projector;
 mod thread_episodic;
 mod timeline_live_projection;
@@ -2566,6 +2570,10 @@ pub struct TurnMcpProjectionRecord {
 
 #[derive(Clone)]
 pub struct CrudStore {
+    #[cfg(any(test, feature = "test-support"))]
+    delivery_commit_test_gate: std::sync::Arc<
+        std::sync::Mutex<Option<task_delivery_lifecycle::TaskDeliveryCommitTestGate>>,
+    >,
     connection: SqliteDatabase,
     projector: TurnProjector,
     task_projector: TaskProjector,
@@ -4146,6 +4154,8 @@ impl CrudStore {
     pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
         Self {
             connection: connection.into(),
+            #[cfg(any(test, feature = "test-support"))]
+            delivery_commit_test_gate: std::sync::Arc::new(std::sync::Mutex::new(None)),
             projector: TurnProjector::new(),
             task_projector: TaskProjector::new(),
         }
@@ -29631,11 +29641,47 @@ impl CrudStore {
         events: Vec<task_event::PreparedTaskEvent>,
         event_timestamp_secs: i64,
     ) -> Result<Vec<AppendedTaskEvent>> {
+        self.append_task_events_in_connection_with_delivery_policy(
+            db,
+            events,
+            event_timestamp_secs,
+            false,
+        )
+        .await
+    }
+
+    async fn append_task_events_with_delivery_cancellation<C: ConnectionTrait + Sync>(
+        &self,
+        db: &C,
+        events: Vec<task_event::PreparedTaskEvent>,
+        at: i64,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        self.append_task_events_in_connection_with_delivery_policy(db, events, at, true)
+            .await
+    }
+
+    async fn append_task_events_in_connection_with_delivery_policy<C: ConnectionTrait + Sync>(
+        &self,
+        db: &C,
+        events: Vec<task_event::PreparedTaskEvent>,
+        event_timestamp_secs: i64,
+        delivery_cancellation: bool,
+    ) -> Result<Vec<AppendedTaskEvent>> {
         let created_at = unix_to_datetime(event_timestamp_secs);
         let mut appended_events = Vec::with_capacity(events.len());
         let mut batch_run_turns = HashMap::<String, PreparedLegacyTaskRunTurn>::new();
 
         for event in events {
+            let mut event = if delivery_cancellation {
+                let Some(event) =
+                    task_delivery_lifecycle::preflight_cancellation(db, event).await?
+                else {
+                    continue;
+                };
+                event
+            } else {
+                event
+            };
             // Only state-independent work (validation, serialization and CPU
             // projection preparation) is performed before writer admission.
             // Database-dependent preparation is deliberately sequential here:
@@ -29649,15 +29695,20 @@ impl CrudStore {
                     batch_run_turns.insert(turn.run_id.clone(), turn);
                 }
             }
-            let delivery_authority = match event.payload() {
-                TaskEventPayload::DeliveryQueued { delivery }
-                | TaskEventPayload::DeliveryStarted { delivery, .. }
-                | TaskEventPayload::DeliveryDelivered { delivery, .. }
-                | TaskEventPayload::DeliveryFailed { delivery, .. }
-                | TaskEventPayload::DeliveryCancelled { delivery, .. } => Some(
-                    crate::task_projector::prepare_task_delivery_authority(db, delivery).await?,
-                ),
-                _ => None,
+            let delivery_authority = if let Some(authority) = event.take_delivery_authority() {
+                Some(authority)
+            } else {
+                match event.payload() {
+                    TaskEventPayload::DeliveryQueued { delivery }
+                    | TaskEventPayload::DeliveryStarted { delivery, .. }
+                    | TaskEventPayload::DeliveryDelivered { delivery, .. }
+                    | TaskEventPayload::DeliveryFailed { delivery, .. }
+                    | TaskEventPayload::DeliveryCancelled { delivery, .. } => Some(
+                        crate::task_projector::prepare_task_delivery_authority(db, delivery)
+                            .await?,
+                    ),
+                    _ => None,
+                }
             };
             let event = event.preflight_idempotency(db).await?;
             let (gate_resolution, legacy_candidate, legacy_review) = self

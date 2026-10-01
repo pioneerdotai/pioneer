@@ -5,7 +5,9 @@ use pioneer_protocol::{
     TaskResultReviewerKind, TaskResultReviewerRef, TaskValue,
 };
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+};
 
 use crate::convention::{
     task_result_review_decision_to_db, task_result_review_event_kind_to_db,
@@ -206,4 +208,32 @@ pub async fn list_review_events_by_run<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to list task result review events by run")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, sea_orm::FromQueryResult)]
+pub(crate) struct TaskDeliveryReviewerFacts {
+    pub id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub decision: String,
+    pub reviewer_ref_json: String,
+}
+
+pub(crate) async fn find_delivery_reviewer<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+) -> Result<Option<TaskDeliveryReviewerFacts>> {
+    task_result_review_event::Entity::find_by_id(id.to_owned())
+        .select_only()
+        .columns([
+            task_result_review_event::Column::Id,
+            task_result_review_event::Column::TaskId,
+            task_result_review_event::Column::RunId,
+            task_result_review_event::Column::Decision,
+            task_result_review_event::Column::ReviewerRefJson,
+        ])
+        .into_model::<TaskDeliveryReviewerFacts>()
+        .one(db)
+        .await
+        .context("failed to read exact delivery final reviewer facts")
 }
