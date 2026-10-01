@@ -11,6 +11,7 @@ mod local;
 pub(crate) mod ollama;
 pub(crate) mod openai;
 pub(crate) mod openrouter;
+pub(crate) mod retired;
 pub(crate) mod telnyx;
 
 pub use anthropic::AnthropicProvider;

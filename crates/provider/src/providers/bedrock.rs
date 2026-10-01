@@ -320,7 +320,15 @@ fn sign_request(
 ) -> String {
     let date = &datetime[..8]; // "20260319"
     let host = url.host_str().unwrap_or_default();
-    let path = url.path();
+    // AWS's non-S3 default signs a second URI encoding of the escaped path.
+    // Preserve separators while encoding the percent bytes in model IDs/ARNs.
+    // https://docs.rs/aws-sigv4/latest/aws_sigv4/http_request/enum.PercentEncodingMode.html
+    let path = url
+        .path()
+        .split('/')
+        .map(crate::definition::encode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/");
 
     // Canonical query string (empty for POST)
     let canonical_query = url.query().unwrap_or("");
@@ -367,6 +375,65 @@ fn sign_request(
 // ── Implementation ─────────────────────────────────────────────────────────
 
 impl BedrockProvider {
+    pub(crate) fn environment_is_configured() -> bool {
+        let access = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default();
+        let secret = std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default();
+        let session = std::env::var("AWS_SESSION_TOKEN").ok();
+        Self::validate_connection_values(
+            &access,
+            &secret,
+            session.as_deref(),
+            &Self::environment_region(),
+        )
+        .is_ok()
+    }
+
+    fn validate_connection(&self) -> Result<()> {
+        Self::validate_connection_values(
+            &self.access_key_id,
+            &self.secret_access_key,
+            self.session_token.as_deref(),
+            &self.region,
+        )
+    }
+
+    fn validate_connection_values(
+        access: &str,
+        secret: &str,
+        session: Option<&str>,
+        region: &str,
+    ) -> Result<()> {
+        if access.trim().is_empty() || secret.trim().is_empty() {
+            anyhow::bail!(
+                "Bedrock SigV4 requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY; a single provider API key is insufficient"
+            );
+        }
+        if session.is_some_and(|token| token.trim().is_empty()) {
+            anyhow::bail!("AWS_SESSION_TOKEN must be nonempty when supplied");
+        }
+        if region.is_empty()
+            || !region
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        {
+            anyhow::bail!("Bedrock requires a valid AWS region");
+        }
+        Ok(())
+    }
+
+    fn environment_region() -> String {
+        std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|_| "us-east-1".to_string())
+    }
+
+    fn dns_suffix(&self) -> &'static str {
+        if self.region.starts_with("cn-") {
+            "amazonaws.com.cn"
+        } else {
+            "amazonaws.com"
+        }
+    }
     pub fn new(
         access_key_id: impl Into<String>,
         secret_access_key: impl Into<String>,
@@ -442,31 +509,36 @@ impl BedrockProvider {
         let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
             .map_err(|_| anyhow!("AWS_SECRET_ACCESS_KEY environment variable not set"))?;
         let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
-        let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        let region = Self::environment_region();
 
-        Ok(Self {
+        let provider = Self {
             access_key_id,
             secret_access_key,
             session_token,
             region,
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
-        })
+        };
+        provider.validate_connection()?;
+        Ok(provider)
     }
 
     fn list_foundation_models_url(&self) -> String {
         format!(
-            "https://bedrock.{}.amazonaws.com/foundation-models",
-            self.region
+            "https://bedrock.{}.{}/foundation-models",
+            self.region,
+            self.dns_suffix()
         )
     }
 
     /// Build the Converse API endpoint URL for the given model ID.
     fn converse_url(&self, model_id: &str) -> String {
-        let encoded_model = model_id.replace('/', "%2F");
+        let encoded_model = crate::definition::encode_path_segment(model_id);
         format!(
-            "https://bedrock-runtime.{}.amazonaws.com/model/{}/converse",
-            self.region, encoded_model
+            "https://bedrock-runtime.{}.{}/model/{}/converse",
+            self.region,
+            self.dns_suffix(),
+            encoded_model
         )
     }
 
@@ -877,6 +949,7 @@ impl crate::traits::Provider for BedrockProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        self.validate_connection()?;
         let prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
@@ -1028,6 +1101,7 @@ impl crate::traits::Provider for BedrockProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        self.validate_connection()?;
         let url_str = self.list_foundation_models_url();
         let url: Url = url_str.parse()?;
 
@@ -1291,6 +1365,61 @@ mod tests {
     }
 
     #[test]
+    fn sigv4_connection_requires_pair_and_nonempty_session_token() {
+        for provider in [
+            BedrockProvider::new("dummy-access", "", "us-east-1"),
+            BedrockProvider::new("", "dummy-secret", "us-east-1"),
+            BedrockProvider::new("dummy-access", "dummy-secret", "region.invalid"),
+            BedrockProvider::with_session_token("dummy-access", "dummy-secret", "us-east-1", ""),
+        ] {
+            assert!(provider.validate_connection().is_err());
+        }
+        let provider = BedrockProvider::with_session_token(
+            "dummy-access",
+            "dummy-secret",
+            "cn-north-1",
+            "dummy-session",
+        );
+        assert!(provider.validate_connection().is_ok());
+        assert_eq!(
+            provider.converse_url("arn:aws-cn:bedrock:cn-north-1::foundation-model/example~1"),
+            "https://bedrock-runtime.cn-north-1.amazonaws.com.cn/model/arn%3Aaws-cn%3Abedrock%3Acn-north-1%3A%3Afoundation-model%2Fexample~1/converse"
+        );
+        assert_eq!(
+            provider.list_foundation_models_url(),
+            "https://bedrock.cn-north-1.amazonaws.com.cn/foundation-models"
+        );
+        let url: Url = provider.converse_url("model:0").parse().unwrap();
+        let auth = sign_request(
+            "POST",
+            &url,
+            b"{}",
+            "dummy-access",
+            "dummy-secret",
+            Some("dummy-session"),
+            "cn-north-1",
+            SERVICE,
+            "20261001T120000Z",
+        );
+        assert!(auth.contains("Credential=dummy-access/20261001/cn-north-1/bedrock/aws4_request"));
+        assert!(auth.contains("SignedHeaders=content-type;host;x-amz-date;x-amz-security-token"));
+        let without_session = sign_request(
+            "POST",
+            &url,
+            b"{}",
+            "dummy-access",
+            "dummy-secret",
+            None,
+            "cn-north-1",
+            SERVICE,
+            "20261001T120000Z",
+        );
+        assert_ne!(auth, without_session);
+        assert!(!auth.contains("dummy-secret"));
+        assert!(!auth.contains("dummy-session"));
+    }
+
+    #[test]
     fn creates_with_session_token() {
         let provider = BedrockProvider::with_session_token("AKID", "SECRET", "eu-west-1", "TOKEN");
         assert_eq!(provider.access_key_id, "AKID");
@@ -1411,6 +1540,7 @@ mod tests {
             std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
             std::env::remove_var("AWS_SESSION_TOKEN");
             std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
         }
 
         let provider = BedrockProvider::from_env().unwrap();
@@ -1443,7 +1573,7 @@ mod tests {
         let url = provider.converse_url("anthropic.claude-3-sonnet-20240229-v1:0");
         assert_eq!(
             url,
-            "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-sonnet-20240229-v1:0/converse"
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-sonnet-20240229-v1%3A0/converse"
         );
     }
 
