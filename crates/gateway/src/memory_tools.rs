@@ -240,7 +240,7 @@ async fn authorize_post_turn_memory_execution(
     turn_id: &str,
     scoped_principal_hint: Option<&str>,
     access: MemoryExecutionAccess,
-) -> Result<MemoryExecutionBoundary, String> {
+) -> Result<MemoryExecutionBoundary, pioneer_memory::MemoryWriteFailure> {
     match processor
         .revalidate_post_turn_execution_authorization(
             workspace_id,
@@ -261,17 +261,17 @@ async fn authorize_post_turn_memory_execution(
                 scoped_collaboration: current
                     .memory_runtime_principal_policy(processor.crud_store.as_ref())
                     .await
-                    .map_err(|_| "post-turn memory principal policy is unavailable".to_owned())?
+                    .map_err(classify_memory_write_failure)?
                     == crate::authorization::RuntimePrincipalPolicy::ScopedCollaboration,
             })
         }
-        Err(_) => {
+        Err(error) => {
             crate::authorization::record_authorization_unavailable(
                 access.action().safe_name(),
                 "memory.post_turn",
                 "hook",
             );
-            Err("post-turn memory is unavailable for the current execution".to_owned())
+            Err(classify_memory_write_failure(error))
         }
     }
 }
@@ -313,7 +313,7 @@ async fn authorize_post_turn_memory_upsert_execution(
     thread_id: &str,
     turn_id: &str,
     scoped_principal_hint: Option<&str>,
-) -> Result<MemoryExecutionBoundary, String> {
+) -> Result<MemoryExecutionBoundary, pioneer_memory::MemoryWriteFailure> {
     let create = authorize_post_turn_memory_execution(
         processor,
         workspace_id,
@@ -333,9 +333,7 @@ async fn authorize_post_turn_memory_upsert_execution(
     )
     .await?;
     if create != update {
-        return Err(
-            "post-turn memory upsert authority has inconsistent collaboration scope".to_owned(),
-        );
+        return Err(pioneer_memory::MemoryWriteFailure::AuthorizationOrDomain);
     }
     Ok(create)
 }
@@ -1406,7 +1404,8 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
             context.principal_id.as_deref(),
             MemoryExecutionAccess::Read,
         )
-        .await?;
+        .await
+        .map_err(|_| "post-turn memory is unavailable for the current execution".to_owned())?;
 
         let operation_context = runtime.operation_context_for_authorized_turn(
             &context,
@@ -1493,12 +1492,14 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
         &self,
         context: MemoryTurnContext,
         mut params: MemorySemanticWriteParams,
-    ) -> Result<MemorySemanticWriteResponse, String> {
-        let processor = self.processor()?;
+    ) -> Result<MemorySemanticWriteResponse, pioneer_memory::MemoryWriteFailure> {
+        let processor = self
+            .processor()
+            .map_err(|_| pioneer_memory::MemoryWriteFailure::Unclassified)?;
         let runtime = processor.memory_runtime();
         runtime
             .ensure_enabled()
-            .map_err(|error| format!("{error:#}"))?;
+            .map_err(classify_memory_write_failure)?;
         let boundary = authorize_post_turn_memory_upsert_execution(
             processor.as_ref(),
             context.workspace_id.as_str(),
@@ -1537,12 +1538,53 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
             .service()
             .write_semantic_memory(operation_context.clone(), params)
             .await
-            .map_err(|error| format!("{error:#}"))?;
+            .map_err(classify_memory_write_failure)?;
         processor
             .send_memory_changed_after_semantic_write(&operation_context, &response)
             .await;
         Ok(response)
     }
+}
+
+/// Use typed causes and SQLite result codes, never raw error text.
+fn classify_memory_write_failure(error: anyhow::Error) -> pioneer_memory::MemoryWriteFailure {
+    use pioneer_memory::MemoryWriteFailure;
+    use sea_orm::{ConnAcquireErr, DbErr, RuntimeErr, SqlxError};
+
+    if let Some(failure) = error.downcast_ref::<MemoryWriteFailure>() {
+        return *failure;
+    }
+    if let Some(db_error) = error.downcast_ref::<DbErr>() {
+        if matches!(db_error, DbErr::ConnectionAcquire(ConnAcquireErr::Timeout)) {
+            return MemoryWriteFailure::StorageTransient;
+        }
+        if let DbErr::Conn(RuntimeErr::SqlxError(cause))
+        | DbErr::Exec(RuntimeErr::SqlxError(cause))
+        | DbErr::Query(RuntimeErr::SqlxError(cause)) = db_error
+        {
+            match cause.as_ref() {
+                SqlxError::PoolTimedOut => {
+                    return MemoryWriteFailure::StorageTransient;
+                }
+                SqlxError::Database(database) => {
+                    // Extended SQLite codes retain BUSY=5 / LOCKED=6 in the low byte.
+                    if database
+                        .code()
+                        .and_then(|code| code.parse::<i32>().ok())
+                        .is_some_and(sqlite_write_failure_code_is_transient)
+                    {
+                        return MemoryWriteFailure::StorageTransient;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    MemoryWriteFailure::Unclassified
+}
+
+fn sqlite_write_failure_code_is_transient(code: i32) -> bool {
+    matches!(code & 0xff, 5 | 6)
 }
 
 #[derive(Clone)]
@@ -2762,6 +2804,45 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
+    fn semantic_write_classification_preserves_typed_causes_without_error_text_matching() {
+        use pioneer_memory::MemoryWriteFailure;
+        for failure in [
+            MemoryWriteFailure::InvalidInput,
+            MemoryWriteFailure::AuthorizationOrDomain,
+            MemoryWriteFailure::StorageTransient,
+            MemoryWriteFailure::Unclassified,
+        ] {
+            assert_eq!(
+                classify_memory_write_failure(anyhow::Error::new(failure).context("outer context")),
+                failure
+            );
+        }
+        assert_eq!(
+            classify_memory_write_failure(anyhow::anyhow!("database is locked SQLITE_BUSY")),
+            MemoryWriteFailure::Unclassified
+        );
+        assert_eq!(
+            classify_memory_write_failure(anyhow::Error::new(sea_orm::DbErr::ConnectionAcquire(
+                sea_orm::ConnAcquireErr::Timeout
+            ))),
+            MemoryWriteFailure::StorageTransient
+        );
+        let pool_error = sea_orm::DbErr::Query(sea_orm::RuntimeErr::SqlxError(Arc::new(
+            sea_orm::SqlxError::PoolTimedOut,
+        )));
+        assert_eq!(
+            classify_memory_write_failure(anyhow::Error::new(pool_error).context("query failed")),
+            MemoryWriteFailure::StorageTransient,
+        );
+        assert_eq!(
+            classify_memory_write_failure(anyhow::Error::new(sea_orm::DbErr::Custom(
+                "SQLITE_BUSY".into()
+            ))),
+            MemoryWriteFailure::Unclassified
+        );
+    }
+
+    #[test]
     fn durable_memory_post_turn_checkpoint_is_bounded_and_authority_fenced() {
         let raw_json = r#"{"facts":[]}"#;
         let encoded = encode_memory_post_turn_extractor_checkpoint(
@@ -2991,3 +3072,7 @@ mod tests {
 #[cfg(test)]
 #[path = "memory_tools_response_tests.rs"]
 mod response_validation_tests;
+
+#[cfg(test)]
+#[path = "memory_tools/sqlite_write_failure_tests.rs"]
+mod sqlite_write_failure_tests;

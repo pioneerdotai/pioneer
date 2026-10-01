@@ -77117,3 +77117,6 @@ fn provider_replay_is_fenced_after_retryable_recovery_start_error() {
         assert!(saved_turn.error.is_none());
     });
 }
+
+#[path = "tests/memory_post_turn_recovery.rs"]
+mod memory_post_turn_recovery;

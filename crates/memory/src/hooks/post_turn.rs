@@ -388,6 +388,7 @@ pub(super) fn validate_memory_post_turn_fact(
         return Err("transient_or_session_only");
     }
     let semantic = normalized_post_turn_fact_semantic(fact.semantic);
+    crate::write::validate_memory_semantic_identity(&semantic)?;
     let Some(content) = bounded_nonempty_text(fact.content.as_str(), config.max_fact_content_chars)
     else {
         return Err("empty_content");

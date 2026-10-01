@@ -50,12 +50,14 @@ struct RemoteAccessRunConfig {
 enum RatholeRunOutcome {
     Stopped,
     Exited,
+    TerminalFailure,
 }
 
 #[derive(Default)]
 struct RatholeEventState {
     connected_once: bool,
     suppress_connecting_status: bool,
+    terminal_failure: bool,
 }
 
 #[derive(Serialize)]
@@ -115,7 +117,7 @@ impl RemoteAccessSupervisor {
     pub async fn apply(&self, desired: RemoteAccessDesiredState) -> Result<()> {
         let mut state = self.state.lock().await;
         state.generation = state.generation.saturating_add(1);
-        stop_supervisor_task(state.shutdown_tx.take(), state.task.take()).await;
+        stop_supervisor_task(&mut state).await;
 
         let Some(run_config) = self.validate_run_config(state.generation, desired)? else {
             return Ok(());
@@ -140,7 +142,7 @@ impl RemoteAccessSupervisor {
 
     pub async fn shutdown(&self) {
         let mut state = self.state.lock().await;
-        stop_supervisor_task(state.shutdown_tx.take(), state.task.take()).await;
+        stop_supervisor_task(&mut state).await;
         publish_status(
             &self.status_tx,
             GatewayRemoteAccessState::Stopped,
@@ -223,21 +225,17 @@ impl RemoteAccessSupervisor {
     }
 }
 
-async fn stop_supervisor_task(
-    shutdown_tx: Option<watch::Sender<bool>>,
-    task: Option<JoinHandle<()>>,
-) {
-    if let Some(shutdown_tx) = shutdown_tx {
+async fn stop_supervisor_task(state: &mut RemoteAccessSupervisorState) {
+    if let Some(shutdown_tx) = state.shutdown_tx.as_ref() {
         let _ = shutdown_tx.send(true);
     }
-    if let Some(mut task) = task {
-        if tokio::time::timeout(Duration::from_secs(6), &mut task)
-            .await
-            .is_err()
-        {
-            task.abort();
-        }
+    // Keep ownership in state across await, including cancellation of apply/shutdown.
+    // Relay now cancels handshake/backoff and joins its control and TCP data tasks.
+    if let Some(task) = state.task.as_mut() {
+        let _ = task.await;
     }
+    state.task = None;
+    state.shutdown_tx = None;
 }
 
 async fn supervise_rathole(
@@ -266,6 +264,10 @@ async fn supervise_rathole(
                     None,
                     Some("remote access tunnel stopped".to_owned()),
                 );
+                return;
+            }
+            Ok(RatholeRunOutcome::TerminalFailure) => {
+                // The typed event already published the failure. Cleanup must not replace it.
                 return;
             }
             Ok(RatholeRunOutcome::Exited) => {
@@ -304,7 +306,7 @@ async fn supervise_rathole(
         restart_count = restart_count.saturating_add(1);
         sleep_or_shutdown(next_delay, &mut shutdown_rx).await;
         next_delay = next_restart_delay(&run_config, next_delay, restart_count);
-        if *shutdown_rx.borrow() {
+        if *shutdown_rx.borrow() || shutdown_rx.has_changed().is_err() {
             publish_status(
                 &status_tx,
                 GatewayRemoteAccessState::Stopped,
@@ -331,38 +333,49 @@ async fn run_rathole_once(
     let (rathole_shutdown_tx, rathole_shutdown_rx) = broadcast::channel::<bool>(1);
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let mut event_state = RatholeEventState::default();
-    let mut task = tokio::spawn(async move {
-        rathole::run_config_with_events(config, args, rathole_shutdown_rx, Some(event_tx)).await
-    });
+    let client = rathole::run_config_with_events(config, args, rathole_shutdown_rx, Some(event_tx));
+    tokio::pin!(client);
 
     loop {
         tokio::select! {
-            result = &mut task => {
-                return match result {
-                    Ok(Ok(())) => Ok(RatholeRunOutcome::Exited),
-                    Ok(Err(error)) => Err(error).context("remote access relay client returned an error"),
-                    Err(error) => Err(error).context("remote access relay client task failed"),
-                };
+            biased;
+            _ = wait_for_shutdown(shutdown_rx) => {
+                let _ = rathole_shutdown_tx.send(true);
+                // A shutdown outcome is intentional even if the client reports an error.
+                let _ = client.await;
+                return Ok(RatholeRunOutcome::Stopped);
             }
             Some(event) = event_rx.recv() => {
                 publish_rathole_event(status_tx, event, &mut event_state);
-            }
-            changed = shutdown_rx.changed() => {
-                if changed.is_ok() && *shutdown_rx.borrow() {
+                if event_state.terminal_failure {
                     let _ = rathole_shutdown_tx.send(true);
-                    return match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
-                        Ok(Ok(Ok(()))) => Ok(RatholeRunOutcome::Stopped),
-                        Ok(Ok(Err(error))) => Err(error).context("remote access relay client failed during shutdown"),
-                        Ok(Err(error)) => Err(error).context("remote access relay client task failed during shutdown"),
-                        Err(_) => {
-                            task.abort();
-                            Ok(RatholeRunOutcome::Stopped)
-                        }
-                    }
-                } else {
-                    return Ok(RatholeRunOutcome::Exited);
+                    let _ = client.await;
+                    return Ok(RatholeRunOutcome::TerminalFailure);
                 }
             }
+            result = &mut client => {
+                // Preserve a rejection queued immediately before the client completed.
+                while let Ok(event) = event_rx.try_recv() {
+                    publish_rathole_event(status_tx, event, &mut event_state);
+                }
+                if event_state.terminal_failure {
+                    return Ok(RatholeRunOutcome::TerminalFailure);
+                }
+                return result
+                    .map(|()| RatholeRunOutcome::Exited)
+                    .context("remote access relay client returned an error");
+            }
+        }
+    }
+}
+
+async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        if shutdown_rx.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -471,7 +484,7 @@ fn should_restart(max_restarts: u32, restart_count: u32) -> bool {
 async fn sleep_or_shutdown(delay: Duration, shutdown_rx: &mut watch::Receiver<bool>) {
     tokio::select! {
         _ = tokio::time::sleep(delay) => {}
-        _ = shutdown_rx.changed() => {}
+        _ = wait_for_shutdown(shutdown_rx) => {}
     }
 }
 
@@ -510,6 +523,9 @@ fn publish_rathole_event(
     event: RatholeEvent,
     state: &mut RatholeEventState,
 ) {
+    if state.terminal_failure {
+        return;
+    }
     match event {
         RatholeEvent::Client(event) => match event {
             RatholeClientEvent::ControlChannelConnecting { .. } => {
@@ -553,24 +569,26 @@ fn publish_rathole_event(
                     Some(error),
                 );
             }
-            RatholeClientEvent::ControlChannelAuthFailed { error, .. } => {
+            RatholeClientEvent::ControlChannelAuthFailed { .. } => {
+                state.terminal_failure = true;
                 state.connected_once = false;
                 state.suppress_connecting_status = true;
                 publish_status(
                     status_tx,
                     GatewayRemoteAccessState::Failed,
                     Some(GatewayRemoteAccessErrorKind::TunnelAuthFailed),
-                    Some(error),
+                    Some("remote access authentication rejected; update the key or disable and enable the tunnel to retry".to_owned()),
                 );
             }
-            RatholeClientEvent::ControlChannelServiceNotExist { error, .. } => {
+            RatholeClientEvent::ControlChannelServiceNotExist { .. } => {
+                state.terminal_failure = true;
                 state.connected_once = false;
                 state.suppress_connecting_status = true;
                 publish_status(
                     status_tx,
                     GatewayRemoteAccessState::Failed,
                     Some(GatewayRemoteAccessErrorKind::InvalidSettings),
-                    Some(error),
+                    Some("remote access service rejected; update settings or disable and enable the tunnel to retry".to_owned()),
                 );
             }
             RatholeClientEvent::ControlChannelStopped { .. } => {
@@ -620,6 +638,9 @@ fn unix_timestamp_secs() -> Result<u64> {
 
 impl Drop for RemoteAccessSupervisor {
     fn drop(&mut self) {
+        if let Some(shutdown_tx) = self.state.get_mut().shutdown_tx.as_ref() {
+            let _ = shutdown_tx.send(true);
+        }
         info!("remote access supervisor dropped");
     }
 }
@@ -884,8 +905,10 @@ mod tests {
         assert_eq!(status.state, GatewayRemoteAccessState::Failed);
         assert_eq!(
             status.error_kind,
-            Some(GatewayRemoteAccessErrorKind::RelayConnectFailed)
+            Some(GatewayRemoteAccessErrorKind::TunnelAuthFailed)
         );
+
+        let mut event_state = RatholeEventState::default();
 
         publish_rathole_event(
             &status_tx,
@@ -911,6 +934,213 @@ mod tests {
             status.error_kind,
             Some(GatewayRemoteAccessErrorKind::RelayConnectFailed)
         );
+    }
+
+    #[test]
+    fn terminal_event_ignores_cleanup_and_late_events_without_raw_diagnostics() {
+        for (event, kind) in [
+            (
+                RatholeClientEvent::ControlChannelAuthFailed {
+                    service_name: "private-service".to_owned(),
+                    error: "private-key-in-raw-diagnostic".to_owned(),
+                },
+                GatewayRemoteAccessErrorKind::TunnelAuthFailed,
+            ),
+            (
+                RatholeClientEvent::ControlChannelServiceNotExist {
+                    service_name: "private-service".to_owned(),
+                    error: "private-key-in-raw-diagnostic".to_owned(),
+                },
+                GatewayRemoteAccessErrorKind::InvalidSettings,
+            ),
+        ] {
+            let (tx, _rx) = watch::channel(GatewayRemoteAccessStatusSnapshot::default());
+            let mut state = RatholeEventState::default();
+            publish_rathole_event(&tx, RatholeEvent::Client(event), &mut state);
+            let failed = tx.borrow().clone();
+            assert_eq!(failed.error_kind, Some(kind));
+            assert!(!failed.message.as_ref().unwrap().contains("private-"));
+            for late in [
+                RatholeClientEvent::ControlChannelStopped {
+                    service_name: "old".to_owned(),
+                },
+                RatholeClientEvent::ControlChannelConnecting {
+                    service_name: "old".to_owned(),
+                },
+                RatholeClientEvent::ControlChannelConnected {
+                    service_name: "old".to_owned(),
+                },
+            ] {
+                publish_rathole_event(&tx, RatholeEvent::Client(late), &mut state);
+                assert_eq!(*tx.borrow(), failed);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn canceled_apply_keeps_old_task_owned_until_followup_joins_it() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for followup_apply in [true, false] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let home = tempfile::tempdir().unwrap();
+                let supervisor = RemoteAccessSupervisor::new(
+                    home.path(),
+                    GatewayRemoteAccessConfig {
+                        relay_addr: listener.local_addr().unwrap().to_string(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let desired = || RemoteAccessDesiredState {
+                    settings: GatewayRemoteAccessSettings {
+                        enabled: true,
+                        has_key: true,
+                        ..Default::default()
+                    },
+                    key: Some("local-cancellation-test-key".to_owned()),
+                };
+                let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+                let (stopping_tx, stopping_rx) = oneshot::channel();
+                let (finish_tx, finish_rx) = oneshot::channel();
+                let (finished_tx, mut finished_rx) = oneshot::channel();
+                let old_status_tx = supervisor.status_tx.clone();
+                publish_status(
+                    &supervisor.status_tx,
+                    GatewayRemoteAccessState::Connected,
+                    None,
+                    None,
+                );
+                let old_status = supervisor.status_snapshot();
+                let old_task = tokio::spawn(async move {
+                    wait_for_shutdown(&mut shutdown_rx).await;
+                    stopping_tx.send(()).unwrap();
+                    // Stand in for owned client cleanup that cannot complete before this gate.
+                    finish_rx.await.unwrap();
+                    publish_status(
+                        &old_status_tx,
+                        GatewayRemoteAccessState::Failed,
+                        Some(GatewayRemoteAccessErrorKind::RelayConnectFailed),
+                        Some("old generation cleanup event".to_owned()),
+                    );
+                    finished_tx.send(()).unwrap();
+                });
+                let old_id = old_task.id();
+                {
+                    let mut state = supervisor.state.lock().await;
+                    state.generation = 1;
+                    state.shutdown_tx = Some(shutdown_tx);
+                    state.task = Some(old_task);
+                }
+
+                let mut canceled = Box::pin(supervisor.apply(desired()));
+                poll_fn(|cx| {
+                    assert!(canceled.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                stopping_rx.await.unwrap();
+                drop(canceled); // Cancels apply precisely while it is joining the gated old task.
+                {
+                    let state = supervisor.state.lock().await;
+                    assert_eq!(state.task.as_ref().unwrap().id(), old_id);
+                    assert!(!state.task.as_ref().unwrap().is_finished());
+                    assert!(*state.shutdown_tx.as_ref().unwrap().borrow());
+                    assert_eq!(state.generation, 2);
+                }
+                assert_eq!(supervisor.status_snapshot(), old_status);
+
+                // Both supported followups must wait, retaining ownership of the same old task.
+                let mut followup = Box::pin(async {
+                    if followup_apply {
+                        supervisor.apply(desired()).await.unwrap();
+                    } else {
+                        supervisor.shutdown().await;
+                    }
+                });
+                poll_fn(|cx| {
+                    assert!(followup.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                assert_eq!(supervisor.status_snapshot(), old_status);
+                {
+                    let accept = listener.accept();
+                    tokio::pin!(accept);
+                    poll_fn(|cx| {
+                        assert!(
+                            accept.as_mut().poll(cx).is_pending(),
+                            "new generation started before old cleanup"
+                        );
+                        Poll::Ready(())
+                    })
+                    .await;
+                }
+                finish_tx.send(()).unwrap();
+                followup.await;
+                assert_eq!(finished_rx.try_recv(), Ok(()));
+                if !followup_apply {
+                    {
+                        let state = supervisor.state.lock().await;
+                        assert!(state.task.is_none());
+                        assert!(state.shutdown_tx.is_none());
+                    }
+                    assert_eq!(
+                        supervisor.status_snapshot().state,
+                        GatewayRemoteAccessState::Stopped
+                    );
+                    supervisor.apply(desired()).await.unwrap();
+                }
+                assert_ne!(
+                    supervisor.state.lock().await.task.as_ref().unwrap().id(),
+                    old_id
+                );
+
+                // A real new client receives a typed rejection; old cleanup is already joined.
+                let (mut peer, _) = listener.accept().await.unwrap();
+                let mut hello = [0; 37];
+                peer.read_exact(&mut hello).await.unwrap();
+                assert_eq!(&hello[..5], &[0, 0, 0, 0, 1]);
+                peer.write_all(&hello).await.unwrap();
+                let mut proof = [0; 32];
+                peer.read_exact(&mut proof).await.unwrap();
+                let mut statuses = supervisor.subscribe_status();
+                peer.write_all(&2u32.to_le_bytes()).await.unwrap(); // Ack::AuthFailed
+                loop {
+                    if statuses.borrow().error_kind
+                        == Some(GatewayRemoteAccessErrorKind::TunnelAuthFailed)
+                    {
+                        break;
+                    }
+                    statuses.changed().await.unwrap();
+                }
+                {
+                    let mut state = supervisor.state.lock().await;
+                    stop_supervisor_task(&mut state).await;
+                }
+                let new_status = supervisor.status_snapshot();
+                assert_eq!(new_status.state, GatewayRemoteAccessState::Failed);
+                assert_eq!(
+                    new_status.error_kind,
+                    Some(GatewayRemoteAccessErrorKind::TunnelAuthFailed)
+                );
+                assert!(
+                    !new_status
+                        .message
+                        .as_ref()
+                        .unwrap()
+                        .contains("old generation")
+                );
+                supervisor.shutdown().await;
+            }
+        })
+        .await
+        .expect("canceled apply or its followup failed to complete");
     }
 
     #[test]

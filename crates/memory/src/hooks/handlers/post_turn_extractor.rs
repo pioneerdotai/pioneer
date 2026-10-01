@@ -225,6 +225,8 @@ impl HookHandler for MemoryPostTurnExtractorHook {
             .diagnostics
             .extend(hook_diagnostics_from_strings(parsed.diagnostics.as_slice()));
 
+        let mut write_failure: Option<(crate::MemoryWriteFailure, usize)> = None;
+        let mut failure_counts = BTreeMap::new();
         for (index, fact) in parsed.facts.into_iter().enumerate() {
             let Some(params) = memory_semantic_write_params_from_extracted_fact(
                 index,
@@ -252,49 +254,73 @@ impl HookHandler for MemoryPostTurnExtractorHook {
                     stats.write_success_count += 1;
                     stats.observe_write_response(&write_response);
                 }
-                Err(_error) => {
+                Err(error) => {
                     stats.write_failure_count += 1;
+                    *failure_counts.entry(error.class()).or_insert(0_usize) += 1;
+                    // A permanent rejection must not hide another fact's transient failure.
+                    if write_failure.is_none() || error.retryable() {
+                        write_failure = Some((error, index));
+                    }
                     tracing::warn!(
                         target: "pioneer::memory_post_turn_extractor",
                         stage = "semantic_write",
                         durable = durable_terminal_effect.is_some(),
                         extractor_provider = ?extractor_model_provider.as_deref(),
                         extractor_model = ?extractor_model.as_deref(),
-                        fact_index = index,
+                        fact_index = index.min(255),
+                        failure_class = error.class(),
+                        failure_stage = "semantic_write",
                         "memory post-turn extractor semantic write failed"
                     );
-                    response.diagnostics.push(memory_safe_warning_diagnostic(
-                        "memory.post_turn_extractor.write_failed",
+                    let mut diagnostic = memory_safe_warning_diagnostic(
+                        error.code(),
                         "memory post-turn extractor semantic write failed",
-                    ));
+                    );
+                    for (key, value) in semantic_write_hook_error(
+                        error,
+                        index,
+                        extractor_model.as_deref(),
+                        extractor_model_provider.as_deref(),
+                        &stats,
+                    )
+                    .metadata
+                    {
+                        diagnostic.metadata.insert(key, HookValue::Text(value));
+                    }
+                    response.diagnostics.push(diagnostic);
                 }
             }
         }
 
-        if durable_terminal_effect.is_some() && stats.write_failure_count > 0 {
-            let mut error = memory_retryable_safe_hook_error(
-                "memory.post_turn_extractor.write_failed",
-                "memory post-turn extractor failed to persist one or more semantic writes",
+        if let Some((failure, index)) = write_failure {
+            let mut error = semantic_write_hook_error(
+                failure,
+                index,
+                extractor_model.as_deref(),
+                extractor_model_provider.as_deref(),
+                &stats,
             );
-            for (key, value) in [
-                ("provider", extractor_model_provider.as_deref()),
-                ("model", extractor_model.as_deref()),
-                ("failure_stage", Some("semantic_write")),
-                ("failure_class", Some("write_failed")),
-            ] {
-                if let Some(value) = value {
-                    error
-                        .metadata
-                        .insert(hook_metadata_key(key), value.to_owned());
-                }
+            for (class, count) in failure_counts {
+                error.metadata.insert(
+                    HookMetadataKey::new(format!("write_failure_{class}_count"))
+                        .expect("bounded static failure class key"),
+                    count.to_string(),
+                );
             }
-            return Err(error);
+            if durable_terminal_effect.is_some() {
+                return Err(error);
+            }
+            for (key, value) in error.metadata {
+                response.metadata.insert(key, HookValue::Text(value));
+            }
         }
 
         response
             .diagnostics
             .push(memory_post_turn_stats_diagnostic(&stats));
-        response.metadata = memory_post_turn_stats_metadata(&stats);
+        response
+            .metadata
+            .extend(memory_post_turn_stats_metadata(&stats));
         Ok(response)
     }
 }
@@ -358,4 +384,44 @@ fn post_turn_extractor_response_sha256(response: &str) -> String {
     use sha2::{Digest, Sha256};
 
     hex::encode(Sha256::digest(response.as_bytes()))
+}
+
+fn semantic_write_hook_error(
+    failure: crate::MemoryWriteFailure,
+    fact_index: usize,
+    model: Option<&str>,
+    provider: Option<&str>,
+    stats: &MemoryPostTurnExtractorStats,
+) -> HookError {
+    let mut error = memory_hook_error(
+        failure.code(),
+        "memory post-turn extractor failed to persist one or more semantic writes",
+    )
+    .with_safe_for_user(true)
+    .with_retryable(failure.retryable());
+    for (key, value) in [
+        ("failure_class", failure.class().to_owned()),
+        ("failure_stage", "semantic_write".to_owned()),
+        ("fact_index", fact_index.min(255).to_string()),
+        ("write_failure_count", stats.write_failure_count.to_string()),
+        ("write_success_count", stats.write_success_count.to_string()),
+        (
+            "validation_rejected_count",
+            stats.validation_rejected_count.to_string(),
+        ),
+    ] {
+        error.metadata.insert(
+            HookMetadataKey::new(key).expect("static metadata key"),
+            value,
+        );
+    }
+    for (key, value, limit) in [("model", model, 160), ("provider", provider, 80)] {
+        if let Some(value) = value {
+            error.metadata.insert(
+                HookMetadataKey::new(key).expect("static metadata key"),
+                value.trim().chars().take(limit).collect(),
+            );
+        }
+    }
+    error
 }

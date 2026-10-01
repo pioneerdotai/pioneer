@@ -20,3 +20,6 @@ rathole = { workspace = true, features = ["server"] }
 sha2.workspace = true
 hex.workspace = true
 tempfile.workspace = true
+sentry = { workspace = true, features = ["test"] }
+serde_json.workspace = true
+tracing-subscriber.workspace = true

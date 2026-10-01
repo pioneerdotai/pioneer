@@ -449,7 +449,7 @@ pub trait AgentMemoryWriteProvider: Send + Sync {
         &self,
         context: MemoryTurnContext,
         params: MemorySemanticWriteParams,
-    ) -> Result<MemorySemanticWriteResponse, String>;
+    ) -> Result<MemorySemanticWriteResponse, crate::MemoryWriteFailure>;
 }
 
 #[async_trait::async_trait]

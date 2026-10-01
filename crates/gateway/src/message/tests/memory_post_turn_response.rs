@@ -629,10 +629,11 @@ impl AgentMemoryWriteProvider for FailOnceAfterWrite {
         &self,
         context: MemoryTurnContext,
         params: pioneer_protocol::MemorySemanticWriteParams,
-    ) -> Result<pioneer_protocol::MemorySemanticWriteResponse, String> {
+    ) -> Result<pioneer_protocol::MemorySemanticWriteResponse, pioneer_memory::MemoryWriteFailure>
+    {
         let result = self.bridge.write_semantic_memory(context, params).await?;
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-            return Err("injected failure after semantic commit".to_owned());
+            return Err(pioneer_memory::MemoryWriteFailure::StorageTransient);
         }
         Ok(result)
     }
@@ -647,7 +648,7 @@ fn memory_response_write_failure_replays_without_model_or_duplicate_memory() {
         assert_eq!(row.status, "retry_wait");
         assert_eq!(
             row.last_error_code.as_deref(),
-            Some("memory.post_turn_extractor.write_failed")
+            Some("memory.post_turn_extractor.write_storage_transient")
         );
         let checkpoint = row.handler_checkpoint_json.unwrap();
         let claim = f
