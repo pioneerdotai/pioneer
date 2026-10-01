@@ -2841,7 +2841,7 @@ impl MessageProcessor {
         Ok(())
     }
 
-    async fn materialize_native_agent_turn_event(
+    pub(super) async fn materialize_native_agent_turn_event(
         &self,
         event: pioneer_crud::CanonicalTurnEventPayload,
         event_timestamp_secs: i64,
