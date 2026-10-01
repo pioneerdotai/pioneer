@@ -7,7 +7,7 @@ use crate::tools::stream::{IncrementalLineDecoder, sse_data};
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
     ProviderInputCapabilities, ProviderReplayState, ProviderTermination, ProviderTimeoutPolicy,
-    ProviderToolCall, ReasoningConfig, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+    ProviderToolCall, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -50,6 +50,8 @@ struct ApiChatRequest {
     output_config: Option<AnthropicOutputConfig>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+    #[serde(flatten)]
+    generation: crate::generation::Fields,
 }
 
 #[derive(Debug, Serialize)]
@@ -258,6 +260,30 @@ struct AnthropicModelEntry {
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl AnthropicProvider {
+    fn build_chat_request(
+        request: &ChatRequest,
+        system: Option<String>,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        let generation = crate::generation::anthropic_fields("anthropic", request)?;
+        Ok(ApiChatRequest {
+            generation,
+            model: request.model.clone(),
+            messages,
+            max_tokens: crate::generation::required_cap("anthropic", request, DEFAULT_MAX_TOKENS)?,
+            temperature: request.temperature,
+            system,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: request.tool_choice.clone().map(Self::convert_tool_choice),
+            output_config: None,
+            stream,
+        })
+    }
+
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_timeout_policy(api_key, ProviderTimeoutPolicy::default())
     }
@@ -438,15 +464,6 @@ impl AnthropicProvider {
         }
     }
 
-    fn output_config(reasoning: Option<ReasoningConfig>) -> Option<AnthropicOutputConfig> {
-        match reasoning {
-            Some(ReasoningConfig::Effort(effort)) => Some(AnthropicOutputConfig {
-                effort: effort.as_str().to_owned(),
-            }),
-            Some(ReasoningConfig::Disabled) | None => None,
-        }
-    }
-
     fn messages_url(&self) -> String {
         format!("{}/v1/messages", self.base_url)
     }
@@ -532,20 +549,7 @@ impl crate::traits::Provider for AnthropicProvider {
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let (system, messages) = Self::prepare_messages(&prepared)?;
 
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages,
-            max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-            temperature: request.temperature,
-            system,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            output_config: Self::output_config(request.reasoning),
-            stream: false,
-        };
+        let api_request = Self::build_chat_request(&request, system, messages, false)?;
 
         let request_builder = self
             .client
@@ -665,20 +669,7 @@ impl crate::traits::Provider for AnthropicProvider {
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let (system, messages) = Self::prepare_messages(&prepared)?;
 
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages,
-            max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-            temperature: request.temperature,
-            system,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            output_config: Self::output_config(request.reasoning),
-            stream: true,
-        };
+        let api_request = Self::build_chat_request(&request, system, messages, true)?;
 
         let request_builder = self
             .client
@@ -1417,6 +1408,7 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![ApiMessage {
                 role: "user".into(),
@@ -1448,6 +1440,7 @@ mod tests {
     #[test]
     fn api_request_serializes_stream_true() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![ApiMessage {
                 role: "user".into(),
@@ -1472,38 +1465,49 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_thinking_body_validates_effort_and_temperature_without_a_second_reserve() {
+        let mut request = crate::generation::test_request("claude-opus-4-6");
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+        for stream in [false, true] {
+            let body = serde_json::to_value(
+                AnthropicProvider::build_chat_request(&request, None, vec![], stream).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["thinking"]["type"], "adaptive");
+            assert_eq!(body["output_config"]["effort"], "high");
+            assert_eq!(body["max_tokens"], 1024);
+            assert!(body["thinking"].get("budget_tokens").is_none());
+        }
+        request.temperature = Some(0.7);
+        assert!(AnthropicProvider::build_chat_request(&request, None, vec![], false).is_err());
+        request.temperature = None;
+        request.model = "claude-sonnet-4-20250514".into();
+        assert!(AnthropicProvider::build_chat_request(&request, None, vec![], false).is_err());
+        request.model = "claude-opus-5.5".into();
+        request.reasoning = Some(ReasoningConfig::Disabled);
+        assert!(AnthropicProvider::build_chat_request(&request, None, vec![], false).is_err());
+    }
+
+    #[test]
     fn api_request_serializes_reasoning_effort_under_output_config() {
-        assert!(AnthropicProvider::output_config(Some(ReasoningConfig::disabled())).is_none());
-        assert_eq!(
-            AnthropicProvider::output_config(Some(ReasoningConfig::effort(ReasoningEffort::None)))
-                .expect("explicit none effort should serialize")
-                .effort,
-            "none"
-        );
-
-        let request = ApiChatRequest {
-            model: "claude-sonnet-4-20250514".into(),
-            messages: vec![ApiMessage {
-                role: "user".into(),
-                content: vec![ApiMessageContentBlock::Text {
-                    text: "Hello".into(),
-                }],
-            }],
-            max_tokens: 8192,
-            temperature: None,
-            system: None,
-            tools: None,
-            tool_choice: None,
-            output_config: AnthropicProvider::output_config(Some(ReasoningConfig::effort(
-                ReasoningEffort::High,
-            ))),
-            stream: false,
-        };
-
-        let json = serde_json::to_value(&request).unwrap();
-
-        assert_eq!(json["output_config"]["effort"], "high");
-        assert!(json.get("thinking").is_none());
+        let mut request = crate::generation::test_request("claude-opus-4-5");
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+        for stream in [false, true] {
+            let body = serde_json::to_value(
+                AnthropicProvider::build_chat_request(&request, None, vec![], stream).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["output_config"]["effort"], "high");
+            assert_eq!(body["max_tokens"], 1024);
+            assert!(body.get("thinking").is_none());
+        }
+        request.reasoning = Some(ReasoningConfig::Disabled);
+        let body = serde_json::to_value(
+            AnthropicProvider::build_chat_request(&request, None, vec![], false).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("output_config").is_none());
     }
 
     #[test]

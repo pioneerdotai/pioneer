@@ -9,8 +9,8 @@ use crate::{
     tools::stream::{IncrementalLineDecoder, sse_data},
     types::{
         ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-        ProviderInputCapabilities, ProviderTermination, ProviderTimeoutPolicy, ReasoningConfig,
-        Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+        ProviderInputCapabilities, ProviderTermination, ProviderTimeoutPolicy, Role, StreamChunk,
+        TokenUsage, ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -56,6 +56,8 @@ struct ApiChatRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<serde_json::Value>,
+    #[serde(flatten)]
+    generation: crate::generation::Fields,
 }
 
 #[derive(Debug, Serialize)]
@@ -317,6 +319,29 @@ struct AzureModelEntry {
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl AzureOpenAiProvider {
+    fn build_chat_request(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        let generation = crate::generation::chat_fields("azure_openai", request)?;
+        Ok(ApiChatRequest {
+            generation,
+            messages,
+            temperature: None,
+            max_tokens: None,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: request.tool_choice.clone().map(Self::convert_tool_choice),
+            parallel_tool_calls: request.parallel_tool_calls,
+            reasoning_effort: None,
+            stream,
+            stream_options: stream.then(|| serde_json::json!({"include_usage": true})),
+        })
+    }
+
     pub fn new(
         api_key: impl Into<String>,
         resource_name: impl Into<String>,
@@ -669,13 +694,6 @@ impl AzureOpenAiProvider {
     }
 }
 
-fn reasoning_effort_for_azure_openai_request(reasoning: Option<ReasoningConfig>) -> Option<String> {
-    match reasoning {
-        Some(ReasoningConfig::Effort(effort)) => Some(effort.as_str().to_owned()),
-        Some(ReasoningConfig::Disabled) | None => None,
-    }
-}
-
 #[async_trait]
 impl crate::traits::Provider for AzureOpenAiProvider {
     fn name(&self) -> &str {
@@ -713,20 +731,8 @@ impl crate::traits::Provider for AzureOpenAiProvider {
         )
         .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = ApiChatRequest {
-            messages: Self::convert_messages(&prepared)?,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            reasoning_effort: reasoning_effort_for_azure_openai_request(request.reasoning),
-            stream: false,
-            stream_options: None,
-        };
+        let api_request =
+            Self::build_chat_request(&request, Self::convert_messages(&prepared)?, false)?;
 
         let request_builder = self
             .client
@@ -797,20 +803,8 @@ impl crate::traits::Provider for AzureOpenAiProvider {
         )
         .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = ApiChatRequest {
-            messages: Self::convert_messages(&prepared)?,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            reasoning_effort: reasoning_effort_for_azure_openai_request(request.reasoning),
-            stream: true,
-            stream_options: Some(serde_json::json!({"include_usage": true})),
-        };
+        let api_request =
+            Self::build_chat_request(&request, Self::convert_messages(&prepared)?, true)?;
 
         let request_builder = self
             .client
@@ -1084,6 +1078,32 @@ fn apply_azure_openai_reasoning_capabilities(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deployment_alias_does_not_invent_base_model_generation_contract() {
+        let request = crate::generation::test_request("production-deployment");
+        for stream in [false, true] {
+            assert!(
+                AzureOpenAiProvider::build_chat_request(&request, vec![], stream)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("known base model")
+            );
+            let mut known = request.clone();
+            known.model = "gpt-5.4".into();
+            known.reasoning = Some(ReasoningConfig::Disabled);
+            let body = serde_json::to_value(
+                AzureOpenAiProvider::build_chat_request(&known, vec![], stream).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["max_completion_tokens"], 1024);
+            assert_eq!(body["reasoning_effort"], "none");
+            assert!(body.get("max_tokens").is_none());
+            assert!(body.get("model").is_none()); // deployment remains in URL
+            known.temperature = Some(0.5);
+            known.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+            assert!(AzureOpenAiProvider::build_chat_request(&known, vec![], stream).is_err());
+        }
+    }
     use super::*;
     use crate::attachments::prepare_messages_for_provider;
     use crate::traits::Provider;
@@ -1256,6 +1276,7 @@ mod tests {
     #[test]
     fn api_request_serializes_reasoning_effort_only_when_selected() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             messages: Vec::new(),
             temperature: None,
             max_tokens: None,
@@ -1276,19 +1297,5 @@ mod tests {
         };
         let json = serde_json::to_value(&request_without_reasoning).unwrap();
         assert!(json.get("reasoning_effort").is_none());
-    }
-
-    #[test]
-    fn reasoning_effort_mapping_omits_disabled_and_serializes_explicit_none() {
-        assert_eq!(
-            reasoning_effort_for_azure_openai_request(Some(ReasoningConfig::disabled())),
-            None
-        );
-        assert_eq!(
-            reasoning_effort_for_azure_openai_request(Some(ReasoningConfig::effort(
-                ReasoningEffort::None
-            ))),
-            Some("none".to_owned())
-        );
     }
 }

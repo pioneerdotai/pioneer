@@ -49,6 +49,8 @@ struct ApiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
     stream: bool,
+    #[serde(flatten)]
+    generation: crate::generation::Fields,
 }
 
 #[derive(Debug, Serialize)]
@@ -310,6 +312,28 @@ struct ApiModelEntry {
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl GlmProvider {
+    fn build_chat_request(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        let generation = crate::generation::chat_fields("glm", request)?;
+        Ok(ApiChatRequest {
+            generation,
+            model: request.model.clone(),
+            messages,
+            temperature: None,
+            max_tokens: None,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: request.tool_choice.clone().map(Self::convert_tool_choice),
+            parallel_tool_calls: request.parallel_tool_calls,
+            stream,
+        })
+    }
+
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_timeout_policy(api_key, ProviderTimeoutPolicy::default())
     }
@@ -570,19 +594,8 @@ impl crate::traits::Provider for GlmProvider {
         )
         .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages: Self::convert_messages(&prepared)?,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            stream: false,
-        };
+        let api_request =
+            Self::build_chat_request(&request, Self::convert_messages(&prepared)?, false)?;
 
         let request_builder = self
             .client
@@ -653,19 +666,8 @@ impl crate::traits::Provider for GlmProvider {
         )
         .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages: Self::convert_messages(&prepared)?,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            stream: true,
-        };
+        let api_request =
+            Self::build_chat_request(&request, Self::convert_messages(&prepared)?, true)?;
 
         let request_builder = self
             .client
@@ -916,6 +918,44 @@ impl crate::traits::Provider for GlmProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn glm_normal_and_streaming_bodies_preserve_default_explicit_off_and_effort() {
+        let mut request = crate::generation::test_request("glm-5.2");
+        for stream in [false, true] {
+            request.reasoning = None;
+            let body = serde_json::to_value(
+                GlmProvider::build_chat_request(&request, vec![], stream).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["max_tokens"], 1024);
+            assert!(body.get("thinking").is_none());
+            request.reasoning = Some(crate::types::ReasoningConfig::Disabled);
+            let body = serde_json::to_value(
+                GlmProvider::build_chat_request(&request, vec![], stream).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["thinking"]["type"], "disabled");
+            request.reasoning = Some(crate::types::ReasoningConfig::Effort(
+                crate::types::ReasoningEffort::Max,
+            ));
+            let body = serde_json::to_value(
+                GlmProvider::build_chat_request(&request, vec![], stream).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["thinking"]["type"], "enabled");
+            assert_eq!(body["reasoning_effort"], "max");
+        }
+        request.model = "glm-5.3".into();
+        request.reasoning = Some(crate::types::ReasoningConfig::Disabled);
+        assert!(GlmProvider::build_chat_request(&request, vec![], false).is_err());
+        request.model = "glm-5.9-unknown-family".into();
+        assert!(GlmProvider::build_chat_request(&request, vec![], false).is_err());
+        request.model = "glm-4.7".into();
+        request.reasoning = Some(crate::types::ReasoningConfig::Effort(
+            crate::types::ReasoningEffort::High,
+        ));
+        assert!(GlmProvider::build_chat_request(&request, vec![], false).is_err());
+    }
     use super::*;
     use crate::attachments::prepare_messages_for_provider;
     use crate::traits::Provider;

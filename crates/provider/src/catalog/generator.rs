@@ -238,7 +238,8 @@ fn base(
         model: json!({"id":id,"name":source["name"].as_str().filter(|s|!s.is_empty()).unwrap_or(id),
         "provider":provider,"api":api,"baseUrl":url,"reasoning":source["reasoning"]==true,
         "input":if has(&source["modalities"]["input"],"image") {vec!["text","image"]} else {vec!["text"]},
-        "cost":cost(&source["cost"]),"contextWindow":context,"maxTokens":output}),
+        "cost":cost(&source["cost"]),"contextWindow":context,"maxTokens":output,
+        "sourceGeneration":{"temperature":source["temperature"],"reasoningOptions":source["reasoning_options"]}}),
         context_origin,
         output_origin,
         reasoning_options: source["reasoning_options"].clone(),
@@ -363,6 +364,9 @@ mod tests {
                 .unwrap();
         let mut origins = Vec::new();
         for (p, models) in &generated.provenance {
+            if reference.get(p).is_none() {
+                continue;
+            }
             for (id, fields) in models {
                 for field in ["contextWindow", "maxTokens"] {
                     differences(
@@ -382,6 +386,22 @@ mod tests {
         let actual = serde_json::to_value(generated.models).unwrap();
         let expected: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json")).unwrap();
+        // Pioneer-only profiles augment the pinned Pi transformation; compare
+        // every original provider in full, and cover additions separately.
+        let mut actual: Value = Value::Object(
+            actual
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(provider, _)| expected.get(*provider).is_some())
+                .map(|(provider, models)| (provider.clone(), models.clone()))
+                .collect(),
+        );
+        for models in actual.as_object_mut().unwrap().values_mut() {
+            for model in models.as_object_mut().unwrap().values_mut() {
+                model.as_object_mut().unwrap().remove("sourceGeneration");
+            }
+        }
         let mut diff = Vec::new();
         differences("", &actual, &expected, &mut diff);
         assert!(

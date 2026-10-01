@@ -98,9 +98,14 @@ impl DeepSeekProvider {
     }
 
     fn thinking_replay_required(&self, request: &ChatRequest) -> bool {
+        if crate::generation::selected_off(request.reasoning) {
+            return false;
+        }
         crate::history::deepseek_thinking_required(
             &request.model,
-            matches!(request.reasoning, Some(ReasoningConfig::Effort(_))),
+            matches!(request.reasoning, Some(ReasoningConfig::Effort(_)))
+                || request.model.starts_with("deepseek-v4")
+                || matches!(request.model.as_str(), "deepseek-flash" | "deepseek-pro"),
             &request.messages,
         )
     }
@@ -744,7 +749,7 @@ mod tests {
                 None,
                 &[tool_call()],
             );
-            replay.model = Some("deepseek-chat".into());
+            replay.model = Some("deepseek-v4-flash".into());
             if let Some(value) = reasoning_field {
                 replay.payload["assistant_message"]["reasoning_content"] = value;
             } else {
@@ -765,7 +770,7 @@ mod tests {
             complete_round(&mut messages);
             let canonical = messages.clone();
             let mut request = request_with(messages);
-            request.model = "deepseek-chat".into();
+            request.model = "deepseek-v4-flash".into();
             request.reasoning = Some(ReasoningConfig::effort(ReasoningEffort::High));
             let (projected, wire) = prepare_locally(&provider, request).unwrap();
             assert_eq!(projected.messages.len(), 2);
@@ -788,7 +793,7 @@ mod tests {
                 vec![tool_call()],
                 Some(ProviderReplayState::for_model(
                     PROVIDER_NAME,
-                    "deepseek-chat",
+                    "deepseek-v4-flash",
                     serde_json::json!({"schema_version":1,"assistant_message":{"content":null,"reasoning_content":null,"tool_calls":[]}}),
                 )),
             ),
@@ -799,7 +804,7 @@ mod tests {
         reasoned.reasoning_content = Some("later thinking".into());
         mixed.push(reasoned);
         let mut request = request_with(mixed);
-        request.model = "deepseek-chat".into();
+        request.model = "deepseek-v4-flash".into();
         let (projected, wire) = prepare_locally(&provider, request).unwrap();
         assert_eq!(projected.messages[0].role, Role::User);
         assert!(wire.to_string().contains("mixed result"));
@@ -810,13 +815,13 @@ mod tests {
             vec![tool_call()],
             Some(ProviderReplayState::for_model(
                 PROVIDER_NAME,
-                "deepseek-chat",
+                "deepseek-v4-flash",
                 serde_json::json!({"schema_version":1,"assistant_message":{"content":null,"tool_calls":[]}}),
             )),
         );
         active.provenance = None;
         let mut request = request_with(vec![active]);
-        request.model = "deepseek-chat".into();
+        request.model = "deepseek-v4-flash".into();
         request.reasoning = Some(ReasoningConfig::effort(ReasoningEffort::High));
         assert!(prepare_locally(&provider, request).is_err());
     }

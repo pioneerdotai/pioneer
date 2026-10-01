@@ -156,6 +156,13 @@ pub(super) fn models_dev(data: &Value, nvidia: &Value, strict: bool) -> Result<V
                 m
             };
             let mut candidate = base(provider, id, api, url, effective, (4096, 4096));
+            if matches!(provider, "google" | "google-vertex")
+                && let Some(resolved) = alias.filter(|a| data[source]["models"].get(*a).is_some())
+            {
+                // Retain the identity of the existing source alias resolution;
+                // effort names alone do not identify a budget/level protocol.
+                candidate.model["sourceGeneration"]["resolvedModelId"] = json!(resolved);
+            }
             candidate.model["name"] =
                 json!(m["name"].as_str().filter(|s| !s.is_empty()).unwrap_or(id));
             match provider {
@@ -608,6 +615,69 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
                         .collect(),
                 "incomplete Qwen individual model allowlist"
             );
+        }
+    }
+    // Pioneer has more Chat profiles than the pinned Pi registry. Extend the
+    // existing source transformation (and refresh path), not a hand-maintained
+    // model list. Pi's specialized candidates always win identity collisions.
+    for definition in crate::definition::provider_definitions() {
+        let provider = definition.name;
+        if result.iter().any(|c| c.provider() == provider)
+            || matches!(
+                provider,
+                "local" | "ollama" | "glm" | "openrouter" | "copilot" | "azure-openai"
+            )
+        {
+            continue;
+        }
+        let Some(url) = definition.default_base_url else {
+            continue;
+        };
+        for (id, model) in entries(data, provider) {
+            if model["tool_call"] != true || model["status"] == "deprecated" {
+                continue;
+            }
+            let url = data[provider]["api"].as_str().unwrap_or(url);
+            let mut candidate = base(provider, id, "openai-completions", url, model, (4096, 4096));
+            // A list of effort names alone does not establish a wire format.
+            // These profiles document the standard Chat effort field.
+            // Sources: each vendor's Chat schema, recorded in G04 coverage.
+            if !matches!(
+                provider,
+                "deepinfra" | "friendli" | "venice" | "synthetic" | "nebius" | "cohere"
+            ) {
+                candidate.compat(json!({"supportsReasoningEffort":false}));
+            }
+            candidate.compat(json!({"maxTokensField":"max_tokens"}));
+            if provider == "cohere" && model["reasoning"] == true {
+                // Compatibility API documents only none/high, corresponding
+                // to off/on, including toggle-only source entries.
+                candidate.thinking(json!({"off":"none","minimal":null,"low":null,
+                    "medium":null,"high":"high","xhigh":null,"max":null}));
+                candidate.compat(
+                    json!({"generationSource":"https://docs.cohere.com/docs/compatibility-api"}),
+                );
+            }
+            if provider == "novita" {
+                // Official Chat schema documents the switch for these families;
+                // a generic toggle in source metadata does not prove this field.
+                let supports_off = matches!(
+                    id.as_str(),
+                    "zai-org/glm-4.5"
+                        | "deepseek/deepseek-v3.1"
+                        | "deepseek/deepseek-v3.1-terminus"
+                        | "deepseek/deepseek-v3.2-exp"
+                );
+                candidate.compat(json!({"thinkingFormat":"novita","supportsThinkingToggle":supports_off,
+                    "generationSource":"https://docs.novita.ai/api-reference/model-apis-llm-create-chat-completion"}));
+            }
+            if provider == "siliconflow" {
+                candidate.compat(json!({"thinkingFormat":"siliconflow",
+                    "supportsThinkingToggle":model["reasoning_options"].as_array().is_some_and(|o| o.iter().any(|o| o["type"] == "toggle")),
+                    "generationCapIncludesThinking":false,
+                    "generationSource":"https://docs.siliconflow.cn/docs/api/chat-completions-post"}));
+            }
+            result.push(candidate);
         }
     }
     Ok(result)

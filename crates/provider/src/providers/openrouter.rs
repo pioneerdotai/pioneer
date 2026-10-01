@@ -10,8 +10,8 @@ use crate::{
     types::{
         ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, InputContentType,
         InputTypeSupport, ProviderCapabilities, ProviderInputCapabilities, ProviderReplayState,
-        ProviderTermination, ProviderTimeoutPolicy, ReasoningConfig, ReasoningEffort, Role,
-        StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+        ProviderTermination, ProviderTimeoutPolicy, ReasoningEffort, Role, StreamChunk, TokenUsage,
+        ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -59,6 +59,8 @@ struct ApiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ApiReasoningOptions>,
     stream: bool,
+    #[serde(flatten)]
+    generation: crate::generation::Fields,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -390,6 +392,40 @@ struct OpenRouterPricing {
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl OpenRouterProvider {
+    fn build_chat_request(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        let catalog = crate::catalog::model_catalog().ok();
+        Self::build_chat_request_with_catalog(request, messages, stream, catalog.as_deref())
+    }
+
+    fn build_chat_request_with_catalog(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> Result<ApiChatRequest> {
+        let generation =
+            crate::generation::chat_fields_from_catalog(catalog, "openrouter", request)?;
+        Ok(ApiChatRequest {
+            generation,
+            model: request.model.clone(),
+            messages,
+            temperature: None,
+            max_tokens: None,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: request.tool_choice.clone().map(Self::convert_tool_choice),
+            parallel_tool_calls: request.parallel_tool_calls,
+            reasoning: None,
+            stream,
+        })
+    }
+
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_timeout_policy(api_key, ProviderTimeoutPolicy::default())
     }
@@ -442,19 +478,6 @@ impl OpenRouterProvider {
     fn looks_like_url(value: &str) -> bool {
         let value = value.trim().to_ascii_lowercase();
         value.starts_with("http://") || value.starts_with("https://") || value.starts_with("data:")
-    }
-
-    fn reasoning_options(
-        request_reasoning: Option<ReasoningConfig>,
-    ) -> Option<ApiReasoningOptions> {
-        let effort = match request_reasoning {
-            Some(ReasoningConfig::Effort(effort)) => effort,
-            Some(ReasoningConfig::Disabled) | None => return None,
-        };
-
-        Some(ApiReasoningOptions {
-            effort: effort.as_str().to_owned(),
-        })
     }
 
     fn media_url_or_data_url(
@@ -840,22 +863,8 @@ impl crate::traits::Provider for OpenRouterProvider {
         .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let rendered_messages = Self::convert_messages(&prepared)?;
-        let reasoning = Self::reasoning_options(request.reasoning);
 
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages: rendered_messages,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            reasoning,
-            stream: false,
-        };
+        let api_request = Self::build_chat_request(&request, rendered_messages, false)?;
 
         let request_builder = Self::with_app_attribution(
             self.client
@@ -931,22 +940,8 @@ impl crate::traits::Provider for OpenRouterProvider {
         .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let rendered_messages = Self::convert_messages(&prepared)?;
-        let reasoning = Self::reasoning_options(request.reasoning);
 
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages: rendered_messages,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            reasoning,
-            stream: true,
-        };
+        let api_request = Self::build_chat_request(&request, rendered_messages, true)?;
 
         let request_builder = Self::with_app_attribution(
             self.client
@@ -1327,6 +1322,60 @@ fn openrouter_reasoning_capabilities(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn router_default_off_effort_and_mandatory_models_reach_both_bodies() {
+        let catalog = crate::catalog::ModelCatalog::parse(
+            include_str!("../../tests/fixtures/catalog/models.json"),
+            include_str!("../../tests/fixtures/catalog/provenance.json"),
+        )
+        .unwrap();
+        let mut request = crate::generation::test_request("openai/gpt-5.4");
+        for stream in [false, true] {
+            for reasoning in [
+                None,
+                Some(ReasoningConfig::Disabled),
+                Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+            ] {
+                request.reasoning = reasoning;
+                let body = serde_json::to_value(
+                    OpenRouterProvider::build_chat_request_with_catalog(
+                        &request,
+                        vec![],
+                        stream,
+                        Some(&catalog),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(body["max_tokens"], 1024);
+                if reasoning.is_none() {
+                    assert!(body.get("reasoning").is_none());
+                } else {
+                    assert_eq!(
+                        body["reasoning"]["effort"],
+                        if crate::generation::selected_off(reasoning) {
+                            "none"
+                        } else {
+                            "high"
+                        }
+                    );
+                }
+                assert!(body.get("reasoning_effort").is_none());
+            }
+        }
+        request.model = "openai/gpt-oss-120b".into();
+        request.reasoning = Some(ReasoningConfig::Disabled);
+        assert!(
+            OpenRouterProvider::build_chat_request_with_catalog(
+                &request,
+                vec![],
+                false,
+                Some(&catalog)
+            )
+            .is_err()
+        );
+    }
     use super::*;
     use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
     use crate::providers::OpenAiCompatibleProvider;
@@ -1819,6 +1868,7 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "anthropic/claude-sonnet-4".into(),
             messages: vec![
                 ApiMessage {
@@ -1862,6 +1912,7 @@ mod tests {
     #[test]
     fn api_request_serializes_reasoning_options() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "openai/gpt-5".into(),
             messages: vec![ApiMessage {
                 role: "user".into(),
@@ -1888,21 +1939,9 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_options_omit_absent_or_disabled_effort_and_serialize_explicit_none() {
-        assert!(OpenRouterProvider::reasoning_options(None).is_none());
-        assert!(OpenRouterProvider::reasoning_options(Some(ReasoningConfig::disabled())).is_none());
-
-        let reasoning = OpenRouterProvider::reasoning_options(Some(ReasoningConfig::effort(
-            ReasoningEffort::None,
-        )))
-        .expect("explicit none reasoning effort should serialize");
-
-        assert_eq!(reasoning.effort, "none");
-    }
-
-    #[test]
     fn api_request_serializes_reasoning_options_for_any_model() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "anthropic/claude-sonnet-4".into(),
             messages: vec![ApiMessage {
                 role: "user".into(),

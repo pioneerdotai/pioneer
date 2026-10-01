@@ -87,6 +87,8 @@ struct ApiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
     stream: bool,
+    #[serde(flatten)]
+    generation: crate::generation::Fields,
 }
 
 #[derive(Debug, Serialize)]
@@ -1027,12 +1029,26 @@ impl OpenAiCompatibleProvider {
         stream: bool,
         prepared: PreparedProviderMessages,
     ) -> Result<ApiChatRequest> {
+        let catalog = crate::catalog::model_catalog().ok();
+        self.build_chat_request_with_catalog(request, stream, prepared, catalog.as_deref())
+    }
+
+    fn build_chat_request_with_catalog(
+        &self,
+        request: ChatRequest,
+        stream: bool,
+        prepared: PreparedProviderMessages,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> Result<ApiChatRequest> {
         ensure_no_unrendered_attachments(self.name.as_str(), &prepared)?;
+        let generation =
+            crate::generation::chat_fields_from_catalog(catalog, &self.name, &request)?;
         Ok(ApiChatRequest {
+            generation,
             model: request.model,
             messages: self.convert_messages(&prepared)?,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
+            temperature: None,
+            max_tokens: None,
             tools: request
                 .tools
                 .as_ref()
@@ -1438,6 +1454,396 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_compatible_profile_preserves_prepared_cap_and_default_in_both_bodies() {
+        let profiles: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/generation-profiles.json"
+        ))
+        .unwrap();
+        for profile in profiles.as_array().unwrap() {
+            let provider = OpenAiCompatibleProvider::new(
+                profile["provider"].as_str().unwrap(),
+                "https://example.test/v1",
+                "",
+                AuthStyle::Bearer,
+            );
+            for stream in [false, true] {
+                let request = crate::generation::test_request(profile["model"].as_str().unwrap());
+                let prepared = prepared_for(&provider, &request.messages);
+                let result =
+                    provider.build_chat_request_with_catalog(request, stream, prepared, None);
+                if profile["default_supported"] == false {
+                    assert!(result.is_err());
+                    continue;
+                }
+                let body = serde_json::to_value(result.unwrap()).unwrap();
+                assert_eq!(body[profile["cap_field"].as_str().unwrap()], profile["cap"]);
+                assert_eq!(body["stream"], stream);
+                assert_eq!(body["messages"][0]["content"], "Hello");
+                assert!(body.get("reasoning_effort").is_none());
+                assert!(body.get("thinking").is_none());
+            }
+            for reasoning in [
+                ReasoningConfig::Disabled,
+                ReasoningConfig::Effort(ReasoningEffort::None),
+                ReasoningConfig::Effort(ReasoningEffort::High),
+            ] {
+                let mut request =
+                    crate::generation::test_request(profile["model"].as_str().unwrap());
+                request.reasoning = Some(reasoning);
+                let prepared = prepared_for(&provider, &request.messages);
+                assert!(
+                    provider
+                        .build_chat_request_with_catalog(request, false, prepared, None)
+                        .is_err(),
+                    "unknown explicit control must not disappear: {}",
+                    profile["provider"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn siliconflow_visible_cap_requires_verified_off_or_a_nonreasoning_model() {
+        use crate::catalog::{
+            ModelCatalog,
+            generator::{SOURCE_URLS, SourceSnapshot, generate},
+        };
+        let mut source: SourceSnapshot =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                .unwrap();
+        let data = &mut source.sources.get_mut(SOURCE_URLS[0]).unwrap().body;
+        data["siliconflow"]["models"] = serde_json::json!({
+            "toggle": {"tool_call":true,"reasoning":true,
+                "reasoning_options":[{"type":"toggle","values":[true,false]}],
+                "limit":{"context":24000,"output":2048}},
+            "mandatory": {"tool_call":true,"reasoning":true,
+                "limit":{"context":24000,"output":2048}},
+            "instruct": {"tool_call":true,"reasoning":false,
+                "limit":{"context":24000,"output":2048}}
+        });
+        let generated = generate(&source, true).unwrap();
+        let catalog = ModelCatalog::parse(
+            &serde_json::to_string(&generated.models).unwrap(),
+            &serde_json::to_string(&generated.provenance).unwrap(),
+        )
+        .unwrap();
+        let provider = OpenAiCompatibleProvider::new(
+            "siliconflow",
+            "https://example.test/v1",
+            "",
+            AuthStyle::Bearer,
+        );
+        for stream in [false, true] {
+            for reasoning in [
+                None,
+                Some(ReasoningConfig::Disabled),
+                Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+            ] {
+                for id in ["toggle", "mandatory", "instruct"] {
+                    let mut request = crate::generation::test_request(id);
+                    request.reasoning = reasoning;
+                    let prepared = prepared_for(&provider, &request.messages);
+                    let result = provider.build_chat_request_with_catalog(
+                        request,
+                        stream,
+                        prepared,
+                        Some(&catalog),
+                    );
+                    let off = crate::generation::selected_off(reasoning);
+                    let supported = (id == "toggle" && off)
+                        || (id == "instruct" && (off || reasoning.is_none()));
+                    if supported {
+                        let body = serde_json::to_value(result.unwrap()).unwrap();
+                        assert_eq!(body["max_tokens"], 1024);
+                        if id == "toggle" {
+                            assert_eq!(body["enable_thinking"], false);
+                        } else {
+                            assert!(body.get("enable_thinking").is_none());
+                        }
+                    } else {
+                        assert!(result.is_err(), "{id}: {reasoning:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn updated_source_limits_maps_and_compat_reach_discovery_and_outgoing_json() {
+        use crate::catalog::{
+            ModelCatalog,
+            generator::{SOURCE_URLS, SourceSnapshot, generate},
+        };
+        let mut source: SourceSnapshot =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                .unwrap();
+        let data = &mut source.sources.get_mut(SOURCE_URLS[0]).unwrap().body;
+        data["deepinfra"]["models"]["fixture-generation-update"] = serde_json::json!({
+            "tool_call":true,"reasoning":true,"temperature":false,
+            "reasoning_options":[{"type":"effort","values":["none","high"]}],
+            "limit":{"context":24000,"output":2048}});
+        let generated = generate(&source, true).unwrap();
+        let mut models = serde_json::to_value(&generated.models).unwrap();
+        // Simulate a validated published metadata update without mutating the
+        // process-global store shared with other tests.
+        models["deepinfra"]["fixture-generation-update"]["compat"]["maxTokensField"] =
+            serde_json::json!("max_completion_tokens");
+        models["deepinfra"]["fixture-generation-update"]["thinkingLevelMap"]["high"] =
+            serde_json::json!("medium");
+        let catalog = ModelCatalog::parse(
+            &models.to_string(),
+            &serde_json::to_string(&generated.provenance).unwrap(),
+        )
+        .unwrap();
+        let provider = OpenAiCompatibleProvider::new(
+            "deepinfra",
+            "https://example.test/v1",
+            "",
+            AuthStyle::Bearer,
+        );
+        let mut request = crate::generation::test_request("fixture-generation-update");
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+        for stream in [false, true] {
+            let prepared = prepared_for(&provider, &request.messages);
+            let body = serde_json::to_value(
+                provider
+                    .build_chat_request_with_catalog(
+                        request.clone(),
+                        stream,
+                        prepared,
+                        Some(&catalog),
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["max_completion_tokens"], 1024);
+            assert!(body.get("max_tokens").is_none());
+            assert_eq!(body["reasoning_effort"], "medium");
+        }
+        let mut discovered = vec![ProviderModelInfo {
+            id: request.model.clone(),
+            name: None,
+            description: None,
+            created: None,
+            provider: "deepinfra".into(),
+            owned_by: None,
+            limits: Default::default(),
+            capabilities: Default::default(),
+            transcription: None,
+            pricing: None,
+            active: None,
+            family: None,
+            lifecycle_status: None,
+        }];
+        catalog.enrich("deepinfra", &mut discovered);
+        assert_eq!(discovered[0].limits.max_output_tokens, Some(2048));
+        assert!(
+            discovered[0]
+                .capabilities
+                .reasoning
+                .as_ref()
+                .unwrap()
+                .effort_options
+                .contains(&"high".into())
+        );
+        request.max_tokens = Some(2049);
+        let prepared = prepared_for(&provider, &request.messages);
+        assert!(
+            provider
+                .build_chat_request_with_catalog(request.clone(), false, prepared, Some(&catalog))
+                .is_err()
+        );
+        request.max_tokens = Some(1024);
+        request.temperature = Some(0.3);
+        let prepared = prepared_for(&provider, &request.messages);
+        assert!(
+            provider
+                .build_chat_request_with_catalog(request.clone(), false, prepared, Some(&catalog))
+                .is_err()
+        );
+        request.temperature = None;
+        request.reasoning = Some(ReasoningConfig::Disabled);
+        let prepared = prepared_for(&provider, &request.messages);
+        let body = serde_json::to_value(
+            provider
+                .build_chat_request_with_catalog(request, true, prepared, Some(&catalog))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["reasoning_effort"], "none");
+    }
+
+    #[test]
+    fn documented_toggle_and_effort_profiles_render_their_actual_chat_controls() {
+        use crate::catalog::{
+            ModelCatalog,
+            generator::{SOURCE_URLS, SourceSnapshot, generate},
+        };
+        let mut source: SourceSnapshot =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                .unwrap();
+        source.sources.get_mut(SOURCE_URLS[0]).unwrap().body["novita"]["models"]["zai-org/glm-4.5"] = serde_json::json!({"tool_call":true,"reasoning":true,
+                "reasoning_options":[{"type":"toggle"}],
+                "limit":{"context":24000,"output":2048}});
+        let generated = generate(&source, true).unwrap();
+        let catalog = ModelCatalog::parse(
+            &serde_json::to_string(&generated.models).unwrap(),
+            &serde_json::to_string(&generated.provenance).unwrap(),
+        )
+        .unwrap();
+        for (name, id, mode, expected) in [
+            (
+                "novita",
+                "zai-org/glm-4.5",
+                ReasoningConfig::Disabled,
+                serde_json::json!({"enable_thinking":false}),
+            ),
+            (
+                "cohere",
+                "command-a-reasoning-08-2025",
+                ReasoningConfig::Disabled,
+                serde_json::json!({"reasoning_effort":"none"}),
+            ),
+            (
+                "cohere",
+                "command-a-reasoning-08-2025",
+                ReasoningConfig::Effort(ReasoningEffort::High),
+                serde_json::json!({"reasoning_effort":"high"}),
+            ),
+            (
+                "mistral",
+                "mistral-medium-latest",
+                ReasoningConfig::Effort(ReasoningEffort::High),
+                serde_json::json!({"reasoning_effort":"high"}),
+            ),
+            (
+                "together",
+                "Qwen/Qwen3.5-9B",
+                ReasoningConfig::Disabled,
+                serde_json::json!({"reasoning":{"enabled":false}}),
+            ),
+            (
+                "together",
+                "deepseek-ai/DeepSeek-V4-Pro",
+                ReasoningConfig::Effort(ReasoningEffort::High),
+                serde_json::json!({"reasoning":{"enabled":true},"reasoning_effort":"high"}),
+            ),
+        ] {
+            let provider = OpenAiCompatibleProvider::new(
+                name,
+                "https://example.test/v1",
+                "",
+                AuthStyle::Bearer,
+            );
+            let mut request = crate::generation::test_request(id);
+            request.reasoning = Some(mode);
+            for stream in [false, true] {
+                let prepared = prepared_for(&provider, &request.messages);
+                let body = serde_json::to_value(
+                    provider
+                        .build_chat_request_with_catalog(
+                            request.clone(),
+                            stream,
+                            prepared,
+                            Some(&catalog),
+                        )
+                        .unwrap(),
+                )
+                .unwrap();
+                for (key, value) in expected.as_object().unwrap() {
+                    assert_eq!(&body[key], value, "{name}/{id}");
+                }
+                assert_eq!(body["max_tokens"], 1024);
+                assert!(body.get("chat_template_kwargs").is_none());
+            }
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::Medium));
+            let prepared = prepared_for(&provider, &request.messages);
+            assert!(
+                provider
+                    .build_chat_request_with_catalog(request, false, prepared, Some(&catalog))
+                    .is_err()
+            );
+        }
+        let provider = OpenAiCompatibleProvider::new(
+            "together",
+            "https://example.test/v1",
+            "",
+            AuthStyle::Bearer,
+        );
+        let mut request = crate::generation::test_request("zai-org/GLM-5.3");
+        request.reasoning = Some(ReasoningConfig::Disabled);
+        let prepared = prepared_for(&provider, &request.messages);
+        assert!(
+            provider
+                .build_chat_request_with_catalog(request, false, prepared, Some(&catalog))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn documented_profile_formats_use_vendor_controls_not_a_universal_effort_field() {
+        let catalog = crate::catalog::ModelCatalog::parse(
+            include_str!("../../tests/fixtures/catalog/models.json"),
+            include_str!("../../tests/fixtures/catalog/provenance.json"),
+        )
+        .unwrap();
+        for (name, model, expected) in [
+            (
+                "groq",
+                "openai/gpt-oss-120b",
+                serde_json::json!({"reasoning_effort":"high"}),
+            ),
+            (
+                "cerebras",
+                "gpt-oss-120b",
+                serde_json::json!({"reasoning_effort":"high"}),
+            ),
+            (
+                "deepseek",
+                "deepseek-v4-flash",
+                serde_json::json!({"thinking":{"type":"enabled"},"reasoning_effort":"high"}),
+            ),
+            (
+                "glm",
+                "glm-5.2",
+                serde_json::json!({"thinking":{"type":"enabled"},"reasoning_effort":"high"}),
+            ),
+            (
+                "fireworks",
+                "accounts/fireworks/models/glm-5p2",
+                serde_json::json!({"reasoning_effort":"high"}),
+            ),
+        ] {
+            let provider = OpenAiCompatibleProvider::new(
+                name,
+                "https://example.test/v1",
+                "",
+                AuthStyle::Bearer,
+            );
+            let mut request = crate::generation::test_request(model);
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+            for stream in [false, true] {
+                let prepared = prepared_for(&provider, &request.messages);
+                let body = serde_json::to_value(
+                    provider
+                        .build_chat_request_with_catalog(
+                            request.clone(),
+                            stream,
+                            prepared,
+                            Some(&catalog),
+                        )
+                        .unwrap(),
+                )
+                .unwrap();
+                for (key, value) in expected.as_object().unwrap() {
+                    assert_eq!(&body[key], value, "{name}/{model}");
+                }
+                assert_eq!(body["max_tokens"], 1024);
+            }
+        }
+    }
     use super::*;
     use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
     use crate::traits::Provider;
@@ -2110,6 +2516,7 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "gpt-4".into(),
             messages: vec![
                 ApiMessage {
@@ -2147,7 +2554,7 @@ mod tests {
     }
 
     #[test]
-    fn compatible_request_omits_reasoning_fields_even_when_selected() {
+    fn unknown_compatible_model_rejects_explicit_unverified_reasoning() {
         let provider = test_provider();
         let request = ChatRequest {
             model: "custom-compatible-model".to_owned(),
@@ -2161,15 +2568,8 @@ mod tests {
             compiled_prompt: None,
         };
 
-        let api_request = provider
-            .build_chat_request(request, false)
-            .expect("compatible request should render");
-        let json = serde_json::to_value(&api_request).unwrap();
-
-        assert!(json.get("reasoning_effort").is_none());
-        assert!(json.get("reasoning").is_none());
-        assert!(json.get("output_config").is_none());
-        assert!(json.get("thinkingConfig").is_none());
+        let error = provider.build_chat_request(request, false).unwrap_err();
+        assert!(error.to_string().contains("no documented mapping"));
     }
 
     #[test]

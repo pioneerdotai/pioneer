@@ -6,7 +6,7 @@ use crate::reasoning_registry;
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
     ProviderInputCapabilities, ProviderReplayState, ProviderTermination, ProviderTimeoutPolicy,
-    ProviderToolCall, ReasoningConfig, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+    ProviderToolCall, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -723,6 +723,7 @@ impl BedrockProvider {
         prepared: &PreparedProviderMessages,
     ) -> Result<BedrockRequest> {
         let (messages, system) = Self::convert_messages(prepared)?;
+        let generation = crate::generation::anthropic_fields("bedrock", request)?;
 
         let inference_config = if request.temperature.is_some() || request.max_tokens.is_some() {
             Some(BedrockInferenceConfig {
@@ -741,33 +742,9 @@ impl BedrockProvider {
                 .tools
                 .as_ref()
                 .map(|tools| Self::convert_tool_config(tools, request.tool_choice.clone())),
-            additional_model_request_fields: Self::additional_model_request_fields(
-                request.model.as_str(),
-                request.reasoning,
-            ),
+            additional_model_request_fields: (!generation.is_empty())
+                .then(|| serde_json::Value::Object(generation)),
         })
-    }
-
-    fn additional_model_request_fields(
-        model_id: &str,
-        reasoning: Option<ReasoningConfig>,
-    ) -> Option<serde_json::Value> {
-        if !Self::is_anthropic_claude_model(model_id) {
-            return None;
-        }
-
-        match reasoning {
-            Some(ReasoningConfig::Effort(effort)) => Some(serde_json::json!({
-                "output_config": {
-                    "effort": effort.as_str(),
-                },
-            })),
-            Some(ReasoningConfig::Disabled) | None => None,
-        }
-    }
-
-    fn is_anthropic_claude_model(model_id: &str) -> bool {
-        model_id.contains("anthropic.claude")
     }
 
     /// Get the current UTC datetime in the format required by SigV4.
@@ -1657,7 +1634,7 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_claude_request_omits_reasoning_extension_for_disabled_reasoning() {
+    fn bedrock_claude_request_sends_explicit_disabled_thinking() {
         let request = ChatRequest {
             model: "anthropic.claude-opus-4-5".to_owned(),
             messages: vec![ChatMessage::user("Hello")],
@@ -1675,11 +1652,14 @@ mod tests {
         let bedrock_request = BedrockProvider::build_request(&request, &prepared).unwrap();
         let json = serde_json::to_value(&bedrock_request).unwrap();
 
-        assert!(json.get("additionalModelRequestFields").is_none());
+        assert_eq!(
+            json["additionalModelRequestFields"]["thinking"]["type"],
+            "disabled"
+        );
     }
 
     #[test]
-    fn bedrock_non_claude_request_omits_reasoning_extension() {
+    fn bedrock_non_claude_rejects_unimplemented_reasoning_setting() {
         let request = ChatRequest {
             model: "amazon.nova-pro-v1:0".to_owned(),
             messages: vec![ChatMessage::user("Hello")],
@@ -1694,10 +1674,7 @@ mod tests {
         let rendered = request.rendered_messages_with_compiled_sections();
         let prepared = prepared_for(rendered.as_slice());
 
-        let bedrock_request = BedrockProvider::build_request(&request, &prepared).unwrap();
-        let json = serde_json::to_value(&bedrock_request).unwrap();
-
-        assert!(json.get("additionalModelRequestFields").is_none());
+        assert!(BedrockProvider::build_request(&request, &prepared).is_err());
     }
 
     #[test]

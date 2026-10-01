@@ -119,6 +119,7 @@ impl ModelCatalog {
             "gemini" => "google",
             "bedrock" => "amazon-bedrock",
             "copilot" => "github-copilot",
+            "glm" => "zai",
             "azure_openai" | "azure-openai" => "azure-openai-responses",
             other => other,
         };
@@ -174,6 +175,84 @@ impl ModelCatalog {
                 model.name = Some(entry.name.clone());
             }
             model.capabilities.thinking.get_or_insert(entry.reasoning);
+            // The same updateable map drives discovery and outgoing bodies.
+            // Requested keys are UI efforts; map values are vendor wire values.
+            let source_efforts = entry
+                .metadata
+                .get("sourceGeneration")
+                .and_then(|s| s["reasoningOptions"].as_array())
+                .map(|options| {
+                    options
+                        .iter()
+                        .filter(|o| o["type"] == "effort")
+                        .flat_map(|o| o["values"].as_array().into_iter().flatten())
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if entry.metadata.get("thinkingLevelMap").is_some() || !source_efforts.is_empty() {
+                let mut reasoning = model.capabilities.reasoning.clone().unwrap_or_default();
+                reasoning.supported = Some(entry.reasoning);
+                if !source_efforts.is_empty() {
+                    reasoning.effort_options = source_efforts;
+                }
+                if let Some(map) = entry
+                    .metadata
+                    .get("thinkingLevelMap")
+                    .and_then(Value::as_object)
+                {
+                    for (key, value) in map {
+                        let effort = if key == "off" { "none" } else { key };
+                        reasoning.effort_options.retain(|e| e != effort);
+                        if value.is_string() {
+                            reasoning.effort_options.push(effort.into());
+                        }
+                    }
+                    reasoning.mandatory = map.get("off").map(|value| value.is_null());
+                }
+                if entry
+                    .metadata
+                    .get("compat")
+                    .is_some_and(|c| c["supportsReasoningEffort"] == false)
+                {
+                    reasoning.effort_options.retain(|e| e == "none");
+                }
+                reasoning.source =
+                    Some(pioneer_protocol::ReasoningCapabilitySource::StaticRegistry);
+                if reasoning
+                    .default_effort
+                    .as_ref()
+                    .is_some_and(|default| !reasoning.effort_options.contains(default))
+                {
+                    reasoning.default_effort = None;
+                }
+                model.capabilities.reasoning = Some(reasoning);
+            }
+            if provider == "gemini" && model.id.starts_with("gemini-2.5-") {
+                // generateContent has budgets, not qualitative levels. There is
+                // no product effort-to-budget policy; do not advertise one.
+                let mut reasoning = model.capabilities.reasoning.clone().unwrap_or_default();
+                reasoning.supported = Some(entry.reasoning);
+                reasoning.effort_options.clear();
+                let supports_off = matches!(
+                    model.id.as_str(),
+                    "gemini-2.5-flash" | "gemini-2.5-flash-lite"
+                );
+                if supports_off {
+                    reasoning.effort_options.push("none".into());
+                }
+                reasoning.default_effort = None;
+                reasoning.mandatory = if supports_off {
+                    Some(false)
+                } else if model.id == "gemini-2.5-pro" {
+                    Some(true)
+                } else {
+                    None // an unknown variant needs its own documented off contract
+                };
+                reasoning.supports_token_budget = Some(false); // no numeric product control yet
+                model.capabilities.reasoning = Some(reasoning);
+            }
             model.capabilities.tool_calling.get_or_insert(true);
             model
                 .capabilities
