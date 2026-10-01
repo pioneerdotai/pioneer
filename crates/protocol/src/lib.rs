@@ -66,13 +66,13 @@ pub use agent_authorship::{
 };
 pub use agent_event::{
     AgentDurableEvent, AgentProgressEvent, DurableEventCausalityKey, ItemHeartbeatSource,
-    NativeTerminalEffectGate, NativeTerminalEffectKind, NativeTerminalEffectPayload,
-    NativeTerminalEffectPreparation, NativeTerminalEffectPreparationFailure,
-    NativeTerminalEffectSpec, ProgressCoalescingKey, ProtocolEventClass, RecoveryAttemptContext,
-    SkillAuditEvent, ToolResultView, TurnAcceptedCapability, TurnCapabilityAcceptedReason,
-    TurnCapabilityRejectedReason, TurnPermissionAuditDecision, TurnPermissionAuditEvent,
-    TurnPermissionAuditEventKind, TurnPermissionAuditRequestKey, TurnRejectedCapability,
-    TurnSkillBinding,
+    NativeDurableCancellationReceipt, NativeTerminalEffectGate, NativeTerminalEffectKind,
+    NativeTerminalEffectPayload, NativeTerminalEffectPreparation,
+    NativeTerminalEffectPreparationFailure, NativeTerminalEffectSpec, ProgressCoalescingKey,
+    ProtocolEventClass, RecoveryAttemptContext, SkillAuditEvent, ToolResultView,
+    TurnAcceptedCapability, TurnCapabilityAcceptedReason, TurnCapabilityRejectedReason,
+    TurnPermissionAuditDecision, TurnPermissionAuditEvent, TurnPermissionAuditEventKind,
+    TurnPermissionAuditRequestKey, TurnRejectedCapability, TurnSkillBinding,
 };
 pub use agent_launch::{
     AgentAuthoredInput, AgentAuthoredInputError, AgentExecutionProfileBackend,
