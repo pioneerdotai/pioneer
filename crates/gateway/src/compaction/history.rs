@@ -663,6 +663,33 @@ fn finish_round(
     active: bool,
     output: &mut Vec<(i64, Vec<ChatMessage>)>,
 ) -> Result<()> {
+    if round
+        .envelope
+        .message
+        .tool_calls
+        .as_ref()
+        .is_none_or(|calls| calls.is_empty())
+    {
+        ensure!(
+            round.envelope.version == 1
+                && !round.envelope.round_id.trim().is_empty()
+                && round.envelope.message.role == Role::Assistant
+                && round.envelope.termination == pioneer_provider::ProviderTermination::Complete
+                && round.envelope.calls.is_empty()
+                && round.results.is_empty(),
+            "invalid canonical assistant response"
+        );
+        let mut message = round.envelope.message;
+        message.provenance = Some(origin(
+            workspace,
+            thread,
+            turn,
+            &round.envelope.round_id,
+            vec![round.assistant_source],
+        ));
+        output.push((round.sequence, vec![message]));
+        return Ok(());
+    }
     let calls = round
         .envelope
         .message
@@ -1930,6 +1957,12 @@ async fn load_line_history_inner(
                             aliases.extend(
                                 envelope.calls.iter().map(|call| call.turn_item_id.clone()),
                             );
+                            // Native content owns the model history. Suppress its
+                            // exact reasoning/final UI copies, keeping stored events.
+                            aliases.insert(envelope.round_id.clone());
+                            if let Some(item) = row.item_id.as_ref() {
+                                aliases.insert(item.clone());
+                            }
                             pending = Some(Round {
                                 sequence: starts
                                     .get(&envelope.round_id)
@@ -2420,6 +2453,49 @@ fn event_message_with_input_copy_policy(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn canonical_no_tool_response_keeps_native_state_in_cold_history() {
+        let mut message = ChatMessage::assistant("answer");
+        let state = pioneer_provider::ProviderReplayState::for_model(
+            "gemini",
+            "fixture",
+            serde_json::json!({"schema_version":2,"parts":[{"text":"answer","thoughtSignature":"signed"}]}),
+        );
+        message.provider_replay_state = Some(state.clone());
+        let envelope = CanonicalProviderRoundEnvelope {
+            version: 1,
+            round_id: "final-item".into(),
+            termination: pioneer_provider::ProviderTermination::Complete,
+            message,
+            calls: vec![],
+        };
+        let mut output = Vec::new();
+        finish_round(
+            "ws",
+            "thread",
+            "turn",
+            Round {
+                sequence: 10,
+                envelope,
+                assistant_source: SourceRef {
+                    scope: "context:turn".into(),
+                    id: "source".into(),
+                    version: "revision:1".into(),
+                },
+                results: BTreeMap::new(),
+            },
+            false,
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].1[0].provider_replay_state.as_ref(), Some(&state));
+        assert_eq!(
+            output[0].1[0].provenance.as_ref().unwrap().unit_id,
+            "turn:final-item"
+        );
+    }
+
     use super::*;
 
     fn completed_command_event(output: &str) -> Event {

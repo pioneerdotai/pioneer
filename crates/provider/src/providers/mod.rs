@@ -34,3 +34,6 @@ pub use telnyx::TelnyxProvider;
 
 #[cfg(test)]
 mod usage_tests;
+
+#[cfg(test)]
+mod history_test_support;

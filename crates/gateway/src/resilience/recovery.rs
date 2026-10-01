@@ -4512,6 +4512,25 @@ fn assemble_canonical_provider_history(
                 pending.envelope.round_id
             );
         }
+        if pending
+            .envelope
+            .message
+            .tool_calls
+            .as_ref()
+            .is_none_or(|calls| calls.is_empty())
+        {
+            anyhow::ensure!(
+                pending.envelope.termination == ProviderTermination::Complete
+                    && pending.envelope.calls.is_empty()
+                    && pending.results.is_empty(),
+                "invalid retained canonical assistant response"
+            );
+            retained.push(RetainedProviderHistoryMessage {
+                sequence: pending.sequence,
+                message: pending.envelope.message,
+            });
+            return Ok(());
+        }
         if pending.envelope.termination != ProviderTermination::ToolCalls {
             bail!(
                 "retained provider round `{}` for turn `{turn_id}` has non-tool terminal semantics",
@@ -4996,6 +5015,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn resumed_no_tool_response_keeps_native_state() {
+        let mut message = ChatMessage::assistant("answer");
+        message.provider_replay_state = Some(ProviderReplayState::for_model(
+            "anthropic",
+            "fixture",
+            serde_json::json!({"schema_version":2,"blocks":[{"type":"text","text":"answer"}]}),
+        ));
+        let envelope = CanonicalProviderRoundEnvelope {
+            version: 1,
+            round_id: "final".into(),
+            termination: ProviderTermination::Complete,
+            message: message.clone(),
+            calls: vec![],
+        };
+        let rows = vec![retained_history_row(
+            10,
+            "assistant_round",
+            Some("final"),
+            None,
+            serde_json::to_string(&envelope).unwrap(),
+        )];
+        let restored = assemble_retained_provider_history("turn", rows).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].message, message);
+    }
     #[test]
     fn legacy_round_requires_durable_outcome_even_with_result_rows() {
         let assistant = ChatMessage::assistant_tool_calls_with_provider_state(

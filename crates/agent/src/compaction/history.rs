@@ -48,6 +48,35 @@ pub fn pending_origin(
     }
 }
 
+fn execution_turn_key(origin: &pioneer_provider::MessageProvenance) -> Option<(String, String)> {
+    // logical_turn_id identifies Task delivery ownership, not the physical
+    // provider turn. Use exact source scopes, including resolved item sources.
+    let turns = origin
+        .sources
+        .iter()
+        .filter_map(|source| {
+            let (kind, turn) = source.scope.split_once(':')?;
+            matches!(
+                kind,
+                "context"
+                    | "item"
+                    | "event"
+                    | "input"
+                    | "pending-assistant"
+                    | "pending-tool"
+                    | "pending-input"
+            )
+            .then_some(turn)
+        })
+        .collect::<BTreeSet<_>>();
+    (turns.len() == 1).then(|| {
+        (
+            origin.thread_id.clone(),
+            (*turns.first().expect("one turn")).to_owned(),
+        )
+    })
+}
+
 pub struct NativeHistoryLayout {
     pub units: Vec<HistoryUnit>,
     pub message_indexes: Vec<Vec<usize>>,
@@ -170,6 +199,57 @@ impl NativeHistoryLayout {
             }
             unit.complete &= calls == outcomes;
         }
+        // A completed call/result pair is not necessarily the end of the
+        // assistant turn. Anthropic/Gemini/DeepSeek continuation may still need
+        // state from earlier rounds of that same turn. Mark those units pending
+        // until a final assistant response is present; Emergency respects this
+        // correctness boundary as it already respects incomplete tool pairs.
+        let active_turns = messages
+            .iter()
+            .filter_map(|message| {
+                let origin = message.provenance.as_ref()?;
+                (message.role == Role::User && origin.protected_input)
+                    .then(|| execution_turn_key(origin))
+                    .flatten()
+            })
+            .collect::<BTreeSet<_>>();
+        let mut native_turns = BTreeSet::new();
+        let mut last_assistant = BTreeMap::new();
+        for message in messages {
+            let Some(origin) = message.provenance.as_ref() else {
+                continue;
+            };
+            let Some(key) = execution_turn_key(origin) else {
+                continue;
+            };
+            if message.role == Role::Assistant {
+                last_assistant.insert(
+                    key.clone(),
+                    message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| !calls.is_empty()),
+                );
+                if message.provider_replay_state.as_ref().is_some_and(|state| {
+                    matches!(state.provider.as_str(), "anthropic" | "gemini" | "deepseek")
+                }) {
+                    native_turns.insert(key);
+                }
+            }
+        }
+        for (unit, indexes) in result.units.iter_mut().zip(&result.message_indexes) {
+            if indexes.iter().any(|index| {
+                messages[*index].provenance.as_ref().is_some_and(|origin| {
+                    execution_turn_key(origin).is_some_and(|key| {
+                        active_turns.contains(&key)
+                            && native_turns.contains(&key)
+                            && last_assistant.get(&key) == Some(&true)
+                    })
+                })
+            }) {
+                unit.complete = false;
+            }
+        }
         let mut seen = BTreeSet::new();
         for unit in &result.units {
             for reference in &unit.sources {
@@ -205,6 +285,55 @@ mod tests {
             protected_input: protected,
             inherited: false,
         });
+    }
+
+    #[test]
+    fn native_multi_round_turn_stays_pending_until_final_assistant_response() {
+        let mut input = ChatMessage::user("current input");
+        origin(&mut input, "input", "input-source", true);
+        let mut messages = vec![input];
+        for index in 0..2 {
+            let id = format!("call-{index}");
+            let mut assistant = ChatMessage::assistant_tool_calls_with_provider_state(
+                None::<String>,
+                None::<String>,
+                vec![ProviderToolCall {
+                    id: id.clone(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                }],
+                Some(pioneer_provider::ProviderReplayState::for_model(
+                    "anthropic",
+                    "fixture",
+                    serde_json::json!({"schema_version":2,"blocks":[{"type":"thinking","thinking":"","signature":"signed"},{"type":"tool_use","id":id,"name":"read","input":{}}]}),
+                )),
+            );
+            origin(
+                &mut assistant,
+                &format!("round-{index}"),
+                &format!("a-{index}"),
+                false,
+            );
+            let mut result = ChatMessage::tool_result(id, "read", "output");
+            origin(
+                &mut result,
+                &format!("round-{index}"),
+                &format!("r-{index}"),
+                false,
+            );
+            messages.extend([assistant, result]);
+        }
+        let layout =
+            NativeHistoryLayout::from_messages("ws", "thread", &messages, &[1; 5]).unwrap();
+        assert!(layout.units[1..].iter().all(|unit| !unit.complete));
+        let mut final_message = ChatMessage::assistant("final");
+        origin(&mut final_message, "final", "final-source", false);
+        messages.push(final_message);
+        let closed =
+            NativeHistoryLayout::from_messages("ws", "thread", &messages, &[1; 6]).unwrap();
+        assert!(closed.units.iter().all(|unit| unit.complete));
+        assert_eq!(closed.message_indexes[1], [1, 2]);
+        assert_eq!(closed.message_indexes[2], [3, 4]);
     }
     #[test]
     fn whole_round_remains_pending_until_outcome_and_preserves_intervening_steering() {
