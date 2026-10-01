@@ -2569,8 +2569,9 @@ pub struct TurnMcpProjectionRecord {
 #[derive(Clone)]
 pub struct CrudStore {
     #[cfg(any(test, feature = "test-support"))]
-    delivery_commit_test_gate:
-        Arc<std::sync::Mutex<Option<task_delivery_lifecycle::TaskDeliveryCommitTestGate>>>,
+    delivery_commit_test_gate: std::sync::Arc<
+        std::sync::Mutex<Option<task_delivery_lifecycle::TaskDeliveryCommitTestGate>>,
+    >,
     connection: SqliteDatabase,
     projector: TurnProjector,
     task_projector: TaskProjector,
@@ -4152,7 +4153,7 @@ impl CrudStore {
         Self {
             connection: connection.into(),
             #[cfg(any(test, feature = "test-support"))]
-            delivery_commit_test_gate: Arc::new(std::sync::Mutex::new(None)),
+            delivery_commit_test_gate: std::sync::Arc::new(std::sync::Mutex::new(None)),
             projector: TurnProjector::new(),
             task_projector: TaskProjector::new(),
         }

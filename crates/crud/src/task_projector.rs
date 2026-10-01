@@ -19,7 +19,7 @@ use crate::repositories::{
     task_trigger, task_write_lock, thread_lineage,
 };
 use crate::task_events::{AppendedTaskEvent, TaskEventPayload};
-use crate::util::{optional_typed_json_from_db, unix_to_datetime};
+use crate::util::unix_to_datetime;
 
 type ProjectFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
