@@ -77117,3 +77117,6 @@ fn provider_replay_is_fenced_after_retryable_recovery_start_error() {
 
 #[path = "tests/memory_post_turn_recovery.rs"]
 mod memory_post_turn_recovery;
+
+#[path = "tests/task_start_failure.rs"]
+mod task_start_failure;

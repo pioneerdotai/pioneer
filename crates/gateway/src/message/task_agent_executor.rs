@@ -1863,7 +1863,8 @@ impl TaskAgentExecutor {
                         .model_provider
                         .as_str(),
                 )
-                .await?,
+                .await
+                .map_err(task_history_start_failure)?,
             )
         };
         let frozen_parent_history = frozen_conversation_scope
@@ -2234,6 +2235,7 @@ impl TaskAgentExecutor {
                             history_thread.model_provider.as_str(),
                         )
                         .await
+                        .map_err(task_history_start_failure)
                         .context("failed to accept Task conversation history")?;
                     }
                     let mut cli_params = TurnStartParams {
@@ -2284,20 +2286,31 @@ impl TaskAgentExecutor {
                             .await?
                             .is_some_and(|current| current.status.is_terminal())
                         {
+                            #[cfg(test)]
+                            processor.task_cli_terminal_preparation_finished.notify_one();
                             return Ok(TaskExecutorStartOutcome::Started);
                         }
+                        // Report before persistence: a new persistence failure must
+                        // retain its own diagnostic even if this cause was reported.
+                        let mut error = if error.downcast_ref::<pioneer_tasks::TaskStartFailure>().is_some() {
+                            error
+                        } else {
+                            pioneer_tasks::TaskStartFailure::from_error(
+                                pioneer_tasks::TaskStartStage::CliPreparation, error,
+                            ).into()
+                        };
+                        error.downcast_mut::<pioneer_tasks::TaskStartFailure>()
+                            .expect("Task preparation failure is typed")
+                            .report_in_place();
+                        let descriptor = error
+                            .downcast_ref::<pioneer_tasks::TaskStartFailure>()
+                            .expect("Task preparation failure is typed")
+                            .descriptor();
                         record_task_run_turn_failure(
                             &handle,
                             &child_runtime.task_run_turn,
                             TaskRunTurnStatus::Failed,
-                            Some(task_error(
-                                "task_cli_runtime_prepare_failed",
-                                format!(
-                                    "failed to prepare hidden task CLI runtime turn: {error:#}"
-                                ),
-                                TaskErrorClass::Internal,
-                                Some(run.id.clone()),
-                            )),
+                            Some(descriptor.task_error(Some(run.id.clone()))),
                             now_timestamp_secs(),
                         )
                         .await
@@ -4714,6 +4727,20 @@ impl TaskAgentExecutor {
         reason: &str,
         origin: TaskChildReconciliationOrigin,
     ) -> Result<bool> {
+        self.reconcile_child_turn_blocked_with_start_failure(
+            thread_id, turn_id, reason, origin, None,
+        )
+        .await
+    }
+
+    pub(super) async fn reconcile_child_turn_blocked_with_start_failure(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        reason: &str,
+        origin: TaskChildReconciliationOrigin,
+        start_failure: Option<&pioneer_tasks::TaskStartFailureDescriptor>,
+    ) -> Result<bool> {
         let Some(processor) = self.task_reconciliation_processor(origin)? else {
             return Ok(true);
         };
@@ -4750,7 +4777,8 @@ impl TaskAgentExecutor {
             child_runtime.task_run_turn.task_id.clone(),
             child_runtime.task_run_turn.run_id.clone(),
         );
-        self.block_child_turn(child_runtime, reason, handle).await?;
+        self.block_child_turn_with_start_failure(child_runtime, reason, handle, start_failure)
+            .await?;
         Ok(true)
     }
 
@@ -4778,6 +4806,15 @@ impl TaskAgentExecutor {
             &child_runtime.task_run_turn,
         )
         .await?;
+        #[cfg(test)]
+        if let Some(error) = processor
+            .task_output_capture_failures
+            .lock()
+            .unwrap()
+            .remove(child_runtime.task_run_turn.turn_id.as_str())
+        {
+            return Err(error);
+        }
         let agent_spec =
             select_agent_spec(&task_response, child_runtime.task_run_turn.run_id.as_str())
                 .ok_or_else(|| {
@@ -6097,17 +6134,33 @@ impl TaskAgentExecutor {
         reason: &str,
         handle: TaskExecutionHandle,
     ) -> Result<()> {
+        self.block_child_turn_with_start_failure(child_runtime, reason, handle, None)
+            .await
+    }
+
+    async fn block_child_turn_with_start_failure(
+        &self,
+        child_runtime: TaskRunChildRuntime,
+        reason: &str,
+        handle: TaskExecutionHandle,
+        start_failure: Option<&pioneer_tasks::TaskStartFailureDescriptor>,
+    ) -> Result<()> {
         let processor = self
             .processor()?
             .with_database_class(SqliteWriteClass::Critical);
         let handle = handle.with_critical_writes();
         let blocked_at = now_timestamp_secs();
-        let error = task_error(
-            "child_turn_blocked",
-            reason.to_owned(),
-            TaskErrorClass::Policy,
-            Some(child_runtime.task_run_turn.run_id.clone()),
-        );
+        let error = match start_failure {
+            Some(descriptor) => {
+                descriptor.task_error(Some(child_runtime.task_run_turn.run_id.clone()))
+            }
+            None => task_error(
+                "child_turn_blocked",
+                reason.to_owned(),
+                TaskErrorClass::Policy,
+                Some(child_runtime.task_run_turn.run_id.clone()),
+            ),
+        };
         handle
             .record_task_run_turn_blocked(
                 blocked_task_run_turn(&child_runtime.task_run_turn, blocked_at),
@@ -6620,6 +6673,14 @@ fn task_hook_runtime_context(
     )
 }
 
+fn task_history_start_failure(error: anyhow::Error) -> anyhow::Error {
+    pioneer_tasks::TaskStartFailure::from_error(
+        pioneer_tasks::TaskStartStage::HistoryPreparation,
+        error,
+    )
+    .into()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn load_task_execution_conversation_scope(
     processor: &Arc<MessageProcessor>,
@@ -6753,6 +6814,15 @@ async fn load_task_execution_conversation_scope(
             processor.current_authorization_revision().await?,
         )
         .await?;
+    #[cfg(test)]
+    if let Some(error) = processor
+        .task_history_preparation_failure
+        .lock()
+        .unwrap()
+        .take()
+    {
+        return Err(error).context("failed to freeze Task conversation sources");
+    }
     let prepared_history = processor
         .capture_authorized_task_basis_prepared(
             &history_store,

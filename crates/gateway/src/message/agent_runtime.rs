@@ -7188,13 +7188,21 @@ impl MessageProcessor {
         };
         let task_reconciliation_succeeded = match task_reconciliation {
             Ok(Ok(reconciled)) => reconciled,
-            Ok(Err(error)) => {
-                warn!(
-                    thread_id,
-                    turn_id,
-                    error = %format!("{error:#}"),
-                    "completed child task reconciliation is pending durable retry"
-                );
+            Ok(Err(mut error)) => {
+                if let Some(failure) = error.downcast_mut::<pioneer_tasks::TaskStartFailure>() {
+                    failure.report_in_place();
+                    warn!(
+                        descriptor = ?failure.descriptor(),
+                        "completed child task preparation is pending durable retry"
+                    );
+                } else {
+                    warn!(
+                        thread_id,
+                        turn_id,
+                        error = %format!("{error:#}"),
+                        "completed child task reconciliation is pending durable retry"
+                    );
+                }
                 false
             }
             Err(error) => {
@@ -7570,6 +7578,32 @@ impl MessageProcessor {
         turn_id: String,
         reason: String,
     ) -> bool {
+        self.mark_turn_blocked_with_task_start_failure(thread_id, turn_id, reason, None)
+            .await
+    }
+
+    pub(super) async fn mark_task_turn_blocked_on_start_failure(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        descriptor: &pioneer_tasks::TaskStartFailureDescriptor,
+    ) -> bool {
+        self.mark_turn_blocked_with_task_start_failure(
+            thread_id,
+            turn_id,
+            "task_cli_preparation_failed".to_owned(),
+            Some(descriptor),
+        )
+        .await
+    }
+
+    async fn mark_turn_blocked_with_task_start_failure(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        reason: String,
+        start_failure: Option<&pioneer_tasks::TaskStartFailureDescriptor>,
+    ) -> bool {
         if let Some(user_cancellation_reason) = self
             .user_turn_cancel_intents
             .lock()
@@ -7587,8 +7621,15 @@ impl MessageProcessor {
                 )
                 .await;
         }
-        self.mark_turn_blocked_with_resume_metadata(thread_id, turn_id, reason, None, None)
-            .await
+        self.mark_turn_blocked_with_resume_metadata_and_start_failure(
+            thread_id,
+            turn_id,
+            reason,
+            None,
+            None,
+            start_failure,
+        )
+        .await
     }
 
     async fn build_recovery_blocked_resume_metadata(
@@ -7701,6 +7742,21 @@ impl MessageProcessor {
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
         resume: Option<pioneer_protocol::TurnBlockedResumeMetadata>,
     ) -> bool {
+        self.mark_turn_blocked_with_resume_metadata_and_start_failure(
+            thread_id, turn_id, reason, recovery, resume, None,
+        )
+        .await
+    }
+
+    async fn mark_turn_blocked_with_resume_metadata_and_start_failure(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        reason: String,
+        recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
+        resume: Option<pioneer_protocol::TurnBlockedResumeMetadata>,
+        start_failure: Option<&pioneer_tasks::TaskStartFailureDescriptor>,
+    ) -> bool {
         let terminal_actor_generation = self
             .agent_manager
             .turn_owner_generation(thread_id.as_str(), turn_id.as_str())
@@ -7801,6 +7857,7 @@ impl MessageProcessor {
                     reason,
                     recovery.as_ref(),
                     resume,
+                    start_failure,
                 )
                 .await;
         }
@@ -7885,11 +7942,12 @@ impl MessageProcessor {
 
         let task_reconciliation_succeeded = match self
             .task_agent_executor
-            .reconcile_child_turn_blocked(
+            .reconcile_child_turn_blocked_with_start_failure(
                 thread_id.as_str(),
                 turn_id.as_str(),
                 turn_blocked.turn.error.as_deref().unwrap_or("turn blocked"),
                 TaskChildReconciliationOrigin::Live,
+                start_failure,
             )
             .await
         {
@@ -7950,6 +8008,7 @@ impl MessageProcessor {
         reason: String,
         recovery: Option<&pioneer_protocol::RecoveryAttemptContext>,
         resume: Option<pioneer_protocol::TurnBlockedResumeMetadata>,
+        start_failure: Option<&pioneer_tasks::TaskStartFailureDescriptor>,
     ) -> bool {
         let (workspace_id, current_turn) = match self
             .crud_store
@@ -8069,11 +8128,12 @@ impl MessageProcessor {
 
         let task_reconciliation_succeeded = match self
             .task_agent_executor
-            .reconcile_child_turn_blocked(
+            .reconcile_child_turn_blocked_with_start_failure(
                 thread_id.as_str(),
                 turn_id.as_str(),
                 turn_blocked.turn.error.as_deref().unwrap_or("turn blocked"),
                 TaskChildReconciliationOrigin::Live,
+                start_failure,
             )
             .await
         {
