@@ -5716,6 +5716,14 @@ impl MessageProcessor {
                                     root_error,
                                 )
                             }
+                            Err(_) if record.legacy_manifest_revalidation => (
+                                "memory.post_turn_extractor.legacy_manifest_revalidation_timeout"
+                                    .to_owned(),
+                                "legacy manifest revalidation exceeded its execution deadline"
+                                    .to_owned(),
+                                false,
+                                None,
+                            ),
                             Err(_) => (
                                 "effect_timeout".to_owned(),
                                 format!(
@@ -5740,6 +5748,12 @@ impl MessageProcessor {
                             let failure_stage = root_error.as_ref().and_then(|error| {
                                 hook_error_metadata_text(error, "failure_stage")
                             });
+                            let sqlite_primary_code = root_error.as_ref().and_then(|error| {
+                                hook_error_metadata_i64(error, "sqlite_primary_code")
+                            });
+                            let sqlite_extended_code = root_error.as_ref().and_then(|error| {
+                                hook_error_metadata_i64(error, "sqlite_extended_code")
+                            });
                             let http_status = root_error.as_ref().and_then(|error| {
                                 hook_error_metadata_i64(error, "http_status")
                             });
@@ -5756,6 +5770,8 @@ impl MessageProcessor {
                                     model = model.unwrap_or("unknown"),
                                     failure_class = failure_class.unwrap_or("unknown"),
                                     failure_stage = failure_stage.unwrap_or("unknown"),
+                                    sqlite_primary_code = sqlite_primary_code,
+                                    sqlite_extended_code = sqlite_extended_code,
                                     http_status = ?http_status,
                                     fact_index = ?fact_index,
                                     retryable,
@@ -5773,6 +5789,8 @@ impl MessageProcessor {
                                     model = model.unwrap_or("unknown"),
                                     failure_class = failure_class.unwrap_or("unknown"),
                                     failure_stage = failure_stage.unwrap_or("unknown"),
+                                    sqlite_primary_code = sqlite_primary_code,
+                                    sqlite_extended_code = sqlite_extended_code,
                                     http_status = ?http_status,
                                     fact_index = ?fact_index,
                                     retryable,

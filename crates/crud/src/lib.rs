@@ -1012,6 +1012,8 @@ pub struct ClaimedNativeTerminalEffectRecord {
     pub attempt_count: u16,
     pub max_attempts: u16,
     pub claim_token: String,
+    /// Captured from the durable marker for this fenced attempt.
+    pub legacy_manifest_revalidation: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -24727,6 +24729,8 @@ impl CrudStore {
                     {
                         bail!("native terminal-effect retry state is invalid");
                     }
+                    let legacy_manifest_revalidation = row.last_error_code.as_deref()
+                        == Some("memory.post_turn_extractor.legacy_manifest_revalidate");
                     Ok(ClaimedNativeTerminalEffectRecord {
                         effect_id: row.effect_id,
                         workspace_id: row.workspace_id,
@@ -24737,6 +24741,7 @@ impl CrudStore {
                         attempt_count,
                         max_attempts,
                         claim_token: claimed.claim_token.clone(),
+                        legacy_manifest_revalidation,
                     })
                 })();
                 match decoded {
@@ -34961,6 +34966,91 @@ mod tests {
                 0,
                 "memory.post_turn_extractor.write_unclassified",
             ),
+            (
+                "memory.post_turn_extractor.manifest_domain_rejected",
+                false,
+                3_602,
+                0,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_invalid_stored_data",
+                false,
+                3_602,
+                0,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_unclassified",
+                false,
+                3_602,
+                0,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_storage_transient",
+                false,
+                3_602,
+                1,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_failed",
+                false,
+                3_602,
+                1,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_failed",
+                true,
+                3_602,
+                1,
+                "memory.post_turn_extractor.manifest_domain_rejected",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_failed",
+                false,
+                3_602,
+                1,
+                "memory.post_turn_extractor.manifest_invalid_stored_data",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_failed",
+                false,
+                3_602,
+                1,
+                "memory.post_turn_extractor.manifest_storage_transient",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_failed",
+                false,
+                3_599,
+                0,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_failed",
+                false,
+                86_401,
+                0,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.legacy_manifest_revalidate",
+                false,
+                3_602,
+                0,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            ("effect_timeout", false, 3_602, 1, "effect_timeout"),
+            (
+                "memory.post_turn_extractor.provider_network_transient",
+                false,
+                3_602,
+                1,
+                "effect_timeout",
+            ),
         ] {
             let timestamp = 1_700_040_000;
             let workspace_id = "ws_post_turn_reopen";
@@ -35069,6 +35159,15 @@ mod tests {
                 );
                 continue;
             }
+            // Repeat discovery through a newly scoped handle, as after restart.
+            assert_eq!(
+                store
+                    .with_maintenance_access()
+                    .requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 1)
+                    .await
+                    .unwrap(),
+                0
+            );
             let reopened = store
                 .claim_due_native_terminal_effects(timestamp + delay, 10, 1)
                 .await
@@ -35076,7 +35175,30 @@ mod tests {
                 .pop()
                 .unwrap();
             assert_eq!(reopened.effect_id, effect_id);
-            if code == "memory.post_turn_extractor.write_failed" {
+            assert_eq!(
+                reopened.legacy_manifest_revalidation,
+                code == "memory.post_turn_extractor.manifest_failed"
+            );
+            assert!(
+                !store
+                    .fail_native_terminal_effect(
+                        &effect_id,
+                        &first.claim_token,
+                        "stale_owner",
+                        "stale result",
+                        false,
+                        timestamp + delay,
+                        timestamp + delay
+                    )
+                    .await
+                    .unwrap()
+            );
+
+            if matches!(
+                code,
+                "memory.post_turn_extractor.write_failed"
+                    | "memory.post_turn_extractor.manifest_failed"
+            ) {
                 assert_eq!(
                     reopened.max_attempts, 1,
                     "legacy revalidation must not expand the budget"
@@ -35090,9 +35212,13 @@ mod tests {
                         .unwrap()
                         .last_error_code
                         .as_deref(),
-                    Some("memory.post_turn_extractor.legacy_write_revalidate")
+                    Some(if code == "memory.post_turn_extractor.manifest_failed" {
+                        "memory.post_turn_extractor.legacy_manifest_revalidate"
+                    } else {
+                        "memory.post_turn_extractor.legacy_write_revalidate"
+                    })
                 );
-                assert!(
+                assert_eq!(
                     store
                         .native_terminal_effect_handler_checkpoint(
                             &effect_id,
@@ -35100,7 +35226,8 @@ mod tests {
                         )
                         .await
                         .unwrap()
-                        .is_some()
+                        .is_some(),
+                    checkpoint
                 );
                 // The revalidated cause replaces the legacy marker and stays terminal.
                 store
@@ -35109,7 +35236,11 @@ mod tests {
                         &reopened.claim_token,
                         revalidated_code,
                         "safe classified failure",
-                        revalidated_code == "memory.post_turn_extractor.write_storage_transient",
+                        matches!(
+                            revalidated_code,
+                            "memory.post_turn_extractor.write_storage_transient"
+                                | "memory.post_turn_extractor.manifest_storage_transient"
+                        ),
                         timestamp + delay + 1,
                         timestamp + delay,
                     )
@@ -35124,9 +35255,11 @@ mod tests {
                     .unwrap();
                 assert_eq!(
                     reclassified_recovery,
-                    u64::from(
-                        revalidated_code == "memory.post_turn_extractor.write_storage_transient",
-                    )
+                    u64::from(matches!(
+                        revalidated_code,
+                        "memory.post_turn_extractor.write_storage_transient"
+                            | "memory.post_turn_extractor.manifest_storage_transient"
+                    ),)
                 );
             } else {
                 assert_eq!(

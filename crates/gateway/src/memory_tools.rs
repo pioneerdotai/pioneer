@@ -13,7 +13,10 @@ use pioneer_memory::hooks::{
     MemoryRecallItem as AgentMemoryRecallItem, MemoryRecallRequest, MemoryRecallSnapshot,
     MemoryToolMaterialization, MemoryTurnContext,
 };
-use pioneer_memory::{MemoryModeRecallParams, MemoryOperationContext, MemoryRecallParams};
+use pioneer_memory::{
+    MemoryManifestFailure, MemoryManifestFailureClass, MemoryManifestFailureStage,
+    MemoryModeRecallParams, MemoryOperationContext, MemoryRecallParams,
+};
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryCandidateStatus, MemoryCandidatesListParams,
     MemoryCategory, MemoryForgetParams, MemoryForgetTarget, MemoryGetParams, MemoryListParams,
@@ -270,6 +273,57 @@ async fn authorize_post_turn_memory_execution(
                 "hook",
             );
             Err(classify_memory_write_failure(error))
+        }
+    }
+}
+
+async fn authorize_manifest_memory_execution(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    scoped_principal_hint: Option<&str>,
+    access: MemoryExecutionAccess,
+) -> Result<MemoryExecutionBoundary, MemoryManifestFailure> {
+    match processor
+        .revalidate_post_turn_execution_authorization(
+            workspace_id,
+            thread_id,
+            turn_id,
+            scoped_principal_hint,
+            access.action(),
+        )
+        .await
+    {
+        Ok(current) => {
+            crate::authorization::record_tool_decision(
+                access.action(),
+                "memory.post_turn",
+                current.authorization().decision(),
+            );
+            Ok(MemoryExecutionBoundary {
+                scoped_collaboration: current
+                    .memory_runtime_principal_policy(processor.crud_store.as_ref())
+                    .await
+                    .map_err(|error| {
+                        classify_memory_manifest_failure(
+                            error,
+                            MemoryManifestFailureStage::Authorization,
+                        )
+                    })?
+                    == crate::authorization::RuntimePrincipalPolicy::ScopedCollaboration,
+            })
+        }
+        Err(error) => {
+            crate::authorization::record_authorization_unavailable(
+                access.action().safe_name(),
+                "memory.post_turn",
+                "hook",
+            );
+            Err(classify_memory_manifest_failure(
+                error,
+                MemoryManifestFailureStage::Authorization,
+            ))
         }
     }
 }
@@ -1097,16 +1151,21 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
         &self,
         context: MemoryTurnContext,
         request: MemoryManifestRequest,
-    ) -> Result<MemoryManifest, String> {
-        let processor = self.processor()?;
+    ) -> Result<MemoryManifest, MemoryManifestFailure> {
+        let processor = self.processor().map_err(|_| {
+            MemoryManifestFailure::new(
+                MemoryManifestFailureClass::Unclassified,
+                MemoryManifestFailureStage::Runtime,
+            )
+        })?;
         let runtime = processor.memory_runtime();
-        if let Err(error) = runtime.ensure_enabled() {
+        if runtime.ensure_enabled().is_err() {
             return Ok(MemoryManifest {
-                diagnostics: vec![format!("memory runtime unavailable: {error:#}")],
+                diagnostics: vec!["memory runtime unavailable".to_owned()],
                 ..MemoryManifest::default()
             });
         }
-        let boundary = authorize_post_turn_memory_execution(
+        let boundary = authorize_manifest_memory_execution(
             processor.as_ref(),
             context.workspace_id.as_str(),
             context.thread_id.as_str(),
@@ -1114,8 +1173,7 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
             context.principal_id.as_deref(),
             MemoryExecutionAccess::Read,
         )
-        .await
-        .map_err(|_| "post-turn memory is unavailable for the current execution".to_owned())?;
+        .await?;
 
         let operation_context = runtime.operation_context_for_authorized_turn(
             &context,
@@ -1133,7 +1191,9 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
                 },
             )
             .await
-            .map_err(|error| format!("{error:#}"))?;
+            .map_err(|error| {
+                classify_memory_manifest_failure(error, MemoryManifestFailureStage::Active)
+            })?;
         let candidates = runtime
             .service()
             .list_candidates(
@@ -1154,7 +1214,9 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
                 },
             )
             .await
-            .map_err(|error| format!("{error:#}"))?;
+            .map_err(|error| {
+                classify_memory_manifest_failure(error, MemoryManifestFailureStage::Candidates)
+            })?;
 
         let active_count = active.records.len();
         let candidate_count = candidates.candidates.len();
@@ -1254,6 +1316,64 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
             .await;
         Ok(response)
     }
+}
+
+/// Classify while typed causes are available, after service/DB resources are released.
+pub(super) fn classify_memory_manifest_failure(
+    error: anyhow::Error,
+    stage: MemoryManifestFailureStage,
+) -> MemoryManifestFailure {
+    use sea_orm::{ConnAcquireErr, DbErr, RuntimeErr, SqlxError};
+    let mut failure = MemoryManifestFailure::new(MemoryManifestFailureClass::Unclassified, stage);
+    // Walk sources as well as anyhow contexts; never inspect Display or Debug.
+    for cause in error.chain() {
+        let sqlx = if let Some(db) = cause.downcast_ref::<DbErr>() {
+            match db {
+                DbErr::ConnectionAcquire(ConnAcquireErr::Timeout) => {
+                    failure.class = MemoryManifestFailureClass::StorageTransient;
+                    return failure;
+                }
+                DbErr::Conn(RuntimeErr::SqlxError(sqlx))
+                | DbErr::Exec(RuntimeErr::SqlxError(sqlx))
+                | DbErr::Query(RuntimeErr::SqlxError(sqlx)) => Some(sqlx.as_ref()),
+                _ => None,
+            }
+        } else {
+            cause.downcast_ref::<SqlxError>()
+        };
+        match sqlx {
+            Some(SqlxError::PoolTimedOut) => {
+                failure.class = MemoryManifestFailureClass::StorageTransient;
+                return failure;
+            }
+            Some(SqlxError::Database(database)) => {
+                // A numeric code from another backend cannot establish SQLite origin.
+                if let Some(sqlite) =
+                    database.try_downcast_ref::<sea_orm::sqlx::sqlite::SqliteError>()
+                {
+                    use sea_orm::sqlx::error::DatabaseError;
+                    if let Some(code) = sqlite.code().and_then(|code| code.parse::<i32>().ok()) {
+                        failure.sqlite_primary_code = Some(code & 0xff);
+                        failure.sqlite_extended_code = Some(code);
+                        if matches!(code & 0xff, 5 | 6) {
+                            failure.class = MemoryManifestFailureClass::StorageTransient;
+                        }
+                        return failure;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if pioneer_memory::is_invalid_stored_memory_data(&error) {
+        failure.class = MemoryManifestFailureClass::InvalidStoredData;
+    } else if matches!(
+        error.downcast_ref::<pioneer_memory::MemoryWriteFailure>(),
+        Some(pioneer_memory::MemoryWriteFailure::AuthorizationOrDomain)
+    ) {
+        failure.class = MemoryManifestFailureClass::AuthorizationOrDomain;
+    }
+    failure
 }
 
 /// Use typed causes and SQLite result codes, never raw error text.
@@ -2782,3 +2902,7 @@ mod tests {
 #[cfg(test)]
 #[path = "memory_tools/sqlite_write_failure_tests.rs"]
 mod sqlite_write_failure_tests;
+
+#[cfg(test)]
+#[path = "memory_manifest_failure_tests.rs"]
+mod manifest_failure_tests;
