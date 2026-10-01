@@ -34,6 +34,7 @@ pub struct PreparedTaskEvent {
     review_projection: Option<super::task_result_review_event::PreparedTaskResultReviewEvent>,
     delivery_authority: Option<super::task_actor_contract::PreparedTaskDeliveryAuthority>,
     projection: crate::task_projector::PreparedTaskProjection,
+    delivery_boundary: Option<crate::task_projector::PreparedDeliveryAuthorityBoundary>,
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +110,7 @@ impl PreparedTaskEvent {
             review_projection,
             delivery_authority: None,
             projection,
+            delivery_boundary: None,
         })
     }
 
@@ -126,6 +128,49 @@ impl PreparedTaskEvent {
             });
         }
         Ok(self)
+    }
+
+    pub(crate) fn validate_delivery_start_fields(&self) -> Result<()> {
+        self.projection.validate_delivery_start_fields()
+    }
+
+    pub(crate) fn validate_delivery_fields(&self) -> Result<()> {
+        self.projection.validate_delivery_fields()
+    }
+
+    pub(crate) fn with_delivery_rows(
+        mut self,
+        delivery: pioneer_entity::task_delivery::Model,
+        attempt: Option<pioneer_entity::task_delivery_attempt::Model>,
+    ) -> Self {
+        self.projection = self.projection.with_delivery_rows(delivery, attempt);
+        self
+    }
+
+    pub(crate) fn validate_delivery_identity(
+        &self,
+        row: &pioneer_entity::task_delivery::Model,
+    ) -> Result<()> {
+        self.projection.validate_delivery_identity(row)
+    }
+
+    pub(crate) fn set_delivery_boundary(
+        &mut self,
+        boundary: crate::task_projector::PreparedDeliveryAuthorityBoundary,
+    ) {
+        self.delivery_boundary = Some(boundary);
+    }
+
+    pub(crate) fn take_delivery_boundary(
+        &mut self,
+    ) -> Option<crate::task_projector::PreparedDeliveryAuthorityBoundary> {
+        self.delivery_boundary.take()
+    }
+
+    pub(crate) fn take_delivery_authority(
+        &mut self,
+    ) -> Option<super::task_actor_contract::PreparedTaskDeliveryAuthority> {
+        self.delivery_authority.take()
     }
 
     pub(crate) fn payload(&self) -> &TaskEventPayload {
@@ -211,6 +256,7 @@ pub async fn append_prepared_event<C: ConnectionTrait>(
         review_projection,
         delivery_authority,
         projection,
+        delivery_boundary: _,
     } = prepared;
     let sequence = next_sequence_for_task(db, task_id.as_str()).await?;
 
@@ -336,7 +382,7 @@ fn appended_task_event_from_known_payload(
     }
 }
 
-async fn find_event_by_idempotency_key<C: ConnectionTrait>(
+pub(crate) async fn find_event_by_idempotency_key<C: ConnectionTrait>(
     db: &C,
     task_id: &str,
     idempotency_key: &str,
@@ -454,6 +500,25 @@ fn terminal_outcome(payload: &TaskEventPayload) -> Option<TerminalOutcome> {
         }
         _ => None,
     }
+}
+
+pub(crate) async fn find_queued_delivery_for_run<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+) -> Result<Option<task_event::Model>> {
+    let mut rows = task_event::Entity::find()
+        .filter(task_event::Column::RunId.eq(run_id.to_owned()))
+        .filter(
+            task_event::Column::EventType
+                .eq(pioneer_protocol::constants::events::TASK_DELIVERY_QUEUED),
+        )
+        .limit(2)
+        .all(db)
+        .await?;
+    if rows.len() > 1 {
+        anyhow::bail!("terminal Task run has multiple queued deliveries");
+    }
+    Ok(rows.pop())
 }
 
 pub async fn list_events_for_task<C: ConnectionTrait>(

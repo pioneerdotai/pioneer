@@ -1358,6 +1358,23 @@ pub async fn mark_succeeded<C: ConnectionTrait>(
     Ok(updated == 1)
 }
 
+#[derive(Debug)]
+pub struct HandlerCheckpointInvalid {
+    pub class: &'static str,
+}
+
+impl std::fmt::Display for HandlerCheckpointInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "native terminal-effect checkpoint is invalid ({})",
+            self.class
+        )
+    }
+}
+
+impl std::error::Error for HandlerCheckpointInvalid {}
+
 /// Load the immutable handler checkpoint owned by the current delivery lease.
 /// A missing/expired claim is an error rather than an empty checkpoint so a
 /// stale worker can never continue provider or memory side effects.
@@ -1380,14 +1397,23 @@ pub async fn load_handler_checkpoint<C: ConnectionTrait>(
         (None, None) => Ok(None),
         (Some(checkpoint), Some(expected_sha256)) => {
             if checkpoint.len() > MAX_EFFECT_HANDLER_CHECKPOINT_BYTES {
-                bail!("native terminal-effect handler checkpoint exceeds its durable byte limit");
+                return Err(HandlerCheckpointInvalid {
+                    class: "checkpoint_size",
+                }
+                .into());
             }
             if payload_sha256_hex(checkpoint.as_str()) != expected_sha256 {
-                bail!("native terminal-effect handler checkpoint hash mismatch");
+                return Err(HandlerCheckpointInvalid {
+                    class: "checkpoint_hash",
+                }
+                .into());
             }
             Ok(Some(checkpoint))
         }
-        _ => bail!("native terminal-effect handler checkpoint is incomplete"),
+        _ => Err(HandlerCheckpointInvalid {
+            class: "checkpoint_incomplete",
+        }
+        .into()),
     }
 }
 
@@ -1404,6 +1430,8 @@ pub async fn store_handler_checkpoint<C: ConnectionTrait>(
     if checkpoint_json.len() > MAX_EFFECT_HANDLER_CHECKPOINT_BYTES {
         bail!("native terminal-effect handler checkpoint exceeds its durable byte limit");
     }
+    // Pure preparation precedes SqliteDatabase's statement-scoped writer.
+    // CrudStore's run_serialized_write is a lock-retry wrapper, not a reservation.
     let checkpoint_sha256 = payload_sha256_hex(checkpoint_json);
     let updated = native_terminal_effect_outbox::Entity::update_many()
         .col_expr(

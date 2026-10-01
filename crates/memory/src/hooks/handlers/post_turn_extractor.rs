@@ -180,7 +180,7 @@ impl HookHandler for MemoryPostTurnExtractorHook {
 
         let extraction = match extract_post_turn_memory_once(
             extractor_provider.as_ref(),
-            extractor_context,
+            extractor_context.clone(),
             extractor_request,
             &config,
         )
@@ -190,10 +190,27 @@ impl HookHandler for MemoryPostTurnExtractorHook {
             Err(MemoryPostTurnExtractorFailure::ProviderFailed(error)) => return Err(error),
             Err(MemoryPostTurnExtractorFailure::InvalidJson(error)) => {
                 if durable_terminal_effect.is_some() {
-                    return Err(memory_hook_error(
+                    let mut hook_error = memory_hook_error(
                         "memory.post_turn_extractor.invalid_json",
                         format!("memory post-turn extractor returned invalid JSON: {error}"),
-                    ));
+                    )
+                    .with_safe_for_user(true);
+                    for (key, value) in [
+                        ("provider", extractor_context.model_provider.clone()),
+                        ("model", extractor_context.model.clone()),
+                        ("failure_stage", Some("response_json_parse".to_owned())),
+                        ("failure_class", Some(error.category.as_str().to_owned())),
+                        ("parse_category", Some(error.category.as_str().to_owned())),
+                        ("parse_line", Some(error.line.to_string())),
+                        ("parse_column", Some(error.column.to_string())),
+                    ] {
+                        if let Some(value) = value {
+                            hook_error.metadata.insert(hook_metadata_key(key), value);
+                        }
+                    }
+                    // An alternate provider has not established fresh provenance.
+                    // Only Gateway's pre-checkpoint fresh failure authorizes retry.
+                    return Err(hook_error);
                 }
                 response.diagnostics.push(memory_safe_warning_diagnostic(
                     "memory.post_turn_extractor.invalid_json",
@@ -323,7 +340,7 @@ struct MemoryPostTurnExtractionOutcome {
 
 enum MemoryPostTurnExtractorFailure {
     ProviderFailed(HookError),
-    InvalidJson(String),
+    InvalidJson(MemoryPostTurnResponseFormatError),
 }
 
 async fn extract_post_turn_memory_once(

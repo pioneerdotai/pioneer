@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use pioneer_entity::{task_result_candidate, task_result_review_event};
 use pioneer_protocol::{TaskError, TaskResult, TaskResultCandidate, TaskResultCandidateStatus};
 use sea_orm::sea_query::{Expr, OnConflict};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+};
 
 use crate::convention::task_result_candidate_status_to_db;
 use crate::util::{optional_typed_json_to_db, typed_json_to_db, unix_to_datetime};
@@ -373,4 +375,34 @@ pub async fn update_candidate_resolution<C: ConnectionTrait>(
     }
     let candidate = find_candidate_by_id(db, id).await?;
     Ok(candidate)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, sea_orm::FromQueryResult)]
+pub(crate) struct TaskDeliveryReviewBinding {
+    pub id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub final_review_event_id: Option<String>,
+}
+
+pub(crate) async fn find_delivery_review_binding<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+) -> Result<Option<TaskDeliveryReviewBinding>> {
+    task_result_candidate::Entity::find()
+        .select_only()
+        .columns([
+            task_result_candidate::Column::Id,
+            task_result_candidate::Column::TaskId,
+            task_result_candidate::Column::RunId,
+            task_result_candidate::Column::FinalReviewEventId,
+        ])
+        .filter(task_result_candidate::Column::RunId.eq(run_id.to_owned()))
+        .filter(task_result_candidate::Column::Status.eq("accepted"))
+        .order_by_desc(task_result_candidate::Column::Round)
+        .order_by_desc(task_result_candidate::Column::CreatedAt)
+        .into_model::<TaskDeliveryReviewBinding>()
+        .one(db)
+        .await
+        .context("failed to read exact delivery final review binding")
 }

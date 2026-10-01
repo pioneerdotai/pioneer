@@ -317,10 +317,11 @@ impl MessageProcessor {
             .map_err(|error| anyhow!("{error:#}"))?;
         let deliveries = self.crud_store.list_due_task_deliveries(now, limit).await?;
         for delivery in deliveries {
-            let Some((delivery, attempt)) = task_service
-                .start_delivery(delivery.id.as_str(), now)
-                .await
-                .map_err(|error| anyhow!("{error:#}"))?
+            let pioneer_crud::TaskDeliveryTransitionOutcome::Applied((delivery, attempt)) =
+                task_service
+                    .start_delivery(delivery.id.as_str(), now)
+                    .await
+                    .map_err(|error| anyhow!("{error:#}"))?
             else {
                 continue;
             };
@@ -340,7 +341,8 @@ impl MessageProcessor {
             )
             .await;
             let failure_class = match execution_result {
-                Ok(Ok(Ok(()))) => None,
+                Ok(Ok(Ok(pioneer_crud::TaskDeliveryTransitionOutcome::Applied(()))))
+                | Ok(Ok(Ok(pioneer_crud::TaskDeliveryTransitionOutcome::Superseded))) => None,
                 Ok(Ok(Err(error))) => Some(task_delivery_execution_failure_class(&error)),
                 Ok(Err(_)) => Some("task_delivery_worker_join_failed"),
                 Err(_) => Some("task_delivery_execution_timed_out"),
@@ -367,7 +369,7 @@ impl MessageProcessor {
         &self,
         delivery: TaskDelivery,
         attempt: TaskDeliveryAttempt,
-    ) -> Result<()> {
+    ) -> Result<pioneer_crud::TaskDeliveryTransitionOutcome<()>> {
         if delivery.mode != TaskDeliveryMode::None {
             self.ensure_task_delivery_still_authorized(&delivery)
                 .await?;
@@ -388,23 +390,35 @@ impl MessageProcessor {
             TaskDeliveryMode::UserNotification => {
                 let notification = self.deliver_user_notification(&delivery).await?;
                 let notification_id = notification.notification_id.clone();
-                // The committed exact-recipient inbox row above is the
-                // delivery receipt. Live fanout is deliberately best-effort:
-                // an offline user recovers the same deterministic receipt,
-                // and a crash/retry cannot create a second notification.
-                let _ = self
-                    .send_task_user_notification(
-                        delivery.workspace_id.as_str(),
-                        delivery
-                            .target_user_id
-                            .as_deref()
-                            .context("user notification delivery has no recipient")?,
-                        events::TASK_USER_NOTIFICATION_DELIVERED,
-                        &notification,
+                let outcome = self
+                    .complete_delivery(
+                        delivery.clone(),
+                        attempt,
+                        None,
+                        Some(notification_id),
+                        None,
+                        None,
                     )
-                    .await;
-                self.complete_delivery(delivery, attempt, None, Some(notification_id), None, None)
-                    .await
+                    .await?;
+                if matches!(
+                    outcome,
+                    pioneer_crud::TaskDeliveryTransitionOutcome::Applied(())
+                ) {
+                    // Live fanout follows the owned completion. The exact
+                    // recipient inbox remains the durable notification receipt.
+                    let _ = self
+                        .send_task_user_notification(
+                            delivery.workspace_id.as_str(),
+                            delivery
+                                .target_user_id
+                                .as_deref()
+                                .context("user notification delivery has no recipient")?,
+                            events::TASK_USER_NOTIFICATION_DELIVERED,
+                            &notification,
+                        )
+                        .await;
+                }
+                Ok(outcome)
             }
             TaskDeliveryMode::Webhook => self.deliver_webhook(delivery, attempt).await,
         }
@@ -549,8 +563,9 @@ impl MessageProcessor {
         delivered_notification_id: Option<String>,
         http_status: Option<u16>,
         response_fingerprint: Option<String>,
-    ) -> Result<()> {
-        self.task_runtime
+    ) -> Result<pioneer_crud::TaskDeliveryTransitionOutcome<()>> {
+        let outcome = self
+            .task_runtime
             .background_control_service()
             .complete_delivery(
                 delivery,
@@ -563,7 +578,14 @@ impl MessageProcessor {
             )
             .await
             .map_err(|error| anyhow!("{error:#}"))?;
-        Ok(())
+        Ok(match outcome {
+            pioneer_crud::TaskDeliveryTransitionOutcome::Applied(_) => {
+                pioneer_crud::TaskDeliveryTransitionOutcome::Applied(())
+            }
+            pioneer_crud::TaskDeliveryTransitionOutcome::Superseded => {
+                pioneer_crud::TaskDeliveryTransitionOutcome::Superseded
+            }
+        })
     }
 
     async fn prepare_task_delivery_agent_action(
@@ -1273,7 +1295,7 @@ impl MessageProcessor {
         &self,
         delivery: TaskDelivery,
         attempt: TaskDeliveryAttempt,
-    ) -> Result<()> {
+    ) -> Result<pioneer_crud::TaskDeliveryTransitionOutcome<()>> {
         let webhook_url = delivery
             .webhook_url
             .as_deref()
@@ -1295,7 +1317,8 @@ impl MessageProcessor {
             self.complete_delivery(delivery, attempt, None, None, Some(status.as_u16()), None)
                 .await
         } else {
-            self.task_runtime
+            let outcome = self
+                .task_runtime
                 .background_control_service()
                 .fail_delivery(
                     delivery,
@@ -1307,7 +1330,14 @@ impl MessageProcessor {
                 )
                 .await
                 .map_err(|error| anyhow!("{error:#}"))?;
-            Ok(())
+            Ok(match outcome {
+                pioneer_crud::TaskDeliveryTransitionOutcome::Applied(_) => {
+                    pioneer_crud::TaskDeliveryTransitionOutcome::Applied(())
+                }
+                pioneer_crud::TaskDeliveryTransitionOutcome::Superseded => {
+                    pioneer_crud::TaskDeliveryTransitionOutcome::Superseded
+                }
+            })
         }
     }
 

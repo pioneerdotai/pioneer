@@ -289,10 +289,30 @@ pub async fn mark_execution_terminal<C: ConnectionTrait>(
     result: Option<&TaskResult>,
     error: Option<&TaskError>,
 ) -> Result<Option<task_run_execution::Model>> {
-    debug_assert!(is_terminal_task_run_execution_status(status));
-    let terminal_statuses = terminal_status_values();
     let result_json = optional_typed_json_to_db(&result.cloned())?;
     let error_json = optional_typed_json_to_db(&error.cloned())?;
+    mark_execution_terminal_json(
+        db,
+        execution_id,
+        status,
+        completed_at,
+        result_json,
+        error_json,
+    )
+    .await
+}
+
+/// Caller prepares payload serialization before writer admission.
+pub(crate) async fn mark_execution_terminal_json<C: ConnectionTrait>(
+    db: &C,
+    execution_id: &str,
+    status: TaskRunExecutionStatus,
+    completed_at: DateTimeWithTimeZone,
+    result_json: Option<String>,
+    error_json: Option<String>,
+) -> Result<Option<task_run_execution::Model>> {
+    debug_assert!(is_terminal_task_run_execution_status(status));
+    let terminal_statuses = terminal_status_values();
     let update_result = task_run_execution::Entity::update_many()
         .filter(task_run_execution::Column::Id.eq(execution_id.to_owned()))
         .filter(task_run_execution::Column::Status.is_not_in(terminal_statuses))

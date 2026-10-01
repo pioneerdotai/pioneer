@@ -10,8 +10,9 @@ use pioneer_memory::hooks::{
     AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider, AgentMemoryWriteProvider,
     MemoryManifest, MemoryManifestActiveItem, MemoryManifestCandidateItem, MemoryManifestRequest,
     MemoryPostTurnExtractorContext, MemoryPostTurnExtractorRequest,
-    MemoryRecallItem as AgentMemoryRecallItem, MemoryRecallRequest, MemoryRecallSnapshot,
-    MemoryToolMaterialization, MemoryTurnContext,
+    MemoryPostTurnResponseFormatError, MemoryRecallItem as AgentMemoryRecallItem,
+    MemoryRecallRequest, MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext,
+    validate_memory_post_turn_response_format,
 };
 use pioneer_memory::{
     MemoryManifestFailure, MemoryManifestFailureClass, MemoryManifestFailureStage,
@@ -26,7 +27,8 @@ use pioneer_protocol::{
     ProviderFailureStage,
 };
 use pioneer_provider::{
-    ChatMessage, ChatRequest, Provider, ProviderFailureClassification, StreamChunk,
+    ChatMessage, ChatRequest, Provider, ProviderFailureClassification, ProviderTermination,
+    StreamChunk,
 };
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
@@ -677,7 +679,22 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                     claim.claim_token.as_str(),
                 )
                 .await
-                .map_err(|_error| {
+                .map_err(|error| {
+                    if let Some(invalid) =
+                        error.downcast_ref::<pioneer_crud::HandlerCheckpointInvalid>()
+                    {
+                        return memory_extractor_hook_error(
+                            "memory.post_turn_extractor.checkpoint_invalid",
+                            "memory post-turn extractor checkpoint is invalid",
+                            false,
+                            response_failure_metadata(
+                                provider_name,
+                                model,
+                                "checkpoint_load",
+                                invalid.class,
+                            ),
+                        );
+                    }
                     tracing::warn!(
                         target: "pioneer::memory_post_turn_extractor",
                         stage = "checkpoint_load",
@@ -690,7 +707,12 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                         "memory.post_turn_extractor.checkpoint_load_failed",
                         "memory post-turn extractor checkpoint loading failed",
                         true,
-                        provider_model_metadata(provider_name, model, "checkpoint_load"),
+                        response_failure_metadata(
+                            provider_name,
+                            model,
+                            "checkpoint_load",
+                            "checkpoint_load_failed",
+                        ),
                     )
                 })?
         {
@@ -712,8 +734,25 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                     "memory.post_turn_extractor.checkpoint_invalid",
                     "memory post-turn extractor checkpoint is invalid",
                     false,
-                    provider_model_metadata(provider_name, model, "checkpoint_decode"),
+                    response_failure_metadata(
+                        provider_name,
+                        model,
+                        "checkpoint_decode",
+                        "checkpoint_invalid",
+                    ),
                 )
+            })
+            .and_then(|raw_json| {
+                validate_memory_post_turn_response_format(&raw_json).map_err(|error| {
+                    memory_response_format_error(
+                        provider_name,
+                        model,
+                        ResponseOrigin::Checkpoint,
+                        raw_json.len(),
+                        error,
+                    )
+                })?;
+                Ok(raw_json)
             });
         }
         let provider_authorization = processor
@@ -790,25 +829,15 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
         let raw_json =
             request_post_turn_extractor_json(provider.as_ref(), model, request.render_prompt())
                 .await?;
-        if raw_json.len() > MAX_POST_TURN_EXTRACTOR_RAW_BYTES {
-            tracing::warn!(
-                target: "pioneer::memory_post_turn_extractor",
-                stage = "response_size_validation",
-                provider = provider_name,
+        validate_memory_post_turn_response_format(&raw_json).map_err(|error| {
+            memory_response_format_error(
+                provider_name,
                 model,
-                durable = context.durable_terminal_effect.is_some(),
-                response_bytes = raw_json.len(),
-                response_sha256 = %post_turn_extractor_response_sha256(raw_json.as_str()),
-                response_limit_bytes = MAX_POST_TURN_EXTRACTOR_RAW_BYTES,
-                "memory post-turn extractor response size validation failed"
-            );
-            return Err(memory_extractor_hook_error(
-                "memory.post_turn_extractor.response_too_large",
-                "memory post-turn extractor response exceeds its byte limit",
-                false,
-                provider_model_metadata(provider_name, model, "response_size_validation"),
-            ));
-        }
+                ResponseOrigin::Fresh,
+                raw_json.len(),
+                error,
+            )
+        })?;
         if let Some(claim) = context.durable_terminal_effect.as_ref() {
             let checkpoint_json = encode_memory_post_turn_extractor_checkpoint(
                 raw_json.as_str(),
@@ -830,7 +859,13 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                     "memory.post_turn_extractor.checkpoint_encode_failed",
                     "memory post-turn extractor checkpoint encoding failed",
                     false,
-                    provider_model_metadata(provider_name, model, "checkpoint_encode"),
+                    validated_fresh_response_metadata(
+                        provider_name,
+                        model,
+                        "checkpoint_encode",
+                        "checkpoint_encode_failed",
+                        raw_json.len(),
+                    ),
                 )
             })?;
             processor
@@ -857,7 +892,13 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                         "memory.post_turn_extractor.checkpoint_store_failed",
                         "memory post-turn extractor checkpoint persistence failed",
                         true,
-                        provider_model_metadata(provider_name, model, "checkpoint_store"),
+                        validated_fresh_response_metadata(
+                            provider_name,
+                            model,
+                            "checkpoint_store",
+                            "checkpoint_store_failed",
+                            raw_json.len(),
+                        ),
                     )
                 })?;
         }
@@ -908,7 +949,6 @@ async fn request_post_turn_extractor_json_once(
     provider
         .chat(request)
         .await
-        .map(|response| response.text)
         .map_err(|error| {
             let classified = memory_provider_request_error(
                 provider,
@@ -929,6 +969,21 @@ async fn request_post_turn_extractor_json_once(
             );
             classified
         })
+        .and_then(|response| {
+            validate_extractor_completion(
+                provider.name(),
+                model,
+                Some(&response.termination),
+                !response.tool_calls.is_empty(),
+            )?;
+            validate_extractor_response_size(
+                provider.name(),
+                model,
+                response.text.len(),
+                Some(&response.termination),
+            )?;
+            Ok(response.text)
+        })
 }
 
 async fn collect_post_turn_extractor_stream(
@@ -940,6 +995,14 @@ async fn collect_post_turn_extractor_stream(
     let mut text = String::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
+            if pioneer_provider::failure::provider_stream_incomplete(&error).is_some() {
+                return extractor_completion_error(
+                    provider.name(),
+                    model,
+                    ExtractorCompletionFailure::StreamEof,
+                    None,
+                );
+            }
             let (stage_name, stage) = if text.is_empty() {
                 (
                     "provider_stream_first_chunk",
@@ -964,14 +1027,241 @@ async fn collect_post_turn_extractor_stream(
             );
             classified
         })?;
-        if !chunk.delta.is_empty() {
-            text.push_str(chunk.delta.as_str());
+        if !chunk.tool_calls.is_empty() {
+            return Err(extractor_completion_error(
+                provider.name(),
+                model,
+                ExtractorCompletionFailure::UnexpectedToolCalls,
+                chunk.termination.as_ref(),
+            ));
         }
         if chunk.is_final {
-            break;
+            validate_extractor_completion(
+                provider.name(),
+                model,
+                chunk.termination.as_ref(),
+                false,
+            )?;
+        }
+        validate_extractor_response_size(
+            provider.name(),
+            model,
+            text.len().saturating_add(chunk.delta.len()),
+            chunk.termination.as_ref(),
+        )?;
+        text.push_str(&chunk.delta);
+        if chunk.is_final {
+            return Ok(text);
         }
     }
-    Ok(text)
+    Err(extractor_completion_error(
+        provider.name(),
+        model,
+        ExtractorCompletionFailure::StreamEof,
+        None,
+    ))
+}
+
+#[derive(Clone, Copy)]
+enum ResponseOrigin {
+    Fresh,
+    Checkpoint,
+}
+
+fn response_failure_metadata(
+    provider: &str,
+    model: &str,
+    stage: &str,
+    class: &str,
+) -> HookErrorMetadata {
+    let mut metadata = provider_model_metadata(provider, model, stage);
+    insert_hook_text_metadata(&mut metadata, "failure_class", class);
+    metadata
+}
+
+fn validated_fresh_response_metadata(
+    provider: &str,
+    model: &str,
+    stage: &str,
+    class: &str,
+    bytes: usize,
+) -> HookErrorMetadata {
+    let mut metadata = response_failure_metadata(provider, model, stage, class);
+    insert_hook_text_metadata(&mut metadata, "termination", "complete");
+    insert_hook_text_metadata(&mut metadata, "response_bytes", bytes.to_string());
+    metadata
+}
+
+fn memory_response_format_error(
+    provider: &str,
+    model: &str,
+    origin: ResponseOrigin,
+    bytes: usize,
+    error: MemoryPostTurnResponseFormatError,
+) -> HookError {
+    let (code, stage, retryable) = match origin {
+        ResponseOrigin::Fresh => (
+            "memory.post_turn_extractor.fresh_response_invalid",
+            "fresh_response_validation",
+            true,
+        ),
+        ResponseOrigin::Checkpoint => (
+            "memory.post_turn_extractor.checkpoint_invalid",
+            "checkpoint_validation",
+            false,
+        ),
+    };
+    let class = error.category.as_str();
+    let mut metadata = response_failure_metadata(provider, model, stage, class);
+    for (key, value) in [
+        ("response_bytes", bytes),
+        ("parse_line", error.line),
+        ("parse_column", error.column),
+    ] {
+        insert_hook_text_metadata(&mut metadata, key, value.to_string());
+    }
+    insert_hook_text_metadata(&mut metadata, "parse_category", class);
+    if matches!(origin, ResponseOrigin::Fresh) {
+        insert_hook_text_metadata(&mut metadata, "termination", "complete");
+    }
+    memory_extractor_hook_error(
+        code,
+        format!("memory extractor response rejected ({error}; bytes={bytes})"),
+        retryable,
+        metadata,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ExtractorCompletionFailure {
+    StreamEof,
+    Length,
+    ContentFiltered,
+    Safety,
+    Cancelled,
+    ProviderError,
+    Unknown,
+    Missing,
+    ToolCalls,
+    UnexpectedToolCalls,
+}
+
+impl ExtractorCompletionFailure {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::StreamEof => "stream_truncated",
+            Self::Length => "length",
+            Self::ContentFiltered => "content_filtered",
+            Self::Safety => "safety",
+            Self::Cancelled => "cancelled",
+            Self::ProviderError => "provider_error",
+            Self::Unknown => "unknown_termination",
+            Self::Missing => "missing_termination",
+            Self::ToolCalls => "tool_calls",
+            Self::UnexpectedToolCalls => "unexpected_tool_calls",
+        }
+    }
+}
+
+fn extractor_termination_name(termination: Option<&ProviderTermination>) -> &'static str {
+    match termination {
+        Some(ProviderTermination::Complete) => "complete",
+        Some(ProviderTermination::ToolCalls) => "tool_calls",
+        Some(ProviderTermination::Length) => "length",
+        Some(ProviderTermination::ContentFiltered) => "content_filtered",
+        Some(ProviderTermination::Safety) => "safety",
+        Some(ProviderTermination::Cancelled) => "cancelled",
+        Some(ProviderTermination::ProviderError) => "provider_error",
+        Some(ProviderTermination::Unknown(_)) => "unknown",
+        None => "missing",
+    }
+}
+
+fn extractor_completion_error(
+    provider: &str,
+    model: &str,
+    failure: ExtractorCompletionFailure,
+    termination: Option<&ProviderTermination>,
+) -> HookError {
+    // EOF is a confirmed transport truncation. Other termination failures have no
+    // proven transient cause (including an unclassified ProviderError).
+    let retryable = matches!(failure, ExtractorCompletionFailure::StreamEof);
+    let mut metadata =
+        response_failure_metadata(provider, model, "transport_completion", failure.as_str());
+    insert_hook_text_metadata(
+        &mut metadata,
+        "termination",
+        extractor_termination_name(termination),
+    );
+    insert_hook_text_metadata(&mut metadata, "provider_stage", "finalize");
+    memory_extractor_hook_error(
+        format!("memory.post_turn_extractor.completion_{}", failure.as_str()),
+        "memory extractor generation did not complete normally",
+        retryable,
+        metadata,
+    )
+}
+
+fn validate_extractor_completion(
+    provider: &str,
+    model: &str,
+    termination: Option<&ProviderTermination>,
+    has_tools: bool,
+) -> HookResult<()> {
+    let failure = if has_tools {
+        ExtractorCompletionFailure::UnexpectedToolCalls
+    } else {
+        match termination {
+            Some(ProviderTermination::Complete) => return Ok(()),
+            Some(ProviderTermination::ToolCalls) => ExtractorCompletionFailure::ToolCalls,
+            Some(ProviderTermination::Length) => ExtractorCompletionFailure::Length,
+            Some(ProviderTermination::ContentFiltered) => {
+                ExtractorCompletionFailure::ContentFiltered
+            }
+            Some(ProviderTermination::Safety) => ExtractorCompletionFailure::Safety,
+            Some(ProviderTermination::Cancelled) => ExtractorCompletionFailure::Cancelled,
+            Some(ProviderTermination::ProviderError) => ExtractorCompletionFailure::ProviderError,
+            Some(ProviderTermination::Unknown(_)) => ExtractorCompletionFailure::Unknown,
+            None => ExtractorCompletionFailure::Missing,
+        }
+    };
+    Err(extractor_completion_error(
+        provider,
+        model,
+        failure,
+        termination,
+    ))
+}
+
+fn validate_extractor_response_size(
+    provider: &str,
+    model: &str,
+    bytes: usize,
+    termination: Option<&ProviderTermination>,
+) -> HookResult<()> {
+    if bytes <= MAX_POST_TURN_EXTRACTOR_RAW_BYTES {
+        return Ok(());
+    }
+    let mut metadata = response_failure_metadata(
+        provider,
+        model,
+        "response_size_validation",
+        "response_too_large",
+    );
+    insert_hook_text_metadata(&mut metadata, "response_bytes", bytes.to_string());
+    if termination.is_some() {
+        insert_hook_text_metadata(
+            &mut metadata,
+            "termination",
+            extractor_termination_name(termination),
+        );
+    }
+    Err(memory_extractor_hook_error(
+        "memory.post_turn_extractor.response_too_large",
+        "memory extractor response exceeds its byte limit",
+        false,
+        metadata,
+    ))
 }
 
 fn post_turn_extractor_response_sha256(response: &str) -> String {
@@ -2898,6 +3188,10 @@ mod tests {
         assert_eq!(*provider.requests.lock().expect("request lock poisoned"), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "memory_tools_response_tests.rs"]
+mod response_validation_tests;
 
 #[cfg(test)]
 #[path = "memory_tools/sqlite_write_failure_tests.rs"]
