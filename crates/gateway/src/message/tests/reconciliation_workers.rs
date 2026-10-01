@@ -23,7 +23,7 @@ fn local_capture() -> (
     (hub, transport, dispatch)
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
     let (processor, _, _, _, _, _) = setup_workspace_message_processor().await;
     let processor = Arc::new(processor);
@@ -34,6 +34,10 @@ async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
         .close()
         .await
         .unwrap();
+    // SQLite pool setup uses a real worker thread. Pause only after the fixture
+    // is ready and closed, so Tokio cannot advance its acquisition timeout while
+    // that thread is still opening the connection.
+    tokio::time::pause();
     let (hub, transport, dispatch) = local_capture();
     let projection = tokio::spawn(
         MessageProcessor::run_projection_delivery_resilience_worker(Arc::downgrade(&processor))
