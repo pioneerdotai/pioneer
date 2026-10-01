@@ -979,3 +979,36 @@ fn delivery_thread_target_key(target: pioneer_protocol::TaskDeliveryThreadTarget
         pioneer_protocol::TaskDeliveryThreadTarget::ExactThread => "exact_thread",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_protocol::{TaskArtifact, TaskDeliveryFormat, TaskValue};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn summary_delivery_snapshot_drops_full_data_and_artifacts() {
+        let result = TaskResult {
+            summary: Some("safe summary".to_owned()),
+            data: Some(TaskValue::Object(BTreeMap::from([(
+                "secret".to_owned(),
+                TaskValue::String("must-not-cross".to_owned()),
+            )]))),
+            artifacts: vec![TaskArtifact {
+                artifact_id: Some("artifact-1".to_owned()),
+                version_id: Some("version-1".to_owned()),
+                path: None,
+                url: None,
+                mime_type: None,
+                metadata: None,
+            }],
+            completed_by_run_id: Some("run-1".to_owned()),
+        };
+
+        let projected = task_delivery_result_snapshot(result, TaskDeliveryFormat::Summary);
+        assert_eq!(projected.summary.as_deref(), Some("safe summary"));
+        assert!(projected.data.is_none());
+        assert!(projected.artifacts.is_empty());
+        assert_eq!(projected.completed_by_run_id.as_deref(), Some("run-1"));
+    }
+}

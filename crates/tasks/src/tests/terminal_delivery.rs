@@ -189,8 +189,8 @@ async fn reconstructed_runtime_replay_repairs_interrupted_post_commit_finalizati
     assert_eq!(committed.status, TaskTerminalCommitStatus::Applied);
     let original = deliveries(&runtime, &run).await;
     let db = store.database_connection();
-    db.execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite, "UPDATE task_run_execution SET status='running',result_json=NULL,error_json=NULL,completed_at=NULL WHERE task_run_id=?", [run.id.clone().into()])).await.unwrap();
-    db.execute(Statement::from_sql_and_values(
+    db.execute(&Statement::from_sql_and_values(DatabaseBackend::Sqlite, "UPDATE task_run_execution SET status='running',result_json=NULL,error_json=NULL,completed_at=NULL WHERE task_run_id=?", [run.id.clone().into()])).await.unwrap();
+    db.execute(&Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
         "UPDATE task_occurrence_contract SET status='running' WHERE run_id=?",
         [run.id.clone().into()],
@@ -236,7 +236,7 @@ async fn reconstructed_runtime_replay_repairs_interrupted_post_commit_finalizati
     let before = events(&recovered_runtime, &run).await;
     store
         .database_connection()
-        .execute(Statement::from_sql_and_values(
+        .execute(&Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
             "UPDATE task_occurrence_contract SET status='running' WHERE run_id=?",
             [run.id.clone().into()],
@@ -507,7 +507,7 @@ async fn stale_destination_authority_or_generation_rolls_back_the_terminal_batch
                 let plan = occurrence.delivery_plan.as_mut().unwrap();
                 plan.policy.thread_id = Some("another_destination".into());
                 plan.presentation_thread_id = plan.policy.thread_id.clone();
-                db.execute(Statement::from_sql_and_values(
+                db.execute(&Statement::from_sql_and_values(
                     DatabaseBackend::Sqlite,
                     "UPDATE task_occurrence_contract SET delivery_plan_json=? WHERE run_id=?",
                     [
@@ -527,7 +527,7 @@ async fn stale_destination_authority_or_generation_rolls_back_the_terminal_batch
                     .unwrap()
                     .unwrap();
                 actor.delivery.disclosure_generation += 1;
-                db.execute(Statement::from_sql_and_values(
+                db.execute(&Statement::from_sql_and_values(
                     DatabaseBackend::Sqlite,
                     "UPDATE task_actor_contract SET delivery_json=? WHERE task_id=?",
                     [
@@ -539,13 +539,13 @@ async fn stale_destination_authority_or_generation_rolls_back_the_terminal_batch
                 .unwrap();
             }
             "generation" => {
-                db.execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite, "UPDATE task_occurrence_contract SET execution_generation=execution_generation+1 WHERE run_id=?", [run.id.clone().into()])).await.unwrap();
+                db.execute(&Statement::from_sql_and_values(DatabaseBackend::Sqlite, "UPDATE task_occurrence_contract SET execution_generation=execution_generation+1 WHERE run_id=?", [run.id.clone().into()])).await.unwrap();
             }
             "retry_generation" => {
-                db.execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite, "UPDATE task_occurrence_contract SET retry_attempt=retry_attempt+1 WHERE run_id=?", [run.id.clone().into()])).await.unwrap();
+                db.execute(&Statement::from_sql_and_values(DatabaseBackend::Sqlite, "UPDATE task_occurrence_contract SET retry_attempt=retry_attempt+1 WHERE run_id=?", [run.id.clone().into()])).await.unwrap();
             }
             "trigger" => {
-                db.execute(Statement::from_sql_and_values(
+                db.execute(&Statement::from_sql_and_values(
                     DatabaseBackend::Sqlite,
                     "UPDATE task_trigger SET status='paused' WHERE id=?",
                     [run.trigger_id.clone().unwrap().into()],
@@ -653,7 +653,7 @@ async fn already_committed_delivery_rejects_changed_destination_and_authority() 
             let plan = occurrence.delivery_plan.as_mut().unwrap();
             plan.policy.thread_id = Some("different_destination".into());
             plan.presentation_thread_id = plan.policy.thread_id.clone();
-            db.execute(Statement::from_sql_and_values(
+            db.execute(&Statement::from_sql_and_values(
                 DatabaseBackend::Sqlite,
                 "UPDATE task_occurrence_contract SET delivery_plan_json=? WHERE run_id=?",
                 [
@@ -670,7 +670,7 @@ async fn already_committed_delivery_rejects_changed_destination_and_authority() 
                 .unwrap()
                 .unwrap();
             actor.delivery.disclosure_generation += 1;
-            db.execute(Statement::from_sql_and_values(
+            db.execute(&Statement::from_sql_and_values(
                 DatabaseBackend::Sqlite,
                 "UPDATE task_actor_contract SET delivery_json=? WHERE task_id=?",
                 [
@@ -709,7 +709,7 @@ async fn concurrent_failure_reuses_one_retry_and_does_not_finalize_the_occurrenc
     };
     store
         .database_connection()
-        .execute(Statement::from_sql_and_values(
+        .execute(&Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
             "UPDATE task SET retry_policy_json=? WHERE id=?",
             [
@@ -1011,7 +1011,7 @@ async fn delivery_output_binding_and_candidate_keep_the_original_delivery_identi
         .await
         .unwrap();
     let db = store.database_connection();
-    db.execute(Statement::from_sql_and_values(
+    db.execute(&Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
         "UPDATE turn SET status='completed' WHERE id=?",
         [TEST_PARENT_TURN_ID.into()],
@@ -1150,7 +1150,7 @@ async fn implicit_result_replay_uses_the_original_delivery_snapshot() {
     let db = store.database_connection();
     // The historical builder permits a None run result to fall back to the
     // previous Task result. TaskCompleted then replaces Task.result with None.
-    db.execute(Statement::from_sql_and_values(
+    db.execute(&Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
         "UPDATE task SET result_json=? WHERE id=?",
         [
@@ -1165,7 +1165,7 @@ async fn implicit_result_replay_uses_the_original_delivery_snapshot() {
     let original = deliveries(&runtime, &run).await;
     assert_eq!(original[0].result_snapshot, Some(result.clone()));
     result.summary = Some("later task result".into());
-    db.execute(Statement::from_sql_and_values(
+    db.execute(&Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
         "UPDATE task SET result_json=? WHERE id=?",
         [
