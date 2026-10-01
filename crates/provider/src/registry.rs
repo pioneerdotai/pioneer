@@ -245,7 +245,10 @@ fn redacted_endpoint_error(
         .or_else(|| extract_retry_after_ms(&lower));
     // Provider-supplied codes may themselves contain the endpoint path.
     classification.provider_code =
-        crate::failure::anthropic_stream_error(&error).map(|native| native.code().to_owned());
+        crate::failure::anthropic_stream_error(&error).and_then(|native| {
+            (native != crate::failure::AnthropicStreamError::Unknown)
+                .then(|| native.code().to_owned())
+        });
     let message = if is_network {
         "provider network request failed"
     } else if status.is_some() {

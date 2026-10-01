@@ -75,7 +75,7 @@ impl AnthropicStreamError {
             }
         };
         let mut classification = ProviderFailureClassification::new(class);
-        classification.provider_code = Some(self.code().to_owned());
+        classification.provider_code = (self != Self::Unknown).then(|| self.code().to_owned());
         // Native events have no HTTP failure status: the response was HTTP 200.
         classification
     }
@@ -400,4 +400,25 @@ pub fn extract_retry_after_ms(message_lower: &str) -> Option<u64> {
         .collect::<String>();
     let secs = seconds.parse::<u64>().ok()?;
     Some(secs.saturating_mul(1000))
+}
+
+#[cfg(test)]
+mod native_stream_privacy_tests {
+    use super::*;
+    #[test]
+    fn unknown_native_type_is_safe_rejection_without_invented_provider_code() {
+        let error: anyhow::Error =
+            AnthropicStreamError::from_type(Some("credential=secret")).into();
+        let classification = classify_stream_error(&error).unwrap();
+        assert_eq!(classification.class, ProviderFailureClass::ProviderRejected);
+        assert!(classification.provider_code.is_none());
+        assert!(classification.http_status.is_none());
+        assert!(!format!("{error:?}").contains("secret"));
+        let chat = native_chat_stream_error("unrecognized private payload", None);
+        assert_eq!(
+            classify_stream_error(&chat).unwrap().class,
+            ProviderFailureClass::ProviderRejected
+        );
+        assert!(!format!("{chat:?}").contains("private"));
+    }
 }
