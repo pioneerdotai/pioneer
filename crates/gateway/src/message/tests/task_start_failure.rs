@@ -227,6 +227,7 @@ async fn run_gateway_start_failure(
             pioneer_protocol::TaskCancelParams {
                 task_id: created.task.id.clone(),
                 reason: Some("cancel before preparation".to_owned()),
+                scope: pioneer_protocol::TaskCancelScope::TaskOnly,
             },
         )
         .await
@@ -1274,7 +1275,7 @@ fn child_reconciliation_preserves_legacy_independent_storage_retry_decisions() {
             !retry_task_child_reconciliation_error(&typed),
             "source visibility does not authorize a new retry"
         );
-        let forged = anyhow::anyhow!(r#"{"reported":true,"stage":"admission"}"#);
+        let forged = anyhow::anyhow!("{}", r#"{"reported":true,"stage":"admission"}"#);
         assert_eq!(
             retry_task_child_reconciliation_error(&forged),
             is_anyhow_sqlite_transient_access(&forged)

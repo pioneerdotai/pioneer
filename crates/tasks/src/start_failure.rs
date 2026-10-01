@@ -320,6 +320,7 @@ mod tests {
     #[test]
     fn public_error_json_and_admission_text_cannot_authorize_reporting_or_policy() {
         let source = anyhow::anyhow!(
+            "{}",
             r#"{"code":"PolicyDenied","stage":"admission","correlation_id":"forged","reported":true,"message":"SQLite CANTOPEN (14)"}"#
         );
         let failure = TaskStartFailure::from_error(TaskStartStage::CliAdmission, source);

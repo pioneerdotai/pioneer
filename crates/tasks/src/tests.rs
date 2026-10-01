@@ -8114,6 +8114,7 @@ async fn scheduler_unknown_executor_error_never_saves_json_or_raw_chain() {
     let runtime = runtime().await;
     let executor = Arc::new(StartFailureSystemExecutor {
         failure: std::sync::Mutex::new(Some(anyhow::anyhow!(
+            "{}",
             r#"{"reported":true,"stage":"admission","code":"PolicyDenied","message":"/private SQL secret"}"#
         ))),
         starts: AtomicUsize::new(0),
