@@ -572,11 +572,26 @@ fn voice_frame_error(kind: VoiceErrorKind, message: impl Into<String>) -> VoiceE
         | VoiceErrorKind::SequenceGap
         | VoiceErrorKind::NoSpeech => pioneer_protocol::PublicErrorCode::InvalidInput,
     };
-    let public_error = crate::public_error::map_agent_failure(
+    let public_error = crate::public_error::build_public_error(
         public_code,
         pioneer_protocol::PublicErrorStage::Admission,
-        message.into(),
     );
+    match kind {
+        VoiceErrorKind::Cancelled => {
+            crate::public_error::report_expected_failure(&public_error, "voice_frame", "cancelled")
+        }
+        VoiceErrorKind::MicrophonePermissionBlocked
+        | VoiceErrorKind::DeviceUnavailable
+        | VoiceErrorKind::InvalidSession
+        | VoiceErrorKind::StaleChunk
+        | VoiceErrorKind::SequenceGap
+        | VoiceErrorKind::NoSpeech => crate::public_error::report_expected_failure(
+            &public_error,
+            "voice_frame",
+            "protocol_refusal",
+        ),
+        _ => crate::public_error::report_agent_failure(&public_error, message.into()),
+    }
     VoiceError {
         kind,
         message: public_error.message.clone(),
@@ -584,11 +599,15 @@ fn voice_frame_error(kind: VoiceErrorKind, message: impl Into<String>) -> VoiceE
     }
 }
 
-fn voice_frame_resource_error(kind: VoiceErrorKind, message: impl Into<String>) -> VoiceError {
-    let public_error = crate::public_error::map_agent_failure(
+fn voice_frame_resource_error(kind: VoiceErrorKind, _message: impl Into<String>) -> VoiceError {
+    let public_error = crate::public_error::build_public_error(
         pioneer_protocol::PublicErrorCode::ResourceExhausted,
         pioneer_protocol::PublicErrorStage::Admission,
-        message.into(),
+    );
+    crate::public_error::report_expected_failure(
+        &public_error,
+        "voice_frame",
+        "resource_limit_exceeded",
     );
     VoiceError {
         kind,
@@ -600,6 +619,28 @@ fn voice_frame_resource_error(kind: VoiceErrorKind, message: impl Into<String>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_protocol_and_resource_refusals_do_not_create_error_events() {
+        use crate::public_error::test_support::capture_events;
+        let (_, events) = capture_events(|| {
+            let invalid = map_voice_frame_decode_error(VoiceFrameDecodeError::InvalidMagic);
+            assert_eq!(invalid.kind, VoiceErrorKind::InvalidSession);
+            assert_eq!(
+                invalid.public_error.unwrap().code,
+                pioneer_protocol::PublicErrorCode::InvalidInput
+            );
+            let limit = voice_frame_resource_error(
+                VoiceErrorKind::InvalidSession,
+                "bearer-token /private/path",
+            );
+            assert_eq!(
+                limit.public_error.unwrap().code,
+                pioneer_protocol::PublicErrorCode::ResourceExhausted
+            );
+        });
+        assert!(events.is_empty());
+    }
 
     #[test]
     fn binary_frame_kind_detects_skill_upload_magic() {

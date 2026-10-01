@@ -34939,6 +34939,255 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_write_recovery_is_classified_and_legacy_revalidation_is_bounded() {
+        for (code, checkpoint, delay, expected, revalidated_code) in [
+            (
+                "memory.post_turn_extractor.write_invalid_input",
+                true,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_domain_rejected",
+                true,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_unclassified",
+                true,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_storage_transient",
+                true,
+                3_602,
+                1,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                true,
+                3_602,
+                1,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                true,
+                3_602,
+                1,
+                "memory.post_turn_extractor.write_storage_transient",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                false,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                true,
+                3_599,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                true,
+                86_401,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.legacy_write_revalidate",
+                true,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+        ] {
+            let timestamp = 1_700_040_000;
+            let workspace_id = "ws_post_turn_reopen";
+            let thread_id = "thr_post_turn_reopen";
+            let turn_id = "turn_post_turn_reopen";
+            let (store, _, mut terminal_turn) =
+                test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+            let store = store.with_maintenance_access();
+            let effect_id = format!("{turn_id}:terminal-effect:post-turn");
+            store
+                .prepare_native_terminal_effects(
+                    pioneer_protocol::NativeTerminalEffectPreparation {
+                        batch_id: format!("{turn_id}:batch:post-turn-reopen"),
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        runtime_generation: 1,
+                        effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+                            effect_id: effect_id.clone(),
+                            effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
+                            gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                            payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                                request: serde_json::json!({}),
+                                runtime_snapshot: serde_json::json!({}),
+                            },
+                            max_attempts: 1,
+                        }],
+                    },
+                    timestamp,
+                )
+                .await
+                .expect("post-turn effect should prepare");
+            terminal_turn.status = TurnStatus::Completed;
+            store
+                .materialize_turn_completed(
+                    TurnCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn: terminal_turn,
+                    },
+                    timestamp + 1,
+                )
+                .await
+                .expect("terminal commit should activate post-turn effect");
+
+            let first = store
+                .claim_due_native_terminal_effects(timestamp + 1, 10, 1)
+                .await
+                .expect("first attempt should claim")
+                .pop()
+                .expect("first attempt must exist");
+            if checkpoint {
+                store.store_native_terminal_effect_handler_checkpoint(
+                    &effect_id, &first.claim_token, r#"{"schema_version":1,"raw_json":"{\"facts\":[]}","model":"model","model_provider":"provider"}"#, timestamp + 1,
+                ).await.unwrap();
+            }
+            assert!(
+                store
+                    .fail_native_terminal_effect(
+                        effect_id.as_str(),
+                        first.claim_token.as_str(),
+                        code,
+                        "safe write failure",
+                        matches!(
+                            code,
+                            "memory.post_turn_extractor.write_storage_transient"
+                                | "memory.post_turn_extractor.write_failed"
+                        ),
+                        timestamp + 2,
+                        timestamp + 1,
+                    )
+                    .await
+                    .expect("exhausted transient failure should persist")
+            );
+            assert_eq!(
+                store
+                    .native_terminal_effect_status(effect_id.as_str())
+                    .await
+                    .expect("status should load")
+                    .expect("effect should exist")
+                    .status,
+                "unresolved"
+            );
+            assert_eq!(
+                store
+                    .requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 0)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                store
+                    .requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 1)
+                    .await
+                    .unwrap(),
+                expected,
+                "{code}, delay={delay}"
+            );
+            if expected == 0 {
+                assert!(
+                    store
+                        .claim_due_native_terminal_effects(timestamp + delay, 10, 1)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                continue;
+            }
+            let reopened = store
+                .claim_due_native_terminal_effects(timestamp + delay, 10, 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(reopened.effect_id, effect_id);
+            if code == "memory.post_turn_extractor.write_failed" {
+                assert_eq!(
+                    reopened.max_attempts, 1,
+                    "legacy revalidation must not expand the budget"
+                );
+                assert_eq!(reopened.attempt_count, reopened.max_attempts);
+                assert_eq!(
+                    store
+                        .native_terminal_effect_status(&effect_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .last_error_code
+                        .as_deref(),
+                    Some("memory.post_turn_extractor.legacy_write_revalidate")
+                );
+                assert!(
+                    store
+                        .native_terminal_effect_handler_checkpoint(
+                            &effect_id,
+                            &reopened.claim_token
+                        )
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                // The revalidated cause replaces the legacy marker and stays terminal.
+                store
+                    .fail_native_terminal_effect(
+                        &effect_id,
+                        &reopened.claim_token,
+                        revalidated_code,
+                        "safe classified failure",
+                        revalidated_code == "memory.post_turn_extractor.write_storage_transient",
+                        timestamp + delay + 1,
+                        timestamp + delay,
+                    )
+                    .await
+                    .unwrap();
+                let reclassified_recovery = store
+                    .requeue_retryable_unresolved_native_terminal_effects(
+                        timestamp + delay + 3_601,
+                        1,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    reclassified_recovery,
+                    u64::from(
+                        revalidated_code == "memory.post_turn_extractor.write_storage_transient",
+                    )
+                );
+            } else {
+                assert_eq!(
+                    reopened.max_attempts, 8,
+                    "preserve existing transient recovery budget"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn native_terminal_effect_retention_is_bounded_and_preserves_recovery_authority() {
         let workspace_id = "ws_terminal_effect_retention";
         let thread_id = "thr_terminal_effect_retention";
