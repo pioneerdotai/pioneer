@@ -173,7 +173,7 @@ impl HookHandler for MemoryPostTurnExtractorHook {
 
         let extraction = match extract_post_turn_memory_once(
             extractor_provider.as_ref(),
-            extractor_context,
+            extractor_context.clone(),
             extractor_request,
             &config,
         )
@@ -183,10 +183,27 @@ impl HookHandler for MemoryPostTurnExtractorHook {
             Err(MemoryPostTurnExtractorFailure::ProviderFailed(error)) => return Err(error),
             Err(MemoryPostTurnExtractorFailure::InvalidJson(error)) => {
                 if durable_terminal_effect.is_some() {
-                    return Err(memory_hook_error(
+                    let mut hook_error = memory_hook_error(
                         "memory.post_turn_extractor.invalid_json",
                         format!("memory post-turn extractor returned invalid JSON: {error}"),
-                    ));
+                    )
+                    .with_safe_for_user(true);
+                    for (key, value) in [
+                        ("provider", extractor_context.model_provider.clone()),
+                        ("model", extractor_context.model.clone()),
+                        ("failure_stage", Some("response_json_parse".to_owned())),
+                        ("failure_class", Some(error.category.as_str().to_owned())),
+                        ("parse_category", Some(error.category.as_str().to_owned())),
+                        ("parse_line", Some(error.line.to_string())),
+                        ("parse_column", Some(error.column.to_string())),
+                    ] {
+                        if let Some(value) = value {
+                            hook_error.metadata.insert(hook_metadata_key(key), value);
+                        }
+                    }
+                    // An alternate provider has not established fresh provenance.
+                    // Only Gateway's pre-checkpoint fresh failure authorizes retry.
+                    return Err(hook_error);
                 }
                 response.diagnostics.push(memory_safe_warning_diagnostic(
                     "memory.post_turn_extractor.invalid_json",
@@ -208,6 +225,8 @@ impl HookHandler for MemoryPostTurnExtractorHook {
             .diagnostics
             .extend(hook_diagnostics_from_strings(parsed.diagnostics.as_slice()));
 
+        let mut write_failure: Option<(crate::MemoryWriteFailure, usize)> = None;
+        let mut failure_counts = BTreeMap::new();
         for (index, fact) in parsed.facts.into_iter().enumerate() {
             let Some(params) = memory_semantic_write_params_from_extracted_fact(
                 index,
@@ -237,35 +256,71 @@ impl HookHandler for MemoryPostTurnExtractorHook {
                 }
                 Err(error) => {
                     stats.write_failure_count += 1;
+                    *failure_counts.entry(error.class()).or_insert(0_usize) += 1;
+                    // A permanent rejection must not hide another fact's transient failure.
+                    if write_failure.is_none() || error.retryable() {
+                        write_failure = Some((error, index));
+                    }
                     tracing::warn!(
                         target: "pioneer::memory_post_turn_extractor",
                         stage = "semantic_write",
                         durable = durable_terminal_effect.is_some(),
                         extractor_provider = ?extractor_model_provider.as_deref(),
                         extractor_model = ?extractor_model.as_deref(),
-                        fact_index = index,
-                        error = %error,
+                        fact_index = index.min(255),
+                        failure_class = error.class(),
+                        failure_stage = "semantic_write",
                         "memory post-turn extractor semantic write failed"
                     );
-                    response.diagnostics.push(memory_safe_warning_diagnostic(
-                        "memory.post_turn_extractor.write_failed",
+                    let mut diagnostic = memory_safe_warning_diagnostic(
+                        error.code(),
                         "memory post-turn extractor semantic write failed",
-                    ));
+                    );
+                    for (key, value) in semantic_write_hook_error(
+                        error,
+                        index,
+                        extractor_model.as_deref(),
+                        extractor_model_provider.as_deref(),
+                        &stats,
+                    )
+                    .metadata
+                    {
+                        diagnostic.metadata.insert(key, HookValue::Text(value));
+                    }
+                    response.diagnostics.push(diagnostic);
                 }
             }
         }
 
-        if durable_terminal_effect.is_some() && stats.write_failure_count > 0 {
-            return Err(memory_retryable_safe_hook_error(
-                "memory.post_turn_extractor.write_failed",
-                "memory post-turn extractor failed to persist one or more semantic writes",
-            ));
+        if let Some((failure, index)) = write_failure {
+            let mut error = semantic_write_hook_error(
+                failure,
+                index,
+                extractor_model.as_deref(),
+                extractor_model_provider.as_deref(),
+                &stats,
+            );
+            for (class, count) in failure_counts {
+                error.metadata.insert(
+                    HookMetadataKey::new(format!("write_failure_{class}_count"))
+                        .expect("bounded static failure class key"),
+                    count.to_string(),
+                );
+            }
+            if durable_terminal_effect.is_some() {
+                return Err(error);
+            }
+            for (key, value) in error.metadata {
+                response.metadata.insert(key, HookValue::Text(value));
+            }
         }
 
         response
             .diagnostics
             .push(memory_post_turn_stats_diagnostic(&stats));
-        response.metadata = memory_post_turn_stats_metadata(&stats);
+        response
+            .metadata
+            .extend(memory_post_turn_stats_metadata(&stats));
         Ok(response)
     }
 }
@@ -278,7 +333,7 @@ struct MemoryPostTurnExtractionOutcome {
 
 enum MemoryPostTurnExtractorFailure {
     ProviderFailed(HookError),
-    InvalidJson(String),
+    InvalidJson(MemoryPostTurnResponseFormatError),
 }
 
 async fn extract_post_turn_memory_once(
@@ -329,4 +384,44 @@ fn post_turn_extractor_response_sha256(response: &str) -> String {
     use sha2::{Digest, Sha256};
 
     hex::encode(Sha256::digest(response.as_bytes()))
+}
+
+fn semantic_write_hook_error(
+    failure: crate::MemoryWriteFailure,
+    fact_index: usize,
+    model: Option<&str>,
+    provider: Option<&str>,
+    stats: &MemoryPostTurnExtractorStats,
+) -> HookError {
+    let mut error = memory_hook_error(
+        failure.code(),
+        "memory post-turn extractor failed to persist one or more semantic writes",
+    )
+    .with_safe_for_user(true)
+    .with_retryable(failure.retryable());
+    for (key, value) in [
+        ("failure_class", failure.class().to_owned()),
+        ("failure_stage", "semantic_write".to_owned()),
+        ("fact_index", fact_index.min(255).to_string()),
+        ("write_failure_count", stats.write_failure_count.to_string()),
+        ("write_success_count", stats.write_success_count.to_string()),
+        (
+            "validation_rejected_count",
+            stats.validation_rejected_count.to_string(),
+        ),
+    ] {
+        error.metadata.insert(
+            HookMetadataKey::new(key).expect("static metadata key"),
+            value,
+        );
+    }
+    for (key, value, limit) in [("model", model, 160), ("provider", provider, 80)] {
+        if let Some(value) = value {
+            error.metadata.insert(
+                HookMetadataKey::new(key).expect("static metadata key"),
+                value.trim().chars().take(limit).collect(),
+            );
+        }
+    }
+    error
 }

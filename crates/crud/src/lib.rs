@@ -7,8 +7,12 @@ mod memory;
 mod model_history;
 mod projector;
 mod repositories;
+mod task_delivery_lifecycle;
 mod task_events;
 mod task_terminal;
+#[cfg(any(test, feature = "test-support"))]
+pub use task_delivery_lifecycle::TaskDeliveryCommitTestKind;
+pub use task_delivery_lifecycle::{TaskDeliveryTransition, TaskDeliveryTransitionOutcome};
 pub use task_terminal::{
     PreparedTaskTerminalTransition, TaskTerminalCommitOutcome, TaskTerminalCommitStatus,
     TaskTerminalConflict,
@@ -941,7 +945,9 @@ pub use crate::repositories::execution_admission_lease::{
     ExecutionAdmissionClass, ExecutionAdmissionQuotaPolicy, ExecutionQuotaBucket,
     ExecutionQuotaCeilings, NewExecutionAdmissionLease,
 };
-pub use crate::repositories::native_terminal_effect_outbox::NativeTerminalEffectStats;
+pub use crate::repositories::native_terminal_effect_outbox::{
+    HandlerCheckpointInvalid, NativeTerminalEffectStats,
+};
 pub use crate::repositories::turn_admission::NewTurnAdmission;
 pub use crate::repositories::turn_execution::{
     NewTurnExecution, TurnExecutionRecord, TurnExecutionStatus, TurnExecutorKind,
@@ -2569,6 +2575,10 @@ pub struct TurnMcpProjectionRecord {
 
 #[derive(Clone)]
 pub struct CrudStore {
+    #[cfg(any(test, feature = "test-support"))]
+    delivery_commit_test_gate: std::sync::Arc<
+        std::sync::Mutex<Option<task_delivery_lifecycle::TaskDeliveryCommitTestGate>>,
+    >,
     connection: SqliteDatabase,
     projector: TurnProjector,
     task_projector: TaskProjector,
@@ -4149,6 +4159,8 @@ impl CrudStore {
     pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
         Self {
             connection: connection.into(),
+            #[cfg(any(test, feature = "test-support"))]
+            delivery_commit_test_gate: std::sync::Arc::new(std::sync::Mutex::new(None)),
             projector: TurnProjector::new(),
             task_projector: TaskProjector::new(),
         }
@@ -24698,9 +24710,7 @@ impl CrudStore {
                                 && native_terminal_effect_outbox::payload_sha256_hex(checkpoint)
                                     == expected_sha256 => {}
                         _ => {
-                            bail!(
-                                "native terminal-effect handler checkpoint failed integrity validation"
-                            );
+                            return Err(HandlerCheckpointInvalid { class: "checkpoint_integrity" }.into());
                         }
                     }
                     if !matches!(
@@ -24746,7 +24756,15 @@ impl CrudStore {
                 })();
                 match decoded {
                     Ok(record) => valid.push(record),
-                    Err(_error) => {
+                    Err(error) => {
+                        // Claim validation serves every terminal-effect kind. Hook ownership
+                        // is established by the executor, not by this generic quarantine path.
+                        let code = "invalid_persisted_effect";
+                        let message = if let Some(invalid) = error.downcast_ref::<HandlerCheckpointInvalid>() {
+                            format!("persisted checkpoint failed integrity validation; failure_stage=checkpoint_integrity; failure_class={}", invalid.class)
+                        } else {
+                            "persisted native terminal-effect row failed schema validation".to_owned()
+                        };
                         // One malformed durable row must not poison every
                         // valid claim in the bounded batch. Quarantine it with
                         // a typed, non-payload diagnostic under the same claim
@@ -24755,8 +24773,8 @@ impl CrudStore {
                             &self.connection,
                             effect_id.as_str(),
                             claimed.claim_token.as_str(),
-                            "invalid_persisted_effect",
-                            "persisted native terminal-effect row failed schema validation",
+                            code,
+                            &message,
                             false,
                             now,
                             now,
@@ -29628,11 +29646,47 @@ impl CrudStore {
         events: Vec<task_event::PreparedTaskEvent>,
         event_timestamp_secs: i64,
     ) -> Result<Vec<AppendedTaskEvent>> {
+        self.append_task_events_in_connection_with_delivery_policy(
+            db,
+            events,
+            event_timestamp_secs,
+            false,
+        )
+        .await
+    }
+
+    async fn append_task_events_with_delivery_cancellation<C: ConnectionTrait + Sync>(
+        &self,
+        db: &C,
+        events: Vec<task_event::PreparedTaskEvent>,
+        at: i64,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        self.append_task_events_in_connection_with_delivery_policy(db, events, at, true)
+            .await
+    }
+
+    async fn append_task_events_in_connection_with_delivery_policy<C: ConnectionTrait + Sync>(
+        &self,
+        db: &C,
+        events: Vec<task_event::PreparedTaskEvent>,
+        event_timestamp_secs: i64,
+        delivery_cancellation: bool,
+    ) -> Result<Vec<AppendedTaskEvent>> {
         let created_at = unix_to_datetime(event_timestamp_secs);
         let mut appended_events = Vec::with_capacity(events.len());
         let mut batch_run_turns = HashMap::<String, PreparedLegacyTaskRunTurn>::new();
 
         for event in events {
+            let mut event = if delivery_cancellation {
+                let Some(event) =
+                    task_delivery_lifecycle::preflight_cancellation(db, event).await?
+                else {
+                    continue;
+                };
+                event
+            } else {
+                event
+            };
             // Only state-independent work (validation, serialization and CPU
             // projection preparation) is performed before writer admission.
             // Database-dependent preparation is deliberately sequential here:
@@ -29646,15 +29700,20 @@ impl CrudStore {
                     batch_run_turns.insert(turn.run_id.clone(), turn);
                 }
             }
-            let delivery_authority = match event.payload() {
-                TaskEventPayload::DeliveryQueued { delivery }
-                | TaskEventPayload::DeliveryStarted { delivery, .. }
-                | TaskEventPayload::DeliveryDelivered { delivery, .. }
-                | TaskEventPayload::DeliveryFailed { delivery, .. }
-                | TaskEventPayload::DeliveryCancelled { delivery, .. } => Some(
-                    crate::task_projector::prepare_task_delivery_authority(db, delivery).await?,
-                ),
-                _ => None,
+            let delivery_authority = if let Some(authority) = event.take_delivery_authority() {
+                Some(authority)
+            } else {
+                match event.payload() {
+                    TaskEventPayload::DeliveryQueued { delivery }
+                    | TaskEventPayload::DeliveryStarted { delivery, .. }
+                    | TaskEventPayload::DeliveryDelivered { delivery, .. }
+                    | TaskEventPayload::DeliveryFailed { delivery, .. }
+                    | TaskEventPayload::DeliveryCancelled { delivery, .. } => Some(
+                        crate::task_projector::prepare_task_delivery_authority(db, delivery)
+                            .await?,
+                    ),
+                    _ => None,
+                }
             };
             let event = event.preflight_idempotency(db).await?;
             let (gate_resolution, legacy_candidate, legacy_review) = self
@@ -33938,6 +33997,56 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_terminal_effect_checkpoint_is_quarantined_before_handler_execution() {
+        assert_terminal_checkpoint_quarantine(serde_json::json!({"schema_version": 1}), false)
+            .await;
+    }
+
+    fn checkpoint_test_hook_snapshot(hook_id: &str) -> serde_json::Value {
+        let hook_id = pioneer_hooks::HookId::new(hook_id).unwrap();
+        let subscription = pioneer_hooks::HookSubscription::new(
+            pioneer_hooks::HookSubscriptionId::new("test.post_turn").unwrap(),
+            hook_id.clone(),
+            pioneer_hooks::HookPhase::TurnPostTurn,
+        );
+        let descriptor = pioneer_hooks::HookHandlerDescriptor {
+            hook_id,
+            hook_kind: pioneer_hooks::HookKind::new("memory").unwrap(),
+            supported_phases: vec![pioneer_hooks::HookPhase::TurnPostTurn],
+            version: 1,
+            input_contract_version: 1,
+            output_contract_version: 1,
+            default_execution_policy: Default::default(),
+            default_failure_policy: pioneer_hooks::HookFailurePolicy::BestEffort,
+            capabilities: pioneer_hooks::HookCapabilities::new([
+                pioneer_hooks::HookCapability::new("idempotent_side_effect").unwrap(),
+            ]),
+        };
+        serde_json::json!({"schema_version":1, "subscriptions":[subscription], "handlers":[descriptor]})
+    }
+
+    #[tokio::test]
+    async fn checkpoint_quarantine_is_generic_even_with_memory_subscription() {
+        assert_terminal_checkpoint_quarantine(
+            checkpoint_test_hook_snapshot("memory.post_turn_extractor"),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_quarantine_does_not_attribute_other_hook_or_kind_to_memory() {
+        assert_terminal_checkpoint_quarantine(
+            checkpoint_test_hook_snapshot("test.other_post_turn"),
+            false,
+        )
+        .await;
+        assert_terminal_checkpoint_quarantine(serde_json::json!({}), true).await;
+    }
+
+    async fn assert_terminal_checkpoint_quarantine(
+        runtime_snapshot: serde_json::Value,
+        cleanup: bool,
+    ) {
         let timestamp = 1_700_005_250;
         let workspace_id = "ws_terminal_effect_bad_checkpoint";
         let thread_id = "thr_terminal_effect_bad_checkpoint";
@@ -33953,16 +34062,52 @@ mod tests {
                     thread_id: thread_id.to_owned(),
                     turn_id: turn_id.to_owned(),
                     runtime_generation: 1,
-                    effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
-                        effect_id: effect_id.clone(),
-                        effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
-                        gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
-                        payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
-                            request: serde_json::json!({"phase": "turn.post_turn"}),
-                            runtime_snapshot: serde_json::json!({"schema_version": 1}),
+                    effects: vec![
+                        pioneer_protocol::NativeTerminalEffectSpec {
+                            effect_id: effect_id.clone(),
+                            effect_kind: if cleanup {
+                                pioneer_protocol::NativeTerminalEffectKind::AttachedTaskCleanup
+                            } else {
+                                pioneer_protocol::NativeTerminalEffectKind::PostTurnHook
+                            },
+                            gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                            payload: if cleanup {
+                                pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
+                                    reason: "parent turn completed".to_owned(),
+                                    runtime_contract: "pioneer.test.attached-task-cleanup.v1"
+                                        .to_owned(),
+                                }
+                            } else {
+                                pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                                    request: serde_json::json!({"phase": "turn.post_turn"}),
+                                    runtime_snapshot,
+                                }
+                            },
+                            max_attempts: 3,
                         },
-                        max_attempts: 3,
-                    }],
+                        pioneer_protocol::NativeTerminalEffectSpec {
+                            effect_id: format!("{turn_id}:terminal-effect:healthy"),
+                            effect_kind: if cleanup {
+                                pioneer_protocol::NativeTerminalEffectKind::PostTurnHook
+                            } else {
+                                pioneer_protocol::NativeTerminalEffectKind::AttachedTaskCleanup
+                            },
+                            gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                            payload: if cleanup {
+                                pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                                    request: serde_json::json!({}),
+                                    runtime_snapshot: serde_json::json!({}),
+                                }
+                            } else {
+                                pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
+                                    reason: "completed".to_owned(),
+                                    runtime_contract: "pioneer.test.attached-task-cleanup.v1"
+                                        .to_owned(),
+                                }
+                            },
+                            max_attempts: 3,
+                        },
+                    ],
                 },
                 timestamp,
             )
@@ -33988,7 +34133,11 @@ mod tests {
             )
             .col_expr(
                 pioneer_entity::native_terminal_effect_outbox::Column::HandlerCheckpointSha256,
-                Expr::value(Some("0".repeat(64))),
+                Expr::value(Some(if cleanup {
+                    native_terminal_effect_outbox::payload_sha256_hex(r#"{"schema_version":1}"#)
+                } else {
+                    "0".repeat(64)
+                })),
             )
             .filter(
                 pioneer_entity::native_terminal_effect_outbox::Column::EffectId
@@ -33998,13 +34147,28 @@ mod tests {
             .await
             .expect("fault injection should corrupt the durable checkpoint hash");
 
+        let healthy = store
+            .claim_due_native_terminal_effects(timestamp + 1, 10, 10)
+            .await
+            .expect("corrupt checkpoint should be quarantined without poisoning its batch");
+        assert_eq!(
+            healthy.len(),
+            1,
+            "only the healthy obligation may reach a handler"
+        );
+        assert_eq!(
+            healthy[0].effect_id,
+            format!("{turn_id}:terminal-effect:healthy")
+        );
         assert!(
             store
-                .claim_due_native_terminal_effects(timestamp + 1, 10, 1)
+                .complete_native_terminal_effect(
+                    &healthy[0].effect_id,
+                    &healthy[0].claim_token,
+                    timestamp + 2
+                )
                 .await
-                .expect("corrupt checkpoint should be quarantined")
-                .is_empty(),
-            "a corrupt checkpoint must never reach a hook handler"
+                .unwrap()
         );
         let quarantined = store
             .native_terminal_effect_status(effect_id.as_str())
@@ -34015,6 +34179,31 @@ mod tests {
         assert_eq!(
             quarantined.last_error_code.as_deref(),
             Some("invalid_persisted_effect")
+        );
+        let persisted =
+            pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(effect_id)
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(persisted.next_run_at.is_none());
+        assert_eq!(
+            persisted.handler_checkpoint_json.as_deref(),
+            Some(r#"{"schema_version":1}"#)
+        );
+        assert_eq!(
+            store
+                .requeue_retryable_unresolved_native_terminal_effects(timestamp + 7200, 10)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            store
+                .claim_due_native_terminal_effects(timestamp + 7200, 10, 10)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -34802,6 +34991,18 @@ mod tests {
 
     #[tokio::test]
     async fn retryable_post_turn_effect_reopens_after_bounded_cooldown() {
+        for code in [
+            "memory.post_turn_extractor.provider_network_transient",
+            "memory.post_turn_extractor.provider_stream_stall",
+            "memory.post_turn_extractor.provider_stream_truncated",
+            "memory.post_turn_extractor.provider_rate_limited",
+            "memory.post_turn_extractor.provider_5xx",
+        ] {
+            assert_neighbor_post_turn_effect_reopens(code).await;
+        }
+    }
+
+    async fn assert_neighbor_post_turn_effect_reopens(code: &str) {
         let timestamp = 1_700_040_000;
         let workspace_id = "ws_post_turn_reopen";
         let thread_id = "thr_post_turn_reopen";
@@ -34856,7 +35057,7 @@ mod tests {
                 .fail_native_terminal_effect(
                     effect_id.as_str(),
                     first.claim_token.as_str(),
-                    "memory.post_turn_extractor.provider_network_transient",
+                    code,
                     "provider request failed (network_transient)",
                     true,
                     timestamp + 2,
@@ -34891,6 +35092,255 @@ mod tests {
         assert_eq!(reopened.effect_id, effect_id);
         assert_eq!(reopened.attempt_count, 1);
         assert_eq!(reopened.max_attempts, 8);
+    }
+
+    #[tokio::test]
+    async fn memory_write_recovery_is_classified_and_legacy_revalidation_is_bounded() {
+        for (code, checkpoint, delay, expected, revalidated_code) in [
+            (
+                "memory.post_turn_extractor.write_invalid_input",
+                true,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_domain_rejected",
+                true,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_unclassified",
+                true,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_storage_transient",
+                true,
+                3_602,
+                1,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                true,
+                3_602,
+                1,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                true,
+                3_602,
+                1,
+                "memory.post_turn_extractor.write_storage_transient",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                false,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                true,
+                3_599,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                true,
+                86_401,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.legacy_write_revalidate",
+                true,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+        ] {
+            let timestamp = 1_700_040_000;
+            let workspace_id = "ws_post_turn_reopen";
+            let thread_id = "thr_post_turn_reopen";
+            let turn_id = "turn_post_turn_reopen";
+            let (store, _, mut terminal_turn) =
+                test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+            let store = store.with_maintenance_access();
+            let effect_id = format!("{turn_id}:terminal-effect:post-turn");
+            store
+                .prepare_native_terminal_effects(
+                    pioneer_protocol::NativeTerminalEffectPreparation {
+                        batch_id: format!("{turn_id}:batch:post-turn-reopen"),
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        runtime_generation: 1,
+                        effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+                            effect_id: effect_id.clone(),
+                            effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
+                            gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                            payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                                request: serde_json::json!({}),
+                                runtime_snapshot: serde_json::json!({}),
+                            },
+                            max_attempts: 1,
+                        }],
+                    },
+                    timestamp,
+                )
+                .await
+                .expect("post-turn effect should prepare");
+            terminal_turn.status = TurnStatus::Completed;
+            store
+                .materialize_turn_completed(
+                    TurnCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn: terminal_turn,
+                    },
+                    timestamp + 1,
+                )
+                .await
+                .expect("terminal commit should activate post-turn effect");
+
+            let first = store
+                .claim_due_native_terminal_effects(timestamp + 1, 10, 1)
+                .await
+                .expect("first attempt should claim")
+                .pop()
+                .expect("first attempt must exist");
+            if checkpoint {
+                store.store_native_terminal_effect_handler_checkpoint(
+                    &effect_id, &first.claim_token, r#"{"schema_version":1,"raw_json":"{\"facts\":[]}","model":"model","model_provider":"provider"}"#, timestamp + 1,
+                ).await.unwrap();
+            }
+            assert!(
+                store
+                    .fail_native_terminal_effect(
+                        effect_id.as_str(),
+                        first.claim_token.as_str(),
+                        code,
+                        "safe write failure",
+                        matches!(
+                            code,
+                            "memory.post_turn_extractor.write_storage_transient"
+                                | "memory.post_turn_extractor.write_failed"
+                        ),
+                        timestamp + 2,
+                        timestamp + 1,
+                    )
+                    .await
+                    .expect("exhausted transient failure should persist")
+            );
+            assert_eq!(
+                store
+                    .native_terminal_effect_status(effect_id.as_str())
+                    .await
+                    .expect("status should load")
+                    .expect("effect should exist")
+                    .status,
+                "unresolved"
+            );
+            assert_eq!(
+                store
+                    .requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 0)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                store
+                    .requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 1)
+                    .await
+                    .unwrap(),
+                expected,
+                "{code}, delay={delay}"
+            );
+            if expected == 0 {
+                assert!(
+                    store
+                        .claim_due_native_terminal_effects(timestamp + delay, 10, 1)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                continue;
+            }
+            let reopened = store
+                .claim_due_native_terminal_effects(timestamp + delay, 10, 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(reopened.effect_id, effect_id);
+            if code == "memory.post_turn_extractor.write_failed" {
+                assert_eq!(
+                    reopened.max_attempts, 1,
+                    "legacy revalidation must not expand the budget"
+                );
+                assert_eq!(reopened.attempt_count, reopened.max_attempts);
+                assert_eq!(
+                    store
+                        .native_terminal_effect_status(&effect_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .last_error_code
+                        .as_deref(),
+                    Some("memory.post_turn_extractor.legacy_write_revalidate")
+                );
+                assert!(
+                    store
+                        .native_terminal_effect_handler_checkpoint(
+                            &effect_id,
+                            &reopened.claim_token
+                        )
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                // The revalidated cause replaces the legacy marker and stays terminal.
+                store
+                    .fail_native_terminal_effect(
+                        &effect_id,
+                        &reopened.claim_token,
+                        revalidated_code,
+                        "safe classified failure",
+                        revalidated_code == "memory.post_turn_extractor.write_storage_transient",
+                        timestamp + delay + 1,
+                        timestamp + delay,
+                    )
+                    .await
+                    .unwrap();
+                let reclassified_recovery = store
+                    .requeue_retryable_unresolved_native_terminal_effects(
+                        timestamp + delay + 3_601,
+                        1,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    reclassified_recovery,
+                    u64::from(
+                        revalidated_code == "memory.post_turn_extractor.write_storage_transient",
+                    )
+                );
+            } else {
+                assert_eq!(
+                    reopened.max_attempts, 8,
+                    "preserve existing transient recovery budget"
+                );
+            }
+        }
     }
 
     #[tokio::test]

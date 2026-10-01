@@ -24,7 +24,7 @@ use crate::trigger::TaskTriggerCalculator;
 use anyhow::{Context, anyhow, bail};
 use pioneer_crud::{
     AppendedTaskEvent, ArtifactBindingTargetRecord, CrudStore, NewTaskRunConversationSnapshot,
-    TaskRootAccessFilter,
+    TaskDeliveryTransition, TaskDeliveryTransitionOutcome, TaskRootAccessFilter,
 };
 use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactRole, TASK_COMPOSER_WORK_VERSION, Task,
@@ -2443,7 +2443,6 @@ impl TaskService {
         let plan = plan_cancellation(&tree, params.scope);
         let mut events = Vec::new();
         let mut cancelled_runs = Vec::new();
-        let mut cancelled_deliveries = Vec::new();
         let mut cancelled_executions = Vec::new();
 
         for task in &plan.cancelled_tasks {
@@ -2456,7 +2455,6 @@ impl TaskService {
                 now,
                 &mut events,
                 &mut cancelled_runs,
-                &mut cancelled_deliveries,
                 &mut cancelled_executions,
             )
             .await?;
@@ -2486,8 +2484,16 @@ impl TaskService {
         }
 
         let appended = self
-            .append_events_with_optional_agent_action(events, now, agent_action)
+            .projector
+            .append_cancellation_events(events, now, agent_action)
             .await?;
+        let cancelled_deliveries = appended
+            .iter()
+            .filter_map(|event| match &event.payload {
+                TaskEventPayload::DeliveryCancelled { delivery, .. } => Some(delivery.clone()),
+                _ => None,
+            })
+            .collect();
         for run in &cancelled_runs {
             let mut occurrence = self
                 .store
@@ -3383,23 +3389,23 @@ impl TaskService {
         &self,
         delivery_id: &str,
         started_at: i64,
-    ) -> TaskRuntimeResult<Option<(TaskDelivery, TaskDeliveryAttempt)>> {
-        let Some(mut delivery) = self.store.get_task_delivery(delivery_id).await? else {
-            return Ok(None);
-        };
-        if delivery.status != TaskDeliveryStatus::Pending {
-            return Ok(None);
-        }
-        if let Some(next_attempt_at) = delivery.next_attempt_at
-            && next_attempt_at > started_at
-        {
-            return Ok(None);
-        }
+    ) -> TaskRuntimeResult<TaskDeliveryTransitionOutcome<(TaskDelivery, TaskDeliveryAttempt)>> {
+        let mut delivery = self
+            .store
+            .get_task_delivery(delivery_id)
+            .await?
+            .context("delivery start has no durable delivery")?;
         self.validate_delivery_boundary(&delivery).await?;
         let attempt_number = delivery.attempt_count.saturating_add(1);
         delivery.status = TaskDeliveryStatus::Delivering;
         delivery.attempt_count = attempt_number;
         delivery.next_attempt_at = None;
+        // Prepare a start candidate even for a terminal snapshot; only writer
+        // preflight can grant it. Terminal receipt fields remain durable and
+        // this candidate is discarded without an event when it loses.
+        delivery.delivered_turn_id = None;
+        delivery.delivered_notification_id = None;
+        delivery.delivered_at = None;
         delivery.updated_at = started_at;
         let attempt = TaskDeliveryAttempt {
             id: generate_id(ID_LEN),
@@ -3412,17 +3418,26 @@ impl TaskService {
             error: None,
             response_fingerprint: None,
         };
-        let appended = self
-            .append_event(
+        let outcome = self
+            .projector
+            .transition_delivery(
                 TaskEventPayload::DeliveryStarted {
                     delivery: delivery.clone(),
                     attempt: attempt.clone(),
                 },
+                TaskDeliveryTransition::Start,
                 started_at,
             )
             .await?;
-        self.event_bus.publish(appended).await;
-        Ok(Some((delivery, attempt)))
+        match outcome {
+            TaskDeliveryTransitionOutcome::Applied(appended) => {
+                self.event_bus.publish(appended).await;
+                Ok(TaskDeliveryTransitionOutcome::Applied((delivery, attempt)))
+            }
+            TaskDeliveryTransitionOutcome::Superseded => {
+                Ok(TaskDeliveryTransitionOutcome::Superseded)
+            }
+        }
     }
 
     pub async fn complete_delivery(
@@ -3434,7 +3449,8 @@ impl TaskService {
         http_status: Option<u16>,
         response_fingerprint: Option<String>,
         delivered_at: i64,
-    ) -> TaskRuntimeResult<TaskDelivery> {
+    ) -> TaskRuntimeResult<TaskDeliveryTransitionOutcome<TaskDelivery>> {
+        validate_worker_delivery_attempt(&delivery, &attempt)?;
         self.validate_delivery_boundary(&delivery).await?;
         delivery.status = TaskDeliveryStatus::Delivered;
         delivery.delivered_turn_id = delivered_turn_id;
@@ -3447,17 +3463,26 @@ impl TaskService {
         attempt.completed_at = Some(delivered_at);
         attempt.http_status = http_status;
         attempt.response_fingerprint = response_fingerprint;
-        let appended = self
-            .append_event(
+        let outcome = self
+            .projector
+            .transition_delivery(
                 TaskEventPayload::DeliveryDelivered {
                     delivery: delivery.clone(),
                     attempt,
                 },
+                TaskDeliveryTransition::Finish,
                 delivered_at,
             )
             .await?;
-        self.event_bus.publish(appended).await;
-        Ok(delivery)
+        match outcome {
+            TaskDeliveryTransitionOutcome::Applied(appended) => {
+                self.event_bus.publish(appended).await;
+                Ok(TaskDeliveryTransitionOutcome::Applied(delivery))
+            }
+            TaskDeliveryTransitionOutcome::Superseded => {
+                Ok(TaskDeliveryTransitionOutcome::Superseded)
+            }
+        }
     }
 
     pub async fn fail_delivery(
@@ -3468,7 +3493,8 @@ impl TaskService {
         http_status: Option<u16>,
         response_fingerprint: Option<String>,
         failed_at: i64,
-    ) -> TaskRuntimeResult<TaskDelivery> {
+    ) -> TaskRuntimeResult<TaskDeliveryTransitionOutcome<TaskDelivery>> {
+        validate_worker_delivery_attempt(&delivery, &attempt)?;
         self.validate_delivery_boundary(&delivery).await?;
         let retryable = delivery.attempt_count < delivery.max_attempts;
         delivery.status = if retryable {
@@ -3485,17 +3511,26 @@ impl TaskService {
         attempt.http_status = http_status;
         attempt.error = Some(failure_class);
         attempt.response_fingerprint = response_fingerprint;
-        let appended = self
-            .append_event(
+        let outcome = self
+            .projector
+            .transition_delivery(
                 TaskEventPayload::DeliveryFailed {
                     delivery: delivery.clone(),
                     attempt,
                 },
+                TaskDeliveryTransition::Finish,
                 failed_at,
             )
             .await?;
-        self.event_bus.publish(appended).await;
-        Ok(delivery)
+        match outcome {
+            TaskDeliveryTransitionOutcome::Applied(appended) => {
+                self.event_bus.publish(appended).await;
+                Ok(TaskDeliveryTransitionOutcome::Applied(delivery))
+            }
+            TaskDeliveryTransitionOutcome::Superseded => {
+                Ok(TaskDeliveryTransitionOutcome::Superseded)
+            }
+        }
     }
 
     async fn validate_delivery_boundary(&self, delivery: &TaskDelivery) -> TaskRuntimeResult<()> {
@@ -3582,29 +3617,12 @@ impl TaskService {
         let deliveries = self.store.list_stuck_task_deliveries(cutoff, limit).await?;
         let mut recovered = 0usize;
         for mut delivery in deliveries {
-            let attempts = self
+            let mut attempt = self
                 .store
-                .list_task_deliveries(TaskDeliveriesParams {
-                    workspace_id: delivery.workspace_id.clone(),
-                    task_id: Some(delivery.task_id.clone()),
-                    run_id: Some(delivery.run_id.clone()),
-                    statuses: Vec::new(),
-                    limit: Some(100),
-                })
+                .get_task_delivery_attempt(&delivery.id, delivery.attempt_count)
                 .await?
-                .attempts;
-            let mut attempt = attempts
-                .into_iter()
-                .find(|attempt| {
-                    attempt.delivery_id == delivery.id
-                        && attempt.attempt_number == delivery.attempt_count
-                        && attempt.status == TaskDeliveryAttemptStatus::Started
-                })
-                .ok_or_else(|| {
-                    anyhow!(
-                        "stuck Task delivery `{}` has no exact active attempt",
-                        delivery.id
-                    )
+                .with_context(|| {
+                    format!("stuck Task delivery `{}` has no exact attempt", delivery.id)
                 })?;
             let retryable = delivery.attempt_count < delivery.max_attempts;
             delivery.status = if retryable {
@@ -3619,11 +3637,18 @@ impl TaskService {
             attempt.status = TaskDeliveryAttemptStatus::Failed;
             attempt.completed_at = Some(now);
             attempt.error = Some(recovery_error);
-            let appended = self
-                .append_event(TaskEventPayload::DeliveryFailed { delivery, attempt }, now)
+            let outcome = self
+                .projector
+                .transition_delivery(
+                    TaskEventPayload::DeliveryFailed { delivery, attempt },
+                    TaskDeliveryTransition::Recover { cutoff },
+                    now,
+                )
                 .await?;
-            self.event_bus.publish(appended).await;
-            recovered = recovered.saturating_add(1);
+            if let TaskDeliveryTransitionOutcome::Applied(appended) = outcome {
+                self.event_bus.publish(appended).await;
+                recovered = recovered.saturating_add(1);
+            }
         }
         Ok(recovered)
     }
@@ -4417,7 +4442,6 @@ impl TaskService {
         now: i64,
         events: &mut Vec<TaskEventPayload>,
         cancelled_runs: &mut Vec<TaskRun>,
-        cancelled_deliveries: &mut Vec<TaskDelivery>,
         cancelled_executions: &mut Vec<(String, Option<TaskError>)>,
     ) -> TaskRuntimeResult<()> {
         if is_terminal_task(response.task.status) && response.task.status != TaskStatus::Blocked {
@@ -4508,38 +4532,9 @@ impl TaskService {
             .await?
             .deliveries
         {
-            let attempt = if delivery.status == TaskDeliveryStatus::Delivering {
-                let attempts = self
-                    .store
-                    .list_task_deliveries(TaskDeliveriesParams {
-                        workspace_id: delivery.workspace_id.clone(),
-                        task_id: Some(delivery.task_id.clone()),
-                        run_id: Some(delivery.run_id.clone()),
-                        statuses: Vec::new(),
-                        limit: Some(100),
-                    })
-                    .await?
-                    .attempts;
-                let mut attempt = attempts
-                    .into_iter()
-                    .find(|attempt| {
-                        attempt.delivery_id == delivery.id
-                            && attempt.attempt_number == delivery.attempt_count
-                            && attempt.status == TaskDeliveryAttemptStatus::Started
-                    })
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "cancelling Task delivery `{}` has no exact active attempt",
-                            delivery.id
-                        )
-                    })?;
-                attempt.status = TaskDeliveryAttemptStatus::Failed;
-                attempt.completed_at = Some(now);
-                attempt.error = Some(reason.to_owned());
-                Some(attempt)
-            } else {
-                None
-            };
+            // The cancellation batch prepares/revalidates the exact active
+            // attempt through CrudStore, preserving its atomic Task write set.
+            let attempt = None;
             delivery.status = TaskDeliveryStatus::Cancelled;
             delivery.next_attempt_at = None;
             delivery.last_error = Some(reason.to_owned());
@@ -4549,7 +4544,6 @@ impl TaskService {
                 attempt,
                 reason: Some(reason.to_owned()),
             });
-            cancelled_deliveries.push(delivery);
         }
         if let Some(current_response) = self.store.get_task(response.task.id.as_str()).await?
             && is_terminal_task(current_response.task.status)
@@ -4722,6 +4716,23 @@ impl TaskService {
         self.publish_and_wake(vec![appended]).await;
         Ok(())
     }
+}
+
+fn validate_worker_delivery_attempt(
+    delivery: &TaskDelivery,
+    attempt: &TaskDeliveryAttempt,
+) -> TaskRuntimeResult<()> {
+    if delivery.status != TaskDeliveryStatus::Delivering
+        || attempt.status != TaskDeliveryAttemptStatus::Started
+        || attempt.delivery_id != delivery.id
+        || attempt.attempt_number != delivery.attempt_count
+        || attempt.attempt_number == 0
+        || attempt.completed_at.is_some()
+        || attempt.error.is_some()
+    {
+        bail!("worker does not carry its exact started delivery attempt");
+    }
+    Ok(())
 }
 
 fn normalize_delivery_failure_class(value: &str) -> String {

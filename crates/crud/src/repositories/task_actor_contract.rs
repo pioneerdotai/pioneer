@@ -74,6 +74,37 @@ pub async fn upsert_task_actor_contract<C: ConnectionTrait>(
     Ok(())
 }
 
+pub(crate) async fn find_task_actor_contract_row<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+) -> Result<Option<task_actor_contract::Model>> {
+    task_actor_contract::Entity::find_by_id(task_id.to_owned())
+        .one(db)
+        .await
+        .context("failed to load task actor contract row")
+}
+
+pub(crate) async fn find_task_occurrence_row_by_run<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+) -> Result<Option<task_occurrence_contract::Model>> {
+    task_occurrence_contract::Entity::find()
+        .filter(task_occurrence_contract::Column::RunId.eq(run_id.to_owned()))
+        .one(db)
+        .await
+        .context("failed to load task occurrence row by run")
+}
+
+pub(crate) async fn find_task_occurrence_row_by_id<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+) -> Result<Option<task_occurrence_contract::Model>> {
+    task_occurrence_contract::Entity::find_by_id(id.to_owned())
+        .one(db)
+        .await
+        .context("failed to load task occurrence row by id")
+}
+
 pub async fn find_task_actor_contract<C: ConnectionTrait>(
     db: &C,
     task_id: &str,
@@ -794,6 +825,7 @@ pub(crate) struct PreparedTaskDeliveryAuthority {
     idempotency_key: String,
     status: String,
     now: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    persisted: Option<task_delivery_authority::Model>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -845,10 +877,45 @@ pub(crate) fn prepare_task_delivery_authority(
         idempotency_key: idempotency_key.to_owned(),
         status: status.to_owned(),
         now: unix_to_datetime(now),
+        persisted: None,
     })
 }
 
-fn validate_delivery_authority_facts(
+pub(crate) async fn validate_delivery_authority_replay<C: ConnectionTrait>(
+    db: &C,
+    prepared: &PreparedTaskDeliveryAuthority,
+) -> Result<()> {
+    let persisted = task_delivery_authority::Entity::find_by_id(prepared.delivery_id.clone())
+        .one(db)
+        .await?
+        .context("terminal delivery has no durable authority")?;
+    validate_delivery_authority_identity(&persisted, prepared)?;
+    if persisted.status != prepared.status {
+        bail!("task delivery authority differs from committed delivery status");
+    }
+    Ok(())
+}
+
+impl PreparedTaskDeliveryAuthority {
+    pub(crate) async fn check_existing<C: ConnectionTrait>(
+        mut self,
+        db: &C,
+        delivery_status: &str,
+    ) -> Result<Self> {
+        let persisted = task_delivery_authority::Entity::find_by_id(self.delivery_id.clone())
+            .one(db)
+            .await?
+            .context("delivery lifecycle has no durable authority projection")?;
+        validate_delivery_authority_identity(&persisted, &self)?;
+        if persisted.status != delivery_status {
+            bail!("delivery authority status differs from its durable delivery");
+        }
+        self.persisted = Some(persisted);
+        Ok(self)
+    }
+}
+
+fn validate_delivery_authority_identity(
     persisted: &task_delivery_authority::Model,
     prepared: &PreparedTaskDeliveryAuthority,
 ) -> Result<()> {
@@ -866,53 +933,42 @@ fn validate_delivery_authority_facts(
     Ok(())
 }
 
-pub(crate) async fn validate_delivery_authority_replay<C: ConnectionTrait>(
-    db: &C,
-    prepared: &PreparedTaskDeliveryAuthority,
-) -> Result<()> {
-    let persisted = task_delivery_authority::Entity::find_by_id(prepared.delivery_id.clone())
-        .one(db)
-        .await?
-        .context("terminal delivery has no durable authority")?;
-    validate_delivery_authority_facts(&persisted, prepared)?;
-    if persisted.status != prepared.status {
-        bail!("task delivery authority differs from committed delivery status");
-    }
-    Ok(())
-}
-
 pub(crate) async fn upsert_prepared_task_delivery_authority<C: ConnectionTrait>(
     db: &C,
-    prepared: PreparedTaskDeliveryAuthority,
+    mut prepared: PreparedTaskDeliveryAuthority,
 ) -> Result<()> {
-    task_delivery_authority::Entity::insert(task_delivery_authority::ActiveModel {
-        delivery_id: Set(prepared.delivery_id.clone()),
-        task_id: Set(prepared.task_id.clone()),
-        run_id: Set(prepared.run_id.clone()),
-        author_json: Set(prepared.author_json.clone()),
-        reviewer_json: Set(prepared.reviewer_json.clone()),
-        destination_route_id: Set(prepared.destination_route_id.clone()),
-        route_receipt_json: Set(prepared.route_receipt_json.clone()),
-        disclosure_generation: Set(prepared.disclosure_generation),
-        idempotency_key: Set(prepared.idempotency_key.clone()),
-        status: Set(prepared.status.clone()),
-        created_at: Set(prepared.now),
-        updated_at: Set(prepared.now),
-    })
-    .on_conflict(
-        OnConflict::column(task_delivery_authority::Column::DeliveryId)
-            .do_nothing()
-            .to_owned(),
-    )
-    .exec_without_returning(db)
-    .await
-    .context("failed to insert task delivery authority")?;
-    let persisted = task_delivery_authority::Entity::find_by_id(prepared.delivery_id.clone())
-        .one(db)
+    let persisted = if let Some(persisted) = prepared.persisted.take() {
+        persisted
+    } else {
+        task_delivery_authority::Entity::insert(task_delivery_authority::ActiveModel {
+            delivery_id: Set(prepared.delivery_id.clone()),
+            task_id: Set(prepared.task_id.clone()),
+            run_id: Set(prepared.run_id.clone()),
+            author_json: Set(prepared.author_json.clone()),
+            reviewer_json: Set(prepared.reviewer_json.clone()),
+            destination_route_id: Set(prepared.destination_route_id.clone()),
+            route_receipt_json: Set(prepared.route_receipt_json.clone()),
+            disclosure_generation: Set(prepared.disclosure_generation),
+            idempotency_key: Set(prepared.idempotency_key.clone()),
+            status: Set(prepared.status.clone()),
+            created_at: Set(prepared.now),
+            updated_at: Set(prepared.now),
+        })
+        .on_conflict(
+            OnConflict::column(task_delivery_authority::Column::DeliveryId)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(db)
         .await
-        .context("failed to reload task delivery authority")?
-        .context("task delivery authority disappeared after insert")?;
-    validate_delivery_authority_facts(&persisted, &prepared)?;
+        .context("failed to insert task delivery authority")?;
+        task_delivery_authority::Entity::find_by_id(prepared.delivery_id.clone())
+            .one(db)
+            .await
+            .context("failed to reload task delivery authority")?
+            .context("task delivery authority disappeared after insert")?
+    };
+    validate_delivery_authority_identity(&persisted, &prepared)?;
     let status = prepared.status.as_str();
     let transition_allowed = match persisted.status.as_str() {
         "pending" => matches!(status, "pending" | "delivering" | "cancelled"),
@@ -959,7 +1015,7 @@ pub(crate) async fn upsert_prepared_task_delivery_authority<C: ConnectionTrait>(
     Ok(())
 }
 
-pub(super) fn task_actor_contract_from_model(
+pub(crate) fn task_actor_contract_from_model(
     row: task_actor_contract::Model,
 ) -> Result<TaskActorContract> {
     let (_, contract) = upgrade_task_actor_contract_model_and_parse(row)?;

@@ -19,7 +19,7 @@ use crate::repositories::{
     task_trigger, task_write_lock, thread_lineage,
 };
 use crate::task_events::{AppendedTaskEvent, TaskEventPayload};
-use crate::util::{optional_typed_json_from_db, unix_to_datetime};
+use crate::util::unix_to_datetime;
 
 type ProjectFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
@@ -65,6 +65,58 @@ pub(crate) struct PreparedTaskProjection {
 }
 
 impl PreparedTaskProjection {
+    pub(crate) fn validate_delivery_start_fields(&self) -> Result<()> {
+        self.delivery
+            .as_ref()
+            .context("delivery projection missing")?
+            .validate_start_fields()?;
+        self.delivery_attempt
+            .as_ref()
+            .context("start attempt projection missing")?
+            .validate_fields()
+    }
+
+    pub(crate) fn validate_delivery_fields(&self) -> Result<()> {
+        self.delivery
+            .as_ref()
+            .context("delivery projection missing")?
+            .validate_fields()?;
+        if let Some(attempt) = &self.delivery_attempt {
+            attempt.validate_fields()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_delivery_rows(
+        mut self,
+        delivery: pioneer_entity::task_delivery::Model,
+        attempt: Option<pioneer_entity::task_delivery_attempt::Model>,
+    ) -> Self {
+        self.delivery = self
+            .delivery
+            .map(|prepared| prepared.with_persisted(delivery));
+        if let Some(attempt) = attempt {
+            self.delivery_attempt = self
+                .delivery_attempt
+                .map(|prepared| prepared.with_persisted(attempt));
+        } else {
+            self.delivery_attempt = self
+                .delivery_attempt
+                .map(|prepared| prepared.with_new_attempt());
+        }
+        self
+    }
+
+    pub(crate) fn validate_delivery_identity(
+        &self,
+        row: &pioneer_entity::task_delivery::Model,
+    ) -> Result<()> {
+        self.delivery
+            .as_ref()
+            .context("delivery projection missing")?
+            .validate_identity(row)
+    }
+
     pub(crate) fn prepare(payload: &TaskEventPayload) -> Result<Self> {
         let mut prepared = Self::default();
         match payload {
@@ -1147,9 +1199,142 @@ pub(crate) async fn prepare_task_delivery_authority<C: ConnectionTrait>(
     db: &C,
     delivery: &TaskDelivery,
 ) -> Result<task_actor_contract::PreparedTaskDeliveryAuthority> {
-    let contract = task_actor_contract::find_task_actor_contract(db, &delivery.task_id)
+    Ok(prepare_delivery_authority_boundary(db, delivery)
+        .await?
+        .authority)
+}
+
+// CPU preparation runs before lifecycle writer admission. Revalidation reads
+// the same indexed inputs without parsing or serializing their JSON payloads.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedDeliveryAuthorityBoundary {
+    authority: task_actor_contract::PreparedTaskDeliveryAuthority,
+    contract: pioneer_entity::task_actor_contract::Model,
+    task: task::TaskDeliveryTaskFacts,
+    occurrence: pioneer_entity::task_occurrence_contract::Model,
+    agent_spec: Option<task_agent_spec::TaskDeliveryReviewPolicyFacts>,
+    accepted_candidate: Option<task_result_candidate::TaskDeliveryReviewBinding>,
+    final_review: Option<task_result_review_event::TaskDeliveryReviewerFacts>,
+    check_review_policy: bool,
+}
+
+impl PreparedDeliveryAuthorityBoundary {
+    pub(crate) async fn revalidate<C: ConnectionTrait>(
+        &self,
+        db: &C,
+    ) -> Result<task_actor_contract::PreparedTaskDeliveryAuthority> {
+        let contract =
+            task_actor_contract::find_task_actor_contract_row(db, &self.contract.task_id)
+                .await?
+                .context("Task delivery actor contract disappeared")?;
+        if contract != self.contract {
+            anyhow::bail!("Task delivery actor contract changed after preparation");
+        }
+        let task = task::find_delivery_task_facts(db, &self.task.id)
+            .await?
+            .context("Task delivery Task disappeared")?;
+        if task.workspace_id != self.task.workspace_id
+            || task.executor_kind != self.task.executor_kind
+            || task.owner_kind != self.task.owner_kind
+            || task.owner_id != self.task.owner_id
+        {
+            anyhow::bail!("Task delivery Task authority changed after preparation");
+        }
+        let occurrence =
+            task_actor_contract::find_task_occurrence_row_by_id(db, &self.occurrence.occurrence_id)
+                .await?
+                .context("Task delivery occurrence disappeared")?;
+        // Runtime status/timestamps may advance during cancellation. Frozen
+        // occurrence identity, route and author must remain exactly bound.
+        if occurrence.trigger_id != self.occurrence.trigger_id
+            || occurrence.occurrence_key != self.occurrence.occurrence_key
+            || occurrence.created_at != self.occurrence.created_at
+            || occurrence.task_id != self.occurrence.task_id
+            || occurrence.run_id != self.occurrence.run_id
+            || occurrence.execution_generation != self.occurrence.execution_generation
+            || occurrence.agent_execution_id != self.occurrence.agent_execution_id
+            || occurrence.work_graph_root_execution_id
+                != self.occurrence.work_graph_root_execution_id
+            || occurrence.root_resource_scope_id != self.occurrence.root_resource_scope_id
+            || occurrence.action_idempotency_key != self.occurrence.action_idempotency_key
+            || occurrence.route_id != self.occurrence.route_id
+            || occurrence.result_return_route_id != self.occurrence.result_return_route_id
+            || occurrence.delivery_plan_json != self.occurrence.delivery_plan_json
+        {
+            anyhow::bail!("Task delivery frozen occurrence authority changed after preparation");
+        }
+        if !matches!(
+            occurrence.status.as_str(),
+            "dormant"
+                | "queued"
+                | "recovering"
+                | "running"
+                | "waiting_review"
+                | "delivered"
+                | "failed"
+                | "cancelled"
+        ) || !(0..=i64::from(u32::MAX)).contains(&occurrence.retry_attempt)
+            || occurrence
+                .queue_position
+                .is_some_and(|position| position < 0)
+        {
+            anyhow::bail!("Task delivery occurrence has inconsistent durable state");
+        }
+        if self.check_review_policy {
+            let spec = task_agent_spec::find_delivery_review_policy(
+                db,
+                &self.task.id,
+                &self.occurrence.run_id,
+            )
+            .await?;
+            if spec
+                .as_ref()
+                .map(|row| (&row.id, &row.task_id, &row.review_policy_json))
+                != self
+                    .agent_spec
+                    .as_ref()
+                    .map(|row| (&row.id, &row.task_id, &row.review_policy_json))
+            {
+                anyhow::bail!("Task delivery review authority changed after preparation");
+            }
+        }
+        if let Some(expected) = &self.accepted_candidate {
+            let candidate =
+                task_result_candidate::find_delivery_review_binding(db, &self.occurrence.run_id)
+                    .await?
+                    .context("Task delivery accepted candidate disappeared")?;
+            if candidate.id != expected.id
+                || candidate.task_id != expected.task_id
+                || candidate.run_id != expected.run_id
+                || candidate.final_review_event_id != expected.final_review_event_id
+            {
+                anyhow::bail!("Task delivery final review binding changed after preparation");
+            }
+        }
+        if let Some(expected) = &self.final_review {
+            let review = task_result_review_event::find_delivery_reviewer(db, &expected.id)
+                .await?
+                .context("Task delivery final reviewer disappeared")?;
+            if review.task_id != expected.task_id
+                || review.run_id != expected.run_id
+                || review.decision != expected.decision
+                || review.reviewer_ref_json != expected.reviewer_ref_json
+            {
+                anyhow::bail!("Task delivery final reviewer changed after preparation");
+            }
+        }
+        Ok(self.authority.clone())
+    }
+}
+
+pub(crate) async fn prepare_delivery_authority_boundary<C: ConnectionTrait>(
+    db: &C,
+    delivery: &TaskDelivery,
+) -> Result<PreparedDeliveryAuthorityBoundary> {
+    let contract_row = task_actor_contract::find_task_actor_contract_row(db, &delivery.task_id)
         .await?
         .context("Task delivery is missing its immutable actor contract")?;
+    let contract = task_actor_contract::task_actor_contract_from_model(contract_row.clone())?;
     contract
         .delivery
         .validate()
@@ -1157,12 +1342,17 @@ pub(crate) async fn prepare_task_delivery_authority<C: ConnectionTrait>(
     if contract.workspace_id != delivery.workspace_id {
         anyhow::bail!("Task delivery differs from its immutable actor contract");
     }
-    let task = task::find_task_by_id(db, &delivery.task_id)
+    let task = task::find_delivery_task_facts(db, &delivery.task_id)
         .await?
         .context("Task delivery has no Task")?;
-    let occurrence = task_actor_contract::find_task_occurrence_by_run_id(db, &delivery.run_id)
+    if task.workspace_id != delivery.workspace_id {
+        anyhow::bail!("Task delivery Task belongs to another workspace");
+    }
+    let occurrence_row = task_actor_contract::find_task_occurrence_row_by_run(db, &delivery.run_id)
         .await?
         .context("Task delivery has no exact occurrence")?;
+    let occurrence =
+        task_actor_contract::task_occurrence_contract_from_model(occurrence_row.clone())?;
     if occurrence.task_id != delivery.task_id {
         anyhow::bail!("Task delivery occurrence belongs to another Task");
     }
@@ -1220,21 +1410,43 @@ pub(crate) async fn prepare_task_delivery_authority<C: ConnectionTrait>(
     } else {
         PersistedActorRef::System
     };
-    let review_required = delivery.error_snapshot.is_none()
-        && task_delivery_requires_final_review(db, &delivery.task_id, &delivery.run_id).await?;
+    let agent_spec = if delivery.error_snapshot.is_none() {
+        task_agent_spec::find_delivery_review_policy(db, &delivery.task_id, &delivery.run_id)
+            .await?
+    } else {
+        None
+    };
+    if agent_spec
+        .as_ref()
+        .is_some_and(|spec| spec.task_id != delivery.task_id)
+    {
+        anyhow::bail!("Task delivery Agent spec belongs to another Task");
+    }
+    let review_policy: Option<TaskAgentReviewPolicy> = agent_spec
+        .as_ref()
+        .and_then(|spec| spec.review_policy_json.as_deref())
+        .map(serde_json::from_str)
+        .transpose()?;
+    let review_required = review_policy
+        .as_ref()
+        .is_some_and(TaskAgentReviewPolicy::is_enabled);
+    let mut accepted_candidate = None;
+    let mut final_review = None;
     let reviewer = if !review_required {
         None
     } else {
-        let candidate = task_result_candidate::find_candidate_by_run_and_status(
-            db,
-            &delivery.run_id,
-            TaskResultCandidateStatus::Accepted,
-        )
-        .await?;
+        let candidate =
+            task_result_candidate::find_delivery_review_binding(db, &delivery.run_id).await?;
+        if candidate.as_ref().is_some_and(|candidate| {
+            candidate.task_id != delivery.task_id || candidate.run_id != delivery.run_id
+        }) {
+            anyhow::bail!("Task delivery accepted result belongs to another occurrence");
+        }
         let review_id = candidate
-            .and_then(|candidate| candidate.final_review_event_id)
+            .as_ref()
+            .and_then(|candidate| candidate.final_review_event_id.clone())
             .context("Task result delivery has no exact final review event")?;
-        let event = task_result_review_event::find_review_event_by_id(db, &review_id)
+        let event = task_result_review_event::find_delivery_reviewer(db, &review_id)
             .await?
             .context("Task delivery final review event disappeared")?;
         if event.task_id != delivery.task_id
@@ -1243,9 +1455,11 @@ pub(crate) async fn prepare_task_delivery_authority<C: ConnectionTrait>(
         {
             anyhow::bail!("Task delivery final reviewer has different immutable lineage");
         }
-        Some(serde_json::from_str::<TaskResultReviewerRef>(
-            event.reviewer_ref_json.as_str(),
-        )?)
+        let reviewer =
+            serde_json::from_str::<TaskResultReviewerRef>(event.reviewer_ref_json.as_str())?;
+        accepted_candidate = candidate;
+        final_review = Some(event);
+        Some(reviewer)
     };
     let status = match delivery.status {
         TaskDeliveryStatus::Pending => "pending",
@@ -1256,7 +1470,7 @@ pub(crate) async fn prepare_task_delivery_authority<C: ConnectionTrait>(
     };
     let author_json = serde_json::to_string(&author)?;
     let reviewer_json = reviewer.as_ref().map(serde_json::to_string).transpose()?;
-    task_actor_contract::prepare_task_delivery_authority(
+    let authority = task_actor_contract::prepare_task_delivery_authority(
         &delivery.id,
         &delivery.task_id,
         &delivery.run_id,
@@ -1268,29 +1482,17 @@ pub(crate) async fn prepare_task_delivery_authority<C: ConnectionTrait>(
         &delivery.delivery_key,
         status,
         delivery.updated_at,
-    )
-}
-
-async fn task_delivery_requires_final_review<C: ConnectionTrait>(
-    db: &C,
-    task_id: &str,
-    run_id: &str,
-) -> Result<bool> {
-    let agent_spec = match task_agent_spec::find_agent_spec_by_run(db, run_id).await? {
-        Some(agent_spec) => Some(agent_spec),
-        None => task_agent_spec::find_latest_agent_spec_by_task(db, task_id).await?,
-    };
-    let Some(agent_spec) = agent_spec else {
-        return Ok(false);
-    };
-    if agent_spec.task_id != task_id {
-        anyhow::bail!("Task delivery Agent spec belongs to another Task");
-    }
-    let review_policy: Option<TaskAgentReviewPolicy> =
-        optional_typed_json_from_db(agent_spec.review_policy_json)?;
-    Ok(review_policy
-        .as_ref()
-        .is_some_and(TaskAgentReviewPolicy::is_enabled))
+    )?;
+    Ok(PreparedDeliveryAuthorityBoundary {
+        authority,
+        contract: contract_row,
+        task,
+        occurrence: occurrence_row,
+        agent_spec,
+        accepted_candidate,
+        final_review,
+        check_review_policy: delivery.error_snapshot.is_none(),
+    })
 }
 
 async fn task_is_terminal_db<C: ConnectionTrait + Sync>(db: &C, task_id: &str) -> Result<bool> {

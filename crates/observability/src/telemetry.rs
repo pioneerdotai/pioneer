@@ -18,10 +18,10 @@ use opentelemetry_sdk::trace::{
     SdkTracer, SdkTracerProvider, SpanData, SpanExporter as SdkSpanExporter,
 };
 use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use url::{Host, Url};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,40 +380,162 @@ fn validate_endpoint(endpoint: &str, signal: &str) -> Result<()> {
     Ok(())
 }
 
+const EXPORT_OUTAGE_REPORT_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
 #[derive(Debug, Default)]
 struct ExportAvailability {
-    unavailable_signals: AtomicU8,
+    state: Mutex<ExportAvailabilityState>,
+}
+
+#[derive(Debug, Default)]
+struct ExportAvailabilityState {
+    unavailable_signals: u8,
+    episode_started_at: Option<Instant>,
+    last_report_at: Option<Instant>,
+    episode_failed_exports: u64,
+    // Lifetime totals for this shared availability instance. Recovery and new
+    // reports never reset them. One final Err after SDK retries counts once,
+    // regardless of the number of HTTP attempts. All counters saturate.
+    total_failed_exports: u64,
+    total_suppressed_episodes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExportOutageSummary {
+    total_suppressed_episodes: u64,
+    total_failed_exports: u64,
+    episode_failed_exports: u64,
+    // Time from the first observed final Err to this observation, not a
+    // measurement of server availability. On recovery this is the full episode.
+    observed_episode_duration_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExportDiagnostic {
+    None,
+    Unavailable(ExportOutageSummary),
+    Suppressed(ExportOutageSummary),
+    Recovered(ExportOutageSummary),
+}
+
+impl ExportAvailabilityState {
+    fn summary(&self, now: Instant) -> ExportOutageSummary {
+        ExportOutageSummary {
+            total_suppressed_episodes: self.total_suppressed_episodes,
+            total_failed_exports: self.total_failed_exports,
+            episode_failed_exports: self.episode_failed_exports,
+            observed_episode_duration_ms: self
+                .episode_started_at
+                .map(|start| now.saturating_duration_since(start).as_millis())
+                .unwrap_or_default()
+                .min(u64::MAX as u128) as u64,
+        }
+    }
+
+    fn observe(&mut self, signal_bit: u8, failed: bool, now: Instant) -> ExportDiagnostic {
+        let previous = self.unavailable_signals;
+        if failed {
+            self.unavailable_signals |= signal_bit;
+            self.total_failed_exports = self.total_failed_exports.saturating_add(1);
+            if previous != 0 {
+                self.episode_failed_exports = self.episode_failed_exports.saturating_add(1);
+                return ExportDiagnostic::None;
+            }
+            self.episode_started_at = Some(now);
+            self.episode_failed_exports = 1;
+            if self.last_report_at.is_none_or(|last| {
+                now.saturating_duration_since(last) >= EXPORT_OUTAGE_REPORT_COOLDOWN
+            }) {
+                self.last_report_at = Some(now);
+                ExportDiagnostic::Unavailable(self.summary(now))
+            } else {
+                self.total_suppressed_episodes = self.total_suppressed_episodes.saturating_add(1);
+                ExportDiagnostic::Suppressed(self.summary(now))
+            }
+        } else {
+            self.unavailable_signals &= !signal_bit;
+            if previous != 0 && self.unavailable_signals == 0 {
+                let summary = self.summary(now);
+                self.episode_started_at = None;
+                // Keep the completed episode count until the next episode;
+                // neither recovery nor reporting clears lifetime totals.
+                ExportDiagnostic::Recovered(summary)
+            } else {
+                ExportDiagnostic::None
+            }
+        }
+    }
 }
 
 impl ExportAvailability {
     fn observe(&self, signal: &'static str, signal_bit: u8, result: &OTelSdkResult) {
-        match result {
-            Err(error) => {
-                let previous = self
-                    .unavailable_signals
-                    .fetch_or(signal_bit, Ordering::AcqRel);
-                if previous == 0 {
+        let diagnostic = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Sample monotonic time under the same lock as the transition, so
+            // concurrent exporters cannot apply timestamps in reverse order.
+            state.observe(signal_bit, result.is_err(), Instant::now())
+        };
+        Self::emit(signal, result, diagnostic);
+    }
+
+    fn emit(signal: &'static str, result: &OTelSdkResult, diagnostic: ExportDiagnostic) {
+        // No tracing/Sentry or other external work runs with the state locked.
+        match diagnostic {
+            ExportDiagnostic::Unavailable(summary) => {
+                if let Err(error) = result {
                     tracing::error!(
                         target: "pioneer_observability::otlp",
                         signal,
                         error = %error,
+                        total_suppressed_episodes = summary.total_suppressed_episodes,
+                        total_failed_exports = summary.total_failed_exports,
+                        episode_failed_exports = summary.episode_failed_exports,
                         "OTLP exporter became unavailable after retries"
                     );
                 }
             }
-            Ok(()) => {
-                let previous = self
-                    .unavailable_signals
-                    .fetch_and(!signal_bit, Ordering::AcqRel);
-                if previous != 0 && previous & !signal_bit == 0 {
-                    tracing::info!(
-                        target: "pioneer_observability::otlp",
-                        signal,
-                        "OTLP exporter recovered"
-                    );
-                }
+            ExportDiagnostic::Suppressed(summary) => {
+                tracing::info!(
+                    target: "pioneer_observability::otlp",
+                    signal,
+                    total_suppressed_episodes = summary.total_suppressed_episodes,
+                    total_failed_exports = summary.total_failed_exports,
+                    "OTLP exporter outage report suppressed"
+                );
             }
+            ExportDiagnostic::Recovered(summary) => {
+                tracing::info!(
+                    target: "pioneer_observability::otlp",
+                    signal,
+                    total_suppressed_episodes = summary.total_suppressed_episodes,
+                    total_failed_exports = summary.total_failed_exports,
+                    episode_failed_exports = summary.episode_failed_exports,
+                    observed_episode_duration_ms = summary.observed_episode_duration_ms,
+                    "OTLP exporter recovered"
+                );
+            }
+            ExportDiagnostic::None => {}
         }
+    }
+
+    #[cfg(test)]
+    fn observe_at(
+        &self,
+        signal: &'static str,
+        signal_bit: u8,
+        result: &OTelSdkResult,
+        now: Instant,
+    ) -> ExportDiagnostic {
+        let diagnostic = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(signal_bit, result.is_err(), now);
+        Self::emit(signal, result, diagnostic);
+        diagnostic
     }
 }
 
@@ -491,10 +613,11 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
-        ConsentGatedMetricExporter, ConsentGatedSpanExporter, ExportAvailability,
-        OtlpTelemetryConfig, otlp_retry_policy, validate_config,
+        ConsentGatedMetricExporter, ConsentGatedSpanExporter, EXPORT_OUTAGE_REPORT_COOLDOWN,
+        ExportAvailability, ExportDiagnostic, ExportOutageSummary, OtlpTelemetryConfig,
+        otlp_retry_policy, validate_config,
     };
     use opentelemetry_sdk::Resource;
     use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
@@ -504,30 +627,35 @@ mod tests {
     use opentelemetry_sdk::trace::{SpanData, SpanExporter};
     use std::future::Future;
     use std::pin::pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Waker};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    static TELEMETRY_TEST_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static TELEMETRY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    struct TelemetryEnabledReset;
+    struct TelemetryEnabledReset(bool);
 
     impl Drop for TelemetryEnabledReset {
         fn drop(&mut self) {
-            super::super::set_telemetry_enabled(true);
+            super::super::set_telemetry_enabled(self.0);
         }
     }
 
     struct CountingMetricExporter {
         exports: Arc<AtomicUsize>,
+        fail: Arc<AtomicBool>,
     }
 
     impl PushMetricExporter for CountingMetricExporter {
         async fn export(&self, _metrics: &ResourceMetrics) -> OTelSdkResult {
             let exports = self.exports.clone();
             exports.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            if self.fail.load(Ordering::Relaxed) {
+                failure()
+            } else {
+                Ok(())
+            }
         }
 
         fn force_flush(&self) -> OTelSdkResult {
@@ -546,13 +674,18 @@ mod tests {
     #[derive(Debug)]
     struct CountingSpanExporter {
         exports: Arc<AtomicUsize>,
+        fail: Arc<AtomicBool>,
     }
 
     impl SpanExporter for CountingSpanExporter {
         async fn export(&self, _batch: Vec<SpanData>) -> OTelSdkResult {
             let exports = self.exports.clone();
             exports.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            if self.fail.load(Ordering::Relaxed) {
+                failure()
+            } else {
+                Ok(())
+            }
         }
 
         fn set_resource(&mut self, _resource: &Resource) {}
@@ -675,35 +808,521 @@ mod tests {
     #[test]
     fn consent_gate_covers_metric_and_trace_exporters() {
         let _guard = TELEMETRY_TEST_LOCK.lock().expect("telemetry test lock");
-        let _reset = TelemetryEnabledReset;
+        let _reset = TelemetryEnabledReset(super::super::telemetry_enabled());
         let metric_exports = Arc::new(AtomicUsize::new(0));
         let trace_exports = Arc::new(AtomicUsize::new(0));
         let availability = Arc::new(ExportAvailability::default());
         let metric_exporter = ConsentGatedMetricExporter {
             inner: CountingMetricExporter {
                 exports: metric_exports.clone(),
+                fail: Arc::new(AtomicBool::new(false)),
             },
             availability: availability.clone(),
         };
         let trace_exporter = ConsentGatedSpanExporter {
             inner: CountingSpanExporter {
                 exports: trace_exports.clone(),
+                fail: Arc::new(AtomicBool::new(false)),
             },
-            availability,
+            availability: availability.clone(),
         };
         let metrics = ResourceMetrics::default();
+        availability.observe("metrics", 0b01, &failure());
+        availability.observe("traces", 0b10, &failure());
 
         super::super::set_telemetry_enabled(false);
         await_ready(metric_exporter.export(&metrics)).expect("disabled metric export is a no-op");
         await_ready(trace_exporter.export(Vec::new())).expect("disabled trace export is a no-op");
         assert_eq!(metric_exports.load(Ordering::Relaxed), 0);
         assert_eq!(trace_exports.load(Ordering::Relaxed), 0);
+        assert_eq!(availability.state.lock().unwrap().unavailable_signals, 0b11);
 
         super::super::set_telemetry_enabled(true);
         await_ready(metric_exporter.export(&metrics)).expect("enabled metric export succeeds");
+        assert_eq!(availability.state.lock().unwrap().unavailable_signals, 0b10);
         await_ready(trace_exporter.export(Vec::new())).expect("enabled trace export succeeds");
         assert_eq!(metric_exports.load(Ordering::Relaxed), 1);
         assert_eq!(trace_exports.load(Ordering::Relaxed), 1);
+        assert_eq!(availability.state.lock().unwrap().unavailable_signals, 0);
+    }
+
+    fn failure() -> OTelSdkResult {
+        Err(OTelSdkError::InternalFailure(
+            "fixture final export failure".to_owned(),
+        ))
+    }
+
+    fn summary(diagnostic: ExportDiagnostic) -> ExportOutageSummary {
+        match diagnostic {
+            ExportDiagnostic::Unavailable(summary)
+            | ExportDiagnostic::Suppressed(summary)
+            | ExportDiagnostic::Recovered(summary) => summary,
+            ExportDiagnostic::None => panic!("expected a diagnostic"),
+        }
+    }
+
+    #[test]
+    fn exporter_availability_first_failure_and_continuous_outage() {
+        let availability = ExportAvailability::default();
+        let now = Instant::now();
+        let first = availability.observe_at("traces", 0b10, &failure(), now);
+        assert!(matches!(first, ExportDiagnostic::Unavailable(_)));
+        assert_eq!(summary(first).total_failed_exports, 1);
+        assert_eq!(summary(first).total_suppressed_episodes, 0);
+        for (signal, bit, elapsed) in [
+            ("traces", 0b10, Duration::from_secs(1)),
+            ("metrics", 0b01, EXPORT_OUTAGE_REPORT_COOLDOWN),
+            ("traces", 0b10, EXPORT_OUTAGE_REPORT_COOLDOWN * 2),
+        ] {
+            assert_eq!(
+                availability.observe_at(signal, bit, &failure(), now + elapsed),
+                ExportDiagnostic::None
+            );
+        }
+        let state = availability.state.lock().unwrap();
+        assert_eq!(state.unavailable_signals, 0b11);
+        assert_eq!(state.total_failed_exports, 4);
+        assert_eq!(state.episode_failed_exports, 4);
+        assert_eq!(state.total_suppressed_episodes, 0);
+        assert_eq!(state.last_report_at, Some(now));
+    }
+
+    #[test]
+    fn exporter_availability_cooldown_boundary_is_inclusive() {
+        for (elapsed, allowed) in [
+            (
+                EXPORT_OUTAGE_REPORT_COOLDOWN - Duration::from_nanos(1),
+                false,
+            ),
+            (EXPORT_OUTAGE_REPORT_COOLDOWN, true),
+            (
+                EXPORT_OUTAGE_REPORT_COOLDOWN + Duration::from_nanos(1),
+                true,
+            ),
+        ] {
+            let availability = ExportAvailability::default();
+            let now = Instant::now();
+            availability.observe_at("metrics", 0b01, &failure(), now);
+            let recovered =
+                availability.observe_at("metrics", 0b01, &Ok(()), now + Duration::from_secs(1));
+            assert!(matches!(recovered, ExportDiagnostic::Recovered(_)));
+            assert_eq!(summary(recovered).observed_episode_duration_ms, 1_000);
+            let next = availability.observe_at("traces", 0b10, &failure(), now + elapsed);
+            assert_eq!(matches!(next, ExportDiagnostic::Unavailable(_)), allowed);
+            assert_eq!(matches!(next, ExportDiagnostic::Suppressed(_)), !allowed);
+            let state = availability.state.lock().unwrap();
+            assert_eq!(state.unavailable_signals, 0b10);
+            assert_eq!(
+                state.last_report_at,
+                Some(if allowed { now + elapsed } else { now })
+            );
+            assert_eq!(state.total_suppressed_episodes, u64::from(!allowed));
+        }
+    }
+
+    #[test]
+    fn exporter_availability_recovery_preserves_cooldown_and_lifetime_totals() {
+        let availability = ExportAvailability::default();
+        let now = Instant::now();
+        availability.observe_at("metrics", 0b01, &failure(), now);
+        availability.observe_at("metrics", 0b01, &Ok(()), now + Duration::from_secs(2));
+        for seconds in [10, 20] {
+            let start = now + Duration::from_secs(seconds);
+            let suppressed = availability.observe_at("traces", 0b10, &failure(), start);
+            assert!(matches!(suppressed, ExportDiagnostic::Suppressed(_)));
+            assert_eq!(
+                availability.observe_at("metrics", 0b01, &failure(), start),
+                ExportDiagnostic::None
+            );
+            assert_eq!(
+                availability.observe_at("traces", 0b10, &Ok(()), start + Duration::from_secs(1)),
+                ExportDiagnostic::None
+            );
+            let recovered =
+                availability.observe_at("metrics", 0b01, &Ok(()), start + Duration::from_secs(3));
+            assert!(matches!(recovered, ExportDiagnostic::Recovered(_)));
+            let recovered = summary(recovered);
+            assert_eq!(recovered.episode_failed_exports, 2);
+            assert_eq!(recovered.observed_episode_duration_ms, 3_000);
+            assert_eq!(recovered.total_suppressed_episodes, seconds / 10);
+            assert_eq!(recovered.total_failed_exports, 1 + seconds / 5);
+            assert_eq!(availability.state.lock().unwrap().last_report_at, Some(now));
+        }
+        let allowed = availability.observe_at(
+            "metrics",
+            0b01,
+            &failure(),
+            now + EXPORT_OUTAGE_REPORT_COOLDOWN,
+        );
+        assert!(matches!(allowed, ExportDiagnostic::Unavailable(_)));
+        assert_eq!(summary(allowed).total_suppressed_episodes, 2);
+        assert_eq!(summary(allowed).total_failed_exports, 6);
+        assert_eq!(summary(allowed).episode_failed_exports, 1);
+        availability.observe_at(
+            "metrics",
+            0b01,
+            &Ok(()),
+            now + EXPORT_OUTAGE_REPORT_COOLDOWN,
+        );
+        let suppressed = availability.observe_at(
+            "metrics",
+            0b01,
+            &failure(),
+            now + EXPORT_OUTAGE_REPORT_COOLDOWN + Duration::from_secs(1),
+        );
+        assert!(matches!(suppressed, ExportDiagnostic::Suppressed(_)));
+        assert_eq!(summary(suppressed).total_suppressed_episodes, 3);
+    }
+
+    #[test]
+    fn exporter_availability_both_signal_orders_and_partial_recovery() {
+        for failures in [
+            [("metrics", 0b01), ("traces", 0b10)],
+            [("traces", 0b10), ("metrics", 0b01)],
+        ] {
+            for recoveries in [failures, [failures[1], failures[0]]] {
+                let availability = ExportAvailability::default();
+                let now = Instant::now();
+                for episode in 0..2 {
+                    let start = now + Duration::from_secs(episode * 10);
+                    let first =
+                        availability.observe_at(failures[0].0, failures[0].1, &failure(), start);
+                    assert!(if episode == 0 {
+                        matches!(first, ExportDiagnostic::Unavailable(_))
+                    } else {
+                        matches!(first, ExportDiagnostic::Suppressed(_))
+                    });
+                    // Success of an unaffected signal cannot recover the episode.
+                    assert_eq!(
+                        availability.observe_at(failures[1].0, failures[1].1, &Ok(()), start),
+                        ExportDiagnostic::None
+                    );
+                    assert_eq!(
+                        availability.observe_at(failures[1].0, failures[1].1, &failure(), start),
+                        ExportDiagnostic::None
+                    );
+                    assert_eq!(availability.state.lock().unwrap().unavailable_signals, 0b11);
+                    assert_eq!(
+                        availability.observe_at(recoveries[0].0, recoveries[0].1, &Ok(()), start),
+                        ExportDiagnostic::None
+                    );
+                    assert_eq!(
+                        availability.state.lock().unwrap().unavailable_signals,
+                        recoveries[1].1
+                    );
+                    assert_eq!(
+                        availability.observe_at(recoveries[0].0, recoveries[0].1, &Ok(()), start),
+                        ExportDiagnostic::None
+                    );
+                    assert!(matches!(
+                        availability.observe_at(recoveries[1].0, recoveries[1].1, &Ok(()), start),
+                        ExportDiagnostic::Recovered(_)
+                    ));
+                    assert_eq!(availability.state.lock().unwrap().unavailable_signals, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exporter_availability_concurrent_observations_are_coalesced() {
+        let availability = Arc::new(ExportAvailability::default());
+        let now = Instant::now();
+        for (elapsed, allowed) in [
+            (Duration::ZERO, true),
+            (Duration::from_secs(1), false),
+            (EXPORT_OUTAGE_REPORT_COOLDOWN, true),
+        ] {
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let results: Vec<_> = std::thread::scope(|scope| {
+                let handles: Vec<_> = [("metrics", 0b01), ("traces", 0b10)]
+                    .into_iter()
+                    .map(|(signal, bit)| {
+                        let availability = availability.clone();
+                        let barrier = barrier.clone();
+                        scope.spawn(move || {
+                            barrier.wait();
+                            availability.observe_at(signal, bit, &failure(), now + elapsed)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect()
+            });
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|result| matches!(result, ExportDiagnostic::Unavailable(_)))
+                    .count(),
+                usize::from(allowed)
+            );
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|result| matches!(result, ExportDiagnostic::Suppressed(_)))
+                    .count(),
+                usize::from(!allowed)
+            );
+            assert_eq!(availability.state.lock().unwrap().unavailable_signals, 0b11);
+            let recovered: Vec<_> = std::thread::scope(|scope| {
+                let handles: Vec<_> = [("metrics", 0b01), ("traces", 0b10)]
+                    .into_iter()
+                    .map(|(signal, bit)| {
+                        let availability = availability.clone();
+                        let barrier = barrier.clone();
+                        scope.spawn(move || {
+                            barrier.wait();
+                            availability.observe_at(signal, bit, &Ok(()), now + elapsed)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect()
+            });
+            assert_eq!(
+                recovered
+                    .iter()
+                    .filter(|result| matches!(result, ExportDiagnostic::Recovered(_)))
+                    .count(),
+                1
+            );
+            assert_eq!(availability.state.lock().unwrap().unavailable_signals, 0);
+        }
+        let state = availability.state.lock().unwrap();
+        assert_eq!(state.total_failed_exports, 6);
+        assert_eq!(state.total_suppressed_episodes, 1);
+    }
+
+    #[test]
+    fn exporter_availability_concurrent_failure_and_recovery_preserve_mask() {
+        let availability = Arc::new(ExportAvailability::default());
+        let now = Instant::now();
+        availability.observe_at("traces", 0b10, &failure(), now);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let recovering = {
+                let availability = availability.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    availability.observe_at("traces", 0b10, &Ok(()), now + Duration::from_secs(1))
+                })
+            };
+            let failing = {
+                let availability = availability.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    availability.observe_at(
+                        "metrics",
+                        0b01,
+                        &failure(),
+                        now + Duration::from_secs(1),
+                    )
+                })
+            };
+            [recovering.join().unwrap(), failing.join().unwrap()]
+        });
+        // Either one continuous episode, or recovery followed by a suppressed
+        // episode, depending on lock order. Neither order may emit another ERROR.
+        assert!(
+            results
+                .iter()
+                .all(|result| !matches!(result, ExportDiagnostic::Unavailable(_)))
+        );
+        let suppressed = u64::from(matches!(results[1], ExportDiagnostic::Suppressed(_)));
+        assert_eq!(
+            matches!(results[0], ExportDiagnostic::Recovered(_)),
+            suppressed == 1
+        );
+        {
+            let state = availability.state.lock().unwrap();
+            assert_eq!(state.unavailable_signals, 0b01);
+            assert_eq!(state.total_failed_exports, 2);
+            assert_eq!(state.total_suppressed_episodes, suppressed);
+        }
+        assert!(matches!(
+            availability.observe_at("metrics", 0b01, &Ok(()), now + Duration::from_secs(2)),
+            ExportDiagnostic::Recovered(_)
+        ));
+        assert_eq!(availability.state.lock().unwrap().unavailable_signals, 0);
+    }
+
+    #[test]
+    fn exporter_availability_counters_saturate_and_poison_does_not_panic() {
+        let availability = ExportAvailability::default();
+        let now = Instant::now();
+        availability.observe_at("metrics", 0b01, &failure(), now);
+        {
+            let mut state = availability.state.lock().unwrap();
+            state.total_failed_exports = u64::MAX;
+            state.total_suppressed_episodes = u64::MAX;
+            state.episode_failed_exports = u64::MAX;
+        }
+        availability.observe_at("traces", 0b10, &failure(), now);
+        let recovered = {
+            availability.observe_at("metrics", 0b01, &Ok(()), now);
+            availability.observe_at("traces", 0b10, &Ok(()), now)
+        };
+        assert_eq!(summary(recovered).episode_failed_exports, u64::MAX);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = availability.state.lock().unwrap();
+            panic!("poison fixture");
+        });
+        let suppressed = availability.observe_at("metrics", 0b01, &failure(), now);
+        assert!(matches!(suppressed, ExportDiagnostic::Suppressed(_)));
+        assert_eq!(summary(suppressed).total_failed_exports, u64::MAX);
+        assert_eq!(summary(suppressed).total_suppressed_episodes, u64::MAX);
+        // Also exercise the production clock/lock path with poisoned state.
+        availability.observe("metrics", 0b01, &failure());
+    }
+
+    #[test]
+    fn consent_wrappers_preserve_final_export_results_and_call_counts() {
+        let _guard = TELEMETRY_TEST_LOCK.lock().expect("telemetry test lock");
+        let _reset = TelemetryEnabledReset(super::super::telemetry_enabled());
+        super::super::set_telemetry_enabled(true);
+        let availability = Arc::new(ExportAvailability::default());
+        let metric_calls = Arc::new(AtomicUsize::new(0));
+        let span_calls = Arc::new(AtomicUsize::new(0));
+        let fail = Arc::new(AtomicBool::new(true));
+        let metrics = ConsentGatedMetricExporter {
+            inner: CountingMetricExporter {
+                exports: metric_calls.clone(),
+                fail: fail.clone(),
+            },
+            availability: availability.clone(),
+        };
+        let spans = ConsentGatedSpanExporter {
+            inner: CountingSpanExporter {
+                exports: span_calls.clone(),
+                fail: fail.clone(),
+            },
+            availability: availability.clone(),
+        };
+        for failed in [true, false, true] {
+            fail.store(failed, Ordering::Relaxed);
+            let metric_result = await_ready(metrics.export(&ResourceMetrics::default()));
+            let span_result = await_ready(spans.export(Vec::new()));
+            for result in [metric_result, span_result] {
+                if failed {
+                    assert!(
+                        matches!(result, Err(OTelSdkError::InternalFailure(ref message)) if message == "fixture final export failure")
+                    );
+                } else {
+                    assert!(result.is_ok());
+                }
+            }
+            assert_eq!(
+                availability.state.lock().unwrap().unavailable_signals,
+                if failed { 0b11 } else { 0 }
+            );
+        }
+        assert_eq!(metric_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(span_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(availability.state.lock().unwrap().total_failed_exports, 4);
+    }
+
+    // Local, synchronous capture only: no default transport, initialization,
+    // network, test feature, or global subscriber is needed.
+    #[derive(Default)]
+    struct TestTransport(Mutex<Vec<sentry::protocol::Event<'static>>>);
+
+    impl sentry::Transport for TestTransport {
+        fn send_envelope(&self, envelope: sentry::Envelope) {
+            if let Some(event) = envelope.event() {
+                self.0.lock().unwrap().push(event.clone());
+            }
+        }
+    }
+
+    #[test]
+    fn exporter_outage_cooldown_through_real_sentry_mapper() {
+        use tracing_subscriber::prelude::*;
+        let _guard = TELEMETRY_TEST_LOCK.lock().expect("telemetry test lock");
+        let _reset = TelemetryEnabledReset(super::super::telemetry_enabled());
+        super::super::set_telemetry_enabled(true);
+        let transport = Arc::new(TestTransport::default());
+        let mut options = sentry::ClientOptions::default();
+        options.dsn = Some("https://public@example.invalid/1".parse().unwrap());
+        options.transport = Some(Arc::new(transport.clone()));
+        options.default_integrations = false;
+        let client = sentry::Client::from(options);
+        let hub = Arc::new(sentry::Hub::new(
+            Some(Arc::new(client)),
+            Arc::new(Default::default()),
+        ));
+        let subscriber = tracing_subscriber::registry().with(super::super::sentry_tracing_layer());
+        let availability = ExportAvailability::default();
+        let now = Instant::now();
+        sentry::Hub::run(hub, || {
+            tracing::subscriber::with_default(subscriber, || {
+                availability.observe_at("traces", 0b10, &failure(), now);
+                assert_eq!(transport.0.lock().unwrap().len(), 1);
+                availability.observe_at("traces", 0b10, &failure(), now + Duration::from_secs(1));
+                assert_eq!(transport.0.lock().unwrap().len(), 1);
+                availability.observe_at("traces", 0b10, &Ok(()), now + Duration::from_secs(2));
+                availability.observe_at("traces", 0b10, &failure(), now + Duration::from_secs(3));
+                availability.observe_at("metrics", 0b01, &failure(), now + Duration::from_secs(4));
+                availability.observe_at("traces", 0b10, &Ok(()), now + Duration::from_secs(5));
+                assert_eq!(transport.0.lock().unwrap().len(), 1);
+                availability.observe_at("metrics", 0b01, &Ok(()), now + Duration::from_secs(6));
+                assert_eq!(transport.0.lock().unwrap().len(), 1);
+                tracing::error!(target: "pioneer::unrelated", "unrelated error fixture");
+                assert_eq!(transport.0.lock().unwrap().len(), 2);
+                availability.observe_at(
+                    "metrics",
+                    0b01,
+                    &failure(),
+                    now + EXPORT_OUTAGE_REPORT_COOLDOWN,
+                );
+                assert_eq!(transport.0.lock().unwrap().len(), 3);
+                // Expiration during a continuous outage does not report again.
+                availability.observe_at(
+                    "traces",
+                    0b10,
+                    &failure(),
+                    now + EXPORT_OUTAGE_REPORT_COOLDOWN * 2,
+                );
+            })
+        });
+        let events = transport.0.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        for index in [0, 2] {
+            assert_eq!(events[index].level, sentry::Level::Error);
+            assert_eq!(
+                events[index].message.as_deref(),
+                Some("OTLP exporter became unavailable after retries")
+            );
+        }
+        assert_eq!(
+            events[1].message.as_deref(),
+            Some("unrelated error fixture")
+        );
+        let recovery = events[1]
+            .breadcrumbs
+            .iter()
+            .rev()
+            .find(|breadcrumb| breadcrumb.message.as_deref() == Some("OTLP exporter recovered"))
+            .unwrap();
+        assert_eq!(recovery.level, sentry::Level::Info);
+        assert_eq!(
+            recovery.data["total_suppressed_episodes"],
+            serde_json::json!(1)
+        );
+        assert_eq!(recovery.data["total_failed_exports"], serde_json::json!(4));
+        assert_eq!(
+            recovery.data["episode_failed_exports"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            recovery.data["observed_episode_duration_ms"],
+            serde_json::json!(3_000)
+        );
     }
 
     #[test]
@@ -713,18 +1332,12 @@ mod tests {
 
         availability.observe("traces", 0b10, &failure);
         availability.observe("metrics", 0b01, &failure);
-        assert_eq!(
-            availability.unavailable_signals.load(Ordering::Acquire),
-            0b11
-        );
+        assert_eq!(availability.state.lock().unwrap().unavailable_signals, 0b11);
 
         availability.observe("traces", 0b10, &Ok(()));
-        assert_eq!(
-            availability.unavailable_signals.load(Ordering::Acquire),
-            0b01
-        );
+        assert_eq!(availability.state.lock().unwrap().unavailable_signals, 0b01);
         availability.observe("metrics", 0b01, &Ok(()));
-        assert_eq!(availability.unavailable_signals.load(Ordering::Acquire), 0);
+        assert_eq!(availability.state.lock().unwrap().unavailable_signals, 0);
     }
 }
 

@@ -7996,5 +7996,7 @@ async fn immediate_dispatch_inherits_request_scope_and_scheduler_keeps_maintenan
     observer.assert_scope(SqliteReadClass::Maintenance, SqliteWriteClass::Maintenance);
 }
 
+#[path = "tests_delivery_lifecycle.rs"]
+mod delivery_lifecycle;
 #[path = "tests/terminal_delivery.rs"]
 mod terminal_delivery;
