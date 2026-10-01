@@ -829,13 +829,17 @@ async fn legacy_manifest_without_checkpoint_reclassifies_saved_candidate() {
     let run = fixture.extractor_run().await;
     let error = run.error.unwrap();
     assert!(!error.retryable);
+    // CRUD persists code/message/retryable, not HookError metadata. The fixed
+    // safe message carries these fields through both persisted error APIs.
+    assert!(error.metadata.is_empty());
+    assert!(error.safe_for_user);
     assert_eq!(
-        error.metadata[&pioneer_hooks::HookMetadataKey::new("failure_class").unwrap()],
-        "invalid_stored_data"
+        error.message.as_str(),
+        "memory manifest loading failed: failure_class=invalid_stored_data failure_stage=candidates sqlite_primary_code=None sqlite_extended_code=None"
     );
     assert_eq!(
-        error.metadata[&pioneer_hooks::HookMetadataKey::new("failure_stage").unwrap()],
-        "candidates"
+        status.last_error_message.as_deref(),
+        Some(error.message.as_str())
     );
     assert!(
         !serde_json::to_string(&error)
@@ -1397,14 +1401,21 @@ async fn manifest_actual_active_query_failure_is_unclassified_with_sqlite_codes(
         "memory.post_turn_extractor.manifest_unclassified"
     );
     assert!(!error.retryable);
+    assert!(error.metadata.is_empty());
+    assert!(error.safe_for_user);
     assert_eq!(
-        error.metadata[&pioneer_hooks::HookMetadataKey::new("failure_stage").unwrap()],
-        "active"
+        error.message.as_str(),
+        "memory manifest loading failed: failure_class=unclassified failure_stage=active sqlite_primary_code=Some(1) sqlite_extended_code=Some(1)"
     );
+    let status = fixture.status().await;
+    assert_eq!(status.status, "unresolved");
+    assert_eq!(status.last_error_code.as_deref(), Some(error.code.as_str()));
     assert_eq!(
-        error.metadata[&pioneer_hooks::HookMetadataKey::new("sqlite_primary_code").unwrap()],
-        "1"
+        status.last_error_message.as_deref(),
+        Some(error.message.as_str())
     );
+    assert_eq!(fixture.model.call_count(), 0);
+    assert!(fixture.writes.attempts.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
