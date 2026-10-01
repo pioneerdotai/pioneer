@@ -1,3 +1,4 @@
+use crate::failure::ProviderStreamIncomplete;
 use crate::{
     attachments::{
         PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes, attachment_data_url,
@@ -1332,7 +1333,9 @@ impl crate::traits::Provider for OpenRouterProvider {
                             .take()
                             .map(StreamChunk::final_chunk_with)
                             .ok_or_else(|| {
-                                anyhow!("provider stream ended without a finish_reason")
+                                anyhow::Error::from(
+                                    ProviderStreamIncomplete::DoneWithoutFinishReason,
+                                )
                             });
                         let _ = tx
                             .send(terminal.map_err(|error| {
@@ -1505,7 +1508,9 @@ impl crate::traits::Provider for OpenRouterProvider {
                 Err(error) => Err(error),
                 Ok(_) => terminal_reason
                     .map(StreamChunk::final_chunk_with)
-                    .ok_or_else(|| anyhow!("provider stream ended before a terminal marker")),
+                    .ok_or_else(|| {
+                        anyhow::Error::from(ProviderStreamIncomplete::EofWithoutTerminalMarker)
+                    }),
             };
             let _ = tx
                 .send(terminal.map_err(|error| {
