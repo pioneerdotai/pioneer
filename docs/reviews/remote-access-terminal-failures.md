@@ -10,21 +10,22 @@ filtering policy.
 - Pioneer branch: `fix/remote-access-terminal-failures`.
 - Pioneer worktree: `/Users/alexander/Code/pioneer/pioneer/.worktrees/remote-access-terminal-failures`.
 - Pioneer base: `ddcc02057c76f7b44cce86c420c4596de414c1bb` (local `main`).
-- Relay branch: `fix/remote-access-terminal-failures` in the separate relay repository.
-- Relay worktree: `/Users/alexander/Code/pioneer/pioneer-relay/.worktrees/remote-access-terminal-failures`.
+- Former Relay branch: `fix/remote-access-terminal-failures` (deleted after merge).
+- Former Relay worktree: `/Users/alexander/Code/pioneer/pioneer-relay/.worktrees/remote-access-terminal-failures` (removed after merge).
 - Relay base and original pinned dependency: `93e0ddccab7cb6c255b417c391ef649a4f7554a7`.
 
-Relay 0.6.1 is committed and pushed at `686680a37689bf0abea13f8e37340a588003da50` on the fix branch:
+Relay PR #1 is merged into main with version 0.6.1:
 https://github.com/pioneerdotai/relay/pull/1
-The GitHub branch ref was checked against the local commit before updating Pioneer.
+The development branch and its local worktree have been removed after merge.
 
-Pioneer pins that exact published Git commit in the workspace dependency.
-`Cargo.lock` records rathole 0.6.1 with the matching Git source. The local path patch
-has been removed, so the dependency no longer requires a neighboring relay worktree.
-The Cargo checkout is untouched.
+Pioneer uses the GitHub Relay dependency with `version = "0.6.1"`, without a `rev`
+or local path patch. Cargo resolves the default GitHub branch; `Cargo.lock` records
+the resolved source for reproducible dependency installation. The library no longer
+requires a neighboring relay worktree. The Cargo checkout is untouched.
 
-The Relay and Pioneer PRs still need review and merge. Publishing the branch does
-not merge it or create a release. No release tags or deployments were created.
+The Pioneer PR still needs review and merge. No release tags or deployments were
+created. This change does not require updating the production relay server: the
+wire protocol, routing, authentication and server implementation are unchanged.
 
 ## Lifecycle invariants
 
@@ -159,7 +160,7 @@ was performed during implementation and review. The written tests and runtime be
 execution/verification. UDP task ownership is covered only by static review;
 Pioneer supports TCP and the runtime socket regression tests written here exercise
 TCP. After acceptance, Relay was committed and pushed with a version bump to 0.6.1,
-and Pioneer was updated to the verified published commit. GitHub CI was not disabled
+and Pioneer was updated to the GitHub dependency at version 0.6.1 without a rev. GitHub CI was not disabled
 or skipped for these pushes. Local tests, builds and applications remain unexecuted.
 
 Тесты не запускались по указанию пользователя.
