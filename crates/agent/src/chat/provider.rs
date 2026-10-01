@@ -1573,7 +1573,12 @@ mod tests {
             provider.chat(request).await.err().unwrap()
         };
         server.await.unwrap();
-        assert_eq!(error.chain().count(), 1);
+        assert!(
+            error
+                .chain()
+                .skip(1)
+                .all(|cause| { cause.is::<pioneer_provider::failure::ProviderStreamIncomplete>() })
+        );
         assert!(!error.chain().any(
             |cause| cause.is::<std::string::FromUtf8Error>() || cause.is::<serde_json::Error>()
         ));

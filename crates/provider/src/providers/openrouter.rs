@@ -412,6 +412,8 @@ impl ResponseFailureFacts {
 #[derive(Debug)]
 struct OpenRouterFailure {
     classification: crate::types::ProviderFailureClassification,
+    // Only the established, data-free completion enum may survive as a source.
+    incomplete: Option<ProviderStreamIncomplete>,
 }
 
 impl std::fmt::Display for OpenRouterFailure {
@@ -420,7 +422,13 @@ impl std::fmt::Display for OpenRouterFailure {
     }
 }
 
-impl std::error::Error for OpenRouterFailure {}
+impl std::error::Error for OpenRouterFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.incomplete
+            .as_ref()
+            .map(|cause| cause as &(dyn std::error::Error + 'static))
+    }
+}
 
 impl OpenRouterFailure {
     fn from_envelope(
@@ -447,7 +455,10 @@ impl OpenRouterFailure {
             .and_then(|error| error.metadata)
             .and_then(|metadata| metadata.error_type);
         classification.request_id = id.and_then(|id| ProviderRequestId::try_from(id).ok());
-        Self { classification }
+        Self {
+            classification,
+            incomplete: None,
+        }
     }
 
     fn stream(error: StreamError, id: Option<String>) -> Self {
@@ -476,6 +487,7 @@ impl OpenRouterFailure {
     // Classify the original transport failure before discarding its text and
     // source chain. Adding an ID must not turn a transport failure into a 5xx.
     fn stream_transport(error: anyhow::Error, id: Option<String>) -> anyhow::Error {
+        let incomplete = crate::failure::provider_stream_incomplete(&error);
         let description = error.to_string();
         let status = error
             .downcast_ref::<reqwest::Error>()
@@ -492,6 +504,7 @@ impl OpenRouterFailure {
         if error.is::<crate::types::ProviderResponseTooLarge>() {
             failure.classification.class = pioneer_protocol::ProviderFailureClass::ProviderRejected;
         }
+        failure.incomplete = incomplete;
         failure.into()
     }
 
@@ -2460,6 +2473,14 @@ mod tests {
                 ProviderFailureClass::StreamStall,
             ),
             (
+                ProviderStreamIncomplete::EofWithoutTerminalMarker.into(),
+                ProviderFailureClass::StreamStall,
+            ),
+            (
+                ProviderStreamIncomplete::DoneWithoutFinishReason.into(),
+                ProviderFailureClass::StreamStall,
+            ),
+            (
                 IncrementalLineDecoder::default()
                     .push(&[0xff, b'\n'])
                     .unwrap_err(),
@@ -2470,7 +2491,12 @@ mod tests {
                 ProviderFailureClass::ProviderRejected,
             ),
         ] {
+            let incomplete = crate::failure::provider_stream_incomplete(&error);
             let error = OpenRouterFailure::stream_transport(error, Some("gen-fixture".to_owned()));
+            assert_eq!(
+                crate::failure::provider_stream_incomplete(&error),
+                incomplete
+            );
             let failure = error.downcast_ref::<OpenRouterFailure>().unwrap();
             assert_eq!(failure.classification.class, expected);
             assert_eq!(failure.classification.http_status, None);
@@ -2479,7 +2505,7 @@ mod tests {
                 Some(ProviderRequestId::try_from("gen-fixture".to_owned()).unwrap())
             );
             assert!(!format!("{error:#?}").contains("private_fixture"));
-            assert_eq!(error.chain().count(), 1);
+            assert_eq!(error.chain().count(), 1 + usize::from(incomplete.is_some()));
         }
     }
 

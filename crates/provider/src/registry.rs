@@ -1940,7 +1940,7 @@ mod tests {
                 let body = format!(
                     "{}{}",
                     if with_json {
-                        "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"facts\\\":[]}\"},\"finish_reason\":null}]}\n\n"
+                        "data: {\"id\":\"gen-completion_body\",\"choices\":[{\"delta\":{\"content\":\"{\\\"facts\\\":[]}\"},\"finish_reason\":null}]}\n\n"
                     } else {
                         ""
                     },
@@ -1969,7 +1969,7 @@ mod tests {
                             }
                         }
                     }
-                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Generation-Id: gen-completion_header\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
                     socket.shutdown().await.unwrap();
                 });
                 let registry =
@@ -2004,9 +2004,17 @@ mod tests {
                         ProviderStreamIncomplete::EofWithoutTerminalMarker
                     })
                 );
+                let classification = provider.classify_failure(&error).unwrap();
+                assert_eq!(classification.class, ProviderFailureClass::StreamStall);
+                assert_eq!(classification.http_status, None);
+                assert_eq!(classification.error_reason, None);
                 assert_eq!(
-                    provider.classify_failure(&error).unwrap().class,
-                    ProviderFailureClass::StreamStall
+                    classification.request_id.map(String::from).as_deref(),
+                    Some(if with_json {
+                        "gen-completion_body"
+                    } else {
+                        "gen-completion_header"
+                    })
                 );
                 assert!(!format!("{error:#?}").contains("private-marker-path"));
             }
