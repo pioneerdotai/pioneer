@@ -1254,8 +1254,26 @@ fn voice_error_at_public_boundary(
                 pioneer_protocol::PublicErrorCode::Internal
             }
         };
-        let public_error =
-            crate::public_error::map_agent_failure(public_code, stage, error.message);
+        let public_error = crate::public_error::build_public_error(public_code, stage);
+        match error.kind {
+            VoiceErrorKind::Cancelled => crate::public_error::report_expected_failure(
+                &public_error,
+                "voice_request",
+                "cancelled",
+            ),
+            VoiceErrorKind::MicrophonePermissionBlocked
+            | VoiceErrorKind::DeviceUnavailable
+            | VoiceErrorKind::InvalidSession
+            | VoiceErrorKind::StaleChunk
+            | VoiceErrorKind::SequenceGap
+            | VoiceErrorKind::NoSpeech => crate::public_error::report_expected_failure(
+                &public_error,
+                "voice_request",
+                "protocol_refusal",
+            ),
+            // Availability and unknown errors can represent infrastructure failures.
+            _ => crate::public_error::report_agent_failure(&public_error, error.message),
+        }
         error.message = public_error.message.clone();
         error.public_error = Some(public_error);
     }
@@ -1465,6 +1483,76 @@ fn voice_error_kind_code(kind: VoiceErrorKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_cancellation_and_protocol_refusal_are_breadcrumbs() {
+        use crate::public_error::test_support::capture_events;
+        let (_, events) = capture_events(|| {
+            for kind in [
+                VoiceErrorKind::Cancelled,
+                VoiceErrorKind::InvalidSession,
+                VoiceErrorKind::StaleChunk,
+                VoiceErrorKind::SequenceGap,
+                VoiceErrorKind::NoSpeech,
+            ] {
+                let error = voice_error_at_public_boundary(
+                    VoiceError {
+                        kind,
+                        message: "bearer-token /Users/operator/private".to_owned(),
+                        public_error: None,
+                    },
+                    pioneer_protocol::PublicErrorStage::Execution,
+                );
+                let encoded = serde_json::to_string(&error).unwrap();
+                assert!(!encoded.contains("bearer-token"));
+                assert!(!encoded.contains("/Users/operator/private"));
+                let public = error.public_error.as_ref().unwrap();
+                assert_eq!(public.stage, pioneer_protocol::PublicErrorStage::Execution);
+                assert_eq!(
+                    public.code,
+                    if kind == VoiceErrorKind::Cancelled {
+                        pioneer_protocol::PublicErrorCode::Conflict
+                    } else {
+                        pioneer_protocol::PublicErrorCode::InvalidInput
+                    }
+                );
+                // Reusing an already sanitized error also does not register a failure.
+                assert_eq!(
+                    voice_error_at_public_boundary(
+                        error.clone(),
+                        pioneer_protocol::PublicErrorStage::Admission
+                    ),
+                    error
+                );
+            }
+        });
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn unknown_and_infrastructure_voice_failures_remain_errors() {
+        use crate::public_error::test_support::*;
+        for kind in [
+            VoiceErrorKind::Unknown,
+            VoiceErrorKind::GatewayBusy,
+            VoiceErrorKind::ModelUnavailable,
+            VoiceErrorKind::TranscriptionFailed,
+        ] {
+            let (error, events) = capture_events(|| {
+                voice_error_at_public_boundary(
+                    VoiceError {
+                        kind,
+                        message: "cancelled is only raw text here".to_owned(),
+                        public_error: None,
+                    },
+                    pioneer_protocol::PublicErrorStage::Execution,
+                )
+            });
+            assert_eq!(events.len(), 1);
+            assert_correlated(&events[0], error.public_error.as_ref().unwrap());
+        }
+    }
+
     use crate::voice::transcription::{
         VoiceTranscriptionDiagnostics, VoiceTranscriptionNoSpeechReason, VoiceTranscriptionStrategy,
     };

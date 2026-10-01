@@ -73,11 +73,29 @@ impl GatewayVoiceSessionError {
                 pioneer_protocol::PublicErrorCode::Unavailable,
             ),
         };
-        let public_error = crate::public_error::map_agent_failure(
+        let public_error = crate::public_error::build_public_error(
             public_code,
             pioneer_protocol::PublicErrorStage::Admission,
-            self.message,
         );
+        match self.kind {
+            GatewayVoiceSessionErrorKind::StoreUnavailable => {
+                crate::public_error::report_agent_failure(&public_error, self.message);
+            }
+            expected => {
+                let failure_class = match expected {
+                    GatewayVoiceSessionErrorKind::UnknownSession => "unknown_session",
+                    GatewayVoiceSessionErrorKind::DuplicateSession => "duplicate_session",
+                    GatewayVoiceSessionErrorKind::OwnershipMismatch => "ownership_mismatch",
+                    GatewayVoiceSessionErrorKind::InvalidTransition => "invalid_transition",
+                    GatewayVoiceSessionErrorKind::StoreUnavailable => unreachable!(),
+                };
+                crate::public_error::report_expected_failure(
+                    &public_error,
+                    "voice_session",
+                    failure_class,
+                );
+            }
+        }
         VoiceError {
             kind,
             message: public_error.message.clone(),
@@ -500,6 +518,152 @@ mod tests {
             .expect("auth session id"),
             connection_id,
         }
+    }
+
+    #[test]
+    fn ownership_refusal_keeps_a_safe_authorization_breadcrumb() {
+        use crate::public_error::{map_agent_failure, test_support::capture_events};
+        let (_, events) = capture_events(|| {
+            session_error(
+                GatewayVoiceSessionErrorKind::OwnershipMismatch,
+                "bearer-token /Users/operator/private voice_session_secret",
+            )
+            .into_voice_error();
+            // A separate incident makes the accumulated breadcrumb inspectable.
+            map_agent_failure(
+                pioneer_protocol::PublicErrorCode::Internal,
+                pioneer_protocol::PublicErrorStage::Execution,
+                "test incident",
+            );
+        });
+        assert_eq!(events.len(), 1);
+        let breadcrumb = events[0]
+            .breadcrumbs
+            .iter()
+            .find(|breadcrumb| {
+                breadcrumb.message.as_deref() == Some("agent-domain operation refused")
+            })
+            .expect("authorization audit breadcrumb");
+        assert_eq!(breadcrumb.level, sentry::Level::Warning);
+        assert_eq!(
+            breadcrumb.data["operation"],
+            serde_json::json!("voice_session")
+        );
+        assert_eq!(
+            breadcrumb.data["failure_class"],
+            serde_json::json!("ownership_mismatch")
+        );
+        let encoded = serde_json::to_string(breadcrumb).unwrap();
+        assert!(!encoded.contains("bearer-token"));
+        assert!(!encoded.contains("/Users/operator/private"));
+        assert!(!encoded.contains("voice_session_secret"));
+    }
+
+    #[test]
+    fn expected_session_refusals_preserve_owner_checks_and_do_not_create_events() {
+        use crate::public_error::test_support::capture_events;
+        use pioneer_protocol::PublicErrorCode;
+        let store = GatewayVoiceSessionStore::default();
+        let owner = authenticated_owner(7, 'P', 'S');
+        store
+            .create_authenticated_session(
+                "voice_session_1",
+                owner.clone(),
+                test_context(),
+                target_format(),
+            )
+            .unwrap();
+        let (_, events) = capture_events(|| {
+            for foreign in [
+                authenticated_owner(8, 'P', 'S'),
+                authenticated_owner(7, 'Q', 'S'),
+                authenticated_owner(7, 'P', 'T'),
+            ] {
+                for failure in [
+                    store
+                        .lookup_authenticated_session("voice_session_1", &foreign)
+                        .unwrap_err(),
+                    store
+                        .mark_finalizing_authenticated("voice_session_1", &foreign)
+                        .unwrap_err(),
+                    store
+                        .remove_authenticated_session("voice_session_1", &foreign)
+                        .unwrap_err(),
+                ] {
+                    assert_eq!(
+                        failure.kind,
+                        GatewayVoiceSessionErrorKind::OwnershipMismatch
+                    );
+                    let error = failure.into_voice_error();
+                    assert_eq!(error.kind, VoiceErrorKind::InvalidSession);
+                    assert_eq!(error.public_error.unwrap().code, PublicErrorCode::NotFound);
+                }
+            }
+            for failure in [
+                store
+                    .lookup_authenticated_session("missing_session", &owner)
+                    .unwrap_err(),
+                store
+                    .create_authenticated_session(
+                        "voice_session_1",
+                        owner.clone(),
+                        test_context(),
+                        target_format(),
+                    )
+                    .unwrap_err(),
+                store
+                    .mark_transcribing_authenticated("voice_session_1", &owner)
+                    .unwrap_err(),
+            ] {
+                let code = if failure.kind == GatewayVoiceSessionErrorKind::UnknownSession {
+                    PublicErrorCode::NotFound
+                } else {
+                    PublicErrorCode::Conflict
+                };
+                let error = failure.into_voice_error();
+                let public = error.public_error.unwrap();
+                assert_eq!(public.code, code);
+                assert_eq!(public.retryable, code == PublicErrorCode::Conflict);
+                assert_eq!(error.message, public.message);
+            }
+            assert_eq!(
+                store
+                    .lookup_authenticated_session("voice_session_1", &owner)
+                    .unwrap()
+                    .state,
+                GatewayVoiceSessionState::Created
+            );
+            store
+                .remove_authenticated_session("voice_session_1", &owner)
+                .unwrap();
+            let removed = store
+                .lookup_authenticated_session("voice_session_1", &owner)
+                .unwrap_err()
+                .into_voice_error();
+            assert_eq!(
+                removed.public_error.unwrap().code,
+                PublicErrorCode::NotFound
+            );
+        });
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn unavailable_store_creates_correlated_error_event() {
+        use crate::public_error::test_support::*;
+        let store = GatewayVoiceSessionStore::default();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = store.sessions.lock().unwrap();
+            panic!("poison test store");
+        });
+        let (error, events) =
+            capture_events(|| store.has_active_sessions().unwrap_err().into_voice_error());
+        let public = error.public_error.unwrap();
+        assert_eq!(public.code, pioneer_protocol::PublicErrorCode::Unavailable);
+        assert!(public.retryable);
+        assert_eq!(error.kind, VoiceErrorKind::GatewayBusy);
+        assert_eq!(events.len(), 1);
+        assert_correlated(&events[0], &public);
     }
 
     #[test]
