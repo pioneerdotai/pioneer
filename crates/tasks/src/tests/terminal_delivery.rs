@@ -1325,8 +1325,7 @@ async fn cancellation_rejects_a_missing_previously_bound_agent_graph() {
     );
 }
 
-#[tokio::test]
-async fn task_cancellation_preserves_the_existing_work_graph_execution_fence() {
+async fn cancelled_work_graph_fixture() -> (TaskRuntime, TaskRun, TaskExecutionHandle) {
     let (runtime, run, handle) = unadmitted_agent_fixture().await;
     let store = runtime.service().store();
     persist_test_agent_turn(
@@ -1368,6 +1367,18 @@ async fn task_cancellation_preserves_the_existing_work_graph_execution_fence() {
         "UPDATE agent_execution SET status='cancelled',finished_at=updated_at,parent_task_id=? WHERE id=?",
         [run.task_id.clone().into(), execution.id.clone().into()],
     )).await.unwrap();
+    (runtime, run, handle)
+}
+
+#[tokio::test]
+async fn task_cancellation_preserves_the_existing_work_graph_execution_fence() {
+    let (runtime, run, handle) = cancelled_work_graph_fixture().await;
+    let store = runtime.service().store();
+    let occurrence = store
+        .get_task_occurrence_contract_by_run(&run.id)
+        .await
+        .unwrap()
+        .unwrap();
     let fenced = store
         .load_execution_for_run(&run.id)
         .await
@@ -1429,4 +1440,227 @@ async fn task_cancellation_preserves_the_existing_work_graph_execution_fence() {
             .downcast_ref::<TaskTerminalConflict>()
             .is_some()
     );
+}
+
+async fn persisted_graph_fence(
+    runtime: &TaskRuntime,
+    run: &TaskRun,
+) -> (
+    pioneer_entity::task_run_execution::Model,
+    pioneer_entity::task_occurrence_contract::Model,
+    pioneer_entity::agent_execution::Model,
+) {
+    let db = runtime.service().store().database_connection();
+    let execution = pioneer_entity::task_run_execution::Entity::find()
+        .filter(pioneer_entity::task_run_execution::Column::TaskRunId.eq(run.id.clone()))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let occurrence = pioneer_entity::task_occurrence_contract::Entity::find_by_id(run.id.clone())
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let agent = pioneer_entity::agent_execution::Entity::find_by_id(execution.id.clone())
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    (execution, occurrence, agent)
+}
+
+#[tokio::test]
+async fn cancellation_without_reason_preserves_graph_fence_after_handle_reconstruction() {
+    let (runtime, run, handle) = cancelled_work_graph_fixture().await;
+    let store = runtime.service().store();
+    let fence = persisted_graph_fence(&runtime, &run).await;
+    assert_eq!(fence.1.terminal_reason.as_deref(), Some("graph fence"));
+    assert!(fence.0.result_json.is_none() && fence.0.error_json.is_none());
+
+    let incompatible = TaskResult {
+        summary: Some("incompatible success".into()),
+        data: Some(TaskValue::Integer(99)),
+        artifacts: Vec::new(),
+        completed_by_run_id: Some(run.id.clone()),
+    };
+    let before = events(&runtime, &run).await;
+    let original_task = store.get_task(&run.task_id).await.unwrap().unwrap().task;
+    let original_run = store.get_task_run(&run.id).await.unwrap().unwrap();
+    let error = handle
+        .complete_run(Some(incompatible.clone()), run.created_at + 9)
+        .await
+        .unwrap_err();
+    assert!(error.downcast_ref::<TaskTerminalConflict>().is_some());
+    assert_eq!(events(&runtime, &run).await, before);
+    assert_eq!(
+        store.get_task(&run.task_id).await.unwrap().unwrap().task,
+        original_task
+    );
+    assert_eq!(
+        store.get_task_run(&run.id).await.unwrap().unwrap(),
+        original_run
+    );
+    assert_eq!(persisted_graph_fence(&runtime, &run).await, fence);
+
+    handle.cancel_run(None, run.created_at + 10).await.unwrap();
+    assert_eq!(
+        store.get_task_run(&run.id).await.unwrap().unwrap().status,
+        TaskRunStatus::Cancelled
+    );
+    assert_eq!(
+        store
+            .get_task(&run.task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .task
+            .status,
+        TaskStatus::Cancelled
+    );
+    // Compare complete persisted rows, including created_at/updated_at and
+    // completion facts, rather than just the protocol status projections.
+    assert_eq!(persisted_graph_fence(&runtime, &run).await, fence);
+    let before = events(&runtime, &run).await;
+    let reconstructed = TaskExecutionHandle::new(
+        store,
+        runtime.event_bus(),
+        run.task_id.clone(),
+        run.id.clone(),
+    );
+    reconstructed
+        .cancel_run(None, run.created_at + 20)
+        .await
+        .unwrap();
+    assert_eq!(events(&runtime, &run).await, before);
+    assert_eq!(persisted_graph_fence(&runtime, &run).await, fence);
+    assert!(deliveries(&runtime, &run).await.is_empty());
+
+    let error = reconstructed
+        .complete_run(Some(incompatible), run.created_at + 30)
+        .await
+        .unwrap_err();
+    assert!(error.downcast_ref::<TaskTerminalConflict>().is_some());
+    assert_eq!(events(&runtime, &run).await, before);
+    assert_eq!(persisted_graph_fence(&runtime, &run).await, fence);
+}
+
+#[tokio::test]
+async fn cancellation_without_reason_rejects_unconfirmed_graph_facts_atomically() {
+    for invalid_fact in [
+        "binding",
+        "generation",
+        "parent_task",
+        "root",
+        "occurrence_status",
+        "execution_completion",
+        "agent_completion",
+        "agent_status",
+        "result",
+    ] {
+        let (runtime, run, handle) = cancelled_work_graph_fixture().await;
+        let store = runtime.service().store();
+        let db = store.database_connection();
+        let execution = store
+            .load_execution_for_run(&run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        // Corrupt the fixture before preparation: commit must validate the
+        // actual graph facts even when execution and RunCancelled payloads match.
+        let (sql, id) = match invalid_fact {
+            "binding" => (
+                "UPDATE task_occurrence_contract SET agent_execution_id=work_graph_root_execution_id WHERE run_id=?",
+                run.id.clone(),
+            ),
+            "generation" => (
+                "UPDATE agent_execution SET execution_generation=execution_generation+1 WHERE id=?",
+                execution.id.clone(),
+            ),
+            "parent_task" => (
+                "UPDATE agent_execution SET parent_task_id=NULL WHERE id=?",
+                execution.id.clone(),
+            ),
+            "root" => (
+                "UPDATE task_occurrence_contract SET work_graph_root_execution_id=agent_execution_id,root_resource_scope_id=agent_execution_id WHERE run_id=?",
+                run.id.clone(),
+            ),
+            "occurrence_status" => (
+                "UPDATE task_occurrence_contract SET status='running' WHERE run_id=?",
+                run.id.clone(),
+            ),
+            "execution_completion" => (
+                "UPDATE task_run_execution SET completed_at=NULL WHERE id=?",
+                execution.id.clone(),
+            ),
+            "agent_completion" => (
+                "UPDATE agent_execution SET finished_at=NULL WHERE id=?",
+                execution.id.clone(),
+            ),
+            "agent_status" => (
+                "UPDATE agent_execution SET status='running' WHERE id=?",
+                execution.id.clone(),
+            ),
+            "result" => (
+                "UPDATE task_run_execution SET result_json='{}' WHERE id=?",
+                execution.id.clone(),
+            ),
+            _ => unreachable!(),
+        };
+        db.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            sql,
+            [id.into()],
+        ))
+        .await
+        .unwrap();
+        let fence = persisted_graph_fence(&runtime, &run).await;
+        let task = pioneer_entity::task::Entity::find_by_id(run.task_id.clone())
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let persisted_run = pioneer_entity::task_run::Entity::find_by_id(run.id.clone())
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let before = events(&runtime, &run).await;
+        let error = handle
+            .cancel_run(None, run.created_at + 10)
+            .await
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<TaskTerminalConflict>().is_some(),
+            "{invalid_fact}: {error:#}"
+        );
+        assert_eq!(events(&runtime, &run).await, before, "{invalid_fact}");
+        assert_eq!(
+            persisted_graph_fence(&runtime, &run).await,
+            fence,
+            "{invalid_fact}"
+        );
+        assert_eq!(
+            pioneer_entity::task::Entity::find_by_id(run.task_id.clone())
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap(),
+            task,
+            "{invalid_fact}"
+        );
+        assert_eq!(
+            pioneer_entity::task_run::Entity::find_by_id(run.id.clone())
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap(),
+            persisted_run,
+            "{invalid_fact}"
+        );
+        assert!(
+            deliveries(&runtime, &run).await.is_empty(),
+            "{invalid_fact}"
+        );
+    }
 }

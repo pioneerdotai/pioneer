@@ -408,13 +408,16 @@ impl CrudStore {
                 .context("invalid execution status")?
                 .is_terminal()
             {
-                if execution.status != task_run_execution_status_to_db(status)
-                    || execution.result_json != prepared.result_json
-                    || execution.error_json != prepared.error_json
+                if matches!(prepared.terminal, TaskEventPayload::RunCancelled { .. })
+                    && execution.status == "cancelled"
+                    && execution.result_json.is_none()
+                    && execution.error_json.is_none()
+                    && agent.is_some()
                 {
                     // Work-graph cancellation fences Task executions before
                     // Task events are emitted. That fence intentionally has no
-                    // result/error payload; retain it when closing the Task.
+                    // result/error payload. Recognize it even when RunCancelled
+                    // has no reason and its payload already matches execution.
                     let occurrence = task_actor_contract::find_task_occurrence_by_run_id(
                         db,
                         &prepared.state.run.id,
@@ -444,11 +447,17 @@ impl CrudStore {
                                         == Some(agent.work_graph_root_execution_id.as_str())
                             });
                     if !graph_cancelled {
-                        return conflict("different committed execution outcome");
+                        return conflict("unconfirmed agent work graph cancellation fence");
                     }
                     // The graph fence owns its original completion time and
                     // reason. Both execution and occurrence are finalized.
                     return Ok(());
+                }
+                if execution.status != task_run_execution_status_to_db(status)
+                    || execution.result_json != prepared.result_json
+                    || execution.error_json != prepared.error_json
+                {
+                    return conflict("different committed execution outcome");
                 }
             } else {
                 let transitioned = task_run_execution::mark_execution_terminal_json(
