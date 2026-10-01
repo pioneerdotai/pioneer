@@ -13,12 +13,63 @@ use pioneer_crud::{
 use pioneer_hooks::{
     HookAuditEventStoreRecord, HookRecoverableRunRecord, HookRecoveryScan, HookRetrySchedule,
     HookRunAttemptId, HookRunAttemptStoreCompletion, HookRunAttemptStoreRecord, HookRunId,
-    HookRunScope, HookRunScopeKind, HookRunStore, HookRunStoreCompletion, HookRunStoreError,
-    HookRunStoreRecord, HookRunStoreResult, NewHookAuditEventStoreRecord,
-    NewHookRunAttemptStoreRecord, NewHookRunStoreRecord,
+    HookRunScope, HookRunScopeKind, HookRunStore, HookRunStoreCauseClass, HookRunStoreCompletion,
+    HookRunStoreDiagnostic, HookRunStoreError, HookRunStoreRecord, HookRunStoreResult,
+    NewHookAuditEventStoreRecord, NewHookRunAttemptStoreRecord, NewHookRunStoreRecord,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use std::sync::Arc;
+
+/// Called only after CRUD has returned and released the serialized writer.
+/// RuntimeErr does not expose its SQLx error as a standard source, so inspect
+/// that typed wrapper explicitly while walking anyhow's context/source chain.
+fn append_audit_error(error: anyhow::Error) -> HookRunStoreError {
+    let diagnostic = error
+        .chain()
+        .find_map(|cause| {
+            if let Some(sqlite) = cause.downcast_ref::<sea_orm::SqlxSqliteError>() {
+                return sqlite_diagnostic(sqlite);
+            }
+            let sqlx = if let Some(sqlx) = cause.downcast_ref::<sea_orm::SqlxError>() {
+                Some(sqlx)
+            } else if let Some(sea_orm::RuntimeErr::SqlxError(sqlx)) =
+                cause.downcast_ref::<sea_orm::RuntimeErr>()
+            {
+                Some(sqlx.as_ref())
+            } else {
+                None
+            };
+            let sea_orm::SqlxError::Database(database) = sqlx? else {
+                return None;
+            };
+            sqlite_diagnostic(database.try_downcast_ref::<sea_orm::SqlxSqliteError>()?)
+        })
+        .unwrap_or_default();
+    HookRunStoreError::internal_with_diagnostic("failed to append hook audit events", diagnostic)
+}
+
+fn sqlite_diagnostic(sqlite: &sea_orm::SqlxSqliteError) -> Option<HookRunStoreDiagnostic> {
+    use sea_orm::sqlx::error::DatabaseError;
+    // code() is SQLx's typed numeric SQLite code API, not Display/error text.
+    let extended = sqlite.code()?.parse::<i32>().ok()?;
+    Some(sqlite_code_diagnostic(extended))
+}
+
+fn sqlite_code_diagnostic(extended: i32) -> HookRunStoreDiagnostic {
+    let primary = extended & 0xff;
+    let cause_class = match primary {
+        5 => HookRunStoreCauseClass::SqliteBusy,
+        6 => HookRunStoreCauseClass::SqliteLocked,
+        14 => HookRunStoreCauseClass::SqliteCantOpen,
+        19 => HookRunStoreCauseClass::SqliteConstraint,
+        _ => HookRunStoreCauseClass::SqliteOther,
+    };
+    HookRunStoreDiagnostic {
+        cause_class,
+        sqlite_primary_code: Some(primary),
+        sqlite_extended_code: Some(extended),
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct CrudHookRunStore {
@@ -215,7 +266,7 @@ impl HookRunStore for CrudHookRunStore {
         self.crud_store
             .append_hook_audit_events(records, now)
             .await
-            .map_err(|_| HookRunStoreError::internal("failed to append hook audit events"))?
+            .map_err(append_audit_error)?
             .into_iter()
             .map(crud_audit_to_store_record)
             .collect()
@@ -436,6 +487,10 @@ fn current_unix_ms() -> i64 {
 }
 
 #[cfg(test)]
+#[path = "hook_run_store_diagnostic_tests.rs"]
+mod diagnostic_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use migration::{Migrator, MigratorTrait};
@@ -453,6 +508,246 @@ mod tests {
     };
     use sea_orm::{Database, DatabaseConnection, EntityTrait};
     use std::time::Duration;
+
+    #[test]
+    fn sqlite_primary_and_extended_codes_have_distinct_safe_classes() {
+        // SQLite native result codes, including extended variants. This tests
+        // the numeric mapping; typed-source extraction is tested below.
+        for (code, primary, class) in [
+            (5, 5, HookRunStoreCauseClass::SqliteBusy),
+            (517, 5, HookRunStoreCauseClass::SqliteBusy),
+            (6, 6, HookRunStoreCauseClass::SqliteLocked),
+            (262, 6, HookRunStoreCauseClass::SqliteLocked),
+            (14, 14, HookRunStoreCauseClass::SqliteCantOpen),
+            (526, 14, HookRunStoreCauseClass::SqliteCantOpen),
+            (19, 19, HookRunStoreCauseClass::SqliteConstraint),
+            (1811, 19, HookRunStoreCauseClass::SqliteConstraint),
+            (1, 1, HookRunStoreCauseClass::SqliteOther),
+        ] {
+            let diagnostic = sqlite_code_diagnostic(code);
+            assert_eq!(diagnostic.cause_class, class);
+            assert_eq!(diagnostic.sqlite_primary_code, Some(primary));
+            assert_eq!(diagnostic.sqlite_extended_code, Some(code));
+        }
+    }
+
+    #[test]
+    fn untyped_sqlite_looking_errors_remain_unclassified_and_discard_canaries() {
+        use anyhow::Context;
+        let canary = "SELECT SQL_CANARY FROM /private/PATH_CANARY ID_CANARY AUDIT_PAYLOAD_CANARY";
+        for error in [
+            anyhow::anyhow!("database locked (code: 5) {canary}"),
+            anyhow::Error::new(sea_orm::DbErr::Custom(format!(
+                "CANTOPEN (code: 14) {canary}"
+            ))),
+            anyhow::Error::new(sea_orm::DbErr::Exec(sea_orm::RuntimeErr::Internal(
+                format!("SQLite constraint (code: 19) {canary}"),
+            ))),
+            Err::<(), _>(anyhow::anyhow!("{canary}"))
+                .context("database locked")
+                .unwrap_err(),
+        ] {
+            let safe = append_audit_error(error);
+            assert_eq!(safe.diagnostic(), HookRunStoreDiagnostic::default());
+            assert_eq!(safe.safe_message(), "failed to append hook audit events");
+            assert!(!format!("{safe:?} {safe}").contains(canary));
+            assert!(std::error::Error::source(&safe).is_none());
+        }
+    }
+
+    async fn audit_failure_fixture() -> (Arc<CrudStore>, CrudHookRunStore) {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        // Disable SQLx query logging in this isolated fixture so telemetry
+        // assertions inspect the adapter/runtime event without SQL breadcrumbs.
+        let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+        options.sqlx_logging(false);
+        let connection = Database::connect(options)
+            .await
+            .expect("fixture connection");
+        Migrator::up(&connection, None)
+            .await
+            .expect("fixture migrations");
+        let crud = Arc::new(CrudStore::new(connection));
+        let store = CrudHookRunStore::new(crud.clone());
+        // A deterministic, typed SQLITE_CONSTRAINT_TRIGGER error. The raw
+        // SQLite message contains secrets and must be discarded by the adapter.
+        crud.database_connection().execute_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "CREATE TRIGGER audit_diagnostic_failure BEFORE INSERT ON hook_audit_event BEGIN SELECT RAISE(ABORT, 'SELECT SQL_CANARY FROM /private/PATH_CANARY ID_CANARY AUDIT_PAYLOAD_CANARY'); END;".to_owned(),
+        )).await.expect("install controlled failure trigger");
+        (crud, store)
+    }
+
+    #[tokio::test]
+    async fn typed_sqlite_cause_survives_anyhow_context_without_raw_error() {
+        use anyhow::Context;
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        let (_, crud, _) = migrated_store().await;
+        let db = crud.database_connection();
+        db.execute_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "CREATE TABLE diagnostic_constraint (value INTEGER CHECK (value > 0))".to_owned(),
+        ))
+        .await
+        .expect("create fixture table");
+        let raw = db
+            .execute_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "INSERT INTO diagnostic_constraint (value) VALUES (-1)".to_owned(),
+            ))
+            .await
+            .expect_err("real typed SQLite constraint");
+        for error in [
+            anyhow::Error::new(raw.clone()),
+            Err::<(), _>(raw)
+                .context("SELECT SQL_CANARY /private/PATH_CANARY ID_CANARY AUDIT_PAYLOAD_CANARY")
+                .unwrap_err(),
+        ] {
+            let safe = append_audit_error(error);
+            assert_eq!(
+                safe.diagnostic(),
+                HookRunStoreDiagnostic {
+                    cause_class: HookRunStoreCauseClass::SqliteConstraint,
+                    sqlite_primary_code: Some(19),
+                    sqlite_extended_code: Some(275),
+                }
+            );
+            let encoded = format!("{safe:?} {safe}");
+            for secret in [
+                "diagnostic_constraint",
+                "SELECT SQL_CANARY",
+                "PATH_CANARY",
+                "ID_CANARY",
+                "AUDIT_PAYLOAD_CANARY",
+            ] {
+                assert!(!encoded.contains(secret));
+            }
+            assert!(std::error::Error::source(&safe).is_none());
+        }
+    }
+
+    async fn run_audit_failure_fixture(durable: bool) {
+        let (crud, store) = audit_failure_fixture().await;
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let hook_id = HookId::new("ID_CANARY").expect("hook id");
+        handlers
+            .register_handler(Arc::new(AuditContributionHandler {
+                id: hook_id.clone(),
+                details: Some("AUDIT_PAYLOAD_CANARY".to_owned()),
+                idempotent: durable,
+            }))
+            .expect("register handler");
+        subscriptions
+            .register_subscription(
+                handlers.as_ref(),
+                HookSubscription::new(
+                    HookSubscriptionId::new("SUBSCRIPTION_CANARY").expect("subscription id"),
+                    hook_id,
+                    HookPhase::TurnPrePromptCompile,
+                )
+                .with_failure_policy(HookFailurePolicy::BestEffort),
+            )
+            .expect("register subscription");
+        let runtime = HookRuntime::with_run_store(handlers, subscriptions, Arc::new(store));
+        let mut request = phase_15_request();
+        if durable {
+            request.context.metadata.insert(
+                pioneer_hooks::HookMetadataKey::new("native_terminal_effect_id")
+                    .expect("metadata key"),
+                HookValue::Text("EFFECT_CANARY".to_owned()),
+            );
+        }
+        let result = runtime.run_phase(request).await;
+        if durable {
+            assert!(matches!(
+                result,
+                Err(
+                    pioneer_hooks::HookRuntimeError::DurablePersistenceUnavailable {
+                        phase: HookPhase::TurnPrePromptCompile,
+                        operation: "append_audit_events",
+                    }
+                )
+            ));
+        } else {
+            assert_eq!(
+                result
+                    .expect("ordinary best effort hook retains success")
+                    .runs[0]
+                    .status,
+                HookRunStatus::Succeeded
+            );
+        }
+        let database = crud.database_connection();
+        assert_eq!(
+            hook_run::Entity::find()
+                .one(&database)
+                .await
+                .expect("run row")
+                .expect("persisted run")
+                .status,
+            if durable { "failed" } else { "succeeded" }
+        );
+        assert_eq!(
+            hook_run_attempt::Entity::find()
+                .one(&database)
+                .await
+                .expect("attempt row")
+                .expect("persisted attempt")
+                .status,
+            if durable { "failed" } else { "succeeded" }
+        );
+    }
+
+    #[test]
+    fn audit_adapter_reports_safe_sqlite_diagnostics_and_preserves_execution_policy() {
+        use tracing_subscriber::prelude::*;
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("local executor");
+        for durable in [false, true] {
+            let subscriber =
+                tracing_subscriber::registry().with(sentry::integrations::tracing::layer());
+            // with_captured_events installs an isolated hub and TestTransport;
+            // no default/global client and no network transport are used.
+            let events = sentry::test::with_captured_events(|| {
+                tracing::subscriber::with_default(subscriber, || {
+                    executor.block_on(async {
+                        run_audit_failure_fixture(durable).await;
+                    })
+                });
+            });
+            assert_eq!(events.len(), 1, "one ERROR event per audit failure");
+            let event = &events[0];
+            assert_eq!(event.level, sentry::Level::Error);
+            assert_eq!(
+                event.message.as_deref(),
+                Some("failed to persist hook run lifecycle")
+            );
+            assert_eq!(event.extra["operation"], "append_audit_events");
+            assert_eq!(event.extra["phase"], "turn.pre_prompt_compile");
+            assert_eq!(event.extra["cause_class"], "sqlite_constraint");
+            assert_eq!(event.extra["sqlite_primary_code"], 19);
+            assert_eq!(event.extra["sqlite_extended_code"], 1811);
+            assert!(event.exception.values.is_empty());
+            let encoded =
+                serde_json::to_string(&events).expect("serialize entire captured telemetry");
+            for secret in [
+                "SELECT SQL_CANARY",
+                "PATH_CANARY",
+                "ID_CANARY",
+                "AUDIT_PAYLOAD_CANARY",
+                "SUBSCRIPTION_CANARY",
+                "EFFECT_CANARY",
+            ] {
+                assert!(
+                    !encoded.contains(secret),
+                    "canary leaked into telemetry: {secret}"
+                );
+            }
+        }
+    }
 
     struct PromptContributionHandler {
         id: HookId,
@@ -508,6 +803,8 @@ mod tests {
 
     struct AuditContributionHandler {
         id: HookId,
+        details: Option<String>,
+        idempotent: bool,
     }
 
     #[async_trait]
@@ -525,7 +822,13 @@ mod tests {
         }
 
         fn capabilities(&self) -> HookCapabilities {
-            HookCapabilities::new([HookCapability::new("emit_audit").expect("valid capability")])
+            let mut capabilities =
+                vec![HookCapability::new("emit_audit").expect("valid capability")];
+            if self.idempotent {
+                capabilities
+                    .push(HookCapability::new("idempotent_side_effect").expect("valid capability"));
+            }
+            HookCapabilities::new(capabilities)
         }
 
         async fn execute(
@@ -536,7 +839,11 @@ mod tests {
                 contributions: vec![HookContribution::Audit(AuditContribution {
                     event_kind: HookAuditEventKind::new("test.gateway_hook_audit")
                         .expect("valid audit event kind"),
-                    details: HookValue::Text("gateway audit detail".to_owned()),
+                    details: HookValue::Text(
+                        self.details
+                            .clone()
+                            .unwrap_or_else(|| "gateway audit detail".to_owned()),
+                    ),
                     safe_for_user: false,
                 })],
                 ..HookHandlerResponse::default()
@@ -1085,6 +1392,8 @@ mod tests {
         handlers
             .register_handler(Arc::new(AuditContributionHandler {
                 id: hook_id.clone(),
+                details: None,
+                idempotent: false,
             }))
             .expect("handler registers");
         subscriptions

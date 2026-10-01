@@ -9625,6 +9625,7 @@ dependencies = [
  "reqwest",
  "schemars 1.2.2",
  "sea-orm",
+ "sentry",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -9652,11 +9653,13 @@ dependencies = [
  "futures-timer",
  "futures-util",
  "hex",
+ "sentry",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
