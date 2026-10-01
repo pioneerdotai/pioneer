@@ -1,3 +1,6 @@
+#[path = "tests/reconciliation_workers.rs"]
+mod reconciliation_workers;
+
 #[path = "tests/task_capsule.rs"]
 mod task_capsule;
 
@@ -67363,7 +67366,7 @@ async fn setup_workspace_manager() -> (Arc<WorkspaceManager>, Arc<CrudStore>, St
 }
 
 /// Exercise concurrent preparation with the Gateway reader/writer contour.
-async fn setup_pooled_file_workspace_manager() -> (
+pub(super) async fn setup_pooled_file_workspace_manager() -> (
     tempfile::TempDir,
     Arc<WorkspaceManager>,
     Arc<CrudStore>,
