@@ -491,7 +491,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         ConsentGatedMetricExporter, ConsentGatedSpanExporter, ExportAvailability,
         OtlpTelemetryConfig, otlp_retry_policy, validate_config,
@@ -509,7 +509,7 @@ mod tests {
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
-    static TELEMETRY_TEST_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static TELEMETRY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct TelemetryEnabledReset;
 
