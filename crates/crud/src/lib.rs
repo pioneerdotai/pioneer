@@ -8,6 +8,11 @@ mod model_history;
 mod projector;
 mod repositories;
 mod task_events;
+mod task_terminal;
+pub use task_terminal::{
+    PreparedTaskTerminalTransition, TaskTerminalCommitOutcome, TaskTerminalCommitStatus,
+    TaskTerminalConflict,
+};
 mod task_projector;
 mod thread_episodic;
 mod timeline_live_projection;

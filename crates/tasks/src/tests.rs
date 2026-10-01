@@ -7949,3 +7949,6 @@ async fn immediate_dispatch_inherits_request_scope_and_scheduler_keeps_maintenan
     assert_eq!(runtime.process_due_once(4_000_000_000).await.unwrap(), 1);
     observer.assert_scope(SqliteReadClass::Maintenance, SqliteWriteClass::Maintenance);
 }
+
+#[path = "tests/terminal_delivery.rs"]
+mod terminal_delivery;

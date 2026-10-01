@@ -31,6 +31,12 @@ pub struct PreparedTaskDeliveryProjection {
     error_snapshot_json: Option<String>,
 }
 
+impl PreparedTaskDeliveryProjection {
+    pub(crate) fn delivery_key(&self) -> &str {
+        &self.delivery.delivery_key
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PreparedTaskDeliveryAttemptProjection {
     attempt: TaskDeliveryAttempt,
@@ -215,7 +221,7 @@ pub async fn upsert_prepared_attempt<C: ConnectionTrait>(
     Ok(())
 }
 
-fn validate_delivery_update(
+fn validate_delivery_logical_facts(
     persisted: &task_delivery::Model,
     delivery: &TaskDelivery,
     result_snapshot_json: Option<&str>,
@@ -236,9 +242,28 @@ fn validate_delivery_update(
         && persisted.webhook_url_fingerprint == delivery.webhook_url_fingerprint
         && persisted.max_attempts == i64::from(delivery.max_attempts)
         && persisted.result_snapshot_json.as_deref() == result_snapshot_json
-        && persisted.error_snapshot_json.as_deref() == error_snapshot_json
-        && persisted.created_at.timestamp() == delivery.created_at;
+        && persisted.error_snapshot_json.as_deref() == error_snapshot_json;
     if !immutable_matches {
+        bail!("task delivery attempts to rewrite immutable destination/result facts");
+    }
+    Ok(())
+}
+
+fn validate_delivery_update(
+    persisted: &task_delivery::Model,
+    delivery: &TaskDelivery,
+    result_snapshot_json: Option<&str>,
+    error_snapshot_json: Option<&str>,
+) -> Result<()> {
+    validate_delivery_logical_facts(
+        persisted,
+        delivery,
+        result_snapshot_json,
+        error_snapshot_json,
+    )?;
+    // Ordinary updates still address the exact persisted id and may not change
+    // its original creation time. Only queue replay omits wall-clock equality.
+    if persisted.created_at.timestamp() != delivery.created_at {
         bail!("task delivery attempts to rewrite immutable destination/result facts");
     }
     if delivery.max_attempts == 0
@@ -416,6 +441,46 @@ fn validate_attempt_update(
         }
     }
     Ok(())
+}
+
+pub async fn find_delivery_by_key<C: ConnectionTrait>(
+    db: &C,
+    delivery_key: &str,
+) -> Result<Option<task_delivery::Model>> {
+    task_delivery::Entity::find()
+        .filter(task_delivery::Column::DeliveryKey.eq(delivery_key.to_owned()))
+        .one(db)
+        .await
+        .context("failed to query exact task delivery key")
+}
+
+/// Queue replay compares logical facts, never the new random id or wall clock.
+/// It does not call the ordinary update validator or mutate attempt/receipt state.
+pub(crate) fn resolve_queue_replay(
+    persisted: task_delivery::Model,
+    prepared: PreparedTaskDeliveryProjection,
+) -> Result<TaskDelivery> {
+    validate_delivery_logical_facts(
+        &persisted,
+        &prepared.delivery,
+        prepared.result_snapshot_json.as_deref(),
+        prepared.error_snapshot_json.as_deref(),
+    )?;
+    // Reuse every durable identity, time, attempt and receipt without decoding
+    // result/error JSON under the writer. Their bytes were compared above.
+    let mut delivery = prepared.delivery;
+    delivery.id = persisted.id;
+    delivery.status = crate::convention::task_delivery_status_from_db(&persisted.status)
+        .context("invalid persisted delivery status")?;
+    delivery.next_attempt_at = persisted.next_attempt_at.map(|t| t.timestamp());
+    delivery.attempt_count = u32::try_from(persisted.attempt_count)?;
+    delivery.delivered_turn_id = persisted.delivered_turn_id;
+    delivery.delivered_notification_id = persisted.delivered_notification_id;
+    delivery.delivered_at = persisted.delivered_at.map(|t| t.timestamp());
+    delivery.last_error = persisted.last_error;
+    delivery.created_at = persisted.created_at.timestamp();
+    delivery.updated_at = persisted.updated_at.timestamp();
+    Ok(delivery)
 }
 
 pub async fn find_delivery_by_id<C: ConnectionTrait>(
