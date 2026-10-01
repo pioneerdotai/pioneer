@@ -490,6 +490,10 @@ impl TaskRuntimeInvariantScanner {
         observed_at_unix: i64,
     ) -> Result<TaskRuntimeInvariantReport> {
         let db_path = db_path.as_ref();
+        // Auto-extensions only apply to connections opened after registration.
+        // The standalone scanner must also be able to read sqlite-zstd views.
+        pioneer_sqlite::zstd::register_auto_extension_once()
+            .context("failed to register sqlite-zstd extension for invariant scan")?;
         let mut options = ConnectOptions::new(sqlite_read_only_connection_url(db_path));
         options.sqlx_logging(false);
         let connection = Database::connect(options).await.with_context(|| {

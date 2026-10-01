@@ -1974,3 +1974,281 @@ async fn post_turn_extractor_suppresses_implicit_when_proactive_disabled() {
                 .contains("validation_rejected=1")
     }));
 }
+
+#[test]
+fn post_turn_identity_validation_matches_canonical_keys_after_normalization() {
+    let config = MemoryPostTurnExtractorConfig::default();
+    let scope = MemoryScope {
+        kind: MemoryScopeKind::Workspace,
+        key: "workspace".into(),
+    };
+    for subject in ["project", "person", "organization", "artifact", "custom"] {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("  "),
+            serde_json::json!("__ / -- 🚀"),
+            serde_json::json!("Проект Pioneer"),
+        ] {
+            let mut raw: serde_json::Value =
+                serde_json::from_str(&valid_post_turn_extractor_json()).unwrap();
+            raw["facts"][0]["semantic"]["subject"] = serde_json::json!(subject);
+            let field = if subject == "custom" {
+                "custom_subject"
+            } else {
+                "subject_key"
+            };
+            raw["facts"][0]["semantic"][field] = value.clone();
+            let semantic: MemorySemanticFields =
+                serde_json::from_value(raw["facts"][0]["semantic"].clone()).unwrap();
+            let parsed = parse_memory_post_turn_extractor_json(&raw.to_string(), &config).unwrap();
+            let valid = value == serde_json::json!("Проект Pioneer");
+            assert_eq!(
+                crate::build_memory_canonical_key(&scope, &semantic).is_ok(),
+                valid,
+                "{subject}: {value}"
+            );
+            assert_eq!(parsed.facts.len(), usize::from(valid), "{subject}: {value}");
+            assert_eq!(parsed.validation_rejected_count, usize::from(!valid));
+            if value.is_null() {
+                raw["facts"][0]["semantic"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(field);
+                let omitted =
+                    parse_memory_post_turn_extractor_json(&raw.to_string(), &config).unwrap();
+                assert_eq!(omitted.validation_rejected_count, 1);
+            }
+            assert!(!parsed.diagnostics.join(" ").contains("Проект Pioneer"));
+        }
+    }
+    for subject in ["current_user", "current_agent", "workspace"] {
+        for attribute in ["name", "custom"] {
+            for value in [
+                serde_json::Value::Null,
+                serde_json::json!(""),
+                serde_json::json!(" -- 🚀 "),
+                serde_json::json!("review policy"),
+            ] {
+                let mut raw: serde_json::Value =
+                    serde_json::from_str(&valid_post_turn_extractor_json()).unwrap();
+                raw["facts"][0]["semantic"]["subject"] = serde_json::json!(subject);
+                raw["facts"][0]["semantic"]["attribute"] = serde_json::json!(attribute);
+                raw["facts"][0]["semantic"]["custom_attribute"] = value.clone();
+                let semantic: MemorySemanticFields =
+                    serde_json::from_value(raw["facts"][0]["semantic"].clone()).unwrap();
+                let parsed =
+                    parse_memory_post_turn_extractor_json(&raw.to_string(), &config).unwrap();
+                let valid = attribute == "name" || value == serde_json::json!("review policy");
+                assert_eq!(
+                    crate::build_memory_canonical_key(&scope, &semantic).is_ok(),
+                    valid
+                );
+                assert_eq!(parsed.facts.len(), usize::from(valid));
+                if value.is_null() {
+                    raw["facts"][0]["semantic"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("custom_attribute");
+                    let omitted =
+                        parse_memory_post_turn_extractor_json(&raw.to_string(), &config).unwrap();
+                    assert_eq!(omitted.facts.len(), usize::from(valid));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn post_turn_mixed_invalid_candidates_never_reach_write_provider() {
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&valid_post_turn_extractor_json()).unwrap();
+    let mut invalid = raw["facts"][0].clone();
+    invalid["semantic"]["attribute"] = serde_json::json!("custom");
+    raw["facts"].as_array_mut().unwrap().insert(0, invalid);
+    let writes = Arc::new(TestMemoryWriteProvider::default());
+    let hook = MemoryPostTurnExtractorHook {
+        write_provider: Some(writes.clone()),
+        extractor_provider: Some(Arc::new(TestPostTurnExtractorProvider::json(
+            raw.to_string(),
+        ))),
+        config: MemoryPostTurnExtractorConfig::default(),
+    };
+    let response = hook
+        .execute(test_post_turn_hook_request(
+            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+            "Меня зовут Александр",
+            "Понял.",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(writes.write_call_count(), 1);
+    assert!(
+        response
+            .diagnostics
+            .iter()
+            .any(|d| d.message.as_str().contains("validation_rejected=1")
+                && d.message.as_str().contains("write_successes=1"))
+    );
+}
+
+#[tokio::test]
+async fn durable_write_failures_are_typed_safe_and_transient_failure_survives_partial_success() {
+    use crate::MemoryWriteFailure::*;
+    for failures in [
+        vec![Some(InvalidInput)],
+        vec![Some(AuthorizationOrDomain)],
+        vec![Some(Unclassified)],
+        vec![Some(StorageTransient)],
+        vec![None, Some(AuthorizationOrDomain), Some(StorageTransient)],
+        vec![Some(StorageTransient), Some(AuthorizationOrDomain), None],
+    ] {
+        let count = failures.len();
+        let retryable = failures.contains(&Some(StorageTransient));
+        let writes = Arc::new(TestMemoryWriteProvider {
+            failures: Mutex::new(failures.into()),
+            ..Default::default()
+        });
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&valid_post_turn_extractor_json()).unwrap();
+        raw["facts"] = serde_json::Value::Array(vec![raw["facts"][0].clone(); count]);
+        let hook = MemoryPostTurnExtractorHook {
+            write_provider: Some(writes.clone()),
+            extractor_provider: Some(Arc::new(TestPostTurnExtractorProvider::json(
+                raw.to_string(),
+            ))),
+            config: MemoryPostTurnExtractorConfig::default(),
+        };
+        let mut request = test_post_turn_hook_request(
+            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+            "Меня зовут Александр",
+            "Понял.",
+        );
+        request.context.metadata.insert(
+            hook_metadata_key("native_terminal_effect_id"),
+            HookValue::Text("effect".into()),
+        );
+        request.context.metadata.insert(
+            hook_metadata_key("native_terminal_effect_claim_token"),
+            HookValue::Text("claim".into()),
+        );
+        let error = hook.execute(request.clone()).await.unwrap_err();
+        assert_eq!(writes.write_call_count(), count);
+        assert_eq!(error.retryable, retryable);
+        assert_ne!(
+            error.code.as_str(),
+            "memory.post_turn_extractor.write_failed"
+        );
+        assert_eq!(
+            error.metadata[&hook_metadata_key("failure_stage")],
+            "semantic_write"
+        );
+        assert_eq!(error.metadata[&hook_metadata_key("model")], "test-model");
+        assert_eq!(
+            error.metadata[&hook_metadata_key("provider")],
+            "test-provider"
+        );
+        assert!(
+            error
+                .metadata
+                .contains_key(&hook_metadata_key("fact_index"))
+        );
+        if count == 3 {
+            assert_eq!(
+                error.metadata[&hook_metadata_key("write_success_count")],
+                "1"
+            );
+            assert_eq!(
+                error.metadata[&hook_metadata_key("write_failure_authorization_or_domain_count")],
+                "1"
+            );
+            assert_eq!(
+                error.metadata[&hook_metadata_key("write_failure_storage_transient_count")],
+                "1"
+            );
+        }
+        let safe = serde_json::to_string(&error).unwrap();
+        assert!(!safe.contains("Александр"));
+        assert!(!safe.contains("quote_or_span"));
+        if retryable {
+            // Replaying all valid facts is allowed; duplicate protection remains
+            // the service's canonical identity/fingerprint responsibility.
+            assert!(hook.execute(request).await.is_ok());
+            assert_eq!(writes.write_call_count(), count * 2);
+        }
+    }
+}
+
+/// Checkpoint-only provider seam: no model client is installed. Gateway's
+/// checkpoint codec/authority fences are covered separately in gateway tests.
+struct CheckpointOnlyPostTurnExtractor {
+    checkpoint_json: String,
+}
+
+#[async_trait::async_trait]
+impl AgentMemoryPostTurnExtractorProvider for CheckpointOnlyPostTurnExtractor {
+    async fn extract_post_turn_memory_json(
+        &self,
+        context: MemoryPostTurnExtractorContext,
+        _request: MemoryPostTurnExtractorRequest,
+    ) -> HookResult<String> {
+        assert!(context.durable_terminal_effect.is_some());
+        let checkpoint: serde_json::Value = serde_json::from_str(&self.checkpoint_json).unwrap();
+        Ok(checkpoint["raw_json"].as_str().unwrap().to_owned())
+    }
+}
+
+#[tokio::test]
+async fn old_checkpoint_invalid_facts_are_rejected_on_every_replay_without_model_or_write() {
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&valid_post_turn_extractor_json()).unwrap();
+    raw["facts"][0]["semantic"]["attribute"] = serde_json::json!("custom");
+    let mut second = raw["facts"][0].clone();
+    second["semantic"]["subject"] = serde_json::json!("project");
+    raw["facts"].as_array_mut().unwrap().push(second);
+    let checkpoint_json = serde_json::json!({
+        "schema_version": 1, "raw_json": raw.to_string(),
+        "model": "test-model", "model_provider": "test-provider",
+    })
+    .to_string();
+    let writes = Arc::new(TestMemoryWriteProvider::default());
+    let checkpoint = Arc::new(CheckpointOnlyPostTurnExtractor {
+        checkpoint_json: checkpoint_json.clone(),
+    });
+    let hook = MemoryPostTurnExtractorHook {
+        write_provider: Some(writes.clone()),
+        extractor_provider: Some(checkpoint.clone()),
+        config: MemoryPostTurnExtractorConfig::default(),
+    };
+    let mut request = test_post_turn_hook_request(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        "Меня зовут Александр",
+        "Понял.",
+    );
+    request.context.metadata.insert(
+        hook_metadata_key("native_terminal_effect_id"),
+        HookValue::Text("effect".into()),
+    );
+    request.context.metadata.insert(
+        hook_metadata_key("native_terminal_effect_claim_token"),
+        HookValue::Text("claim".into()),
+    );
+    for _ in 0..2 {
+        let response = hook.execute(request.clone()).await.unwrap();
+        assert!(
+            response.diagnostics.iter().any(|d| d
+                .message
+                .as_str()
+                .contains("validation_rejected=2")
+                && d.message.as_str().contains("write_successes=0"))
+        );
+        assert!(
+            !response
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_str() == "memory.post_turn_extractor.write_failed")
+        );
+        assert_eq!(writes.write_call_count(), 0);
+    }
+    assert_eq!(checkpoint.checkpoint_json, checkpoint_json);
+}

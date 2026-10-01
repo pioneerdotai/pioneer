@@ -51,7 +51,7 @@ async fn source_creation_order_keeps_child_tool_work_before_later_parent_input()
         "INSERT INTO turn_input(id,turn_id,input_index,input_type,payload,created_at) VALUES ('parent-middle','turn',2,'text','{}','2026-09-29T09:59:30Z')",
         "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('child-call','child-turn','round',1,'assistant_round','{}','{}','2026-09-29T09:59:00Z')",
         "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('child-result','child-turn','result',2,'tool_result_v2','{}','{}','2026-09-29T10:00:00Z')",
-        "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES ('child-new','child-turn','new','agent_message','completed','{}','2026-09-29T10:00:30Z','2026-09-29T10:00:30Z')",
+        "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES ('child-new','child-turn','new','agent_message','completed','{}','2026-09-29T10:00:30Z','2026-10-01T12:00:00Z')",
     ] {
         f.store
             .database_connection()
@@ -202,7 +202,9 @@ async fn source_creation_order_keeps_child_tool_work_before_later_parent_input()
     super::frozen::order_history_by_creation(&f.store, "ws", &mut with_missing)
         .await
         .unwrap();
-    assert_eq!(with_missing, recorded);
+    assert_eq!(with_missing[1], recorded[1]);
+    assert_eq!(with_missing[0], recorded[2]);
+    assert_eq!(with_missing[2], recorded[0]);
     let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
         "ws",
         "thread",
@@ -303,6 +305,180 @@ async fn source_creation_order_keeps_child_tool_work_before_later_parent_input()
         .await
         .unwrap();
     assert_eq!(mixed_precision, expected);
+    f.store
+        .database_connection()
+        .execute_unprepared(
+            "UPDATE turn_input SET created_at='2026-09-29T10:00:00.250Z' WHERE id='parent-middle'",
+        )
+        .await
+        .unwrap();
+    let expected_interleaved = vec![expected[0].clone(), once[2].clone(), expected[1].clone()];
+    let mut interleaved = vec![expected[1].clone(), expected[0].clone(), once[2].clone()];
+    super::frozen::order_history_by_creation(&f.store, "ws", &mut interleaved)
+        .await
+        .unwrap();
+    assert_eq!(interleaved, expected_interleaved);
+    super::frozen::order_history_by_creation(&f.store, "ws", &mut interleaved)
+        .await
+        .unwrap();
+    assert_eq!(interleaved, expected_interleaved);
+}
+
+#[tokio::test]
+async fn source_creation_order_crosses_mcp_input_copies_between_conversations() {
+    use pioneer_protocol::{
+        AgentMessagePhase, ItemCompletedNotification, TurnItem, TurnMcpServerCapabilitySummary,
+        UserMessageAttachment,
+    };
+
+    let f = fixture("unused", vec![], true, false).await;
+    for sql in [
+        "DELETE FROM turn_event WHERE id='source'",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('child','ws','','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('child-turn','child','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    ] {
+        f.store
+            .database_connection()
+            .execute_unprepared(sql)
+            .await
+            .unwrap();
+    }
+    // Like test3.json: parent questions from the 18th and 21st precede the
+    // delivered answer to the 15th in recorded branch order. Each question
+    // has a surviving input_copy carrying MCP metadata.
+    for day in [15, 18, 21] {
+        let date = format!("2026-09-{day}T10:00:00Z");
+        let parent_turn = format!("parent-{day}");
+        f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES (?,'thread','completed','conversation','user',?,?)",
+            [parent_turn.clone().into(), date.clone().into(), date.clone().into()],
+        )).await.unwrap();
+        f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_input(id,turn_id,input_index,input_type,payload,created_at) VALUES (?,?,0,'text',?,?)",
+            [format!("question-{day}").into(), parent_turn.clone().into(),
+             serde_json::to_string(&pioneer_protocol::UserInput::Text {
+                 text: format!("question {day}"), text_elements: vec![],
+             }).unwrap().into(), date.clone().into()],
+        )).await.unwrap();
+        let time = chrono::DateTime::parse_from_rfc3339(&date)
+            .unwrap()
+            .timestamp();
+        for (thread, turn, item, time) in [
+            (
+                "thread",
+                parent_turn.as_str(),
+                TurnItem::UserMessage {
+                    id: format!("metadata-{day}"),
+                    text: format!("question {day}"),
+                    attachments: vec![UserMessageAttachment::McpServer {
+                        capability: TurnMcpServerCapabilitySummary {
+                            id: format!("mcp-{day}"),
+                            label: format!("metadata {day}"),
+                            name: "fixture".into(),
+                            scope_kind: pioneer_protocol::McpScopeKind::Workspace,
+                        },
+                    }],
+                },
+                time,
+            ),
+            (
+                "child",
+                "child-turn",
+                TurnItem::Reasoning {
+                    id: format!("reasoning-{day}"),
+                    summary: vec![format!("reasoning {day}")],
+                    content: vec![],
+                },
+                time + 1,
+            ),
+            (
+                "child",
+                "child-turn",
+                TurnItem::AgentMessage {
+                    id: format!("commentary-{day}"),
+                    text: format!("commentary {day}"),
+                    phase: AgentMessagePhase::Commentary,
+                    markdown: None,
+                    markdown_version: None,
+                },
+                time + 2,
+            ),
+            (
+                "child",
+                "child-turn",
+                TurnItem::AgentMessage {
+                    id: format!("answer-{day}"),
+                    text: format!("answer {day}"),
+                    phase: AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+                time + 3,
+            ),
+        ] {
+            f.store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: thread.into(),
+                        turn_id: turn.into(),
+                        item,
+                    },
+                    time,
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let mut history = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+        .await
+        .unwrap();
+    history.extend(
+        super::history::load_line_history(&f.store, "ws", "child", None, &fence)
+            .await
+            .unwrap(),
+    );
+    let expected = [15, 18, 21]
+        .into_iter()
+        .flat_map(|day| {
+            [
+                format!("question {day}"),
+                format!("metadata {day}"),
+                format!("reasoning {day}"),
+                format!("commentary {day}"),
+                format!("answer {day}"),
+            ]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(history.len(), expected.len());
+    assert!(
+        history
+            .iter()
+            .position(|m| m.content == "question 21")
+            .unwrap()
+            < history
+                .iter()
+                .position(|m| m.content == "answer 15")
+                .unwrap()
+    );
+    super::frozen::order_history_by_creation(&f.store, "ws", &mut history)
+        .await
+        .unwrap();
+    for (message, marker) in history.iter().zip(&expected) {
+        assert!(
+            message.content.contains(marker),
+            "expected {marker}, got {}",
+            message.content
+        );
+    }
+    let once = history.clone();
+    super::frozen::order_history_by_creation(&f.store, "ws", &mut history)
+        .await
+        .unwrap();
+    assert_eq!(history, once);
 }
 
 #[tokio::test]
@@ -312,6 +488,26 @@ async fn prepared_history_and_execution_restore_use_source_creation_order() {
     let f = fixture_with_canonical_payloads(
         vec![
             canonical_agent_message_event_payload("later", "created later"),
+            serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item: pioneer_protocol::TurnItem::UserMessage {
+                        id: "mcp-copy".into(),
+                        text: "copied input".into(),
+                        attachments: vec![pioneer_protocol::UserMessageAttachment::McpServer {
+                            capability: pioneer_protocol::TurnMcpServerCapabilitySummary {
+                                id: "mcp".into(),
+                                label: "restore metadata".into(),
+                                name: "fixture".into(),
+                                scope_kind: pioneer_protocol::McpScopeKind::Workspace,
+                            },
+                        }],
+                    },
+                },
+            ))
+            .unwrap(),
             canonical_agent_message_event_payload("earlier", "created earlier"),
         ],
         vec![],
@@ -321,7 +517,8 @@ async fn prepared_history_and_execution_restore_use_source_creation_order() {
     .await;
     for sql in [
         "UPDATE turn_event SET created_at='2026-09-29T10:01:00Z' WHERE id='source'",
-        "UPDATE turn_event SET created_at='2026-09-29T10:00:00Z' WHERE id='source-1'",
+        "UPDATE turn_event SET created_at='2026-09-29T10:00:30Z' WHERE id='source-1'",
+        "UPDATE turn_event SET created_at='2026-09-29T10:00:00Z' WHERE id='source-2'",
     ] {
         f.store
             .database_connection()
@@ -339,10 +536,10 @@ async fn prepared_history_and_execution_restore_use_source_creation_order() {
             .map(|message| message.content.clone())
             .collect::<Vec<_>>()
     };
-    assert_eq!(
-        contents(&prepared.messages),
-        ["created earlier", "created later"]
-    );
+    assert_eq!(prepared.messages.len(), 3);
+    assert_eq!(prepared.messages[0].content, "created earlier");
+    assert!(prepared.messages[1].content.contains("restore metadata"));
+    assert_eq!(prepared.messages[2].content, "created later");
     let model = NativeRequestProjection::full(
         ChatRequest {
             model: "fixture-model".into(),
@@ -383,6 +580,10 @@ async fn prepared_history_and_execution_restore_use_source_creation_order() {
     .await
     .unwrap();
     assert_eq!(contents(&literal), contents(&old_messages));
+    assert_eq!(
+        serde_json::to_value(&literal).unwrap(),
+        serde_json::to_value(&old_messages).unwrap()
+    );
     let working = super::frozen::restore_accepted_history_for_execution(
         &f.store,
         "ws",
@@ -812,6 +1013,29 @@ async fn published_summary_stays_frozen_while_uncovered_commentary_uses_new_proj
         )
         .await
         .unwrap();
+    f.store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: pioneer_protocol::TurnItem::UserMessage {
+                    id: "tail-mcp-copy".into(),
+                    text: "tail input".into(),
+                    attachments: vec![pioneer_protocol::UserMessageAttachment::McpServer {
+                        capability: pioneer_protocol::TurnMcpServerCapabilitySummary {
+                            id: "tail-mcp".into(),
+                            label: "tail metadata".into(),
+                            name: "fixture".into(),
+                            scope_kind: pioneer_protocol::McpScopeKind::Workspace,
+                        },
+                    }],
+                },
+            },
+            chrono::Utc::now().timestamp() - 60,
+        )
+        .await
+        .unwrap();
     let prepared =
         super::frozen::capture_execution_basis_prepared(&f.store, "ws", "thread", None, None, None)
             .await
@@ -825,6 +1049,7 @@ async fn published_summary_stays_frozen_while_uncovered_commentary_uses_new_proj
     assert!(rendered.contains(&before.summary));
     assert!(rendered.contains(&pioneer_crud::portable_commentary_text("tail progress")));
     assert!(!rendered.contains("covered old response"));
+    assert!(rendered.find("tail metadata").unwrap() < rendered.find("tail progress").unwrap());
     let restored = super::frozen::restore_accepted_history_for_execution(
         &f.store,
         "ws",
@@ -843,6 +1068,10 @@ async fn published_summary_stays_frozen_while_uncovered_commentary_uses_new_proj
         .join("\n");
     assert!(restored_text.contains(&before.summary));
     assert!(restored_text.contains(&pioneer_crud::portable_commentary_text("tail progress")));
+    assert!(
+        restored_text.find("tail metadata").unwrap() < restored_text.find("tail progress").unwrap()
+    );
+    assert!(!restored_text.contains("covered old response"));
     assert_eq!(
         f.store
             .compaction_head(&super::native_owner("ws", "thread"))
@@ -5055,6 +5284,11 @@ async fn interrupted_portion_resumes_from_saved_summary_with_same_retry_budget()
         false,
     )
     .await;
+    // A pre-fix operation may have admitted this nonchronological order.
+    // Restart must consume its immutable manifest rather than rebuilding it.
+    f.store.database_connection().execute_unprepared(
+        "UPDATE turn_event SET created_at=CASE id WHEN 'source' THEN '2026-09-21T10:00:00Z' WHEN 'source-1' THEN '2026-09-18T10:00:00Z' ELSE '2026-09-15T10:00:00Z' END WHERE turn_id='turn'",
+    ).await.unwrap();
     let fence = f.store.compaction_history_read_fence().await.unwrap();
     let mut history = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
         .await

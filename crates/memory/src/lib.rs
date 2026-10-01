@@ -19,6 +19,8 @@ mod service;
 mod thread_episodic;
 mod thread_episodic_embedding;
 mod write;
+mod write_failure;
+pub use write_failure::MemoryWriteFailure;
 
 pub use backend::{
     BackendDeleteRequest, BackendDeleteResult, BackendGetRequest, BackendPayload,

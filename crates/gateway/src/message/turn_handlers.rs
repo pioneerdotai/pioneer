@@ -44,6 +44,7 @@ pub(super) enum ApiProviderTurnAdmission {
 pub(crate) struct TurnStartFailure {
     public_code: pioneer_protocol::PublicErrorCode,
     diagnostic: String,
+    expected_failure: Option<&'static str>,
 }
 
 impl TurnStartFailure {
@@ -51,11 +52,37 @@ impl TurnStartFailure {
         Self {
             public_code,
             diagnostic: diagnostic.into(),
+            expected_failure: None,
         }
+    }
+
+    fn expected(mut self, failure_class: &'static str) -> Self {
+        self.expected_failure = Some(failure_class);
+        self
+    }
+
+    fn into_public_error(self) -> pioneer_protocol::PublicError {
+        let public_error = crate::public_error::build_public_error(
+            self.public_code,
+            pioneer_protocol::PublicErrorStage::Admission,
+        );
+        match self.expected_failure {
+            Some(failure_class) => crate::public_error::report_expected_failure(
+                &public_error,
+                "turn_start",
+                failure_class,
+            ),
+            None => crate::public_error::report_agent_failure(&public_error, self.diagnostic),
+        }
+        public_error
     }
 
     fn invalid_input(diagnostic: impl Into<String>) -> Self {
         Self::new(pioneer_protocol::PublicErrorCode::InvalidInput, diagnostic)
+    }
+
+    fn protocol_invalid_input(diagnostic: impl Into<String>) -> Self {
+        Self::invalid_input(diagnostic).expected("invalid_input")
     }
 
     fn policy_denied(diagnostic: impl Into<String>) -> Self {
@@ -68,6 +95,7 @@ impl TurnStartFailure {
 
     fn conflict(diagnostic: impl Into<String>) -> Self {
         Self::new(pioneer_protocol::PublicErrorCode::Conflict, diagnostic)
+            .expected("admission_conflict")
     }
 
     fn internal(diagnostic: impl Into<String>) -> Self {
@@ -173,12 +201,10 @@ fn public_turn_start_error(
     failure: impl Into<TurnStartFailure>,
 ) -> JsonRpcErrorResponse {
     let failure = failure.into();
-    crate::public_error::agent_rpc_error(
+    crate::public_error::rpc_error_from_public_error(
         Some(request_id),
         INVALID_REQUEST_CODE,
-        failure.public_code,
-        pioneer_protocol::PublicErrorStage::Admission,
-        failure.diagnostic,
+        failure.into_public_error(),
     )
 }
 
@@ -342,13 +368,13 @@ pub(super) fn validate_root_agent_launch_capabilities(
     let mut launch_skills = launch.execution.skill_ids.clone();
     launch_skills.sort_by(|left, right| left.as_str().cmp(right.as_str()));
     if launch_skills.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(TurnStartFailure::invalid_input(
+        return Err(TurnStartFailure::protocol_invalid_input(
             "root Agent launch contains duplicate Skills",
         ));
     }
     launch_skills.dedup();
     if selected_skills != launch_skills {
-        return Err(TurnStartFailure::invalid_input(
+        return Err(TurnStartFailure::protocol_invalid_input(
             "root Agent launch Skills differ from the Turn capabilities",
         ));
     }
@@ -375,13 +401,13 @@ pub(super) fn validate_root_agent_launch_capabilities(
     let mut launch_mcp = launch.execution.mcp_server_ids.clone();
     launch_mcp.sort();
     if launch_mcp.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(TurnStartFailure::invalid_input(
+        return Err(TurnStartFailure::protocol_invalid_input(
             "root Agent launch contains duplicate MCP servers",
         ));
     }
     launch_mcp.dedup();
     if selected_mcp != launch_mcp {
-        return Err(TurnStartFailure::invalid_input(
+        return Err(TurnStartFailure::protocol_invalid_input(
             "root Agent launch MCP selection differs from the Turn capabilities",
         ));
     }
@@ -3327,11 +3353,7 @@ impl MessageProcessor {
         failure: impl Into<TurnStartFailure>,
     ) {
         let failure = failure.into();
-        let public_error = crate::public_error::map_agent_failure(
-            failure.public_code,
-            pioneer_protocol::PublicErrorStage::Admission,
-            failure.diagnostic,
-        );
+        let public_error = failure.into_public_error();
         match success_response {
             TurnStartSuccessResponse::TurnStart => {
                 self.send_error(
@@ -11081,6 +11103,42 @@ fn cli_runtime_unavailable_reason(status: &RuntimeStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_admission_refusals_are_silent_but_unclassified_and_unavailable_failures_are_errors() {
+        use crate::public_error::test_support::*;
+        let request_id = RequestId::new("R".repeat(21)).unwrap();
+        let (_, events) = capture_events(|| {
+            for failure in [
+                TurnStartFailure::protocol_invalid_input("bearer-token /private/path"),
+                TurnStartFailure::conflict("bearer-token /private/path"),
+            ] {
+                let expected_code = failure.public_code;
+                let response = public_turn_start_error(request_id.clone(), failure);
+                assert_eq!(response.error.code, INVALID_REQUEST_CODE);
+                let public: pioneer_protocol::PublicError =
+                    serde_json::from_value(response.error.data.unwrap()["public_error"].clone())
+                        .unwrap();
+                assert_eq!(public.code, expected_code);
+                assert_eq!(public.stage, pioneer_protocol::PublicErrorStage::Admission);
+                assert!(!public.message.contains("bearer-token"));
+                assert!(!public.message.contains("/private/path"));
+            }
+        });
+        assert!(events.is_empty());
+        for failure in [
+            TurnStartFailure::invalid_input("unclassified validation cause"),
+            TurnStartFailure::policy_denied("unclassified policy cause"),
+            TurnStartFailure::internal("cancelled"),
+            TurnStartFailure::unavailable("unknown session"),
+            TurnStartFailure::new(pioneer_protocol::PublicErrorCode::Conflict, "unclassified"),
+            TurnStartFailure::from("unclassified failure".to_owned()),
+        ] {
+            let (public, events) = capture_events(|| failure.into_public_error());
+            assert_eq!(events.len(), 1);
+            assert_correlated(&events[0], &public);
+        }
+    }
 
     #[test]
     fn detached_task_creator_keeps_the_exact_request_actor() {

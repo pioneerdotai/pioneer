@@ -5743,6 +5743,10 @@ impl MessageProcessor {
                             let http_status = root_error.as_ref().and_then(|error| {
                                 hook_error_metadata_i64(error, "http_status")
                             });
+                            let fact_index = root_error
+                                .as_ref()
+                                .and_then(|error| hook_error_metadata_i64(error, "fact_index"))
+                                .map(|index| index.clamp(0, 255));
                             if final_failure {
                                 tracing::error!(
                                     target: "pioneer::memory_post_turn_extractor",
@@ -5753,6 +5757,7 @@ impl MessageProcessor {
                                     failure_class = failure_class.unwrap_or("unknown"),
                                     failure_stage = failure_stage.unwrap_or("unknown"),
                                     http_status = ?http_status,
+                                    fact_index = ?fact_index,
                                     retryable,
                                     attempt_count = record.attempt_count,
                                     max_attempts = record.max_attempts,
@@ -5769,6 +5774,7 @@ impl MessageProcessor {
                                     failure_class = failure_class.unwrap_or("unknown"),
                                     failure_stage = failure_stage.unwrap_or("unknown"),
                                     http_status = ?http_status,
+                                    fact_index = ?fact_index,
                                     retryable,
                                     attempt_count = record.attempt_count,
                                     max_attempts = record.max_attempts,

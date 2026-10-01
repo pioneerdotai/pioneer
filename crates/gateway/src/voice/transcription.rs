@@ -162,11 +162,20 @@ impl VoiceTranscriptionError {
                 pioneer_protocol::PublicErrorCode::Internal,
             ),
         };
-        let public_error = crate::public_error::map_agent_failure(
+        let public_error = crate::public_error::build_public_error(
             public_code,
             pioneer_protocol::PublicErrorStage::Execution,
-            self.message,
         );
+        match self.kind {
+            VoiceTranscriptionErrorKind::UnsupportedAudioFormat => {
+                crate::public_error::report_expected_failure(
+                    &public_error,
+                    "voice_transcription",
+                    "unsupported_audio_format",
+                );
+            }
+            _ => crate::public_error::report_agent_failure(&public_error, self.message),
+        }
         VoiceError {
             kind,
             message: public_error.message.clone(),
@@ -397,6 +406,36 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
             self.active_calls.fetch_sub(1, Ordering::SeqCst);
             Ok("serialized".to_owned())
+        }
+    }
+
+    #[test]
+    fn typed_format_refusal_is_expected_but_runtime_failures_are_correlated() {
+        use crate::public_error::test_support::*;
+        for kind in [
+            VoiceTranscriptionErrorKind::UnsupportedAudioFormat,
+            VoiceTranscriptionErrorKind::ModelUnavailable,
+            VoiceTranscriptionErrorKind::EngineNotImplemented,
+            VoiceTranscriptionErrorKind::RuntimeFailure,
+        ] {
+            let (error, events) = capture_events(|| {
+                VoiceTranscriptionError {
+                    kind,
+                    message: "bearer-token /private/path".to_owned(),
+                }
+                .into_voice_error()
+            });
+            assert!(
+                !serde_json::to_string(&error)
+                    .unwrap()
+                    .contains("bearer-token")
+            );
+            if kind == VoiceTranscriptionErrorKind::UnsupportedAudioFormat {
+                assert!(events.is_empty());
+            } else {
+                assert_eq!(events.len(), 1);
+                assert_correlated(&events[0], error.public_error.as_ref().unwrap());
+            }
         }
     }
 

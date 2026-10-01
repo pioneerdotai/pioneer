@@ -74895,6 +74895,52 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
                 .await
                 .unwrap();
         }
+        // Surviving input_copy metadata used to be a barrier in the recorded
+        // historical turn, preventing the later turn's input from crossing
+        // the result. Its own source timestamp must also be sorted.
+        store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: workspace.clone(),
+                    thread_id: thread_id.into(),
+                    turn_id: historical_turn.into(),
+                    item: pioneer_protocol::TurnItem::UserMessage {
+                        id: "ordered-mcp-copy".into(),
+                        text: "initial input".into(),
+                        attachments: vec![pioneer_protocol::UserMessageAttachment::McpServer {
+                            capability: pioneer_protocol::TurnMcpServerCapabilitySummary {
+                                id: "ordered-mcp".into(),
+                                label: "metadata order marker".into(),
+                                name: "fixture".into(),
+                                scope_kind: pioneer_protocol::McpScopeKind::Workspace,
+                            },
+                        }],
+                    },
+                },
+                chrono::DateTime::parse_from_rfc3339("2026-09-29T10:00:45Z")
+                    .unwrap()
+                    .timestamp(),
+            )
+            .await
+            .unwrap();
+        store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: workspace.clone(),
+                    thread_id: thread_id.into(),
+                    turn_id: historical_turn.into(),
+                    item: pioneer_protocol::TurnItem::Reasoning {
+                        id: "ordered-reasoning".into(),
+                        summary: vec!["reasoning order marker".into()],
+                        content: vec![],
+                    },
+                },
+                chrono::DateTime::parse_from_rfc3339("2026-09-29T10:00:50Z")
+                    .unwrap()
+                    .timestamp(),
+            )
+            .await
+            .unwrap();
         // A separate user turn between the call and result must stay between
         // them, although the planner selects the tool round as one unit.
         store
@@ -75029,6 +75075,8 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
             let positions = [
                 "call order marker",
                 "current input marker",
+                "metadata order marker",
+                "reasoning order marker",
                 "middle order marker",
                 "result order marker",
             ]
@@ -75085,6 +75133,8 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
             .join("\n");
         let positions = [
             "call order marker",
+            "metadata order marker",
+            "reasoning order marker",
             "middle order marker",
             "result order marker",
         ]
@@ -75127,6 +75177,8 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
             .join("\n");
         for marker in [
             "call order marker",
+            "metadata order marker",
+            "reasoning order marker",
             "middle order marker",
             "result order marker",
         ] {
@@ -77432,3 +77484,6 @@ fn provider_replay_is_fenced_after_retryable_recovery_start_error() {
         assert!(saved_turn.error.is_none());
     });
 }
+
+#[path = "tests/memory_post_turn_recovery.rs"]
+mod memory_post_turn_recovery;
