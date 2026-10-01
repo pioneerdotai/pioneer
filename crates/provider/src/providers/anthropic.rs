@@ -1588,3 +1588,7 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "wire_tests/anthropic.rs"]
+mod wire_contract_tests;

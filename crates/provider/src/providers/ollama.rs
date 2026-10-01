@@ -50,6 +50,8 @@ struct OllamaMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     images: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OllamaToolCall>>,
 }
 
@@ -219,6 +221,7 @@ impl OllamaProvider {
                         .then(|| m.reasoning_content.clone())
                         .flatten(),
                     images: (!images.is_empty()).then_some(images),
+                    tool_name: (m.role == Role::Tool).then(|| m.name.clone()).flatten(),
                     tool_calls: m.tool_calls.as_ref().map(|tool_calls| {
                         tool_calls
                             .iter()
@@ -786,6 +789,7 @@ mod tests {
                 content: Some("Hello".into()),
                 thinking: None,
                 images: None,
+                tool_name: None,
                 tool_calls: None,
             }],
             stream: false,
@@ -808,6 +812,7 @@ mod tests {
                 content: Some("Hello".into()),
                 thinking: None,
                 images: None,
+                tool_name: None,
                 tool_calls: None,
             }],
             stream: false,
@@ -910,3 +915,7 @@ mod tests {
         assert!(caps.vision);
     }
 }
+
+#[cfg(test)]
+#[path = "wire_tests/ollama.rs"]
+mod wire_contract_tests;
