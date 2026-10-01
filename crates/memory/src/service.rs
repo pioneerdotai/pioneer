@@ -4755,17 +4755,41 @@ mod tests {
         let mut invalid = valid.clone();
         invalid.semantic.attribute = MemoryAttribute::Custom;
         invalid.semantic.custom_attribute = Some(" -- 🚀 ".into());
-        let first = service.write_semantic_memory(context.clone(), valid.clone()).await.unwrap();
-        let failure = service.write_semantic_memory(context.clone(), invalid.clone()).await.unwrap_err();
-        assert_eq!(failure.downcast_ref::<crate::MemoryWriteFailure>(), Some(&crate::MemoryWriteFailure::InvalidInput));
-        let replay = service.write_semantic_memory(context.clone(), valid.clone()).await.unwrap();
+        let first = service
+            .write_semantic_memory(context.clone(), valid.clone())
+            .await
+            .unwrap();
+        let failure = service
+            .write_semantic_memory(context.clone(), invalid.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure.downcast_ref::<crate::MemoryWriteFailure>(),
+            Some(&crate::MemoryWriteFailure::InvalidInput)
+        );
+        let replay = service
+            .write_semantic_memory(context.clone(), valid.clone())
+            .await
+            .unwrap();
         assert_eq!(replay.relation, MemoryWriteRelation::Duplicate);
-        assert_eq!(first.record.as_ref().unwrap().id, replay.record.as_ref().unwrap().id);
-        assert!(service.write_semantic_memory(context, invalid).await.is_err());
-        let records = store.list_agent_memory_records(AgentMemoryListFilter {
-            scopes: vec![valid.scope], statuses: vec![MemoryStatus::Active],
-            ..AgentMemoryListFilter::default()
-        }).await.unwrap();
+        assert_eq!(
+            first.record.as_ref().unwrap().id,
+            replay.record.as_ref().unwrap().id
+        );
+        assert!(
+            service
+                .write_semantic_memory(context, invalid)
+                .await
+                .is_err()
+        );
+        let records = store
+            .list_agent_memory_records(AgentMemoryListFilter {
+                scopes: vec![valid.scope],
+                statuses: vec![MemoryStatus::Active],
+                ..AgentMemoryListFilter::default()
+            })
+            .await
+            .unwrap();
         assert_eq!(records.len(), 1);
     }
 

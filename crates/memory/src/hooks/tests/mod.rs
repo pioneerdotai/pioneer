@@ -694,7 +694,12 @@ impl AgentMemoryWriteProvider for TestMemoryWriteProvider {
             .lock()
             .expect("write params lock poisoned")
             .push(params);
-        if let Some(Some(failure)) = self.failures.lock().expect("failure sequence lock").pop_front() {
+        if let Some(Some(failure)) = self
+            .failures
+            .lock()
+            .expect("failure sequence lock")
+            .pop_front()
+        {
             return Err(failure);
         }
         Ok(self

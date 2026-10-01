@@ -2516,21 +2516,40 @@ mod tests {
     #[test]
     fn semantic_write_classification_preserves_typed_causes_without_error_text_matching() {
         use pioneer_memory::MemoryWriteFailure;
-        for failure in [MemoryWriteFailure::InvalidInput, MemoryWriteFailure::AuthorizationOrDomain,
-            MemoryWriteFailure::StorageTransient, MemoryWriteFailure::Unclassified]
-        {
-            assert_eq!(classify_memory_write_failure(anyhow::Error::new(failure).context("outer context")), failure);
+        for failure in [
+            MemoryWriteFailure::InvalidInput,
+            MemoryWriteFailure::AuthorizationOrDomain,
+            MemoryWriteFailure::StorageTransient,
+            MemoryWriteFailure::Unclassified,
+        ] {
+            assert_eq!(
+                classify_memory_write_failure(anyhow::Error::new(failure).context("outer context")),
+                failure
+            );
         }
-        assert_eq!(classify_memory_write_failure(anyhow::anyhow!("database is locked SQLITE_BUSY")), MemoryWriteFailure::Unclassified);
-        assert_eq!(classify_memory_write_failure(anyhow::Error::new(sea_orm::DbErr::ConnectionAcquire(sea_orm::ConnAcquireErr::Timeout))), MemoryWriteFailure::StorageTransient);
-        let pool_error = sea_orm::DbErr::Query(sea_orm::RuntimeErr::SqlxError(
-            Arc::new(sea_orm::SqlxError::PoolTimedOut),
-        ));
+        assert_eq!(
+            classify_memory_write_failure(anyhow::anyhow!("database is locked SQLITE_BUSY")),
+            MemoryWriteFailure::Unclassified
+        );
+        assert_eq!(
+            classify_memory_write_failure(anyhow::Error::new(sea_orm::DbErr::ConnectionAcquire(
+                sea_orm::ConnAcquireErr::Timeout
+            ))),
+            MemoryWriteFailure::StorageTransient
+        );
+        let pool_error = sea_orm::DbErr::Query(sea_orm::RuntimeErr::SqlxError(Arc::new(
+            sea_orm::SqlxError::PoolTimedOut,
+        )));
         assert_eq!(
             classify_memory_write_failure(anyhow::Error::new(pool_error).context("query failed")),
             MemoryWriteFailure::StorageTransient,
         );
-        assert_eq!(classify_memory_write_failure(anyhow::Error::new(sea_orm::DbErr::Custom("SQLITE_BUSY".into()))), MemoryWriteFailure::Unclassified);
+        assert_eq!(
+            classify_memory_write_failure(anyhow::Error::new(sea_orm::DbErr::Custom(
+                "SQLITE_BUSY".into()
+            ))),
+            MemoryWriteFailure::Unclassified
+        );
     }
 
     #[test]

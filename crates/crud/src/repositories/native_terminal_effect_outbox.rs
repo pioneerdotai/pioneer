@@ -1574,9 +1574,10 @@ pub async fn requeue_retryable_unresolved<C: ConnectionTrait>(
         .add(native_terminal_effect_outbox::Column::LastErrorCode.is_in(retryable_codes))
         .add(
             Condition::all()
-                .add(native_terminal_effect_outbox::Column::LastErrorCode.eq(
-                    "memory.post_turn_extractor.write_failed",
-                ))
+                .add(
+                    native_terminal_effect_outbox::Column::LastErrorCode
+                        .eq("memory.post_turn_extractor.write_failed"),
+                )
                 .add(native_terminal_effect_outbox::Column::HandlerCheckpointJson.is_not_null()),
         );
     let effect_ids = native_terminal_effect_outbox::Entity::find()

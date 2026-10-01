@@ -34891,16 +34891,76 @@ mod tests {
     #[tokio::test]
     async fn memory_write_recovery_is_classified_and_legacy_revalidation_is_bounded() {
         for (code, checkpoint, delay, expected, revalidated_code) in [
-            ("memory.post_turn_extractor.write_invalid_input", true, 3_602, 0, "memory.post_turn_extractor.write_unclassified"),
-            ("memory.post_turn_extractor.write_domain_rejected", true, 3_602, 0, "memory.post_turn_extractor.write_unclassified"),
-            ("memory.post_turn_extractor.write_unclassified", true, 3_602, 0, "memory.post_turn_extractor.write_unclassified"),
-            ("memory.post_turn_extractor.write_storage_transient", true, 3_602, 1, "memory.post_turn_extractor.write_unclassified"),
-            ("memory.post_turn_extractor.write_failed", true, 3_602, 1, "memory.post_turn_extractor.write_unclassified"),
-            ("memory.post_turn_extractor.write_failed", true, 3_602, 1, "memory.post_turn_extractor.write_storage_transient"),
-            ("memory.post_turn_extractor.write_failed", false, 3_602, 0, "memory.post_turn_extractor.write_unclassified"),
-            ("memory.post_turn_extractor.write_failed", true, 3_599, 0, "memory.post_turn_extractor.write_unclassified"),
-            ("memory.post_turn_extractor.write_failed", true, 86_401, 0, "memory.post_turn_extractor.write_unclassified"),
-            ("memory.post_turn_extractor.legacy_write_revalidate", true, 3_602, 0, "memory.post_turn_extractor.write_unclassified"),
+            (
+                "memory.post_turn_extractor.write_invalid_input",
+                true,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_domain_rejected",
+                true,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_unclassified",
+                true,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_storage_transient",
+                true,
+                3_602,
+                1,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                true,
+                3_602,
+                1,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                true,
+                3_602,
+                1,
+                "memory.post_turn_extractor.write_storage_transient",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                false,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                true,
+                3_599,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                true,
+                86_401,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.legacy_write_revalidate",
+                true,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
         ] {
             let timestamp = 1_700_040_000;
             let workspace_id = "ws_post_turn_reopen";
@@ -34964,7 +35024,11 @@ mod tests {
                         first.claim_token.as_str(),
                         code,
                         "safe write failure",
-                        matches!(code, "memory.post_turn_extractor.write_storage_transient" | "memory.post_turn_extractor.write_failed"),
+                        matches!(
+                            code,
+                            "memory.post_turn_extractor.write_storage_transient"
+                                | "memory.post_turn_extractor.write_failed"
+                        ),
                         timestamp + 2,
                         timestamp + 1,
                     )
@@ -34980,32 +35044,95 @@ mod tests {
                     .status,
                 "unresolved"
             );
-            assert_eq!(store.requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 0).await.unwrap(), 0);
-            assert_eq!(store.requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 1).await.unwrap(), expected, "{code}, delay={delay}");
+            assert_eq!(
+                store
+                    .requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 0)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                store
+                    .requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 1)
+                    .await
+                    .unwrap(),
+                expected,
+                "{code}, delay={delay}"
+            );
             if expected == 0 {
-                assert!(store.claim_due_native_terminal_effects(timestamp + delay, 10, 1).await.unwrap().is_empty());
+                assert!(
+                    store
+                        .claim_due_native_terminal_effects(timestamp + delay, 10, 1)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
                 continue;
             }
-            let reopened = store.claim_due_native_terminal_effects(timestamp + delay, 10, 1).await.unwrap().pop().unwrap();
+            let reopened = store
+                .claim_due_native_terminal_effects(timestamp + delay, 10, 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
             assert_eq!(reopened.effect_id, effect_id);
             if code == "memory.post_turn_extractor.write_failed" {
-                assert_eq!(reopened.max_attempts, 1, "legacy revalidation must not expand the budget");
+                assert_eq!(
+                    reopened.max_attempts, 1,
+                    "legacy revalidation must not expand the budget"
+                );
                 assert_eq!(reopened.attempt_count, reopened.max_attempts);
-                assert_eq!(store.native_terminal_effect_status(&effect_id).await.unwrap().unwrap().last_error_code.as_deref(), Some("memory.post_turn_extractor.legacy_write_revalidate"));
-                assert!(store.native_terminal_effect_handler_checkpoint(&effect_id, &reopened.claim_token).await.unwrap().is_some());
+                assert_eq!(
+                    store
+                        .native_terminal_effect_status(&effect_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .last_error_code
+                        .as_deref(),
+                    Some("memory.post_turn_extractor.legacy_write_revalidate")
+                );
+                assert!(
+                    store
+                        .native_terminal_effect_handler_checkpoint(
+                            &effect_id,
+                            &reopened.claim_token
+                        )
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
                 // The revalidated cause replaces the legacy marker and stays terminal.
-                store.fail_native_terminal_effect(&effect_id, &reopened.claim_token,
-                    revalidated_code, "safe classified failure",
-                    revalidated_code == "memory.post_turn_extractor.write_storage_transient",
-                    timestamp + delay + 1, timestamp + delay).await.unwrap();
+                store
+                    .fail_native_terminal_effect(
+                        &effect_id,
+                        &reopened.claim_token,
+                        revalidated_code,
+                        "safe classified failure",
+                        revalidated_code == "memory.post_turn_extractor.write_storage_transient",
+                        timestamp + delay + 1,
+                        timestamp + delay,
+                    )
+                    .await
+                    .unwrap();
                 let reclassified_recovery = store
-                    .requeue_retryable_unresolved_native_terminal_effects(timestamp + delay + 3_601, 1)
-                    .await.unwrap();
-                assert_eq!(reclassified_recovery, u64::from(
-                    revalidated_code == "memory.post_turn_extractor.write_storage_transient",
-                ));
+                    .requeue_retryable_unresolved_native_terminal_effects(
+                        timestamp + delay + 3_601,
+                        1,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    reclassified_recovery,
+                    u64::from(
+                        revalidated_code == "memory.post_turn_extractor.write_storage_transient",
+                    )
+                );
             } else {
-                assert_eq!(reopened.max_attempts, 8, "preserve existing transient recovery budget");
+                assert_eq!(
+                    reopened.max_attempts, 8,
+                    "preserve existing transient recovery budget"
+                );
             }
         }
     }

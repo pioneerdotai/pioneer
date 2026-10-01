@@ -308,9 +308,7 @@ fn subject_key(scope: &MemoryScope, semantic: &MemorySemanticFields) -> Result<S
         .unwrap_or_else(|| normalize_key_component(&scope.key)))
 }
 
-fn attribute_key(
-    semantic: &MemorySemanticFields,
-) -> std::result::Result<String, &'static str> {
+fn attribute_key(semantic: &MemorySemanticFields) -> std::result::Result<String, &'static str> {
     let attribute = match semantic.attribute {
         MemoryAttribute::Name => "name".to_owned(),
         MemoryAttribute::Birthday => "birthday".to_owned(),

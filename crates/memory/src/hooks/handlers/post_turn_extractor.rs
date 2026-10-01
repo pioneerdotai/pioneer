@@ -265,7 +265,9 @@ impl HookHandler for MemoryPostTurnExtractorHook {
                         extractor_model.as_deref(),
                         extractor_model_provider.as_deref(),
                         &stats,
-                    ).metadata {
+                    )
+                    .metadata
+                    {
                         diagnostic.metadata.insert(key, HookValue::Text(value));
                     }
                     response.diagnostics.push(diagnostic);
@@ -386,7 +388,10 @@ fn semantic_write_hook_error(
         ("fact_index", fact_index.min(255).to_string()),
         ("write_failure_count", stats.write_failure_count.to_string()),
         ("write_success_count", stats.write_success_count.to_string()),
-        ("validation_rejected_count", stats.validation_rejected_count.to_string()),
+        (
+            "validation_rejected_count",
+            stats.validation_rejected_count.to_string(),
+        ),
     ] {
         error.metadata.insert(
             HookMetadataKey::new(key).expect("static metadata key"),
