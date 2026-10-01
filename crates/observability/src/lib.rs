@@ -1151,6 +1151,16 @@ mod tests {
     }
 
     #[test]
+    fn keeps_single_typed_rathole_rejection_as_event() {
+        assert!(!should_demote_rathole_client_control_channel_retry(
+            &tracing::Level::ERROR,
+            "rathole::client",
+            None,
+            Some("Remote access control channel rejected"),
+        ));
+    }
+
+    #[test]
     fn keeps_rathole_client_control_channel_retry_from_other_targets_as_event() {
         assert!(!should_demote_rathole_client_control_channel_retry(
             &tracing::Level::ERROR,
