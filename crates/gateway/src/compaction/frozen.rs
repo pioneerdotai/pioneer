@@ -1948,9 +1948,12 @@ pub(super) async fn order_history_by_creation(
             for row in page.entries {
                 // An unprojected event cannot yet be distinguished from a
                 // delivery copy without reading its body. Keep its old place.
+                // input_copy can retain authoritative attachment metadata;
+                // its classification alone does not make its date unusable.
+                // Task deliveries use the exact imported output sources,
+                // never the acknowledgement's creation time.
                 if ids.remove(&row.reference.id)
                     && (!matches!(kind, PagedSource::Event) || row.projection_kind.is_some())
-                    && row.projection_kind.as_deref() != Some("input_copy")
                     && !row
                         .item_id
                         .as_deref()
@@ -2042,8 +2045,20 @@ pub(super) async fn order_history_by_creation(
         }
         Some((time, false))
     };
-    for span in messages.split_mut(|message| created_at(message).is_none()) {
-        span.sort_by_cached_key(&ordering_time);
+    // Unknown originals keep their slots, but are not chronological barriers.
+    // Sort only dated messages, then put them back into the dated slots. The
+    // stable sort preserves the recorded order of equal source timestamps.
+    let mut dated = messages
+        .iter()
+        .filter(|message| created_at(message).is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    dated.sort_by_cached_key(&ordering_time);
+    let mut dated = dated.into_iter();
+    for message in messages.iter_mut() {
+        if created_at(message).is_some() {
+            *message = dated.next().expect("one message per dated slot");
+        }
     }
     Ok(())
 }
