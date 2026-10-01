@@ -1441,6 +1441,37 @@ mod tests {
         headers: &'static str,
         truncated_transport: bool,
     ) -> ProviderFailureDetails {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            failure_from_local_response_inner(
+                provider_name,
+                status,
+                message,
+                stream_request,
+                response_body,
+                redacted,
+                headers,
+                truncated_transport,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "local provider failure fixture exceeded its deadline: provider={provider_name}, status={status}, stream={stream_request}, redacted={redacted}, truncated={truncated_transport}"
+            )
+        })
+    }
+
+    async fn failure_from_local_response_inner(
+        provider_name: &'static str,
+        status: u16,
+        message: &'static str,
+        stream_request: bool,
+        response_body: Option<Vec<u8>>,
+        redacted: bool,
+        headers: &'static str,
+        truncated_transport: bool,
+    ) -> ProviderFailureDetails {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -1451,8 +1482,31 @@ mod tests {
         let echoed_url = url.clone();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 8192];
-            stream.read(&mut request).await.unwrap();
+            // Read the complete request before closing the connection. Closing
+            // with unread request bytes can reset the socket on Linux, obscuring
+            // the response failure this fixture is intended to exercise.
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0u8; 2048];
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert!(count > 0, "fixture request ended before its body");
+                assert!(request.len() + count <= 8192, "fixture request too large");
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(start) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let header = std::str::from_utf8(&request[..start]).unwrap();
+                    let length = header
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .expect("fixture request Content-Length");
+                    if request.len() >= start + 4 + length {
+                        break;
+                    }
+                }
+            }
             let body = response_body.unwrap_or_else(|| {
                 serde_json::json!({
                     "error": {"message": format!("{message} at {echoed_url}")}
