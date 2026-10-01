@@ -9949,12 +9949,15 @@ dependencies = [
  "pioneer-config",
  "pioneer-protocol",
  "rathole",
+ "sentry",
  "serde",
+ "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -10692,8 +10695,8 @@ dependencies = [
 
 [[package]]
 name = "rathole"
-version = "0.6.0"
-source = "git+https://github.com/pioneerdotai/relay.git?rev=93e0ddccab7cb6c255b417c391ef649a4f7554a7#93e0ddccab7cb6c255b417c391ef649a4f7554a7"
+version = "0.6.1"
+source = "git+https://github.com/pioneerdotai/relay.git?rev=686680a37689bf0abea13f8e37340a588003da50#686680a37689bf0abea13f8e37340a588003da50"
 dependencies = [
  "anyhow",
  "async-http-proxy",
