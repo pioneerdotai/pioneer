@@ -725,11 +725,17 @@ mod tests {
                 event.message.as_deref(),
                 Some("failed to persist hook run lifecycle")
             );
-            assert_eq!(event.extra["operation"], "append_audit_events");
-            assert_eq!(event.extra["phase"], "turn.pre_prompt_compile");
-            assert_eq!(event.extra["cause_class"], "sqlite_constraint");
-            assert_eq!(event.extra["sqlite_primary_code"], 19);
-            assert_eq!(event.extra["sqlite_extended_code"], 1811);
+            // Sentry 0.49 stores tracing values in this structured context.
+            let Some(sentry::protocol::Context::Other(fields)) =
+                event.contexts.get("Rust Tracing Fields")
+            else {
+                panic!("lifecycle event must contain its structured tracing fields");
+            };
+            assert_eq!(fields["operation"], "append_audit_events");
+            assert_eq!(fields["phase"], "turn.pre_prompt_compile");
+            assert_eq!(fields["cause_class"], "sqlite_constraint");
+            assert_eq!(fields["sqlite_primary_code"], 19);
+            assert_eq!(fields["sqlite_extended_code"], 1811);
             assert!(event.exception.values.is_empty());
             let encoded =
                 serde_json::to_string(&events).expect("serialize entire captured telemetry");

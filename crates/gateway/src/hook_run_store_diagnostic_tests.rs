@@ -107,7 +107,10 @@ async fn typed_cantopen_retains_code_and_discards_path_under_anyhow_context() {
         .path()
         .join("missing_PARENT_CANARY")
         .join("PATH_CANARY.sqlite");
-    let database = open_fixture_database("sqlite::memory:").await;
+    // ATTACH inherits SQLITE_OPEN_MEMORY from an in-memory main database,
+    // which would make even this missing path succeed as an in-memory attach.
+    let url = sqlite_connection_url(&directory.path().join("fixture.sqlite"));
+    let database = open_fixture_database(&url).await;
     let error = database
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,

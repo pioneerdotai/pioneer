@@ -3129,6 +3129,17 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Barrier;
 
+    fn persistence_event_fields(
+        event: &sentry::protocol::Event<'static>,
+    ) -> &BTreeMap<String, serde_json::Value> {
+        let Some(sentry::protocol::Context::Other(fields)) =
+            event.contexts.get("Rust Tracing Fields")
+        else {
+            panic!("lifecycle event must contain its structured tracing fields");
+        };
+        fields
+    }
+
     fn capture_persistence_failure(
         persistence: &mut HookRunPersistence,
     ) -> sentry::protocol::Event<'static> {
@@ -3151,10 +3162,11 @@ mod tests {
         assert_eq!(events.len(), 1);
         let event = events.remove(0);
         assert_eq!(event.level, sentry::Level::Error);
-        assert_eq!(event.extra["operation"], "append_audit_events");
-        assert_eq!(event.extra["cause_class"], "sqlite_busy");
-        assert_eq!(event.extra["sqlite_primary_code"], 5);
-        assert_eq!(event.extra["sqlite_extended_code"], 517);
+        let fields = persistence_event_fields(&event);
+        assert_eq!(fields["operation"], "append_audit_events");
+        assert_eq!(fields["cause_class"], "sqlite_busy");
+        assert_eq!(fields["sqlite_primary_code"], 5);
+        assert_eq!(fields["sqlite_extended_code"], 517);
         assert!(event.exception.values.is_empty());
         event
     }
@@ -3190,7 +3202,10 @@ mod tests {
                 assert_eq!(persistence.execution_phase, request.phase);
                 assert_eq!(persistence.durable_phase, durable.then_some(request.phase));
                 let event = capture_persistence_failure(&mut persistence);
-                assert_eq!(event.extra["phase"], request.phase.as_str());
+                assert_eq!(
+                    persistence_event_fields(&event)["phase"],
+                    request.phase.as_str()
+                );
                 assert!(
                     !serde_json::to_string(&event)
                         .expect("serialized event")
@@ -3244,7 +3259,7 @@ mod tests {
                 durable.then_some(HookPhase::TurnPostTurn)
             );
             let event = capture_persistence_failure(&mut persistence);
-            assert_eq!(event.extra["phase"], "turn.post_turn");
+            assert_eq!(persistence_event_fields(&event)["phase"], "turn.post_turn");
             assert!(
                 !serde_json::to_string(&event)
                     .expect("serialized event")
