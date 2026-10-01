@@ -90,6 +90,7 @@ pub mod mcp_audit_event;
 pub mod mcp_server_catalog_snapshot;
 pub mod mcp_server_installation;
 pub mod native_agent_config;
+pub mod native_cancellation_context;
 pub mod native_event_cleanup_bootstrap;
 pub mod native_event_cleanup_job;
 pub mod native_event_cleanup_scheduler;

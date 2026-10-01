@@ -397,7 +397,7 @@ fn load_local_dotenv() {
     });
 }
 
-fn sentry_tracing_layer<S>() -> impl tracing_subscriber::Layer<S>
+pub fn sentry_tracing_layer<S>() -> impl tracing_subscriber::Layer<S>
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
 {

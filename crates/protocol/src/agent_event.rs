@@ -142,9 +142,15 @@ pub enum AgentDurableEvent {
         turn_id: String,
         recovery: RecoveryAttemptContext,
     },
-    /// Immutable terminal side-effect preparation. Gateway persists this
-    /// bounded batch before acknowledging it; the subsequent canonical Turn
-    /// terminal projection atomically makes the current batch runnable.
+    /// Frozen cancellation description, registered before provider/tool work.
+    /// Recovery may only confirm an existing description, never replace missing
+    /// history with current configuration. This does not activate outbox work.
+    NativeCancellationContextPrepared {
+        preparation: NativeTerminalEffectPreparation,
+        initial_turn: bool,
+    },
+    /// Bounded obligations prepared before a canonical terminal result; the
+    /// subsequent terminal projection atomically makes the current batch runnable.
     NativeTerminalEffectsPrepared {
         preparation: NativeTerminalEffectPreparation,
     },
@@ -239,6 +245,17 @@ pub struct NativeTerminalEffectSpec {
     pub gate: NativeTerminalEffectGate,
     pub payload: NativeTerminalEffectPayload,
     pub max_attempts: u16,
+}
+
+/// A controller receipt issued only for an accepted canonical cancellation
+/// whose bounded obligations were persisted in the same append transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeDurableCancellationReceipt {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub execution_owner_id: String,
+    pub canonical_event_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -435,9 +452,12 @@ impl AgentDurableEvent {
             | Self::TurnInterrupted { turn_id, .. } => DurableEventCausalityKey::Turn {
                 turn_id: turn_id.clone(),
             },
-            Self::NativeTerminalEffectsPrepared { preparation } => DurableEventCausalityKey::Turn {
-                turn_id: preparation.turn_id.clone(),
-            },
+            Self::NativeCancellationContextPrepared { preparation, .. }
+            | Self::NativeTerminalEffectsPrepared { preparation } => {
+                DurableEventCausalityKey::Turn {
+                    turn_id: preparation.turn_id.clone(),
+                }
+            }
             Self::TurnPermissionAudit { event } => DurableEventCausalityKey::Turn {
                 turn_id: event.turn_id.clone(),
             },
@@ -506,6 +526,7 @@ impl AgentDurableEvent {
             | Self::TurnPermissionAudit { .. }
             | Self::TurnLlmContextAppended { .. }
             | Self::TurnProviderHistoryAppended { .. }
+            | Self::NativeCancellationContextPrepared { .. }
             | Self::NativeTerminalEffectsPrepared { .. }
             | Self::ToolOutputRecorded { .. }
             | Self::ItemStarted { .. }
