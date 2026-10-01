@@ -61,6 +61,7 @@ pub struct CodexServiceRequest {
     pub input: String,
 }
 pub struct CodexServiceCompletion {
+    pub observed_usage: serde_json::Value,
     pub text: String,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -241,6 +242,7 @@ fn process_config(
 
 fn decode_exec_completion(output: &[u8]) -> Result<CodexServiceCompletion> {
     let mut completion = CodexServiceCompletion {
+        observed_usage: serde_json::json!({}),
         text: String::new(),
         input_tokens: None,
         output_tokens: None,
@@ -290,13 +292,19 @@ fn decode_exec_completion(output: &[u8]) -> Result<CodexServiceCompletion> {
                     params: Some(params.clone()),
                     raw: params,
                 })
-                .into());
+                .into())
+                .map_err(|error: anyhow::Error| {
+                    error.context(crate::service::ObservedServiceUsage(
+                        crate::service::bounded_usage(&event),
+                    ))
+                });
             }
             Some("turn.completed") => {
                 ensure!(
                     started && !completion.text.trim().is_empty(),
                     "Codex service returned no final answer"
                 );
+                completion.observed_usage = crate::service::bounded_usage(&event);
                 completion.input_tokens = event["usage"]["input_tokens"].as_u64();
                 completion.output_tokens = event["usage"]["output_tokens"].as_u64();
                 completed = true;

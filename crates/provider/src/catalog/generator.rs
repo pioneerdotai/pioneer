@@ -109,7 +109,10 @@ impl GeneratedCatalog {
                 );
                 for field in ["input", "output", "cacheRead", "cacheWrite"] {
                     ensure!(
-                        model["cost"][field].as_f64().is_some_and(|v| v.is_finite()),
+                        model["cost"][field].is_null()
+                            || model["cost"][field]
+                                .as_f64()
+                                .is_some_and(|v| v.is_finite() && v >= 0.),
                         "invalid model pricing"
                     );
                 }
@@ -187,15 +190,20 @@ fn missing_or_falsy(value: &Value) -> bool {
     value.is_null() || value == false || value.as_f64() == Some(0.) || value == ""
 }
 fn source_price(value: &Value) -> Value {
-    if missing_or_falsy(value) {
-        json!(0)
-    } else {
-        value.clone()
-    }
+    value.clone()
 }
 fn cost(source: &Value) -> Value {
-    json!({"input":source_price(&source["input"]), "output":source_price(&source["output"]),
-        "cacheRead":source_price(&source["cache_read"]), "cacheWrite":source_price(&source["cache_write"])})
+    // Preserve tier conditions, TTL prices and non-token fees from the source.
+    let mut result = source.as_object().cloned().unwrap_or_default();
+    for (key, field) in [
+        ("input", "input"),
+        ("output", "output"),
+        ("cacheRead", "cache_read"),
+        ("cacheWrite", "cache_write"),
+    ] {
+        result.insert(key.into(), source_price(&source[field]));
+    }
+    Value::Object(result)
 }
 fn limit(value: &Value, fallback: u64, source: &str) -> (Value, LimitOrigin) {
     if missing_or_falsy(value) {
@@ -238,7 +246,7 @@ fn base(
         model: json!({"id":id,"name":source["name"].as_str().filter(|s|!s.is_empty()).unwrap_or(id),
         "provider":provider,"api":api,"baseUrl":url,"reasoning":source["reasoning"]==true,
         "input":if has(&source["modalities"]["input"],"image") {vec!["text","image"]} else {vec!["text"]},
-        "cost":cost(&source["cost"]),"contextWindow":context,"maxTokens":output}),
+        "cost":cost(&source["cost"]),"pricingSource":{"url":SOURCE_URLS[0],"units":"USD_per_million_tokens","raw":source["cost"]},"contextWindow":context,"maxTokens":output}),
         context_origin,
         output_origin,
         reasoning_options: source["reasoning_options"].clone(),
@@ -265,6 +273,13 @@ pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCata
     overrides::apply(&mut candidates)?;
     for model in &mut candidates {
         compatibility::apply(model);
+        model.model["pricingEvidenceVersion"] = json!(1);
+        model.model["pricingCapturedAt"] = json!(snapshot.captured_at);
+        model.model["pricingUnits"] = json!(if model.provider() == "github-copilot" {
+            "unknown_subscription_units"
+        } else {
+            "USD_per_million_tokens"
+        });
     }
     compatibility::fallbacks(&mut candidates);
     let mut output = GeneratedCatalog {
@@ -330,6 +345,19 @@ mod tests {
         }
     }
     #[test]
+    fn missing_source_price_is_unknown_and_explicit_zero_is_free() {
+        let c = cost(
+            &json!({"input":2,"output":0,"tiers":[{"tier":{"type":"context","size":200000},"input":4}]}),
+        );
+        assert_eq!(c["input"], 2);
+        assert_eq!(c["output"], 0);
+        assert!(c["cacheRead"].is_null());
+        assert!(c["cacheWrite"].is_null());
+        assert_eq!(c["tiers"][0]["tier"]["size"], 200000);
+        assert_eq!(source_price(&json!(false)), false);
+    }
+
+    #[test]
     fn separate_input_limit_reaches_runtime_without_changing_pi_model_fields() {
         let mut source = snapshot();
         let model = &mut source.sources.get_mut(SOURCE_URLS[0]).unwrap().body["openai"]["models"]["gpt-5-nano"];
@@ -356,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn entire_pinned_catalog_matches_pi_reference() {
+    fn entire_pinned_catalog_preserves_pi_contract_and_distinguishes_unknown_pricing() {
         let generated = generate(&snapshot(), true).unwrap();
         let reference: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/provenance.json"))
@@ -379,9 +407,84 @@ mod tests {
             "origin differences:\n{}",
             origins.join("\n")
         );
-        let actual = serde_json::to_value(generated.models).unwrap();
+        let mut actual = serde_json::to_value(generated.models).unwrap();
         let expected: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json")).unwrap();
+        // The Pi fixture collapsed missing prices into zero. Keep every
+        // existing non-pricing field and known price under exact comparison;
+        // allow unknown only when the source omitted that exact category.
+        let captured_at = snapshot().captured_at;
+        for (provider, models) in actual.as_object_mut().unwrap() {
+            for (id, model) in models.as_object_mut().unwrap() {
+                let source = model.get("pricingSource").cloned().unwrap_or(Value::Null);
+                if model.get("pricingEvidenceVersion").is_some() {
+                    assert_eq!(model["pricingEvidenceVersion"], 1);
+                    assert_eq!(model["pricingCapturedAt"], captured_at);
+                    assert_eq!(
+                        model["pricingUnits"],
+                        if provider == "github-copilot" {
+                            json!("unknown_subscription_units")
+                        } else {
+                            json!("USD_per_million_tokens")
+                        }
+                    );
+                }
+                for field in [
+                    "pricingSource",
+                    "pricingEvidenceVersion",
+                    "pricingCapturedAt",
+                    "pricingUnits",
+                ] {
+                    model.as_object_mut().unwrap().remove(field);
+                }
+                let reference = &expected[provider][id]["cost"];
+                let prices = model["cost"].as_object_mut().unwrap();
+                // Native source fields remain in production; the old fixture
+                // compares normalized fields only. Separate tests assert their
+                // retention and conservative handling of opaque tier conditions.
+                prices.retain(|key, _| reference.get(key).is_some());
+                for (field, native) in [
+                    ("input", "input"),
+                    ("output", "output"),
+                    ("cacheRead", "cache_read"),
+                    ("cacheWrite", "cache_write"),
+                ] {
+                    if prices.get(field) == Some(&Value::Null)
+                        && reference[field].as_f64() == Some(0.)
+                    {
+                        let router = match field {
+                            "input" => "prompt",
+                            "output" => "completion",
+                            "cacheRead" => "input_cache_read",
+                            _ => "input_cache_write",
+                        };
+                        assert!(
+                            source["raw"][native].is_null() && source["raw"][router].is_null(),
+                            "{provider}/{id}/{field}: explicit zero must not become unknown"
+                        );
+                        prices.insert(field.into(), reference[field].clone());
+                    }
+                }
+                if let (Some(tiers), Some(old)) = (
+                    prices.get_mut("tiers").and_then(Value::as_array_mut),
+                    reference["tiers"].as_array(),
+                ) {
+                    for (tier, old) in tiers.iter_mut().zip(old) {
+                        for (field, native) in [
+                            ("input", "input"),
+                            ("output", "output"),
+                            ("cacheRead", "cache_read"),
+                            ("cacheWrite", "cache_write"),
+                        ] {
+                            if tier[field].is_null() && old[field].as_f64() == Some(0.) {
+                                assert!(source["raw"][native].is_null());
+                                tier[field] = old[field].clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut diff = Vec::new();
         differences("", &actual, &expected, &mut diff);
         assert!(

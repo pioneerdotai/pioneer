@@ -772,6 +772,15 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                     ProviderFailureClassification::new(class),
                 )
             })?;
+        // Extraction is post-turn work: never inherit an interactive handle.
+        let usage_store = processor.crud_store.with_maintenance_access();
+        let provider = crate::usage_journal::observe(
+            provider,
+            &usage_store,
+            context.workspace_id.as_str(),
+            "memory_extraction",
+            context.workspace_id.as_str(),
+        );
         let raw_json =
             request_post_turn_extractor_json(provider.as_ref(), model, request.render_prompt())
                 .await?;

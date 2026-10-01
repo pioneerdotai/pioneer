@@ -34,6 +34,7 @@ pub struct ClaudeServiceRequest {
     pub output_cap: u64,
 }
 pub struct ClaudeServiceCompletion {
+    pub observed_usage: serde_json::Value,
     pub text: String,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -97,7 +98,12 @@ impl ClaudeService {
                     MAX_BYTES,
                 )
                 .await?;
-            confirmed_completion(&serde_json::from_slice::<Value>(&output)?, &request.model)
+            let value = serde_json::from_slice::<Value>(&output)?;
+            confirmed_completion(&value, &request.model).map_err(|error| {
+                error.context(crate::service::ObservedServiceUsage(
+                    crate::service::bounded_usage(terminal_value(&value)),
+                ))
+            })
         };
         let result = match tokio::time::timeout_at(deadline, run).await {
             Ok(result) => result,
@@ -302,10 +308,11 @@ fn completion(value: &Value, model: &str) -> Result<ClaudeServiceCompletion> {
     let usage = &value["usage"];
     let input_tokens = usage["input_tokens"].as_u64().and_then(|input| {
         input
-            .checked_add(usage["cache_read_input_tokens"].as_u64()?)?
-            .checked_add(usage["cache_creation_input_tokens"].as_u64()?)
+            .checked_add(usage["cache_read_input_tokens"].as_u64().unwrap_or(0))?
+            .checked_add(usage["cache_creation_input_tokens"].as_u64().unwrap_or(0))
     });
     Ok(ClaudeServiceCompletion {
+        observed_usage: crate::service::bounded_usage(value),
         text: text.to_owned(),
         input_tokens,
         output_tokens: usage["output_tokens"].as_u64(),
@@ -392,7 +399,14 @@ mod tests {
             let mut partial = value.clone();
             partial["usage"].as_object_mut().unwrap().remove(missing);
             let observed = completion(&partial, "claude-sonnet-4-6").unwrap();
-            assert_eq!(observed.input_tokens, None);
+            assert_eq!(
+                observed.input_tokens,
+                match missing {
+                    "input_tokens" => None,
+                    "cache_read_input_tokens" => Some(4),
+                    _ => Some(3),
+                }
+            );
             assert_eq!(observed.output_tokens, Some(4));
         }
         let mut overflow = value.clone();

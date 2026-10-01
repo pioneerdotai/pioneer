@@ -222,6 +222,13 @@ impl DeepSeekProvider {
 
 #[async_trait]
 impl Provider for DeepSeekProvider {
+    fn usage_api(&self) -> &'static str {
+        self.transport.usage_api()
+    }
+    fn usage_route(&self) -> Option<String> {
+        self.transport.usage_route()
+    }
+
     fn name(&self) -> &str {
         PROVIDER_NAME
     }

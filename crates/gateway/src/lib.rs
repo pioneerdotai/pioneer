@@ -61,6 +61,7 @@ mod transport;
 mod turn_mcp;
 mod turn_runtime_snapshot;
 mod turn_security;
+mod usage_journal;
 mod view_grants;
 mod voice;
 mod workspace;

@@ -1,12 +1,18 @@
 //! Explicit reference corrections and models absent from upstream catalogs.
-use super::{Candidate, LimitOrigin, OriginKind, Value, json, number, round, rules};
+use super::{Candidate, LimitOrigin, OriginKind, Value, json, round, rules};
 
 fn pricing(rates: [f64; 4]) -> Value {
     json!({"input":rates[0],"output":rates[1],"cacheRead":rates[2],"cacheWrite":rates[3]})
 }
+fn scaled_price(value: &Value, factor: f64) -> Value {
+    value
+        .as_f64()
+        .map(|v| json!(round(v * factor)))
+        .unwrap_or(Value::Null)
+}
 fn long_pricing(mut cost: Value) -> Value {
-    cost["tiers"] = json!([{"inputTokensAbove":272000,"input":round(number(&cost["input"])*2.),
-        "output":round(number(&cost["output"])*1.5),"cacheRead":round(number(&cost["cacheRead"])*2.),"cacheWrite":round(number(&cost["cacheWrite"])*2.)}]);
+    cost["tiers"] = json!([{"inputTokensAbove":272000,"input":scaled_price(&cost["input"],2.),
+        "output":scaled_price(&cost["output"],1.5),"cacheRead":scaled_price(&cost["cacheRead"],2.),"cacheWrite":scaled_price(&cost["cacheWrite"],2.)}]);
     cost
 }
 fn standard(id: &str) -> Option<Value> {
@@ -35,7 +41,7 @@ fn explicit(
     };
     Candidate {
         model: json!({"id":id,"name":name,"provider":provider,"api":api,"baseUrl":url,"reasoning":reasoning,
-        "input":if image {vec!["text","image"]} else {vec!["text"]},"cost":cost,"contextWindow":context,"maxTokens":output}),
+        "input":if image {vec!["text","image"]} else {vec!["text"]},"pricingSource":{"kind":"pinned_catalog_override","units":"USD_per_million_tokens"},"cost":cost,"contextWindow":context,"maxTokens":output}),
         context_origin: origin.clone(),
         output_origin: origin,
         reasoning_options: Value::Null,

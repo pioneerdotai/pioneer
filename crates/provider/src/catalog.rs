@@ -75,6 +75,7 @@ pub struct CatalogLimits {
 pub struct ModelCatalog {
     models: BTreeMap<String, BTreeMap<String, CatalogModel>>,
     origins: BTreeMap<String, BTreeMap<String, ModelOrigins>>,
+    snapshot_id: String,
 }
 
 impl ModelCatalog {
@@ -82,6 +83,10 @@ impl ModelCatalog {
         let catalog = Self {
             models: serde_json::from_str(models)?,
             origins: serde_json::from_str(origins)?,
+            snapshot_id: {
+                use sha2::{Digest, Sha256};
+                hex::encode(Sha256::digest(models.as_bytes()))
+            },
         };
         anyhow::ensure!(!catalog.models.is_empty(), "empty model catalog");
         for (provider, models) in &catalog.models {
@@ -112,6 +117,10 @@ impl ModelCatalog {
             }
         }
         Ok(catalog)
+    }
+
+    pub fn snapshot_id(&self) -> &str {
+        &self.snapshot_id
     }
 
     pub fn model(&self, provider: &str, id: &str) -> Option<&CatalogModel> {

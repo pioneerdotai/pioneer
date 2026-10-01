@@ -541,7 +541,7 @@ fn classify_system_event(
             status,
             "internal plan update",
         ),
-        Some("agent_runtime_event") => {
+        Some("agent_runtime_event" | "provider_usage") => {
             classify_runtime_event(item_id, item_type, message, details, status)
         }
         Some("agent_runtime_item") => hidden_work(
@@ -626,7 +626,7 @@ fn classify_runtime_event(
         .or_else(|| message.strip_prefix("Runtime event: "));
 
     match native_method {
-        Some("thread/tokenUsage/updated") => hidden_work(
+        Some("thread/tokenUsage/updated" | "provider/usage/observed") => hidden_work(
             item_id,
             item_type,
             WorkItemClassification::InternalTokenUsage,
@@ -922,6 +922,24 @@ mod tests {
         assert_eq!(
             classify_turn_item_row_for_turn(&detached, &turn_row("conversation")).placement,
             ProjectionPlacement::TurnWork
+        );
+    }
+
+    #[test]
+    fn provider_usage_is_hidden_without_becoming_context_or_work() {
+        let item = info_system(
+            Some("provider_usage"),
+            "Provider usage observation",
+            Some(
+                json!({"nativeMethod":"provider/usage/observed","schema_version":1,
+                "usage":{"input_tokens":100,"cache_read_input_tokens":80}}),
+            ),
+        );
+        let classified = classify_turn_item_with_db_status(&item, Some("completed"));
+        assert_eq!(classified.visibility, ProjectionVisibility::Hidden);
+        assert_eq!(
+            classified.classification,
+            WorkItemClassification::InternalTokenUsage
         );
     }
 

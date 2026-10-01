@@ -25,6 +25,21 @@ pub trait Provider: Send + Sync {
     /// Human-readable provider name (e.g. "openrouter", "anthropic").
     fn name(&self) -> &str;
 
+    /// Actual adapter API, independent of the API preferred by the model catalog.
+    fn usage_api(&self) -> &'static str {
+        "chat_completions"
+    }
+
+    fn usage_api_version(&self) -> Option<String> {
+        None
+    }
+
+    /// Public route identity: an opaque endpoint fingerprint and API template.
+    /// Never credentials, query, private host or configured path fragments.
+    fn usage_route(&self) -> Option<String> {
+        None
+    }
+
     /// Non-secret identity of the credential/account/endpoint authority that
     /// created this instance. Registry-managed providers always expose one;
     /// directly constructed test providers may remain unbound.
@@ -154,6 +169,7 @@ mod tests {
                 usage: Some(TokenUsage {
                     input_tokens: Some(10),
                     output_tokens: Some(5),
+                    ..Default::default()
                 }),
                 reasoning_content: None,
                 tool_calls: Vec::new(),

@@ -7,6 +7,7 @@ mod memory;
 mod model_history;
 mod projector;
 mod repositories;
+pub use repositories::provider_usage::ProviderUsageObservation;
 mod task_delivery_lifecycle;
 mod task_events;
 mod task_terminal;

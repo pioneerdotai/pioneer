@@ -170,6 +170,10 @@ struct ApiThinkingConfig {
 #[serde(rename_all = "camelCase")]
 struct ApiGenerateResponse {
     #[serde(default)]
+    response_id: Option<String>,
+    #[serde(default)]
+    model_version: Option<String>,
+    #[serde(default)]
     candidates: Vec<ApiCandidate>,
     #[serde(default)]
     usage_metadata: Option<ApiUsageMetadata>,
@@ -183,14 +187,7 @@ struct ApiCandidate {
     finish_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ApiUsageMetadata {
-    #[serde(default)]
-    prompt_token_count: Option<u64>,
-    #[serde(default)]
-    candidates_token_count: Option<u64>,
-}
+type ApiUsageMetadata = crate::usage::GeminiUsage;
 
 // ── List models response types ─────────────────────────────────────────────
 
@@ -595,9 +592,14 @@ impl GeminiProvider {
     }
 
     fn extract_usage(response: &ApiGenerateResponse) -> Option<TokenUsage> {
-        response.usage_metadata.as_ref().map(|u| TokenUsage {
-            input_tokens: u.prompt_token_count,
-            output_tokens: u.candidates_token_count,
+        (response.usage_metadata.is_some() || response.response_id.is_some()).then(|| {
+            response
+                .usage_metadata
+                .as_ref()
+                .map(|u| u.normalized())
+                .unwrap_or_default()
+                .with_native_id(response.response_id.as_deref())
+                .with_reported_model(response.model_version.as_deref())
         })
     }
 
@@ -671,6 +673,13 @@ fn parse_json_or_string(raw: &str) -> serde_json::Value {
 
 #[async_trait]
 impl crate::traits::Provider for GeminiProvider {
+    fn usage_api(&self) -> &'static str {
+        "generate_content"
+    }
+    fn usage_route(&self) -> Option<String> {
+        crate::usage::route(&self.base_url, "/models/{model}:generateContent")
+    }
+
     fn name(&self) -> &str {
         "gemini"
     }

@@ -322,6 +322,13 @@ fn normalize_base_url(mut url: String) -> String {
 
 #[async_trait]
 impl crate::traits::Provider for OllamaProvider {
+    fn usage_api(&self) -> &'static str {
+        "ollama_chat"
+    }
+    fn usage_route(&self) -> Option<String> {
+        crate::usage::route(&self.base_url, "/api/chat")
+    }
+
     fn name(&self) -> &str {
         "ollama"
     }
@@ -384,6 +391,9 @@ impl crate::traits::Provider for OllamaProvider {
             (input, output) => Some(TokenUsage {
                 input_tokens: input,
                 output_tokens: output,
+                raw_usage: Some(serde_json::json!({"prompt_eval_count":input,"eval_count":output})),
+                semantics: Some("native_eval_counts".into()),
+                ..Default::default()
             }),
         };
 
@@ -548,6 +558,9 @@ impl crate::traits::Provider for OllamaProvider {
                                         .with_usage(Some(TokenUsage {
                                             input_tokens: chunk.prompt_eval_count,
                                             output_tokens: chunk.eval_count,
+                                            raw_usage: Some(serde_json::json!({"prompt_eval_count":chunk.prompt_eval_count,"eval_count":chunk.eval_count})),
+                                            semantics: Some("native_eval_counts".into()),
+                    ..Default::default()
                                         }))))
                                     .await
                                     .is_err()

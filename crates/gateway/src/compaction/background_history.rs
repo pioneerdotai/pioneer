@@ -398,6 +398,7 @@ pub(crate) async fn prepare_completed_history_owned(
         diagnostic.stage = "summary_configuration".into();
         let summarizer = super::service::make_summarizer(
             processor.provider_registry().as_ref(),
+            &store,
             Some(processor),
             workspace,
             selection,

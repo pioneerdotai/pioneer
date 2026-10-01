@@ -273,3 +273,47 @@ async fn dropping_stream_closes_pending_http_transport() {
     drop(stream);
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn compatible_stream_usage_opt_in_is_profile_specific_and_terminal_is_cumulative() {
+    use super::compatible::{AuthStyle, OpenAiCompatibleProvider};
+    for (profile, opt_in) in [
+        ("groq", true),
+        ("deepseek", true),
+        ("fireworks", true),
+        ("custom", false),
+        ("mistral", false),
+    ] {
+        let body=concat!(
+            "data: {\"id\":\"chat-native-1\",\"model\":\"reported-model\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":140,\"completion_tokens\":19,\"prompt_tokens_details\":{\"cached_tokens\":100,\"cache_write_tokens\":20},\"completion_tokens_details\":{\"reasoning_tokens\":10}}}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":140,\"completion_tokens\":19}}\n\n",
+            "data: [DONE]\n\n").to_owned();
+        let (url, server) = fixture(body).await;
+        let provider =
+            OpenAiCompatibleProvider::new(profile, url, "fixture-key", AuthStyle::Bearer);
+        let mut stream = crate::attachments::runtime::with_async_authority_scope(
+            "usage-fixture-authority".into(),
+            provider.stream_chat(request()),
+        )
+        .await
+        .unwrap();
+        let mut usage = TokenUsage::default();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            if let Some(snapshot) = chunk.usage {
+                usage.update(&snapshot);
+            }
+        }
+        assert_eq!(usage.input_tokens, Some(140));
+        assert_eq!(usage.output_tokens, Some(19));
+        assert_eq!(usage.cache_read_input_tokens, Some(100));
+        assert_eq!(usage.cache_write_input_tokens, Some(20));
+        assert_eq!(usage.reasoning_tokens, Some(10));
+        assert_eq!(usage.generation_id.as_deref(), Some("chat-native-1"));
+        assert_eq!(usage.reported_model.as_deref(), Some("reported-model"));
+        let request = server.await.unwrap();
+        assert_eq!(request.get("stream_options").is_some(), opt_in, "{profile}");
+    }
+}

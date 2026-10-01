@@ -556,7 +556,8 @@ async fn prepare_native_projection_with_prepared(
         };
         let selection = effective_selection(&current, settings.selection.as_ref(), None).clone();
         let summarizer =
-            super::service::make_summarizer(providers, processor, workspace, selection).await?;
+            super::service::make_summarizer(providers, store, processor, workspace, selection)
+                .await?;
         let layout = NativeHistoryLayout::from_messages(
             workspace,
             thread,

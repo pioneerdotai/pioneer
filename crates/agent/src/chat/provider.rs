@@ -67,16 +67,7 @@ impl<'a> FailureTarget<'a> {
 
 fn total_token_usage(usage: Option<&TokenUsage>) -> Option<u64> {
     let usage = usage?;
-    if usage.input_tokens.is_none() && usage.output_tokens.is_none() {
-        return None;
-    }
-
-    Some(
-        usage
-            .input_tokens
-            .unwrap_or_default()
-            .saturating_add(usage.output_tokens.unwrap_or_default()),
-    )
+    usage.input_tokens?.checked_add(usage.output_tokens?)
 }
 
 fn bind_replay_to_response_target(
@@ -131,7 +122,7 @@ async fn persist_failed_provider_observation(
     .await
 }
 
-pub(super) async fn request_agent_round(
+async fn request_agent_round_observed(
     provider: &Arc<dyn Provider>,
     request: ChatRequest,
     workspace_id: &str,
@@ -141,6 +132,7 @@ pub(super) async fn request_agent_round(
     force_non_stream: bool,
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
+    observation: &ProviderAttemptObservation,
 ) -> Result<AgentRoundResponse, ChatTurnError> {
     pioneer_observability::turn_startup::dispatched(turn_id);
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
@@ -199,6 +191,7 @@ pub(super) async fn request_agent_round(
                 }
                 if let Some(snapshot) = &chunk.usage {
                     usage.get_or_insert_with(Default::default).update(snapshot);
+                    observation.observe(snapshot);
                 }
                 if chunk.provider_replay_state.is_some() {
                     provider_replay_state = chunk.provider_replay_state.take();
@@ -333,6 +326,9 @@ pub(super) async fn request_agent_round(
             &error,
         )
     })?;
+    if let Some(usage) = &response.usage {
+        observation.observe(usage);
+    }
     bind_replay_to_response_target(
         &mut response.provider_replay_state,
         provider.name(),
@@ -410,7 +406,7 @@ pub(super) async fn request_agent_round(
     })
 }
 
-pub(super) async fn stream_provider_response(
+async fn stream_provider_response_observed(
     provider: &Arc<dyn Provider>,
     request: ChatRequest,
     workspace_id: &str,
@@ -420,6 +416,7 @@ pub(super) async fn stream_provider_response(
     message_item_id: &str,
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
+    observation: &ProviderAttemptObservation,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
     pioneer_observability::turn_startup::dispatched(turn_id);
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
@@ -488,6 +485,7 @@ pub(super) async fn stream_provider_response(
 
             if let Some(snapshot) = &chunk_usage {
                 usage.get_or_insert_with(Default::default).update(snapshot);
+                observation.observe(snapshot);
             }
             if chunk_replay.is_some() {
                 provider_replay_state = chunk_replay;
@@ -773,7 +771,7 @@ pub(super) async fn stream_provider_response(
     Ok((assistant_text, usage))
 }
 
-pub(super) async fn non_stream_provider_response(
+async fn non_stream_provider_response_observed(
     provider: &Arc<dyn Provider>,
     request: ChatRequest,
     workspace_id: &str,
@@ -782,6 +780,7 @@ pub(super) async fn non_stream_provider_response(
     thinking_item_id: &str,
     message_item_id: &str,
     event_tx: &AgentEventHub,
+    observation: &ProviderAttemptObservation,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
     pioneer_observability::turn_startup::dispatched(turn_id);
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
@@ -799,6 +798,9 @@ pub(super) async fn non_stream_provider_response(
         )
     })?;
 
+    if let Some(usage) = &response.usage {
+        observation.observe(usage);
+    }
     if !response.text.is_empty() {
         pioneer_observability::turn_startup::runtime_output(
             turn_id,
@@ -1946,6 +1948,11 @@ mod partial_observation_tests {
         ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
         {
             Ok(futures_util::stream::iter(vec![
+                Ok(StreamChunk::usage(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                })),
                 Ok(StreamChunk::reasoning("reasoning actually received")),
                 Ok(StreamChunk::delta("partial answer actually received")),
                 Ok(StreamChunk::provider_replay_state(
@@ -1982,21 +1989,37 @@ mod partial_observation_tests {
                 compiled_prompt: None,
             };
             let receive = async {
+                let mut history = None;
                 loop {
                     let event = events.recv().await.unwrap();
                     assert!(!matches!(
                         event,
                         AgentDurableEvent::TurnFinalizationPrepared { .. }
                     ));
-                    let observation = match event {
+                    let usage = match event {
                         AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } => {
-                            Some(payload)
+                            history = Some(payload);
+                            None
+                        }
+                        AgentDurableEvent::ItemCompleted { notification } => {
+                            match notification.item {
+                                TurnItem::SystemEvent { code, details, .. }
+                                    if code.as_deref() == Some("provider_usage") =>
+                                {
+                                    details
+                                }
+                                _ => None,
+                            }
                         }
                         _ => None,
                     };
                     events.acknowledge_last(Ok(()));
-                    if let Some(payload) = observation {
-                        break payload;
+                    if let Some(details) = usage {
+                        assert_eq!(details["status"], "failed");
+                        assert_eq!(details["usage"]["input_tokens"], 10);
+                        assert_eq!(details["usage"]["output_tokens"], 2);
+                        assert!(!details.to_string().contains("request\""));
+                        break history.expect("partial history precedes failure");
                     }
                 }
             };
@@ -2074,4 +2097,198 @@ fn observe_startup_chunk(turn_id: &str, chunk: &pioneer_provider::StreamChunk) {
     if let Some(output) = output {
         turn_startup::runtime_output(turn_id, output);
     }
+}
+
+/// One item per physical chat dispatch; snapshots are never additional charges.
+/// Start records survive cancellation. Only provider-reported partial counters
+/// survive error; no usage is invented for a failed connect or missing terminal.
+pub(super) struct ProviderAttemptObservation {
+    id: String,
+    provider: String,
+    model: String,
+    api: String,
+    route: Option<String>,
+    usage: std::sync::Mutex<TokenUsage>,
+}
+impl ProviderAttemptObservation {
+    pub(super) fn new(provider: &dyn Provider, model: &str) -> Self {
+        Self {
+            id: super::generate_id(super::TURN_ITEM_ID_LEN),
+            provider: provider.name().to_owned(),
+            model: model.to_owned(),
+            api: provider.usage_api().to_owned(),
+            route: provider.usage_route(),
+            usage: std::sync::Mutex::new(TokenUsage::default()),
+        }
+    }
+    pub(super) fn observe(&self, snapshot: &TokenUsage) {
+        self.usage
+            .lock()
+            .expect("usage observation")
+            .update(snapshot);
+    }
+    pub(super) async fn publish(
+        &self,
+        events: &AgentEventHub,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        completed: Option<bool>,
+    ) -> Result<(), ChatTurnError> {
+        let mut usage = self.usage.lock().expect("usage observation").clone();
+        if let Some(raw) = &usage.raw_usage {
+            usage.raw_usage = Some(pioneer_provider::usage::bounded_usage(raw));
+        }
+        let item = TurnItem::SystemEvent {
+            id: self.id.clone(),
+            level: pioneer_protocol::SystemEventLevel::Info,
+            message: "Provider usage observation".into(),
+            code: Some("provider_usage".into()),
+            details: Some(serde_json::json!({"schema_version":1,
+                "nativeMethod":"provider/usage/observed", "observation_id":self.id,
+                "physical_attempt_id":usage.physical_attempt_id,
+                "request_sent":serde_json::Value::Null,
+                "provider":self.provider,"model":self.model,"api":self.api,"route":self.route,
+                "status":match completed {None=>"started",Some(true)=>"completed",Some(false)=>"failed"},
+                "complete":completed == Some(true),"usage":usage})),
+        };
+        let event = if completed.is_none() {
+            AgentDurableEvent::ItemStarted {
+                notification: ItemStartedNotification {
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item,
+                },
+            }
+        } else {
+            AgentDurableEvent::ItemCompleted {
+                notification: ItemCompletedNotification {
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item,
+                },
+            }
+        };
+        super::emit_durable_event(events, event).await
+    }
+}
+
+pub(super) async fn request_agent_round(
+    provider: &Arc<dyn Provider>,
+    request: ChatRequest,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    thinking_item_id: &str,
+    force_non_stream: bool,
+    provider_timeout_policy: ProviderTimeoutPolicy,
+    event_tx: &AgentEventHub,
+) -> Result<AgentRoundResponse, ChatTurnError> {
+    let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model);
+    observation
+        .publish(event_tx, workspace_id, thread_id, turn_id, None)
+        .await?;
+    let result = request_agent_round_observed(
+        provider,
+        request,
+        workspace_id,
+        thread_id,
+        turn_id,
+        thinking_item_id,
+        force_non_stream,
+        provider_timeout_policy,
+        event_tx,
+        &observation,
+    )
+    .await;
+    observation
+        .publish(
+            event_tx,
+            workspace_id,
+            thread_id,
+            turn_id,
+            Some(result.is_ok()),
+        )
+        .await?;
+    result
+}
+
+pub(super) async fn stream_provider_response(
+    provider: &Arc<dyn Provider>,
+    request: ChatRequest,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    thinking_item_id: &str,
+    message_item_id: &str,
+    provider_timeout_policy: ProviderTimeoutPolicy,
+    event_tx: &AgentEventHub,
+) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
+    let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model);
+    observation
+        .publish(event_tx, workspace_id, thread_id, turn_id, None)
+        .await?;
+    let result = stream_provider_response_observed(
+        provider,
+        request,
+        workspace_id,
+        thread_id,
+        turn_id,
+        thinking_item_id,
+        message_item_id,
+        provider_timeout_policy,
+        event_tx,
+        &observation,
+    )
+    .await;
+    observation
+        .publish(
+            event_tx,
+            workspace_id,
+            thread_id,
+            turn_id,
+            Some(result.is_ok()),
+        )
+        .await?;
+    result
+}
+
+pub(super) async fn non_stream_provider_response(
+    provider: &Arc<dyn Provider>,
+    request: ChatRequest,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    thinking_item_id: &str,
+    message_item_id: &str,
+    event_tx: &AgentEventHub,
+) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
+    let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model);
+    observation
+        .publish(event_tx, workspace_id, thread_id, turn_id, None)
+        .await?;
+    let result = non_stream_provider_response_observed(
+        provider,
+        request,
+        workspace_id,
+        thread_id,
+        turn_id,
+        thinking_item_id,
+        message_item_id,
+        event_tx,
+        &observation,
+    )
+    .await;
+    observation
+        .publish(
+            event_tx,
+            workspace_id,
+            thread_id,
+            turn_id,
+            Some(result.is_ok()),
+        )
+        .await?;
+    result
 }

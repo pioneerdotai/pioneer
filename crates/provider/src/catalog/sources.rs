@@ -164,7 +164,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
                 "google-vertex"=>{candidate.model["cost"]["cacheWrite"]=json!(0);if id=="gemini-2.5-flash"{candidate.model["cost"]["cacheRead"]=json!(0.03);}},
                 "cloudflare-workers-ai"=>candidate.compat(json!({"sendSessionAffinityHeaders":true})),
                 "xai"=>candidate.compat(json!({"supportsLongCacheRetention":false})),
-                "mistral"=>{if m["cost"]["cache_read"].is_null(){candidate.model["cost"]["cacheRead"]=json!(round(number(&m["cost"]["input"])*0.1));}},
+                "mistral"=>{if m["cost"]["cache_read"].is_null(){candidate.model["cost"]["cacheRead"]=m["cost"]["input"].as_f64().map(|v|json!(round(v*0.1))).unwrap_or(Value::Null);}},
                 "huggingface"=>candidate.compat(json!({"supportsDeveloperRole":false})),
                 p if p.starts_with("xiaomi")=>candidate.compat(json!({"requiresReasoningContentOnAssistantMessages":true,"thinkingFormat":"deepseek"})),
                 _=>{}
@@ -663,8 +663,19 @@ pub(super) fn openrouter(data: &Value) -> Vec<Candidate> {
                 ("cacheRead", "input_cache_read"),
                 ("cacheWrite", "input_cache_write"),
             ] {
-                c.model["cost"][key] = json!(round(number(&m["pricing"][source]) * 1_000_000.));
+                c.model["cost"][key] = match &m["pricing"][source] {
+                    Value::Null => Value::Null,
+                    value => value
+                        .as_str()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .or_else(|| value.as_f64())
+                        .filter(|v| v.is_finite() && *v >= 0.)
+                        .map(|v| json!(round(v * 1_000_000.)))
+                        .unwrap_or_else(|| value.clone()),
+                };
             }
+            c.model["pricingSource"] =
+                json!({"url":SOURCE_URLS[1],"units":"USD_per_token","raw":m["pricing"]});
             let reasoning = &m["reasoning"];
             let mandatory = reasoning["mandatory"] == true;
             if let Some(mut map) =
@@ -699,6 +710,8 @@ pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
                 m,
                 (4096, 4096),
             );
+            c.model["pricingSource"] =
+                json!({"url":SOURCE_URLS[2],"units":"USD_per_token","raw":m["pricing"]});
             c.model["reasoning"] = json!(has(&m["tags"], "reasoning"));
             c.model["input"] = if has(&m["tags"], "vision") {
                 json!(["text", "image"])
@@ -715,7 +728,16 @@ pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
                 ("cacheRead", "input_cache_read"),
                 ("cacheWrite", "input_cache_write"),
             ] {
-                c.model["cost"][key] = json!(round(number(&m["pricing"][source]) * 1_000_000.));
+                c.model["cost"][key] = match &m["pricing"][source] {
+                    Value::Null => Value::Null,
+                    value => value
+                        .as_str()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .or_else(|| value.as_f64())
+                        .filter(|v| v.is_finite() && *v >= 0.)
+                        .map(|v| json!(round(v * 1_000_000.)))
+                        .unwrap_or_else(|| value.clone()),
+                };
             }
             c
         })

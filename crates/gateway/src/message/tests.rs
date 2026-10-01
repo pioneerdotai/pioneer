@@ -77123,3 +77123,311 @@ mod task_delivery_cancellation;
 
 #[path = "tests/memory_post_turn_recovery.rs"]
 mod memory_post_turn_recovery;
+
+#[tokio::test]
+async fn provider_usage_items_persist_idempotently_without_entering_llm_history() {
+    let thread = "thr_usage_ledger";
+    let turn = "turn_usage_ledger";
+    let (processor, store, workspace) = setup_execution_window_terminal_turn(thread, turn).await;
+    start_terminal_test_execution_window(&processor, &workspace, thread, turn, "win_usage_ledger")
+        .await;
+    let make_item = |id: &str, input: Option<u64>, output: Option<u64>, complete: bool| {
+        TurnItem::SystemEvent {
+            id: id.into(),
+            level: pioneer_protocol::SystemEventLevel::Info,
+            message: "Provider usage observation".into(),
+            code: Some("provider_usage".into()),
+            details: Some(
+                json!({"schema_version":1,"nativeMethod":"provider/usage/observed",
+            "physical_attempt_id":id,"provider":"openrouter","model":"fixture","api":"chat_completions",
+            "complete":complete,"usage":{"input_tokens":input,"output_tokens":output,
+                "cache_read_input_tokens":80,"raw_usage":{"prompt_tokens":input,"completion_tokens":output},
+                "accounting":{"reported_cost":{"amount":0.01,"currency":"credits","provenance":"provider_response_usage.cost"},"estimated_cost":null}}}),
+            ),
+        }
+    };
+    let mut restored = Vec::new();
+    for (id, input, output, complete) in [
+        ("usage-failed", Some(100), Some(2), false),
+        ("usage-retry", Some(120), Some(0), true),
+        ("usage-missing", None, None, false),
+    ] {
+        let item = make_item(id, input, output, complete);
+        let started = AgentDurableEvent::ItemStarted {
+            notification: ItemStartedNotification {
+                workspace_id: workspace.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: make_item(id, None, None, false),
+            },
+        };
+        assert!(processor.handle_durable_agent_event(started).await);
+        let event = AgentDurableEvent::ItemCompleted {
+            notification: ItemCompletedNotification {
+                workspace_id: workspace.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: item.clone(),
+            },
+        };
+        assert!(processor.handle_durable_agent_event(event.clone()).await);
+        assert!(processor.handle_durable_agent_event(event).await);
+        let persisted = store.get_turn_item(turn, id).await.unwrap().unwrap();
+        assert_eq!(persisted, item);
+        restored.push(persisted);
+    }
+    let totals = pioneer_protocol::observed_provider_usage_totals(&restored);
+    assert_eq!(totals.attempts, 3);
+    assert_eq!(totals.known_input_tokens, 220);
+    assert_eq!(totals.known_output_tokens, 2);
+    assert_eq!(totals.missing_input_attempts, 1);
+    let context = store
+        .compaction_source_page(
+            &workspace,
+            thread,
+            turn,
+            pioneer_crud::compaction::PagedSource::ProviderContext,
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(
+        context.entries.is_empty(),
+        "accounting is not provider replay/history"
+    );
+}
+
+#[tokio::test]
+async fn auxiliary_usage_journal_is_scoped_idempotent_bounded_and_restart_readable() {
+    use pioneer_crud::ProviderUsageObservation;
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_aux_usage", "turn_aux_usage").await;
+    let background = store.with_maintenance_access();
+    assert_eq!(
+        background.database_connection().read_class(),
+        pioneer_sqlite::SqliteReadClass::Maintenance
+    );
+    assert_eq!(
+        background.database_connection().write_class(),
+        pioneer_sqlite::SqliteWriteClass::Maintenance
+    );
+    assert_eq!(
+        store.database_connection().write_class(),
+        pioneer_sqlite::SqliteWriteClass::Interactive
+    );
+    let mut partial = ProviderUsageObservation {
+        id: "aux-1".into(),
+        workspace_id: workspace.clone(),
+        operation_kind: "self_improvement".into(),
+        owner_id: "run-usage".into(),
+        status: "started".into(),
+        usage_json: json!({"input_tokens":100,"cache_read_input_tokens":80,"output_tokens":null})
+            .to_string(),
+        started_at: 1,
+        updated_at: 1,
+    };
+    background
+        .record_provider_usage(partial.clone())
+        .await
+        .unwrap();
+    partial.status = "failed".into();
+    partial.updated_at = 2;
+    background
+        .record_provider_usage(partial.clone())
+        .await
+        .unwrap();
+    background
+        .record_provider_usage(partial.clone())
+        .await
+        .unwrap();
+    let mut stale = partial.clone();
+    stale.status = "started".into();
+    stale.updated_at = 3;
+    assert!(background.record_provider_usage(stale).await.is_err());
+    let mut cross_workspace = partial.clone();
+    cross_workspace.workspace_id = "unrelated-workspace".into();
+    assert!(
+        background
+            .record_provider_usage(cross_workspace)
+            .await
+            .is_err()
+    );
+    let mut invalid = partial.clone();
+    invalid.id = "poison".into();
+    invalid.usage_json = "x".repeat(32769);
+    assert!(background.record_provider_usage(invalid).await.is_err());
+    let mut retry = partial.clone();
+    retry.id = "aux-2".into();
+    retry.status = "completed".into();
+    retry.usage_json = json!({"input_tokens":120,"output_tokens":0}).to_string();
+    let (write, read) = tokio::join!(
+        store.record_provider_usage(retry.clone()),
+        background.provider_usage_page(&workspace, "run-usage", "", 1)
+    );
+    write.unwrap();
+    assert_eq!(read.unwrap().len(), 1);
+    let restarted = pioneer_crud::CrudStore::new(background.database_connection());
+    let rows = restarted
+        .provider_usage_page(&workspace, "run-usage", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![partial, retry]);
+    assert!(
+        restarted
+            .provider_usage_page(&workspace, "run-usage", "", 101)
+            .await
+            .is_err()
+    );
+    assert!(
+        restarted
+            .provider_usage_page(&workspace, "another-run", "", 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .compaction_source_page(
+                &workspace,
+                "thr_aux_usage",
+                "turn_aux_usage",
+                pioneer_crud::compaction::PagedSource::ProviderContext,
+                0
+            )
+            .await
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn auxiliary_chat_keeps_native_usage_before_application_validation() {
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_aux_chat", "turn_aux_chat").await;
+    let registry = test_provider();
+    let provider = crate::usage_journal::observe(
+        registry
+            .get_or_create_for_workspace(&workspace, "openai")
+            .unwrap(),
+        store.as_ref(),
+        &workspace,
+        "title",
+        "thr_aux_chat",
+    );
+    let response = provider
+        .chat(ChatRequest {
+            model: "fixture".into(),
+            messages: vec![ChatMessage::user("fixture prompt")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        })
+        .await
+        .unwrap();
+    let rows = store
+        .provider_usage_page(&workspace, "thr_aux_chat", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "completed");
+    let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(Some(retained), response.usage);
+    assert!(!rows[0].usage_json.contains("fixture prompt"));
+}
+
+#[tokio::test]
+async fn auxiliary_stream_partial_usage_survives_drop_and_retry_without_holding_database_capacity()
+{
+    use futures_util::StreamExt;
+    struct Partial;
+    #[async_trait::async_trait]
+    impl pioneer_provider::Provider for Partial {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            anyhow::bail!("unexpected non-stream fixture")
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::usage(pioneer_provider::TokenUsage {
+                    input_tokens: Some(123),
+                    output_tokens: Some(2),
+                    physical_attempt_id: Some(pioneer_protocol::generate_id(21)),
+                    raw_usage: Some(json!({"prompt_tokens":123,"completion_tokens":2})),
+                    ..Default::default()
+                })),
+                Err(anyhow::anyhow!("fixture interrupted")),
+            ])))
+        }
+    }
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_aux_partial", "turn_aux_partial").await;
+    let background = store.with_maintenance_access();
+    let provider = crate::usage_journal::observe(
+        Arc::new(Partial),
+        &background,
+        &workspace,
+        "memory_extraction",
+        "partial-owner",
+    );
+    let request = || ChatRequest {
+        model: "fixture".into(),
+        messages: vec![],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let mut first = provider.stream_chat(request()).await.unwrap();
+    assert_eq!(
+        first
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .usage
+            .unwrap()
+            .input_tokens,
+        Some(123)
+    );
+    drop(first);
+    let mut retry = provider.stream_chat(request()).await.unwrap();
+    assert!(retry.next().await.unwrap().is_ok());
+    assert!(retry.next().await.unwrap().is_err());
+    assert!(retry.next().await.is_none());
+    let rows = background
+        .provider_usage_page(&workspace, "partial-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let statuses = rows
+        .iter()
+        .map(|r| r.status.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        statuses,
+        std::collections::BTreeSet::from(["failed", "started"])
+    );
+    let usages = rows
+        .iter()
+        .map(|r| serde_json::from_str::<pioneer_provider::TokenUsage>(&r.usage_json).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        usages.iter().map(|u| u.input_tokens.unwrap()).sum::<u64>(),
+        246
+    );
+    assert_ne!(usages[0].physical_attempt_id, usages[1].physical_attempt_id);
+}

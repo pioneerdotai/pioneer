@@ -50,6 +50,8 @@ struct ApiChatRequest {
     output_config: Option<AnthropicOutputConfig>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -121,6 +123,8 @@ enum AnthropicToolChoice {
 
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
+    #[serde(default)]
+    id: Option<String>,
     content: Vec<ContentBlock>,
     #[serde(default)]
     stop_reason: Option<String>,
@@ -148,30 +152,7 @@ struct ContentBlock {
     input: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiUsage {
-    #[serde(default)]
-    input_tokens: Option<u64>,
-    #[serde(default)]
-    output_tokens: Option<u64>,
-    #[serde(default)]
-    cache_creation_input_tokens: Option<u64>,
-    #[serde(default)]
-    cache_read_input_tokens: Option<u64>,
-}
-
-impl ApiUsage {
-    fn normalized(&self) -> TokenUsage {
-        TokenUsage {
-            input_tokens: self.input_tokens.and_then(|input| {
-                input
-                    .checked_add(self.cache_creation_input_tokens?)?
-                    .checked_add(self.cache_read_input_tokens?)
-            }),
-            output_tokens: self.output_tokens,
-        }
-    }
-}
+type ApiUsage = crate::usage::AnthropicUsage;
 
 // ── SSE streaming response types ────────────────────────────────────────────
 
@@ -195,6 +176,8 @@ struct StreamEvent {
 
 #[derive(Debug, Deserialize)]
 struct StreamMessage {
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     usage: Option<ApiUsage>,
 }
@@ -500,6 +483,13 @@ impl PendingToolUse {
 
 #[async_trait]
 impl crate::traits::Provider for AnthropicProvider {
+    fn usage_api(&self) -> &'static str {
+        "messages"
+    }
+    fn usage_route(&self) -> Option<String> {
+        crate::usage::route(&self.base_url, "/v1/messages")
+    }
+
     fn name(&self) -> &str {
         "anthropic"
     }
@@ -532,7 +522,9 @@ impl crate::traits::Provider for AnthropicProvider {
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let (system, messages) = Self::prepare_messages(&prepared)?;
 
+        let cache_control = crate::usage::anthropic_cache_control(&self.base_url, &request.model);
         let api_request = ApiChatRequest {
+            cache_control,
             model: request.model,
             messages,
             max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
@@ -562,6 +554,12 @@ impl crate::traits::Provider for AnthropicProvider {
             return Err(Self::api_error(response).await);
         }
 
+        let native_request_id = crate::usage::native_id(
+            response
+                .headers()
+                .get("request-id")
+                .and_then(|v| v.to_str().ok()),
+        );
         let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
             response,
             Default::default(),
@@ -573,7 +571,14 @@ impl crate::traits::Provider for AnthropicProvider {
             .as_deref()
             .map(ProviderTermination::from_openai_reason)
             .unwrap_or_else(|| ProviderTermination::Unknown("missing_stop_reason".to_owned()));
-        let usage = api_response.usage.map(|u| u.normalized());
+        let usage = Some(
+            api_response
+                .usage
+                .map(|u| u.normalized())
+                .unwrap_or_default()
+                .with_native_id(api_response.id.as_deref())
+                .with_request_id(native_request_id.as_deref()),
+        );
 
         let mut text_parts = Vec::new();
         let mut thinking_parts = Vec::new();
@@ -665,7 +670,9 @@ impl crate::traits::Provider for AnthropicProvider {
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let (system, messages) = Self::prepare_messages(&prepared)?;
 
+        let cache_control = crate::usage::anthropic_cache_control(&self.base_url, &request.model);
         let api_request = ApiChatRequest {
+            cache_control,
             model: request.model,
             messages,
             max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
@@ -694,6 +701,12 @@ impl crate::traits::Provider for AnthropicProvider {
             return Err(Self::api_error(response).await);
         }
 
+        let native_request_id = crate::usage::native_id(
+            response
+                .headers()
+                .get("request-id")
+                .and_then(|v| v.to_str().ok()),
+        );
         let byte_stream = crate::http::bounded_response_stream(
             response,
             crate::types::ProviderResponseLimits::default().max_transport_bytes,
@@ -703,6 +716,16 @@ impl crate::traits::Provider for AnthropicProvider {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
         tokio::spawn(async move {
+            if native_request_id.is_some()
+                && tx
+                    .send(Ok(StreamChunk::usage(
+                        TokenUsage::default().with_request_id(native_request_id.as_deref()),
+                    )))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
             use std::collections::{BTreeMap, HashMap, HashSet};
 
             let mut decoder = IncrementalLineDecoder::default();
@@ -750,6 +773,17 @@ impl crate::traits::Provider for AnthropicProvider {
 
                     match serde_json::from_str::<StreamEvent>(data) {
                         Ok(event) => {
+                            if let Some(id) = event.message.as_ref().and_then(|m| m.id.as_deref()) {
+                                if tx
+                                    .send(Ok(StreamChunk::usage(
+                                        TokenUsage::default().with_native_id(Some(id)),
+                                    )))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
                             for usage in event
                                 .message
                                 .as_ref()
@@ -1064,7 +1098,7 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
 #[cfg(test)]
 mod tests {
     #[test]
-    fn usage_normalization_requires_complete_separate_cache_counters() {
+    fn usage_normalization_preserves_input_without_optional_cache_counters() {
         let complete: super::ApiUsage = serde_json::from_value(serde_json::json!({
             "input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":20,"output_tokens":8
         })).unwrap();
@@ -1074,7 +1108,7 @@ mod tests {
             "input_tokens":10,"output_tokens":8
         }))
         .unwrap();
-        assert_eq!(missing.normalized().input_tokens, None);
+        assert_eq!(missing.normalized().input_tokens, Some(10));
         assert_eq!(missing.normalized().output_tokens, Some(8));
     }
 
@@ -1417,6 +1451,7 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ApiChatRequest {
+            cache_control: None,
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![ApiMessage {
                 role: "user".into(),
@@ -1448,6 +1483,7 @@ mod tests {
     #[test]
     fn api_request_serializes_stream_true() {
         let request = ApiChatRequest {
+            cache_control: None,
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![ApiMessage {
                 role: "user".into(),
@@ -1482,6 +1518,7 @@ mod tests {
         );
 
         let request = ApiChatRequest {
+            cache_control: None,
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![ApiMessage {
                 role: "user".into(),
@@ -1518,7 +1555,7 @@ mod tests {
             response.content[0].text.as_deref(),
             Some("Hello from Claude")
         );
-        let usage = response.usage.unwrap();
+        let usage = response.usage.unwrap().normalized();
         assert_eq!(usage.input_tokens, Some(10));
         assert_eq!(usage.output_tokens, Some(25));
     }

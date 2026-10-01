@@ -15898,6 +15898,7 @@ impl Provider for UsageToolProvider {
         response.usage = Some(pioneer_provider::TokenUsage {
             input_tokens: Some(12345),
             output_tokens: Some(12),
+            ..Default::default()
         });
         Ok(response)
     }

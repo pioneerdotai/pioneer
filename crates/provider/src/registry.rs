@@ -275,6 +275,16 @@ impl AuthorityBoundProvider {
 
 #[async_trait]
 impl Provider for AuthorityBoundProvider {
+    fn usage_api(&self) -> &'static str {
+        self.inner.usage_api()
+    }
+    fn usage_api_version(&self) -> Option<String> {
+        self.inner.usage_api_version()
+    }
+    fn usage_route(&self) -> Option<String> {
+        self.inner.usage_route()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -317,13 +327,17 @@ impl Provider for AuthorityBoundProvider {
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         self.ensure_not_revoked()?;
-        self.public_result(
+        let context = crate::usage::UsageContext::capture(self.inner.as_ref(), &request.model);
+        let mut response = self.public_result(
             crate::attachments::runtime::with_async_authority_scope(
                 self.authority_fingerprint.as_str().to_owned(),
                 self.inner.chat(request),
             )
             .await,
-        )
+        )?;
+        let usage = response.usage.get_or_insert_with(Default::default);
+        context.enrich(usage);
+        Ok(response)
     }
 
     async fn stream_chat(
@@ -331,6 +345,7 @@ impl Provider for AuthorityBoundProvider {
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
         self.ensure_not_revoked()?;
+        let context = crate::usage::UsageContext::capture(self.inner.as_ref(), &request.model);
         let stream = self.public_result(
             crate::attachments::runtime::with_async_authority_scope(
                 self.authority_fingerprint.as_str().to_owned(),
@@ -338,16 +353,28 @@ impl Provider for AuthorityBoundProvider {
             )
             .await,
         )?;
-        if self.redact_endpoint_errors {
-            let inner = self.inner.clone();
-            Ok(Box::pin(stream.map(move |result| {
+        let inner = self.inner.clone();
+        let redact = self.redact_endpoint_errors;
+        let mut accumulated = crate::TokenUsage::default();
+        Ok(Box::pin(stream.map(move |result| {
+            let result = if redact {
                 result.map_err(|error| {
                     redacted_endpoint_error(inner.as_ref(), error, ProviderFailureStage::MidStream)
                 })
-            })))
-        } else {
-            Ok(stream)
-        }
+            } else {
+                result
+            };
+            result.map(|mut chunk| {
+                if let Some(snapshot) = &chunk.usage {
+                    accumulated.update(snapshot);
+                }
+                if chunk.usage.is_some() || chunk.is_final {
+                    context.enrich(&mut accumulated);
+                    chunk.usage = Some(accumulated.clone());
+                }
+                chunk
+            })
+        })))
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
