@@ -25,3 +25,4 @@ tracing.workspace = true
 pioneer-migration.workspace = true
 pioneer-entity.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+tempfile.workspace = true
