@@ -1187,7 +1187,7 @@ async fn migrate_fixture(
 
 #[tokio::test]
 async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_event_index() {
-    use pioneer_migration::SchemaManager;
+    use migration::SchemaManager;
     for compressed in [false, true] {
         if compressed {
             pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
