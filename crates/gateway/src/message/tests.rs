@@ -77114,3 +77114,6 @@ fn provider_replay_is_fenced_after_retryable_recovery_start_error() {
         assert!(saved_turn.error.is_none());
     });
 }
+
+#[path = "tests_task_delivery_cancellation.rs"]
+mod task_delivery_cancellation;

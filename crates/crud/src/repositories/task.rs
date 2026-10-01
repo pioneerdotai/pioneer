@@ -469,3 +469,33 @@ fn active_model_from_task(task_model: &Task) -> Result<task::ActiveModel> {
         completed_at: Set(task_model.completed_at.map(unix_to_datetime)),
     })
 }
+
+// Delivery writer preflight needs ownership, not the Task's potentially large
+// goal/result/error payloads or accumulated run history.
+#[derive(Clone, Debug, PartialEq, Eq, sea_orm::FromQueryResult)]
+pub(crate) struct TaskDeliveryTaskFacts {
+    pub id: String,
+    pub workspace_id: String,
+    pub executor_kind: String,
+    pub owner_kind: String,
+    pub owner_id: Option<String>,
+}
+
+pub(crate) async fn find_delivery_task_facts<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+) -> Result<Option<TaskDeliveryTaskFacts>> {
+    task::Entity::find_by_id(id.to_owned())
+        .select_only()
+        .columns([
+            task::Column::Id,
+            task::Column::WorkspaceId,
+            task::Column::ExecutorKind,
+            task::Column::OwnerKind,
+            task::Column::OwnerId,
+        ])
+        .into_model::<TaskDeliveryTaskFacts>()
+        .one(db)
+        .await
+        .context("failed to read Task delivery ownership facts")
+}

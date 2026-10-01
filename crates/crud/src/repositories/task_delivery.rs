@@ -29,12 +29,15 @@ pub struct PreparedTaskDeliveryProjection {
     active_model: task_delivery::ActiveModel,
     result_snapshot_json: Option<String>,
     error_snapshot_json: Option<String>,
+    persisted: Option<task_delivery::Model>,
 }
 
 #[derive(Clone, Debug)]
 pub struct PreparedTaskDeliveryAttemptProjection {
     attempt: TaskDeliveryAttempt,
     active_model: task_delivery_attempt::ActiveModel,
+    persisted: Option<task_delivery_attempt::Model>,
+    insert_new: bool,
 }
 
 pub fn prepare_delivery_projection(
@@ -51,6 +54,7 @@ pub fn prepare_delivery_projection(
         ),
         result_snapshot_json,
         error_snapshot_json,
+        persisted: None,
     })
 }
 
@@ -60,6 +64,8 @@ pub fn prepare_attempt_projection(
     PreparedTaskDeliveryAttemptProjection {
         attempt: attempt.clone(),
         active_model: active_model_from_attempt(attempt),
+        persisted: None,
+        insert_new: false,
     }
 }
 
@@ -68,18 +74,22 @@ pub async fn upsert_prepared_delivery<C: ConnectionTrait>(
     prepared: PreparedTaskDeliveryProjection,
 ) -> Result<()> {
     let delivery = &prepared.delivery;
-    task_delivery::Entity::insert(prepared.active_model)
-        .on_conflict(
-            OnConflict::column(task_delivery::Column::Id)
-                .do_nothing()
-                .to_owned(),
-        )
-        .exec_without_returning(db)
-        .await
-        .context("failed to insert task delivery")?;
-    let persisted = find_delivery_by_id(db, &delivery.id)
-        .await?
-        .context("task delivery disappeared after insert")?;
+    let persisted = if let Some(persisted) = prepared.persisted {
+        persisted
+    } else {
+        task_delivery::Entity::insert(prepared.active_model)
+            .on_conflict(
+                OnConflict::column(task_delivery::Column::Id)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_without_returning(db)
+            .await
+            .context("failed to insert task delivery")?;
+        find_delivery_by_id(db, &delivery.id)
+            .await?
+            .context("task delivery disappeared after insert")?
+    };
     validate_delivery_update(
         &persisted,
         delivery,
@@ -156,20 +166,39 @@ pub async fn upsert_prepared_attempt<C: ConnectionTrait>(
     prepared: PreparedTaskDeliveryAttemptProjection,
 ) -> Result<()> {
     let attempt = &prepared.attempt;
-    task_delivery_attempt::Entity::insert(prepared.active_model)
-        .on_conflict(
-            OnConflict::column(task_delivery_attempt::Column::Id)
-                .do_nothing()
-                .to_owned(),
-        )
-        .exec_without_returning(db)
-        .await
-        .context("failed to insert task delivery attempt")?;
-    let persisted = task_delivery_attempt::Entity::find_by_id(attempt.id.clone())
-        .one(db)
-        .await
-        .context("failed to reload task delivery attempt")?
-        .context("task delivery attempt disappeared after insert")?;
+    if prepared.insert_new {
+        validate_attempt_fields(attempt)?;
+        if attempt.status != TaskDeliveryAttemptStatus::Started {
+            bail!("new delivery attempt is not started");
+        }
+        // The lifecycle preflight proved absence of the next exact number.
+        // Plain INSERT preserves id/number collision errors, so no post-insert
+        // SELECT or no-op UPSERT is necessary on this path.
+        task_delivery_attempt::Entity::insert(prepared.active_model)
+            .exec_without_returning(db)
+            .await
+            .context("failed to insert owned new task delivery attempt")?;
+        return Ok(());
+    }
+
+    let persisted = if let Some(persisted) = prepared.persisted {
+        persisted
+    } else {
+        task_delivery_attempt::Entity::insert(prepared.active_model)
+            .on_conflict(
+                OnConflict::column(task_delivery_attempt::Column::Id)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_without_returning(db)
+            .await
+            .context("failed to insert task delivery attempt")?;
+        task_delivery_attempt::Entity::find_by_id(attempt.id.clone())
+            .one(db)
+            .await
+            .context("failed to reload task delivery attempt")?
+            .context("task delivery attempt disappeared after insert")?
+    };
     validate_attempt_update(&persisted, attempt)?;
     let desired_status = task_delivery_attempt_status_to_db(attempt.status);
     if persisted.status != desired_status
@@ -215,7 +244,123 @@ pub async fn upsert_prepared_attempt<C: ConnectionTrait>(
     Ok(())
 }
 
-fn validate_delivery_update(
+// These cached rows are attached only after a point read in the same writer
+// transaction. General event ingestion continues to load and validate its own rows.
+impl PreparedTaskDeliveryProjection {
+    pub(crate) fn with_persisted(mut self, row: task_delivery::Model) -> Self {
+        self.persisted = Some(row);
+        self
+    }
+
+    pub(crate) fn validate_start_fields(&self) -> Result<()> {
+        // A terminal delivery at its budget still gets a writer preflight.
+        // Its prepared next number is never inserted: only an eligible Pending
+        // row with remaining budget can grant that number inside the writer.
+        if self.delivery.max_attempts == 0
+            || self.delivery.max_attempts > MAX_DELIVERY_ATTEMPTS
+            || self.delivery.attempt_count > self.delivery.max_attempts.saturating_add(1)
+        {
+            bail!("delivery start has an invalid attempt budget");
+        }
+        validate_delivery_receipt_fields(&self.delivery)
+    }
+
+    pub(crate) fn validate_fields(&self) -> Result<()> {
+        validate_delivery_fields(&self.delivery)
+    }
+
+    pub(crate) fn validate_identity(&self, row: &task_delivery::Model) -> Result<()> {
+        validate_delivery_identity(
+            row,
+            &self.delivery,
+            self.result_snapshot_json.as_deref(),
+            self.error_snapshot_json.as_deref(),
+        )
+    }
+}
+
+impl PreparedTaskDeliveryAttemptProjection {
+    pub(crate) fn with_new_attempt(mut self) -> Self {
+        self.insert_new = true;
+        self
+    }
+
+    pub(crate) fn validate_fields(&self) -> Result<()> {
+        validate_attempt_fields(&self.attempt)
+    }
+    pub(crate) fn with_persisted(mut self, row: task_delivery_attempt::Model) -> Self {
+        self.persisted = Some(row);
+        self
+    }
+}
+
+pub(crate) fn validate_durable_delivery(row: &task_delivery::Model) -> Result<()> {
+    if row.attempt_count < 0
+        || row.max_attempts <= 0
+        || row.max_attempts > i64::from(MAX_DELIVERY_ATTEMPTS)
+        || row.attempt_count > row.max_attempts
+    {
+        bail!("durable delivery has an invalid attempt budget");
+    }
+    let has_receipt = row.delivered_turn_id.is_some()
+        || row.delivered_notification_id.is_some()
+        || row.delivered_at.is_some();
+    let valid = match row.status.as_str() {
+        "pending" => {
+            row.next_attempt_at.is_some() && !has_receipt && row.attempt_count < row.max_attempts
+        }
+        "delivering" => row.attempt_count > 0 && row.next_attempt_at.is_none() && !has_receipt,
+        "cancelled" => row.next_attempt_at.is_none() && !has_receipt,
+        "failed" => {
+            row.attempt_count > 0
+                && row.next_attempt_at.is_none()
+                && !has_receipt
+                && row.last_error.is_some()
+        }
+        "delivered" => {
+            row.attempt_count > 0
+                && row.next_attempt_at.is_none()
+                && row.delivered_at.is_some()
+                && row.last_error.is_none()
+                && match row.mode.as_str() {
+                    "thread" => {
+                        row.delivered_turn_id.is_some() && row.delivered_notification_id.is_none()
+                    }
+                    "user_notification" => {
+                        row.delivered_turn_id.is_none() && row.delivered_notification_id.is_some()
+                    }
+                    "webhook" => {
+                        row.delivered_turn_id.is_none() && row.delivered_notification_id.is_none()
+                    }
+                    _ => false,
+                }
+        }
+        _ => false,
+    };
+    if !valid {
+        bail!("durable delivery has inconsistent lifecycle fields");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_durable_attempt(row: &task_delivery_attempt::Model) -> Result<()> {
+    if row.attempt_number <= 0
+        || row
+            .http_status
+            .is_some_and(|status| !(0..=i64::from(u16::MAX)).contains(&status))
+        || !match row.status.as_str() {
+            "started" => row.completed_at.is_none() && row.error.is_none(),
+            "delivered" => row.completed_at.is_some() && row.error.is_none(),
+            "failed" => row.completed_at.is_some() && row.error.is_some(),
+            _ => false,
+        }
+    {
+        bail!("durable delivery attempt has inconsistent lifecycle fields");
+    }
+    Ok(())
+}
+
+fn validate_delivery_identity(
     persisted: &task_delivery::Model,
     delivery: &TaskDelivery,
     result_snapshot_json: Option<&str>,
@@ -241,6 +386,59 @@ fn validate_delivery_update(
     if !immutable_matches {
         bail!("task delivery attempts to rewrite immutable destination/result facts");
     }
+    Ok(())
+}
+
+pub(crate) fn validate_attempt_identity(
+    persisted: &task_delivery_attempt::Model,
+    attempt: &TaskDeliveryAttempt,
+) -> Result<()> {
+    if persisted.id != attempt.id
+        || persisted.delivery_id != attempt.delivery_id
+        || persisted.attempt_number != i64::from(attempt.attempt_number)
+        || persisted.started_at.timestamp() != attempt.started_at
+        || attempt.attempt_number == 0
+    {
+        bail!("task delivery attempt rewrites immutable ownership facts");
+    }
+    Ok(())
+}
+
+pub(crate) async fn find_attempt_by_id<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+) -> Result<Option<task_delivery_attempt::Model>> {
+    task_delivery_attempt::Entity::find_by_id(id.to_owned())
+        .one(db)
+        .await
+        .context("failed to query task delivery attempt by id")
+}
+
+pub(crate) async fn find_attempt_by_number<C: ConnectionTrait>(
+    db: &C,
+    delivery_id: &str,
+    number: u32,
+) -> Result<Option<task_delivery_attempt::Model>> {
+    task_delivery_attempt::Entity::find()
+        .filter(task_delivery_attempt::Column::DeliveryId.eq(delivery_id.to_owned()))
+        .filter(task_delivery_attempt::Column::AttemptNumber.eq(i64::from(number)))
+        .one(db)
+        .await
+        .context("failed to query exact task delivery attempt")
+}
+
+fn validate_delivery_update(
+    persisted: &task_delivery::Model,
+    delivery: &TaskDelivery,
+    result_snapshot_json: Option<&str>,
+    error_snapshot_json: Option<&str>,
+) -> Result<()> {
+    validate_delivery_identity(
+        persisted,
+        delivery,
+        result_snapshot_json,
+        error_snapshot_json,
+    )?;
     if delivery.max_attempts == 0
         || delivery.max_attempts > MAX_DELIVERY_ATTEMPTS
         || delivery.attempt_count > delivery.max_attempts
@@ -296,6 +494,20 @@ fn validate_delivery_update(
             bail!("task delivery attempts to rewrite a committed attempt/terminal state");
         }
     }
+    validate_delivery_fields(delivery)
+}
+
+fn validate_delivery_fields(delivery: &TaskDelivery) -> Result<()> {
+    if delivery.max_attempts == 0
+        || delivery.max_attempts > MAX_DELIVERY_ATTEMPTS
+        || delivery.attempt_count > delivery.max_attempts
+    {
+        bail!("task delivery has an invalid attempt bound");
+    }
+    validate_delivery_receipt_fields(delivery)
+}
+
+fn validate_delivery_receipt_fields(delivery: &TaskDelivery) -> Result<()> {
     match delivery.status {
         TaskDeliveryStatus::Pending => {
             if delivery.next_attempt_at.is_none()
@@ -397,6 +609,13 @@ fn validate_attempt_update(
         if !exact {
             bail!("task delivery attempt rewrites terminal receipt facts");
         }
+    }
+    validate_attempt_fields(attempt)
+}
+
+fn validate_attempt_fields(attempt: &TaskDeliveryAttempt) -> Result<()> {
+    if attempt.attempt_number == 0 {
+        bail!("task delivery attempt number is zero");
     }
     match attempt.status {
         TaskDeliveryAttemptStatus::Started => {
