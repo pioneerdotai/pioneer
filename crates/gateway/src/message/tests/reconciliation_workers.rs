@@ -131,6 +131,7 @@ async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
 #[tokio::test]
 async fn real_complete_reconciliation_results_recover_only_their_reporter() {
     let (processor, _, _, _, _, _) = setup_workspace_message_processor().await;
+    let processor = Arc::new(processor);
     let background = processor.for_background_reconciliation();
     let mut finalization = Reporter::new(Operation::NativeFinalization);
     let mut occurrence = Reporter::new(Operation::TaskRunOccurrence);
@@ -181,6 +182,7 @@ async fn real_complete_reconciliation_results_recover_only_their_reporter() {
 async fn partial_durable_progress_followed_by_real_error_does_not_recover() {
     let (processor, store, workspace_id) =
         setup_execution_window_terminal_turn("diagnostic_thread", "diagnostic_turn").await;
+    let processor = Arc::new(processor);
     store
         .prepare_turn_finalization(
             &ItemCompletedNotification {
