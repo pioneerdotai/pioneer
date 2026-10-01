@@ -1,3 +1,4 @@
+use crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget;
 use crate::thread_episodic_embedding::{
     LocalEmbeddingProvider, RemoteEmbeddingProvider, local_embedding_model_files,
 };
@@ -1834,8 +1835,7 @@ impl ThreadEpisodicRecallService {
         &self,
         workspace_id: &str,
         config: &ThreadEpisodicRecallServiceConfig,
-    ) -> crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget
-    {
+    ) -> ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget {
         let vector_search =
             self.vector_search_config_for_workspace(workspace_id, &config.vector_search);
         crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
