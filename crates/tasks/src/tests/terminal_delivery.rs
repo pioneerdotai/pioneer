@@ -1,7 +1,7 @@
 use super::*;
 use pioneer_crud::{TaskTerminalCommitStatus, TaskTerminalConflict};
 use pioneer_protocol::{TaskDelivery, TaskDeliveryAttempt, TaskDeliveryAttemptStatus};
-use sea_orm::{ColumnTrait, QueryFilter};
+use sea_orm::{ColumnTrait, QueryFilter, TransactionTrait};
 
 async fn fixture_with_runtime(
     runtime: TaskRuntime,

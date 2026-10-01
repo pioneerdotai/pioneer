@@ -594,7 +594,7 @@ pub(crate) async fn finalize_task_occurrence<C: ConnectionTrait>(
         .await?
         .context("terminal Task run has no occurrence")?;
     let mut candidate = persisted.clone();
-    candidate.status = status;
+    candidate.status = status.clone();
     candidate.terminal_reason = reason.clone();
     validate_occurrence_update(&persisted, &candidate)?;
     if persisted.status == status && persisted.terminal_reason == reason {

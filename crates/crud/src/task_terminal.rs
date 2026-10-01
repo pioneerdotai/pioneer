@@ -21,7 +21,7 @@ use pioneer_protocol::{
     TaskOccurrenceStatus, TaskRescheduleReason, TaskResult, TaskRetryBackoffKind, TaskRun,
     TaskRunExecutionStatus, TaskRunStatus, TaskWriteLockStatus, generate_id,
 };
-use sea_orm::ConnectionTrait;
+use sea_orm::{ConnectionTrait, TransactionTrait};
 use sha2::{Digest, Sha256};
 
 const ID_LEN: usize = 21;
