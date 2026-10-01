@@ -50,8 +50,8 @@ pub trait Provider: Send + Sync {
     /// Returning `None` is always safe: unknown request rejections are not
     /// retried, while transport/HTTP transient failures are classified by the
     /// shared provider-neutral fallback before endpoint errors are redacted.
-    fn classify_failure(&self, _error: &anyhow::Error) -> Option<ProviderFailureClassification> {
-        None
+    fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
+        crate::failure::classify_stream_error(error)
     }
 
     /// Materialize and locally budget the media that this request will send.

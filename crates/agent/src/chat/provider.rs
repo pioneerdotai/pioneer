@@ -208,10 +208,6 @@ pub(super) async fn request_agent_round(
                         model_name.as_str(),
                     );
                 }
-                if chunk.is_final {
-                    termination = chunk.termination;
-                    break;
-                }
 
                 validate_stream_append_limits(
                     &response_limits,
@@ -277,6 +273,10 @@ pub(super) async fn request_agent_round(
                         ProviderTransportKind::Stream,
                         error,
                     ));
+                }
+                if chunk.is_final {
+                    termination = chunk.termination;
+                    break;
                 }
             }
 
@@ -497,10 +497,6 @@ pub(super) async fn stream_provider_response(
                     model_name.as_str(),
                 );
             }
-            if is_final {
-                termination = chunk_termination;
-                break;
-            }
 
             let target = response_stream_target(message_started, thinking_item_id, message_item_id);
             validate_stream_append_limits(
@@ -629,6 +625,10 @@ pub(super) async fn stream_provider_response(
                     ProviderTransportKind::Stream,
                     error,
                 ));
+            }
+            if is_final {
+                termination = chunk_termination;
+                break;
             }
         }
 
@@ -2073,5 +2073,129 @@ fn observe_startup_chunk(turn_id: &str, chunk: &pioneer_provider::StreamChunk) {
     };
     if let Some(output) = output {
         turn_startup::runtime_output(turn_id, output);
+    }
+}
+
+#[cfg(test)]
+mod terminal_boundary_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FixtureProvider {
+        chunks: Vec<StreamChunk>,
+        fail: bool,
+        attempts: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Provider for FixtureProvider {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+        fn capabilities(&self) -> pioneer_provider::ProviderCapabilities {
+            pioneer_provider::ProviderCapabilities {
+                streaming: true,
+                ..Default::default()
+            }
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            anyhow::bail!("unexpected fallback/retry")
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            let mut chunks = self.chunks.iter().cloned().map(Ok).collect::<Vec<_>>();
+            if self.fail {
+                chunks.push(Err(
+                    pioneer_provider::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker
+                        .into(),
+                ));
+            }
+            Ok(Box::pin(futures_util::stream::iter(chunks)))
+        }
+    }
+    fn request() -> ChatRequest {
+        ChatRequest {
+            model: "fixture".into(),
+            messages: vec![pioneer_provider::ChatMessage::user("fixture")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        }
+    }
+    #[tokio::test]
+    async fn failed_partial_call_never_becomes_executable_round_or_automatic_retry() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn Provider> = Arc::new(FixtureProvider {
+            chunks: vec![StreamChunk::tool_calls(vec![ProviderToolCall {
+                id: "call".into(),
+                name: "write_file".into(),
+                arguments: "{}".into(),
+            }])],
+            fail: true,
+            attempts: attempts.clone(),
+        });
+        let hub = AgentEventHub::new();
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        let acknowledgement = tokio::spawn(async move {
+            let event = receiver.recv().await.unwrap();
+            let AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } = event else {
+                panic!("expected failed observation")
+            };
+            let envelope: pioneer_provider::CanonicalProviderRoundEnvelope =
+                serde_json::from_value(payload).unwrap();
+            assert_eq!(envelope.termination, ProviderTermination::ProviderError);
+            assert!(
+                envelope.calls.is_empty(),
+                "failed observations must not retain executable identities"
+            );
+            receiver.acknowledge_last(Ok(()));
+        });
+        let result = request_agent_round(
+            &provider,
+            request(),
+            "ws",
+            "thread",
+            "turn",
+            "item",
+            false,
+            ProviderTimeoutPolicy::default(),
+            &hub,
+        )
+        .await;
+        assert!(matches!(result, Err(ChatTurnError::ProviderFailure { .. })));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        acknowledgement.await.unwrap();
+    }
+    #[tokio::test]
+    async fn final_chunk_payload_is_accumulated_before_terminal_validation() {
+        let mut terminal = StreamChunk::final_chunk_with(ProviderTermination::Complete);
+        terminal.delta = "terminal text".into();
+        let provider: Arc<dyn Provider> = Arc::new(FixtureProvider {
+            chunks: vec![terminal],
+            fail: false,
+            attempts: Arc::new(AtomicUsize::new(0)),
+        });
+        let result = request_agent_round(
+            &provider,
+            request(),
+            "ws",
+            "thread",
+            "turn",
+            "item",
+            false,
+            ProviderTimeoutPolicy::default(),
+            &AgentEventHub::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.text, "terminal text");
     }
 }

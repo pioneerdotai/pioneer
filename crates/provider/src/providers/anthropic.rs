@@ -3,7 +3,7 @@ use crate::attachments::{
     ensure_no_unrendered_attachments, prepare_messages_for_provider_async,
 };
 use crate::reasoning_registry;
-use crate::tools::stream::{IncrementalLineDecoder, sse_data};
+use crate::tools::stream::IncrementalSseDecoder;
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
     ProviderInputCapabilities, ProviderReplayState, ProviderTermination, ProviderTimeoutPolicy,
@@ -191,6 +191,14 @@ struct StreamEvent {
     /// Present on `content_block_start` events — carries the block type.
     #[serde(default)]
     content_block: Option<StreamContentBlock>,
+    #[serde(default)]
+    error: Option<StreamNativeError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamNativeError {
+    #[serde(default, rename = "type")]
+    error_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,6 +229,8 @@ struct StreamDelta {
 struct StreamContentBlock {
     #[serde(rename = "type")]
     block_type: String,
+    #[serde(default)]
+    text: Option<String>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -487,7 +497,7 @@ struct PendingToolUse {
 impl PendingToolUse {
     fn finalize(self) -> Result<ProviderToolCall> {
         let value = serde_json::from_str::<serde_json::Value>(self.arguments.as_str())
-            .map_err(|error| anyhow!("Anthropic tool call contains invalid arguments: {error}"))?;
+            .map_err(|_| anyhow!("Anthropic tool call contains invalid arguments"))?;
         let arguments = serde_json::to_string(&value)?;
 
         Ok(ProviderToolCall {
@@ -495,6 +505,384 @@ impl PendingToolUse {
             name: self.name,
             arguments,
         })
+    }
+}
+
+// The same decoder is used by HTTP transport and in-memory regression fixtures.
+impl AnthropicProvider {
+    pub(super) fn decode_stream(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
+
+        tokio::spawn(async move {
+            use std::collections::{BTreeMap, HashMap, HashSet};
+
+            let mut decoder = IncrementalSseDecoder::default();
+            let mut termination = None;
+            let mut message_started = false;
+            let mut active_blocks = HashSet::new();
+            let mut thinking_blocks = HashSet::new();
+            let mut replay_thinking_blocks: BTreeMap<usize, ApiMessageContentBlock> =
+                BTreeMap::new();
+            let mut pending_tool_uses: HashMap<usize, PendingToolUse> = HashMap::new();
+
+            tokio::pin!(byte_stream);
+
+            while let Some(result) = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = byte_stream.next() => result,
+            } {
+                let bytes = match result {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        if tx.send(Err(anyhow!(e))).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+
+                let lines = match decoder.push(bytes.as_ref()) {
+                    Ok(lines) => lines,
+                    Err(error) => {
+                        if tx.send(Err(error)).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+                for frame in lines {
+                    let data = frame.data.as_str();
+
+                    match serde_json::from_str::<StreamEvent>(data) {
+                        Ok(event) => {
+                            if event.event_type == "error"
+                                || frame.event.as_deref() == Some("error")
+                            {
+                                let error = crate::failure::AnthropicStreamError::from_type(
+                                    event
+                                        .error
+                                        .as_ref()
+                                        .and_then(|error| error.error_type.as_deref()),
+                                );
+                                let _ = tx.send(Err(error.into())).await;
+                                return;
+                            }
+
+                            if event.event_type == "message_start" {
+                                if message_started {
+                                    let _ = tx
+                                        .send(Err(anyhow!("duplicate Anthropic message_start")))
+                                        .await;
+                                    return;
+                                }
+                                message_started = true;
+                            }
+                            if matches!(
+                                event.event_type.as_str(),
+                                "content_block_start"
+                                    | "content_block_delta"
+                                    | "content_block_stop"
+                            ) {
+                                let Some(index) = event.index else {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "Anthropic block event is missing its index"
+                                        )))
+                                        .await;
+                                    return;
+                                };
+                                let valid = message_started
+                                    && match event.event_type.as_str() {
+                                        "content_block_start" => active_blocks.insert(index),
+                                        "content_block_stop" => active_blocks.remove(&index),
+                                        _ => active_blocks.contains(&index),
+                                    };
+                                if !valid {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "invalid Anthropic content block lifecycle"
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                            }
+                            for usage in event
+                                .message
+                                .as_ref()
+                                .and_then(|m| m.usage.as_ref())
+                                .into_iter()
+                                .chain(event.usage.as_ref())
+                            {
+                                if tx
+                                    .send(Ok(StreamChunk::usage(usage.normalized())))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            if event.event_type == "message_stop" {
+                                if !message_started || !active_blocks.is_empty() {
+                                    let _ = tx.send(Err(crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into())).await;
+                                    return;
+                                }
+
+                                let remaining_calls = pending_tool_uses
+                                    .drain()
+                                    .map(|(_, call)| call.finalize())
+                                    .collect::<Result<Vec<_>>>();
+                                let remaining_calls = match remaining_calls {
+                                    Ok(calls) => calls,
+                                    Err(error) => {
+                                        if tx.send(Err(error)).await.is_err() {
+                                            return;
+                                        }
+                                        return;
+                                    }
+                                };
+                                if !remaining_calls.is_empty() {
+                                    if tx
+                                        .send(Ok(StreamChunk::tool_calls(remaining_calls)))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                if !replay_thinking_blocks.is_empty() {
+                                    let blocks =
+                                        replay_thinking_blocks.into_values().collect::<Vec<_>>();
+                                    if tx
+                                        .send(Ok(StreamChunk::provider_replay_state(
+                                            ProviderReplayState::new(
+                                                "anthropic",
+                                                serde_json::json!({ "blocks": blocks }),
+                                            ),
+                                        )))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                if tx
+                                    .send(Ok(StreamChunk::final_chunk_with(
+                                        termination.take().unwrap_or_else(|| {
+                                            ProviderTermination::Unknown(
+                                                "missing_stop_reason".to_owned(),
+                                            )
+                                        }),
+                                    )))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                return;
+                            }
+
+                            if event.event_type == "message_delta" {
+                                if let Some(reason) =
+                                    event.delta.and_then(|delta| delta.stop_reason)
+                                {
+                                    termination =
+                                        Some(ProviderTermination::from_openai_reason(&reason));
+                                }
+                                continue;
+                            }
+
+                            if event.event_type == "content_block_start" {
+                                let index = event.index.unwrap_or(0);
+                                if let Some(block) = event.content_block.as_ref() {
+                                    match block.block_type.as_str() {
+                                        "text" => {
+                                            if let Some(text) =
+                                                block.text.as_ref().filter(|text| !text.is_empty())
+                                            {
+                                                if tx
+                                                    .send(Ok(StreamChunk::delta(text.clone())))
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        "thinking" => {
+                                            if let Some(thinking) = block
+                                                .thinking
+                                                .as_ref()
+                                                .filter(|thinking| !thinking.is_empty())
+                                            {
+                                                if tx
+                                                    .send(Ok(StreamChunk::reasoning(
+                                                        thinking.clone(),
+                                                    )))
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    return;
+                                                }
+                                            }
+                                            thinking_blocks.insert(index);
+                                            replay_thinking_blocks.insert(
+                                                index,
+                                                ApiMessageContentBlock::Thinking {
+                                                    thinking: block
+                                                        .thinking
+                                                        .clone()
+                                                        .unwrap_or_default(),
+                                                    signature: block
+                                                        .signature
+                                                        .clone()
+                                                        .unwrap_or_default(),
+                                                },
+                                            );
+                                        }
+                                        "redacted_thinking" => {
+                                            thinking_blocks.remove(&index);
+                                            if let Some(data) = block.data.clone() {
+                                                replay_thinking_blocks.insert(
+                                                    index,
+                                                    ApiMessageContentBlock::RedactedThinking {
+                                                        data,
+                                                    },
+                                                );
+                                            }
+                                        }
+                                        "tool_use" => {
+                                            thinking_blocks.remove(&index);
+                                            if let (Some(id), Some(name)) =
+                                                (block.id.as_ref(), block.name.as_ref())
+                                            {
+                                                pending_tool_uses.insert(
+                                                    index,
+                                                    PendingToolUse {
+                                                        id: id.clone(),
+                                                        name: name.clone(),
+                                                        arguments: block
+                                                            .input
+                                                            .as_ref()
+                                                            .map(|input| {
+                                                                serde_json::to_string(&input)
+                                                                    .unwrap_or_else(|_| {
+                                                                        "{}".to_owned()
+                                                                    })
+                                                            })
+                                                            .unwrap_or_default(),
+                                                        has_partial_json: false,
+                                                    },
+                                                );
+                                            }
+                                        }
+                                        _ => {
+                                            thinking_blocks.remove(&index);
+                                        }
+                                    }
+                                }
+                            }
+
+                            if event.event_type == "content_block_stop" {
+                                let index = event.index.unwrap_or(0);
+                                thinking_blocks.remove(&index);
+                                if let Some(call) = pending_tool_uses.remove(&index) {
+                                    match call.finalize() {
+                                        Ok(call) => {
+                                            if tx
+                                                .send(Ok(StreamChunk::tool_calls(vec![call])))
+                                                .await
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
+                                        }
+                                        Err(error) => {
+                                            if tx.send(Err(error)).await.is_err() {
+                                                return;
+                                            }
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if event.event_type == "content_block_delta" {
+                                if let Some(delta) = event.delta {
+                                    let index = event.index.unwrap_or(0);
+                                    // Thinking block deltas use the `thinking` field
+                                    if thinking_blocks.contains(&index) {
+                                        if let Some(thinking) = delta.thinking {
+                                            if !thinking.is_empty() {
+                                                if let Some(ApiMessageContentBlock::Thinking {
+                                                    thinking: replay_thinking,
+                                                    ..
+                                                }) = replay_thinking_blocks.get_mut(&index)
+                                                {
+                                                    replay_thinking.push_str(&thinking);
+                                                }
+                                                if tx
+                                                    .send(Ok(StreamChunk::reasoning(thinking)))
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        if let Some(signature) = delta.signature
+                                            && let Some(ApiMessageContentBlock::Thinking {
+                                                signature: replay_signature,
+                                                ..
+                                            }) = replay_thinking_blocks.get_mut(&index)
+                                        {
+                                            replay_signature.push_str(&signature);
+                                        }
+                                    } else if let Some(partial_json) = delta.partial_json {
+                                        if let Some(call) = pending_tool_uses.get_mut(&index) {
+                                            if !call.has_partial_json {
+                                                call.arguments.clear();
+                                                call.has_partial_json = true;
+                                            }
+                                            call.arguments.push_str(partial_json.as_str());
+                                        }
+                                    } else if let Some(text) = delta.text {
+                                        if !text.is_empty() {
+                                            if tx.send(Ok(StreamChunk::delta(text))).await.is_err()
+                                            {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            if tx
+                                .send(Err(anyhow!("malformed Anthropic SSE frame")))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let error = decoder.finish().err().unwrap_or_else(|| {
+                crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into()
+            });
+            if tx.send(Err(error)).await.is_err() {
+                return;
+            }
+        });
+
+        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Box::pin(chunk_stream)
     }
 }
 
@@ -700,298 +1088,7 @@ impl crate::traits::Provider for AnthropicProvider {
             "provider_stream",
         );
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
-
-        tokio::spawn(async move {
-            use std::collections::{BTreeMap, HashMap, HashSet};
-
-            let mut decoder = IncrementalLineDecoder::default();
-            let mut termination = None;
-            let mut thinking_blocks = HashSet::new();
-            let mut replay_thinking_blocks: BTreeMap<usize, ApiMessageContentBlock> =
-                BTreeMap::new();
-            let mut pending_tool_uses: HashMap<usize, PendingToolUse> = HashMap::new();
-
-            tokio::pin!(byte_stream);
-
-            while let Some(result) = tokio::select! {
-                biased;
-                _ = tx.closed() => return,
-                result = byte_stream.next() => result,
-            } {
-                let bytes = match result {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        if tx.send(Err(anyhow!(e))).await.is_err() {
-                            return;
-                        }
-                        return;
-                    }
-                };
-
-                let lines = match decoder.push(bytes.as_ref()) {
-                    Ok(lines) => lines,
-                    Err(error) => {
-                        if tx.send(Err(error)).await.is_err() {
-                            return;
-                        }
-                        return;
-                    }
-                };
-                for line in lines {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    let Some(data) = sse_data(line) else {
-                        continue;
-                    };
-
-                    match serde_json::from_str::<StreamEvent>(data) {
-                        Ok(event) => {
-                            for usage in event
-                                .message
-                                .as_ref()
-                                .and_then(|m| m.usage.as_ref())
-                                .into_iter()
-                                .chain(event.usage.as_ref())
-                            {
-                                if tx
-                                    .send(Ok(StreamChunk::usage(usage.normalized())))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            if event.event_type == "message_stop" {
-                                let remaining_calls = pending_tool_uses
-                                    .drain()
-                                    .map(|(_, call)| call.finalize())
-                                    .collect::<Result<Vec<_>>>();
-                                let remaining_calls = match remaining_calls {
-                                    Ok(calls) => calls,
-                                    Err(error) => {
-                                        if tx.send(Err(error)).await.is_err() {
-                                            return;
-                                        }
-                                        return;
-                                    }
-                                };
-                                if !remaining_calls.is_empty() {
-                                    if tx
-                                        .send(Ok(StreamChunk::tool_calls(remaining_calls)))
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
-                                }
-                                if !replay_thinking_blocks.is_empty() {
-                                    let blocks =
-                                        replay_thinking_blocks.into_values().collect::<Vec<_>>();
-                                    if tx
-                                        .send(Ok(StreamChunk::provider_replay_state(
-                                            ProviderReplayState::new(
-                                                "anthropic",
-                                                serde_json::json!({ "blocks": blocks }),
-                                            ),
-                                        )))
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
-                                }
-                                if tx
-                                    .send(Ok(StreamChunk::final_chunk_with(
-                                        termination.take().unwrap_or_else(|| {
-                                            ProviderTermination::Unknown(
-                                                "missing_stop_reason".to_owned(),
-                                            )
-                                        }),
-                                    )))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                return;
-                            }
-
-                            if event.event_type == "message_delta" {
-                                if let Some(reason) =
-                                    event.delta.and_then(|delta| delta.stop_reason)
-                                {
-                                    termination =
-                                        Some(ProviderTermination::from_openai_reason(&reason));
-                                }
-                                continue;
-                            }
-
-                            if event.event_type == "content_block_start" {
-                                let index = event.index.unwrap_or(0);
-                                if let Some(block) = event.content_block.as_ref() {
-                                    match block.block_type.as_str() {
-                                        "thinking" => {
-                                            thinking_blocks.insert(index);
-                                            replay_thinking_blocks.insert(
-                                                index,
-                                                ApiMessageContentBlock::Thinking {
-                                                    thinking: block
-                                                        .thinking
-                                                        .clone()
-                                                        .unwrap_or_default(),
-                                                    signature: block
-                                                        .signature
-                                                        .clone()
-                                                        .unwrap_or_default(),
-                                                },
-                                            );
-                                        }
-                                        "redacted_thinking" => {
-                                            thinking_blocks.remove(&index);
-                                            if let Some(data) = block.data.clone() {
-                                                replay_thinking_blocks.insert(
-                                                    index,
-                                                    ApiMessageContentBlock::RedactedThinking {
-                                                        data,
-                                                    },
-                                                );
-                                            }
-                                        }
-                                        "tool_use" => {
-                                            thinking_blocks.remove(&index);
-                                            if let (Some(id), Some(name)) =
-                                                (block.id.as_ref(), block.name.as_ref())
-                                            {
-                                                pending_tool_uses.insert(
-                                                    index,
-                                                    PendingToolUse {
-                                                        id: id.clone(),
-                                                        name: name.clone(),
-                                                        arguments: block
-                                                            .input
-                                                            .as_ref()
-                                                            .map(|input| {
-                                                                serde_json::to_string(&input)
-                                                                    .unwrap_or_else(|_| {
-                                                                        "{}".to_owned()
-                                                                    })
-                                                            })
-                                                            .unwrap_or_default(),
-                                                        has_partial_json: false,
-                                                    },
-                                                );
-                                            }
-                                        }
-                                        _ => {
-                                            thinking_blocks.remove(&index);
-                                        }
-                                    }
-                                }
-                            }
-
-                            if event.event_type == "content_block_stop" {
-                                let index = event.index.unwrap_or(0);
-                                thinking_blocks.remove(&index);
-                                if let Some(call) = pending_tool_uses.remove(&index) {
-                                    match call.finalize() {
-                                        Ok(call) => {
-                                            if tx
-                                                .send(Ok(StreamChunk::tool_calls(vec![call])))
-                                                .await
-                                                .is_err()
-                                            {
-                                                return;
-                                            }
-                                        }
-                                        Err(error) => {
-                                            if tx.send(Err(error)).await.is_err() {
-                                                return;
-                                            }
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-
-                            if event.event_type == "content_block_delta" {
-                                if let Some(delta) = event.delta {
-                                    let index = event.index.unwrap_or(0);
-                                    // Thinking block deltas use the `thinking` field
-                                    if thinking_blocks.contains(&index) {
-                                        if let Some(thinking) = delta.thinking {
-                                            if !thinking.is_empty() {
-                                                if let Some(ApiMessageContentBlock::Thinking {
-                                                    thinking: replay_thinking,
-                                                    ..
-                                                }) = replay_thinking_blocks.get_mut(&index)
-                                                {
-                                                    replay_thinking.push_str(&thinking);
-                                                }
-                                                if tx
-                                                    .send(Ok(StreamChunk::reasoning(thinking)))
-                                                    .await
-                                                    .is_err()
-                                                {
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                        if let Some(signature) = delta.signature
-                                            && let Some(ApiMessageContentBlock::Thinking {
-                                                signature: replay_signature,
-                                                ..
-                                            }) = replay_thinking_blocks.get_mut(&index)
-                                        {
-                                            replay_signature.push_str(&signature);
-                                        }
-                                    } else if let Some(partial_json) = delta.partial_json {
-                                        if let Some(call) = pending_tool_uses.get_mut(&index) {
-                                            if !call.has_partial_json {
-                                                call.arguments.clear();
-                                                call.has_partial_json = true;
-                                            }
-                                            call.arguments.push_str(partial_json.as_str());
-                                        }
-                                    } else if let Some(text) = delta.text {
-                                        if !text.is_empty() {
-                                            if tx.send(Ok(StreamChunk::delta(text))).await.is_err()
-                                            {
-                                                return;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            if tx
-                                .send(Err(anyhow!("malformed Anthropic SSE frame: {e}")))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                            return;
-                        }
-                    }
-                }
-            }
-
-            let error = decoder
-                .finish()
-                .err()
-                .unwrap_or_else(|| anyhow!("Anthropic stream ended before message_stop"));
-            if tx.send(Err(error)).await.is_err() {
-                return;
-            }
-        });
-
-        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(Box::pin(chunk_stream))
+        Ok(Self::decode_stream(byte_stream))
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {

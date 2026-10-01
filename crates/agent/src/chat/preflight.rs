@@ -855,6 +855,7 @@ async fn request_turn_preflight_provider_json(
             )
         })?;
         let mut text = String::new();
+        let mut completed = false;
         while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
             let chunk = chunk.map_err(|error| {
                 let failure_stage = if text.is_empty() {
@@ -895,8 +896,38 @@ async fn request_turn_preflight_provider_json(
             }
             text.push_str(chunk.delta.as_str());
             if chunk.is_final {
+                validate_preflight_completion(
+                    chunk.termination.as_ref(),
+                    !chunk.tool_calls.is_empty(),
+                )
+                .map_err(|error| {
+                    TurnPreflightProviderRequestFailure::response_validation(
+                        "stream_completion_validation",
+                        error,
+                        text.as_str(),
+                    )
+                })?;
+                completed = true;
                 break;
             }
+            if !chunk.tool_calls.is_empty() {
+                return Err(TurnPreflightProviderRequestFailure::response_validation(
+                    "stream_completion_validation",
+                    anyhow::anyhow!("preflight returned unexpected tool calls"),
+                    text.as_str(),
+                )
+                .into());
+            }
+        }
+        if !completed {
+            return Err(TurnPreflightProviderRequestFailure::provider_error(
+                provider,
+                "stream_completion_validation",
+                ProviderFailureStage::Finalize,
+                pioneer_provider::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker,
+            )
+            .with_response_prefix(text.as_str())
+            .into());
         }
         return Ok(text);
     }
@@ -909,6 +940,14 @@ async fn request_turn_preflight_provider_json(
             error,
         )
     })?;
+    validate_preflight_completion(Some(&response.termination), !response.tool_calls.is_empty())
+        .map_err(|error| {
+            TurnPreflightProviderRequestFailure::response_validation(
+                "non_stream_completion_validation",
+                error,
+                response.text.as_str(),
+            )
+        })?;
     limits.validate_chat_response(&response).map_err(|error| {
         TurnPreflightProviderRequestFailure::response_validation(
             "non_stream_response_validation",
@@ -4395,4 +4434,38 @@ fn load_test_catalog() {
         std::fs::write(directory.path().join("catalog.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
         pioneer_provider::catalog::runtime::restore_cached_catalog(directory.path()).unwrap();
     });
+}
+
+fn validate_preflight_completion(
+    termination: Option<&pioneer_provider::ProviderTermination>,
+    has_tools: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !has_tools
+            && matches!(
+                termination,
+                Some(pioneer_provider::ProviderTermination::Complete)
+            ),
+        "preflight provider response did not complete successfully"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod streaming_completion_tests {
+    use super::validate_preflight_completion;
+    use pioneer_provider::ProviderTermination;
+    #[test]
+    fn partial_eof_length_error_and_unexpected_tools_cannot_supply_a_preflight_plan() {
+        for termination in [
+            None,
+            Some(ProviderTermination::Length),
+            Some(ProviderTermination::ProviderError),
+            Some(ProviderTermination::Cancelled),
+        ] {
+            assert!(validate_preflight_completion(termination.as_ref(), false).is_err());
+        }
+        assert!(validate_preflight_completion(Some(&ProviderTermination::Complete), true).is_err());
+        assert!(validate_preflight_completion(Some(&ProviderTermination::Complete), false).is_ok());
+    }
 }
