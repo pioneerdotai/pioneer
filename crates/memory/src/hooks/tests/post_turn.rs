@@ -1974,3 +1974,27 @@ async fn post_turn_extractor_suppresses_implicit_when_proactive_disabled() {
                 .contains("validation_rejected=1")
     }));
 }
+
+#[test]
+fn post_turn_shared_format_validator_matches_typed_parser_and_redacts_values() {
+    let config = MemoryPostTurnExtractorConfig::default();
+    for raw in [
+        r#"{"facts":[]}"#.to_owned(),
+        r#"{}"#.to_owned(), // Preserve the existing default for omitted facts.
+        valid_post_turn_extractor_json(),
+        r#"{"facts":"PRIVATE_PARSE_CANARY"}"#.to_owned(),
+        r#"{"facts":PRIVATE_PARSE_CANARY}"#.to_owned(),
+    ] {
+        let format = validate_memory_post_turn_response_format(&raw);
+        let parsed = parse_memory_post_turn_extractor_json(&raw, &config);
+        assert_eq!(format.is_ok(), parsed.is_ok());
+        if let Err(error) = format {
+            assert!(!format!("{error:?} {error}").contains("PRIVATE_PARSE_CANARY"));
+            assert!(matches!(
+                error.category,
+                MemoryPostTurnResponseFormatCategory::Syntax
+                    | MemoryPostTurnResponseFormatCategory::Structure
+            ));
+        }
+    }
+}

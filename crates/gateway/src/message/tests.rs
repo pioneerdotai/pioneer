@@ -1,3 +1,6 @@
+#[path = "tests/memory_post_turn_response.rs"]
+mod memory_post_turn_response;
+
 #[path = "tests/task_capsule.rs"]
 mod task_capsule;
 

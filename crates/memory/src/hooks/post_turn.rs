@@ -232,12 +232,72 @@ pub(super) struct MemoryPostTurnExtractedFactJson {
     evidence: MemoryWriteEvidence,
 }
 
+/// Safe parse diagnostics: never retain serde's message, which may quote response values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryPostTurnResponseFormatError {
+    pub category: MemoryPostTurnResponseFormatCategory,
+    pub line: usize,
+    pub column: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryPostTurnResponseFormatCategory {
+    Syntax,
+    Structure,
+    Eof,
+    Io,
+}
+
+impl MemoryPostTurnResponseFormatCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Syntax => "syntax",
+            Self::Structure => "structure",
+            Self::Eof => "eof",
+            Self::Io => "io",
+        }
+    }
+}
+
+impl fmt::Display for MemoryPostTurnResponseFormatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "category={} line={} column={}",
+            self.category.as_str(),
+            self.line,
+            self.column
+        )
+    }
+}
+
+fn decode_memory_post_turn_response(
+    raw: &str,
+) -> Result<MemoryPostTurnExtractorJson, MemoryPostTurnResponseFormatError> {
+    serde_json::from_str(raw.trim()).map_err(|error| MemoryPostTurnResponseFormatError {
+        category: match error.classify() {
+            serde_json::error::Category::Syntax => MemoryPostTurnResponseFormatCategory::Syntax,
+            serde_json::error::Category::Data => MemoryPostTurnResponseFormatCategory::Structure,
+            serde_json::error::Category::Eof => MemoryPostTurnResponseFormatCategory::Eof,
+            serde_json::error::Category::Io => MemoryPostTurnResponseFormatCategory::Io,
+        },
+        line: error.line(),
+        column: error.column(),
+    })
+}
+
+/// Uses exactly the handler's typed schema; candidate policy remains a later step.
+pub fn validate_memory_post_turn_response_format(
+    raw: &str,
+) -> Result<(), MemoryPostTurnResponseFormatError> {
+    decode_memory_post_turn_response(raw).map(|_| ())
+}
+
 pub(super) fn parse_memory_post_turn_extractor_json(
     raw: &str,
     config: &MemoryPostTurnExtractorConfig,
-) -> Result<MemoryPostTurnParsedFacts, String> {
-    let parsed = serde_json::from_str::<MemoryPostTurnExtractorJson>(raw.trim())
-        .map_err(|error| error.to_string())?;
+) -> Result<MemoryPostTurnParsedFacts, MemoryPostTurnResponseFormatError> {
+    let parsed = decode_memory_post_turn_response(raw)?;
     let raw_fact_count = parsed.facts.len();
     let mut validation_rejected_count = 0;
     let mut diagnostics = Vec::new();

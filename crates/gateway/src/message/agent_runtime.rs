@@ -5702,7 +5702,7 @@ impl MessageProcessor {
                                 elapsed: Some(effect_started.elapsed()),
                             },
                         );
-                        let (code, message, retryable, root_error) = match outcome {
+                        let (code, mut message, retryable, root_error) = match outcome {
                             Ok(Err(error)) => {
                                 let root_error = error.root_hook_error().cloned();
                                 let message = root_error
@@ -5740,6 +5740,11 @@ impl MessageProcessor {
                             let failure_stage = root_error.as_ref().and_then(|error| {
                                 hook_error_metadata_text(error, "failure_stage")
                             });
+                            let termination = root_error.as_ref().and_then(|error| hook_error_metadata_text(error, "termination"));
+                            let parse_category = root_error.as_ref().and_then(|error| hook_error_metadata_text(error, "parse_category"));
+                            let parse_line = root_error.as_ref().and_then(|error| hook_error_metadata_i64(error, "parse_line"));
+                            let parse_column = root_error.as_ref().and_then(|error| hook_error_metadata_i64(error, "parse_column"));
+                            let response_bytes = root_error.as_ref().and_then(|error| hook_error_metadata_i64(error, "response_bytes"));
                             let http_status = root_error.as_ref().and_then(|error| {
                                 hook_error_metadata_i64(error, "http_status")
                             });
@@ -5753,6 +5758,11 @@ impl MessageProcessor {
                                     failure_class = failure_class.unwrap_or("unknown"),
                                     failure_stage = failure_stage.unwrap_or("unknown"),
                                     http_status = ?http_status,
+                                    termination = ?termination,
+                                    parse_category = ?parse_category,
+                                    parse_line = ?parse_line,
+                                    parse_column = ?parse_column,
+                                    response_bytes = ?response_bytes,
                                     retryable,
                                     attempt_count = record.attempt_count,
                                     max_attempts = record.max_attempts,
@@ -5769,12 +5779,29 @@ impl MessageProcessor {
                                     failure_class = failure_class.unwrap_or("unknown"),
                                     failure_stage = failure_stage.unwrap_or("unknown"),
                                     http_status = ?http_status,
+                                    termination = ?termination,
+                                    parse_category = ?parse_category,
+                                    parse_line = ?parse_line,
+                                    parse_column = ?parse_column,
+                                    response_bytes = ?response_bytes,
                                     retryable,
                                     attempt_count = record.attempt_count,
                                     max_attempts = record.max_attempts,
                                     elapsed_ms = ?effect_started.elapsed().as_millis(),
                                     "memory post-turn extractor durable attempt will retry"
                                 );
+                            }
+                        }
+                        if is_memory_post_turn_extractor_effect {
+                            // The hook summary redacts/bounds its message separately.
+                            // Preserve known safe metadata in the existing durable error
+                            // message, without adding response values or a new DB protocol.
+                            if let Some(error) = root_error.as_ref() {
+                                for key in ["provider", "model", "failure_stage", "failure_class", "termination", "parse_category", "parse_line", "parse_column", "response_bytes"] {
+                                    if let Some(value) = hook_error_metadata_text(error, key) {
+                                        message.push_str(&format!("; {key}={value}"));
+                                    }
+                                }
                             }
                         }
                         let completed_at = chrono::Utc::now().timestamp();
