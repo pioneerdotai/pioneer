@@ -38,6 +38,7 @@ pub(crate) struct VoiceChunkIngestReport {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VoiceChunkIngestErrorKind {
+    StoreUnavailable,
     UnknownSession,
     DuplicateSession,
     StaleChunk,
@@ -54,7 +55,8 @@ pub(crate) struct VoiceChunkIngestError {
 impl VoiceChunkIngestError {
     pub(crate) fn into_voice_error(self) -> VoiceError {
         let (kind, public_code) = match self.kind {
-            VoiceChunkIngestErrorKind::UnknownSession
+            VoiceChunkIngestErrorKind::StoreUnavailable
+            | VoiceChunkIngestErrorKind::UnknownSession
             | VoiceChunkIngestErrorKind::DuplicateSession => (
                 VoiceErrorKind::InvalidSession,
                 pioneer_protocol::PublicErrorCode::InvalidInput,
@@ -72,11 +74,30 @@ impl VoiceChunkIngestError {
                 pioneer_protocol::PublicErrorCode::ResourceExhausted,
             ),
         };
-        let public_error = crate::public_error::map_agent_failure(
+        let public_error = crate::public_error::build_public_error(
             public_code,
             pioneer_protocol::PublicErrorStage::Admission,
-            self.message,
         );
+        match self.kind {
+            VoiceChunkIngestErrorKind::StoreUnavailable => {
+                crate::public_error::report_agent_failure(&public_error, self.message);
+            }
+            expected => {
+                let failure_class = match expected {
+                    VoiceChunkIngestErrorKind::UnknownSession => "unknown_session",
+                    VoiceChunkIngestErrorKind::DuplicateSession => "duplicate_session",
+                    VoiceChunkIngestErrorKind::StaleChunk => "stale_chunk",
+                    VoiceChunkIngestErrorKind::AudioFormatMismatch => "audio_format_mismatch",
+                    VoiceChunkIngestErrorKind::BufferLimitExceeded => "buffer_limit_exceeded",
+                    VoiceChunkIngestErrorKind::StoreUnavailable => unreachable!(),
+                };
+                crate::public_error::report_expected_failure(
+                    &public_error,
+                    "voice_chunk_ingest",
+                    failure_class,
+                );
+            }
+        }
         VoiceError {
             kind,
             message: public_error.message.clone(),
@@ -99,7 +120,7 @@ impl GatewayVoiceSessionBufferStore {
         let session_id = session_id.into();
         let mut sessions = self.sessions.lock().map_err(|_| {
             ingest_error(
-                VoiceChunkIngestErrorKind::UnknownSession,
+                VoiceChunkIngestErrorKind::StoreUnavailable,
                 "voice session buffer store is unavailable",
             )
         })?;
@@ -117,7 +138,7 @@ impl GatewayVoiceSessionBufferStore {
     pub(crate) fn remove_session(&self, session_id: &str) -> Result<(), VoiceChunkIngestError> {
         let mut sessions = self.sessions.lock().map_err(|_| {
             ingest_error(
-                VoiceChunkIngestErrorKind::UnknownSession,
+                VoiceChunkIngestErrorKind::StoreUnavailable,
                 "voice session buffer store is unavailable",
             )
         })?;
@@ -135,7 +156,7 @@ impl GatewayVoiceSessionBufferStore {
     ) -> Result<BufferedVoiceSessionAudio, VoiceChunkIngestError> {
         let mut sessions = self.sessions.lock().map_err(|_| {
             ingest_error(
-                VoiceChunkIngestErrorKind::UnknownSession,
+                VoiceChunkIngestErrorKind::StoreUnavailable,
                 "voice session buffer store is unavailable",
             )
         })?;
@@ -155,7 +176,7 @@ impl GatewayVoiceSessionBufferStore {
     ) -> Result<VoiceChunkIngestReport, VoiceChunkIngestError> {
         let mut sessions = self.sessions.lock().map_err(|_| {
             ingest_error(
-                VoiceChunkIngestErrorKind::UnknownSession,
+                VoiceChunkIngestErrorKind::StoreUnavailable,
                 "voice session buffer store is unavailable",
             )
         })?;
@@ -177,7 +198,7 @@ impl GatewayVoiceSessionBufferStore {
     ) -> Result<usize, VoiceChunkIngestError> {
         let sessions = self.sessions.lock().map_err(|_| {
             ingest_error(
-                VoiceChunkIngestErrorKind::UnknownSession,
+                VoiceChunkIngestErrorKind::StoreUnavailable,
                 "voice session buffer store is unavailable",
             )
         })?;
@@ -327,6 +348,42 @@ fn ingest_error(
 mod tests {
     use super::*;
     use pioneer_protocol::{VoiceAudioEncoding, VoiceAudioFormat};
+
+    #[test]
+    fn buffer_refusals_are_breadcrumbs_but_poisoned_store_is_an_error() {
+        use crate::public_error::test_support::*;
+        let store = GatewayVoiceSessionBufferStore::default();
+        let (error, events) = capture_events(|| {
+            store
+                .take_session_audio("missing_session")
+                .unwrap_err()
+                .into_voice_error()
+        });
+        assert!(events.is_empty());
+        assert_eq!(error.kind, VoiceErrorKind::InvalidSession);
+        assert_eq!(
+            error.public_error.unwrap().code,
+            pioneer_protocol::PublicErrorCode::InvalidInput
+        );
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = store.sessions.lock().unwrap();
+            panic!("poison test buffer store");
+        });
+        let (error, events) = capture_events(|| {
+            let failure = store.take_session_audio("missing_session").unwrap_err();
+            assert_eq!(failure.kind, VoiceChunkIngestErrorKind::StoreUnavailable);
+            failure.into_voice_error()
+        });
+        // Preserve the original public contract even though the internal cause
+        // now distinguishes infrastructure from a missing session.
+        assert_eq!(error.kind, VoiceErrorKind::InvalidSession);
+        assert_eq!(
+            error.public_error.as_ref().unwrap().code,
+            pioneer_protocol::PublicErrorCode::InvalidInput
+        );
+        assert_eq!(events.len(), 1);
+        assert_correlated(&events[0], error.public_error.as_ref().unwrap());
+    }
 
     #[test]
     fn active_session_buffers_ordered_chunks() {
