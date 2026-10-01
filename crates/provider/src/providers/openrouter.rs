@@ -1,3 +1,4 @@
+use super::embedding::{ApiEmbeddingData, ApiEmbeddingUsage, ordered_vectors, validate_input};
 use crate::failure::ProviderStreamIncomplete;
 use crate::{
     attachments::{
@@ -228,12 +229,8 @@ struct ApiEmbeddingRequest {
 #[derive(Debug, Deserialize)]
 struct ApiEmbeddingResponse {
     data: Vec<ApiEmbeddingData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApiEmbeddingData {
-    embedding: Vec<f32>,
-    index: usize,
+    #[serde(default)]
+    usage: Option<ApiEmbeddingUsage>,
 }
 
 // ── SSE streaming response types ────────────────────────────────────────────
@@ -1569,6 +1566,7 @@ impl crate::traits::Provider for OpenRouterProvider {
     }
 
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+        validate_input(&request.model, &request.input)?;
         let expected_count = request.input.len();
         let api_request = ApiEmbeddingRequest {
             model: request.model,
@@ -1590,24 +1588,15 @@ impl crate::traits::Provider for OpenRouterProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let mut data = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
+        let response = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
             response,
             Default::default(),
             "provider_response",
         )
-        .await?
-        .data;
-        data.sort_by_key(|item| item.index);
-        if data.len() != expected_count {
-            return Err(anyhow!(
-                "OpenRouter embedding response returned {} embeddings for {} inputs",
-                data.len(),
-                expected_count
-            ));
-        }
-
+        .await?;
         Ok(EmbeddingResponse {
-            embeddings: data.into_iter().map(|item| item.embedding).collect(),
+            embeddings: ordered_vectors(response.data, expected_count)?,
+            usage: response.usage.map(Into::into),
         })
     }
 }
@@ -1726,6 +1715,47 @@ fn openrouter_reasoning_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedding_wire_contract_has_actual_endpoint_model_input_encoding_and_usage() {
+        let provider = OpenRouterProvider::new("fixture-key");
+        assert_eq!(
+            provider.embeddings_url(),
+            "https://openrouter.ai/api/v1/embeddings"
+        );
+        let input = vec!["first".to_owned(), "second".to_owned()];
+        let body = ApiEmbeddingRequest {
+            model: "openai/text-embedding-3-small".to_owned(),
+            input: input.clone(),
+            encoding_format: "float",
+        };
+        assert_eq!(
+            serde_json::to_value(body).unwrap(),
+            serde_json::json!({
+                "model": "openai/text-embedding-3-small", "input": input, "encoding_format": "float"
+            })
+        );
+        let response: ApiEmbeddingResponse = serde_json::from_value(serde_json::json!({
+            "data": [{"index":1,"embedding":[2.0]},{"index":0,"embedding":[1.0]}],
+            "usage": {"prompt_tokens":7,"total_tokens":7}
+        }))
+        .unwrap();
+        assert_eq!(
+            ordered_vectors(response.data, 2).unwrap(),
+            vec![vec![1.0], vec![2.0]]
+        );
+        let usage: crate::types::TokenUsage = response.usage.unwrap().into();
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(0));
+        for bad in [serde_json::json!(-1), serde_json::json!(0.5)] {
+            assert!(
+                serde_json::from_value::<ApiEmbeddingResponse>(serde_json::json!({
+                    "data":[{"index":bad,"embedding":[1.0]}]
+                }))
+                .is_err()
+            );
+        }
+    }
     use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
     use crate::providers::OpenAiCompatibleProvider;
     use crate::traits::Provider;

@@ -366,9 +366,30 @@ impl MessageProcessor {
         .await;
 
         let pipeline_outcome = self.finalize_voice_session_audio(&session).await;
-        let _ = self
+        // Claim the terminal outcome atomically against cancel/disconnect. The
+        // native call cannot be interrupted, but a removed session must never
+        // materialize its late transcript as a user turn or emit a second result.
+        match self
             .voice_sessions
-            .remove_authenticated_session(session.session_id.as_str(), &owner);
+            .claim_finalized_authenticated_session(session.session_id.as_str(), &owner)
+        {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                self.send_voice_session_result_notification(
+                    connection_id,
+                    session.thread_id.as_str(),
+                    VoiceSessionResultNotification {
+                        session_id: session.session_id.clone(),
+                        outcome: VoiceSessionOutcome::Failed,
+                        turn_id: Some(session.turn_id.clone()),
+                        error: Some(error.into_voice_error()),
+                    },
+                )
+                .await;
+                return;
+            }
+        }
 
         match pipeline_outcome {
             Ok(GatewayVoiceSessionPipelineOutcome::Transcript {
