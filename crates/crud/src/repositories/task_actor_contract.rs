@@ -612,6 +612,59 @@ fn validate_occurrence_update(
     Ok(())
 }
 
+/// Finalize only mutable occurrence fields; never reserialize/rewrite its
+/// frozen routing capsule inside the terminal writer transaction.
+pub(crate) async fn finalize_task_occurrence<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+    status: TaskOccurrenceStatus,
+    reason: Option<String>,
+    now: sea_orm::entity::prelude::DateTimeWithTimeZone,
+) -> Result<()> {
+    let persisted = find_task_occurrence_by_run_id(db, run_id)
+        .await?
+        .context("terminal Task run has no occurrence")?;
+    let mut candidate = persisted.clone();
+    candidate.status = status.clone();
+    candidate.terminal_reason = reason.clone();
+    validate_occurrence_update(&persisted, &candidate)?;
+    if persisted.status == status && persisted.terminal_reason == reason {
+        return Ok(());
+    }
+    let update = task_occurrence_contract::Entity::update_many()
+        .filter(task_occurrence_contract::Column::OccurrenceId.eq(persisted.occurrence_id))
+        .filter(task_occurrence_contract::Column::RunId.eq(run_id.to_owned()))
+        .filter(
+            task_occurrence_contract::Column::ExecutionGeneration
+                .eq(i64::try_from(persisted.execution_generation)?),
+        )
+        .filter(
+            task_occurrence_contract::Column::RetryAttempt.eq(i64::from(persisted.retry_attempt)),
+        )
+        .filter(
+            task_occurrence_contract::Column::Status
+                .eq(task_occurrence_status_to_db(&persisted.status)),
+        )
+        .col_expr(
+            task_occurrence_contract::Column::Status,
+            Expr::value(task_occurrence_status_to_db(&status)),
+        )
+        .col_expr(
+            task_occurrence_contract::Column::TerminalReason,
+            Expr::value(reason),
+        )
+        .col_expr(
+            task_occurrence_contract::Column::UpdatedAt,
+            Expr::cust_with_values("MAX(updated_at, ?)", [now]),
+        )
+        .exec(db)
+        .await?;
+    if update.rows_affected != 1 {
+        bail!("terminal Task occurrence changed during finalization");
+    }
+    Ok(())
+}
+
 pub(crate) const fn is_terminal_task_occurrence_status(status: &TaskOccurrenceStatus) -> bool {
     matches!(
         status,
@@ -826,6 +879,21 @@ pub(crate) fn prepare_task_delivery_authority(
         now: unix_to_datetime(now),
         persisted: None,
     })
+}
+
+pub(crate) async fn validate_delivery_authority_replay<C: ConnectionTrait>(
+    db: &C,
+    prepared: &PreparedTaskDeliveryAuthority,
+) -> Result<()> {
+    let persisted = task_delivery_authority::Entity::find_by_id(prepared.delivery_id.clone())
+        .one(db)
+        .await?
+        .context("terminal delivery has no durable authority")?;
+    validate_delivery_authority_identity(&persisted, prepared)?;
+    if persisted.status != prepared.status {
+        bail!("task delivery authority differs from committed delivery status");
+    }
+    Ok(())
 }
 
 impl PreparedTaskDeliveryAuthority {

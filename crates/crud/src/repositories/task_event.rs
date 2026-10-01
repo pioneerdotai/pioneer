@@ -382,7 +382,7 @@ fn appended_task_event_from_known_payload(
     }
 }
 
-async fn find_event_by_idempotency_key<C: ConnectionTrait>(
+pub(crate) async fn find_event_by_idempotency_key<C: ConnectionTrait>(
     db: &C,
     task_id: &str,
     idempotency_key: &str,
@@ -500,6 +500,25 @@ fn terminal_outcome(payload: &TaskEventPayload) -> Option<TerminalOutcome> {
         }
         _ => None,
     }
+}
+
+pub(crate) async fn find_queued_delivery_for_run<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+) -> Result<Option<task_event::Model>> {
+    let mut rows = task_event::Entity::find()
+        .filter(task_event::Column::RunId.eq(run_id.to_owned()))
+        .filter(
+            task_event::Column::EventType
+                .eq(pioneer_protocol::constants::events::TASK_DELIVERY_QUEUED),
+        )
+        .limit(2)
+        .all(db)
+        .await?;
+    if rows.len() > 1 {
+        anyhow::bail!("terminal Task run has multiple queued deliveries");
+    }
+    Ok(rows.pop())
 }
 
 pub async fn list_events_for_task<C: ConnectionTrait>(

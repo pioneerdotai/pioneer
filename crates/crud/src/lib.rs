@@ -9,9 +9,14 @@ mod projector;
 mod repositories;
 mod task_delivery_lifecycle;
 mod task_events;
+mod task_terminal;
 #[cfg(any(test, feature = "test-support"))]
 pub use task_delivery_lifecycle::TaskDeliveryCommitTestKind;
 pub use task_delivery_lifecycle::{TaskDeliveryTransition, TaskDeliveryTransitionOutcome};
+pub use task_terminal::{
+    PreparedTaskTerminalTransition, TaskTerminalCommitOutcome, TaskTerminalCommitStatus,
+    TaskTerminalConflict,
+};
 mod task_projector;
 mod thread_episodic;
 mod timeline_live_projection;

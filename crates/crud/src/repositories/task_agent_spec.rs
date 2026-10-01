@@ -68,6 +68,27 @@ pub async fn find_latest_agent_spec_by_task<C: ConnectionTrait>(
         .context("failed to query latest task agent spec")
 }
 
+/// Matches the executor's historical selection: latest per-run spec first,
+/// otherwise the latest default spec, ordered by creation rather than updates.
+pub async fn find_terminal_agent_spec<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+    run_id: &str,
+) -> Result<Option<task_agent_spec::Model>> {
+    task_agent_spec::Entity::find()
+        .filter(task_agent_spec::Column::TaskId.eq(task_id.to_owned()))
+        .filter(
+            sea_orm::Condition::any()
+                .add(task_agent_spec::Column::RunId.eq(run_id.to_owned()))
+                .add(task_agent_spec::Column::RunId.is_null()),
+        )
+        .order_by_desc(task_agent_spec::Column::RunId)
+        .order_by_desc(task_agent_spec::Column::CreatedAt)
+        .one(db)
+        .await
+        .context("failed to query terminal task agent spec")
+}
+
 pub async fn find_agent_spec_by_run<C: ConnectionTrait>(
     db: &C,
     run_id: &str,
