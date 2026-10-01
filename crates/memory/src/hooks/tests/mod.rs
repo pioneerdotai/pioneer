@@ -636,6 +636,7 @@ struct TestMemoryWriteProvider {
     write_params: Arc<Mutex<Vec<MemorySemanticWriteParams>>>,
     write_contexts: Arc<Mutex<Vec<MemoryTurnContext>>>,
     response: Option<MemorySemanticWriteResponse>,
+    failures: Mutex<std::collections::VecDeque<Option<crate::MemoryWriteFailure>>>,
 }
 
 impl TestMemoryWriteProvider {
@@ -683,7 +684,7 @@ impl AgentMemoryWriteProvider for TestMemoryWriteProvider {
         &self,
         context: MemoryTurnContext,
         params: MemorySemanticWriteParams,
-    ) -> Result<MemorySemanticWriteResponse, String> {
+    ) -> Result<MemorySemanticWriteResponse, crate::MemoryWriteFailure> {
         *self.write_calls.lock().expect("write call lock poisoned") += 1;
         self.write_contexts
             .lock()
@@ -693,6 +694,9 @@ impl AgentMemoryWriteProvider for TestMemoryWriteProvider {
             .lock()
             .expect("write params lock poisoned")
             .push(params);
+        if let Some(Some(failure)) = self.failures.lock().expect("failure sequence lock").pop_front() {
+            return Err(failure);
+        }
         Ok(self
             .response
             .clone()

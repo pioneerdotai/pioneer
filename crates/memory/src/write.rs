@@ -43,6 +43,16 @@ pub(crate) fn prepare_semantic_write(
     })
 }
 
+/// Pure semantic identity validation shared by extraction and canonical key construction.
+/// Uses exactly the key normalizer, including punctuation-only and Unicode inputs.
+pub(crate) fn validate_memory_semantic_identity(
+    semantic: &MemorySemanticFields,
+) -> std::result::Result<(), &'static str> {
+    semantic_subject_key(semantic)?;
+    attribute_key(semantic)?;
+    Ok(())
+}
+
 pub fn build_memory_canonical_key(
     scope: &MemoryScope,
     semantic: &MemorySemanticFields,
@@ -50,7 +60,7 @@ pub fn build_memory_canonical_key(
     let category = semantic.category;
     let category_label = category_key(category);
     let subject_label = subject_key(scope, semantic)?;
-    let attribute_label = attribute_key(semantic)?;
+    let attribute_label = attribute_key(semantic).map_err(|reason| anyhow::anyhow!(reason))?;
     let cardinality = attribute_cardinality(category, semantic.attribute);
     let scope_label = scope_key(scope, semantic.scope_hint);
 
@@ -257,31 +267,50 @@ fn scope_key(scope: &MemoryScope, hint: MemoryScopeHint) -> String {
     }
 }
 
-fn subject_key(scope: &MemoryScope, semantic: &MemorySemanticFields) -> Result<String> {
+fn required_key_component(
+    value: Option<&str>,
+    reason: &'static str,
+) -> std::result::Result<String, &'static str> {
+    value
+        .map(normalize_key_component)
+        .filter(|value| !value.is_empty())
+        .ok_or(reason)
+}
+
+/// Workspace identity is resolved from scope, not from extractor subject_key.
+fn semantic_subject_key(
+    semantic: &MemorySemanticFields,
+) -> std::result::Result<Option<String>, &'static str> {
     let subject = match semantic.subject {
-        MemorySubject::CurrentUser | MemorySubject::CurrentAgent => "self".to_owned(),
-        MemorySubject::Workspace => normalize_key_component(&scope.key),
+        MemorySubject::CurrentUser | MemorySubject::CurrentAgent => Some("self".to_owned()),
+        MemorySubject::Workspace => None,
         MemorySubject::Project
         | MemorySubject::Person
         | MemorySubject::Organization
-        | MemorySubject::Artifact => semantic
-            .subject_key
-            .as_deref()
-            .map(normalize_key_component)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("semantic subject key is required"))?,
-        MemorySubject::Custom => semantic
-            .custom_subject
-            .as_deref()
-            .map(normalize_key_component)
-            .filter(|value| !value.is_empty())
-            .map(|value| format!("custom_{}", short_hash(value.as_str())))
-            .ok_or_else(|| anyhow::anyhow!("custom semantic subject is required"))?,
+        | MemorySubject::Artifact => Some(required_key_component(
+            semantic.subject_key.as_deref(),
+            "missing_subject_key",
+        )?),
+        MemorySubject::Custom => {
+            let value = required_key_component(
+                semantic.custom_subject.as_deref(),
+                "missing_custom_subject",
+            )?;
+            Some(format!("custom_{}", short_hash(value.as_str())))
+        }
     };
     Ok(subject)
 }
 
-fn attribute_key(semantic: &MemorySemanticFields) -> Result<String> {
+fn subject_key(scope: &MemoryScope, semantic: &MemorySemanticFields) -> Result<String> {
+    Ok(semantic_subject_key(semantic)
+        .map_err(|reason| anyhow::anyhow!(reason))?
+        .unwrap_or_else(|| normalize_key_component(&scope.key)))
+}
+
+fn attribute_key(
+    semantic: &MemorySemanticFields,
+) -> std::result::Result<String, &'static str> {
     let attribute = match semantic.attribute {
         MemoryAttribute::Name => "name".to_owned(),
         MemoryAttribute::Birthday => "birthday".to_owned(),
@@ -290,13 +319,13 @@ fn attribute_key(semantic: &MemorySemanticFields) -> Result<String> {
         MemoryAttribute::MigrationPolicy => "migration_file_policy".to_owned(),
         MemoryAttribute::ReviewStyle => "review_style".to_owned(),
         MemoryAttribute::PhaseNaming => "phase_naming".to_owned(),
-        MemoryAttribute::Custom => semantic
-            .custom_attribute
-            .as_deref()
-            .map(normalize_key_component)
-            .filter(|value| !value.is_empty())
-            .map(|value| format!("custom_{}", short_hash(value.as_str())))
-            .ok_or_else(|| anyhow::anyhow!("custom semantic attribute is required"))?,
+        MemoryAttribute::Custom => {
+            let value = required_key_component(
+                semantic.custom_attribute.as_deref(),
+                "missing_custom_attribute",
+            )?;
+            format!("custom_{}", short_hash(value.as_str()))
+        }
     };
     Ok(attribute)
 }

@@ -507,13 +507,14 @@ impl MemoryService {
         let now = context.now_or(current_unix());
         let content = params.content.trim().to_owned();
         if content.is_empty() {
-            bail!("semantic memory content cannot be empty");
+            return Err(crate::MemoryWriteFailure::InvalidInput.into());
         }
         if params.evidence.is_none() {
-            bail!("semantic memory write requires evidence");
+            return Err(crate::MemoryWriteFailure::InvalidInput.into());
         }
         let value = params.value.as_deref().unwrap_or(content.as_str());
-        let prepared = prepare_semantic_write(&params.scope, &params.semantic, value)?;
+        let prepared = prepare_semantic_write(&params.scope, &params.semantic, value)
+            .map_err(|_| crate::MemoryWriteFailure::InvalidInput)?;
         let disposition = params
             .disposition
             .unwrap_or(MemorySemanticWriteDisposition::RouteToCandidatePolicy);
@@ -524,7 +525,8 @@ impl MemoryService {
             &params.scope,
             provenance.source_thread_id.as_deref(),
             sensitivity,
-        )?;
+        )
+        .map_err(|_| crate::MemoryWriteFailure::AuthorizationOrDomain)?;
         let resolved_scope = self
             .store
             .resolve_memory_scope(params.scope.clone())
@@ -535,7 +537,8 @@ impl MemoryService {
                     params.scope.kind, params.scope.key
                 )
             })?;
-        validate_memory_write_scope(&context, &resolved_scope)?;
+        validate_memory_write_scope(&context, &resolved_scope)
+            .map_err(|_| crate::MemoryWriteFailure::AuthorizationOrDomain)?;
         let mut base_metadata = params.metadata.clone();
         base_metadata.remove("target_memory_id");
         if let Some(target) = params.target_memory_id.as_ref() {
@@ -573,20 +576,18 @@ impl MemoryService {
                 .store
                 .get_agent_memory_record(target_id, false)
                 .await?
-                .context("memory correction target is unavailable")?;
+                .ok_or(crate::MemoryWriteFailure::AuthorizationOrDomain)?;
             if target.scope != params.scope
                 || !self.row_control_plane_visible(&target, &context, &[], now)
             {
-                bail!("memory correction target is unavailable in this scope");
+                return Err(crate::MemoryWriteFailure::AuthorizationOrDomain.into());
             }
             if linked
                 .iter()
                 .chain(canonical_record.iter())
                 .any(|row| row.id != target.id)
             {
-                bail!(
-                    "canonical identity already resolves to another active memory; resolve the conflict explicitly"
-                );
+                return Err(crate::MemoryWriteFailure::AuthorizationOrDomain.into());
             }
             Some(target)
         } else {
@@ -594,7 +595,7 @@ impl MemoryService {
         };
         if let Some(existing) = existing {
             if !self.row_control_plane_visible(&existing, &context, &[], now) {
-                bail!("semantic memory identity is unavailable in this execution");
+                return Err(crate::MemoryWriteFailure::AuthorizationOrDomain.into());
             }
             let existing_value = metadata_normalized_value(existing.metadata_json.as_deref())
                 .or_else(|| {
@@ -4744,6 +4745,28 @@ mod tests {
             importance: Some(0.7),
             metadata: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn partial_semantic_replay_preserves_identity_and_rejects_invalid_input() {
+        let (service, store) = test_service().await;
+        let context = duplicate_safe_context();
+        let valid = user_name_semantic_params();
+        let mut invalid = valid.clone();
+        invalid.semantic.attribute = MemoryAttribute::Custom;
+        invalid.semantic.custom_attribute = Some(" -- 🚀 ".into());
+        let first = service.write_semantic_memory(context.clone(), valid.clone()).await.unwrap();
+        let failure = service.write_semantic_memory(context.clone(), invalid.clone()).await.unwrap_err();
+        assert_eq!(failure.downcast_ref::<crate::MemoryWriteFailure>(), Some(&crate::MemoryWriteFailure::InvalidInput));
+        let replay = service.write_semantic_memory(context.clone(), valid.clone()).await.unwrap();
+        assert_eq!(replay.relation, MemoryWriteRelation::Duplicate);
+        assert_eq!(first.record.as_ref().unwrap().id, replay.record.as_ref().unwrap().id);
+        assert!(service.write_semantic_memory(context, invalid).await.is_err());
+        let records = store.list_agent_memory_records(AgentMemoryListFilter {
+            scopes: vec![valid.scope], statuses: vec![MemoryStatus::Active],
+            ..AgentMemoryListFilter::default()
+        }).await.unwrap();
+        assert_eq!(records.len(), 1);
     }
 
     #[tokio::test]
