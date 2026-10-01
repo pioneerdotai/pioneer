@@ -3129,9 +3129,9 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Barrier;
 
-    fn persistence_event_fields(
-        event: &sentry::protocol::Event<'static>,
-    ) -> &BTreeMap<String, serde_json::Value> {
+    fn persistence_event_fields<'a>(
+        event: &'a sentry::protocol::Event<'static>,
+    ) -> &'a BTreeMap<String, serde_json::Value> {
         let Some(sentry::protocol::Context::Other(fields)) =
             event.contexts.get("Rust Tracing Fields")
         else {
