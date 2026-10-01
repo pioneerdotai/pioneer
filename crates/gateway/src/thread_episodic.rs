@@ -1835,7 +1835,7 @@ impl ThreadEpisodicRecallService {
         workspace_id: &str,
         config: &ThreadEpisodicRecallServiceConfig,
     ) -> crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget
-    {
+{
         let vector_search =
             self.vector_search_config_for_workspace(workspace_id, &config.vector_search);
         crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
