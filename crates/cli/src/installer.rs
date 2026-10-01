@@ -1987,6 +1987,62 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn install_reports_preserve_transient_download_classification_after_output_failure() {
+        struct FailedWriter(std::io::ErrorKind);
+
+        impl std::io::Write for FailedWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(self.0, "controlled report failure"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                panic!("report writer must not flush after a failed write");
+            }
+        }
+
+        for name in ["install", "update", "self-update"] {
+            let (options, _) = crate::parse_install_command_options(name, std::iter::empty())
+                .expect("install command options");
+            for kind in [
+                std::io::ErrorKind::BrokenPipe,
+                std::io::ErrorKind::PermissionDenied,
+            ] {
+                let original = anyhow::Error::new(super::InstallerTransientDownloadError {
+                    url: "https://example.invalid/asset".into(),
+                    attempts: 4,
+                    last_error: "connection timeout".into(),
+                })
+                .context("resolve install source");
+                let error = crate::finish_install_result(
+                    options.command,
+                    Err(original),
+                    true,
+                    &mut FailedWriter(kind),
+                )
+                .expect_err("transient installation failure remains a failed command");
+
+                assert!(is_transient_download_error(&error));
+                assert!(
+                    error
+                        .downcast_ref::<super::InstallerTransientDownloadError>()
+                        .is_some()
+                );
+                assert!(format!("{error:#}").contains("resolve install source"));
+                assert_eq!(
+                    crate::install_error_code(options.command, &format!("{error:#}")),
+                    "download_transient_network_failure"
+                );
+                assert_eq!(
+                    error
+                        .downcast_ref::<crate::InstallFailureReportError>()
+                        .is_some(),
+                    kind != std::io::ErrorKind::BrokenPipe
+                );
+            }
+        }
+    }
+
+    #[test]
     fn parses_prefixed_checksum_line() {
         let path = unique_temp_path("checksum-prefixed");
         fs::write(

@@ -894,6 +894,7 @@ mod tests {
                 task_id: "task_1".to_owned(),
                 run_id: "run_1".to_owned(),
                 error: Some(crate::TaskError {
+                    recovery_diagnostic: None,
                     code: "failed".to_owned(),
                     message: "failed".to_owned(),
                     class: TaskErrorClass::Internal,

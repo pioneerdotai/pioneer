@@ -5566,6 +5566,51 @@
         "cli_runtime"
       ]
     },
+    "ProviderFailureClass": {
+      "type": "string",
+      "enum": [
+        "network_transient",
+        "rate_limit",
+        "provider_5xx",
+        "auth_expired",
+        "auth_or_permission",
+        "model_not_found",
+        "prompt_too_long",
+        "context_too_large",
+        "max_output_tokens",
+        "stream_stall",
+        "stream_truncated",
+        "empty_response",
+        "provider_rejected",
+        "unsupported_parameter",
+        "unsupported_capability",
+        "unsupported_image_input",
+        "unsupported_tool_calling",
+        "unsupported_streaming",
+        "malformed_provider_request",
+        "invalid_request",
+        "permission_denied",
+        "unknown"
+      ]
+    },
+    "ProviderFailureStage": {
+      "type": "string",
+      "enum": [
+        "connect",
+        "first_chunk",
+        "mid_stream",
+        "finalize"
+      ]
+    },
+    "ProviderTransportKind": {
+      "type": "string",
+      "enum": [
+        "stream",
+        "non_stream",
+        "ws",
+        "sse"
+      ]
+    },
     "PublicError": {
       "description": "Stable, bounded failure presentation shared by RPC, voice and task\nexecution surfaces. Raw source chains are never part of this type.",
       "type": "object",
@@ -5711,6 +5756,32 @@
         "mark_failed"
       ]
     },
+    "RecoveryDiagnostic": {
+      "type": "object",
+      "properties": {
+        "lastFailure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecoveryProviderFailure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stopReason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecoveryStopReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "RecoveryJobStatus": {
       "type": "string",
       "enum": [
@@ -5781,6 +5852,53 @@
             "mode"
           ]
         }
+      ]
+    },
+    "RecoveryProviderFailure": {
+      "type": "object",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/ProviderFailureClass"
+        },
+        "httpStatus": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "retryAfterMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "stage": {
+          "$ref": "#/$defs/ProviderFailureStage"
+        },
+        "transport": {
+          "$ref": "#/$defs/ProviderTransportKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "class",
+        "stage",
+        "transport"
+      ]
+    },
+    "RecoveryStopReason": {
+      "type": "string",
+      "enum": [
+        "attempts_exhausted",
+        "wall_clock_exhausted",
+        "no_progress",
+        "policy_rejected",
+        "terminal_failure"
       ]
     },
     "RecoveryTrigger": {
@@ -7849,6 +7967,16 @@
         },
         "message": {
           "type": "string"
+        },
+        "recoveryDiagnostic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecoveryDiagnostic"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [

@@ -1311,19 +1311,19 @@ impl ConversationProjector {
     }
 
     fn should_suppress_turn_failure_system_event(&self, turn_id: &str, error: &str) -> bool {
-        is_recovery_failure_error(error)
-            && self.has_system_event_code(turn_id, "item_recovery_exhausted")
-    }
-
-    fn has_system_event_code(&self, turn_id: &str, code: &str) -> bool {
         self.view_state.items.iter().any(|item| {
             item.turn_id == turn_id
                 && matches!(
                     &item.item,
                     TurnItem::SystemEvent {
-                        code: Some(existing),
+                        code: Some(code),
+                        details,
                         ..
-                    } if existing == code
+                    } if code == "item_recovery_exhausted"
+                        && (is_recovery_failure_error(error)
+                            || details.as_ref()
+                                .and_then(|details| details.get("error_message"))
+                                .and_then(JsonValue::as_str) == Some(error))
                 )
         })
     }
@@ -1764,6 +1764,7 @@ fn merge_item_opaque_meta(existing: &mut Option<JsonValue>, incoming: Option<Jso
     *existing = Some(incoming);
 }
 
+// Legacy Turn errors wrapped the recovery message instead of matching it exactly.
 fn is_recovery_failure_error(error: &str) -> bool {
     error.starts_with("recovery failed for item `")
 }

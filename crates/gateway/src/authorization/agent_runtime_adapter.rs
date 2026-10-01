@@ -29,6 +29,8 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentToolAdapterError {
     InvalidInput(String),
+    /// JSON decoding failed before any launch or authorization checks.
+    InvalidArguments,
     Action(AgentActionServiceError),
     OptionsUnavailable,
 }
@@ -870,8 +872,7 @@ impl BoundAgentActionAdapter {
 fn decode<T: serde::de::DeserializeOwned>(
     arguments: serde_json::Value,
 ) -> Result<T, AgentToolAdapterError> {
-    serde_json::from_value(arguments)
-        .map_err(|error| AgentToolAdapterError::InvalidInput(error.to_string()))
+    serde_json::from_value(arguments).map_err(|_| AgentToolAdapterError::InvalidArguments)
 }
 
 fn validate_tool_launch(
@@ -1604,6 +1605,80 @@ mod tests {
                 "allowed-mcp",
             ));
         assert!(validate_tool_launch(&duplicate_mcp, &options).is_err());
+    }
+
+    #[test]
+    fn model_launch_restrictions_keep_their_public_meaning_before_any_intent_can_execute() {
+        let mut adapter = test_adapter();
+        let mut options = test_options(&mut adapter);
+        // Permit FullAccess in the profile to exercise the independent ceiling,
+        // rather than stopping at the profile's allowed-mode list.
+        options.profiles[0]
+            .allowed_permission_profiles
+            .push(TurnPermissionMode::FullAccess);
+        let mut permission = exact_tool_launch();
+        permission.permission_profile = Some(TurnPermissionProfileSelection {
+            mode: TurnPermissionMode::FullAccess,
+        });
+        let mut skill = exact_tool_launch();
+        skill.skill_ids = vec![SkillId::new("K99999999999999999999").unwrap()];
+        let mut mcp = exact_tool_launch();
+        mcp.mcp_server_ids = vec!["private-ungranted-mcp".into()];
+        let mut identity = exact_tool_launch();
+        identity.identity = AgentToolIdentityChoice::Exact {
+            id: AgentIdentityId::new("A99999999999999999999").unwrap(),
+        };
+        let mut profile = exact_tool_launch();
+        profile.profile = AgentToolProfileChoice::Exact(
+            pioneer_protocol::AgentExecutionProfileId::new("P99999999999999999999").unwrap(),
+        );
+        let current_target = adapter.current_target_option_id();
+        for (launch, target_option_id) in [
+            (permission, current_target.clone()),
+            (skill, current_target.clone()),
+            (mcp, current_target.clone()),
+            (identity, current_target.clone()),
+            (profile, current_target),
+            (exact_tool_launch(), "private-unavailable-target".into()),
+        ] {
+            let input = serde_json::to_value(AgentStartToolInput {
+                target_option_id,
+                input: AgentAuthoredInput::default(),
+                launch,
+            })
+            .unwrap();
+            let error = adapter
+                .intent_from_model_call(
+                    "restriction",
+                    AgentModelToolName::StartAgent,
+                    input,
+                    Some(&options),
+                )
+                .expect_err("no executable intent may be produced");
+            assert!(matches!(error, AgentToolAdapterError::InvalidInput(_)));
+            let public = crate::message::agent_action_tools::sanitize_agent_tool_error(
+                crate::message::agent_action_tools::adapter_tool_error(error),
+            );
+            assert_eq!(
+                public.to_string(),
+                "invalid arguments: agent_action_not_allowed"
+            );
+            assert!(!public.to_string().contains("private-"));
+        }
+        let invalid = adapter
+            .intent_from_model_call(
+                "malformed",
+                AgentModelToolName::StartAgent,
+                serde_json::json!({"targetOptionId": "target", "input": {}, "launch": {}}),
+                Some(&options),
+            )
+            .expect_err("malformed request must not produce an intent");
+        assert!(matches!(invalid, AgentToolAdapterError::InvalidArguments));
+        let public = crate::message::agent_action_tools::adapter_tool_error(invalid);
+        assert_eq!(
+            public.to_string(),
+            "invalid arguments: agent_invalid_arguments"
+        );
     }
 
     #[test]

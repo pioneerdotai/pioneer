@@ -23,6 +23,36 @@ impl TaskProjector {
         Self { store }
     }
 
+    pub async fn transition_delivery(
+        &self,
+        event: TaskEventPayload,
+        transition: pioneer_crud::TaskDeliveryTransition,
+        at: i64,
+    ) -> TaskRuntimeResult<pioneer_crud::TaskDeliveryTransitionOutcome<AppendedTaskEvent>> {
+        let store = self.store.clone();
+        task_projector_fresh_task(async move {
+            Ok(store
+                .transition_task_delivery(event, transition, at)
+                .await?)
+        })
+        .await
+    }
+
+    pub async fn append_cancellation_events(
+        &self,
+        events: Vec<TaskEventPayload>,
+        at: i64,
+        action: Option<pioneer_crud::AgentCommitInput>,
+    ) -> TaskRuntimeResult<Vec<AppendedTaskEvent>> {
+        let store = self.store.clone();
+        task_projector_fresh_task(async move {
+            Ok(store
+                .append_task_cancellation_events(events, at, action)
+                .await?)
+        })
+        .await
+    }
+
     pub async fn append_event(
         &self,
         event: TaskEventPayload,

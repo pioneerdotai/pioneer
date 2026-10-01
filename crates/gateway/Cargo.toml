@@ -82,6 +82,7 @@ toml.workspace = true
 
 [dev-dependencies]
 tokio-tungstenite.workspace = true
+sentry = { workspace = true, features = ["test"] }
 pioneer-sqlite = { workspace = true, features = ["test-support"] }
 pioneer-client.workspace = true
 pioneer-client-ffi.workspace = true

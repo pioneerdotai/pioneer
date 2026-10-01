@@ -440,13 +440,16 @@ pub(crate) fn project_result(result: &TaskResult) -> PublicTaskResult {
 }
 
 pub(crate) fn project_error(error: &TaskError) -> PublicTaskFailure {
+    let mut public_error = crate::public_error::build_public_error(
+        task_public_error_code(error.class),
+        PublicErrorStage::Execution,
+    );
+    if let Some(message) = error.recovery_public_message() {
+        public_error.message = message;
+    }
     PublicTaskFailure {
         class: error.class,
-        error: crate::public_error::map_agent_failure(
-            task_public_error_code(error.class),
-            PublicErrorStage::Execution,
-            error.message.as_str(),
-        ),
+        error: public_error,
     }
 }
 
@@ -512,17 +515,13 @@ pub(crate) fn project_delivery(delivery: &TaskDelivery) -> PublicTaskDelivery {
         .as_ref()
         .map(project_error)
         .or_else(|| {
-            delivery
-                .last_error
-                .as_deref()
-                .map(|message| PublicTaskFailure {
-                    class: TaskErrorClass::Internal,
-                    error: crate::public_error::map_agent_failure(
-                        pioneer_protocol::PublicErrorCode::Internal,
-                        PublicErrorStage::Delivery,
-                        message,
-                    ),
-                })
+            delivery.last_error.as_deref().map(|_| PublicTaskFailure {
+                class: TaskErrorClass::Internal,
+                error: crate::public_error::build_public_error(
+                    pioneer_protocol::PublicErrorCode::Internal,
+                    PublicErrorStage::Delivery,
+                ),
+            })
         });
     PublicTaskDelivery {
         id: delivery.id.clone(),
@@ -729,16 +728,14 @@ mod tests {
         assert!(!encoded.contains("private full result"));
     }
 
-    #[test]
-    fn collaborator_projection_drops_host_paths_webhooks_and_raw_diagnostics() {
-        let canary_path = "/Users/operator/private/task-result.txt";
-        let canary_webhook = "https://hooks.example.test/deliver?token=secret";
-        let canary_error = "database failed at /var/lib/pioneer/private.sqlite";
-        let canary_input = "private task input that must not be disclosed";
-        let canary_external_filter = "payload.secret == 'private'";
-        let latest_projected_instruction =
-            "effective instruction retained after the first scheduled run";
-        let mut response = TaskGetResponse {
+    fn collaborator_fixture(
+        canary_path: &str,
+        canary_webhook: &str,
+        canary_error: &str,
+        canary_input: &str,
+        canary_external_filter: &str,
+    ) -> TaskGetResponse {
+        TaskGetResponse {
             task: Task {
                 id: "task-1".to_owned(),
                 workspace_id: "workspace-1".to_owned(),
@@ -780,6 +777,7 @@ mod tests {
                     completed_by_run_id: None,
                 }),
                 error: Some(TaskError {
+                    recovery_diagnostic: None,
                     code: "internal".to_owned(),
                     message: canary_error.to_owned(),
                     class: TaskErrorClass::Internal,
@@ -865,7 +863,215 @@ mod tests {
             task_run_turns: Vec::new(),
             result_candidates: Vec::new(),
             result_review_events: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn repeated_saved_error_projections_are_silent_for_every_failure_class() {
+        use super::*;
+        use crate::public_error::test_support::capture_events;
+        let canary = "bearer-token /Users/operator/private.sqlite";
+        let mut response =
+            collaborator_fixture("private/path", "secret/webhook", canary, "input", "filter");
+        let (_, events) = capture_events(|| {
+            for class in [
+                TaskErrorClass::Cancelled,
+                TaskErrorClass::Timeout,
+                TaskErrorClass::Provider,
+                TaskErrorClass::Tool,
+                TaskErrorClass::Validation,
+                TaskErrorClass::Dependency,
+                TaskErrorClass::Policy,
+                TaskErrorClass::Internal,
+                TaskErrorClass::Unknown,
+            ] {
+                let error = TaskError {
+                    code: "saved_failure".to_owned(),
+                    message: canary.to_owned(),
+                    class,
+                    details: None,
+                    failed_run_id: None,
+                    recovery_diagnostic: None,
+                };
+                response.task.error = Some(error.clone());
+                let run = TaskRun {
+                    id: "run-1".to_owned(),
+                    task_id: response.task.id.clone(),
+                    trigger_id: None,
+                    parent_run_id: None,
+                    run_group_id: "group-1".to_owned(),
+                    attempt_number: 1,
+                    retry_of_run_id: None,
+                    ready_at: None,
+                    run_number: 1,
+                    status: pioneer_protocol::TaskRunStatus::Failed,
+                    executor_kind: TaskExecutorKind::Agent,
+                    started_at: None,
+                    completed_at: Some(1),
+                    heartbeat_at: None,
+                    locked_by: None,
+                    lock_expires_at: None,
+                    result: None,
+                    error: Some(error.clone()),
+                    created_at: 1,
+                    updated_at: 1,
+                };
+                response.runs = vec![run.clone()];
+                let mut delivery = TaskDelivery {
+                    id: "delivery-1".to_owned(),
+                    workspace_id: response.task.workspace_id.clone(),
+                    task_id: response.task.id.clone(),
+                    run_id: run.id.clone(),
+                    delivery_key: "delivery-key".to_owned(),
+                    mode: pioneer_protocol::TaskDeliveryMode::Webhook,
+                    thread_target: None,
+                    target_thread_id: None,
+                    target_user_id: None,
+                    webhook_url: None,
+                    webhook_url_fingerprint: None,
+                    status: pioneer_protocol::TaskDeliveryStatus::Failed,
+                    next_attempt_at: None,
+                    attempt_count: 1,
+                    max_attempts: 3,
+                    result_snapshot: None,
+                    error_snapshot: Some(error.clone()),
+                    delivered_turn_id: None,
+                    delivered_notification_id: None,
+                    delivered_at: None,
+                    last_error: Some(canary.to_owned()),
+                    created_at: 1,
+                    updated_at: 1,
+                };
+                // Repeat the shared projections used by read responses and notifications.
+                for _ in 0..3 {
+                    let task = project_task(&response.task);
+                    let projected_run = project_run(&run);
+                    let projected_delivery = project_delivery(&delivery);
+                    for failure in [
+                        task.error.unwrap(),
+                        projected_run.error.unwrap(),
+                        projected_delivery.error.unwrap(),
+                    ] {
+                        assert_eq!(failure.class, class);
+                        assert_eq!(
+                            failure.error.version,
+                            pioneer_protocol::PUBLIC_ERROR_VERSION
+                        );
+                        assert_eq!(failure.error.code, task_public_error_code(class));
+                        assert_eq!(failure.error.stage, PublicErrorStage::Execution);
+                        assert_eq!(failure.error.retry_after_ms, None);
+                        assert!(!serde_json::to_string(&failure).unwrap().contains(canary));
+                    }
+                    let get = project_task_get(&response, true);
+                    assert_eq!(get.operator.unwrap().task, response.task);
+                    project_task_list(&TaskListResponse {
+                        tasks: vec![response.task.clone()],
+                        next_cursor: None,
+                    });
+                    let tree = TaskTree {
+                        task: response.task.clone(),
+                        triggers: vec![],
+                        runs: vec![run.clone()],
+                        agent_specs: vec![],
+                        dependencies: vec![],
+                        write_locks: vec![],
+                        children: vec![],
+                    };
+                    let tree_response =
+                        project_task_tree(&TaskTreeResponse { tree: tree.clone() }, true);
+                    assert_eq!(tree_response.operator.unwrap(), tree);
+                    let item = TaskWaitItem {
+                        task: response.task.clone(),
+                        run: Some(run.clone()),
+                        child_thread_id: None,
+                        child_turn_id: None,
+                        permission_profile: None,
+                    };
+                    project_task_wait(&TaskWaitResponse {
+                        completed: vec![],
+                        failed: vec![item],
+                        blocked: vec![],
+                        cancelled: vec![],
+                        review_required: vec![],
+                        pending: vec![],
+                        non_waitable: vec![],
+                        timed_out: false,
+                        total_count: 1,
+                        terminal_count: 1,
+                        pending_count: 0,
+                        review_required_count: 0,
+                        blocked_count: 0,
+                        non_waitable_count: 0,
+                        mode: pioneer_protocol::TaskWaitMode::AllTerminal,
+                    });
+                    project_task_agenda(&TaskAgendaResponse {
+                        items: vec![pioneer_protocol::TaskAgendaItem {
+                            task: response.task.clone(),
+                            trigger: None,
+                            latest_run: Some(run.clone()),
+                            latest_delivery: Some(delivery.clone()),
+                            goal_preview: None,
+                            trigger_kind: None,
+                            trigger_status: None,
+                            next_fire_at: None,
+                            last_fire_at: None,
+                            timezone: None,
+                            recurring: false,
+                            delivery_mode: delivery.mode,
+                            result_preview: None,
+                            error_preview: None,
+                        }],
+                    });
+                    let deliveries = project_task_deliveries(
+                        &TaskDeliveriesResponse {
+                            deliveries: vec![delivery.clone()],
+                            attempts: vec![],
+                        },
+                        true,
+                    );
+                    assert_eq!(deliveries.operator.unwrap().deliveries[0], delivery);
+                }
+                delivery.error_snapshot = None;
+                for _ in 0..3 {
+                    let fallback = project_delivery(&delivery).error.unwrap();
+                    assert_eq!(fallback.class, TaskErrorClass::Internal);
+                    assert_eq!(
+                        fallback.error.code,
+                        pioneer_protocol::PublicErrorCode::Internal
+                    );
+                    assert_eq!(fallback.error.stage, PublicErrorStage::Delivery);
+                    assert!(!serde_json::to_string(&fallback).unwrap().contains(canary));
+                }
+                let mut recovery_error = error;
+                recovery_error.recovery_diagnostic = Some(pioneer_protocol::RecoveryDiagnostic {
+                    last_failure: None,
+                    stop_reason: Some(pioneer_protocol::RecoveryStopReason::AttemptsExhausted),
+                });
+                assert_eq!(
+                    project_error(&recovery_error).error.message,
+                    recovery_error.recovery_public_message().unwrap()
+                );
+            }
+        });
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn collaborator_projection_drops_host_paths_webhooks_and_raw_diagnostics() {
+        let canary_path = "/Users/operator/private/task-result.txt";
+        let canary_webhook = "https://hooks.example.test/deliver?token=secret";
+        let canary_error = "database failed at /var/lib/pioneer/private.sqlite";
+        let canary_input = "private task input that must not be disclosed";
+        let canary_external_filter = "payload.secret == 'private'";
+        let latest_projected_instruction =
+            "effective instruction retained after the first scheduled run";
+        let mut response = collaborator_fixture(
+            canary_path,
+            canary_webhook,
+            canary_error,
+            canary_input,
+            canary_external_filter,
+        );
         let mut run_spec = response.agent_specs[0].clone();
         run_spec.id = "agent-spec-run-1".to_owned();
         run_spec.run_id = Some("run-1".to_owned());

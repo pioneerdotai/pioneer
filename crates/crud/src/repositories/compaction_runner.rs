@@ -2682,11 +2682,8 @@ accepted_imports AS MATERIALIZED (
  JOIN compaction_frozen_import i ON i.manifest_id=h.id
   AND i.manifest_id=(SELECT manifest_id FROM compaction_operation_projection WHERE operation_id=?1)
 ),
-accepted_basis AS (
- SELECT json_extract(f.reference_json,'$.source_thread') AS source_thread,
-  json_extract(j.value,'$.scope') AS source_scope,
-  json_extract(j.value,'$.id') AS source_id,
-  json_extract(j.value,'$.version') AS source_version
+accepted_basis_messages AS MATERIALIZED (
+ SELECT f.reference_json
  FROM current_operation o
  JOIN compaction_operation_projection p ON p.operation_id=o.id
  JOIN compaction_frozen_history h ON h.id=p.manifest_id
@@ -2696,12 +2693,20 @@ accepted_basis AS (
   AND h.next_ordinal=h.message_count
  JOIN compaction_frozen_message f ON f.manifest_id=h.id
   AND f.manifest_id=(SELECT manifest_id FROM compaction_operation_projection WHERE operation_id=?1)
- JOIN json_each(f.reference_json,'$.sources') j
+ LIMIT 65537
+),
+accepted_basis AS (
+ SELECT json_extract(f.reference_json,'$.source_thread') AS source_thread,
+  json_extract(j.value,'$.scope') AS source_scope,
+  json_extract(j.value,'$.id') AS source_id,
+  json_extract(j.value,'$.version') AS source_version
+ FROM accepted_basis_messages f JOIN json_each(f.reference_json,'$.sources') j
  WHERE json_extract(f.reference_json,'$.inherited')=1
  LIMIT 65537
 ),
 basis_within_bound AS (
- SELECT COUNT(*)<65537 AS valid FROM accepted_basis
+ SELECT COUNT(*)<65537 AND (SELECT COUNT(*) FROM accepted_basis_messages)<65537 AS valid
+ FROM accepted_basis
 ),
 accepted_basis_roots AS (
  SELECT source_scope AS root_scope, source_id AS root_id, source_version AS root_version,
@@ -2802,6 +2807,66 @@ accepted_basis_atoms AS (
  JOIN complete_basis_roots r ON r.root_scope=g.root_scope AND r.root_id=g.root_id
   AND r.root_version=g.root_version AND r.root_thread=g.root_thread
  WHERE g.source_scope NOT LIKE 'checkpoint:%'
+),
+basis_input_claims AS MATERIALIZED (
+ SELECT f.reference_json AS carrier,
+  json_extract(a.value,'$.represented_thread') AS represented_thread,
+  json_extract(a.value,'$.represented_source.scope') AS represented_scope,
+  json_extract(a.value,'$.represented_source.id') AS represented_id,
+  json_extract(a.value,'$.represented_source.version') AS represented_version,
+  json_extract(a.value,'$.source_thread') AS source_thread,
+  json_extract(a.value,'$.source.scope') AS source_scope,
+  json_extract(a.value,'$.source.id') AS source_id,
+  json_extract(a.value,'$.source.version') AS source_version
+ FROM accepted_basis_messages f JOIN json_each(f.reference_json,'$.source_aliases') a
+ LIMIT 65537
+),
+basis_input_conflicts AS MATERIALIZED (
+ SELECT json_extract(a.value,'$.source_thread') AS source_thread,
+  json_extract(a.value,'$.source.scope') AS source_scope,
+  json_extract(a.value,'$.source.id') AS source_id,
+  json_extract(a.value,'$.source.version') AS source_version
+ FROM accepted_basis_messages f JOIN json_each(f.reference_json,'$.ambiguous_input_aliases') a
+ LIMIT 65537
+),
+accepted_basis_input_aliases AS (
+ SELECT a.source_thread,a.source_scope,a.source_id,a.source_version
+ FROM basis_input_claims a,basis_within_bound bound
+ WHERE bound.valid AND (SELECT COUNT(*) FROM basis_input_claims)<65537
+  AND (SELECT COUNT(*) FROM basis_input_conflicts)<65537
+  AND json_extract(a.carrier,'$.inherited')=1
+  AND json_extract(a.carrier,'$.complete')=1
+  AND json_extract(a.carrier,'$.protected_input')=0
+  AND a.source_scope LIKE 'input:%' AND a.represented_scope LIKE 'input:%'
+  AND (a.source_thread<>a.represented_thread OR a.source_scope<>a.represented_scope
+   OR a.source_id<>a.represented_id OR a.source_version<>a.represented_version)
+  AND EXISTS (
+   SELECT 1 FROM json_each(a.carrier,'$.sources') s
+   WHERE (json_extract(a.carrier,'$.source_thread')=a.represented_thread
+    AND json_extract(s.value,'$.scope')=a.represented_scope
+    AND json_extract(s.value,'$.id')=a.represented_id
+    AND json_extract(s.value,'$.version')=a.represented_version)
+   OR EXISTS (
+    SELECT 1 FROM basis_coverage g JOIN complete_basis_roots r
+     ON r.root_scope=g.root_scope AND r.root_id=g.root_id
+      AND r.root_version=g.root_version AND r.root_thread=g.root_thread
+    WHERE g.root_scope=json_extract(s.value,'$.scope')
+     AND g.root_id=json_extract(s.value,'$.id')
+     AND g.root_version=json_extract(s.value,'$.version')
+     AND g.root_thread=json_extract(a.carrier,'$.source_thread')
+     AND g.source_scope=a.represented_scope AND g.source_id=a.represented_id
+     AND g.source_version=a.represented_version AND g.source_thread=a.represented_thread
+   )
+  )
+  AND NOT EXISTS (SELECT 1 FROM basis_input_conflicts c
+   WHERE c.source_thread=a.source_thread AND c.source_scope=a.source_scope
+    AND c.source_id=a.source_id AND c.source_version=a.source_version)
+  AND NOT EXISTS (SELECT 1 FROM basis_input_claims other
+   WHERE other.source_thread=a.source_thread AND other.source_scope=a.source_scope
+    AND other.source_id=a.source_id AND other.source_version=a.source_version
+    AND (other.represented_thread<>a.represented_thread
+     OR other.represented_scope<>a.represented_scope OR other.represented_id<>a.represented_id
+     OR other.represented_version<>a.represented_version))
 ),
 checkpoint_roots AS (
  SELECT m.ordinal,m.source_scope,m.source_id,m.source_version,m.source_thread,
@@ -2929,6 +2994,9 @@ valid_roots AS (
         OR EXISTS (SELECT 1 FROM accepted_basis_atoms b
          WHERE b.source_scope=g.source_scope AND b.source_id=g.source_id
           AND b.source_version=g.source_version AND b.source_thread=g.source_thread)
+        OR EXISTS (SELECT 1 FROM accepted_basis_input_aliases a
+         WHERE a.source_scope=g.source_scope AND a.source_id=g.source_id
+          AND a.source_version=g.source_version AND a.source_thread=g.source_thread)
        ))
       )
     )
@@ -2980,8 +3048,10 @@ pub(crate) async fn compaction_manifest_sources_current<C: ConnectionTrait>(
     record_publication_heavy_check(operation, true);
     // Direct raw manifest entries remain exact-current. Direct checkpoint
     // entries validate the published object only; bounded historical coverage
-    // is used solely to prove compatibility with the bound frozen basis and
-    // never joins canonical payload/revision rows. OWN imports still require
+    // is used solely to prove compatibility with the bound frozen basis,
+    // including its unambiguous exact input aliases. Those aliases never
+    // authorize direct raw reads or OWN imports. Historical coverage never
+    // joins canonical payload/revision rows. OWN imports still require
     // their immutable delivery proofs. Publication generations fence this
     // reader proof across the short writer CAS.
     let stale = db

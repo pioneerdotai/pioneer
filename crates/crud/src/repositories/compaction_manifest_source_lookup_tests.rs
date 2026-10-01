@@ -941,6 +941,244 @@ async fn install_projection(db: &SqliteDatabase, manifest: &str, message_json: &
 }
 
 #[tokio::test]
+async fn inherited_input_alias_admits_only_exact_historical_checkpoint_coverage() {
+    let f = fixture().await;
+    let db = f.db();
+    for sql in [
+        "UPDATE compaction_operation SET snapshot='{\"plan\":{\"coverage_domain\":\"working_context\"},\"source_epochs\":{\"root-thread\":0,\"source-thread\":0,\"foreign-thread\":0}}' WHERE id='manifest-operation'",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('original-input','foreign-turn',0,'text','fixture','{}',CURRENT_TIMESTAMP)",
+        "UPDATE compaction_coverage SET source_scope='input:source-turn',source_id='input-source',source_version='input-revision:1' WHERE checkpoint_id='source-checkpoint'",
+        "UPDATE compaction_manifest SET source_scope='input:source-turn',source_id='input-source',source_version='input-revision:1' WHERE operation_id='source-operation'",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    let checkpoint = source_cases()[4].clone();
+    set_manifest(&db, &checkpoint, false).await;
+    let alias = serde_json::json!({
+        "represented_thread": "foreign-thread",
+        "represented_source": {"scope":"input:foreign-turn","id":"original-input","version":"input-revision:1"},
+        "source_thread": "source-thread",
+        "source": {"scope":"input:source-turn","id":"input-source","version":"input-revision:1"}
+    });
+    let mut reference = serde_json::json!({
+        "inherited": true, "complete": true, "protected_input": false,
+        "source_thread": "foreign-thread",
+        "unit_id": "foreign-turn:original-input",
+        "wire_sha256": "a".repeat(64),
+        "replay_source": null, "tool_call_id": null, "tool_name": null,
+        "sources": [{"scope":"input:foreign-turn","id":"original-input","version":"input-revision:1"}]
+    });
+    serde_json::from_value::<pioneer_compaction::frozen::FrozenMessageRef>(reference.clone())
+        .unwrap()
+        .validate()
+        .unwrap();
+    install_projection(&db, "input-alias-basis", &reference.to_string()).await;
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        false,
+        "copy is not a primary source",
+    )
+    .await;
+    reference["source_aliases"] = serde_json::json!([alias.clone()]);
+    let update = |reference: serde_json::Value| {
+        let db = db.clone();
+        async move {
+            let json = reference.to_string();
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_frozen_message_data SET reference_json=?1,bytes=length(CAST(?1 AS BLOB)) WHERE manifest_id='input-alias-basis' AND ordinal=0",
+                [json.into()],
+            )).await.unwrap();
+        }
+    };
+    update(reference.clone()).await;
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        true,
+        "published copy checkpoint is represented by an exact alias",
+    )
+    .await;
+
+    for (path, value) in [
+        (
+            "/source_aliases/0/source/version",
+            serde_json::json!("input-revision:2"),
+        ),
+        (
+            "/source_aliases/0/source_thread",
+            serde_json::json!("other-thread"),
+        ),
+        (
+            "/source_aliases/0/represented_source/id",
+            serde_json::json!("unrepresented"),
+        ),
+        (
+            "/source_aliases/0/represented_source/scope",
+            serde_json::json!("event:foreign-turn"),
+        ),
+        ("/inherited", serde_json::json!(false)),
+        ("/complete", serde_json::json!(false)),
+        ("/protected_input", serde_json::json!(true)),
+    ] {
+        let mut invalid = reference.clone();
+        *invalid.pointer_mut(path).unwrap() = value;
+        update(invalid).await;
+        assert_manifest_current(&db, "manifest-operation", false, path).await;
+    }
+    let mut ambiguous = reference.clone();
+    ambiguous["ambiguous_input_aliases"] = serde_json::json!([{
+        "source_thread": "source-thread",
+        "source": {"scope":"input:source-turn","id":"input-source","version":"input-revision:1"}
+    }]);
+    update(ambiguous).await;
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        false,
+        "sticky conflict blocks copy proof",
+    )
+    .await;
+    let mut competing = reference.clone();
+    let mut other = alias;
+    other["represented_source"]["id"] = serde_json::json!("different-original");
+    competing["source_aliases"]
+        .as_array_mut()
+        .unwrap()
+        .push(other);
+    update(competing).await;
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        false,
+        "competing owners block copy proof",
+    )
+    .await;
+    update(reference.clone()).await;
+
+    let raw = source_cases()[3].clone();
+    set_manifest(&db, &raw, false).await;
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        false,
+        "alias grants no direct raw access",
+    )
+    .await;
+    set_manifest(&db, &checkpoint, false).await;
+    db.execute_unprepared("UPDATE compaction_operation SET snapshot=json_set(snapshot,'$.plan.coverage_domain','own_contribution') WHERE id='manifest-operation'").await.unwrap();
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        false,
+        "alias is not an OWN import",
+    )
+    .await;
+    db.execute_unprepared("UPDATE compaction_operation SET snapshot=json_set(snapshot,'$.plan.coverage_domain','working_context') WHERE id='manifest-operation'").await.unwrap();
+    db.execute_unprepared("INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES ('source-checkpoint','event:source-turn','event-source','event-revision:1'); INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('source-operation',1,1,0,'source-thread','event:source-turn','event-source','event-revision:1')").await.unwrap();
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        false,
+        "alias cannot admit unrelated checkpoint leaves",
+    )
+    .await;
+    db.execute_unprepared("DELETE FROM compaction_coverage WHERE checkpoint_id='source-checkpoint' AND source_id='event-source'; DELETE FROM compaction_manifest WHERE operation_id='source-operation' AND ordinal=1; DELETE FROM turn_input WHERE id='input-source'").await.unwrap();
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        true,
+        "old checkpoint survives removed copy payload",
+    )
+    .await;
+
+    // The representative can itself be an already published summary.
+    for sql in [
+        "INSERT INTO compaction_context(workspace_id,thread_id,owner,format_version) VALUES ('ws','foreign-thread','original-owner',1)",
+        "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES ('original-operation','original-owner','original','completed','{}',1)",
+        "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES ('original-summary','original-operation','original-owner',0,'original summary','original-version','{}',0,1,'applied')",
+        "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES ('original-summary','input:foreign-turn','original-input','input-revision:1')",
+        "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('original-operation',0,0,0,'foreign-thread','input:foreign-turn','original-input','input-revision:1')",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    reference["sources"] = serde_json::json!([{"scope":"checkpoint:original-owner","id":"original-summary","version":"original-version"}]);
+    serde_json::from_value::<pioneer_compaction::frozen::FrozenMessageRef>(reference.clone())
+        .unwrap()
+        .validate()
+        .unwrap();
+    update(reference).await;
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        true,
+        "summary carrier proves its exact historical input alias",
+    )
+    .await;
+    let selection = serde_json::to_string(&ModelSelection {
+        transport: Transport::Api,
+        instance: "publication-fixture".into(),
+        model: "publication-model".into(),
+        effort: None,
+    })
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_checkpoint SET selection=? WHERE id IN ('source-checkpoint','original-summary')",
+        [selection.into()],
+    ))
+    .await
+    .unwrap();
+    let old = f
+        .store
+        .compaction_checkpoint("source-checkpoint")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.summary, "source summary");
+    assert_eq!(old.coverage.len(), 1);
+    assert_eq!(old.coverage[0].id, "input-source");
+
+    let state = publication_candidate(&f, "alias-publication", 1).await;
+    for sql in [
+        "UPDATE compaction_operation SET snapshot=json_set(snapshot,'$.plan.coverage_domain','working_context') WHERE id='alias-publication'",
+        "UPDATE compaction_manifest SET source_thread='source-thread',source_scope='checkpoint:source-owner',source_id='source-checkpoint',source_version='source-version' WHERE operation_id='alias-publication'",
+        "UPDATE compaction_coverage SET source_scope='checkpoint:source-owner',source_id='source-checkpoint',source_version='source-version' WHERE checkpoint_id='alias-publication-checkpoint'",
+        "INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) SELECT 'alias-publication',manifest_id,identity_sha256,imports_sha256,import_count FROM compaction_operation_projection WHERE operation_id='manifest-operation'",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    assert_positive_publication_preflight(&f, "alias-publication", &state).await;
+    assert_eq!(
+        f.store
+            .compaction_apply_runner("alias-publication", &state, None)
+            .await
+            .unwrap(),
+        crate::compaction::CommitOutcome::Applied
+    );
+    let next = f
+        .store
+        .compaction_checkpoint("alias-publication-checkpoint")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.coverage.len(), 1);
+    assert_eq!(
+        next.coverage[0].id, old.id,
+        "new summary keeps the old checkpoint atomic"
+    );
+    let preserved = f
+        .store
+        .compaction_checkpoint(&old.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(preserved.summary, old.summary);
+    assert_eq!(preserved.coverage, old.coverage);
+}
+
+#[tokio::test]
 async fn inherited_checkpoint_basis_is_an_atomic_accepted_reference() {
     let fixture = fixture().await;
     let db = fixture.db();

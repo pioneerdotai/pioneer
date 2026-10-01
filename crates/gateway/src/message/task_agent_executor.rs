@@ -4623,12 +4623,15 @@ impl TaskAgentExecutor {
                 &handle,
                 &child_runtime.task_run_turn,
                 TaskRunTurnStatus::Failed,
-                Some(task_error(
-                    "reviewer_turn_failed",
-                    error_message.to_owned(),
-                    TaskErrorClass::Unknown,
-                    Some(child_runtime.task_run_turn.run_id.clone()),
-                )),
+                Some(
+                    task_turn_failure_error(
+                        &processor,
+                        "reviewer_turn_failed",
+                        error_message,
+                        &child_runtime.task_run_turn,
+                    )
+                    .await?,
+                ),
                 failed_at,
             )
             .await?;
@@ -5237,12 +5240,15 @@ impl TaskAgentExecutor {
                         &handle,
                         &task_run_turn,
                         target_status,
-                        Some(task_error(
-                            "reviewer_turn_failed",
-                            error_message,
-                            TaskErrorClass::Unknown,
-                            Some(task_run_turn.run_id.clone()),
-                        )),
+                        Some(
+                            task_turn_failure_error(
+                                &processor,
+                                "reviewer_turn_failed",
+                                &error_message,
+                                &task_run_turn,
+                            )
+                            .await?,
+                        ),
                         failed_at,
                     )
                     .await?;
@@ -6020,12 +6026,14 @@ impl TaskAgentExecutor {
             .with_database_class(SqliteWriteClass::Critical);
         let handle = handle.with_critical_writes();
         let failed_at = now_timestamp_secs();
-        let error = task_error(
+        let error = task_turn_failure_error(
+            &processor,
             "child_turn_failed",
-            error_message.to_owned(),
-            TaskErrorClass::Unknown,
-            Some(child_runtime.task_run_turn.run_id.clone()),
-        );
+            error_message,
+            &child_runtime.task_run_turn,
+        )
+        .await?;
+        let parent_error = error.message.clone();
         record_task_run_turn_failure(
             &handle,
             &child_runtime.task_run_turn,
@@ -6038,7 +6046,7 @@ impl TaskAgentExecutor {
         mark_task_run_occurrence_turn_failed(
             &processor,
             &child_runtime.lineage,
-            "child_turn_failed",
+            parent_error.as_str(),
         )
         .await?;
         Ok(())
@@ -8747,6 +8755,7 @@ fn invalid_structured_result_error(
         )
     };
     Some(TaskError {
+        recovery_diagnostic: None,
         code: "task_agent_result_extraction_failed".to_owned(),
         message,
         class: TaskErrorClass::Validation,
@@ -10724,6 +10733,28 @@ async fn load_task_agent_skill_overlay(
     }
 }
 
+async fn task_turn_failure_error(
+    processor: &MessageProcessor,
+    code: &str,
+    message: &str,
+    turn: &TaskRunTurn,
+) -> Result<TaskError> {
+    let mut error = task_error(
+        code,
+        message,
+        TaskErrorClass::Unknown,
+        Some(turn.run_id.clone()),
+    );
+    error.recovery_diagnostic = processor
+        .crud_store
+        .get_failed_turn_recovery_diagnostic(&turn.turn_id)
+        .await?;
+    if let Some(message) = error.recovery_public_message() {
+        error.message = message;
+    }
+    Ok(error)
+}
+
 fn task_error(
     code: impl Into<String>,
     _message: impl Into<String>,
@@ -10732,6 +10763,7 @@ fn task_error(
 ) -> TaskError {
     let code = code.into();
     TaskError {
+        recovery_diagnostic: None,
         message: code.clone(),
         code,
         class,

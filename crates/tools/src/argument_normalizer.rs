@@ -47,9 +47,23 @@ pub fn normalize_tool_arguments_from_schema(
     schema: &JsonValue,
 ) -> Result<ToolArgumentNormalization, ToolError> {
     let mut coercions = Vec::new();
-    let normalized = normalize_value(arguments, schema, schema, "$", &mut coercions)?;
+    let normalized = normalize_value(arguments, schema, schema, "$", &mut coercions, false)?;
     Ok(ToolArgumentNormalization {
         arguments: normalized,
+        coercions,
+    })
+}
+
+// Builtins keep a failed coercion's original value for schema validation, so
+// one malformed field cannot prevent normalization/validation of its siblings.
+pub(crate) fn normalize_builtin_arguments(
+    arguments: JsonValue,
+    schema: &JsonValue,
+) -> Result<ToolArgumentNormalization, ToolError> {
+    let mut coercions = Vec::new();
+    let arguments = normalize_value(arguments, schema, schema, "$", &mut coercions, true)?;
+    Ok(ToolArgumentNormalization {
+        arguments,
         coercions,
     })
 }
@@ -68,20 +82,32 @@ fn normalize_value(
     root_schema: &JsonValue,
     path: &str,
     coercions: &mut Vec<ToolArgumentCoercion>,
+    retain_invalid_values: bool,
 ) -> Result<JsonValue, ToolError> {
     let schema = resolve_schema(schema, root_schema).unwrap_or(schema);
     let shape = expected_shape(schema, root_schema);
 
     let value = match value {
         JsonValue::String(raw) if should_try_stringified_json(shape) => {
-            parse_stringified_json_for_shape(raw.as_str(), shape, path, coercions)?
+            match parse_stringified_json_for_shape(raw.as_str(), shape, path, coercions) {
+                Ok(parsed) => parsed,
+                Err(_) if retain_invalid_values => JsonValue::String(raw),
+                Err(error) => return Err(error),
+            }
         }
         other => other,
     };
 
     match value {
         JsonValue::Object(mut object) => {
-            normalize_object_fields(&mut object, schema, root_schema, path, coercions)?;
+            normalize_object_fields(
+                &mut object,
+                schema,
+                root_schema,
+                path,
+                coercions,
+                retain_invalid_values,
+            )?;
             Ok(JsonValue::Object(object))
         }
         JsonValue::Array(items) => {
@@ -97,6 +123,7 @@ fn normalize_value(
                         root_schema,
                         &format!("{path}[{index}]"),
                         coercions,
+                        retain_invalid_values,
                     )?);
                 } else {
                     normalized_items.push(item);
@@ -114,6 +141,7 @@ fn normalize_object_fields(
     root_schema: &JsonValue,
     path: &str,
     coercions: &mut Vec<ToolArgumentCoercion>,
+    retain_invalid_values: bool,
 ) -> Result<(), ToolError> {
     let Some(properties) = schema.get("properties").and_then(JsonValue::as_object) else {
         return Ok(());
@@ -132,8 +160,14 @@ fn normalize_object_fields(
         } else {
             format!("{path}.{key}")
         };
-        let normalized =
-            normalize_value(value, property_schema, root_schema, &child_path, coercions)?;
+        let normalized = normalize_value(
+            value,
+            property_schema,
+            root_schema,
+            &child_path,
+            coercions,
+            retain_invalid_values,
+        )?;
         object.insert(key, normalized);
     }
 

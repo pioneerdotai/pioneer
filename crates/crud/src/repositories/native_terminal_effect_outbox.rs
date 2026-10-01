@@ -1358,6 +1358,23 @@ pub async fn mark_succeeded<C: ConnectionTrait>(
     Ok(updated == 1)
 }
 
+#[derive(Debug)]
+pub struct HandlerCheckpointInvalid {
+    pub class: &'static str,
+}
+
+impl std::fmt::Display for HandlerCheckpointInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "native terminal-effect checkpoint is invalid ({})",
+            self.class
+        )
+    }
+}
+
+impl std::error::Error for HandlerCheckpointInvalid {}
+
 /// Load the immutable handler checkpoint owned by the current delivery lease.
 /// A missing/expired claim is an error rather than an empty checkpoint so a
 /// stale worker can never continue provider or memory side effects.
@@ -1380,14 +1397,23 @@ pub async fn load_handler_checkpoint<C: ConnectionTrait>(
         (None, None) => Ok(None),
         (Some(checkpoint), Some(expected_sha256)) => {
             if checkpoint.len() > MAX_EFFECT_HANDLER_CHECKPOINT_BYTES {
-                bail!("native terminal-effect handler checkpoint exceeds its durable byte limit");
+                return Err(HandlerCheckpointInvalid {
+                    class: "checkpoint_size",
+                }
+                .into());
             }
             if payload_sha256_hex(checkpoint.as_str()) != expected_sha256 {
-                bail!("native terminal-effect handler checkpoint hash mismatch");
+                return Err(HandlerCheckpointInvalid {
+                    class: "checkpoint_hash",
+                }
+                .into());
             }
             Ok(Some(checkpoint))
         }
-        _ => bail!("native terminal-effect handler checkpoint is incomplete"),
+        _ => Err(HandlerCheckpointInvalid {
+            class: "checkpoint_incomplete",
+        }
+        .into()),
     }
 }
 
@@ -1404,6 +1430,8 @@ pub async fn store_handler_checkpoint<C: ConnectionTrait>(
     if checkpoint_json.len() > MAX_EFFECT_HANDLER_CHECKPOINT_BYTES {
         bail!("native terminal-effect handler checkpoint exceeds its durable byte limit");
     }
+    // Pure preparation precedes SqliteDatabase's statement-scoped writer.
+    // CrudStore's run_serialized_write is a lock-retry wrapper, not a reservation.
     let checkpoint_sha256 = payload_sha256_hex(checkpoint_json);
     let updated = native_terminal_effect_outbox::Entity::update_many()
         .col_expr(
@@ -1543,7 +1571,9 @@ pub async fn mark_failed<C: ConnectionTrait>(
 
 /// Reopens a bounded set of recently exhausted post-turn obligations whose
 /// typed failure can make progress after an external provider or storage
-/// outage clears. Permanent and legacy-unclassified failures remain terminal.
+/// outage clears. A legacy write_failed with a checkpoint gets one bounded
+/// revalidation attempt, not a fresh retry budget. The marker is committed with
+/// requeue so recovery cannot repeatedly reopen the legacy code.
 pub async fn requeue_retryable_unresolved<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,
@@ -1561,19 +1591,29 @@ pub async fn requeue_retryable_unresolved<C: ConnectionTrait>(
         "memory.post_turn_extractor.checkpoint_load_failed",
         "memory.post_turn_extractor.checkpoint_store_failed",
         "memory.post_turn_extractor.manifest_failed",
-        "memory.post_turn_extractor.write_failed",
+        "memory.post_turn_extractor.write_storage_transient",
         "memory.post_turn_extractor.provider_network_transient",
         "memory.post_turn_extractor.provider_rate_limited",
         "memory.post_turn_extractor.provider_5xx",
         "memory.post_turn_extractor.provider_stream_stall",
         "memory.post_turn_extractor.provider_stream_truncated",
     ];
+    let eligible_failures = Condition::any()
+        .add(native_terminal_effect_outbox::Column::LastErrorCode.is_in(retryable_codes))
+        .add(
+            Condition::all()
+                .add(
+                    native_terminal_effect_outbox::Column::LastErrorCode
+                        .eq("memory.post_turn_extractor.write_failed"),
+                )
+                .add(native_terminal_effect_outbox::Column::HandlerCheckpointJson.is_not_null()),
+        );
     let effect_ids = native_terminal_effect_outbox::Entity::find()
         .select_only()
         .column(native_terminal_effect_outbox::Column::EffectId)
         .filter(native_terminal_effect_outbox::Column::Status.eq(STATUS_UNRESOLVED))
         .filter(native_terminal_effect_outbox::Column::EffectKind.eq("post_turn_hook"))
-        .filter(native_terminal_effect_outbox::Column::LastErrorCode.is_in(retryable_codes))
+        .filter(eligible_failures.clone())
         .filter(native_terminal_effect_outbox::Column::CompletedAt.lte(completed_before))
         .filter(native_terminal_effect_outbox::Column::PreparedAt.gte(prepared_after))
         .order_by_asc(native_terminal_effect_outbox::Column::CompletedAt)
@@ -1592,11 +1632,11 @@ pub async fn requeue_retryable_unresolved<C: ConnectionTrait>(
         )
         .col_expr(
             native_terminal_effect_outbox::Column::AttemptCount,
-            Expr::value(0_i64),
+            Expr::cust("CASE WHEN last_error_code = 'memory.post_turn_extractor.write_failed' THEN max_attempts - 1 ELSE 0 END"),
         )
         .col_expr(
             native_terminal_effect_outbox::Column::MaxAttempts,
-            Expr::cust("MAX(max_attempts, 8)"),
+            Expr::cust("CASE WHEN last_error_code = 'memory.post_turn_extractor.write_failed' THEN max_attempts ELSE MAX(max_attempts, 8) END"),
         )
         .col_expr(
             native_terminal_effect_outbox::Column::NextRunAt,
@@ -1610,8 +1650,15 @@ pub async fn requeue_retryable_unresolved<C: ConnectionTrait>(
             native_terminal_effect_outbox::Column::UpdatedAt,
             Expr::value(now),
         )
+        .col_expr(
+            native_terminal_effect_outbox::Column::LastErrorCode,
+            Expr::cust("CASE WHEN last_error_code = 'memory.post_turn_extractor.write_failed' THEN 'memory.post_turn_extractor.legacy_write_revalidate' ELSE last_error_code END"),
+        )
         .filter(native_terminal_effect_outbox::Column::EffectId.is_in(effect_ids))
         .filter(native_terminal_effect_outbox::Column::Status.eq(STATUS_UNRESOLVED))
+        .filter(eligible_failures)
+        .filter(native_terminal_effect_outbox::Column::CompletedAt.lte(completed_before))
+        .filter(native_terminal_effect_outbox::Column::PreparedAt.gte(prepared_after))
         .exec(db)
         .await
         .context("failed to requeue retryable unresolved native terminal effects")?

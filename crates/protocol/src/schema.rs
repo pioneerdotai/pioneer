@@ -1169,6 +1169,12 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("task_result.json", TaskResult),
         schema_doc!("task_error_class.json", TaskErrorClass),
         schema_doc!("task_error.json", TaskError),
+        schema_doc!("recovery_diagnostic.json", crate::RecoveryDiagnostic),
+        schema_doc!(
+            "recovery_provider_failure.json",
+            crate::RecoveryProviderFailure
+        ),
+        schema_doc!("recovery_stop_reason.json", crate::RecoveryStopReason),
         schema_doc!("task_trigger_kind.json", TaskTriggerKind),
         schema_doc!("task_manual_actor.json", TaskManualActor),
         schema_doc!(

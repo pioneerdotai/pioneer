@@ -589,11 +589,13 @@ impl MessageProcessor {
         if !resolution_is_allowed {
             self.send_error(
                 connection_id,
-                public_permission_error(
+                crate::public_error::expected_agent_rpc_error(
                     Some(request_id),
                     INVALID_PARAMS_CODE,
+                    pioneer_protocol::PublicErrorCode::InvalidInput,
                     pioneer_protocol::PublicErrorStage::Admission,
-                    "permission response scope exceeds the execution approval cap",
+                    "permission_response",
+                    "approval_cap_exceeded",
                 ),
             )
             .await;

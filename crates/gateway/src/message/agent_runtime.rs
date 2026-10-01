@@ -4838,6 +4838,15 @@ impl MessageProcessor {
             }
         };
 
+        if (job.diagnostic.is_some() && job.last_failure_attempt_id.is_none())
+            || job
+                .last_failure_attempt_id
+                .as_deref()
+                .is_some_and(|attempt| attempt != recovery.attempt_id)
+        {
+            return false;
+        }
+
         let event = match job.status {
             pioneer_protocol::RecoveryJobStatus::Pending => {
                 let current_attempt =
@@ -4865,18 +4874,13 @@ impl MessageProcessor {
                     } else {
                         u32::try_from(job.run_count.max(0)).unwrap_or(u32::MAX)
                     };
-                let persisted_error = job
-                    .last_error
-                    .unwrap_or_else(|| "provider recovery failed".to_owned());
-                let error_message = [
-                    "recovery wall-clock budget exhausted",
-                    "recovery attempts exhausted",
-                    "recovery no-progress guardrail exhausted",
-                ]
-                .into_iter()
-                .find(|summary| persisted_error.starts_with(summary))
-                .map(str::to_owned)
-                .unwrap_or(persisted_error);
+                let error_message = job
+                    .diagnostic
+                    .as_ref()
+                    .filter(|value| value.stop_reason.is_some())
+                    .cloned()
+                    .unwrap_or_default()
+                    .public_message();
                 crate::resilience::RecoveryCoordinatorEvent::RecoveryExhausted(
                     crate::resilience::RecoveryTerminalOutcome {
                         job_id: job.id,
@@ -5399,19 +5403,7 @@ impl MessageProcessor {
         }
 
         if should_mark_turn_failed {
-            let status_label = match outcome.status {
-                pioneer_protocol::RecoveryJobStatus::Exhausted => "exhausted",
-                pioneer_protocol::RecoveryJobStatus::Failed => "failed",
-                pioneer_protocol::RecoveryJobStatus::Blocked => "blocked",
-                pioneer_protocol::RecoveryJobStatus::Pending
-                | pioneer_protocol::RecoveryJobStatus::Active
-                | pioneer_protocol::RecoveryJobStatus::Succeeded
-                | pioneer_protocol::RecoveryJobStatus::Cancelled => "terminal",
-            };
-            let turn_error = format!(
-                "recovery {status_label} for item `{}`: {}",
-                outcome.item_id, outcome.error_message
-            );
+            let turn_error = outcome.error_message.clone();
             self.mark_turn_failed_terminal(thread_id, outcome.turn_id, turn_error)
                 .await;
         }
@@ -5710,7 +5702,7 @@ impl MessageProcessor {
                                 elapsed: Some(effect_started.elapsed()),
                             },
                         );
-                        let (code, message, retryable, root_error) = match outcome {
+                        let (code, mut message, retryable, root_error) = match outcome {
                             Ok(Err(error)) => {
                                 let root_error = error.root_hook_error().cloned();
                                 let message = root_error
@@ -5748,9 +5740,18 @@ impl MessageProcessor {
                             let failure_stage = root_error.as_ref().and_then(|error| {
                                 hook_error_metadata_text(error, "failure_stage")
                             });
+                            let termination = root_error.as_ref().and_then(|error| hook_error_metadata_text(error, "termination"));
+                            let parse_category = root_error.as_ref().and_then(|error| hook_error_metadata_text(error, "parse_category"));
+                            let parse_line = root_error.as_ref().and_then(|error| hook_error_metadata_i64(error, "parse_line"));
+                            let parse_column = root_error.as_ref().and_then(|error| hook_error_metadata_i64(error, "parse_column"));
+                            let response_bytes = root_error.as_ref().and_then(|error| hook_error_metadata_i64(error, "response_bytes"));
                             let http_status = root_error.as_ref().and_then(|error| {
                                 hook_error_metadata_i64(error, "http_status")
                             });
+                            let fact_index = root_error
+                                .as_ref()
+                                .and_then(|error| hook_error_metadata_i64(error, "fact_index"))
+                                .map(|index| index.clamp(0, 255));
                             if final_failure {
                                 tracing::error!(
                                     target: "pioneer::memory_post_turn_extractor",
@@ -5761,6 +5762,12 @@ impl MessageProcessor {
                                     failure_class = failure_class.unwrap_or("unknown"),
                                     failure_stage = failure_stage.unwrap_or("unknown"),
                                     http_status = ?http_status,
+                                    termination = ?termination,
+                                    parse_category = ?parse_category,
+                                    parse_line = ?parse_line,
+                                    parse_column = ?parse_column,
+                                    response_bytes = ?response_bytes,
+                                    fact_index = ?fact_index,
                                     retryable,
                                     attempt_count = record.attempt_count,
                                     max_attempts = record.max_attempts,
@@ -5777,12 +5784,30 @@ impl MessageProcessor {
                                     failure_class = failure_class.unwrap_or("unknown"),
                                     failure_stage = failure_stage.unwrap_or("unknown"),
                                     http_status = ?http_status,
+                                    termination = ?termination,
+                                    parse_category = ?parse_category,
+                                    parse_line = ?parse_line,
+                                    parse_column = ?parse_column,
+                                    response_bytes = ?response_bytes,
+                                    fact_index = ?fact_index,
                                     retryable,
                                     attempt_count = record.attempt_count,
                                     max_attempts = record.max_attempts,
                                     elapsed_ms = ?effect_started.elapsed().as_millis(),
                                     "memory post-turn extractor durable attempt will retry"
                                 );
+                            }
+                        }
+                        if is_memory_post_turn_extractor_effect {
+                            // The hook summary redacts/bounds its message separately.
+                            // Preserve known safe metadata in the existing durable error
+                            // message, without adding response values or a new DB protocol.
+                            if let Some(error) = root_error.as_ref() {
+                                for key in ["provider", "model", "failure_stage", "failure_class", "termination", "parse_category", "parse_line", "parse_column", "response_bytes"] {
+                                    if let Some(value) = hook_error_metadata_text(error, key) {
+                                        message.push_str(&format!("; {key}={value}"));
+                                    }
+                                }
                             }
                         }
                         let completed_at = chrono::Utc::now().timestamp();
@@ -6378,6 +6403,26 @@ impl MessageProcessor {
         else {
             return false;
         };
+        let reason = match self.crud_store.get_recovery_job(&job_id).await {
+            Ok(Some(job))
+                if job.trigger == pioneer_protocol::RecoveryTrigger::ProviderError
+                    || job
+                        .diagnostic
+                        .as_ref()
+                        .is_some_and(|value| value.last_failure.is_some()) =>
+            {
+                Some(
+                    job.diagnostic
+                        .as_ref()
+                        .map(|value| value.public_retry_message())
+                        .unwrap_or_else(|| {
+                            "Provider request failed; recovery retry scheduled.".to_owned()
+                        }),
+                )
+            }
+            Ok(Some(_)) => reason,
+            Ok(None) | Err(_) => return false,
+        };
         let notification = pioneer_protocol::ItemRetryScheduledNotification {
             workspace_id,
             thread_id: thread_id.clone(),
@@ -6557,9 +6602,27 @@ impl MessageProcessor {
 
     async fn handle_recovery_exhausted_event(
         &self,
-        outcome: RecoveryTerminalOutcome,
+        mut outcome: RecoveryTerminalOutcome,
         event_timestamp: i64,
     ) -> bool {
+        let job = match self.crud_store.get_recovery_job(&outcome.job_id).await {
+            Ok(Some(job))
+                if job.turn_id == outcome.turn_id
+                    && job.item_id == outcome.item_id
+                    && job.item_type == outcome.item_type
+                    && job.status == outcome.status =>
+            {
+                job
+            }
+            _ => return false,
+        };
+        outcome.error_message = job
+            .diagnostic
+            .as_ref()
+            .filter(|value| value.stop_reason.is_some())
+            .cloned()
+            .unwrap_or_default()
+            .public_message();
         let committed =
             message_future(self.send_recovery_exhausted_notification(&outcome, event_timestamp))
                 .await;
