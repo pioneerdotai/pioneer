@@ -2414,7 +2414,13 @@ mod tests {
             let body = r#"{"id":"gen-success","choices":[{"message":{"content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1}}"#;
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         });
-        let response = OpenRouterProvider::with_base_url("key", url)
+        let provider = crate::ProviderRegistry::with_provider(
+            "openrouter",
+            std::sync::Arc::new(OpenRouterProvider::with_base_url("key", url)),
+        )
+        .get_or_create("openrouter")
+        .unwrap();
+        let response = provider
             .chat(ChatRequest {
                 model: "fixture".into(),
                 messages: vec![ChatMessage::user("hello")],

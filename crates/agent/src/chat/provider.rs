@@ -1406,8 +1406,8 @@ mod tests {
         .await
     }
 
-    // Direct adapter fixtures exercise the standard endpoint diagnostic path,
-    // without the registry's extra custom-endpoint redaction masking leaks.
+    // Injected adapter fixtures use the required authority wrapper without
+    // custom-endpoint redaction masking leaks in standard diagnostics.
     async fn failure_from_local_endpoint(
         provider_name: &'static str,
         status: u16,
@@ -1531,12 +1531,20 @@ mod tests {
                 .unwrap()
         } else {
             assert_eq!(provider_name, "openrouter");
-            Arc::new(
-                pioneer_provider::providers::OpenRouterProvider::with_base_url(
-                    "key",
-                    format!("http://{}/v1", listener_address),
+            // A raw adapter lacks the authority scope needed during input
+            // preparation and would fail before connecting to the fixture.
+            // Injecting it supplies that scope while leaving redaction disabled.
+            pioneer_provider::ProviderRegistry::with_provider(
+                "openrouter",
+                Arc::new(
+                    pioneer_provider::providers::OpenRouterProvider::with_base_url(
+                        "key",
+                        format!("http://{}/v1", listener_address),
+                    ),
                 ),
             )
+            .get_or_create("openrouter")
+            .unwrap()
         };
         let request = ChatRequest {
             model: "fixture".into(),
