@@ -76622,19 +76622,36 @@ async fn blocked_provider_task_consumers_impl(scenario: &str, path: &str) {
         .await
         .unwrap()
         .into_job();
-    let claims = store.claim_due_recovery_jobs(now, 45, 1).await.unwrap();
+    // The initial provider failure includes Retry-After, so enqueue schedules
+    // this job in the future. Advance the fixture clock to the persisted due
+    // time rather than assuming that enqueue makes the job immediately due.
+    let first_due = job.next_run_at_unix;
+    assert_eq!(first_due, now + 2);
+    assert!(
+        store
+            .claim_due_recovery_jobs(now, 45, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let claims = store
+        .claim_due_recovery_jobs(first_due, 45, 1)
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1, "initial recovery must be due");
+    assert_eq!(claims[0].id, job.id);
     store
         .mark_claimed_recovery_job_active(
             &job.id,
             claims[0].claim_token.as_deref().unwrap(),
             "first_attempt",
-            now,
+            first_due,
         )
         .await
         .unwrap();
     let events = processor
         .recovery_coordinator
-        .record_recovery_provider_failure(&job.id, "first_attempt", failure.clone(), now + 1)
+        .record_recovery_provider_failure(&job.id, "first_attempt", failure.clone(), first_due + 1)
         .await
         .unwrap();
     assert!(matches!(
@@ -76644,6 +76661,8 @@ async fn blocked_provider_task_consumers_impl(scenario: &str, path: &str) {
     let pending = store.get_recovery_job(&job.id).await.unwrap().unwrap();
     let due = pending.next_run_at_unix;
     let claims = store.claim_due_recovery_jobs(due, 45, 1).await.unwrap();
+    assert_eq!(claims.len(), 1, "retry recovery must be due");
+    assert_eq!(claims[0].id, job.id);
     store
         .mark_claimed_recovery_job_active(
             &job.id,
