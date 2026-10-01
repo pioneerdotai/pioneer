@@ -639,6 +639,8 @@ pub(super) fn openrouter(data: &Value) -> Vec<Candidate> {
                 (4096, 4096),
             );
             c.model["name"] = m["name"].clone();
+            // This source's candidates were filtered by supported_parameters.
+            c.tool_calling = Some(has(&m["supported_parameters"], "tools"));
             c.model["reasoning"] = json!(has(&m["supported_parameters"], "reasoning"));
             c.model["input"] = if text(&m["architecture"]["modality"]).contains("image") {
                 json!(["text", "image"])
@@ -700,6 +702,7 @@ pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
                 (4096, 4096),
             );
             c.model["reasoning"] = json!(has(&m["tags"], "reasoning"));
+            c.tool_calling = Some(has(&m["tags"], "tool-use"));
             c.model["input"] = if has(&m["tags"], "vision") {
                 json!(["text", "image"])
             } else {

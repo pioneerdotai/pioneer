@@ -55,6 +55,9 @@ struct ModelOrigins {
     /// Pioneer supplement: Pi keeps only the combined window/output in Model.
     #[serde(default)]
     input_limit: Option<InputLimit>,
+    /// Source capability, independent of brand and of token limit fallbacks.
+    #[serde(default)]
+    tool_calling: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -78,6 +81,14 @@ pub struct ModelCatalog {
 }
 
 impl ModelCatalog {
+    pub fn tool_support(&self, provider: &str, id: &str) -> Option<bool> {
+        let model = self.model(provider, id)?;
+        model
+            .metadata
+            .get("toolCalling")
+            .and_then(Value::as_bool)
+            .or_else(|| self.origins.get(&model.provider)?.get(id)?.tool_calling)
+    }
     pub fn parse(models: &str, origins: &str) -> anyhow::Result<Self> {
         let catalog = Self {
             models: serde_json::from_str(models)?,
@@ -119,6 +130,7 @@ impl ModelCatalog {
             "gemini" => "google",
             "bedrock" => "amazon-bedrock",
             "copilot" => "github-copilot",
+            "glm" => "zai",
             "azure_openai" | "azure-openai" => "azure-openai-responses",
             other => other,
         };
@@ -174,7 +186,9 @@ impl ModelCatalog {
                 model.name = Some(entry.name.clone());
             }
             model.capabilities.thinking.get_or_insert(entry.reasoning);
-            model.capabilities.tool_calling.get_or_insert(true);
+            if let Some(supported) = self.tool_support(provider, &model.id) {
+                model.capabilities.tool_calling.get_or_insert(supported);
+            }
             model
                 .capabilities
                 .input_modalities
@@ -214,6 +228,21 @@ pub fn model_catalog() -> anyhow::Result<Arc<ModelCatalog>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_support_is_model_specific_and_unknown_is_preserved() {
+        let mut models: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/catalog/models.json")).unwrap();
+        let mut origins: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/catalog/provenance.json"))
+                .unwrap();
+        models["openai"]["gpt-5.4"]["toolCalling"] = Value::Bool(false);
+        origins["openai"]["gpt-5.4"]["toolCalling"] = Value::Bool(true);
+        let catalog = ModelCatalog::parse(&models.to_string(), &origins.to_string()).unwrap();
+        assert_eq!(catalog.tool_support("openai", "gpt-5.4"), Some(false));
+        assert_eq!(catalog.tool_support("openai", "unknown"), None);
+        assert_eq!(catalog.tool_support("openai", "gpt-5-nano"), None);
+    }
 
     fn fixture_catalog() -> ModelCatalog {
         ModelCatalog::parse(

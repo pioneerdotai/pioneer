@@ -126,6 +126,7 @@ struct Candidate {
     output_origin: LimitOrigin,
     reasoning_options: Value,
     input_limit: Option<u64>,
+    tool_calling: Option<bool>,
 }
 impl Candidate {
     fn id(&self) -> &str {
@@ -243,6 +244,7 @@ fn base(
         output_origin,
         reasoning_options: source["reasoning_options"].clone(),
         input_limit: source["limit"]["input"].as_u64().filter(|limit| *limit > 0),
+        tool_calling: source["tool_call"].as_bool(),
     }
 }
 
@@ -280,6 +282,9 @@ pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCata
         }
         let mut origins =
             json!({"contextWindow":candidate.context_origin,"maxTokens":candidate.output_origin});
+        if let Some(supported) = candidate.tool_calling {
+            origins["toolCalling"] = json!(supported);
+        }
         if let Some(value) = candidate.input_limit {
             // Keep the Pi model contract unchanged; retain this additional
             // authoritative constraint beside its source provenance.
@@ -410,6 +415,10 @@ mod behavior_tests {
         assert_eq!(model["cost"]["input"], 2.25);
         assert_eq!(model["thinkingLevelMap"]["off"], "none");
         assert_eq!(model["thinkingLevelMap"]["high"], "high");
+        assert_eq!(
+            result.provenance["openai"]["fixture-new"]["toolCalling"],
+            true
+        );
         let reader = ModelCatalog::parse(
             &serde_json::to_string(&result.models).unwrap(),
             &serde_json::to_string(&result.provenance).unwrap(),

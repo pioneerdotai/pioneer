@@ -287,6 +287,10 @@ impl Provider for AuthorityBoundProvider {
         self.inner.capabilities()
     }
 
+    fn model_tool_calling(&self, model: &str) -> bool {
+        self.inner.model_tool_calling(model)
+    }
+
     fn native_file_tool_capability(
         &self,
         model: &str,

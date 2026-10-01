@@ -319,6 +319,9 @@ impl GeminiProvider {
         request: &ChatRequest,
         prepared: &PreparedProviderMessages,
     ) -> Result<ApiGenerateRequest> {
+        let request = crate::tools::policy::prepare_request("gemini", request.clone())?;
+        let mut prepared = prepared.clone();
+        crate::tools::policy::prepare_history("gemini", &mut prepared.messages)?;
         let mut system_parts: Vec<ApiPart> = Vec::new();
         let mut contents: Vec<ApiContent> = Vec::new();
 
@@ -693,6 +696,7 @@ impl crate::traits::Provider for GeminiProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
         let model = request.model.clone();
         let prepared = prepare_messages_for_provider_async(
             self.name(),
@@ -761,6 +765,7 @@ impl crate::traits::Provider for GeminiProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
         let model = request.model.clone();
         let prepared = prepare_messages_for_provider_async(
             self.name(),
@@ -1044,6 +1049,34 @@ fn canonical_gemini_thinking_level(level: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_modes_and_parallel_limit_use_native_config_or_error() {
+        for (choice, expected) in [
+            (ToolChoice::Auto, "AUTO"),
+            (ToolChoice::None, "NONE"),
+            (ToolChoice::Required, "ANY"),
+            (
+                ToolChoice::Tool {
+                    name: "lookup".into(),
+                },
+                "ANY",
+            ),
+        ] {
+            let mut request = crate::tools::policy::test_request();
+            request.tool_choice = Some(choice);
+            let wire = GeminiProvider::build_request_result(&request).unwrap();
+            assert_eq!(
+                wire.tool_config.unwrap().function_calling_config.mode,
+                expected
+            );
+        }
+        let mut request = crate::tools::policy::test_request();
+        request.parallel_tool_calls = Some(false);
+        assert!(GeminiProvider::build_request_result(&request).is_err());
+        request.parallel_tool_calls = Some(true);
+        assert!(GeminiProvider::build_request_result(&request).is_ok());
+    }
+
     #[test]
     fn usage_prompt_includes_cached_content_once() {
         let response: super::ApiGenerateResponse = serde_json::from_value(serde_json::json!({
