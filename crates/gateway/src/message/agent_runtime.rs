@@ -6001,7 +6001,7 @@ impl MessageProcessor {
                     turn_id,
                     reason,
                 } => {
-                    message_future(self.handle_recovery_blocked_event(job_id, turn_id, reason))
+                    message_future(self.handle_recovery_blocked_event(job_id, turn_id, reason, event_timestamp))
                         .await
                 }
                 crate::resilience::RecoveryCoordinatorEvent::RecoveryExhausted(outcome) => {
@@ -6472,7 +6472,39 @@ impl MessageProcessor {
         job_id: String,
         turn_id: String,
         reason: String,
+        event_timestamp: i64,
     ) -> bool {
+        // Use the durable outbox for typed no-progress stops in both live delivery
+        // and restart replay. Its claim and commit fences own the terminal event.
+        let job = match self.crud_store.get_recovery_job(&job_id).await {
+            Ok(Some(job))
+                if job.turn_id == turn_id
+                    && job.status == pioneer_protocol::RecoveryJobStatus::Blocked =>
+            {
+                job
+            }
+            _ => return false,
+        };
+        if job.diagnostic.as_ref().is_some_and(|value| {
+            value.stop_reason == Some(pioneer_protocol::RecoveryStopReason::NoProgress)
+        }) {
+            if self
+                .process_due_recovery_terminalizations(event_timestamp, 64)
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            let Ok(Some((thread_id, _))) = self.crud_store.get_turn_location(&turn_id).await else {
+                return false;
+            };
+            let expected = format!(
+                "{} (recovery job {job_id})",
+                job.diagnostic.as_ref().unwrap().public_message()
+            );
+            return matches!(self.crud_store.get_turn(&thread_id, &turn_id).await,
+                Ok(Some((_, turn))) if turn.status == TurnStatus::Blocked && turn.error.as_deref() == Some(expected.as_str()));
+        }
         let Some((thread_id, _workspace_id)) = self
             .crud_store
             .get_turn_location(turn_id.as_str())

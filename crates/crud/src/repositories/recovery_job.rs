@@ -1182,3 +1182,15 @@ pub async fn set_diagnostic<C: ConnectionTrait>(db: &C, job_id: &str, value: Str
         .context("failed to persist recovery diagnostic")?;
     Ok(())
 }
+
+/// A new untyped blocked transition cannot inherit a stop reason from a prior
+/// terminalization (for example, a resumed job). Keep its last provider facts.
+/// Called only after a successful fenced transition in the same transaction.
+pub async fn clear_diagnostic_stop_reason<C: ConnectionTrait>(db: &C, job_id: &str) -> Result<()> {
+    recovery_job::Entity::update_many()
+        .col_expr(recovery_job::Column::Diagnostic,
+            sea_orm::sea_query::Expr::cust("CASE WHEN json_valid(diagnostic) THEN json_remove(diagnostic, '$.stopReason') ELSE NULL END"))
+        .filter(recovery_job::Column::Id.eq(job_id.to_owned()))
+        .exec(db).await.context("failed to clear stale recovery stop reason")?;
+    Ok(())
+}
