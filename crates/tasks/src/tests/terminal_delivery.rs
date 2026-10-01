@@ -1186,3 +1186,247 @@ async fn implicit_result_replay_uses_the_original_delivery_snapshot() {
     .unwrap();
     assert_eq!(deliveries(&runtime, &run).await, original);
 }
+
+async fn unadmitted_agent_fixture() -> (TaskRuntime, TaskRun, TaskExecutionHandle) {
+    let runtime = runtime().await;
+    let mut params = create_params(TaskTriggerSpec::Immediate);
+    configure_agent_task(&mut params);
+    params.agent_spec = Some(agent_spec(3));
+    let response = runtime
+        .service()
+        .create_task(task_create_context_for(&params), params)
+        .await
+        .unwrap();
+    let run = response.run.unwrap();
+    let store = runtime.service().store();
+    store
+        .claim_task_run_for_dispatch(&run.id, run.created_at)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .claim_task_run_execution_for_dispatch(
+            &run.id,
+            TaskExecutorKind::Agent,
+            "before-graph",
+            run.created_at,
+            run.created_at + 60,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let handle = TaskExecutionHandle::new(
+        store,
+        runtime.event_bus(),
+        run.task_id.clone(),
+        run.id.clone(),
+    );
+    (runtime, run, handle)
+}
+
+#[tokio::test]
+async fn cancellation_before_agent_graph_admission_is_atomic_and_restart_safe() {
+    let (runtime, run, handle) = unadmitted_agent_fixture().await;
+    let store = runtime.service().store();
+    let at = run.created_at + 10;
+    handle
+        .cancel_run(Some("cancel before graph".into()), at)
+        .await
+        .unwrap();
+    let execution = store
+        .load_execution_for_run(&run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(execution.status, TaskRunExecutionStatus::Cancelled);
+    assert!(
+        pioneer_crud::load_agent_execution(&store.database_connection(), &execution.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .get_task_occurrence_contract_by_run(&run.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskOccurrenceStatus::Cancelled
+    );
+    let before = events(&runtime, &run).await;
+    let recovered = TaskExecutionHandle::new(
+        store,
+        runtime.event_bus(),
+        run.task_id.clone(),
+        run.id.clone(),
+    );
+    recovered
+        .cancel_run(Some("cancel before graph".into()), at + 20)
+        .await
+        .unwrap();
+    assert_eq!(events(&runtime, &run).await, before);
+    assert!(deliveries(&runtime, &run).await.is_empty());
+}
+
+#[tokio::test]
+async fn cancellation_rejects_a_missing_previously_bound_agent_graph() {
+    let (runtime, run, handle) = unadmitted_agent_fixture().await;
+    let store = runtime.service().store();
+    let execution = store
+        .load_execution_for_run(&run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut occurrence = store
+        .get_task_occurrence_contract_by_run(&run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    // Inject the durable lineage of an admitted graph whose execution is lost.
+    occurrence.agent_execution_id = Some(execution.id.clone());
+    occurrence.work_graph_root_execution_id = Some(execution.id.clone());
+    occurrence.root_resource_scope_id = Some(execution.id.clone());
+    store
+        .upsert_task_occurrence_contract(&occurrence, run.created_at)
+        .await
+        .unwrap();
+    let before = events(&runtime, &run).await;
+    let error = handle
+        .cancel_run(Some("cancel".into()), run.created_at + 10)
+        .await
+        .unwrap_err();
+    assert!(error.downcast_ref::<TaskTerminalConflict>().is_some());
+    assert_eq!(events(&runtime, &run).await, before);
+    assert_eq!(
+        store
+            .load_execution_for_run(&run.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        execution
+    );
+    assert_eq!(
+        store
+            .get_task_occurrence_contract_by_run(&run.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        occurrence
+    );
+    assert!(
+        !store
+            .get_task_run(&run.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .is_terminal()
+    );
+}
+
+#[tokio::test]
+async fn task_cancellation_preserves_the_existing_work_graph_execution_fence() {
+    let (runtime, run, handle) = unadmitted_agent_fixture().await;
+    let store = runtime.service().store();
+    persist_test_agent_turn(
+        &runtime,
+        TEST_PARENT_EXECUTION_ID,
+        TEST_PARENT_THREAD_ID,
+        TEST_PARENT_TURN_ID,
+        None,
+    )
+    .await;
+    let execution = store
+        .load_execution_for_run(&run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    persist_test_child_agent_execution(&runtime, &execution.id).await;
+    let mut occurrence = store
+        .get_task_occurrence_contract_by_run(&run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    occurrence.agent_execution_id = Some(execution.id.clone());
+    occurrence.work_graph_root_execution_id = Some(TEST_PARENT_EXECUTION_ID.into());
+    occurrence.root_resource_scope_id = Some(TEST_PARENT_EXECUTION_ID.into());
+    occurrence.status = TaskOccurrenceStatus::Cancelled;
+    occurrence.terminal_reason = Some("graph fence".into());
+    store
+        .upsert_task_occurrence_contract(&occurrence, run.created_at + 5)
+        .await
+        .unwrap();
+    let db = store.database_connection();
+    // Reproduce cancel_agent_work_graph's pre-Task fence: it leaves payloads
+    // untouched and records completion before the RunCancelled event exists.
+    db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+        "UPDATE task_run_execution SET status='cancelled',worker_id=NULL,lease_until=NULL,completed_at=updated_at WHERE id=?",
+        [execution.id.clone().into()],
+    )).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+        "UPDATE agent_execution SET status='cancelled',finished_at=updated_at,parent_task_id=? WHERE id=?",
+        [run.task_id.clone().into(), execution.id.clone().into()],
+    )).await.unwrap();
+    let fenced = store
+        .load_execution_for_run(&run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let before = events(&runtime, &run).await;
+    assert!(
+        handle
+            .complete_run(None, run.created_at + 9)
+            .await
+            .unwrap_err()
+            .downcast_ref::<TaskTerminalConflict>()
+            .is_some()
+    );
+    assert_eq!(events(&runtime, &run).await, before);
+    assert_eq!(
+        store
+            .load_execution_for_run(&run.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        fenced
+    );
+    handle
+        .cancel_run(Some("Task cancellation".into()), run.created_at + 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .load_execution_for_run(&run.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        fenced
+    );
+    assert_eq!(
+        store
+            .get_task_occurrence_contract_by_run(&run.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        occurrence
+    );
+    assert_eq!(
+        store.get_task_run(&run.id).await.unwrap().unwrap().status,
+        TaskRunStatus::Cancelled
+    );
+    let before = events(&runtime, &run).await;
+    handle
+        .cancel_run(Some("Task cancellation".into()), run.created_at + 20)
+        .await
+        .unwrap();
+    assert_eq!(events(&runtime, &run).await, before);
+    assert!(
+        handle
+            .complete_run(None, run.created_at + 30)
+            .await
+            .unwrap_err()
+            .downcast_ref::<TaskTerminalConflict>()
+            .is_some()
+    );
+}

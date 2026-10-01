@@ -367,6 +367,43 @@ impl CrudStore {
         if let Some(execution) =
             task_run_execution::find_execution_by_run(db, &prepared.state.run.id).await?
         {
+            let agent = if execution.executor_kind == "agent" {
+                crate::repositories::agent_domain::load_agent_execution(db, &execution.id).await?
+            } else {
+                None
+            };
+            if let Some(agent) = agent.as_ref() {
+                let committed_status = match agent.status.as_str() {
+                    "completed" => "succeeded",
+                    other => other,
+                };
+                if matches!(
+                    committed_status,
+                    "succeeded" | "failed" | "blocked" | "cancelled" | "timed_out"
+                ) && committed_status != agent_status
+                {
+                    return conflict("different committed agent execution outcome");
+                }
+            }
+            if execution.executor_kind == "agent"
+                && agent.is_none()
+                && (prepared.state.occurrence.agent_execution_id.is_some()
+                    || prepared
+                        .state
+                        .occurrence
+                        .work_graph_root_execution_id
+                        .is_some()
+                    || prepared.state.occurrence.root_resource_scope_id.is_some()
+                    || prepared
+                        .state
+                        .execution_fence
+                        .as_ref()
+                        .and_then(|(_, generation)| *generation)
+                        .is_some()
+                    || status == TaskRunExecutionStatus::Succeeded)
+            {
+                return conflict("admitted agent execution disappeared");
+            }
             if task_run_execution_status_from_db(&execution.status)
                 .context("invalid execution status")?
                 .is_terminal()
@@ -375,7 +412,43 @@ impl CrudStore {
                     || execution.result_json != prepared.result_json
                     || execution.error_json != prepared.error_json
                 {
-                    return conflict("different committed execution outcome");
+                    // Work-graph cancellation fences Task executions before
+                    // Task events are emitted. That fence intentionally has no
+                    // result/error payload; retain it when closing the Task.
+                    let occurrence = task_actor_contract::find_task_occurrence_by_run_id(
+                        db,
+                        &prepared.state.run.id,
+                    )
+                    .await?
+                    .context("terminal Task run has no occurrence")?;
+                    let graph_cancelled =
+                        matches!(prepared.terminal, TaskEventPayload::RunCancelled { .. })
+                            && execution.status == "cancelled"
+                            && execution.completed_at.is_some()
+                            && execution.result_json.is_none()
+                            && execution.error_json.is_none()
+                            && occurrence.status == TaskOccurrenceStatus::Cancelled
+                            && occurrence.agent_execution_id.as_deref()
+                                == Some(execution.id.as_str())
+                            && agent.as_ref().is_some_and(|agent| {
+                                agent.status == "cancelled"
+                                    && agent.finished_at.is_some()
+                                    && agent.workspace_id == prepared.state.task.workspace_id
+                                    && agent.parent_task_id.as_deref()
+                                        == Some(prepared.state.task.id.as_str())
+                                    && u64::try_from(agent.execution_generation).ok()
+                                        == Some(occurrence.execution_generation)
+                                    && occurrence.work_graph_root_execution_id.as_deref()
+                                        == Some(agent.work_graph_root_execution_id.as_str())
+                                    && occurrence.root_resource_scope_id.as_deref()
+                                        == Some(agent.work_graph_root_execution_id.as_str())
+                            });
+                    if !graph_cancelled {
+                        return conflict("different committed execution outcome");
+                    }
+                    // The graph fence owns its original completion time and
+                    // reason. Both execution and occurrence are finalized.
+                    return Ok(());
                 }
             } else {
                 let transitioned = task_run_execution::mark_execution_terminal_json(
@@ -391,13 +464,18 @@ impl CrudStore {
                     return conflict("execution changed during terminal finalization");
                 }
                 if execution.executor_kind == "agent" {
-                    crate::repositories::agent_domain::finalize_agent_execution(
-                        db,
-                        &execution.id,
-                        agent_status,
-                        at,
-                    )
-                    .await?;
+                    if agent.is_some() {
+                        crate::repositories::agent_domain::finalize_agent_execution(
+                            db,
+                            &execution.id,
+                            agent_status,
+                            at,
+                        )
+                        .await?;
+                    }
+                    // Reservation/claim precedes graph admission. A startup
+                    // failure or cancellation can close that unbound execution
+                    // without inventing an AgentExecution or ignoring a lost one.
                 }
             }
         }
