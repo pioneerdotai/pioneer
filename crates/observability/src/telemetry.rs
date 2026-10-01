@@ -1247,12 +1247,11 @@ mod tests {
         let _reset = TelemetryEnabledReset(super::super::telemetry_enabled());
         super::super::set_telemetry_enabled(true);
         let transport = Arc::new(TestTransport::default());
-        let client = sentry::Client::from(sentry::ClientOptions {
-            dsn: Some("https://public@example.invalid/1".parse().unwrap()),
-            transport: Some(Arc::new(transport.clone())),
-            default_integrations: false,
-            ..Default::default()
-        });
+        let mut options = sentry::ClientOptions::default();
+        options.dsn = Some("https://public@example.invalid/1".parse().unwrap());
+        options.transport = Some(Arc::new(transport.clone()));
+        options.default_integrations = false;
+        let client = sentry::Client::from(options);
         let hub = Arc::new(sentry::Hub::new(
             Some(Arc::new(client)),
             Arc::new(Default::default()),
