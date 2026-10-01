@@ -2,22 +2,18 @@ use crate::TaskRuntimeResult;
 use crate::event_bus::TaskEventBus;
 use crate::projector::TaskProjector;
 use crate::scheduler::TASK_EXECUTION_LEASE_SECONDS;
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use pioneer_crud::CrudStore;
 use pioneer_protocol::{
-    TaskCompletionBehavior, TaskDeliveriesParams, TaskDeliveryMode, TaskDeliveryStatus, TaskError,
-    TaskErrorClass, TaskEventPayload, TaskExecutorKind, TaskGetResponse, TaskProgressDetails,
-    TaskResult, TaskResultCandidate, TaskResultReviewEvent, TaskRetryBackoffKind, TaskRun,
-    TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunTurn,
-    TaskThreadLineage, TaskWriteLockStatus, generate_id,
+    TaskError, TaskErrorClass, TaskEventPayload, TaskExecutorKind, TaskProgressDetails, TaskResult,
+    TaskResultCandidate, TaskResultReviewEvent, TaskRun, TaskRunExecution, TaskRunThreadBinding,
+    TaskRunTurn, TaskThreadLineage, TaskWriteLockStatus,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tokio::sync::RwLock;
-
-const ID_LEN: usize = 21;
 
 #[derive(Debug, Clone)]
 pub struct TaskExecutionContext {
@@ -35,6 +31,8 @@ pub struct TaskExecutionHandle {
     task_id: String,
     run_id: String,
     agent_attempt_generation: Arc<OnceCell<Option<i64>>>,
+    #[cfg(test)]
+    pub(crate) terminal_preparation_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl TaskExecutionHandle {
@@ -52,6 +50,8 @@ impl TaskExecutionHandle {
             task_id,
             run_id,
             agent_attempt_generation: Arc::new(OnceCell::new()),
+            #[cfg(test)]
+            terminal_preparation_barrier: None,
         }
     }
 
@@ -269,57 +269,12 @@ impl TaskExecutionHandle {
         result: Option<TaskResult>,
         completed_at: i64,
     ) -> TaskRuntimeResult<()> {
-        if self.run_is_terminal().await? {
-            return Ok(());
-        }
-        if self.task_is_terminal().await? {
-            return self
-                .release_locks_only(
-                    TaskWriteLockStatus::Released,
-                    Some("run completed after task terminal".to_owned()),
-                    completed_at,
-                )
-                .await;
-        }
-
-        let mut events = vec![TaskEventPayload::RunCompleted {
+        self.commit_terminal_run(TaskEventPayload::RunCompleted {
             task_id: self.task_id.clone(),
             run_id: self.run_id.clone(),
-            result: result.clone(),
+            result,
             completed_at,
-        }];
-        self.push_write_lock_released(
-            &mut events,
-            TaskWriteLockStatus::Released,
-            Some("run completed".to_owned()),
-            completed_at,
-        )
-        .await?;
-        if self.should_emit_terminal_task_event().await? {
-            events.push(TaskEventPayload::TaskCompleted {
-                task_id: self.task_id.clone(),
-                result: result.clone(),
-                completed_at,
-            });
-        } else {
-            self.push_active_schedule_after_terminal(&mut events, completed_at)
-                .await?;
-        }
-        self.push_delivery_queued(&mut events, completed_at, result.clone(), None)
-            .await?;
-        self.append_and_publish(events, completed_at).await?;
-        self.mark_execution_terminal(
-            TaskRunExecutionStatus::Succeeded,
-            completed_at,
-            result.as_ref(),
-            None,
-        )
-        .await?;
-        self.update_occurrence_status(
-            pioneer_protocol::TaskOccurrenceStatus::Delivered,
-            None,
-            completed_at,
-        )
+        })
         .await
     }
 
@@ -330,69 +285,15 @@ impl TaskExecutionHandle {
     ) -> TaskRuntimeResult<()> {
         if task_error_is_cancellation(error.as_ref()) {
             return self
-                .cancel_run(
-                    error.as_ref().map(|error| error.message.clone()),
-                    completed_at,
-                )
+                .cancel_run(error.as_ref().map(|e| e.message.clone()), completed_at)
                 .await;
         }
-        if self.run_is_terminal().await? {
-            return Ok(());
-        }
-        if self.task_is_terminal().await? {
-            return self
-                .release_locks_only(
-                    TaskWriteLockStatus::Released,
-                    Some("run failed after task terminal".to_owned()),
-                    completed_at,
-                )
-                .await;
-        }
-
-        let mut events = vec![TaskEventPayload::RunFailed {
+        self.commit_terminal_run(TaskEventPayload::RunFailed {
             task_id: self.task_id.clone(),
             run_id: self.run_id.clone(),
-            error: error.clone(),
+            error,
             completed_at,
-        }];
-        self.push_write_lock_released(
-            &mut events,
-            TaskWriteLockStatus::Released,
-            Some("run failed".to_owned()),
-            completed_at,
-        )
-        .await?;
-        if self
-            .push_retry_after_failure(&mut events, error.clone(), completed_at)
-            .await?
-        {
-            return self.append_and_publish(events, completed_at).await;
-        }
-        if self.should_emit_terminal_task_event().await? {
-            events.push(TaskEventPayload::TaskFailed {
-                task_id: self.task_id.clone(),
-                error: error.clone(),
-                completed_at,
-            });
-        } else {
-            self.push_active_schedule_after_terminal(&mut events, completed_at)
-                .await?;
-        }
-        self.push_delivery_queued(&mut events, completed_at, None, error.clone())
-            .await?;
-        self.append_and_publish(events, completed_at).await?;
-        self.mark_execution_terminal(
-            failure_execution_status(error.as_ref()),
-            completed_at,
-            None,
-            error.as_ref(),
-        )
-        .await?;
-        self.update_occurrence_status(
-            pioneer_protocol::TaskOccurrenceStatus::Failed,
-            error.as_ref().map(|value| value.message.clone()),
-            completed_at,
-        )
+        })
         .await
     }
 
@@ -401,57 +302,12 @@ impl TaskExecutionHandle {
         error: Option<TaskError>,
         blocked_at: i64,
     ) -> TaskRuntimeResult<()> {
-        if self.run_is_terminal().await? {
-            return Ok(());
-        }
-        if self.task_is_terminal().await? {
-            return self
-                .release_locks_only(
-                    TaskWriteLockStatus::Released,
-                    Some("run blocked after task terminal".to_owned()),
-                    blocked_at,
-                )
-                .await;
-        }
-
-        let mut events = vec![TaskEventPayload::RunBlocked {
+        self.commit_terminal_run(TaskEventPayload::RunBlocked {
             task_id: self.task_id.clone(),
             run_id: self.run_id.clone(),
-            error: error.clone(),
+            error,
             blocked_at,
-        }];
-        self.push_write_lock_released(
-            &mut events,
-            TaskWriteLockStatus::Released,
-            Some("run blocked".to_owned()),
-            blocked_at,
-        )
-        .await?;
-        if self.should_emit_terminal_task_event().await? {
-            events.push(TaskEventPayload::TaskBlocked {
-                task_id: self.task_id.clone(),
-                error: error.clone(),
-                blocked_at,
-            });
-        } else {
-            self.push_active_schedule_after_terminal(&mut events, blocked_at)
-                .await?;
-        }
-        self.push_delivery_queued(&mut events, blocked_at, None, error.clone())
-            .await?;
-        self.append_and_publish(events, blocked_at).await?;
-        self.mark_execution_terminal(
-            TaskRunExecutionStatus::Blocked,
-            blocked_at,
-            None,
-            error.as_ref(),
-        )
-        .await?;
-        self.update_occurrence_status(
-            pioneer_protocol::TaskOccurrenceStatus::Failed,
-            error.as_ref().map(|value| value.message.clone()),
-            blocked_at,
-        )
+        })
         .await
     }
 
@@ -460,70 +316,28 @@ impl TaskExecutionHandle {
         reason: Option<String>,
         cancelled_at: i64,
     ) -> TaskRuntimeResult<()> {
-        if self.run_is_terminal().await? {
-            return Ok(());
-        }
-        if self.task_is_terminal().await? {
-            return self
-                .release_locks_only(TaskWriteLockStatus::Cancelled, reason.clone(), cancelled_at)
-                .await;
-        }
-
-        let mut events = vec![TaskEventPayload::RunCancelled {
+        self.commit_terminal_run(TaskEventPayload::RunCancelled {
             task_id: self.task_id.clone(),
             run_id: self.run_id.clone(),
-            reason: reason.clone(),
-            cancelled_at,
-        }];
-        self.push_write_lock_released(
-            &mut events,
-            TaskWriteLockStatus::Cancelled,
-            reason.clone(),
-            cancelled_at,
-        )
-        .await?;
-        if self.should_emit_terminal_task_event().await? {
-            events.push(TaskEventPayload::TaskCancelled {
-                task_id: self.task_id.clone(),
-                reason: reason.clone(),
-                completed_at: cancelled_at,
-            });
-        } else {
-            self.push_active_schedule_after_terminal(&mut events, cancelled_at)
-                .await?;
-        }
-        let error = reason.as_ref().map(|message| TaskError {
-            recovery_diagnostic: None,
-            code: "task_run_cancelled".to_owned(),
-            message: message.clone(),
-            class: TaskErrorClass::Cancelled,
-            details: None,
-            failed_run_id: Some(self.run_id.clone()),
-        });
-        self.push_delivery_queued(&mut events, cancelled_at, None, error)
-            .await?;
-        self.append_and_publish(events, cancelled_at).await?;
-        let terminal_error = reason.as_ref().map(|message| TaskError {
-            recovery_diagnostic: None,
-            code: "task_run_cancelled".to_owned(),
-            message: message.clone(),
-            class: TaskErrorClass::Cancelled,
-            details: None,
-            failed_run_id: Some(self.run_id.clone()),
-        });
-        self.mark_execution_terminal(
-            TaskRunExecutionStatus::Cancelled,
-            cancelled_at,
-            None,
-            terminal_error.as_ref(),
-        )
-        .await?;
-        self.update_occurrence_status(
-            pioneer_protocol::TaskOccurrenceStatus::Cancelled,
             reason,
             cancelled_at,
-        )
+        })
         .await
+    }
+
+    async fn commit_terminal_run(&self, terminal: TaskEventPayload) -> TaskRuntimeResult<()> {
+        let prepared = self
+            .store
+            .prepare_task_terminal_transition(terminal)
+            .await?
+            .with_pinned_agent_attempt(self.agent_attempt_generation.get().copied().flatten())?;
+        #[cfg(test)]
+        if let Some(barrier) = self.terminal_preparation_barrier.as_ref() {
+            barrier.wait().await;
+        }
+        let outcome = self.store.commit_task_terminal_transition(prepared).await?;
+        self.event_bus.publish_many(outcome.events).await;
+        Ok(())
     }
 
     async fn update_occurrence_status(
@@ -638,296 +452,6 @@ impl TaskExecutionHandle {
         Ok(())
     }
 
-    async fn release_locks_only(
-        &self,
-        status: TaskWriteLockStatus,
-        reason: Option<String>,
-        released_at: i64,
-    ) -> TaskRuntimeResult<()> {
-        let mut events = Vec::new();
-        self.push_write_lock_released(&mut events, status, reason, released_at)
-            .await?;
-        if events.is_empty() {
-            return Ok(());
-        }
-        self.append_and_publish(events, released_at).await
-    }
-
-    async fn task_is_terminal(&self) -> TaskRuntimeResult<bool> {
-        let Some(task_response) = self.store.get_task(self.task_id.as_str()).await? else {
-            return Ok(true);
-        };
-        Ok(task_response.task.status.is_terminal())
-    }
-
-    async fn run_is_terminal(&self) -> TaskRuntimeResult<bool> {
-        let Some(run) = self.store.get_task_run(self.run_id.as_str()).await? else {
-            return Ok(true);
-        };
-        Ok(run.status.is_terminal())
-    }
-
-    async fn should_emit_terminal_task_event(&self) -> TaskRuntimeResult<bool> {
-        let Some(task_response) = self.store.get_task(self.task_id.as_str()).await? else {
-            return Ok(false);
-        };
-        Ok(task_response
-            .task
-            .lifecycle_policy
-            .as_ref()
-            .map(|policy| {
-                matches!(
-                    policy.completion,
-                    TaskCompletionBehavior::CompleteOnTerminalRun
-                )
-            })
-            .unwrap_or(true))
-    }
-
-    async fn push_active_schedule_after_terminal(
-        &self,
-        events: &mut Vec<TaskEventPayload>,
-        event_timestamp_secs: i64,
-    ) -> TaskRuntimeResult<()> {
-        let Some(task_response) = self.store.get_task(self.task_id.as_str()).await? else {
-            return Ok(());
-        };
-        let Some(run) = task_response
-            .runs
-            .iter()
-            .rev()
-            .find(|run| run.id == self.run_id)
-        else {
-            return Ok(());
-        };
-        let Some(trigger_id) = run.trigger_id.as_deref() else {
-            return Ok(());
-        };
-        if let Some(mut trigger) = task_response
-            .triggers
-            .into_iter()
-            .find(|trigger| trigger.id == trigger_id)
-        {
-            trigger.updated_at = event_timestamp_secs;
-            events.push(TaskEventPayload::TaskRescheduled {
-                task_id: self.task_id.clone(),
-                trigger,
-                rescheduled_at: event_timestamp_secs,
-                reason: pioneer_protocol::TaskRescheduleReason::RunTerminalStatusRefresh,
-            });
-        }
-        Ok(())
-    }
-
-    async fn push_delivery_queued(
-        &self,
-        events: &mut Vec<TaskEventPayload>,
-        event_timestamp_secs: i64,
-        result_snapshot: Option<TaskResult>,
-        error_snapshot: Option<TaskError>,
-    ) -> TaskRuntimeResult<()> {
-        let Some(task_response) = self.store.get_task(self.task_id.as_str()).await? else {
-            return Ok(());
-        };
-        let actor_contract = self
-            .store
-            .get_task_actor_contract(task_response.task.id.as_str())
-            .await?
-            .with_context(|| {
-                format!(
-                    "Task `{}` has no durable actor contract",
-                    task_response.task.id
-                )
-            })?;
-        let occurrence = self
-            .store
-            .get_task_occurrence_contract_by_run(self.run_id.as_str())
-            .await?
-            .with_context(|| {
-                format!(
-                    "Task run `{}` has no durable occurrence contract",
-                    self.run_id
-                )
-            })?;
-        // New occurrences freeze their normalized policy before dispatch.
-        // The fallback is only for rows created before routing version 1.
-        let delivery_policy = occurrence
-            .delivery_plan
-            .as_ref()
-            .map(|plan| &plan.policy)
-            .or(task_response.task.delivery_policy.as_ref());
-        let Some(delivery) = delivery_for_terminal_run(
-            &task_response,
-            delivery_policy,
-            self.run_id.as_str(),
-            event_timestamp_secs,
-            result_snapshot,
-            error_snapshot,
-            actor_contract.delivery.destination_user_id.as_deref(),
-        ) else {
-            return Ok(());
-        };
-        let existing = self
-            .store
-            .list_task_deliveries(TaskDeliveriesParams {
-                workspace_id: task_response.task.workspace_id.clone(),
-                task_id: Some(task_response.task.id.clone()),
-                run_id: Some(self.run_id.clone()),
-                statuses: Vec::new(),
-                limit: Some(100),
-            })
-            .await?;
-        if existing
-            .deliveries
-            .iter()
-            .any(|existing| existing.delivery_key == delivery.delivery_key)
-        {
-            return Ok(());
-        }
-        actor_contract
-            .delivery
-            .validate()
-            .map_err(|error| anyhow!("task delivery authority is invalid: {error:?}"))?;
-        events.push(TaskEventPayload::DeliveryQueued { delivery });
-        Ok(())
-    }
-
-    async fn push_retry_after_failure(
-        &self,
-        events: &mut Vec<TaskEventPayload>,
-        error: Option<TaskError>,
-        completed_at: i64,
-    ) -> TaskRuntimeResult<bool> {
-        let Some(task_response) = self.store.get_task(self.task_id.as_str()).await? else {
-            return Ok(false);
-        };
-        let Some(failed_run) = task_response
-            .runs
-            .iter()
-            .rev()
-            .find(|run| run.id == self.run_id)
-            .cloned()
-        else {
-            return Ok(false);
-        };
-        let Some(policy) = task_response.task.retry_policy.as_ref() else {
-            return Ok(false);
-        };
-        let error_class = error
-            .as_ref()
-            .map(|error| error.class)
-            .unwrap_or(pioneer_protocol::TaskErrorClass::Unknown);
-        if !policy.retry_on.iter().any(|class| *class == error_class) {
-            return Ok(false);
-        }
-        if policy.max_attempts <= failed_run.attempt_number {
-            events.push(TaskEventPayload::RunRetryExhausted {
-                task_id: self.task_id.clone(),
-                run_group_id: failed_run.run_group_id.clone(),
-                final_run_id: failed_run.id.clone(),
-                error,
-                exhausted_at: completed_at,
-            });
-            return Ok(false);
-        }
-
-        let next_attempt = failed_run.attempt_number.saturating_add(1);
-        let delay_seconds = retry_delay_seconds(policy, next_attempt)?;
-        let ready_at = completed_at.saturating_add(delay_seconds);
-        let retry_run = TaskRun {
-            id: generate_id(ID_LEN),
-            task_id: self.task_id.clone(),
-            trigger_id: failed_run.trigger_id.clone(),
-            parent_run_id: Some(failed_run.id.clone()),
-            run_group_id: failed_run.run_group_id.clone(),
-            attempt_number: next_attempt,
-            retry_of_run_id: Some(failed_run.id.clone()),
-            ready_at: Some(ready_at),
-            run_number: task_response
-                .runs
-                .iter()
-                .map(|run| run.run_number)
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1),
-            status: TaskRunStatus::Queued,
-            executor_kind: failed_run.executor_kind,
-            started_at: None,
-            completed_at: None,
-            heartbeat_at: None,
-            locked_by: None,
-            lock_expires_at: None,
-            result: None,
-            error: None,
-            created_at: completed_at,
-            updated_at: completed_at,
-        };
-        let agent_spec = task_response
-            .agent_specs
-            .iter()
-            .rev()
-            .find(|spec| spec.run_id.as_deref() == Some(failed_run.id.as_str()))
-            .or_else(|| {
-                task_response
-                    .agent_specs
-                    .iter()
-                    .rev()
-                    .find(|spec| spec.run_id.is_none())
-            })
-            .cloned()
-            .map(|mut spec| {
-                spec.run_id = Some(retry_run.id.clone());
-                spec.updated_at = completed_at;
-                spec
-            });
-        events.push(TaskEventPayload::TaskQueued {
-            task_id: self.task_id.clone(),
-            run_id: Some(retry_run.id.clone()),
-        });
-        events.push(TaskEventPayload::RunRetryScheduled {
-            task_id: self.task_id.clone(),
-            failed_run_id: failed_run.id,
-            retry_run: retry_run.clone(),
-            next_attempt_at: ready_at,
-            reason: error,
-        });
-        events.push(TaskEventPayload::RunCreated {
-            run: retry_run,
-            agent_spec,
-        });
-        Ok(true)
-    }
-
-    async fn push_write_lock_released(
-        &self,
-        events: &mut Vec<TaskEventPayload>,
-        status: TaskWriteLockStatus,
-        reason: Option<String>,
-        released_at: i64,
-    ) -> TaskRuntimeResult<()> {
-        for mut lock in self
-            .store
-            .list_task_write_locks_by_run(self.run_id.as_str())
-            .await?
-            .into_iter()
-            .filter(|lock| {
-                matches!(
-                    lock.status,
-                    TaskWriteLockStatus::Pending
-                        | TaskWriteLockStatus::Acquired
-                        | TaskWriteLockStatus::Blocked
-                )
-            })
-        {
-            lock.status = status;
-            lock.released_at = Some(released_at);
-            lock.reason = reason.clone();
-            lock.updated_at = released_at;
-            events.push(TaskEventPayload::WriteLockReleased { lock, released_at });
-        }
-        Ok(())
-    }
-
     async fn push_waiting_review_write_lock_extensions(
         &self,
         events: &mut Vec<TaskEventPayload>,
@@ -950,192 +474,6 @@ impl TaskExecutionHandle {
         }
         Ok(())
     }
-
-    async fn mark_execution_terminal(
-        &self,
-        status: TaskRunExecutionStatus,
-        completed_at: i64,
-        result: Option<&TaskResult>,
-        error: Option<&TaskError>,
-    ) -> TaskRuntimeResult<()> {
-        if let Some(execution) = self
-            .store
-            .load_execution_for_run(self.run_id.as_str())
-            .await?
-            && !execution.status.is_terminal()
-        {
-            let _ = self
-                .store
-                .mark_execution_terminal(execution.id.as_str(), status, completed_at, result, error)
-                .await?;
-        }
-        Ok(())
-    }
-}
-
-fn retry_delay_seconds(
-    policy: &pioneer_protocol::TaskRetryPolicy,
-    next_attempt_number: u32,
-) -> TaskRuntimeResult<i64> {
-    let delay = match policy.backoff {
-        TaskRetryBackoffKind::None => 0,
-        TaskRetryBackoffKind::Fixed => policy.initial_delay_seconds.unwrap_or(0),
-        TaskRetryBackoffKind::Exponential => {
-            let initial = policy.initial_delay_seconds.unwrap_or(1).max(1);
-            let exponent = next_attempt_number.saturating_sub(2).min(30);
-            let multiplier = 1_i64.checked_shl(exponent).unwrap_or(i64::MAX);
-            initial.saturating_mul(multiplier)
-        }
-    };
-    let capped = policy
-        .max_delay_seconds
-        .map(|max_delay| delay.min(max_delay.max(0)))
-        .unwrap_or(delay);
-    Ok(capped.max(0))
-}
-
-fn delivery_for_terminal_run(
-    task_response: &TaskGetResponse,
-    policy: Option<&pioneer_protocol::TaskDeliveryPolicy>,
-    run_id: &str,
-    event_timestamp_secs: i64,
-    result_snapshot: Option<TaskResult>,
-    error_snapshot: Option<TaskError>,
-    exact_notification_recipient: Option<&str>,
-) -> Option<pioneer_protocol::TaskDelivery> {
-    let policy = policy?;
-    if policy.mode == TaskDeliveryMode::None {
-        return None;
-    }
-    let thread_target = (policy.mode == TaskDeliveryMode::Thread)
-        .then_some(policy.thread_target)
-        .flatten();
-    if policy.mode == TaskDeliveryMode::Thread && thread_target.is_none() {
-        return None;
-    }
-    let target_thread_id = match policy.mode {
-        TaskDeliveryMode::Thread => policy.thread_id.clone(),
-        _ => None,
-    };
-    let target_user_id = (policy.mode == TaskDeliveryMode::UserNotification)
-        .then(|| {
-            exact_notification_recipient.map(str::to_owned).or_else(|| {
-                (task_response.task.owner_kind == pioneer_protocol::TaskOwnerKind::User)
-                    .then(|| task_response.task.owner_id.clone())
-                    .flatten()
-            })
-        })
-        .flatten();
-    let webhook_url = (policy.mode == TaskDeliveryMode::Webhook)
-        .then(|| policy.webhook_url.clone())
-        .flatten();
-    if policy.mode == TaskDeliveryMode::Thread && target_thread_id.is_none() {
-        return None;
-    }
-    if policy.mode == TaskDeliveryMode::UserNotification && target_user_id.is_none() {
-        return None;
-    }
-    if policy.mode == TaskDeliveryMode::Webhook && webhook_url.is_none() {
-        return None;
-    }
-    let run = task_response.runs.iter().rev().find(|run| run.id == run_id);
-    let result_snapshot = if policy.include_result {
-        result_snapshot
-            .or_else(|| run.and_then(|run| run.result.clone()))
-            .or_else(|| task_response.task.result.clone())
-            .map(|result| task_delivery_result_snapshot(result, policy.format))
-    } else {
-        None
-    };
-    let error_snapshot = error_snapshot.or_else(|| {
-        run.and_then(|run| run.error.clone())
-            .or_else(|| task_response.task.error.clone())
-    });
-    let target = target_thread_id
-        .clone()
-        .or_else(|| target_user_id.clone())
-        .or_else(|| webhook_url.clone())
-        .unwrap_or_else(|| "none".to_owned());
-    let delivery_key = match thread_target {
-        Some(thread_target) => format!(
-            "{}:{}:{}:{}:{}",
-            task_response.task.id,
-            run_id,
-            delivery_mode_key(policy.mode),
-            delivery_thread_target_key(thread_target),
-            target
-        ),
-        None => format!(
-            "{}:{}:{}:{}",
-            task_response.task.id,
-            run_id,
-            delivery_mode_key(policy.mode),
-            target
-        ),
-    };
-    Some(pioneer_protocol::TaskDelivery {
-        id: generate_id(ID_LEN),
-        workspace_id: task_response.task.workspace_id.clone(),
-        task_id: task_response.task.id.clone(),
-        run_id: run_id.to_owned(),
-        delivery_key,
-        mode: policy.mode,
-        thread_target,
-        target_thread_id,
-        target_user_id,
-        webhook_url: webhook_url.clone(),
-        webhook_url_fingerprint: webhook_url
-            .as_deref()
-            .map(crate::actor_contract::delivery_target_fingerprint),
-        status: TaskDeliveryStatus::Pending,
-        next_attempt_at: Some(event_timestamp_secs),
-        attempt_count: 0,
-        // Every surface is an idempotent outbox delivery. A crash after the
-        // destination commit but before acknowledgement must retry the same
-        // deterministic receipt instead of stranding it after one attempt.
-        max_attempts: 3,
-        result_snapshot,
-        error_snapshot,
-        delivered_turn_id: None,
-        delivered_notification_id: None,
-        delivered_at: None,
-        last_error: None,
-        created_at: event_timestamp_secs,
-        updated_at: event_timestamp_secs,
-    })
-}
-
-fn task_delivery_result_snapshot(
-    result: TaskResult,
-    format: pioneer_protocol::TaskDeliveryFormat,
-) -> TaskResult {
-    match format {
-        pioneer_protocol::TaskDeliveryFormat::FullResult => result,
-        pioneer_protocol::TaskDeliveryFormat::Summary => TaskResult {
-            summary: result.summary,
-            data: None,
-            artifacts: Vec::new(),
-            completed_by_run_id: result.completed_by_run_id,
-        },
-    }
-}
-
-fn delivery_mode_key(mode: TaskDeliveryMode) -> &'static str {
-    match mode {
-        TaskDeliveryMode::None => "none",
-        TaskDeliveryMode::Thread => "thread",
-        TaskDeliveryMode::UserNotification => "user_notification",
-        TaskDeliveryMode::Webhook => "webhook",
-    }
-}
-
-fn delivery_thread_target_key(target: pioneer_protocol::TaskDeliveryThreadTarget) -> &'static str {
-    match target {
-        pioneer_protocol::TaskDeliveryThreadTarget::OriginThread => "origin_thread",
-        pioneer_protocol::TaskDeliveryThreadTarget::CurrentThread => "current_thread",
-        pioneer_protocol::TaskDeliveryThreadTarget::CollaborationRoot => "collaboration_root",
-        pioneer_protocol::TaskDeliveryThreadTarget::ExactThread => "exact_thread",
-    }
 }
 
 fn task_error_is_cancellation(error: Option<&TaskError>) -> bool {
@@ -1150,13 +488,6 @@ fn task_error_is_cancellation(error: Option<&TaskError>) -> bool {
         code.as_str(),
         "task_cancelled" | "task_run_cancelled" | "child_turn_cancelled" | "cancelled"
     ) || code.contains("cancel")
-}
-
-fn failure_execution_status(error: Option<&TaskError>) -> TaskRunExecutionStatus {
-    match error.map(|error| error.class) {
-        Some(TaskErrorClass::Timeout) => TaskRunExecutionStatus::TimedOut,
-        _ => TaskRunExecutionStatus::Failed,
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1231,38 +562,5 @@ fn executor_key(kind: TaskExecutorKind) -> &'static str {
         TaskExecutorKind::Workflow => "workflow",
         TaskExecutorKind::Webhook => "webhook",
         TaskExecutorKind::System => "system",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pioneer_protocol::{TaskArtifact, TaskDeliveryFormat, TaskValue};
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn summary_delivery_snapshot_drops_full_data_and_artifacts() {
-        let result = TaskResult {
-            summary: Some("safe summary".to_owned()),
-            data: Some(TaskValue::Object(BTreeMap::from([(
-                "secret".to_owned(),
-                TaskValue::String("must-not-cross".to_owned()),
-            )]))),
-            artifacts: vec![TaskArtifact {
-                artifact_id: Some("artifact-1".to_owned()),
-                version_id: Some("version-1".to_owned()),
-                path: None,
-                url: None,
-                mime_type: None,
-                metadata: None,
-            }],
-            completed_by_run_id: Some("run-1".to_owned()),
-        };
-
-        let projected = task_delivery_result_snapshot(result, TaskDeliveryFormat::Summary);
-        assert_eq!(projected.summary.as_deref(), Some("safe summary"));
-        assert!(projected.data.is_none());
-        assert!(projected.artifacts.is_empty());
-        assert_eq!(projected.completed_by_run_id.as_deref(), Some("run-1"));
     }
 }

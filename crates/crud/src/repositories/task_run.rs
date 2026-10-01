@@ -84,6 +84,34 @@ pub async fn find_run_by_id<C: ConnectionTrait>(
         .context("failed to query task run by id")
 }
 
+pub async fn find_retry_successor<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+) -> Result<Option<task_run::Model>> {
+    let mut rows = task_run::Entity::find()
+        .filter(task_run::Column::RetryOfRunId.eq(run_id.to_owned()))
+        .limit(2)
+        .all(db)
+        .await
+        .context("failed to query exact task retry successor")?;
+    if rows.len() > 1 {
+        anyhow::bail!("terminal Task run has multiple retry successors");
+    }
+    Ok(rows.pop())
+}
+
+pub async fn find_latest_numbered_run<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+) -> Result<Option<task_run::Model>> {
+    task_run::Entity::find()
+        .filter(task_run::Column::TaskId.eq(task_id.to_owned()))
+        .order_by_desc(task_run::Column::RunNumber)
+        .one(db)
+        .await
+        .context("failed to query latest numbered task run")
+}
+
 pub async fn list_runs_by_task<C: ConnectionTrait>(
     db: &C,
     task_id: &str,

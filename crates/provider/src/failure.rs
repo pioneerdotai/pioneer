@@ -4,6 +4,32 @@
 use crate::types::ProviderFailureClassification;
 use pioneer_protocol::{ProviderFailureClass, ProviderFailureStage};
 
+/// Confirmed protocol completion failure, detected by the OpenRouter decoder.
+/// This contains no response, endpoint or provider-controlled detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderStreamIncomplete {
+    EofWithoutTerminalMarker,
+    DoneWithoutFinishReason,
+}
+
+impl std::fmt::Display for ProviderStreamIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::EofWithoutTerminalMarker => "provider stream ended before a terminal marker",
+            Self::DoneWithoutFinishReason => "provider stream ended without a finish_reason",
+        })
+    }
+}
+
+impl std::error::Error for ProviderStreamIncomplete {}
+
+/// Endpoint redaction retains only this safe typed source, never the raw error.
+pub fn provider_stream_incomplete(error: &anyhow::Error) -> Option<ProviderStreamIncomplete> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ProviderStreamIncomplete>().copied())
+}
+
 /// A bounded error body has no safe provider detail to classify. Preserve the
 /// existing status-only fallback used by agent for this typed transport error.
 pub fn classify_http_error_body_too_large(status: u16) -> ProviderFailureClassification {

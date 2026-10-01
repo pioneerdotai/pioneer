@@ -83,6 +83,10 @@ pub use policy::*;
 pub use policy_codec::memory_turn_policy_from_hook_policy_set;
 use policy_codec::*;
 use post_turn::*;
+pub use post_turn::{
+    MemoryPostTurnResponseFormatCategory, MemoryPostTurnResponseFormatError,
+    validate_memory_post_turn_response_format,
+};
 use post_turn_eligibility::*;
 use prompt_context::*;
 pub use providers::*;
