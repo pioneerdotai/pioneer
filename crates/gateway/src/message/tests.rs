@@ -1,8 +1,8 @@
-#[path = "tests/reconciliation_workers.rs"]
-mod reconciliation_workers;
-
 #[path = "tests/task_capsule.rs"]
 mod task_capsule;
+
+#[path = "tests/reconciliation_workers.rs"]
+mod reconciliation_workers;
 
 use super::{
     AuthenticatedTransferOwner, CLIRuntimeMachineRequestKey, MessageProcessor,
