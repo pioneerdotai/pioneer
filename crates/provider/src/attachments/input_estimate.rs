@@ -10,6 +10,7 @@ use std::{collections::BTreeMap, io::Cursor};
 pub struct MediaInputEstimate {
     pub message: usize,
     pub part: usize,
+    /// Local heuristic for context admission; never measured media billing.
     pub input_tokens: u64,
 }
 
@@ -236,7 +237,7 @@ pub fn image_tokens(provider: &str, model: &str, width: u32, height: u32) -> Res
         .div_ceil(100))
 }
 
-fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
+pub(super) fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
     if matches!(
         mime,
         "video/mp4" | "audio/mp4" | "video/quicktime" | "audio/x-m4a"

@@ -1870,3 +1870,64 @@ mod tests {
         assert!(caps.vision);
     }
 }
+
+#[cfg(test)]
+mod media_contract_tests {
+    use super::*;
+    use crate::{AttachmentDataSource, MessageAttachment, MessageContentPart};
+    use crate::{ChatMessage, Provider};
+    #[test]
+    fn chat_pdf_inline_bytes_and_internal_owned_upload_use_different_fields() {
+        let provider = OpenAiProvider::new("unused");
+        let file = MessageAttachment {
+            mime_type: "application/pdf".into(),
+            name: Some("doc.pdf".into()),
+            size_bytes: None,
+            sha256: None,
+            source: AttachmentDataSource::Bytes {
+                base64_data: "JVBERi0xLjc=".into(),
+            },
+            artifact: None,
+        };
+        let mut prepared = crate::attachments::prepare_messages_for_provider(
+            "openai",
+            &provider.capabilities(),
+            &[ChatMessage::user_parts(vec![MessageContentPart::file(
+                file,
+            )])],
+        )
+        .unwrap();
+        let inline = serde_json::to_value(
+            OpenAiProvider::build_file_part(&prepared.attachments[0]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inline["file"]["file_data"], "JVBERi0xLjc=");
+        assert_eq!(inline["file"]["filename"], "doc.pdf");
+        assert!(inline["file"].get("file_id").is_none());
+        // Simulate the existing authority-scoped upload's result AFTER bytes
+        // were checked. A caller-supplied reference is rejected before this.
+        prepared.attachments[0].source = PreparedAttachmentSource::Reference {
+            reference: "file-owned-upload".into(),
+        };
+        prepared.attachments[0].transport_plan.kind = AttachmentTransportKind::Upload;
+        prepared.attachments[0].bytes = None;
+        let uploaded = serde_json::to_value(
+            OpenAiProvider::build_file_part(&prepared.attachments[0]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(uploaded["file"]["file_id"], "file-owned-upload");
+        assert!(uploaded["file"].get("file_data").is_none());
+    }
+    #[test]
+    fn chat_audio_format_is_not_derived_from_an_arbitrary_mime_subtype() {
+        assert_eq!(
+            OpenAiProvider::audio_format_from_mime("audio/wav").unwrap(),
+            "wav"
+        );
+        assert_eq!(
+            OpenAiProvider::audio_format_from_mime("audio/mpeg").unwrap(),
+            "mp3"
+        );
+        assert!(OpenAiProvider::audio_format_from_mime("audio/flac").is_err());
+    }
+}

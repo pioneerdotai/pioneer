@@ -1495,7 +1495,7 @@ mod tests {
     #[tokio::test]
     async fn completed_transcript_keeps_typed_media_through_preflight_budget_and_wire() {
         let provider = OpenAiCompatibleProvider::new(
-            "deepseek",
+            "fixture-media-renderer",
             "https://api.example.com/v1",
             "test-key",
             AuthStyle::Bearer,
@@ -1558,7 +1558,7 @@ mod tests {
         let canonical = messages.clone();
         let prepared = prepare_messages_for_provider_model(
             provider.name(),
-            "deepseek-reasoner",
+            "fixture-media",
             &provider.capabilities(),
             &messages,
         )
@@ -1580,7 +1580,7 @@ mod tests {
             Some("artifact-file")
         );
         let request = ChatRequest {
-            model: "deepseek-reasoner".into(),
+            model: "fixture-media".into(),
             messages: messages.clone(),
             temperature: None,
             max_tokens: None,
@@ -1618,7 +1618,7 @@ mod tests {
         ));
         let prepared_wire = prepare_messages_for_provider_model(
             provider.name(),
-            "deepseek-reasoner",
+            "fixture-media",
             &provider.capabilities(),
             &budgeted.request.messages,
         )

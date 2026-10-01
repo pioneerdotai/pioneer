@@ -1,6 +1,8 @@
 //! Runtime model catalog. Readers retain a validated snapshot while background
 //! updates publish a replacement. Unavailable until saved or fetched data loads.
 mod fetch;
+mod input;
+pub use input::InputCapabilityState;
 pub mod generator;
 pub mod runtime;
 use std::{
@@ -115,6 +117,9 @@ impl ModelCatalog {
     }
 
     pub fn model(&self, provider: &str, id: &str) -> Option<&CatalogModel> {
+        let provider = crate::definition::provider_definition(provider)
+            .map(|d| d.name)
+            .unwrap_or(provider);
         let provider = match provider {
             "gemini" => "google",
             "bedrock" => "amazon-bedrock",
@@ -175,10 +180,22 @@ impl ModelCatalog {
             }
             model.capabilities.thinking.get_or_insert(entry.reasoning);
             model.capabilities.tool_calling.get_or_insert(true);
-            model
-                .capabilities
-                .input_modalities
-                .get_or_insert_with(|| entry.input.clone());
+            if entry.input_is_known() {
+                model
+                    .capabilities
+                    .input_modalities
+                    .get_or_insert_with(|| entry.input.clone());
+                model.capabilities.vision.get_or_insert_with(|| {
+                    entry.input.iter().any(|v| v.eq_ignore_ascii_case("image"))
+                });
+            }
+            if let Some(output) = entry
+                .metadata
+                .get("output")
+                .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+            {
+                model.capabilities.output_modalities.get_or_insert(output);
+            }
         }
     }
 }

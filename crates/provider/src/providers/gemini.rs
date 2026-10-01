@@ -706,6 +706,7 @@ impl crate::traits::Provider for GeminiProvider {
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let api_request = Self::build_request_from_prepared(&request, &prepared)?;
 
+        crate::attachments::validate_inline_payload("gemini", &api_request)?;
         let request_builder = self
             .client
             .post(self.generate_content_url(&model))
@@ -774,6 +775,7 @@ impl crate::traits::Provider for GeminiProvider {
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let api_request = Self::build_request_from_prepared(&request, &prepared)?;
 
+        crate::attachments::validate_inline_payload("gemini", &api_request)?;
         let request_builder = self
             .client
             .post(self.stream_generate_content_url(&model))
@@ -1619,5 +1621,53 @@ mod tests {
         };
         let api_req = GeminiProvider::build_request(&request);
         assert_eq!(api_req.contents[1].role, "model");
+    }
+}
+
+#[cfg(test)]
+mod media_contract_tests {
+    use super::*;
+    use crate::{
+        AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart, Provider,
+    };
+    #[test]
+    fn every_declared_kind_uses_native_inline_bytes_and_mime_not_chat_content_parts() {
+        let provider = GeminiProvider::new("unused");
+        for (mime, kind) in [
+            ("image/png", 0),
+            ("application/pdf", 1),
+            ("audio/wav", 2),
+            ("video/mp4", 3),
+        ] {
+            let attachment = MessageAttachment {
+                mime_type: mime.into(),
+                name: None,
+                size_bytes: None,
+                sha256: None,
+                source: AttachmentDataSource::Bytes {
+                    base64_data: "AQIDBA==".into(),
+                },
+                artifact: None,
+            };
+            let part = match kind {
+                0 => MessageContentPart::image(attachment),
+                1 => MessageContentPart::file(attachment),
+                2 => MessageContentPart::audio(attachment),
+                _ => MessageContentPart::video(attachment),
+            };
+            let prepared = crate::attachments::prepare_messages_for_provider(
+                "gemini",
+                &provider.capabilities(),
+                &[ChatMessage::user_parts(vec![part])],
+            )
+            .unwrap();
+            let native = GeminiProvider::attachment_part(&prepared.attachments[0]).unwrap();
+            assert!(native.file_data.is_none());
+            let inline = native.inline_data.unwrap();
+            assert_eq!(inline.mime_type, mime);
+            assert_eq!(inline.data, "AQIDBA==");
+            // Canonical ApiPart JSON field names are the g02 dependency. This
+            // fixture asserts representation without blessing snake_case wire.
+        }
     }
 }

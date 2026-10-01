@@ -382,29 +382,29 @@ impl AnthropicProvider {
                             });
                         }
                     }
+                }
+            }
 
-                    let attachments = prepared
-                        .attachments_for_message(message_index)
-                        .collect::<Vec<_>>();
-                    for attachment in attachments {
-                        match attachment.kind {
-                            InputContentType::Image => {
-                                content.push(ApiMessageContentBlock::Image {
-                                    source: Self::convert_media_source(attachment)?,
-                                });
-                            }
-                            InputContentType::File => {
-                                content.push(ApiMessageContentBlock::Document {
-                                    source: Self::convert_media_source(attachment)?,
-                                });
-                            }
-                            _ => {
-                                return Err(anyhow!(
-                                    "provider `anthropic` does not support {:?} attachments in messages API",
-                                    attachment.kind
-                                ));
-                            }
-                        }
+            let attachments = prepared
+                .attachments_for_message(message_index)
+                .collect::<Vec<_>>();
+            for attachment in attachments {
+                match attachment.kind {
+                    InputContentType::Image => {
+                        content.push(ApiMessageContentBlock::Image {
+                            source: Self::convert_media_source(attachment)?,
+                        });
+                    }
+                    InputContentType::File => {
+                        content.push(ApiMessageContentBlock::Document {
+                            source: Self::convert_media_source(attachment)?,
+                        });
+                    }
+                    _ => {
+                        return Err(anyhow!(
+                            "provider `anthropic` does not support {:?} attachments in messages API",
+                            attachment.kind
+                        ));
                     }
                 }
             }
@@ -547,6 +547,7 @@ impl crate::traits::Provider for AnthropicProvider {
             stream: false,
         };
 
+        crate::attachments::validate_inline_payload("anthropic", &api_request)?;
         let request_builder = self
             .client
             .post(self.messages_url())
@@ -680,6 +681,7 @@ impl crate::traits::Provider for AnthropicProvider {
             stream: true,
         };
 
+        crate::attachments::validate_inline_payload("anthropic", &api_request)?;
         let request_builder = self
             .client
             .post(self.messages_url())
@@ -1586,5 +1588,43 @@ mod tests {
 
         let result = provider.chat(request).await;
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod media_contract_tests {
+    use super::*;
+    use crate::{AttachmentDataSource, MessageAttachment, MessageContentPart};
+    use crate::{ChatMessage, Provider};
+    #[test]
+    fn tool_result_media_survives_as_native_user_blocks_after_the_result() {
+        let mut message = ChatMessage::tool_result("call-1", "screenshot", "ok");
+        message
+            .content_parts
+            .push(MessageContentPart::image(MessageAttachment {
+                mime_type: "image/png".into(),
+                name: None,
+                size_bytes: None,
+                sha256: None,
+                source: AttachmentDataSource::Bytes {
+                    base64_data: "AQIDBA==".into(),
+                },
+                artifact: None,
+            }));
+        let provider = AnthropicProvider::new("unused");
+        let prepared = crate::attachments::prepare_messages_for_provider(
+            "anthropic",
+            &provider.capabilities(),
+            &[message],
+        )
+        .unwrap();
+        let (_, messages) = AnthropicProvider::prepare_messages(&prepared).unwrap();
+        let wire = serde_json::to_value(&messages).unwrap();
+        assert_eq!(wire[0]["role"], "user");
+        assert_eq!(wire[0]["content"][0]["type"], "tool_result");
+        assert_eq!(wire[0]["content"][0]["tool_use_id"], "call-1");
+        assert_eq!(wire[0]["content"][1]["type"], "image");
+        assert_eq!(wire[0]["content"][1]["source"]["type"], "base64");
+        assert_eq!(wire[0]["content"][1]["source"]["data"], "AQIDBA==");
     }
 }

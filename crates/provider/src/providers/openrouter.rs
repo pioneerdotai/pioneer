@@ -433,7 +433,7 @@ impl OpenRouterProvider {
         match subtype {
             "x-wav" => "wav".to_owned(),
             "mpga" => "mp3".to_owned(),
-            "x-m4a" => "m4a".to_owned(),
+            "x-m4a" | "mp4" => "m4a".to_owned(),
             "x-aiff" => "aiff".to_owned(),
             other => other.to_owned(),
         }
@@ -2107,5 +2107,46 @@ mod tests {
         let caps = provider.capabilities();
         assert!(caps.streaming);
         assert!(caps.vision);
+    }
+}
+
+#[cfg(test)]
+mod media_contract_tests {
+    use super::*;
+    use crate::{AttachmentDataSource, MessageAttachment, MessageContentPart};
+    use crate::{ChatMessage, Provider};
+    #[test]
+    fn chat_gateway_pdf_uses_mime_data_url_and_audio_mp4_maps_to_m4a() {
+        let provider = OpenRouterProvider::new("unused");
+        let file = MessageAttachment {
+            mime_type: "application/pdf".into(),
+            name: Some("doc.pdf".into()),
+            size_bytes: None,
+            sha256: None,
+            source: AttachmentDataSource::Bytes {
+                base64_data: "JVBERi0xLjc=".into(),
+            },
+            artifact: None,
+        };
+        let prepared = crate::attachments::prepare_messages_for_provider(
+            "openrouter",
+            &provider.capabilities(),
+            &[ChatMessage::user_parts(vec![MessageContentPart::file(
+                file,
+            )])],
+        )
+        .unwrap();
+        let inline = serde_json::to_value(
+            OpenRouterProvider::build_file_part(&prepared.attachments[0]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            inline["file"]["file_data"],
+            "data:application/pdf;base64,JVBERi0xLjc="
+        );
+        assert_eq!(
+            OpenRouterProvider::audio_format_from_mime("audio/mp4"),
+            "m4a"
+        );
     }
 }

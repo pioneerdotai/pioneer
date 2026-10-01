@@ -210,6 +210,10 @@ fn redacted_endpoint_error(
     if error.is::<RedactedEndpointError>() {
         return error;
     }
+    if let Some(rejection) = error.downcast_ref::<crate::attachments::MediaInputRejection>() {
+        // Keep only the controlled diagnostic, dropping any raw context chain.
+        return rejection.clone().into();
+    }
     // Adapters can supply structured status even when their error does not
     // contain a reqwest source or the usual `API error (...)` prefix.
     let adapter_classification = inner.classify_failure(&error);
@@ -2372,5 +2376,25 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod media_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn media_rejection_crosses_private_endpoint_redaction_without_raw_context() {
+        let provider = crate::providers::EchoProvider;
+        let error = anyhow::anyhow!("https://private.test/credential/path").context(
+            crate::attachments::MediaInputRejection(
+                "unknown input capabilities; refresh the catalog",
+            ),
+        );
+        let safe = redacted_endpoint_error(&provider, error, ProviderFailureStage::Connect);
+        assert_eq!(
+            safe.to_string(),
+            "unknown input capabilities; refresh the catalog"
+        );
+        assert!(!format!("{safe:#}").contains("private.test"));
     }
 }

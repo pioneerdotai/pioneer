@@ -102,9 +102,9 @@ impl GeneratedCatalog {
                     "invalid reasoning metadata"
                 );
                 ensure!(
-                    model["input"].as_array().is_some_and(|a| !a.is_empty()
-                        && a.iter()
-                            .all(|v| matches!(v.as_str(), Some("text" | "image")))),
+                    model["input"].as_array().is_some_and(|a| a
+                        .iter()
+                        .all(|v| v.as_str().is_some_and(|s| !s.is_empty()))),
                     "invalid model modalities"
                 );
                 for field in ["input", "output", "cacheRead", "cacheWrite"] {
@@ -237,7 +237,11 @@ fn base(
     Candidate {
         model: json!({"id":id,"name":source["name"].as_str().filter(|s|!s.is_empty()).unwrap_or(id),
         "provider":provider,"api":api,"baseUrl":url,"reasoning":source["reasoning"]==true,
-        "input":if has(&source["modalities"]["input"],"image") {vec!["text","image"]} else {vec!["text"]},
+        "input":source["modalities"]["input"].as_array().cloned().unwrap_or_default(),
+        "inputOrigin":{"kind":if source["modalities"]["input"].is_array(){"source"}else{"fallback"},"expression":"models.dev.modalities.input"},
+        "sourceMetadata":source,
+        "inputConstraints":source["inputConstraints"],
+        "output":source["modalities"]["output"],
         "cost":cost(&source["cost"]),"contextWindow":context,"maxTokens":output}),
         context_origin,
         output_origin,
@@ -356,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn entire_pinned_catalog_matches_pi_reference() {
+    fn pinned_non_media_catalog_contract_matches_pi_reference() {
         let generated = generate(&snapshot(), true).unwrap();
         let reference: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/provenance.json"))
@@ -365,6 +369,9 @@ mod tests {
         for (p, models) in &generated.provenance {
             for (id, fields) in models {
                 for field in ["contextWindow", "maxTokens"] {
+                    if reference[p][id].is_null() {
+                        continue;
+                    }
                     differences(
                         &format!("{p}/{id}/{field}/kind"),
                         &fields[field]["kind"],
@@ -379,9 +386,36 @@ mod tests {
             "origin differences:\n{}",
             origins.join("\n")
         );
-        let actual = serde_json::to_value(generated.models).unwrap();
+        let mut actual = serde_json::to_value(generated.models).unwrap();
         let expected: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json")).unwrap();
+        // Compare the pinned Pi surface, which deliberately had text/image
+        // only. Pioneer media supplements and new registered source routes
+        // have their own propagation fixtures below.
+        let providers = actual.as_object_mut().unwrap();
+        providers.retain(|p, _| !expected[p].is_null());
+        for (p, models) in providers {
+            models
+                .as_object_mut()
+                .unwrap()
+                .retain(|id, _| !expected[p][id].is_null());
+            for model in models.as_object_mut().unwrap().values_mut() {
+                let image = has(&model["input"], "image");
+                model["input"] = if image {
+                    json!(["text", "image"])
+                } else {
+                    json!(["text"])
+                };
+                for field in [
+                    "inputOrigin",
+                    "sourceMetadata",
+                    "inputConstraints",
+                    "output",
+                ] {
+                    model.as_object_mut().unwrap().remove(field);
+                }
+            }
+        }
         let mut diff = Vec::new();
         differences("", &actual, &expected, &mut diff);
         assert!(
@@ -535,5 +569,66 @@ mod validation_tests {
                 json!({"tool_call":true,"cost":{"input":invalid}});
             assert!(generate(&snapshot, true).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod media_propagation_tests {
+    use super::*;
+    #[test]
+    fn source_modalities_and_constraints_survive_all_dynamic_transform_paths() {
+        let mut snapshot: SourceSnapshot =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                .unwrap();
+        let input = json!(["text", "image", "audio", "video", "pdf"]);
+        let source = json!({"name":"media fixture","tool_call":true,"modalities":{"input":input,"output":["text","audio"]},"inputConstraints":{"audio":{"mimeTypes":["audio/wav"],"maxBytes":4096}},"limit":{"context":64000,"output":4000}});
+        for provider in ["openai", "google", "groq", "venice"] {
+            snapshot.sources.get_mut(SOURCE_URLS[0]).unwrap().body[provider]["models"]["fixture-media"] =
+                source.clone();
+        }
+        // Source identity may use an existing alias or declare the same
+        // registered endpoint. Neither path requires a manual model registry.
+        let data = &mut snapshot.sources.get_mut(SOURCE_URLS[0]).unwrap().body;
+        data["volcengine"]["models"]["fixture-media"] = source.clone();
+        data["novita-ai"]["models"]["fixture-media"] = source.clone();
+        snapshot.sources.get_mut(SOURCE_URLS[0]).unwrap().body["groq"]["models"]["fixture-unknown"] =
+            json!({"tool_call":true});
+        snapshot.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"].as_array_mut().unwrap().push(json!({"id":"fixture/media","name":"media fixture","supported_parameters":["tools"],"architecture":{"input_modalities":input,"output_modalities":["text","audio"]}}));
+        snapshot.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"].as_array_mut().unwrap().push(json!({"id":"fixture/media","tags":["tool-use"],"input_modalities":input,"output_modalities":["text","audio"]}));
+        let generated = generate(&snapshot, true).unwrap();
+        generated.validate().unwrap();
+        for (provider, id) in [
+            ("openai", "fixture-media"),
+            ("google", "fixture-media"),
+            ("groq", "fixture-media"),
+            ("venice", "fixture-media"),
+            ("novita", "fixture-media"),
+            ("doubao", "fixture-media"),
+            ("openrouter", "fixture/media"),
+            ("vercel-ai-gateway", "fixture/media"),
+        ] {
+            let model = &generated.models[provider][id];
+            assert_eq!(model["input"], input, "{provider}");
+            assert_eq!(model["output"], json!(["text", "audio"]), "{provider}");
+            assert_eq!(model["inputOrigin"]["kind"], "source");
+        }
+        assert_eq!(
+            generated.models["groq"]["fixture-unknown"]["input"],
+            json!([])
+        );
+        assert_eq!(
+            generated.models["groq"]["fixture-unknown"]["inputOrigin"]["kind"],
+            "fallback"
+        );
+        assert_eq!(
+            generated.models["venice"]["fixture-media"]["inputConstraints"],
+            source["inputConstraints"]
+        );
+        // Source limits retain their provenance; media support never fabricates
+        // a measured token count or a provider billing limit.
+        assert_eq!(
+            generated.provenance["venice"]["fixture-media"]["contextWindow"]["kind"],
+            "source"
+        );
     }
 }

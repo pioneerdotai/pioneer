@@ -521,7 +521,13 @@ impl BedrockProvider {
                 text: None,
                 image: None,
                 document: Some(BedrockDocumentBlock {
-                    format: normalize_format(subtype),
+                    format: match attachment.mime_type.as_str() {
+                        "text/plain" => "txt".to_owned(),
+                        "text/html" => "html".to_owned(),
+                        "text/csv" => "csv".to_owned(),
+                        "application/pdf" => "pdf".to_owned(),
+                        _ => normalize_format(subtype),
+                    },
                     name: attachment.name.clone(),
                     source,
                 }),
@@ -536,7 +542,12 @@ impl BedrockProvider {
                 image: None,
                 document: None,
                 audio: Some(BedrockAudioBlock {
-                    format: normalize_format(subtype),
+                    format: match subtype {
+                        "x-wav" => "wav",
+                        "x-m4a" => "m4a",
+                        other => other,
+                    }
+                    .to_owned(),
                     source,
                 }),
                 video: None,
@@ -1089,10 +1100,10 @@ fn provider_model_from_bedrock_model_summary(m: BedrockModelSummary) -> Provider
     let has_vision = m
         .input_modalities
         .as_ref()
-        .is_some_and(|mods| mods.iter().any(|m| m == "IMAGE"));
+        .map(|mods| mods.iter().any(|m| m.eq_ignore_ascii_case("image")));
     let model_id = m.model_id.clone().unwrap_or_default();
     let mut capabilities = ProviderModelCapabilities {
-        vision: Some(has_vision),
+        vision: has_vision,
         input_modalities: m.input_modalities,
         output_modalities: m.output_modalities,
         ..ProviderModelCapabilities::default()
@@ -1803,5 +1814,74 @@ mod tests {
         assert_eq!(dt.len(), 16);
         assert!(dt.contains('T'));
         assert!(dt.ends_with('Z'));
+    }
+}
+
+#[cfg(test)]
+mod media_contract_tests {
+    use super::*;
+    use crate::{
+        AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart, Provider,
+    };
+    #[test]
+    fn native_document_and_audio_formats_are_endpoint_enums_not_mime_subtypes() {
+        let provider = BedrockProvider::new("unused", "unused", "us-east-1");
+        for (mime, part, union, expected) in [
+            ("text/plain", 0, "document", "txt"),
+            ("audio/x-wav", 1, "audio", "wav"),
+            ("audio/x-m4a", 1, "audio", "m4a"),
+            ("video/mp4", 2, "video", "mp4"),
+        ] {
+            let attachment = MessageAttachment {
+                mime_type: mime.into(),
+                name: None,
+                size_bytes: None,
+                sha256: None,
+                source: AttachmentDataSource::Bytes {
+                    base64_data: "AQIDBA==".into(),
+                },
+                artifact: None,
+            };
+            let content = match part {
+                0 => MessageContentPart::file(attachment),
+                1 => MessageContentPart::audio(attachment),
+                _ => MessageContentPart::video(attachment),
+            };
+            let mut message = ChatMessage::user_parts(vec![content]);
+            message.content = "analyze".into();
+            let prepared = crate::attachments::prepare_messages_for_provider(
+                "bedrock",
+                &provider.capabilities(),
+                &[message],
+            )
+            .unwrap();
+            let wire = serde_json::to_value(
+                BedrockProvider::attachment_block(&prepared.attachments[0]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(wire[union]["format"], expected);
+            assert_eq!(wire[union]["source"]["bytes"], "AQIDBA==");
+        }
+    }
+    #[test]
+    fn missing_discovery_modalities_are_unknown_not_explicitly_text_only() {
+        let summary: BedrockModelSummary =
+            serde_json::from_value(serde_json::json!({"modelId":"fixture"})).unwrap();
+        assert_eq!(
+            provider_model_from_bedrock_model_summary(summary)
+                .capabilities
+                .vision,
+            None
+        );
+        let summary: BedrockModelSummary = serde_json::from_value(
+            serde_json::json!({"modelId":"fixture","inputModalities":["TEXT"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            provider_model_from_bedrock_model_summary(summary)
+                .capabilities
+                .vision,
+            Some(false)
+        );
     }
 }

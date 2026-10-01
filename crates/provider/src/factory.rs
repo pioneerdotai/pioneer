@@ -234,29 +234,12 @@ fn compat_provider(name: &str, base_url: &str, api_key: &str) -> OpenAiCompatibl
 }
 
 fn compat_input_capabilities() -> ProviderInputCapabilities {
-    // Compatibility-first contract: all OpenAI-compatible adapters expose the
-    // same multimodal surface as our OpenAI-compatible renderer.
+    // Adapter ceiling, not a promise about any selected model. Chat's
+    // image_url renderer is shared; file/audio/video are endpoint-specific.
     ProviderInputCapabilities {
         text: true,
-        file: InputTypeSupport {
-            native: true,
-            file_upload: false,
-            data_url_inline: true,
-            text_fallback: false,
-        },
-        image: InputTypeSupport {
-            native: true,
-            file_upload: false,
-            data_url_inline: true,
-            text_fallback: false,
-        },
-        audio: InputTypeSupport::native_inline_only(),
-        video: InputTypeSupport {
-            native: true,
-            file_upload: false,
-            data_url_inline: true,
-            text_fallback: false,
-        },
+        image: InputTypeSupport::data_url_inline_only(),
+        ..ProviderInputCapabilities::disabled_for_all_file_types()
     }
 }
 
@@ -463,11 +446,10 @@ mod tests {
                 "image" => MessageContentPart::image(MessageAttachment {
                     mime_type: "image/png".to_owned(),
                     name: Some("img.png".to_owned()),
-                    size_bytes: Some(4),
+                    size_bytes: None,
                     sha256: None,
                     source: AttachmentDataSource::Bytes {
-                        base64_data: base64::engine::general_purpose::STANDARD
-                            .encode([1u8, 2, 3, 4]),
+                        base64_data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a8Z0AAAAASUVORK5CYII=".to_owned(),
                     },
                     artifact: None,
                 }),
@@ -516,7 +498,11 @@ mod tests {
                 let result = prepare_messages_for_provider(
                     name,
                     &caps,
-                    &[ChatMessage::user_parts(vec![part])],
+                    &[{
+                        let mut message = ChatMessage::user_parts(vec![part]);
+                        message.content = "analyze".to_owned();
+                        message
+                    }],
                 );
 
                 if support.is_supported() {
@@ -612,7 +598,7 @@ mod tests {
             let caps = provider.capabilities().input_types;
             assert_eq!(
                 caps, expected,
-                "openai-compatible provider `{alias}` must expose full OpenAI-compatible input contract"
+                "openai-compatible provider `{alias}` must expose only the compatible renderer ceiling"
             );
         }
     }
