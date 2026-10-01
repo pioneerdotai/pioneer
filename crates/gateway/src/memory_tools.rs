@@ -1281,7 +1281,7 @@ fn classify_memory_write_failure(error: anyhow::Error) -> pioneer_memory::Memory
                     if database
                         .code()
                         .and_then(|code| code.parse::<i32>().ok())
-                        .is_some_and(|code| matches!(code & 0xff, 5 | 6))
+                        .is_some_and(sqlite_write_failure_code_is_transient)
                     {
                         return MemoryWriteFailure::StorageTransient;
                     }
@@ -1291,6 +1291,10 @@ fn classify_memory_write_failure(error: anyhow::Error) -> pioneer_memory::Memory
         }
     }
     MemoryWriteFailure::Unclassified
+}
+
+fn sqlite_write_failure_code_is_transient(code: i32) -> bool {
+    matches!(code & 0xff, 5 | 6)
 }
 
 #[derive(Clone)]
@@ -2755,3 +2759,7 @@ mod tests {
         assert_eq!(*provider.requests.lock().expect("request lock poisoned"), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "memory_tools/sqlite_write_failure_tests.rs"]
+mod sqlite_write_failure_tests;
