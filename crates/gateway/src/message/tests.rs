@@ -1,3 +1,6 @@
+#[path = "tests/mcp_oauth_rpc_queue.rs"]
+mod mcp_oauth_rpc_queue;
+
 #[path = "tests/task_capsule.rs"]
 mod task_capsule;
 

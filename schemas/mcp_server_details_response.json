@@ -197,6 +197,16 @@
         },
         "transport": {
           "$ref": "#/$defs/McpTransportSummary"
+        },
+        "oauth_state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpOAuthState"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -639,6 +649,25 @@
         "catalog_version",
         "fingerprint",
         "selection_reason"
+      ]
+    },
+    "McpOAuthState": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "preparing",
+        "awaiting_callback",
+        "exchanging",
+        "resolving",
+        "retired",
+        "cleanup_required",
+        "authorized",
+        "auth_required",
+        "insufficient_scope",
+        "denied",
+        "cancelled",
+        "timed_out",
+        "failed"
       ]
     }
   }

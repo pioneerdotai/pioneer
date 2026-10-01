@@ -1,0 +1,720 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "McpDetailsPublication",
+  "type": "object",
+  "properties": {
+    "details": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/McpServerDetailsResponse"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "request": {
+      "$ref": "#/$defs/McpLoadState"
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "server_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "server_id",
+    "revision",
+    "request"
+  ],
+  "$defs": {
+    "McpAuditEventSummary": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "callable_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "catalog_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "decision": {
+          "type": "string"
+        },
+        "details": {
+          "default": null
+        },
+        "raw_tool_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_installation_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_name": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "server_name",
+        "action",
+        "decision",
+        "created_at"
+      ]
+    },
+    "McpListItem": {
+      "type": "object",
+      "properties": {
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/$defs/McpPolicyState"
+        },
+        "prompts_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "resource_templates_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "resources_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "runtime": {
+          "$ref": "#/$defs/McpRuntimeStatus"
+        },
+        "scope": {
+          "$ref": "#/$defs/McpScopeKind"
+        },
+        "status": {
+          "$ref": "#/$defs/McpServerStatus"
+        },
+        "tools_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "scope",
+        "policy",
+        "required",
+        "runtime",
+        "tools_count",
+        "resources_count",
+        "resource_templates_count",
+        "prompts_count",
+        "status"
+      ]
+    },
+    "McpLoadState": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "loading",
+        "ready",
+        "failed",
+        "cancelled",
+        "forbidden"
+      ]
+    },
+    "McpManagementDetails": {
+      "description": "Configuration and diagnostics intentionally excluded from the operational\nMCP capability returned by discovery endpoints.",
+      "type": "object",
+      "properties": {
+        "audit": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/McpAuditEventSummary"
+          }
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "health": {
+          "$ref": "#/$defs/McpServerHealthDetails"
+        },
+        "oauth_state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpOAuthState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "recent_bindings": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/McpTurnBindingSummary"
+          }
+        },
+        "scope": {
+          "$ref": "#/$defs/McpScopeKind"
+        },
+        "source_kind": {
+          "$ref": "#/$defs/McpSourceKind"
+        },
+        "transport": {
+          "$ref": "#/$defs/McpTransportSummary"
+        }
+      },
+      "required": [
+        "scope",
+        "source_kind",
+        "transport",
+        "fingerprint",
+        "health"
+      ]
+    },
+    "McpOAuthState": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "preparing",
+        "awaiting_callback",
+        "exchanging",
+        "resolving",
+        "retired",
+        "cleanup_required",
+        "authorized",
+        "auth_required",
+        "insufficient_scope",
+        "denied",
+        "cancelled",
+        "timed_out",
+        "failed"
+      ]
+    },
+    "McpPolicyState": {
+      "type": "object",
+      "properties": {
+        "allow_implicit_invocation": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "allow_implicit_invocation"
+      ]
+    },
+    "McpPromptCatalogItem": {
+      "type": "object",
+      "properties": {
+        "arguments_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "arguments_count"
+      ]
+    },
+    "McpResourceCatalogItem": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mime_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uri": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "McpResourceTemplateCatalogItem": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mime_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uri_template": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "McpRuntimeState": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "disabled",
+        "starting",
+        "ready",
+        "degraded",
+        "auth_required",
+        "failed",
+        "stopping",
+        "stopped",
+        "restarting"
+      ]
+    },
+    "McpRuntimeStatus": {
+      "type": "object",
+      "properties": {
+        "last_seen_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "live": {
+          "type": "boolean"
+        },
+        "state": {
+          "$ref": "#/$defs/McpRuntimeState"
+        }
+      },
+      "required": [
+        "state",
+        "live"
+      ]
+    },
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    },
+    "McpServerCatalogDetails": {
+      "type": "object",
+      "properties": {
+        "catalog_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generated_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "prompts": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/McpPromptCatalogItem"
+          }
+        },
+        "resource_templates": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/McpResourceTemplateCatalogItem"
+          }
+        },
+        "resources": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/McpResourceCatalogItem"
+          }
+        },
+        "server_info": {
+          "default": null
+        },
+        "server_instructions_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tools": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/McpToolCatalogItem"
+          }
+        }
+      }
+    },
+    "McpServerDetailsResponse": {
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "$ref": "#/$defs/McpServerCatalogDetails"
+        },
+        "generated_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "management": {
+          "description": "Management-only configuration and diagnostics. Omitted unless the\ncaller may manage the selected MCP installation.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpManagementDetails"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "server": {
+          "$ref": "#/$defs/McpListItem"
+        },
+        "snapshot_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "snapshot_version",
+        "generated_at",
+        "server",
+        "catalog"
+      ]
+    },
+    "McpServerHealthDetails": {
+      "type": "object",
+      "properties": {
+        "catalog_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "next_retry_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "retry_attempt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "runtime": {
+          "$ref": "#/$defs/McpRuntimeStatus"
+        },
+        "status": {
+          "$ref": "#/$defs/McpServerStatus"
+        },
+        "status_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stderr_tail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "runtime",
+        "status"
+      ]
+    },
+    "McpServerStatus": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "disabled",
+        "starting",
+        "ready",
+        "degraded",
+        "auth_required",
+        "failed",
+        "stopping",
+        "stopped",
+        "restarting"
+      ]
+    },
+    "McpSourceKind": {
+      "type": "string",
+      "enum": [
+        "config"
+      ]
+    },
+    "McpToolAnnotationSummary": {
+      "type": "object",
+      "properties": {
+        "destructive_hint": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "idempotent_hint": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "open_world_hint": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "read_only_hint": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "McpToolCatalogItem": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpToolAnnotationSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input_schema_summary": true,
+        "name": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "McpTransportSummary": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "stdio"
+            }
+          },
+          "required": [
+            "kind",
+            "command"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "streamable_http"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "url"
+          ]
+        }
+      ]
+    },
+    "McpTurnBindingSummary": {
+      "type": "object",
+      "properties": {
+        "callable_name": {
+          "type": "string"
+        },
+        "capability_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "catalog_version": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "raw_tool_name": {
+          "type": "string"
+        },
+        "selection_reason": {
+          "type": "string"
+        },
+        "server_installation_id": {
+          "type": "string"
+        },
+        "server_name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "server_installation_id",
+        "server_name",
+        "raw_tool_name",
+        "callable_name",
+        "catalog_version",
+        "fingerprint",
+        "selection_reason"
+      ]
+    }
+  }
+}

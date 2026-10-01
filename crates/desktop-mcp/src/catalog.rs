@@ -41,6 +41,8 @@ pub(crate) struct CatalogInput {
     pub mcp_details_loading: bool,
     pub mcp_error: Option<String>,
     pub pending: std::collections::HashSet<String>,
+    pub oauth:
+        std::collections::BTreeMap<String, (pioneer_client::mcp::oauth::OAuthPresentation, bool)>,
 }
 impl CatalogInput {
     fn selected(&self) -> Option<&McpListItem> {
@@ -54,6 +56,7 @@ impl CatalogInput {
     }
     fn same_screen(&self, other: &Self) -> bool {
         self.same_parent(other)
+            && self.oauth == other.oauth
             && if matches!(
                 self.navigation_input.destination(),
                 SemanticDestination::Mcp { server_id: Some(_) }
@@ -98,6 +101,7 @@ impl CatalogInput {
             mcp_details_loading: false,
             mcp_error: None,
             pending: Default::default(),
+            oauth: Default::default(),
         }
     }
     pub fn principal_presentation_capabilities(&self) -> PrincipalPresentationCapabilities {
@@ -308,6 +312,9 @@ impl McpCatalogView {
                     .then(|| t!("mcp.error.load_servers_failed", error = "").to_string());
             }
             for server in &next.mcp_servers {
+                if let Some(oauth) = self.client.mcp_oauth_presentation(&workspace, &server.id) {
+                    next.oauth.insert(server.id.clone(), oauth);
+                }
                 let scope = ClientScope::McpAction {
                     workspace_id: workspace.clone(),
                     target: server.id.clone(),
@@ -318,6 +325,17 @@ impl McpCatalogView {
                         next.pending.insert(server.id.clone());
                     } else if action.state == McpActionState::Failed {
                         next.mcp_error = Some(match action.kind {
+                            McpActionKind::RetryAuthorizationBrowser
+                            | McpActionKind::SignIn
+                            | McpActionKind::Disconnect
+                            | McpActionKind::CancelAuthorization => {
+                                if matches!(action.field_error.as_ref(),Some(pioneer_client::mcp::actions::McpInstallFieldError::Failure{message}) if message=="oauth_callback_port_unavailable")
+                                {
+                                    t!("mcp.oauth.callback_unavailable").to_string()
+                                } else {
+                                    t!("mcp.oauth.failed").to_string()
+                                }
+                            }
                             McpActionKind::Policy => {
                                 t!("mcp.error.policy_update_failed", error = "").to_string()
                             }

@@ -28,8 +28,13 @@ pub struct McpListResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct McpInstallParams {
+    /// Shell preparation failed; report it only if the server challenges.
+    #[serde(default)]
+    pub oauth_callback_unavailable: bool,
     pub workspace_id: String,
     pub config_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_redirect_uri: Option<String>,
     #[serde(default = "default_workspace_scope")]
     pub scope_kind: McpScopeKind,
     #[serde(default = "default_true")]
@@ -150,6 +155,8 @@ pub struct McpServerDetailsResponse {
 /// MCP capability returned by discovery endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct McpManagementDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_state: Option<McpOAuthState>,
     pub scope: McpScopeKind,
     pub source_kind: McpSourceKind,
     pub transport: McpTransportSummary,
@@ -559,5 +566,120 @@ mod tests {
         assert_eq!(params.scope_kind, McpScopeKind::Workspace);
         assert!(params.enabled);
         assert!(!params.allow_implicit_invocation);
+        assert!(params.oauth_redirect_uri.is_none());
     }
+
+    #[test]
+    fn oauth_management_request_requires_the_installation_identity() {
+        let mut request = json!({
+            "workspace_id": "workspace", "name": "reused-name",
+            "action": {"kind": "disconnect"}
+        });
+        assert!(serde_json::from_value::<McpOAuthParams>(request.clone()).is_err());
+        request["server_id"] = json!("installation-uuid");
+        let params: McpOAuthParams = serde_json::from_value(request).unwrap();
+        assert_eq!(params.server_id, "installation-uuid");
+    }
+
+    #[test]
+    fn oauth_callback_debug_redacts_code_and_state_and_projection_has_no_credentials() {
+        let action = McpOAuthAction::Callback {
+            flow_id: "flow".into(),
+            state: crate::AuthSecretString::new("state-canary"),
+            code: Some(crate::AuthSecretString::new("code-canary")),
+            issuer: Some("https://issuer.test".into()),
+            error: None,
+        };
+        let debug = format!("{action:?}");
+        assert!(!debug.contains("canary"));
+        let state = McpOAuthNotification {
+            workspace_id: "workspace".into(),
+            server_id: "installation".into(),
+            name: "server".into(),
+            scope_kind: McpScopeKind::Workspace,
+            flow_id: Some("flow".into()),
+            state: McpOAuthState::AwaitingCallback,
+            authorization_url: Some(crate::AuthSecretString::new(
+                "https://issuer.test/authorize?state=state-canary",
+            )),
+            diagnostic: None,
+        };
+        assert!(!format!("{state:?}").contains("canary"));
+        let json = serde_json::to_value(state).unwrap();
+        for field in [
+            "access_token",
+            "refresh_token",
+            "client_secret",
+            "code",
+            "pkce_verifier",
+        ] {
+            assert!(json.get(field).is_none());
+        }
+    }
+}
+
+/// Shell loopback preparation is complete before this request is sent.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct McpOAuthParams {
+    pub workspace_id: String,
+    pub server_id: String,
+    pub name: String,
+    #[serde(default = "default_workspace_scope")]
+    pub scope_kind: McpScopeKind,
+    pub action: McpOAuthAction,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpOAuthAction {
+    SignIn {
+        redirect_uri: String,
+    },
+    Disconnect,
+    Cancel {
+        flow_id: String,
+    },
+    Callback {
+        flow_id: String,
+        state: crate::AuthSecretString,
+        code: Option<crate::AuthSecretString>,
+        issuer: Option<String>,
+        error: Option<String>,
+    },
+}
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct McpOAuthResponse {
+    /// Operation accepted; completion and durable authorization arrive via notifications.
+    pub accepted: bool,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpOAuthState {
+    Idle,
+    Preparing,
+    AwaitingCallback,
+    Exchanging,
+    // Consent is decided, but durable authorization is still being resolved.
+    Resolving,
+    // Addressed presentation retirement; does not cancel an authorized consent.
+    Retired,
+    CleanupRequired,
+    Authorized,
+    AuthRequired,
+    InsufficientScope,
+    Denied,
+    Cancelled,
+    TimedOut,
+    Failed,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct McpOAuthNotification {
+    pub workspace_id: String,
+    pub server_id: String,
+    pub name: String,
+    pub scope_kind: McpScopeKind,
+    pub flow_id: Option<String>,
+    pub state: McpOAuthState,
+    /// Authorization URLs contain ephemeral state. Debug must redact them.
+    pub authorization_url: Option<crate::AuthSecretString>,
+    pub diagnostic: Option<String>,
 }

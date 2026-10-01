@@ -13,3 +13,5 @@ pub mod operations;
 pub mod types;
 
 pub mod route;
+
+pub mod oauth;

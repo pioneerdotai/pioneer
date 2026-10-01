@@ -7867,6 +7867,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "oauth2"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "getrandom 0.2.17",
+ "http",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "url",
+]
+
+[[package]]
 name = "objc"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9546,6 +9565,7 @@ dependencies = [
  "pioneer-hooks",
  "pioneer-keystore",
  "pioneer-mcp",
+ "pioneer-mcp-oauth",
  "pioneer-memory",
  "pioneer-migration",
  "pioneer-observability",
@@ -9570,6 +9590,7 @@ dependencies = [
  "tempfile",
  "tiktoken-rs",
  "tokio",
+ "tokio-tungstenite 0.30.0",
  "tokio-util",
  "toml 1.1.6+spec-1.1.0",
  "tower",
@@ -9616,6 +9637,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "futures-util",
  "hex",
  "http",
  "process-wrap",
@@ -9625,10 +9647,34 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "sse-stream",
  "tokio",
  "tokio-util",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "pioneer-mcp-oauth"
+version = "0.54.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "fs4 1.1.0",
+ "hex",
+ "pioneer-keystore",
+ "pioneer-mcp",
+ "reqwest",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -11020,12 +11066,14 @@ version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fae7019994ae0fe4ada40b732f798f3ff26f0f04facb1477f1bf37eb4f18a2d3"
 dependencies = [
+ "async-trait",
  "base64 0.23.1",
  "bytes",
  "chrono",
  "futures",
  "http",
  "indexmap 2.14.2",
+ "oauth2",
  "pin-project-lite",
  "process-wrap",
  "reqwest",
@@ -11037,6 +11085,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
+ "url",
 ]
 
 [[package]]

@@ -1749,3 +1749,7 @@ reason_updated = "Обновлён один skill."
 reason_rolled_back = "Восстановлена предыдущая версия skill."
 reason_cancelled = "Запуск отменён."
 reason_unknown = "Операция не завершилась ожидаемым образом. Проверьте логи Gateway."
+
+[mcp.oauth]
+callback_received = "Ответ принят. Вернитесь в Pioneer, чтобы узнать результат входа."
+callback_rejected = "Запрос входа отклонён. Вернитесь в Pioneer для повторного входа."

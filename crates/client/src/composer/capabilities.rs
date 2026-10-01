@@ -1876,6 +1876,7 @@ mod tests {
                 prompts: Vec::new(),
             },
             management: Some(McpManagementDetails {
+                oauth_state: None,
                 scope: McpScopeKind::Workspace,
                 source_kind: McpSourceKind::Config,
                 transport: McpTransportSummary::Stdio {

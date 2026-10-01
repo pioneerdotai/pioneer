@@ -77,6 +77,9 @@ impl DesktopRuntimeCoordinator {
             return;
         }
         let core = ClientCore::shared();
+        core.set_mcp_oauth_shell(Arc::new(
+            crate::platform::mcp_oauth::DesktopMcpOAuthShell::default(),
+        ));
         let effect_router = Arc::new(DesktopPlatformEffectRouter);
         let storage_adapter = DesktopSessionStorageAdapter::start(core.clone(), &effect_router);
         let binding_router = cx.new(|cx| DesktopClientBindingRouter::new(core.clone(), cx));

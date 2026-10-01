@@ -145,6 +145,8 @@ pub fn mcp_install_params(
     config_json: impl Into<String>,
 ) -> McpInstallParams {
     McpInstallParams {
+        oauth_callback_unavailable: false,
+        oauth_redirect_uri: None,
         workspace_id: workspace_id.into(),
         config_json: config_json.into(),
         scope_kind: McpScopeKind::Workspace,
@@ -450,6 +452,7 @@ mod tests {
             snapshot_version: 1,
             generated_at: 10,
             management: Some(McpManagementDetails {
+                oauth_state: None,
                 scope: McpScopeKind::Workspace,
                 source_kind: McpSourceKind::Config,
                 transport: McpTransportSummary::Stdio {

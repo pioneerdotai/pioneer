@@ -46,6 +46,7 @@ pub struct SecretKindCounts {
     pub cli_runtime_proxy: usize,
     pub model_catalog_proxy: usize,
     pub mcp_secret: usize,
+    pub mcp_oauth: usize,
     pub gateway_access_jwt_signing_key: usize,
     pub gateway_auth_credential_hmac_key: usize,
     pub user_jwt_token: usize,
@@ -66,6 +67,9 @@ pub struct McpSecretOrphanStatusReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct McpSecretGarbageCollectionReport {
+    pub oauth_stored: usize,
+    pub oauth_orphans: usize,
+    pub oauth_deleted: usize,
     pub dry_run: bool,
     pub active_refs: usize,
     pub stored_refs: usize,
@@ -153,6 +157,9 @@ pub async fn secrets_garbage_collection(
         .context("failed to garbage collect orphan MCP secrets")?;
 
     Ok(McpSecretGarbageCollectionReport {
+        oauth_stored: report.oauth_stored,
+        oauth_orphans: report.oauth_orphans,
+        oauth_deleted: report.oauth_deleted,
         dry_run,
         active_refs: report.active_refs,
         stored_refs: report.stored_refs,
@@ -261,6 +268,7 @@ fn count_secret_kinds(entries: &[SecretEntryMeta]) -> SecretKindCounts {
             Some(SecretKind::ModelCatalogProxy) => {
                 counts.model_catalog_proxy = counts.model_catalog_proxy.saturating_add(1)
             }
+            Some(SecretKind::McpOAuth) => counts.mcp_oauth = counts.mcp_oauth.saturating_add(1),
             Some(SecretKind::McpSecret) => counts.mcp_secret = counts.mcp_secret.saturating_add(1),
             Some(SecretKind::GatewayAccessJwtSigningKey) => {
                 counts.gateway_access_jwt_signing_key =

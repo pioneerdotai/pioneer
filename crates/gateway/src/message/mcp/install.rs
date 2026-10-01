@@ -94,6 +94,14 @@ impl MessageProcessor {
                 continue;
             };
 
+            let _lifecycle = self
+                .mcp_service
+                .installation_lifecycle_guard(
+                    installation.scope_kind.as_str(),
+                    &installation.scope_key,
+                    &installation.name,
+                )
+                .await;
             let existing = match self
                 .crud_store
                 .find_mcp_server_installation(
@@ -256,7 +264,47 @@ impl MessageProcessor {
                     return;
                 }
             };
-            record.id = Some(installation_id);
+            record.id = Some(installation_id.clone());
+            if matches!(
+                installation.transport,
+                McpTransportConfig::StreamableHttp { .. }
+            ) {
+                let oauth = self.mcp_service.oauth();
+                let outcome = oauth.synchronize(&installation_id, &installation).await;
+                if outcome.is_ok() {
+                    if params.oauth_callback_unavailable {
+                        let _ = oauth
+                            .begin_install_without_callback(
+                                &installation_id,
+                                &installation,
+                                connection_id,
+                                &workspace_id,
+                            )
+                            .await;
+                    } else if let Some(redirect) = params.oauth_redirect_uri.as_deref() {
+                        if let Err(error) = oauth
+                            .begin_install_in_workspace(
+                                &installation_id,
+                                &installation,
+                                connection_id,
+                                redirect,
+                                &workspace_id,
+                            )
+                            .await
+                        {
+                            warn!(reason=%error.message,"MCP OAuth preparation failed");
+                        }
+                    }
+                }
+            }
+            if !matches!(
+                installation.transport,
+                McpTransportConfig::StreamableHttp { .. }
+            ) {
+                if let Err(error) = self.mcp_service.oauth().disconnect(&installation_id).await {
+                    warn!(reason=%error.message,"MCP OAuth cleanup deferred");
+                }
+            }
             events_written = events_written.saturating_add(1);
 
             let stale_refs = old_secret_ref_ids

@@ -50,6 +50,7 @@ impl McpCatalogView {
         v_flex()
             .size_full()
             .bg(cx.theme().background)
+            .child(self.render_mcp_oauth(&server, cx))
             .child(
                 v_flex()
                     .pt_3()
