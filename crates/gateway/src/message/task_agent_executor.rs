@@ -5539,7 +5539,17 @@ impl TaskAgentExecutor {
                     task_run_turn.thread_id.clone(),
                     parent.parent_thread_id.clone(),
                     run.id.clone(),
-                    reviewer_execution_id.clone(),
+                    // Queue liveness belongs to the primary TaskRunExecution;
+                    // reviewer author/response still identify the reviewer actor.
+                    task_response
+                        .task_run_thread_bindings
+                        .iter()
+                        .find(|binding| {
+                            binding.run_id == run.id
+                                && binding.binding_kind == TaskRunThreadBindingKind::PrimaryExecutor
+                        })
+                        .and_then(|binding| binding.execution_id.clone())
+                        .context("reviewer Task run has no primary execution queue identity")?,
                     action_author,
                     turn_response.clone(),
                     None,
@@ -6791,6 +6801,16 @@ async fn load_task_execution_conversation_scope(
         .get_task_run_conversation_snapshot(run.id.as_str())
         .await?
     {
+        #[cfg(test)]
+        if run.retry_of_run_id.is_none()
+            && let Some(error) = processor
+                .task_history_preparation_failure
+                .lock()
+                .unwrap()
+                .take()
+        {
+            return Err(error).context("failed to restore accepted Task conversation sources");
+        }
         let projection = restore_task_run_conversation_snapshot(
             &history_store,
             &snapshot,

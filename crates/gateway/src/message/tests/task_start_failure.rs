@@ -111,6 +111,21 @@ fn unknown_executor_and_forged_public_json_keep_error_severity() {
     }
 }
 
+async fn install_task_start_cleanup_failure(store: &CrudStore) {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    store
+        .database_connection()
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "CREATE TRIGGER pioneer9_cleanup_failure BEFORE INSERT ON turn_event \
+         WHEN NEW.event_type = 'turn/blocked' \
+         BEGIN SELECT RAISE(ABORT, 'pioneer9 cleanup persistence'); END;"
+                .to_owned(),
+        ))
+        .await
+        .unwrap();
+}
+
 enum PreparationFailure {
     History,
     Admission,
@@ -163,6 +178,25 @@ async fn run_gateway_start_failure(
             retry_on: vec![TaskErrorClass::Internal],
         });
     }
+    if matches!(case, PreparationFailure::RetryFrozen) {
+        // Non-composer CLI Tasks restore their accepted history before graph
+        // materialization. A failure here exercises the existing automatic
+        // retry policy without making an admitted actor fail its cleanup.
+        params.metadata.as_mut().unwrap().composer_work = None;
+        params.launch = Some(
+            exact_cli_task_launch_for_test(
+                &processor,
+                &workspace,
+                &format!("cli_runtime:{runtime_id}"),
+                "gpt-5",
+                &runtime_id,
+            )
+            .await
+            .unwrap(),
+        );
+        *processor.task_history_preparation_failure.lock().unwrap() =
+            Some(cantopen_with_private_context().await);
+    }
     if matches!(case, PreparationFailure::TerminalHistory) {
         processor.arm_completed_history_preparation_barrier("__task_cli_before_history__");
         *processor.task_history_preparation_failure.lock().unwrap() = Some(anyhow::anyhow!(CANARY));
@@ -186,7 +220,10 @@ async fn run_gateway_start_failure(
         } else {
             *processor.task_cli_readiness_failure.lock().unwrap() = Some(error);
         }
-    } else if !matches!(case, PreparationFailure::TerminalHistory) {
+    } else if !matches!(
+        case,
+        PreparationFailure::TerminalHistory | PreparationFailure::RetryFrozen
+    ) {
         let failure = if matches!(case, PreparationFailure::Validation) {
             super::super::turn_handlers::TurnStartFailure::protocol_invalid_input(CANARY)
         } else {
@@ -212,22 +249,9 @@ async fn run_gateway_start_failure(
     }
     if matches!(
         case,
-        PreparationFailure::Cleanup
-            | PreparationFailure::RetryFrozen
-            | PreparationFailure::RetryBackoff
+        PreparationFailure::Cleanup | PreparationFailure::RetryBackoff
     ) {
-        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-        store
-            .database_connection()
-            .execute_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "CREATE TRIGGER pioneer9_cleanup_failure BEFORE INSERT ON turn_event \
-             WHEN NEW.event_type = 'turn/blocked' \
-             BEGIN SELECT RAISE(ABORT, 'pioneer9 cleanup persistence'); END;"
-                    .to_owned(),
-            ))
-            .await
-            .unwrap();
+        install_task_start_cleanup_failure(&store).await;
     }
     let mut wakes = processor
         .task_runtime
@@ -283,13 +307,6 @@ async fn run_gateway_start_failure(
         loop {
             let response = store.get_task(&created.task.id).await.unwrap().unwrap();
             if response.runs[0].status == expected_status {
-                return response;
-            }
-            if matches!(
-                case,
-                PreparationFailure::History | PreparationFailure::AdmissionStorage
-            ) && response.runs[0].status == TaskRunStatus::Failed
-            {
                 return response;
             }
             assert_ne!(
@@ -349,7 +366,21 @@ async fn run_gateway_start_failure(
         | TaskEventPayload::TaskRunTurnBlocked { error, .. } => error.as_ref(),
         _ => None,
     });
-    if matches!(case, PreparationFailure::ChildPersistence) {
+    if matches!(case, PreparationFailure::RetryFrozen) {
+        assert!(child_error.is_none());
+        assert!(
+            saved.task_run_turns.is_empty(),
+            "history fails before a child is admitted"
+        );
+        assert_eq!(error.code, "task_history_preparation_storage_failed");
+        assert_eq!(error.class, TaskErrorClass::Internal);
+        assert_eq!(
+            processor
+                .task_cli_preparation_attempts
+                .load(Ordering::SeqCst),
+            0
+        );
+    } else if matches!(case, PreparationFailure::ChildPersistence) {
         assert!(child_error.is_none());
         assert_eq!(error.code, "task_executor_start_unclassified_failed");
     } else {
@@ -431,6 +462,7 @@ async fn run_gateway_start_failure(
             assert!(cli.turn_starts.lock().await.is_empty());
             return (Some(error), run_id);
         }
+        install_task_start_cleanup_failure(&store).await;
         // A fresh capture would consume this failpoint. Reuse must bypass it.
         *processor.task_history_preparation_failure.lock().unwrap() = Some(anyhow::anyhow!(CANARY));
         *processor.task_cli_admission_failure.lock().unwrap() =
@@ -925,29 +957,25 @@ async fn create_review_cli_child(
         .await
         .unwrap();
     let activations = harness.cli_session.turn_starts.lock().await.len();
+    harness
+        .cli_session
+        .set_next_native_turn_id(format!("native-{label}"))
+        .await;
     let response = create_task_for_test(processor, params).await.unwrap();
     let run = response.run.as_ref().unwrap();
-    let mut lineage = None;
-    for _ in 0..512 {
-        if let Some(child) = harness
-            .crud_store
-            .get_latest_task_run_turn(&run.id)
-            .await
-            .unwrap()
-            && let Some(scope) = harness
+    let lineage = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(child) = harness
                 .crud_store
-                .get_task_thread_lineage(&child.thread_id)
+                .get_latest_task_run_turn(&run.id)
                 .await
                 .unwrap()
-        {
-            lineage = Some(TestChildRuntimeAnchor {
-                child_thread_id: scope.child_thread_id,
-                child_turn_id: child.turn_id,
-                parent_thread_id: scope.parent_thread_id,
-                created_by_thread_id: scope.created_by_thread_id,
-                created_by_turn_id: scope.created_by_turn_id,
-            });
-            if harness.cli_session.turn_starts.lock().await.len() == activations + 1
+                && let Some(scope) = harness
+                    .crud_store
+                    .get_task_thread_lineage(&child.thread_id)
+                    .await
+                    .unwrap()
+                && harness.cli_session.turn_starts.lock().await.len() == activations + 1
                 && harness
                     .crud_store
                     .get_task_run(&run.id)
@@ -956,17 +984,33 @@ async fn create_review_cli_child(
                     .unwrap()
                     .status
                     == TaskRunStatus::Running
+                && harness
+                    .crud_store
+                    .get_cli_runtime_turn_binding(&child.turn_id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|binding| {
+                        binding.native_turn_id.as_deref()
+                            == Some(format!("native-{label}").as_str())
+                    })
             {
-                break;
+                return TestChildRuntimeAnchor {
+                    child_thread_id: scope.child_thread_id,
+                    child_turn_id: child.turn_id,
+                    parent_thread_id: scope.parent_thread_id,
+                    created_by_thread_id: scope.created_by_thread_id,
+                    created_by_turn_id: scope.created_by_turn_id,
+                };
             }
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
-    }
+    })
+    .await
+    .expect("initial CLI child must persist its exact native activation ACK within 30 seconds");
     assert_eq!(
         harness.cli_session.turn_starts.lock().await.len(),
         activations + 1
     );
-    let lineage = lineage.expect("initial child lineage");
     assert_eq!(
         harness
             .crud_store
@@ -1556,7 +1600,13 @@ async fn assert_persisted_late_cli_failure(
         .unwrap()
         .unwrap();
     let run = saved.runs.iter().find(|run| run.id == run_id).unwrap();
-    assert_eq!(run.status, TaskRunStatus::Blocked);
+    assert_eq!(
+        run.status,
+        TaskRunStatus::Blocked,
+        "children={:?}, run error={:?}",
+        saved.task_run_turns,
+        run.error
+    );
     assert_eq!(saved.task.status, TaskStatus::Blocked);
     let error = run.error.clone().unwrap();
     assert_eq!(saved.task.error.as_ref(), Some(&error));
@@ -1737,10 +1787,11 @@ fn reviewer_late_cli_preparation_preserves_blocked_transition_and_safe_storage_e
             )
             .await
             .expect_err("late reviewer preparation remains a failed completion");
-        assert!(
-            error.downcast_ref::<TaskStartFailure>().is_some(),
-            "expected typed preparation failure, got {error:#}"
-        );
+        let failure = error
+            .downcast_ref::<TaskStartFailure>()
+            .expect("late reviewer completion must preserve its typed failure");
+        assert_eq!(failure.descriptor().stage, TaskStartStage::CliPreparation);
+        assert_eq!(failure.descriptor().cause, TaskStartCause::Storage);
         let run_id = &task.run.unwrap().id;
         let error = assert_persisted_late_cli_failure(
             &processor,
