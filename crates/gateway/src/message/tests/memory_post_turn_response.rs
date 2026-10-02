@@ -622,7 +622,7 @@ impl AgentMemoryWriteProvider for FailOnceAfterWrite {
         &self,
         context: MemoryTurnContext,
         request: MemoryManifestRequest,
-    ) -> Result<MemoryManifest, String> {
+    ) -> Result<MemoryManifest, pioneer_memory::MemoryManifestFailure> {
         self.bridge.load_memory_manifest(context, request).await
     }
     async fn write_semantic_memory(

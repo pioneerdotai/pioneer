@@ -68486,11 +68486,27 @@ async fn setup_memory_agent_e2e_harness_with_tool_loop_config(
     provider_registry: Arc<pioneer_provider::ProviderRegistry>,
     tool_loop_config: ToolLoopConfig,
 ) -> MemoryAgentE2eHarness {
+    let workspace = setup_workspace_manager().await;
+    setup_memory_agent_e2e_harness_on_workspace(
+        case_id,
+        provider_registry,
+        tool_loop_config,
+        workspace,
+    )
+    .await
+}
+
+async fn setup_memory_agent_e2e_harness_on_workspace(
+    case_id: &str,
+    provider_registry: Arc<pioneer_provider::ProviderRegistry>,
+    tool_loop_config: ToolLoopConfig,
+    workspace: (Arc<WorkspaceManager>, Arc<CrudStore>, String),
+) -> MemoryAgentE2eHarness {
     let session_manager = Arc::new(SessionManager::new());
     let (tx, rx) = mpsc::channel(128);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let (workspace_manager, crud_store, workspace_id) = workspace;
     session_manager
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;

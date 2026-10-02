@@ -135,26 +135,33 @@ impl HookHandler for MemoryPostTurnExtractorHook {
             .await
         {
             Ok(manifest) => manifest,
-            Err(error) => {
+            Err(failure) => {
+                let error = memory_manifest_hook_error(failure);
                 tracing::warn!(
                     target: "pioneer::memory_post_turn_extractor",
                     stage = "manifest_load",
                     durable = durable_terminal_effect.is_some(),
-                    error = %error,
+                    failure_class = failure.class_name(),
+                    failure_stage = failure.stage.as_str(),
+                    sqlite_primary_code = failure.sqlite_primary_code,
+                    sqlite_extended_code = failure.sqlite_extended_code,
                     "memory post-turn extractor manifest load failed"
                 );
                 if durable_terminal_effect.is_some() {
-                    return Err(memory_retryable_safe_hook_error(
-                        "memory.post_turn_extractor.manifest_failed",
-                        "memory post-turn extractor manifest loading failed",
-                    ));
+                    return Err(error);
                 }
-                response
-                    .diagnostics
-                    .push(memory_post_turn_provider_skip_diagnostic(
-                        "manifest_failed",
-                        "memory post-turn extractor skipped: manifest loading failed",
-                    ));
+                let mut diagnostic = memory_post_turn_provider_skip_diagnostic(
+                    "manifest_failed",
+                    "memory post-turn extractor skipped: manifest loading failed",
+                );
+                diagnostic.metadata.insert(
+                    hook_metadata_key("manifest_failure_code"),
+                    HookValue::Text(failure.code().to_owned()),
+                );
+                for (key, value) in error.metadata {
+                    diagnostic.metadata.insert(key, HookValue::Text(value));
+                }
+                response.diagnostics.push(diagnostic);
                 return Ok(response);
             }
         };
