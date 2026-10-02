@@ -613,6 +613,22 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
     Ok(result)
 }
 
+// Shared source-unit conversion, not a tariff table. Invalid known values
+// remain invalid through validation instead of overflow serializing as null.
+fn per_token_rate(value: &Value) -> Value {
+    let converted = value
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| value.as_f64())
+        .filter(|v| v.is_finite() && *v >= 0.)
+        .map(|v| round(v * 1_000_000.));
+    match converted {
+        Some(v) if v.is_finite() => json!(v),
+        Some(_) => json!("invalid_scaled_source_rate"),
+        None => value.clone(),
+    }
+}
+
 pub(super) fn openrouter(data: &Value) -> Vec<Candidate> {
     data["data"]
         .as_array()
@@ -665,17 +681,34 @@ pub(super) fn openrouter(data: &Value) -> Vec<Candidate> {
             ] {
                 c.model["cost"][key] = match &m["pricing"][source] {
                     Value::Null => Value::Null,
-                    value => value
-                        .as_str()
-                        .and_then(|s| s.parse::<f64>().ok())
-                        .or_else(|| value.as_f64())
-                        .filter(|v| v.is_finite() && *v >= 0.)
-                        .map(|v| json!(round(v * 1_000_000.)))
-                        .unwrap_or_else(|| value.clone()),
+                    // The pinned Models API snapshot uses -1 for Auto Router's
+                    // dynamic selected-model tariff, not a negative/free rate.
+                    // Contract: https://openrouter.ai/docs/guides/routing/routers/auto-router
+                    // Scope this exception to documented auto slugs and token
+                    // input/output fields; other negative/malformed rates fail validation.
+                    value
+                        if matches!(id, "openrouter/auto" | "openrouter/auto-beta")
+                            && matches!(source, "prompt" | "completion")
+                            && (value.as_str() == Some("-1") || value.as_f64() == Some(-1.)) =>
+                    {
+                        Value::Null
+                    }
+                    value => per_token_rate(value),
                 };
             }
             c.model["pricingSource"] =
                 json!({"url":SOURCE_URLS[1],"units":"USD_per_token","raw":m["pricing"]});
+            if matches!(id, "openrouter/auto" | "openrouter/auto-beta")
+                && ["prompt", "completion"].iter().any(|key| {
+                    m["pricing"][key].as_str() == Some("-1")
+                        || m["pricing"][key].as_f64() == Some(-1.)
+                })
+            {
+                c.model["pricingSource"]["unknownRateContract"] = json!({
+                    "reason":"dynamic_selected_model_tariff", "sentinel":-1,
+                    "url":"https://openrouter.ai/docs/guides/routing/routers/auto-router"
+                });
+            }
             let reasoning = &m["reasoning"];
             let mandatory = reasoning["mandatory"] == true;
             if let Some(mut map) =
@@ -730,13 +763,7 @@ pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
             ] {
                 c.model["cost"][key] = match &m["pricing"][source] {
                     Value::Null => Value::Null,
-                    value => value
-                        .as_str()
-                        .and_then(|s| s.parse::<f64>().ok())
-                        .or_else(|| value.as_f64())
-                        .filter(|v| v.is_finite() && *v >= 0.)
-                        .map(|v| json!(round(v * 1_000_000.)))
-                        .unwrap_or_else(|| value.clone()),
+                    value => per_token_rate(value),
                 };
             }
             c

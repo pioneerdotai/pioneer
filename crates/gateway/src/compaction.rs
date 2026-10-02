@@ -19,6 +19,8 @@ mod origins;
 mod result_budget;
 mod service;
 #[cfg(test)]
+pub(crate) use service::apply_cli_usage;
+#[cfg(test)]
 pub(crate) mod test_support;
 mod tool_outcomes;
 pub(crate) use admission::{PreparedOperation, admit_operation};

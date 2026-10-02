@@ -592,7 +592,10 @@ impl GeminiProvider {
     }
 
     fn extract_usage(response: &ApiGenerateResponse) -> Option<TokenUsage> {
-        (response.usage_metadata.is_some() || response.response_id.is_some()).then(|| {
+        (response.usage_metadata.is_some()
+            || response.response_id.is_some()
+            || response.model_version.is_some())
+        .then(|| {
             response
                 .usage_metadata
                 .as_ref()
@@ -1053,6 +1056,20 @@ fn canonical_gemini_thinking_level(level: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_version_only_frame_retains_metadata_without_counters_or_arbitrary_ids() {
+        let response: super::ApiGenerateResponse = serde_json::from_value(serde_json::json!({
+            "modelVersion":"gemini-returned", "arbitrary":{"id":"SECRET"}
+        }))
+        .unwrap();
+        let usage = super::GeminiProvider::extract_usage(&response).unwrap();
+        assert_eq!(usage.reported_model.as_deref(), Some("gemini-returned"));
+        assert_eq!(usage.generation_id, None);
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, None);
+        assert!(!serde_json::to_string(&usage).unwrap().contains("SECRET"));
+    }
+
     #[test]
     fn usage_prompt_includes_cached_content_once() {
         let response: super::ApiGenerateResponse = serde_json::from_value(serde_json::json!({

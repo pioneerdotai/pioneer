@@ -208,9 +208,11 @@ fn reported_and_estimated_cost_coexist_with_catalog_snapshot() {
     let provenance = json!({"openrouter":{"fixture":{"contextWindow":{"kind":"source","expression":"fixture"},"maxTokens":{"kind":"source","expression":"fixture"}}}});
     let catalog =
         crate::catalog::ModelCatalog::parse(&models.to_string(), &provenance.to_string()).unwrap();
-    let usage = decode::<0>(
+    let mut usage = decode::<0>(
         json!({"prompt_tokens":300,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":100,"cache_write_tokens":20},"cost":0.4}),
     );
+    usage.api = Some("chat_completions".into());
+    usage.route = route("https://openrouter.ai/api/v1", "/chat/completions");
     let a = accounting(&usage, "openrouter", "fixture", Some(&catalog));
     assert_eq!(a["reported_cost"]["amount"], 0.4);
     assert_eq!(a["reported_cost"]["currency"], "credits");
@@ -325,5 +327,222 @@ fn native_cache_marker_requires_evidenced_model_profile_and_default_retention() 
             )
             .is_none()
         );
+    }
+}
+
+fn billing_catalog(provider: &str, rate: f64) -> std::sync::Arc<crate::catalog::ModelCatalog> {
+    billing_catalog_configured(provider, rate, |_| {})
+}
+fn billing_catalog_configured(
+    provider: &str,
+    rate: f64,
+    mut configure: impl FnMut(&mut Value),
+) -> std::sync::Arc<crate::catalog::ModelCatalog> {
+    let mut entries = serde_json::Map::new();
+    let mut origins = serde_json::Map::new();
+    for (id, input) in [("A", rate), ("B", rate * 10.), ("openrouter/auto", rate)] {
+        entries.insert(id.into(), json!({"id":id,"name":id,"provider":provider,
+            "api":if provider == "openai" {"openai-responses"}else{"openai-completions"},
+            "baseUrl":if provider == "openai" {"https://api.openai.com/v1"}else{"https://openrouter.ai/api/v1"},
+            "contextWindow":1000,"maxTokens":100,"reasoning":false,"input":["text"],
+            "cost":{"input":input,"output":input,"cacheRead":input,"cacheWrite":input},
+            "pricingEvidenceVersion":1,"pricingUnits":"USD_per_million_tokens"}));
+        origins.insert(id.into(), json!({"contextWindow":{"kind":"source","expression":"fixture"},"maxTokens":{"kind":"source","expression":"fixture"}}));
+    }
+    for model in entries.values_mut() {
+        configure(model);
+    }
+    std::sync::Arc::new(
+        crate::catalog::ModelCatalog::parse(
+            &json!({provider:entries}).to_string(),
+            &json!({provider:origins}).to_string(),
+        )
+        .unwrap(),
+    )
+}
+fn billing_context(
+    provider: &str,
+    model: &str,
+    catalog: std::sync::Arc<crate::catalog::ModelCatalog>,
+) -> UsageContext {
+    UsageContext {
+        provider: provider.into(),
+        model: model.into(),
+        api: "chat_completions".into(),
+        api_version: None,
+        route: route(
+            if provider == "openai" {
+                "https://api.openai.com/v1"
+            } else {
+                "https://openrouter.ai/api/v1"
+            },
+            "/chat/completions",
+        ),
+        attempt: "physical-attempt".into(),
+        catalog: Some(catalog),
+    }
+}
+fn billing_usage() -> TokenUsage {
+    decode::<0>(
+        json!({"prompt_tokens":100,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"cost":0.4}),
+    )
+}
+#[test]
+fn pricing_requires_actual_route_and_evidenced_model_mapping() {
+    let context = billing_context("openai", "A", billing_catalog("openai", 2.));
+    let mut matching = billing_usage().with_reported_model(Some("A"));
+    context.enrich(&mut matching);
+    assert_eq!(
+        matching.accounting.as_ref().unwrap()["price_status"],
+        "catalog_estimate"
+    );
+    for reported in ["B", "unresolved-alias"] {
+        let mut usage = billing_usage().with_reported_model(Some(reported));
+        context.enrich(&mut usage);
+        let a = usage.accounting.unwrap();
+        assert!(a["estimated_cost"].is_null());
+        assert_eq!(
+            a["pricing_eligibility"]["reason"],
+            "unconfirmed_reported_model_mapping"
+        );
+        assert_eq!(a["pricing"]["model"], "A");
+        assert_eq!(a["pricing"]["basis"], "reference_tariff_only");
+        assert_eq!(a["reported_cost"]["amount"], 0.4);
+    }
+    let mut private = context;
+    private.route = route(
+        "https://private.example/private?key=SECRET",
+        "/chat/completions",
+    );
+    let mut usage = billing_usage();
+    private.enrich(&mut usage);
+    let a = usage.accounting.unwrap();
+    assert!(a["estimated_cost"].is_null());
+    assert_eq!(
+        a["pricing_eligibility"]["reason"],
+        "route_does_not_match_catalog_tariff"
+    );
+    assert!(!a.to_string().contains("SECRET"));
+    assert!(!a.to_string().contains("private.example"));
+}
+#[test]
+fn documented_auto_selected_model_and_captured_snapshot_determine_estimate() {
+    let original = billing_catalog("openrouter", 2.);
+    let context = billing_context("openrouter", "openrouter/auto", original.clone());
+    let replacement = billing_catalog("openrouter", 7.);
+    let mut usage = billing_usage().with_reported_model(Some("B"));
+    context.enrich(&mut usage);
+    let a = usage.accounting.as_ref().unwrap();
+    assert_eq!(a["pricing_eligibility"]["billing_model"], "B");
+    assert_eq!(a["pricing"]["cost"]["input"], 20.);
+    assert_eq!(a["catalog_snapshot"], original.snapshot_id());
+    assert_ne!(a["catalog_snapshot"], replacement.snapshot_id());
+    assert!((a["estimated_cost"]["amount"].as_f64().unwrap() - 0.0022).abs() < 1e-10);
+    // No summation on duplicate enriched observations.
+    usage.update(&usage.clone());
+    assert_eq!(usage.input_tokens, Some(100));
+    let free = billing_context("openai", "A", billing_catalog("openai", 0.));
+    let mut usage = billing_usage();
+    free.enrich(&mut usage);
+    assert_eq!(usage.accounting.unwrap()["estimated_cost"]["amount"], 0.);
+}
+#[test]
+fn identity_guard_does_not_bypass_existing_conditional_price_guards() {
+    let context = billing_context("openai", "A", billing_catalog("openai", 2.));
+    for raw in [
+        json!({"prompt_tokens":100,"completion_tokens":10}),
+        json!({"prompt_tokens":100,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0,"audio_tokens":1}}),
+        json!({"prompt_tokens":100,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"cache_creation":{"ephemeral_1h_input_tokens":1}}),
+    ] {
+        let mut usage = decode::<0>(raw);
+        context.enrich(&mut usage);
+        assert!(usage.accounting.unwrap()["estimated_cost"].is_null());
+    }
+    let mut usage = billing_usage().with_service_tier(Some("priority"));
+    context.enrich(&mut usage);
+    assert!(usage.accounting.unwrap()["estimated_cost"].is_null());
+}
+
+#[test]
+fn registry_context_enriches_metadata_only_failure_without_zero_counters() {
+    let context = billing_context("openai", "A", billing_catalog("openai", 2.));
+    let snapshot = TokenUsage::default()
+        .with_native_id(Some("gen-header"))
+        .with_request_id(Some("req-distinct"));
+    let error = context.enrich_error(with_error_usage(
+        anyhow::anyhow!("native rejection"),
+        &snapshot,
+    ));
+    let retained = error_usage(&error).unwrap();
+    assert_eq!(retained.generation_id.as_deref(), Some("gen-header"));
+    assert_eq!(retained.request_id.as_deref(), Some("req-distinct"));
+    assert_eq!(
+        retained.physical_attempt_id.as_deref(),
+        Some("physical-attempt")
+    );
+    assert_eq!(retained.input_tokens, None);
+    assert_eq!(retained.output_tokens, None);
+    assert!(retained.accounting.as_ref().unwrap()["estimated_cost"].is_null());
+    let mut accumulated = TokenUsage::default();
+    accumulated.update(retained);
+    accumulated.update(retained);
+    assert_eq!(&accumulated, retained);
+}
+
+#[test]
+fn unresolved_router_and_catalog_conditions_remain_unknown_through_context() {
+    let auto = billing_context(
+        "openrouter",
+        "openrouter/auto",
+        billing_catalog("openrouter", 0.),
+    );
+    for reported in [None, Some("openrouter/auto")] {
+        let mut usage = billing_usage().with_reported_model(reported);
+        auto.enrich(&mut usage);
+        let a = usage.accounting.unwrap();
+        assert!(a["estimated_cost"].is_null());
+        assert_eq!(
+            a["pricing_eligibility"]["reason"],
+            "missing_selected_billing_model"
+        );
+        assert_eq!(a["reported_cost"]["amount"], 0.4);
+    }
+    for (field, value) in [
+        ("pricingUnits", json!("USD_per_token")),
+        ("pricingEvidenceVersion", Value::Null),
+        (
+            "cost",
+            json!({"input":null,"output":2,"cacheRead":2,"cacheWrite":2}),
+        ),
+        (
+            "cost",
+            json!({"input":2,"output":2,"cacheRead":null,"cacheWrite":2}),
+        ),
+        (
+            "cost",
+            json!({"input":2,"output":2,"cacheRead":2,"cacheWrite":2,"tiers":[{"tier":{"size":1},"input":10}]}),
+        ),
+        ("pricingSource", json!({"raw":{"request":"0.1"}})),
+    ] {
+        let catalog = billing_catalog_configured("openai", 2., |m| m[field] = value.clone());
+        let context = billing_context("openai", "A", catalog);
+        let mut usage = decode::<0>(
+            json!({"prompt_tokens":100,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":20,"cache_write_tokens":0}}),
+        );
+        context.enrich(&mut usage);
+        assert!(
+            usage.accounting.unwrap()["estimated_cost"].is_null(),
+            "{field}/{value}"
+        );
+    }
+    for provider in ["custom", "azure-openai", "glm", "copilot"] {
+        let context = billing_context(provider, "A", billing_catalog(provider, 0.));
+        let mut usage = billing_usage();
+        context.enrich(&mut usage);
+        assert_eq!(
+            usage.accounting.as_ref().unwrap()["pricing_eligibility"]["reason"],
+            "deployment_private_or_subscription_billing_contract"
+        );
+        assert!(usage.accounting.unwrap()["estimated_cost"].is_null());
     }
 }

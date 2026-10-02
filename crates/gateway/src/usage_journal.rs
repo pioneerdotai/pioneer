@@ -137,6 +137,10 @@ impl Provider for JournalProvider {
             if let Some(snapshot) = &response.usage {
                 usage.update(snapshot);
             }
+        } else if let Err(error) = &response {
+            if let Some(snapshot) = pioneer_provider::usage::error_usage(error) {
+                usage.update(snapshot);
+            }
         }
         call.record(
             if response.is_ok() {
@@ -153,10 +157,13 @@ impl Provider for JournalProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let (call, usage) = self.start(&request.model).await?;
+        let (call, mut usage) = self.start(&request.model).await?;
         let stream = match self.inner.stream_chat(request).await {
             Ok(stream) => stream,
             Err(error) => {
+                if let Some(snapshot) = pioneer_provider::usage::error_usage(&error) {
+                    usage.update(snapshot);
+                }
                 call.record("failed", &usage).await?;
                 return Err(error);
             }
@@ -178,7 +185,11 @@ impl Provider for JournalProvider {
                                     "started"
                                 }
                             }
-                            Err(_) => {
+                            Err(error) => {
+                                if let Some(snapshot) = pioneer_provider::usage::error_usage(error)
+                                {
+                                    usage.update(snapshot);
+                                }
                                 terminal = true;
                                 "failed"
                             }

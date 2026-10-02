@@ -876,58 +876,93 @@ impl crate::traits::Provider for OpenRouterProvider {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
-        }
-
-        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
-            response,
-            Default::default(),
-            "provider_response",
-        )
-        .await?;
-        let usage = Some(
-            api_response
-                .usage
-                .map(|u| u.normalized())
-                .unwrap_or_default()
-                .with_native_id(api_response.id.as_deref())
-                .with_reported_model(api_response.model.as_deref()),
+        // Header is authoritative correlation evidence. If body disagrees,
+        // retain the header; never invent a combined ID. Body is fallback only.
+        let header_usage = TokenUsage::default().with_native_id(
+            response
+                .headers()
+                .get("X-Generation-Id")
+                .and_then(|v| v.to_str().ok()),
         );
-
-        let choice = api_response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("no response from OpenRouter"))?;
-        let termination = choice
-            .finish_reason
-            .as_deref()
-            .map(ProviderTermination::from_openai_reason)
-            .unwrap_or_else(|| ProviderTermination::Unknown("missing_finish_reason".to_owned()));
-        let message = choice.message;
-
-        let provider_replay_state =
-            Self::reasoning_details_state(message.reasoning_details.clone().unwrap_or_default());
-        let text = message.effective_content();
-        let tool_calls =
-            parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())?;
-        let reasoning_content = message.reasoning_content.or(message.reasoning);
-
-        if text.is_empty()
-            && tool_calls.is_empty()
-            && reasoning_content.as_deref().unwrap_or_default().is_empty()
-        {
-            return Err(anyhow!("no response from OpenRouter"));
+        if !response.status().is_success() {
+            let error = Self::api_error(response).await;
+            return Err(if header_usage.generation_id.is_some() {
+                crate::usage::with_error_usage(error, &header_usage)
+            } else {
+                error
+            });
         }
 
-        Ok(ChatResponse {
-            text,
-            usage,
-            termination,
-            reasoning_content,
-            tool_calls,
-            provider_replay_state,
+        let mut observed = header_usage.clone();
+        let result = async {
+            let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
+                response,
+                Default::default(),
+                "provider_response",
+            )
+            .await?;
+            let usage = Some(
+                api_response
+                    .usage
+                    .map(|u| u.normalized())
+                    .unwrap_or_default()
+                    .with_native_id(
+                        header_usage
+                            .generation_id
+                            .as_deref()
+                            .or(api_response.id.as_deref()),
+                    )
+                    .with_reported_model(api_response.model.as_deref()),
+            );
+
+            if let Some(snapshot) = &usage {
+                observed.update(snapshot);
+            }
+            let choice = api_response
+                .choices
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("no response from OpenRouter"))?;
+            let termination = choice
+                .finish_reason
+                .as_deref()
+                .map(ProviderTermination::from_openai_reason)
+                .unwrap_or_else(|| {
+                    ProviderTermination::Unknown("missing_finish_reason".to_owned())
+                });
+            let message = choice.message;
+
+            let provider_replay_state = Self::reasoning_details_state(
+                message.reasoning_details.clone().unwrap_or_default(),
+            );
+            let text = message.effective_content();
+            let tool_calls =
+                parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())?;
+            let reasoning_content = message.reasoning_content.or(message.reasoning);
+
+            if text.is_empty()
+                && tool_calls.is_empty()
+                && reasoning_content.as_deref().unwrap_or_default().is_empty()
+            {
+                return Err(anyhow!("no response from OpenRouter"));
+            }
+
+            Ok(ChatResponse {
+                text,
+                usage,
+                termination,
+                reasoning_content,
+                tool_calls,
+                provider_replay_state,
+            })
+        }
+        .await;
+        result.map_err(|error| {
+            if observed != TokenUsage::default() {
+                crate::usage::with_error_usage(error, &observed)
+            } else {
+                error
+            }
         })
     }
 
@@ -970,8 +1005,21 @@ impl crate::traits::Provider for OpenRouterProvider {
         let response =
             crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
 
+        // Header is authoritative correlation evidence. If body disagrees,
+        // retain the header; never invent a combined ID. Body is fallback only.
+        let header_usage = TokenUsage::default().with_native_id(
+            response
+                .headers()
+                .get("X-Generation-Id")
+                .and_then(|v| v.to_str().ok()),
+        );
         if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
+            let error = Self::api_error(response).await;
+            return Err(if header_usage.generation_id.is_some() {
+                crate::usage::with_error_usage(error, &header_usage)
+            } else {
+                error
+            });
         }
 
         let byte_stream = crate::http::bounded_response_stream(
@@ -983,6 +1031,16 @@ impl crate::traits::Provider for OpenRouterProvider {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
         tokio::spawn(async move {
+            // Correlation header is available before any body frame, including
+            // early EOF/native failure. Preserve it as a metadata-only snapshot.
+            if header_usage.generation_id.is_some()
+                && tx
+                    .send(Ok(StreamChunk::usage(header_usage.clone())))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
             let mut decoder = IncrementalLineDecoder::default();
             let mut tool_call_accumulator = StreamToolCallAccumulator::default();
             let mut terminal_reason = None;
@@ -1047,12 +1105,17 @@ impl crate::traits::Provider for OpenRouterProvider {
                                     .await;
                                 return;
                             }
-                            if resp.usage.is_some() || resp.id.is_some() {
+                            if resp.usage.is_some() || resp.id.is_some() || resp.model.is_some() {
                                 let usage = resp
                                     .usage
                                     .map(|u| u.normalized())
                                     .unwrap_or_default()
-                                    .with_native_id(resp.id.as_deref())
+                                    .with_native_id(
+                                        header_usage
+                                            .generation_id
+                                            .as_deref()
+                                            .or(resp.id.as_deref()),
+                                    )
                                     .with_reported_model(resp.model.as_deref());
                                 if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
                                     return;

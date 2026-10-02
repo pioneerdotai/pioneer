@@ -449,6 +449,25 @@ mod tests {
                     ("cacheRead", "cache_read"),
                     ("cacheWrite", "cache_write"),
                 ] {
+                    if provider == "openrouter"
+                        && matches!(id.as_str(), "openrouter/auto" | "openrouter/auto-beta")
+                        && matches!(field, "input" | "output")
+                    {
+                        let native = if field == "input" {
+                            "prompt"
+                        } else {
+                            "completion"
+                        };
+                        assert_eq!(source["raw"][native], "-1");
+                        assert_eq!(
+                            source["unknownRateContract"]["reason"],
+                            "dynamic_selected_model_tariff"
+                        );
+                        assert_eq!(prices[field], Value::Null);
+                        assert_eq!(reference[field], -1_000_000);
+                        // Comparison-only projection of the exact old sentinel.
+                        prices.insert(field.into(), reference[field].clone());
+                    }
                     if prices.get(field) == Some(&Value::Null)
                         && reference[field].as_f64() == Some(0.)
                     {
@@ -638,5 +657,131 @@ mod validation_tests {
                 json!({"tool_call":true,"cost":{"input":invalid}});
             assert!(generate(&snapshot, true).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod dynamic_pricing_regressions {
+    use super::*;
+    fn pinned() -> SourceSnapshot {
+        serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json")).unwrap()
+    }
+    #[test]
+    fn full_pinned_generation_accepts_documented_auto_unknown_at_both_strictness_levels() {
+        let strict_output = generate(&pinned(), true).unwrap();
+        for strict in [true, false] {
+            let output = generate(&pinned(), strict).unwrap();
+            assert_eq!(output.models, strict_output.models);
+            assert_eq!(output.provenance, strict_output.provenance);
+            output.validate().unwrap();
+            for id in ["openrouter/auto", "openrouter/auto-beta"] {
+                let m = &output.models["openrouter"][id];
+                assert!(m["cost"]["input"].is_null());
+                assert!(m["cost"]["output"].is_null());
+                assert_eq!(m["pricingSource"]["raw"]["prompt"], "-1");
+                assert_eq!(m["pricingSource"]["raw"]["completion"], "-1");
+                assert_eq!(
+                    m["pricingSource"]["unknownRateContract"]["reason"],
+                    "dynamic_selected_model_tariff"
+                );
+                assert_eq!(m["api"], "openai-completions");
+            }
+        }
+    }
+    #[test]
+    fn sentinel_exception_never_allows_other_negative_or_malformed_rates() {
+        for strict in [true, false] {
+            for value in [
+                json!("-2"),
+                json!(-2),
+                json!("NaN"),
+                json!("inf"),
+                json!("1e308"),
+                json!(1e308),
+                json!("bad"),
+                json!(false),
+            ] {
+                let mut source = pinned();
+                let entries = source.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
+                    .as_array_mut()
+                    .unwrap();
+                let auto = entries
+                    .iter_mut()
+                    .find(|m| m["id"] == "openrouter/auto")
+                    .unwrap();
+                auto["pricing"]["prompt"] = value;
+                assert!(generate(&source, strict).is_err());
+            }
+            let mut source = pinned();
+            let entries = source.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
+                .as_array_mut()
+                .unwrap();
+            let auto = entries
+                .iter()
+                .find(|m| m["id"] == "openrouter/auto")
+                .unwrap()
+                .clone();
+            let mut unsupported = auto;
+            unsupported["id"] = json!("fixture/unknown-sentinel");
+            entries.push(unsupported);
+            assert!(generate(&source, strict).is_err());
+        }
+    }
+    #[test]
+    fn unsupported_source_and_cache_sentinels_are_still_invalid() {
+        let mut source = pinned();
+        let entries = source.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
+            .as_array_mut()
+            .unwrap();
+        let auto = entries
+            .iter_mut()
+            .find(|m| m["id"] == "openrouter/auto")
+            .unwrap();
+        auto["pricing"]["input_cache_read"] = json!("-1");
+        assert!(generate(&source, false).is_err());
+        let mut source = pinned();
+        let entries = source.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"]
+            .as_array_mut()
+            .unwrap();
+        let mut model = entries
+            .iter()
+            .find(|m| {
+                m["tags"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|tag| tag == "tool-use"))
+            })
+            .unwrap()
+            .clone();
+        model["id"] = json!("fixture/negative-vercel");
+        model["pricing"]["input"] = json!("-1");
+        entries.push(model);
+        assert!(generate(&source, false).is_err());
+    }
+    #[test]
+    fn explicit_free_zero_preserves_entire_nonpricing_contract() {
+        let source = pinned();
+        let baseline = generate(&source, true).unwrap();
+        let mut free = source;
+        let auto = free.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|m| m["id"] == "openrouter/auto")
+            .unwrap();
+        auto["pricing"]["prompt"] = json!("0");
+        auto["pricing"]["completion"] = json!("0");
+        let output = generate(&free, true).unwrap();
+        assert_eq!(
+            output.models["openrouter"]["openrouter/auto"]["cost"]["input"],
+            0.
+        );
+        let mut before = baseline.models["openrouter"]["openrouter/auto"].clone();
+        let mut after = output.models["openrouter"]["openrouter/auto"].clone();
+        for field in ["cost", "pricingSource"] {
+            before.as_object_mut().unwrap().remove(field);
+            after.as_object_mut().unwrap().remove(field);
+        }
+        assert_eq!(before, after);
+        assert_eq!(baseline.provenance, output.provenance);
     }
 }

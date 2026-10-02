@@ -302,10 +302,31 @@ pub fn accounting(
         "provenance":"provider_response_usage.cost",
         "details":raw.map(|r|r["cost_details"].clone()),
     }));
-    let entry = catalog.and_then(|c| c.model(provider, model));
-    let mut pricing = entry.map(|e| {
+    let requested_entry = catalog.and_then(|c| c.model(provider, model));
+    let dynamic_router =
+        provider == "openrouter" && matches!(model, "openrouter/auto" | "openrouter/auto-beta");
+    let billing_model = match usage.reported_model.as_deref() {
+        Some(reported) if reported != model => {
+            // Auto Router documents response.model as the selected billed model.
+            // Other aliases/fallbacks require a separate evidenced mapping.
+            if dynamic_router { Some(reported) } else { None }
+        }
+        _ if dynamic_router => None,
+        _ => Some(model),
+    };
+    let entry = billing_model.and_then(|id| catalog.and_then(|c| c.model(provider, id)));
+    let eligibility = if dynamic_router && billing_model.is_none() {
+        Err("missing_selected_billing_model")
+    } else {
+        pricing_eligibility(usage, provider, billing_model, entry)
+    };
+    // A requested-model snapshot is reference evidence only when billing identity
+    // is unresolved. It must never be presented as an actual-attempt estimate.
+    let snapshot_entry = entry.or(requested_entry);
+    let mut pricing = snapshot_entry.map(|e| {
         json!({"catalog_snapshot":catalog.map(|c|c.snapshot_id()),
         "provider":e.provider,"model":e.id,"catalog_api":e.api,
+        "basis":if eligibility.is_ok(){"observed_billing_identity"}else{"reference_tariff_only"},
         "cost":e.cost,"source":e.metadata.get("pricingSource"),
         "captured_at":e.metadata.get("pricingCapturedAt"),
         "units":e.metadata.get("pricingUnits"),
@@ -319,13 +340,89 @@ pub fn accounting(
             json!({"catalog_snapshot":catalog.map(|c|c.snapshot_id()),"metadata_omitted":"exceeds_8192_bytes"}),
         );
     }
-    let estimate = if oversized {
+    let estimate = if oversized || eligibility.is_err() {
         None
     } else {
         entry.and_then(|e| estimate(usage, &e.cost, &e.metadata))
     };
     json!({"reported_cost":reported_cost,"estimated_cost":estimate,
-        "pricing":pricing,"price_status":if entry.is_none(){"unknown_tariff"}else if estimate.is_none(){"unknown_or_conditional_price"}else{"catalog_estimate"}})
+        "catalog_snapshot":catalog.map(|c|c.snapshot_id()),
+        "pricing":pricing,"pricing_eligibility":{
+            "eligible":eligibility.is_ok(),"reason":eligibility.err(),
+            "requested_model":model,"reported_model":usage.reported_model,
+            "billing_model":if eligibility.is_ok(){billing_model}else{None},
+            "source":if provider == "openrouter" && matches!(model, "openrouter/auto" | "openrouter/auto-beta") && billing_model != Some(model) {
+                "https://openrouter.ai/docs/guides/routing/routers/auto-router"
+            } else if provider == "openai" && entry.is_some_and(|e| e.api == "openai-responses") {
+                "https://developers.openai.com/api/docs/pricing"
+            } else {"captured_catalog_api_and_endpoint"}},
+        "price_status":if snapshot_entry.is_none(){"unknown_tariff"}else if estimate.is_none(){"unknown_or_conditional_price"}else{"catalog_estimate"}})
+}
+
+fn pricing_eligibility(
+    usage: &TokenUsage,
+    provider: &str,
+    billing_model: Option<&str>,
+    entry: Option<&crate::catalog::CatalogModel>,
+) -> Result<(), &'static str> {
+    if billing_model.is_none() {
+        return Err("unconfirmed_reported_model_mapping");
+    }
+    if matches!(
+        provider,
+        "custom" | "local" | "azure-openai" | "azure_openai" | "copilot" | "glm"
+    ) {
+        return Err("deployment_private_or_subscription_billing_contract");
+    }
+    let entry = entry.ok_or("unknown_billing_tariff")?;
+    // OpenAI documents shared model token tariffs for Chat and Responses:
+    // https://developers.openai.com/api/docs/pricing (APIs not priced separately).
+    // This narrow API equivalence does not confer endpoint/model equivalence.
+    let matching_api = (provider == "openai"
+        && usage.api.as_deref() == Some("chat_completions")
+        && entry.api == "openai-responses")
+        || matches!(
+            (usage.api.as_deref(), entry.api.as_str()),
+            (Some("chat_completions"), "openai-completions")
+                | (Some("messages"), "anthropic-messages")
+                | (Some("generate_content"), "google-generative-ai")
+                | (Some("bedrock_converse"), "bedrock-converse-stream")
+        );
+    if !matching_api {
+        return Err("unconfirmed_api_pricing_contract");
+    }
+    let actual = usage.route.as_deref().ok_or("missing_billing_route")?;
+    let template = actual
+        .split_once(";path=")
+        .ok_or("unconfirmed_billing_route")?
+        .1;
+    // Compare the existing opaque identity to the captured public catalog
+    // endpoint, including protocol base path. No host/path/query is exported.
+    if route(&entry.base_url, template).as_deref() != Some(actual) {
+        return Err("route_does_not_match_catalog_tariff");
+    }
+    Ok(())
+}
+
+/// Explicit adapter evidence on failures, without raw headers/payloads/errors.
+#[derive(Clone)]
+pub struct ObservedProviderUsage(pub(crate) TokenUsage);
+impl std::fmt::Debug for ObservedProviderUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ObservedProviderUsage")
+    }
+}
+impl std::fmt::Display for ObservedProviderUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("provider usage evidence available")
+    }
+}
+impl std::error::Error for ObservedProviderUsage {}
+pub fn error_usage(error: &anyhow::Error) -> Option<&TokenUsage> {
+    error.downcast_ref::<ObservedProviderUsage>().map(|e| &e.0)
+}
+pub(crate) fn with_error_usage(error: anyhow::Error, usage: &TokenUsage) -> anyhow::Error {
+    error.context(ObservedProviderUsage(usage.clone()))
 }
 
 fn estimate(
@@ -523,6 +620,14 @@ impl UsageContext {
             route: provider.usage_route(),
             attempt: pioneer_protocol::generate_id(21),
             catalog: crate::catalog::model_catalog().ok(),
+        }
+    }
+    pub(crate) fn enrich_error(&self, error: anyhow::Error) -> anyhow::Error {
+        if let Some(mut usage) = error_usage(&error).cloned() {
+            self.enrich(&mut usage);
+            with_error_usage(error, &usage)
+        } else {
+            error
         }
     }
     pub(crate) fn enrich(&self, usage: &mut TokenUsage) {

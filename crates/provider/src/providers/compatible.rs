@@ -198,6 +198,8 @@ struct ApiToolCallFunction {
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     #[serde(default)]
+    x_groq: Option<serde_json::Value>,
+    #[serde(default)]
     model: Option<String>,
     #[serde(default)]
     id: Option<String>,
@@ -1145,7 +1147,16 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                 .map(|u| u.normalized())
                 .unwrap_or_default()
                 .with_native_id(api_response.id.as_deref())
-                .with_reported_model(api_response.model.as_deref()),
+                .with_reported_model(api_response.model.as_deref())
+                .with_request_id(if self.name == "groq" {
+                    api_response
+                        .x_groq
+                        .as_ref()
+                        .and_then(|m| m.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                } else {
+                    None
+                }),
         );
 
         let choice = api_response

@@ -147,6 +147,7 @@ async fn request_agent_round_observed(
                 pioneer_observability::turn_startup::Stage::ProviderConnect,
             );
             provider.stream_chat(request).await.map_err(|error| {
+                observation.observe_error(&error);
                 adapter_error_for_target(
                     target,
                     provider.as_ref(),
@@ -176,6 +177,7 @@ async fn request_agent_round_observed(
                 provider,
                 model_name.as_str(),
                 provider_timeout_policy,
+                observation,
             )
             .await?
             {
@@ -316,6 +318,7 @@ async fn request_agent_round_observed(
     let model_name = request.model.clone();
 
     let mut response = provider.chat(request).await.map_err(|error| {
+        observation.observe_error(&error);
         adapter_error_for_target(
             FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
             provider.as_ref(),
@@ -430,6 +433,7 @@ async fn stream_provider_response_observed(
             pioneer_observability::turn_startup::Stage::ProviderConnect,
         );
         provider.stream_chat(request).await.map_err(|error| {
+            observation.observe_error(&error);
             adapter_error_for_target(
                 connect_target,
                 provider.as_ref(),
@@ -460,6 +464,7 @@ async fn stream_provider_response_observed(
             provider,
             model_name.as_str(),
             provider_timeout_policy,
+            observation,
         )
         .await?
         {
@@ -787,6 +792,7 @@ async fn non_stream_provider_response_observed(
     let model_name = request.model.clone();
 
     let response = provider.chat(request).await.map_err(|error| {
+        observation.observe_error(&error);
         adapter_error_for_target(
             FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
             provider.as_ref(),
@@ -1202,6 +1208,7 @@ async fn read_next_stream_chunk<S>(
     provider: &Arc<dyn Provider>,
     model_name: &str,
     provider_timeout_policy: ProviderTimeoutPolicy,
+    observation: &ProviderAttemptObservation,
 ) -> Result<Option<StreamChunk>, ChatTurnError>
 where
     S: Stream<Item = anyhow::Result<StreamChunk>> + Unpin,
@@ -1235,6 +1242,7 @@ where
     *seen_any_chunk = true;
 
     let chunk = chunk_result.map_err(|error| {
+        observation.observe_error(&error);
         adapter_error_for_target(
             target,
             provider.as_ref(),
@@ -1949,6 +1957,9 @@ mod partial_observation_tests {
         {
             Ok(futures_util::stream::iter(vec![
                 Ok(StreamChunk::usage(TokenUsage {
+                    generation_id: Some("gen-header".into()),
+                    request_id: Some("req-distinct".into()),
+                    reported_model: Some("actual-returned".into()),
                     input_tokens: Some(10),
                     output_tokens: Some(2),
                     ..Default::default()
@@ -2016,6 +2027,9 @@ mod partial_observation_tests {
                     events.acknowledge_last(Ok(()));
                     if let Some(details) = usage {
                         assert_eq!(details["status"], "failed");
+                        assert_eq!(details["usage"]["generation_id"], "gen-header");
+                        assert_eq!(details["usage"]["request_id"], "req-distinct");
+                        assert_eq!(details["usage"]["reported_model"], "actual-returned");
                         assert_eq!(details["usage"]["input_tokens"], 10);
                         assert_eq!(details["usage"]["output_tokens"], 2);
                         assert!(!details.to_string().contains("request\""));
@@ -2126,6 +2140,11 @@ impl ProviderAttemptObservation {
             .lock()
             .expect("usage observation")
             .update(snapshot);
+    }
+    pub(super) fn observe_error(&self, error: &anyhow::Error) {
+        if let Some(snapshot) = pioneer_provider::usage::error_usage(error) {
+            self.observe(snapshot);
+        }
     }
     pub(super) async fn publish(
         &self,

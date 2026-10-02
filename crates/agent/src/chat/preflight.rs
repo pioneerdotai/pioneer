@@ -914,6 +914,9 @@ async fn request_turn_preflight_provider_json(
     let limits = ProviderResponseLimits::default();
     if provider.capabilities().streaming {
         let mut stream = provider.stream_chat(request).await.map_err(|error| {
+            if let Some(observation) = observation {
+                observation.observe_error(&error);
+            }
             TurnPreflightProviderRequestFailure::provider_error(
                 provider,
                 "provider_stream_start",
@@ -924,6 +927,9 @@ async fn request_turn_preflight_provider_json(
         let mut text = String::new();
         while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
             let chunk = chunk.map_err(|error| {
+                if let Some(observation) = observation {
+                    observation.observe_error(&error);
+                }
                 let failure_stage = if text.is_empty() {
                     ProviderFailureStage::FirstChunk
                 } else {
@@ -972,6 +978,9 @@ async fn request_turn_preflight_provider_json(
     }
 
     let response = provider.chat(request).await.map_err(|error| {
+        if let Some(observation) = observation {
+            observation.observe_error(&error);
+        }
         TurnPreflightProviderRequestFailure::provider_error(
             provider,
             "provider_non_stream_response",

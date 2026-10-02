@@ -77141,6 +77141,7 @@ async fn provider_usage_items_persist_idempotently_without_entering_llm_history(
                 json!({"schema_version":1,"nativeMethod":"provider/usage/observed",
             "physical_attempt_id":id,"provider":"openrouter","model":"fixture","api":"chat_completions",
             "complete":complete,"usage":{"input_tokens":input,"output_tokens":output,
+                "generation_id":"gen-header","request_id":"req-distinct","reported_model":"returned-model",
                 "cache_read_input_tokens":80,"raw_usage":{"prompt_tokens":input,"completion_tokens":output},
                 "accounting":{"reported_cost":{"amount":0.01,"currency":"credits","provenance":"provider_response_usage.cost"},"estimated_cost":null}}}),
             ),
@@ -77430,4 +77431,125 @@ async fn auxiliary_stream_partial_usage_survives_drop_and_retry_without_holding_
         246
     );
     assert_ne!(usages[0].physical_attempt_id, usages[1].physical_attempt_id);
+}
+
+#[tokio::test]
+async fn failed_codex_summary_journal_retains_decoder_numeric_evidence_without_cli() {
+    use pioneer_cli_agent_runtime::{
+        codex::service::decode_exec_completion, service::ObservedServiceUsage,
+    };
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_cli_evidence", "turn_cli_evidence").await;
+    let transcript = concat!(
+        "{\"type\":\"thread.started\",\"thread_id\":\"SECRET_SESSION\"}\n",
+        "{\"type\":\"turn.started\"}\n",
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":0,\"cached_input_tokens\":80,\"prompt\":\"SECRET_PROMPT\"}}\n"
+    );
+    let mut observed = pioneer_provider::TokenUsage {
+        provider: Some("codex-cli".into()),
+        ..Default::default()
+    };
+    let call = crate::usage_journal::Call::start(
+        store.as_ref(),
+        &workspace,
+        "summary",
+        "failed-summary-owner",
+        &observed,
+    )
+    .await
+    .unwrap();
+    let error = decode_exec_completion(transcript.as_bytes()).err().unwrap();
+    assert!(format!("{error:#}").contains("no final answer"));
+    // Same production metadata consumer used by the summary error path; no CLI process.
+    crate::compaction::apply_cli_usage(
+        &mut observed,
+        &error.downcast_ref::<ObservedServiceUsage>().unwrap().0,
+    );
+    call.record("failed", &observed).await.unwrap();
+    call.record("failed", &observed).await.unwrap();
+    let rows = store
+        .provider_usage_page(&workspace, "failed-summary-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+    let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(retained.input_tokens, Some(100));
+    assert_eq!(retained.output_tokens, Some(0));
+    assert_eq!(retained.cache_read_input_tokens, Some(80));
+    assert_eq!(retained.cache_write_input_tokens, None);
+    assert_eq!(retained.physical_attempt_id, None);
+    assert_eq!(retained.generation_id, None);
+    assert!(retained.accounting.as_ref().unwrap()["reported_cost"].is_null());
+    assert!(retained.accounting.as_ref().unwrap()["estimated_cost"].is_null());
+    assert!(!rows[0].usage_json.contains("SECRET"));
+    assert!(!rows[0].usage_json.contains("no final answer"));
+}
+
+#[tokio::test]
+async fn auxiliary_metadata_only_header_survives_failure_without_inventing_counts() {
+    struct MetadataOnly;
+    #[async_trait::async_trait]
+    impl pioneer_provider::Provider for MetadataOnly {
+        fn name(&self) -> &str {
+            "openrouter"
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            anyhow::bail!("unexpected chat")
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            let snapshot = pioneer_provider::TokenUsage {
+                generation_id: Some("gen-header".into()),
+                reported_model: Some("actual-model".into()),
+                physical_attempt_id: Some("physical-header-attempt".into()),
+                ..Default::default()
+            };
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::usage(snapshot.clone())),
+                Ok(StreamChunk::usage(snapshot)),
+                Err(anyhow::anyhow!("SECRET transport diagnostic")),
+            ])))
+        }
+    }
+    use futures_util::StreamExt;
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_header_evidence", "turn_header_evidence").await;
+    let provider = crate::usage_journal::observe(
+        Arc::new(MetadataOnly),
+        store.as_ref(),
+        &workspace,
+        "title",
+        "header-owner",
+    );
+    let request = ChatRequest {
+        model: "requested".into(),
+        messages: vec![],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let mut stream = provider.stream_chat(request).await.unwrap();
+    assert!(stream.next().await.unwrap().is_ok());
+    assert!(stream.next().await.unwrap().is_ok());
+    assert!(stream.next().await.unwrap().is_err());
+    let rows = store
+        .provider_usage_page(&workspace, "header-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+    let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(retained.generation_id.as_deref(), Some("gen-header"));
+    assert_eq!(retained.reported_model.as_deref(), Some("actual-model"));
+    assert_eq!(retained.input_tokens, None);
+    assert_eq!(retained.output_tokens, None);
+    assert!(!rows[0].usage_json.contains("SECRET"));
 }

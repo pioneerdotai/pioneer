@@ -401,7 +401,10 @@ impl Summarizer for CliSummarizer {
     }
 }
 
-fn apply_cli_usage(observed: &mut pioneer_provider::TokenUsage, raw: &serde_json::Value) {
+pub(crate) fn apply_cli_usage(
+    observed: &mut pioneer_provider::TokenUsage,
+    raw: &serde_json::Value,
+) {
     observed.uncached_input_tokens = raw["input_tokens"].as_u64();
     observed.cache_read_input_tokens = raw["cache_read_input_tokens"]
         .as_u64()

@@ -5,6 +5,13 @@ use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn fixture(body: String) -> (String, tokio::task::JoinHandle<serde_json::Value>) {
+    fixture_with_headers(body, String::new(), "200 OK").await
+}
+async fn fixture_with_headers(
+    body: String,
+    headers: String,
+    status: &'static str,
+) -> (String, tokio::task::JoinHandle<serde_json::Value>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -36,7 +43,7 @@ async fn fixture(body: String) -> (String, tokio::task::JoinHandle<serde_json::V
         }
         let parsed = serde_json::from_slice(&request[offset..offset + size]).unwrap();
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         );
@@ -315,5 +322,180 @@ async fn compatible_stream_usage_opt_in_is_profile_specific_and_terminal_is_cumu
         assert_eq!(usage.reported_model.as_deref(), Some("reported-model"));
         let request = server.await.unwrap();
         assert_eq!(request.get("stream_options").is_some(), opt_in, "{profile}");
+    }
+}
+
+#[tokio::test]
+async fn groq_request_id_is_distinct_and_profile_specific() {
+    use super::compatible::{AuthStyle, OpenAiCompatibleProvider};
+    for profile in ["groq", "custom"] {
+        let body = r#"{"id":"chatcmpl-completion","model":"actual","x_groq":{"id":"req-native","secret":"SECRET"},"choices":[{"message":{"content":"answer"},"finish_reason":"stop"}]}"#;
+        let (url, server) = fixture(body.into()).await;
+        let provider = OpenAiCompatibleProvider::new(profile, url, "fixture", AuthStyle::Bearer);
+        let response = crate::attachments::runtime::with_async_authority_scope(
+            "usage-fixture-authority".into(),
+            provider.chat(request()),
+        )
+        .await
+        .unwrap();
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.generation_id.as_deref(), Some("chatcmpl-completion"));
+        assert_eq!(
+            usage.request_id.as_deref(),
+            if profile == "groq" {
+                Some("req-native")
+            } else {
+                None
+            }
+        );
+        assert_eq!(usage.input_tokens, None);
+        assert!(!serde_json::to_string(&usage).unwrap().contains("SECRET"));
+        server.await.unwrap();
+    }
+}
+#[tokio::test]
+async fn openrouter_header_is_preserved_on_chat_rejection_and_stream_before_body() {
+    for (body, status) in [
+        ("", "200 OK"),
+        (r#"{"error":{"message":"SECRET"}}"#, "200 OK"),
+        (
+            r#"{"error":{"message":"SECRET"}}"#,
+            "503 Service Unavailable",
+        ),
+    ] {
+        let (url, server) = fixture_with_headers(
+            body.into(),
+            "X-Generation-Id: gen-header\r\n".into(),
+            status,
+        )
+        .await;
+        let provider = OpenRouterProvider::with_base_url("fixture", url);
+        let result = crate::attachments::runtime::with_async_authority_scope(
+            "usage-fixture-authority".into(),
+            provider.stream_chat(request()),
+        )
+        .await;
+        let mut usage = TokenUsage::default();
+        match result {
+            Err(error) => usage
+                .update(crate::usage::error_usage(&error).expect("HTTP failure retains header")),
+            Ok(mut stream) => {
+                let first = stream.next().await.unwrap().unwrap();
+                usage.update(first.usage.as_ref().unwrap());
+                assert!(stream.next().await.unwrap().is_err());
+            }
+        }
+        assert_eq!(usage.generation_id.as_deref(), Some("gen-header"));
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, None);
+        assert!(!serde_json::to_string(&usage).unwrap().contains("SECRET"));
+        server.await.unwrap();
+    }
+    let (url, server) = fixture_with_headers(
+        "invalid JSON".into(),
+        "X-Generation-Id: gen-chat\r\n".into(),
+        "200 OK",
+    )
+    .await;
+    let provider = OpenRouterProvider::with_base_url("fixture", url);
+    let error = crate::attachments::runtime::with_async_authority_scope(
+        "usage-fixture-authority".into(),
+        provider.chat(request()),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(
+        crate::usage::error_usage(&error)
+            .unwrap()
+            .generation_id
+            .as_deref(),
+        Some("gen-chat")
+    );
+    server.await.unwrap();
+    let body = r#"{"id":"gen-body-conflict","model":"actual-model","choices":[{"message":{"content":"answer"},"finish_reason":"stop"}]}"#;
+    let (url, server) = fixture_with_headers(
+        body.into(),
+        "X-Generation-Id: gen-header\r\n".into(),
+        "200 OK",
+    )
+    .await;
+    let provider = OpenRouterProvider::with_base_url("fixture", url);
+    let response = crate::attachments::runtime::with_async_authority_scope(
+        "usage-fixture-authority".into(),
+        provider.chat(request()),
+    )
+    .await
+    .unwrap();
+    let usage = response.usage.unwrap();
+    assert_eq!(usage.generation_id.as_deref(), Some("gen-header"));
+    assert_eq!(usage.reported_model.as_deref(), Some("actual-model"));
+    assert_eq!(usage.input_tokens, None);
+    server.await.unwrap();
+}
+#[tokio::test]
+async fn openrouter_matching_and_conflicting_body_use_header_policy_without_double_counts() {
+    for body_id in ["gen-header", "gen-conflict"] {
+        let body = format!(
+            "data: {{\"id\":\"{body_id}\",\"choices\":[],\"usage\":{{\"prompt_tokens\":10,\"completion_tokens\":2}}}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+        );
+        let (url, server) =
+            fixture_with_headers(body, "X-Generation-Id: gen-header\r\n".into(), "200 OK").await;
+        let provider = OpenRouterProvider::with_base_url("fixture", url);
+        let mut stream = crate::attachments::runtime::with_async_authority_scope(
+            "usage-fixture-authority".into(),
+            provider.stream_chat(request()),
+        )
+        .await
+        .unwrap();
+        let mut usage = TokenUsage::default();
+        while let Some(chunk) = stream.next().await {
+            if let Some(snapshot) = chunk.unwrap().usage {
+                usage.update(&snapshot);
+                usage.update(&snapshot);
+            }
+        }
+        assert_eq!(usage.generation_id.as_deref(), Some("gen-header"));
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(2));
+        server.await.unwrap();
+    }
+}
+#[tokio::test]
+async fn anthropic_returned_model_survives_nonstream_and_message_start_without_usage() {
+    for streaming in [false, true] {
+        let body = if streaming {
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-native\",\"model\":\"claude-returned\"}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n"
+        } else {
+            r#"{"id":"msg-native","model":"claude-returned","content":[{"type":"text","text":"answer"}],"stop_reason":"end_turn"}"#
+        };
+        let (url, server) = fixture(body.into()).await;
+        let provider = AnthropicProvider::with_base_url("fixture", url);
+        let mut usage = TokenUsage::default();
+        if streaming {
+            let mut stream = crate::attachments::runtime::with_async_authority_scope(
+                "usage-fixture-authority".into(),
+                provider.stream_chat(request()),
+            )
+            .await
+            .unwrap();
+            while let Some(chunk) = stream.next().await {
+                if let Some(snapshot) = chunk.unwrap().usage {
+                    usage.update(&snapshot);
+                }
+            }
+        } else {
+            let response = crate::attachments::runtime::with_async_authority_scope(
+                "usage-fixture-authority".into(),
+                provider.chat(request()),
+            )
+            .await
+            .unwrap();
+            usage.update(response.usage.as_ref().unwrap());
+        }
+        assert_eq!(usage.reported_model.as_deref(), Some("claude-returned"));
+        assert_eq!(usage.generation_id.as_deref(), Some("msg-native"));
+        assert_eq!(usage.input_tokens, None);
+        server.await.unwrap();
     }
 }

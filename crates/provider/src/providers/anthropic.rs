@@ -124,6 +124,8 @@ enum AnthropicToolChoice {
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
     id: Option<String>,
     content: Vec<ContentBlock>,
     #[serde(default)]
@@ -176,6 +178,8 @@ struct StreamEvent {
 
 #[derive(Debug, Deserialize)]
 struct StreamMessage {
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -577,6 +581,7 @@ impl crate::traits::Provider for AnthropicProvider {
                 .map(|u| u.normalized())
                 .unwrap_or_default()
                 .with_native_id(api_response.id.as_deref())
+                .with_reported_model(api_response.model.as_deref())
                 .with_request_id(native_request_id.as_deref()),
         );
 
@@ -773,10 +778,16 @@ impl crate::traits::Provider for AnthropicProvider {
 
                     match serde_json::from_str::<StreamEvent>(data) {
                         Ok(event) => {
-                            if let Some(id) = event.message.as_ref().and_then(|m| m.id.as_deref()) {
+                            if let Some(message) = event
+                                .message
+                                .as_ref()
+                                .filter(|_| event.event_type == "message_start")
+                            {
                                 if tx
                                     .send(Ok(StreamChunk::usage(
-                                        TokenUsage::default().with_native_id(Some(id)),
+                                        TokenUsage::default()
+                                            .with_native_id(message.id.as_deref())
+                                            .with_reported_model(message.model.as_deref()),
                                     )))
                                     .await
                                     .is_err()
