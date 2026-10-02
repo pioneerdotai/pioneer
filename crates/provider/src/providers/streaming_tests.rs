@@ -248,7 +248,7 @@ async fn anthropic_parallel_calls_require_closed_blocks_and_message_stop() {
     }
     for index in [1, 0] {
         input += &wire(
-            json!({"type":"content_block_delta","index":index,"delta":{"partial_json":"{\"path\":\"🌍\"}"}}),
+            json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"🌍\"}"}}),
         );
         input += &wire(json!({"type":"content_block_stop","index":index}));
     }
@@ -376,7 +376,9 @@ async fn dropping_consumer_cancels_pending_transport_before_and_after_partial_ou
         + &wire(
             json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t","name":"write","input":{}}}),
         )
-        + &wire(json!({"type":"content_block_delta","index":1,"delta":{"partial_json":"{"}}));
+        + &wire(
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{"}}),
+        );
     for decoder in 0..11 {
         for has_prefix in [false, true] {
             let prefix = match decoder {
@@ -458,5 +460,286 @@ async fn ollama_distinct_no_id_calls_across_frames_remain_distinct_even_if_ident
     assert_eq!(
         chunks.last().unwrap().termination,
         Some(ProviderTermination::ToolCalls)
+    );
+}
+
+#[tokio::test]
+async fn native_terminal_reasons_are_immutable_even_with_same_normalized_outcome() {
+    for (first, second) in [
+        ("MAX_TOKENS", "STOP"),
+        ("SAFETY", "STOP"),
+        ("STOP", "SAFETY"),
+        ("SAFETY", "RECITATION"),
+    ] {
+        let input = wire(
+            json!({"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":first}]}),
+        ) + &wire(json!({"candidates":[{"finishReason":second}]}));
+        let chunks = GeminiProvider::decode_stream(fragmented(&input))
+            .collect::<Vec<_>>()
+            .await;
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.as_ref().is_ok_and(|c| c.delta == "partial"))
+        );
+        assert_contradictory_chunks(&chunks, 0);
+    }
+    for (first, second) in [
+        ("max_tokens", "end_turn"),
+        ("end_turn", "max_tokens"),
+        ("end_turn", "stop_sequence"),
+        ("tool_use", "end_turn"),
+    ] {
+        let input = anthropic_closed_call()
+            + &wire(json!({"type":"message_delta","delta":{"stop_reason":first}}))
+            + &wire(json!({"type":"message_delta","delta":{"stop_reason":second}}))
+            + &wire(json!({"type":"message_stop"}));
+        let chunks = AnthropicProvider::decode_stream(fragmented(&input))
+            .collect::<Vec<_>>()
+            .await;
+        assert_contradictory_chunks(&chunks, 1);
+    }
+    // Legacy snake_case is recognized by today's parser; NOT canonical Gemini conformance (G02).
+    let input = wire(
+        json!({"candidates":[{"content":{"parts":[{"function_call":{"name":"read","args":{}}}]},"finishReason":"STOP"}]}),
+    ) + &wire(json!({"candidates":[{"finishReason":"MAX_TOKENS"}]}));
+    let chunks = GeminiProvider::decode_stream(fragmented(&input))
+        .collect::<Vec<_>>()
+        .await;
+    assert_contradictory_chunks(&chunks, 1);
+}
+
+fn assert_contradictory_chunks(chunks: &[Result<StreamChunk>], calls: usize) {
+    assert!(chunks.iter().any(|c| {
+        c.as_ref()
+            .is_err_and(|error| error.to_string().contains("contradictory"))
+    }));
+    assert_eq!(
+        chunks
+            .iter()
+            .filter_map(|c| c.as_ref().ok())
+            .flat_map(|c| &c.tool_calls)
+            .count(),
+        calls
+    );
+    assert!(!chunks.iter().any(|c| c.as_ref().is_ok_and(|c| c.is_final)));
+}
+
+async fn assert_failed_decode(decoder: BoxStream<'static, Result<StreamChunk>>) {
+    let chunks = decoder.collect::<Vec<_>>().await;
+    assert!(chunks.iter().any(Result::is_err));
+    assert!(
+        !chunks
+            .iter()
+            .any(|chunk| chunk.as_ref().is_ok_and(|chunk| chunk.is_final))
+    );
+}
+
+fn anthropic_closed_call() -> String {
+    wire(json!({"type":"message_start","message":{}}))
+        + &wire(
+            json!({"type":"content_block_start","index":7,"content_block":{"type":"tool_use","id":"valid","name":"read","input":{"path":"initial"}}}),
+        )
+        + &wire(json!({"type":"content_block_stop","index":7}))
+}
+
+#[tokio::test]
+async fn native_repeated_reasons_and_reasonless_metadata_preserve_late_usage() {
+    let input = anthropic_closed_call()
+        + &wire(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}))
+        + &wire(json!({"type":"message_delta","delta":{},"usage":{"output_tokens":4}}))
+        + &wire(
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":9}}),
+        )
+        + &wire(json!({"type":"message_stop"}));
+    let chunks = AnthropicProvider::decode_stream(fragmented(&input))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        chunks.last().unwrap().termination,
+        Some(ProviderTermination::ToolCalls)
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|c| c.usage.as_ref().is_some_and(|u| u.output_tokens == Some(9)))
+    );
+    let input = wire(
+        json!({"candidates":[{"content":{"parts":[{"text":"text"}]},"finishReason":"STOP"}]}),
+    ) + &wire(json!({"candidates":[{}]}))
+        + &wire(
+            json!({"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"candidatesTokenCount":9}}),
+        );
+    let chunks = GeminiProvider::decode_stream(fragmented(&input))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        chunks.last().unwrap().termination,
+        Some(ProviderTermination::Complete)
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|c| c.usage.as_ref().is_some_and(|u| u.output_tokens == Some(9)))
+    );
+}
+
+#[tokio::test]
+async fn anthropic_malformed_second_block_invalidates_previously_collected_call() {
+    for block in [
+        json!({"type":"tool_use","id":"distinct","name":"read","input":{}}),
+        json!({"type":"tool_use","name":"read","input":{}}),
+        json!({"type":"tool_use","id":"distinct","input":{}}),
+        json!({"type":"tool_use","id":"distinct","name":"read"}),
+    ] {
+        let index = if block["id"] == "distinct"
+            && block.get("name").is_some()
+            && block.get("input").is_some()
+        {
+            7
+        } else {
+            11
+        };
+        let input = anthropic_closed_call()
+            + &wire(json!({"type":"content_block_start","index":index,"content_block":block}))
+            + &wire(json!({"type":"content_block_stop","index":index}))
+            + &wire(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}))
+            + &wire(json!({"type":"message_stop"}));
+        assert_failed_decode(AnthropicProvider::decode_stream(fragmented(&input))).await;
+    }
+    for input in [
+        wire(json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}})),
+        wire(json!({"type":"message_start"}))
+            + &wire(json!({"type":"content_block_start","index":0})),
+        wire(json!({"type":"message_start"}))
+            + &wire(
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"initial"}}),
+            )
+            + &wire(json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}})),
+        anthropic_closed_call()
+            + &wire(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}))
+            + &wire(
+                json!({"type":"content_block_start","index":11,"content_block":{"type":"text","text":"late"}}),
+            ),
+        wire(json!({"type":"message_start"}))
+            + &wire(
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            )
+            + &wire(
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+            ),
+    ] {
+        assert_failed_decode(AnthropicProvider::decode_stream(fragmented(&input))).await;
+    }
+}
+
+#[tokio::test]
+async fn anthropic_unknown_future_events_blocks_and_deltas_are_gracefully_ignored() {
+    let input = anthropic_closed_call()
+        + &wire(json!({"type":"future_event","payload":"ignored"}))
+        + &wire(
+            json!({"type":"content_block_start","index":42,"content_block":{"type":"future_block"}}),
+        )
+        + &wire(
+            json!({"type":"content_block_delta","index":42,"delta":{"type":"future_delta","text":"not text output"}}),
+        )
+        + &wire(json!({"type":"content_block_stop","index":42}))
+        + &wire(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}))
+        + &wire(json!({"type":"message_stop"}));
+    let chunks = AnthropicProvider::decode_stream(fragmented(&input))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(chunks.iter().flat_map(|c| &c.tool_calls).count(), 1);
+    assert!(chunks.iter().all(|c| c.delta.is_empty()));
+    assert_eq!(
+        chunks.last().unwrap().termination,
+        Some(ProviderTermination::ToolCalls)
+    );
+}
+
+#[test]
+fn ollama_non_stream_requires_affirmative_done_before_tool_normalization() {
+    for done in [None, Some(false), Some(true)] {
+        for tools in [false, true] {
+            for reason in ["stop", "length", "content_filter", "unknown_native_reason"] {
+                let message = if tools {
+                    json!({"tool_calls":[{"function":{"name":"read","arguments":{}}}]})
+                } else {
+                    json!({"content":"text"})
+                };
+                let mut value = json!({"message":message,"done_reason":reason});
+                if let Some(done) = done {
+                    value["done"] = json!(done);
+                }
+                let result = OllamaProvider::decode_chat_fixture(value);
+                if done != Some(true) {
+                    assert!(result.is_err());
+                    continue;
+                }
+                let response = result.unwrap();
+                if reason == "stop" {
+                    assert_eq!(
+                        response.termination,
+                        if tools {
+                            ProviderTermination::ToolCalls
+                        } else {
+                            ProviderTermination::Complete
+                        }
+                    );
+                } else {
+                    assert!(!matches!(
+                        response.termination,
+                        ProviderTermination::Complete | ProviderTermination::ToolCalls
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn anthropic_native_error_after_terminal_reason_still_rejects_round() {
+    let input = anthropic_closed_call()
+        + &wire(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}))
+        + &wire(
+            json!({"type":"error","error":{"type":"overloaded_error","message":"private payload"}}),
+        )
+        + &wire(json!({"type":"message_stop"}));
+    assert_failed_decode(AnthropicProvider::decode_stream(fragmented(&input))).await;
+}
+
+#[tokio::test]
+async fn ollama_stream_terminal_payload_preserves_tool_call_and_usage() {
+    let input = format!(
+        "{}\n",
+        json!({"message":{"content":"terminal","tool_calls":[{"function":{"name":"read","arguments":{"path":"🌍"}}}]},"done":true,"done_reason":"stop","eval_count":6})
+    );
+    let chunks = OllamaProvider::decode_stream(fragmented(&input))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(chunks.iter().flat_map(|c| &c.tool_calls).count(), 1);
+    assert_eq!(
+        chunks.iter().map(|c| c.delta.as_str()).collect::<String>(),
+        "terminal"
+    );
+    assert_eq!(
+        chunks.last().unwrap().termination,
+        Some(ProviderTermination::ToolCalls)
+    );
+    assert_eq!(
+        chunks.last().unwrap().usage.as_ref().unwrap().output_tokens,
+        Some(6)
     );
 }

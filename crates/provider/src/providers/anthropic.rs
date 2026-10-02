@@ -209,6 +209,8 @@ struct StreamMessage {
 
 #[derive(Debug, Deserialize)]
 struct StreamDelta {
+    #[serde(default, rename = "type")]
+    delta_type: Option<String>,
     #[serde(default)]
     stop_reason: Option<String>,
     #[serde(default)]
@@ -520,6 +522,11 @@ impl AnthropicProvider {
 
             let mut decoder = IncrementalSseDecoder::default();
             let mut termination = None;
+            let mut native_terminal_reason: Option<String> = None;
+            // Ordinary Messages profile: no opt-in server-side fallback phases.
+            let mut message_delta_started = false;
+            let mut used_blocks = HashSet::new();
+            let mut block_types = HashMap::new();
             let mut message_started = false;
             let mut active_blocks = HashSet::new();
             let mut thinking_blocks = HashSet::new();
@@ -595,8 +602,11 @@ impl AnthropicProvider {
                                     return;
                                 };
                                 let valid = message_started
+                                    && !message_delta_started
                                     && match event.event_type.as_str() {
-                                        "content_block_start" => active_blocks.insert(index),
+                                        "content_block_start" => {
+                                            used_blocks.insert(index) && active_blocks.insert(index)
+                                        }
                                         "content_block_stop" => active_blocks.remove(&index),
                                         _ => active_blocks.contains(&index),
                                     };
@@ -608,6 +618,93 @@ impl AnthropicProvider {
                                         .await;
                                     return;
                                 }
+                            }
+                            if event.event_type == "content_block_start" {
+                                let Some(block) = event.content_block.as_ref() else {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "Anthropic block start is missing its payload"
+                                        )))
+                                        .await;
+                                    return;
+                                };
+                                if block.block_type == "tool_use"
+                                    && (block.id.as_deref().is_none_or(str::is_empty)
+                                        || block.name.as_deref().is_none_or(str::is_empty)
+                                        || block.input.is_none())
+                                {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "incomplete Anthropic tool block identity or input"
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                                block_types.insert(event.index.unwrap(), block.block_type.clone());
+                            }
+                            if event.event_type == "content_block_delta" {
+                                let Some(delta) = event.delta.as_ref() else {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "Anthropic block delta is missing its payload"
+                                        )))
+                                        .await;
+                                    return;
+                                };
+                                let block_type =
+                                    block_types.get(&event.index.unwrap()).map(String::as_str);
+                                if delta.delta_type.is_none() {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "Anthropic block delta is missing its type"
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                                let expected = match delta.delta_type.as_deref() {
+                                    Some("text_delta") => Some("text"),
+                                    Some("input_json_delta") => Some("tool_use"),
+                                    Some("thinking_delta" | "signature_delta") => Some("thinking"),
+                                    _ => None,
+                                };
+                                if !matches!(
+                                    block_type,
+                                    Some("text" | "tool_use" | "thinking" | "redacted_thinking")
+                                ) {
+                                    continue;
+                                }
+                                let missing_payload = match delta.delta_type.as_deref() {
+                                    Some("text_delta") => delta.text.is_none(),
+                                    Some("input_json_delta") => delta.partial_json.is_none(),
+                                    Some("thinking_delta") => delta.thinking.is_none(),
+                                    Some("signature_delta") => delta.signature.is_none(),
+                                    _ => false,
+                                };
+                                if missing_payload || (expected.is_some() && expected != block_type)
+                                {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "Anthropic delta contradicts its block type"
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                                // Future delta types are ignored rather than interpreted as executable data.
+                                if expected.is_none() {
+                                    continue;
+                                }
+                            }
+                            if event.event_type == "message_delta" {
+                                if !message_started
+                                    || !active_blocks.is_empty()
+                                    || event.delta.is_none()
+                                {
+                                    let _ = tx
+                                        .send(Err(anyhow!("invalid Anthropic message delta phase")))
+                                        .await;
+                                    return;
+                                }
+                                message_delta_started = true;
                             }
                             for usage in event
                                 .message
@@ -625,7 +722,10 @@ impl AnthropicProvider {
                                 }
                             }
                             if event.event_type == "message_stop" {
-                                if !message_started || !active_blocks.is_empty() {
+                                if !message_started
+                                    || !message_delta_started
+                                    || !active_blocks.is_empty()
+                                {
                                     let _ = tx.send(Err(crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into())).await;
                                     return;
                                 }
@@ -688,6 +788,18 @@ impl AnthropicProvider {
                                 if let Some(reason) =
                                     event.delta.and_then(|delta| delta.stop_reason)
                                 {
+                                    if native_terminal_reason
+                                        .as_deref()
+                                        .is_some_and(|previous| previous != reason)
+                                    {
+                                        let _ = tx
+                                            .send(Err(anyhow!(
+                                                "contradictory Anthropic stop reason"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    native_terminal_reason = Some(reason.clone());
                                     termination =
                                         Some(ProviderTermination::from_openai_reason(&reason));
                                 }

@@ -334,6 +334,59 @@ fn normalize_base_url(mut url: String) -> String {
 
 // The same decoder is used by HTTP transport and in-memory regression fixtures.
 impl OllamaProvider {
+    fn normalize_chat_response(api_response: OllamaChatResponse) -> Result<ChatResponse> {
+        if !api_response.done {
+            return Err(crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into());
+        }
+        let usage = match (api_response.prompt_eval_count, api_response.eval_count) {
+            (None, None) => None,
+            (input, output) => Some(TokenUsage {
+                input_tokens: input,
+                output_tokens: output,
+            }),
+        };
+
+        let reasoning_content = api_response.message.thinking.filter(|t| !t.is_empty());
+        let tool_calls =
+            Self::convert_tool_calls(api_response.message.tool_calls.unwrap_or_default());
+        let mut termination = api_response
+            .done_reason
+            .as_deref()
+            .map(ProviderTermination::from_openai_reason)
+            .unwrap_or_else(|| {
+                if tool_calls.is_empty() {
+                    ProviderTermination::Complete
+                } else {
+                    ProviderTermination::ToolCalls
+                }
+            });
+        if !tool_calls.is_empty() && termination == ProviderTermination::Complete {
+            termination = ProviderTermination::ToolCalls;
+        }
+        let text = api_response.message.content.unwrap_or_default();
+
+        if text.is_empty()
+            && tool_calls.is_empty()
+            && reasoning_content.as_deref().unwrap_or_default().is_empty()
+        {
+            return Err(anyhow!("no response from Ollama"));
+        }
+
+        Ok(ChatResponse {
+            text,
+            usage,
+            termination,
+            reasoning_content,
+            tool_calls,
+            provider_replay_state: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn decode_chat_fixture(value: serde_json::Value) -> Result<ChatResponse> {
+        Self::normalize_chat_response(serde_json::from_value(value)?)
+    }
+
     pub(super) fn decode_stream(
         byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
     ) -> BoxStream<'static, Result<StreamChunk>> {
@@ -554,50 +607,7 @@ impl crate::traits::Provider for OllamaProvider {
             "provider_response",
         )
         .await?;
-        let usage = match (api_response.prompt_eval_count, api_response.eval_count) {
-            (None, None) => None,
-            (input, output) => Some(TokenUsage {
-                input_tokens: input,
-                output_tokens: output,
-            }),
-        };
-
-        let reasoning_content = api_response.message.thinking.filter(|t| !t.is_empty());
-        let tool_calls =
-            Self::convert_tool_calls(api_response.message.tool_calls.unwrap_or_default());
-        let mut termination = api_response
-            .done_reason
-            .as_deref()
-            .map(ProviderTermination::from_openai_reason)
-            .unwrap_or_else(|| {
-                if !api_response.done {
-                    ProviderTermination::Unknown("missing_done_marker".to_owned())
-                } else if tool_calls.is_empty() {
-                    ProviderTermination::Complete
-                } else {
-                    ProviderTermination::ToolCalls
-                }
-            });
-        if !tool_calls.is_empty() && termination == ProviderTermination::Complete {
-            termination = ProviderTermination::ToolCalls;
-        }
-        let text = api_response.message.content.unwrap_or_default();
-
-        if text.is_empty()
-            && tool_calls.is_empty()
-            && reasoning_content.as_deref().unwrap_or_default().is_empty()
-        {
-            return Err(anyhow!("no response from Ollama"));
-        }
-
-        Ok(ChatResponse {
-            text,
-            usage,
-            termination,
-            reasoning_content,
-            tool_calls,
-            provider_replay_state: None,
-        })
+        Self::normalize_chat_response(api_response)
     }
 
     async fn stream_chat(

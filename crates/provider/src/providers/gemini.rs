@@ -711,6 +711,7 @@ impl GeminiProvider {
             let mut decoder = IncrementalSseDecoder::default();
             let mut last_tool_calls: Vec<ProviderToolCall> = Vec::new();
             let mut terminal_reason = None;
+            let mut native_terminal_reason: Option<String> = None;
             let mut tool_call_count = 0;
             let mut provider_replay_state = None;
 
@@ -821,6 +822,16 @@ impl GeminiProvider {
                                 .first()
                                 .and_then(|candidate| candidate.finish_reason.as_deref())
                             {
+                                if native_terminal_reason
+                                    .as_deref()
+                                    .is_some_and(|previous| previous != reason)
+                                {
+                                    let _ = tx
+                                        .send(Err(anyhow!("contradictory Gemini finish reason")))
+                                        .await;
+                                    return;
+                                }
+                                native_terminal_reason = Some(reason.to_owned());
                                 if let Some(state) = provider_replay_state.take() {
                                     if tx
                                         .send(Ok(StreamChunk::provider_replay_state(state)))
