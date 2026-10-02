@@ -2350,10 +2350,17 @@ mod tests {
     fn real_sentry_mapper_captures_one_safe_rejection_and_no_supersession() {
         use tracing_subscriber::prelude::*;
         const CANARY: &str = "private-user-payload-canary";
+        // Keep two independent dispatchers alive: tracing-core's single-dispatch
+        // fast path computes new callsite interest from the registering thread's
+        // default. Parallel publisher tests have no default subscriber and can
+        // otherwise cache Interest::never for our shared ERROR callsite. Neither
+        // dispatcher is installed globally; only this thread uses the Sentry one.
+        let interest_guard = tracing::Dispatch::new(tracing_subscriber::registry());
         let events = sentry::test::with_captured_events(|| {
-            let subscriber =
-                tracing_subscriber::registry().with(pioneer_observability::sentry_tracing_layer());
-            tracing::subscriber::with_default(subscriber, || {
+            let subscriber = tracing::Dispatch::new(
+                tracing_subscriber::registry().with(pioneer_observability::sentry_tracing_layer()),
+            );
+            tracing::dispatcher::with_default(&subscriber, || {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -2383,6 +2390,7 @@ mod tests {
                     });
             });
         });
+        drop(interest_guard);
         assert_eq!(events.len(), 2);
         for event in events {
             assert_eq!(event.level, sentry::Level::Error);
