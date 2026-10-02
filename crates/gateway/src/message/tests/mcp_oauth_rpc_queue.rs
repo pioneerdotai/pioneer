@@ -1699,11 +1699,26 @@ async fn stale_rpc_replacement(
         .unwrap();
     let id = current.id.as_deref().unwrap();
     assert_eq!(id != old_id, new_uuid);
-    let initial_generation = processor
-        .mcp_service
-        .runtime_snapshot("workspace", workspace)
-        .await[id]
-        .runtime_generation;
+    // Install responds before reload publishes the replacement runtime. The
+    // old UUID has no snapshot after uninstall; a same-UUID update may still
+    // expose the old Ready snapshot. Require the current fingerprint as well.
+    let initial_generation = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(snapshot) = processor
+                .mcp_service
+                .runtime_snapshot("workspace", workspace)
+                .await
+                .get(id)
+                && snapshot.state == pioneer_mcp::McpRuntimeState::Ready
+                && snapshot.fingerprint == current.fingerprint
+            {
+                break snapshot.runtime_generation;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("replacement runtime must be Ready for its current configuration before consent");
     current_socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"current-signin_______","method":"mcp/oauth","params":{"workspace_id":workspace,"server_id":id,"name":"queue","action":{"kind":"sign_in","redirect_uri":"http://127.0.0.1:37643/oauth/mcp/callback"}}}).to_string().into())).await.unwrap();
     let fresh = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
