@@ -130,6 +130,8 @@ pub mod task_result_review_event;
 pub mod task_run;
 pub mod task_run_conversation_snapshot;
 pub mod task_run_execution;
+pub mod task_run_occurrence_reconcile_pending;
+pub mod task_run_occurrence_reconcile_sequence;
 pub mod task_run_thread_binding;
 pub mod task_run_turn;
 pub mod task_trigger;
@@ -185,7 +187,3 @@ pub mod turn_work_projection;
 pub mod user_notification_outbox;
 pub mod workspace;
 pub mod workspace_membership;
-
-pub mod task_run_occurrence_reconcile_pending;
-
-pub mod task_run_occurrence_reconcile_sequence;

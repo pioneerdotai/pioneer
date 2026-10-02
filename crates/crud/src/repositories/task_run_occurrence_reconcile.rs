@@ -13,7 +13,7 @@ pub const OCCURRENCE_RECONCILE_BUDGET: u64 = 64;
 // poison candidates retryable without polling them on every two-second pass.
 pub const OCCURRENCE_RECONCILE_INITIAL_BACKOFF_SECS: i64 = 5;
 pub const OCCURRENCE_RECONCILE_MAX_BACKOFF_SECS: i64 = 300;
-pub const OCCURRENCE_RECONCILE_MAX_ATTEMPT_COUNT: i32 = 16;
+pub const OCCURRENCE_RECONCILE_MAX_ATTEMPT_COUNT: i64 = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq, FromQueryResult)]
 pub struct TaskRunOccurrenceReconcileCandidate {
@@ -26,7 +26,7 @@ pub struct TaskRunOccurrenceReconcileClaim {
     pub run_id: String,
     pub generation: i64,
     pub claim_token: String,
-    pub attempt_count: i32,
+    pub attempt_count: i64,
     pub next_attempt_at: i64,
 }
 
@@ -188,7 +188,7 @@ pub(crate) async fn remove_if_consistent<C: ConnectionTrait>(
     Ok(())
 }
 
-pub(crate) fn retry_delay(attempt: i32) -> i64 {
+pub(crate) fn retry_delay(attempt: i64) -> i64 {
     std::cmp::min(
         OCCURRENCE_RECONCILE_INITIAL_BACKOFF_SECS
             .saturating_mul(1_i64 << (attempt.saturating_sub(1).clamp(0, 15) as u32)),
@@ -208,7 +208,7 @@ fn snapshot_filter(row: &pending::Model) -> sea_orm::Condition {
     }
 }
 
-fn next_attempt_count(row: &pending::Model) -> i32 {
+fn next_attempt_count(row: &pending::Model) -> i64 {
     std::cmp::min(
         row.attempt_count.saturating_add(1),
         OCCURRENCE_RECONCILE_MAX_ATTEMPT_COUNT,

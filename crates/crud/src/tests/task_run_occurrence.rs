@@ -828,7 +828,7 @@ fn backoff_is_exponential_bounded_and_attempt_counter_has_finite_policy() {
         vec![5, 10, 20, 40, 80, 160, 300, 300]
     );
     assert_eq!(queue::retry_delay(16), 300);
-    assert_eq!(queue::retry_delay(i32::MAX), 300);
+    assert_eq!(queue::retry_delay(i64::MAX), 300);
 }
 
 #[tokio::test]
