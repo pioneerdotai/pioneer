@@ -653,7 +653,8 @@ fn external_rpc_and_voice_admission_keep_their_safe_public_responses() {
             "gpt-5",
             "safe voice input",
         );
-        ensure_task_create_parent_turn_for_test(&harness.processor, &params)
+        let processor = Arc::new(harness.processor.clone());
+        ensure_task_create_parent_turn_for_test(&processor, &params)
             .await
             .unwrap();
         subscribe_test_connection_to_materialized_thread(

@@ -34753,7 +34753,10 @@ async fn failed_task_thread_delivery_is_a_sanitized_system_state_without_work_gr
         .as_ref()
         .expect("failed delivery keeps a safe descriptor");
     assert_eq!(saved_error.code, "task_executor_start_unclassified_failed");
-    assert_eq!(saved_error.class, TaskErrorClass::Internal);
+    assert_eq!(
+        saved_error.class,
+        pioneer_protocol::TaskErrorClass::Internal
+    );
     assert_eq!(saved_error.message, "Task preparation or launch failed.");
     let encoded = serde_json::to_string(saved_error).unwrap();
     assert!(!encoded.contains("internal path /srv/pioneer"));
