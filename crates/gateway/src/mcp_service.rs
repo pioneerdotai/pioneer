@@ -598,6 +598,22 @@ impl McpService {
     }
 
     pub(crate) async fn stop_oauth_connection(&self, row: &McpServerInstallationRecord) {
+        if !row.enabled {
+            if let Some(id) = &row.id {
+                self.stop_task(id, DomainRuntimeState::Disabled).await;
+            }
+            self.publish_status(
+                row,
+                DomainRuntimeState::Disabled,
+                Some("server is disabled".into()),
+                None,
+                0,
+                None,
+                None,
+            )
+            .await;
+            return;
+        }
         if let Some(id) = &row.id {
             self.stop_task(id, DomainRuntimeState::AuthRequired).await;
         }

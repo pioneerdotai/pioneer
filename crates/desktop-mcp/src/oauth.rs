@@ -1,169 +1,199 @@
-use crate::catalog::McpCatalogView;
-use gpui_kit::component::{Sizable, button::*, theme::ActiveTheme, *};
+use crate::{
+    catalog::GatewayConnectionState,
+    sidebar::{CatalogSidebar, sidebar_label, sidebar_menu_icon},
+};
+use gpui_kit::component::IconName as OAuthIconName;
+use gpui_kit::component::{button::*, *};
 use gpui_kit::{prelude::*, *};
 use pioneer_client::mcp::oauth::OAuthPresentation;
 use pioneer_client::mcp::types::{McpOAuthState, McpServerStatus};
 use pioneer_client::mcp::{operations::McpIntent, types::McpListItem};
-impl McpCatalogView {
-    pub(crate) fn render_mcp_oauth(
-        &self,
-        server: &McpListItem,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+impl CatalogSidebar {
+    pub(crate) fn render_mcp_oauth_actions(&self, server: &McpListItem) -> Option<AnyElement> {
         if !self
             .principal_presentation_capabilities()
             .can_manage_capabilities
         {
-            return div().into_any_element();
+            return None;
         }
         let presentation = self.input.oauth.get(&server.id);
-        let persisted_state = self
+        let management = self
             .input
             .mcp_server_details
             .as_ref()
-            .and_then(|d| d.management.as_ref())
-            .and_then(|m| m.oauth_state);
+            .filter(|details| details.server.id == server.id)
+            .and_then(|details| details.management.as_ref());
+        let persisted_state = management.and_then(|management| management.oauth_state);
         if persisted_state.is_none() && presentation.is_none() {
-            return div().into_any_element();
+            return None;
         }
         let state = pioneer_client::mcp::oauth::effective_oauth_management_state(
-            presentation.map(|(p, _)| p.state),
+            presentation.map(|(event, _)| event.state),
             persisted_state,
             presentation.is_some_and(|(event, _)| {
                 event.flow_id.is_some()
                     && event.diagnostic.as_deref() == Some("oauth_callback_unavailable")
             }),
         );
-        // Do not render a stale terminal label, URL or action over current cleanup.
         let presentation = presentation.filter(|(event, _)| Some(event.state) == state);
-        // A listener failure leaves Gateway's consent flow alive. Cancel that
-        // flow before offering another sign-in; an exchange failure has ended it.
         let callback_unavailable = presentation.is_some_and(|(event, _)| {
             event.flow_id.is_some()
                 && event.diagnostic.as_deref() == Some("oauth_callback_unavailable")
         });
-        let actions = oauth_management_actions(state, server.status, callback_unavailable);
-        let view = cx.entity();
-        let id = server.id.clone();
-        v_flex()
-            .px_6()
-            .py_3()
-            .gap_2()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .when_some(presentation, |this, (event, failed)| {
-                this.child(div().text_sm().child(oauth_label(event, *failed)))
-                    .when(*failed, |this| {
-                        this.when_some(event.authorization_url.as_ref(), |this, _url| {
-                            let view = view.clone();
-                            let id = id.clone();
-                            this.child(
-                                Button::new(self.ui_id(&server.id, "oauth-link"))
-                                    .outline()
-                                    .small()
-                                    .label(t!("mcp.oauth.open_link").to_string())
-                                    .on_click(move |_, _, cx| {
-                                        view.update(cx, |view, cx| {
-                                            view.send(
-                                                McpIntent::RetryAuthorizationBrowser {
-                                                    server_id: id.clone(),
-                                                },
-                                                cx,
-                                            )
-                                        });
-                                    }),
-                            )
-                        })
-                    })
-            })
-            .when(presentation.is_none(), |this| {
-                this.when_some(state, |this, state| {
-                    let label = if state == McpOAuthState::Failed
-                        && server.status != McpServerStatus::AuthRequired
-                    {
-                        t!("mcp.oauth.recovering").to_string()
-                    } else {
-                        oauth_state_label(state)
-                    };
-                    this.child(div().text_sm().child(label))
+        let actions = oauth_management_actions(
+            state,
+            server.status,
+            callback_unavailable,
+            management.and_then(|management| management.oauth_cleanup_available),
+        );
+        let error_hint = presentation
+            .filter(|(event, _)| event.state == McpOAuthState::Failed)
+            .map(|(event, failed)| oauth_label(event, *failed));
+        let flow = presentation.and_then(|(event, _)| event.flow_id.clone());
+        let fallback = presentation
+            .is_some_and(|(event, failed)| *failed && event.authorization_url.is_some());
+        if !actions.sign_in && !(actions.cancel && flow.is_some()) && !actions.clear && !fallback {
+            return None;
+        }
+        Some(
+            v_flex()
+                .gap_1()
+                .when(actions.sign_in, |this| {
+                    this.child(self.oauth_sidebar_button(
+                        "mcp-details-sidebar-oauth-signin",
+                        t!("mcp.oauth.sign_in").to_string(),
+                        OAuthIconName::User,
+                        McpIntent::SignIn {
+                            server_id: server.id.clone(),
+                        },
+                        error_hint.clone(),
+                    ))
                 })
-            })
+                .when(fallback, |this| {
+                    this.child(self.oauth_sidebar_button(
+                        "mcp-details-sidebar-oauth-link",
+                        t!("mcp.oauth.open_link").to_string(),
+                        OAuthIconName::ExternalLink,
+                        McpIntent::RetryAuthorizationBrowser {
+                            server_id: server.id.clone(),
+                        },
+                        error_hint.clone(),
+                    ))
+                })
+                .when(actions.cancel, |this| {
+                    this.when_some(flow, |this, flow_id| {
+                        this.child(self.oauth_sidebar_button(
+                            "mcp-details-sidebar-oauth-cancel",
+                            t!("buttons.cancel").to_string(),
+                            OAuthIconName::Close,
+                            McpIntent::CancelAuthorization {
+                                server_id: server.id.clone(),
+                                flow_id,
+                            },
+                            None,
+                        ))
+                    })
+                })
+                .when(actions.clear, |this| {
+                    this.child(self.oauth_sidebar_button(
+                        "mcp-details-sidebar-oauth-clear",
+                        if state == Some(McpOAuthState::Authorized) {
+                            t!("mcp.oauth.disconnect").to_string()
+                        } else {
+                            t!("mcp.oauth.clear_sign_in").to_string()
+                        },
+                        OAuthIconName::CircleX,
+                        McpIntent::Disconnect {
+                            server_id: server.id.clone(),
+                        },
+                        error_hint,
+                    ))
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn oauth_sidebar_button(
+        &self,
+        id: &'static str,
+        label: String,
+        icon: OAuthIconName,
+        intent: McpIntent,
+        error_hint: Option<String>,
+    ) -> Button {
+        let owner = self.owner.clone();
+        let server_id = match &intent {
+            McpIntent::SignIn { server_id }
+            | McpIntent::RetryAuthorizationBrowser { server_id }
+            | McpIntent::CancelAuthorization { server_id, .. }
+            | McpIntent::Disconnect { server_id } => server_id,
+            _ => unreachable!("OAuth sidebar action"),
+        };
+        Button::new(id)
+            .ghost()
+            .justify_start()
+            .px_2()
+            .disabled(
+                self.gateway.connection_state != GatewayConnectionState::Connected
+                    || self.is_mcp_pending(server_id),
+            )
             .child(
                 h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_start()
                     .gap_2()
-                    .when(actions.sign_in, |this| {
-                        let view = view.clone();
-                        let id = id.clone();
-                        this.child(
-                            Button::new(self.ui_id(&server.id, "oauth-signin"))
-                                .outline()
-                                .small()
-                                .label(t!("mcp.oauth.sign_in").to_string())
-                                .on_click(move |_, _, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.send(
-                                            McpIntent::SignIn {
-                                                server_id: id.clone(),
-                                            },
-                                            cx,
-                                        )
-                                    })
-                                }),
-                        )
-                    })
-                    .when(actions.cancel, |this| {
-                        this.when_some(
-                            presentation.and_then(|(p, _)| p.flow_id.clone()),
-                            |this, flow_id| {
-                                let view = view.clone();
-                                let id = id.clone();
-                                this.child(
-                                    Button::new(self.ui_id(&server.id, "oauth-cancel"))
-                                        .outline()
-                                        .small()
-                                        .label(t!("buttons.cancel").to_string())
-                                        .on_click(move |_, _, cx| {
-                                            view.update(cx, |view, cx| {
-                                                view.send(
-                                                    McpIntent::CancelAuthorization {
-                                                        server_id: id.clone(),
-                                                        flow_id: flow_id.clone(),
-                                                    },
-                                                    cx,
-                                                )
-                                            })
-                                        }),
-                                )
-                            },
-                        )
-                    })
-                    .when(actions.clear, |this| {
-                        this.child(
-                            Button::new(self.ui_id(&server.id, "oauth-disconnect"))
-                                .ghost()
-                                .small()
-                                .label(if state == Some(McpOAuthState::Authorized) {
-                                    t!("mcp.oauth.disconnect").to_string()
-                                } else {
-                                    t!("mcp.oauth.clear_sign_in").to_string()
-                                })
-                                .on_click(move |_, _, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.send(
-                                            McpIntent::Disconnect {
-                                                server_id: id.clone(),
-                                            },
-                                            cx,
-                                        )
-                                    })
-                                }),
-                        )
-                    }),
+                    .child(sidebar_menu_icon(icon))
+                    .child(sidebar_label(label)),
             )
-            .into_any_element()
+            .when_some(error_hint, |button, hint| button.tooltip(hint))
+            .on_click(move |_, _, cx| {
+                let _ = owner.update(cx, |view, cx| {
+                    let intent = match &intent {
+                        McpIntent::SignIn { server_id } => McpIntent::SignIn {
+                            server_id: server_id.clone(),
+                        },
+                        McpIntent::RetryAuthorizationBrowser { server_id } => {
+                            McpIntent::RetryAuthorizationBrowser {
+                                server_id: server_id.clone(),
+                            }
+                        }
+                        McpIntent::CancelAuthorization { server_id, flow_id } => {
+                            McpIntent::CancelAuthorization {
+                                server_id: server_id.clone(),
+                                flow_id: flow_id.clone(),
+                            }
+                        }
+                        McpIntent::Disconnect { server_id } => McpIntent::Disconnect {
+                            server_id: server_id.clone(),
+                        },
+                        _ => unreachable!("OAuth sidebar action"),
+                    };
+                    view.send(intent, cx);
+                    cx.notify();
+                });
+            })
+    }
+}
+pub(crate) fn preparation_error_label(code: &str) -> Option<String> {
+    match code {
+        "oauth_callback_port_invalid" => Some(t!("mcp.oauth.callback_port_invalid").to_string()),
+        "oauth_configuration_load_failed" => {
+            Some(t!("mcp.oauth.configuration_load_failed").to_string())
+        }
+        "oauth_callback_port_unavailable" => Some(t!("mcp.oauth.callback_unavailable").to_string()),
+        _ => None,
     }
 }
 fn oauth_label(event: &OAuthPresentation, failed: bool) -> String {
+    if let Some(label) = event
+        .diagnostic
+        .as_deref()
+        .and_then(preparation_error_label)
+    {
+        return label;
+    }
+
     if event.diagnostic.as_deref() == Some("oauth_callback_unavailable") {
         return t!("mcp.oauth.callback_unavailable").to_string();
     }
@@ -188,25 +218,7 @@ fn oauth_label(event: &OAuthPresentation, failed: bool) -> String {
         }
         _ => {}
     }
-    oauth_state_label(event.state)
-}
-fn oauth_state_label(state: McpOAuthState) -> String {
-    match state {
-        McpOAuthState::Preparing => t!("mcp.oauth.preparing"),
-        McpOAuthState::AwaitingCallback => t!("mcp.oauth.awaiting"),
-        McpOAuthState::Exchanging => t!("mcp.oauth.exchanging"),
-        McpOAuthState::Resolving => t!("mcp.oauth.resolving"),
-        McpOAuthState::CleanupRequired => t!("mcp.oauth.cleanup_required"),
-        McpOAuthState::Authorized => t!("mcp.oauth.authorized"),
-        McpOAuthState::Denied => t!("mcp.oauth.denied"),
-        McpOAuthState::TimedOut => t!("mcp.oauth.timed_out"),
-        McpOAuthState::Cancelled => t!("mcp.oauth.cancelled"),
-        McpOAuthState::InsufficientScope => t!("mcp.oauth.scope_required"),
-        McpOAuthState::AuthRequired => t!("mcp.oauth.auth_required"),
-        McpOAuthState::Failed => t!("mcp.oauth.failed"),
-        McpOAuthState::Retired | McpOAuthState::Idle => t!("mcp.oauth.auth_required"),
-    }
-    .to_string()
+    t!("mcp.oauth.failed").to_string()
 }
 
 struct OAuthManagementActions {
@@ -218,6 +230,7 @@ fn oauth_management_actions(
     state: Option<McpOAuthState>,
     status: McpServerStatus,
     callback_unavailable: bool,
+    cleanup_available: Option<bool>,
 ) -> OAuthManagementActions {
     let active = callback_unavailable
         || matches!(
@@ -232,7 +245,8 @@ fn oauth_management_actions(
         || matches!(
             state,
             Some(
-                McpOAuthState::Denied
+                McpOAuthState::AuthRequired
+                    | McpOAuthState::Denied
                     | McpOAuthState::TimedOut
                     | McpOAuthState::Cancelled
                     | McpOAuthState::InsufficientScope
@@ -246,12 +260,87 @@ fn oauth_management_actions(
                 Some(McpOAuthState::Resolving | McpOAuthState::CleanupRequired)
             ),
         cancel: active,
-        clear: !active && state.is_some_and(|state| state != McpOAuthState::Idle),
+        clear: !active
+            && state.is_some_and(|state| state != McpOAuthState::Idle)
+            && (cleanup_available.unwrap_or(true)
+                || matches!(
+                    state,
+                    Some(McpOAuthState::Resolving | McpOAuthState::CleanupRequired)
+                )),
     }
 }
 #[cfg(test)]
 mod tests {
     use super::{McpOAuthState, McpServerStatus, oauth_management_actions};
+    #[test]
+    fn configuration_failure_copy_is_distinct_in_action_and_consent_presentations() {
+        use pioneer_client::mcp::oauth::{OAuthPreparationError, OAuthPresentation};
+        for (reason, key) in [
+            (
+                OAuthPreparationError::InvalidCallbackPort,
+                "mcp.oauth.callback_port_invalid",
+            ),
+            (
+                OAuthPreparationError::ConfigurationLoad,
+                "mcp.oauth.configuration_load_failed",
+            ),
+            (
+                OAuthPreparationError::PortUnavailable,
+                "mcp.oauth.callback_unavailable",
+            ),
+        ] {
+            let label = super::preparation_error_label(reason.code()).unwrap();
+            assert_eq!(label, t!(key).to_string());
+            assert_ne!(label, t!("mcp.oauth.failed").to_string());
+            if reason != OAuthPreparationError::PortUnavailable {
+                assert_ne!(label, t!("mcp.oauth.prepare_failed").to_string());
+                assert_ne!(label, t!("mcp.oauth.callback_unavailable").to_string());
+            }
+            let event = OAuthPresentation {
+                workspace_id: "workspace".into(),
+                server_id: "server".into(),
+                name: "server".into(),
+                scope_kind: pioneer_client::mcp::actions::mcp_server_restart_params(
+                    "workspace",
+                    "server",
+                )
+                .scope_kind,
+                flow_id: Some("flow".into()),
+                state: McpOAuthState::Failed,
+                authorization_url: None,
+                diagnostic: Some(reason.code().into()),
+            };
+            assert_eq!(super::oauth_label(&event, false), label);
+        }
+    }
+    #[test]
+    fn signed_out_without_saved_registration_offers_signin_without_clear() {
+        for status in [McpServerStatus::AuthRequired, McpServerStatus::Starting] {
+            let actions = oauth_management_actions(
+                Some(McpOAuthState::AuthRequired),
+                status,
+                false,
+                Some(false),
+            );
+            assert!(actions.sign_in);
+            assert!(!actions.clear && !actions.cancel);
+        }
+        let saved = oauth_management_actions(
+            Some(McpOAuthState::AuthRequired),
+            McpServerStatus::AuthRequired,
+            false,
+            Some(true),
+        );
+        assert!(saved.sign_in && saved.clear);
+        let cleanup = oauth_management_actions(
+            Some(McpOAuthState::CleanupRequired),
+            McpServerStatus::AuthRequired,
+            false,
+            Some(true),
+        );
+        assert!(cleanup.clear);
+        assert!(!cleanup.sign_in && !cleanup.cancel);
+    }
     #[test]
     fn current_details_cleanup_overrides_stale_denied_copy_and_actions() {
         let state = pioneer_client::mcp::oauth::effective_oauth_management_state(
@@ -260,7 +349,7 @@ mod tests {
             false,
         );
         assert_eq!(state, Some(McpOAuthState::CleanupRequired));
-        let actions = oauth_management_actions(state, McpServerStatus::AuthRequired, false);
+        let actions = oauth_management_actions(state, McpServerStatus::AuthRequired, false, None);
         assert!(actions.clear);
         assert!(!actions.sign_in && !actions.cancel);
         for pending in [
@@ -287,7 +376,7 @@ mod tests {
             McpServerStatus::Degraded,
         ] {
             let actions =
-                oauth_management_actions(Some(McpOAuthState::CleanupRequired), status, false);
+                oauth_management_actions(Some(McpOAuthState::CleanupRequired), status, false, None);
             assert!(actions.clear);
             assert!(!actions.sign_in);
             assert!(!actions.cancel);
@@ -296,6 +385,7 @@ mod tests {
             Some(McpOAuthState::AwaitingCallback),
             McpServerStatus::AuthRequired,
             false,
+            None,
         );
         assert!(actions.cancel);
         assert!(!actions.clear);
@@ -303,6 +393,7 @@ mod tests {
             Some(McpOAuthState::AuthRequired),
             McpServerStatus::AuthRequired,
             false,
+            None,
         );
         assert!(actions.sign_in && actions.clear);
     }

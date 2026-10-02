@@ -191,6 +191,13 @@
         "health": {
           "$ref": "#/$defs/McpServerHealthDetails"
         },
+        "oauth_cleanup_available": {
+          "description": "Device-neutral cleanup availability, including uncertain persistence.\nFalse after confirmed Clear; omitted by older Gateways.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "oauth_state": {
           "anyOf": [
             {

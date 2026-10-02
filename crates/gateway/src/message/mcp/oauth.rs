@@ -169,16 +169,6 @@ impl MessageProcessor {
                     .await;
                 if result.is_ok() {
                     self.mcp_service.stop_oauth_connection(&row).await;
-                    // Probe anonymously without an install/browser intent. A
-                    // protected server returns AuthRequired; a public one resumes.
-                    if self
-                        .mcp_service
-                        .restart_admitted_server(&row)
-                        .await
-                        .is_err()
-                    {
-                        tracing::warn!("MCP reconnect after account disconnect was deferred");
-                    }
                 }
                 result
             }

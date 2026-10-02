@@ -2499,6 +2499,59 @@ async fn unchanged_identity_preserves_pending_callback_across_timeout_update() {
 }
 
 #[tokio::test]
+async fn managed_clear_keeps_signed_out_admission_until_explicit_signin() {
+    let h = Harness::new(true).await;
+    h.login().await;
+    assert!(h.service.cleanup_available("installation").await);
+    let exchanges = h.server.data.exchanges.load(Ordering::SeqCst);
+    let registrations = h.server.data.registrations.load(Ordering::SeqCst);
+    h.service
+        .disconnect_managed("installation", &h.server.installation(), 10, "workspace")
+        .await
+        .unwrap();
+    assert_eq!(
+        h.service.state("installation").await,
+        Some(OAuthState::AuthRequired)
+    );
+    assert!(!h.service.cleanup_available("installation").await);
+    assert!(h.persistence.read("installation").await.unwrap().is_none());
+    h.sink.events.lock().unwrap().clear();
+    // Reconciliation/transport admission must fail immediately, not initiate
+    // an anonymous connection, consent, exchange or registration after Clear.
+    h.service
+        .synchronize("installation", &h.server.installation())
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(1), h.connect())
+        .await
+        .unwrap()
+        .err()
+        .unwrap();
+    assert_eq!(error.state, McpRuntimeState::AuthRequired);
+    assert_eq!(h.server.data.exchanges.load(Ordering::SeqCst), exchanges);
+    assert_eq!(
+        h.server.data.registrations.load(Ordering::SeqCst),
+        registrations
+    );
+    assert_eq!(h.sink.browsers(), 0);
+    assert!(!h.service.cleanup_available("installation").await);
+    h.service
+        .sign_in("installation", &h.server.installation(), 10, REDIRECT)
+        .await
+        .unwrap();
+    let event = h.sink.browser().await;
+    h.service
+        .callback("installation", 10, h.callback(&event))
+        .await
+        .unwrap();
+    h.sink
+        .wait_state(event.flow_id.as_deref(), OAuthState::Authorized)
+        .await;
+    assert!(h.service.cleanup_available("installation").await);
+    h.service.shutdown().await;
+}
+
+#[tokio::test]
 async fn redirect_mismatch_can_be_cleared_before_fresh_signin() {
     let h = Harness::new(true).await;
     h.login().await;
@@ -2516,6 +2569,14 @@ async fn redirect_mismatch_can_be_cleared_before_fresh_signin() {
         Some("OAuth callback address does not match the saved registration")
     );
     assert_eq!(h.sink.browsers(), 0);
+    // Changing Desktop's callback port must not silently rewrite or clear the
+    // provider's saved registration. Explicit Clear is the recovery boundary.
+    let unchanged = h.persistence.read("installation").await.unwrap().unwrap();
+    assert_eq!(
+        unchanged.registration.redirect_uri,
+        "http://127.0.0.1:37644/oauth/mcp/callback"
+    );
+    assert!(unchanged.credentials.is_some());
     h.service.disconnect("installation").await.unwrap();
     assert!(h.persistence.read("installation").await.unwrap().is_none());
     h.service
@@ -3918,6 +3979,20 @@ async fn cleanup_synchronization_and_suspend_preserve_management_without_restori
         .await
         .unwrap();
     assert!(h.persistence.read("installation").await.unwrap().is_none());
-    assert!(h.service.state("installation").await.is_none());
+    assert_eq!(
+        h.service.state("installation").await,
+        Some(OAuthState::AuthRequired)
+    );
+    assert!(!h.service.cleanup_available("installation").await);
+    assert_eq!(
+        McpOAuthProvider::client(&h.service, "installation", &installation)
+            .await
+            .err()
+            .expect("confirmed Clear must require explicit sign-in")
+            .state,
+        McpRuntimeState::AuthRequired
+    );
+    assert_eq!(h.server.data.exchanges.load(Ordering::SeqCst), exchanges);
+    assert_eq!(h.sink.browsers(), 0);
     h.service.shutdown().await;
 }

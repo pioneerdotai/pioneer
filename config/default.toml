@@ -330,6 +330,9 @@ refresh_token_ttl_seconds = 7776000
 device_activation_code_ttl_seconds = 600
 auth_exchange_timeout_seconds = 15
 
+[desktop.mcp_oauth]
+callback_port = 37643
+
 [desktop.gateway]
 connect_timeout_ms = 300
 startup_timeout_ms = 10000

@@ -155,6 +155,10 @@ pub struct McpServerDetailsResponse {
 /// MCP capability returned by discovery endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct McpManagementDetails {
+    /// Device-neutral cleanup availability, including uncertain persistence.
+    /// False after confirmed Clear; omitted by older Gateways.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_cleanup_available: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_state: Option<McpOAuthState>,
     pub scope: McpScopeKind,

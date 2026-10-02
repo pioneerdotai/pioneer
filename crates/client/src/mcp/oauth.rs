@@ -79,7 +79,36 @@ impl OAuthBrowserAdmission {
         self.0.load(Ordering::Acquire) != 2
     }
 }
+/// Safe local preparation causes; never carries raw configuration or OS errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OAuthPreparationError {
+    InvalidCallbackPort,
+    ConfigurationLoad,
+    PortUnavailable,
+}
+impl OAuthPreparationError {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::InvalidCallbackPort => "oauth_callback_port_invalid",
+            Self::ConfigurationLoad => "oauth_configuration_load_failed",
+            Self::PortUnavailable => "oauth_callback_port_unavailable",
+        }
+    }
+}
+impl std::fmt::Display for OAuthPreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+impl std::error::Error for OAuthPreparationError {}
+
 pub trait McpOAuthShell: Send + Sync {
+    /// Immutable local configuration failure, used to explain an install's
+    /// protected challenge without sending configuration details to Gateway.
+    fn configuration_error(&self) -> Option<OAuthPreparationError> {
+        None
+    }
+
     /// Returns only after a loopback listener is ready. Must use the same URI
     /// across restarts so persisted client registrations remain valid.
     fn prepare(&self) -> anyhow::Result<String>;
@@ -421,6 +450,19 @@ impl ClientCore {
         }
         let key = (event.workspace_id.clone(), event.server_id.clone());
         let mut owner = self.mcp_oauth.lock().expect("MCP OAuth owner poisoned");
+        // The Gateway knows preparation failed, but the immutable device shell
+        // owns its configuration cause. Preserve all notification fencing below.
+        let mut local_event = event.clone();
+        if event.diagnostic.as_deref() == Some("oauth_callback_preparation_failed") {
+            if let Some(reason) = owner
+                .shell
+                .as_ref()
+                .and_then(|shell| shell.configuration_error())
+            {
+                local_event.diagnostic = Some(reason.code().into());
+            }
+        }
+        let event = &local_event;
         owner.flows.retain(|_, (deadline, admission)| {
             if *deadline > std::time::Instant::now() {
                 true

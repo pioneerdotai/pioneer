@@ -73,7 +73,7 @@ issuer before tokens are reused, including each reconnect with a shared manager.
 manager identity and volatile event generations reject late challenges and queued
 browser effects from replaced or completed sessions. OAuth RPCs also carry the
 installation UUID, enter the installation lifecycle gate and reread configuration
-before acting. Callback/Cancel never restore a binding; Disconnect restarts only
+before acting. Callback/Cancel never restore a binding; Disconnect stops only
 the exact admitted row. A reused server name cannot receive an old callback. Separate installations never share credentials.
 OAuth access/refresh rotation is outside configuration and effective-secret
 fingerprints, so refresh does not restart MCP.
@@ -241,6 +241,13 @@ IO retains its leases, and admitted callers finish before shutdown's final drain
 Permanent storage failure can prevent cleanup; no successful deletion is claimed
 from an Err or unknown result. W1 regressions are written/compiled only, NOT RUN.
 
+After confirmed management Clear, a fresh credential-free admission remains
+`AuthRequired` for this running service. Workspace reconciliation cannot start an
+anonymous connection while the user is signed out; explicit Sign in starts a new
+consent operation. This volatile signed-out admission is not a persisted account.
+Management details expose only cleanup availability, never credentials: Desktop
+hides Clear when no registration remains and retains it for uncertain cleanup.
+
 Workspace synchronization accepts an equal-configuration CleanupRequired holder
 without restoring an OAuth client; disable retains its repeat-Clear projection.
 Client transport and new consent still fail closed until cleanup succeeds. Current
@@ -248,3 +255,36 @@ management cleanup replaces completed consent copy such as Denied, while current
 live flows and session retirement fences reject late cleanup/Retired effects.
 Desktop uses the shared management-state selector and preserves the existing
 localized cleanup guidance/actions. X1–X3 regressions are NOT RUN.
+
+### Desktop callback port
+
+Desktop binds `127.0.0.1` and uses `/oauth/mcp/callback`, including when the
+Gateway is remote. The default/production port is 37643. To run a development
+Desktop alongside production, add this to the development override:
+
+```toml
+[desktop.mcp_oauth]
+callback_port = 37644
+```
+
+Keep the existing development `home_directory`, Gateway `listen_addr`, and
+service overrides so development does not share production storage or Gateway.
+Configuration sources, from lowest to highest priority, are embedded
+`config/default.toml`, workspace `config/local.toml` (debug builds only), the
+system config directory's `pioneer-dev/config.toml` (debug) or
+`pioneer/config.toml` (production), and the file selected by `PIONEER_CONFIG`.
+Production does not include workspace `config/local.toml` automatically. A file
+explicitly selected through `PIONEER_CONFIG` remains the highest-priority source,
+even when it is that same `config/local.toml`. The port must be an integer
+from 1 through 65535, excluding port 80 (URL normalization removes the explicit
+HTTP default port required by the existing loopback redirect contract). Invalid configuration and occupied ports fail preparation;
+Desktop does not fall back to another port or open a browser without a listener.
+Retry sign-in after freeing an occupied port.
+
+Restart Desktop after changing the port: each shell keeps one immutable setting
+for binding, redirect URI, and callback parsing. Existing OAuth registrations
+retain their original redirect URI. A mismatch requires **Clear sign-in**, then
+fresh sign-in; changing the setting does not rewrite registration or delete an
+account. Pre-registered clients must have the matching redirect URI registered
+with their provider. Refresh and normal startup do not create a listener or open
+a browser.

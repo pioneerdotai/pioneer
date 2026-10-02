@@ -623,6 +623,10 @@ async fn oauth_queue_cancellation_impl(
                             value["result"]["management"]["oauth_state"],
                             "cleanup_required"
                         );
+                        assert_eq!(
+                            value["result"]["management"]["oauth_cleanup_available"],
+                            true
+                        );
                         break;
                     }
                 }
@@ -700,6 +704,39 @@ async fn oauth_queue_cancellation_impl(
                 .unwrap()
         );
         assert!(persistence.read(&server_id).await.unwrap().is_none());
+        assert!(
+            !processor
+                .mcp_service
+                .oauth()
+                .cleanup_available(&server_id)
+                .await
+        );
+        assert_eq!(
+            processor.mcp_service.oauth().state(&server_id).await,
+            Some(pioneer_mcp_oauth::OAuthState::AuthRequired)
+        );
+        socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"details-cleared______","method":pioneer_protocol::constants::methods::MCP_SERVER_DETAILS,"params":{"workspace_id":workspace_id,"server_id":server_id}}).to_string().into())).await.unwrap();
+        let details = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let ClientMessage::Text(text) = socket.next().await.unwrap().unwrap() {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    if value["id"] == "details-cleared______" {
+                        break value;
+                    }
+                    assert_ne!(value["params"]["state"], "authorized");
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            details.get("error").is_none(),
+            "details after clear: {details}"
+        );
+        assert_eq!(
+            details["result"]["management"]["oauth_cleanup_available"],
+            false
+        );
         assert_ne!(
             processor.mcp_service.oauth().state(&server_id).await,
             Some(pioneer_mcp_oauth::OAuthState::CleanupRequired)

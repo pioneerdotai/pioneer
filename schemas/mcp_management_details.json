@@ -17,6 +17,23 @@
     "health": {
       "$ref": "#/$defs/McpServerHealthDetails"
     },
+    "oauth_cleanup_available": {
+      "description": "Device-neutral cleanup availability, including uncertain persistence.\nFalse after confirmed Clear; omitted by older Gateways.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "oauth_state": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/McpOAuthState"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "recent_bindings": {
       "type": "array",
       "default": [],
@@ -32,16 +49,6 @@
     },
     "transport": {
       "$ref": "#/$defs/McpTransportSummary"
-    },
-    "oauth_state": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/McpOAuthState"
-        },
-        {
-          "type": "null"
-        }
-      ]
     }
   },
   "required": [
@@ -113,6 +120,25 @@
         "action",
         "decision",
         "created_at"
+      ]
+    },
+    "McpOAuthState": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "preparing",
+        "awaiting_callback",
+        "exchanging",
+        "resolving",
+        "retired",
+        "cleanup_required",
+        "authorized",
+        "auth_required",
+        "insufficient_scope",
+        "denied",
+        "cancelled",
+        "timed_out",
+        "failed"
       ]
     },
     "McpRuntimeState": {
@@ -309,25 +335,6 @@
         "catalog_version",
         "fingerprint",
         "selection_reason"
-      ]
-    },
-    "McpOAuthState": {
-      "type": "string",
-      "enum": [
-        "idle",
-        "preparing",
-        "awaiting_callback",
-        "exchanging",
-        "resolving",
-        "retired",
-        "cleanup_required",
-        "authorized",
-        "auth_required",
-        "insufficient_scope",
-        "denied",
-        "cancelled",
-        "timed_out",
-        "failed"
       ]
     }
   }

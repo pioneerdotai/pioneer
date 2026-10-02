@@ -186,6 +186,7 @@ mod tests {
                 prompts: Vec::new(),
             },
             management: Some(McpManagementDetails {
+                oauth_cleanup_available: None,
                 oauth_state: None,
                 scope: McpScopeKind::Workspace,
                 source_kind: McpSourceKind::Config,

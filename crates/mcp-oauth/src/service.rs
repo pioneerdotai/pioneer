@@ -90,6 +90,7 @@ struct Flow {
     consumed: bool,
 }
 struct Entry {
+    cleanup_available: std::sync::atomic::AtomicBool,
     installation: McpServerInstallation,
     identity: String,
     generation: String,
@@ -397,6 +398,7 @@ impl McpOAuthService {
             ),
             cancellation,
             active_flow: std::sync::Mutex::new(None),
+            cleanup_available: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-support")]
             completed_exchange: std::sync::Mutex::new(None),
             presentation_owner: std::sync::Mutex::new(None),
@@ -524,7 +526,11 @@ impl McpOAuthService {
         }
         // Initialize the observable projection before publishing the entry.
         // Details never performs keystore I/O while an actor owns network work.
-        let status = match entry.credentials.record().await? {
+        let record = entry.credentials.record().await?;
+        entry
+            .cleanup_available
+            .store(record.is_some(), std::sync::atomic::Ordering::Release);
+        let status = match record {
             Some(record) if record.credentials.is_some() => OAuthState::Authorized,
             Some(_) => OAuthState::AuthRequired,
             None => OAuthState::Idle,
@@ -1137,6 +1143,11 @@ impl McpOAuthService {
             .await?
             .filter(|r| r.issuer == issuer && r.registration.client_id == registration.client_id)
             .and_then(|r| r.credentials);
+        // A failed write can have mutated storage. Keep cleanup actionable until
+        // explicit deletion confirms both account and promotion fence are gone.
+        entry
+            .cleanup_available
+            .store(true, std::sync::atomic::Ordering::Release);
         entry
             .credentials
             .write_record(AuthorizationRecord {
@@ -1898,6 +1909,53 @@ impl McpOAuthService {
             .get(id)
             .is_some_and(|entry| Self::same_configuration(&entry.installation, installation))
     }
+    /// Safe, non-blocking management projection; no token or keystore read.
+    pub async fn cleanup_available(&self, id: &str) -> bool {
+        let entry = self.inner.entries.lock().await.get(id).cloned();
+        entry.is_some_and(|entry| {
+            entry
+                .cleanup_available
+                .load(std::sync::atomic::Ordering::Acquire)
+                || entry
+                    .projection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .state
+                    == OAuthState::CleanupRequired
+        })
+    }
+    /// Snapshot both management facts from the same current configuration.
+    /// Reading this never waits for consent, exchange or persistent storage.
+    pub async fn management_projection(
+        &self,
+        id: &str,
+        installation: &McpServerInstallation,
+    ) -> (Option<OAuthState>, bool) {
+        let Some(entry) = self.inner.entries.lock().await.get(id).cloned() else {
+            return (None, false);
+        };
+        if !Self::same_configuration(&entry.installation, installation) {
+            return (None, false);
+        }
+        let status = entry
+            .projection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state;
+        let cleanup = entry
+            .cleanup_available
+            .load(std::sync::atomic::Ordering::Acquire)
+            || status == OAuthState::CleanupRequired;
+        let state = if status == OAuthState::Idle
+            || (entry.installation.transport.has_authorization_header()
+                && status != OAuthState::CleanupRequired)
+        {
+            None
+        } else {
+            Some(status)
+        };
+        (state, cleanup)
+    }
     pub async fn state(&self, id: &str) -> Option<OAuthState> {
         let entry = self.inner.entries.lock().await.get(id).cloned()?;
         let status = entry
@@ -2331,8 +2389,37 @@ impl McpOAuthService {
             return Err(oauth_runtime_error(&error));
         }
         // Per-ID admission excludes replacement until deletion and projection
-        // retirement finish. The registry is held only for the final removal.
-        self.inner.entries.lock().await.remove(id);
+        // retirement finish. The registry is held only for the final replacement/removal.
+        if management.is_some() {
+            // Clear completed durably. Keep a fresh, credential-free admission
+            // for this installation so an automatic workspace reload cannot
+            // anonymously reconnect while the user is signed out.
+            let fresh = self.new_entry(id, &entry.installation, entry.identity.clone());
+            {
+                let mut fresh_data = fresh.data.lock().await;
+                fresh_data.status = OAuthState::AuthRequired;
+                fresh_data.terminal = true;
+            }
+            fresh
+                .projection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .state = OAuthState::AuthRequired;
+            {
+                let mut entries = self.inner.entries.lock().await;
+                if self.inner.shutdown.is_cancelled() {
+                    return Err(McpRuntimeError::failed("OAuth service is shutting down"));
+                }
+                entries.insert(id.into(), fresh.clone());
+            }
+            let service = self.clone();
+            let id = id.to_owned();
+            self.spawn(async move {
+                service.worker(id, fresh).await;
+            });
+        } else {
+            self.inner.entries.lock().await.remove(id);
+        }
         Ok(())
     }
     pub async fn garbage_collect(

@@ -452,6 +452,7 @@ mod tests {
             snapshot_version: 1,
             generated_at: 10,
             management: Some(McpManagementDetails {
+                oauth_cleanup_available: None,
                 oauth_state: None,
                 scope: McpScopeKind::Workspace,
                 source_kind: McpSourceKind::Config,

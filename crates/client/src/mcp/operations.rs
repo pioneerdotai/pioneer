@@ -321,17 +321,23 @@ impl ClientCore {
             },
             work.intent.action_kind(),
         );
-        if result
-            .as_ref()
-            .err()
-            .is_some_and(|e| e.to_string() == "oauth_callback_port_unavailable")
-        {
+        let preparation_error = result.as_ref().err().and_then(|error| {
+            error
+                .downcast_ref::<super::oauth::OAuthPreparationError>()
+                .copied()
+                // Retain compatibility with existing shells' stable occupied-port code.
+                .or_else(|| {
+                    (error.to_string() == "oauth_callback_port_unavailable")
+                        .then_some(super::oauth::OAuthPreparationError::PortUnavailable)
+                })
+        });
+        if let Some(reason) = preparation_error {
             let key = (work.workspace.clone(), work.target.clone());
             let current = owner.publications.get(&key).unwrap();
             let mut publication = (**current).clone();
             publication.revision += 1;
             publication.field_error = Some(super::actions::McpInstallFieldError::Failure {
-                message: "oauth_callback_port_unavailable".into(),
+                message: reason.code().into(),
             });
             let publication = Arc::new(publication);
             owner.publications.insert(key, publication.clone());
@@ -677,6 +683,85 @@ mod tests {
         assert!(core.mcp_oauth_presentation("workspace", "public").is_none());
         assert!(core.mcp_oauth_presentation("workspace", "local").is_none());
     }
+    struct ConfigurationFailure(super::super::oauth::OAuthPreparationError);
+    impl super::super::oauth::McpOAuthShell for ConfigurationFailure {
+        fn configuration_error(&self) -> Option<super::super::oauth::OAuthPreparationError> {
+            Some(self.0)
+        }
+        fn prepare(&self) -> anyhow::Result<String> {
+            Err(self.0.into())
+        }
+        fn authorize(
+            &self,
+            _: &super::super::oauth::OAuthPresentation,
+            _: super::super::oauth::OAuthCallbackRelay,
+            _: super::super::oauth::OAuthBrowserAdmission,
+        ) -> super::super::oauth::OAuthBrowserEffectResult {
+            panic!("browser without listener")
+        }
+        fn release(&self, _: &str) {}
+        fn shutdown(&self) {}
+    }
+    #[test]
+    fn preparation_configuration_causes_reach_manual_and_protected_install_publications() {
+        use super::super::oauth::OAuthPreparationError;
+        use pioneer_protocol::*;
+        for reason in [
+            OAuthPreparationError::InvalidCallbackPort,
+            OAuthPreparationError::ConfigurationLoad,
+        ] {
+            let (core, queue) = fixture();
+            core.set_mcp_oauth_shell(Arc::new(ConfigurationFailure(reason)));
+            core.mcp_intent(
+                "workspace",
+                McpIntent::SignIn {
+                    server_id: "a".into(),
+                },
+            )
+            .unwrap();
+            let work = queue.try_recv().unwrap();
+            let failure = core.prepare_mcp_oauth().unwrap_err();
+            core.complete_mcp_action(work, Err(failure));
+            let publication = core.mcp_action_snapshot("workspace", "a").unwrap();
+            assert_eq!(publication.state, McpActionState::Failed);
+            assert!(
+                matches!(&publication.field_error, Some(super::super::actions::McpInstallFieldError::Failure { message }) if message == reason.code())
+            );
+            let config = r#"{"mcpServers":{"protected":{"url":"https://protected.example/mcp"},"public":{"url":"https://public.example/mcp"},"local":{"command":"fake"}}}"#;
+            core.mcp_intent(
+                "workspace",
+                McpIntent::Configure {
+                    config_json: config.into(),
+                },
+            )
+            .unwrap();
+            let work = queue.try_recv().unwrap();
+            let params = configuration_params(&work.workspace, config, core.prepare_mcp_oauth());
+            assert!(params.oauth_callback_unavailable);
+            assert!(params.oauth_redirect_uri.is_none());
+            core.observe_mcp_oauth_notification(&GatewayNotification::McpOAuthChanged(
+                McpOAuthNotification {
+                    workspace_id: "workspace".into(),
+                    server_id: "protected".into(),
+                    name: "protected".into(),
+                    scope_kind: McpScopeKind::Workspace,
+                    flow_id: Some("flow".into()),
+                    state: McpOAuthState::Failed,
+                    authorization_url: None,
+                    diagnostic: Some("oauth_callback_preparation_failed".into()),
+                },
+            ));
+            let (event, fallback) = core
+                .mcp_oauth_presentation("workspace", "protected")
+                .unwrap();
+            assert_eq!(event.diagnostic.as_deref(), Some(reason.code()));
+            assert!(event.authorization_url.is_none());
+            assert!(!fallback);
+            assert!(core.mcp_oauth_presentation("workspace", "public").is_none());
+            assert!(core.mcp_oauth_presentation("workspace", "local").is_none());
+        }
+    }
+
     #[test]
     fn actions_have_one_generation_and_optimistic_policy_rolls_back_only_matching_server() {
         let (core, receiver) = fixture();

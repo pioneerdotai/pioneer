@@ -78,6 +78,8 @@ impl CatalogInput {
     }
     fn same_sidebar(&self, other: &Self) -> bool {
         self.same_parent(other)
+            && self.oauth == other.oauth
+            && self.mcp_server_details == other.mcp_server_details
             && self.selected() == other.selected()
             && self.mcp_loading == other.mcp_loading
             && self.is_mcp_pending(pioneer_client::mcp::list::MCP_INSTALL_PENDING_KEY)
@@ -329,12 +331,12 @@ impl McpCatalogView {
                             | McpActionKind::SignIn
                             | McpActionKind::Disconnect
                             | McpActionKind::CancelAuthorization => {
-                                if matches!(action.field_error.as_ref(),Some(pioneer_client::mcp::actions::McpInstallFieldError::Failure{message}) if message=="oauth_callback_port_unavailable")
-                                {
-                                    t!("mcp.oauth.callback_unavailable").to_string()
-                                } else {
-                                    t!("mcp.oauth.failed").to_string()
-                                }
+                                let code = match action.field_error.as_ref() {
+                                    Some(pioneer_client::mcp::actions::McpInstallFieldError::Failure { message }) => Some(message.as_str()),
+                                    _ => None,
+                                };
+                                code.and_then(crate::oauth::preparation_error_label)
+                                    .unwrap_or_else(|| t!("mcp.oauth.failed").to_string())
                             }
                             McpActionKind::Policy => {
                                 t!("mcp.error.policy_update_failed", error = "").to_string()
@@ -451,6 +453,44 @@ mod tests {
     use pioneer_client::navigation::NavigationIntent;
     use pioneer_desktop_foundation::{ClientBindingRegistration, ClientPublicationSink};
     use std::{cell::Cell, rc::Rc, sync::Weak};
+    #[test]
+    fn oauth_and_details_changes_refresh_sidebar_without_catalog_changes() {
+        let core = pioneer_client::core::ClientCore::new();
+        let original = super::CatalogInput::empty(&core);
+        let mut next = original.clone();
+        next.oauth.insert(
+            "server".into(),
+            (
+                pioneer_client::mcp::oauth::OAuthPresentation {
+                    workspace_id: "workspace".into(),
+                    server_id: "server".into(),
+                    name: "server".into(),
+                    scope_kind: pioneer_client::mcp::actions::mcp_server_restart_params(
+                        "workspace",
+                        "server",
+                    )
+                    .scope_kind,
+                    flow_id: None,
+                    state: pioneer_client::mcp::types::McpOAuthState::AuthRequired,
+                    authorization_url: None,
+                    diagnostic: None,
+                },
+                false,
+            ),
+        );
+        assert!(!original.same_sidebar(&next));
+        assert!(next.same_sidebar(&next.clone()));
+        let previous = next.clone();
+        next.oauth.get_mut("server").unwrap().0.state =
+            pioneer_client::mcp::types::McpOAuthState::Authorized;
+        assert!(!previous.same_sidebar(&next));
+        let previous = next.clone();
+        next.mcp_server_details = Some(pioneer_client::catalog_test_support::mcp_detail("server"));
+        assert!(!previous.same_sidebar(&next));
+        let previous = next.clone();
+        next.oauth.remove("server");
+        assert!(!previous.same_sidebar(&next));
+    }
     struct Registrar;
     impl ClientBindingRegistrar for Registrar {
         fn register(
