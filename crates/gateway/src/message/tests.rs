@@ -34777,7 +34777,7 @@ async fn failed_task_thread_delivery_is_a_sanitized_system_state_without_work_gr
     );
     assert_eq!(
         delivered_turn.error.as_deref(),
-        Some("Scheduled task could not start.")
+        Some("Scheduled task failed.")
     );
     assert!(
         !delivered_turn
@@ -34802,9 +34802,7 @@ async fn failed_task_thread_delivery_is_a_sanitized_system_state_without_work_gr
         .expect("delivery timeline blocks should query");
     assert!(blocks.iter().any(|block| {
         block.block_kind == pioneer_crud::BLOCK_KIND_SYSTEM
-            && block
-                .metadata_json
-                .contains("Scheduled task could not start.")
+            && block.metadata_json.contains("Scheduled task failed.")
     }));
     assert!(
         blocks

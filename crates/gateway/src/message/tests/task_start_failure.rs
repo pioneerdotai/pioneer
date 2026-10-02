@@ -119,6 +119,7 @@ enum PreparationFailure {
     ChildPersistence,
     Cleanup,
     RetryFrozen,
+    RetryBackoff,
     TerminalHistory,
 }
 
@@ -146,12 +147,19 @@ async fn run_gateway_start_failure(
         "gpt-5",
         "safe task input",
     );
-    if matches!(case, PreparationFailure::RetryFrozen) {
+    if matches!(
+        case,
+        PreparationFailure::RetryFrozen | PreparationFailure::RetryBackoff
+    ) {
         params.retry_policy = Some(TaskRetryPolicy {
             max_attempts: 2,
-            backoff: TaskRetryBackoffKind::Fixed,
-            initial_delay_seconds: Some(60),
-            max_delay_seconds: Some(60),
+            backoff: if matches!(case, PreparationFailure::RetryBackoff) {
+                TaskRetryBackoffKind::Fixed
+            } else {
+                TaskRetryBackoffKind::None
+            },
+            initial_delay_seconds: matches!(case, PreparationFailure::RetryBackoff).then_some(60),
+            max_delay_seconds: matches!(case, PreparationFailure::RetryBackoff).then_some(60),
             retry_on: vec![TaskErrorClass::Internal],
         });
     }
@@ -204,7 +212,9 @@ async fn run_gateway_start_failure(
     }
     if matches!(
         case,
-        PreparationFailure::Cleanup | PreparationFailure::RetryFrozen
+        PreparationFailure::Cleanup
+            | PreparationFailure::RetryFrozen
+            | PreparationFailure::RetryBackoff
     ) {
         use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
         store
@@ -262,24 +272,24 @@ async fn run_gateway_start_failure(
         case,
         PreparationFailure::Cleanup
             | PreparationFailure::RetryFrozen
+            | PreparationFailure::RetryBackoff
             | PreparationFailure::ChildPersistence
     ) {
         TaskRunStatus::Failed
     } else {
         TaskRunStatus::Blocked
     };
-    if expected_status == TaskRunStatus::Blocked {
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            processor.task_cli_terminal_preparation_finished.notified(),
-        )
-        .await
-        .expect("blocked preparation must finish its reporting and cleanup within 30 seconds");
-    }
     let saved = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let response = store.get_task(&created.task.id).await.unwrap().unwrap();
             if response.runs[0].status == expected_status {
+                return response;
+            }
+            if matches!(
+                case,
+                PreparationFailure::History | PreparationFailure::AdmissionStorage
+            ) && response.runs[0].status == TaskRunStatus::Failed
+            {
                 return response;
             }
             assert_ne!(
@@ -290,9 +300,22 @@ async fn run_gateway_start_failure(
     })
     .await
     .expect("preparation must commit its terminal Task state within 30 seconds");
+    // Only the CLI terminal branch sends this notification. An error returned
+    // before that branch is completed and reported by scheduler fail_run.
+    if saved.runs[0].status == TaskRunStatus::Blocked {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            processor.task_cli_terminal_preparation_finished.notified(),
+        )
+        .await
+        .expect("blocked preparation must finish reporting and cleanup within 30 seconds");
+    }
     assert_eq!(
         saved.runs.len(),
-        if matches!(case, PreparationFailure::RetryFrozen) {
+        if matches!(
+            case,
+            PreparationFailure::RetryFrozen | PreparationFailure::RetryBackoff
+        ) {
             2
         } else {
             1
@@ -301,7 +324,10 @@ async fn run_gateway_start_failure(
     );
     assert_eq!(saved.runs[0].attempt_number, 1);
     let error = saved.runs[0].error.clone().unwrap();
-    if !matches!(case, PreparationFailure::RetryFrozen) {
+    if !matches!(
+        case,
+        PreparationFailure::RetryFrozen | PreparationFailure::RetryBackoff
+    ) {
         assert_eq!(saved.task.error.as_ref(), Some(&error));
     }
     assert!(
@@ -340,7 +366,9 @@ async fn run_gateway_start_failure(
             .unwrap();
         if matches!(
             case,
-            PreparationFailure::Cleanup | PreparationFailure::RetryFrozen
+            PreparationFailure::Cleanup
+                | PreparationFailure::RetryFrozen
+                | PreparationFailure::RetryBackoff
         ) {
             assert_eq!(
                 turn.status,
@@ -355,14 +383,17 @@ async fn run_gateway_start_failure(
         }
         assert_eq!(
             child.status,
-            if expected_status == TaskRunStatus::Blocked {
+            if saved.runs[0].status == TaskRunStatus::Blocked {
                 TaskRunTurnStatus::Blocked
             } else {
                 TaskRunTurnStatus::Failed
             }
         );
     }
-    if matches!(case, PreparationFailure::RetryFrozen) {
+    if matches!(
+        case,
+        PreparationFailure::RetryFrozen | PreparationFailure::RetryBackoff
+    ) {
         let accepted = store
             .get_task_run_conversation_snapshot(&run_id)
             .await
@@ -373,8 +404,33 @@ async fn run_gateway_start_failure(
         assert_eq!(retry.retry_of_run_id.as_deref(), Some(run_id.as_str()));
         assert_eq!(
             retry.ready_at,
-            Some(saved.runs[0].completed_at.unwrap() + 60)
+            Some(
+                saved.runs[0].completed_at.unwrap()
+                    + if matches!(case, PreparationFailure::RetryBackoff) {
+                        60
+                    } else {
+                        0
+                    }
+            )
         );
+        if matches!(case, PreparationFailure::RetryBackoff) {
+            processor
+                .task_runtime
+                .process_due_once(saved.runs[0].completed_at.unwrap())
+                .await
+                .unwrap();
+            let waiting = store.get_task(&saved.task.id).await.unwrap().unwrap();
+            assert_eq!(waiting.runs.len(), 2);
+            assert_eq!(waiting.runs[1].status, TaskRunStatus::Queued);
+            assert_eq!(
+                processor
+                    .task_cli_preparation_attempts
+                    .load(Ordering::SeqCst),
+                1
+            );
+            assert!(cli.turn_starts.lock().await.is_empty());
+            return (Some(error), run_id);
+        }
         // A fresh capture would consume this failpoint. Reuse must bypass it.
         *processor.task_history_preparation_failure.lock().unwrap() = Some(anyhow::anyhow!(CANARY));
         *processor.task_cli_admission_failure.lock().unwrap() =
@@ -717,6 +773,14 @@ fn gateway_configured_retry_keeps_backoff_budget_and_frozen_history() {
         capture_task_start(run_gateway_start_failure(PreparationFailure::RetryFrozen));
     assert_eq!(events.len(), 2, "each configured attempt has one owner");
     assert_safe_events(&events);
+    let (_, events) =
+        capture_task_start(run_gateway_start_failure(PreparationFailure::RetryBackoff));
+    assert_eq!(
+        events.len(),
+        1,
+        "a retry before its backoff deadline must not start"
+    );
+    assert_safe_events(&events);
 }
 
 #[test]
@@ -725,9 +789,11 @@ fn gateway_terminal_run_during_history_preparation_keeps_cancellation() {
         PreparationFailure::TerminalHistory,
     ));
     assert!(
-        !events
-            .iter()
-            .any(|event| event.message.as_deref() == Some("Task preparation or launch failed")),
+        !events.iter().any(|event| {
+            matches!(event.contexts.get("Rust Tracing Fields"),
+                    Some(sentry::protocol::Context::Other(fields))
+                    if fields.get("stage") == Some(&serde_json::json!("history_preparation")))
+        }),
         "superseded preparation must not report a Task start failure"
     );
     assert_safe_events(&events);
@@ -1171,25 +1237,60 @@ async fn persist_completed_child(
     child: &TestChildRuntimeAnchor,
     timestamp: i64,
 ) {
-    let (_, mut turn) = harness
+    // A provider completion includes its transcript boundary and terminal CLI
+    // cleanup. A plain Turn projection leaves the native attempt/session live.
+    let binding = harness
         .crud_store
-        .get_turn(&child.child_thread_id, &child.child_turn_id)
+        .get_cli_runtime_turn_binding(&child.child_turn_id)
         .await
         .unwrap()
-        .unwrap();
-    turn.status = TurnStatus::Completed;
+        .expect("activated CLI child binding");
     harness
-        .crud_store
-        .materialize_turn_completed(
-            TurnCompletedNotification {
-                workspace_id: harness.workspace_id.clone(),
-                thread_id: child.child_thread_id.clone(),
-                turn,
-            },
-            timestamp,
+        .cli_session
+        .record_provider_assistant_message(
+            &binding.native_thread_id,
+            r#"<task_result>{"summary":"safe candidate","data":{"ok":true}}</task_result>"#,
+        )
+        .await;
+    harness
+        .cli_session
+        .record_provider_boundary(
+            &binding.native_thread_id,
+            binding
+                .native_turn_id
+                .as_deref()
+                .expect("activated native turn"),
+        )
+        .await;
+    let finished = harness
+        .processor
+        .thread_manager
+        .turn_finish(
+            &child.child_thread_id,
+            &child.child_turn_id,
+            TurnStatus::Completed,
+            None,
         )
         .await
         .unwrap();
+    harness
+        .crud_store
+        .materialize_native_agent_turn_event_owned(
+            pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
+                workspace_id: finished.workspace_id,
+                thread_id: finished.thread_id,
+                turn: finished.turn,
+            }),
+            timestamp,
+            None,
+            harness.processor.turn_execution_owner_id.as_ref(),
+        )
+        .await
+        .unwrap();
+    harness
+        .processor
+        .cleanup_completed_cli_task_fixture(&child.child_turn_id)
+        .await;
 }
 
 #[test]
@@ -1636,7 +1737,10 @@ fn reviewer_late_cli_preparation_preserves_blocked_transition_and_safe_storage_e
             )
             .await
             .expect_err("late reviewer preparation remains a failed completion");
-        assert!(error.downcast_ref::<TaskStartFailure>().is_some());
+        assert!(
+            error.downcast_ref::<TaskStartFailure>().is_some(),
+            "expected typed preparation failure, got {error:#}"
+        );
         let run_id = &task.run.unwrap().id;
         let error = assert_persisted_late_cli_failure(
             &processor,
