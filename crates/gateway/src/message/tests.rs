@@ -54418,6 +54418,32 @@ async fn turn_cancel_cli_runtime_without_active_session_does_not_start_runtime()
         thread_id,
     )
     .await;
+    // Subscription seeds a new session and clears its in-memory turns. Restore
+    // the durable turn afterwards, as terminal lifecycle recovery does.
+    let persisted = crud_store
+        .get_thread_model(thread_id)
+        .await
+        .expect("persisted CLI cancellation thread should load")
+        .expect("persisted CLI cancellation thread should exist");
+    let sandbox_mode = crud_store
+        .get_thread_sandbox_mode(thread_id)
+        .await
+        .expect("persisted CLI cancellation sandbox should load");
+    processor
+        .thread_manager
+        .system_thread_restore_persisted(persisted, sandbox_mode)
+        .await
+        .expect("CLI cancellation should restore its durable turn into local state");
+    assert_eq!(
+        processor
+            .thread_manager
+            .turn_get(thread_id, turn_id)
+            .await
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
     assert!(
         processor
             .agent_manager
