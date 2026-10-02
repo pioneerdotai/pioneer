@@ -2364,7 +2364,11 @@ impl MemoryService {
 
         let candidates = rows
             .into_iter()
-            .map(crud_candidate_to_protocol)
+            .map(|row| {
+                crud_candidate_to_protocol(row).map_err(|error| {
+                    error.context(crate::manifest_failure::InvalidStoredMemoryData)
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
 
         Ok(MemoryCandidatesListResponse {
@@ -3227,7 +3231,8 @@ impl MemoryService {
                 &quality,
             )
             .await?;
-        let mut record = crud_record_to_protocol(row, payload)?;
+        let mut record = crud_record_to_protocol(row, payload)
+            .map_err(|error| error.context(crate::manifest_failure::InvalidStoredMemoryData))?;
         record.recall_eligibility = Some(pioneer_protocol::MemoryRecallEligibility {
             eligible: visibility.is_visible(),
             reason: visibility.as_str().to_owned(),

@@ -217,7 +217,10 @@ fn redacted_endpoint_error(
         .as_ref()
         .and_then(|classification| classification.http_status)
         .or_else(|| endpoint_error_status(&error));
-    let is_network = error.chain().any(|cause| cause.is::<reqwest::Error>());
+    let is_network = error.chain().any(|cause| cause.is::<reqwest::Error>())
+        || adapter_classification
+            .as_ref()
+            .is_some_and(|value| value.is_network_error);
     let raw_message = format!("{error:#}");
     let lower = raw_message.to_ascii_lowercase();
     let provider_code = extract_provider_code(&raw_message);
@@ -232,6 +235,11 @@ fn redacted_endpoint_error(
     }
     let mut classification =
         adapter_classification.unwrap_or_else(|| ProviderFailureClassification::new(class));
+    // Preserve the old custom-endpoint reqwest fallback even when the adapter
+    // has already discarded the unsafe source and retained only transport facts.
+    if classification.class == ProviderFailureClass::Unknown && classification.is_network_error {
+        classification.class = ProviderFailureClass::NetworkTransient;
+    }
     classification.http_status = classification.http_status.or(status);
     // `retry-after` is useful for recovery. Retain only the numeric interval.
     classification.retry_after_ms = classification
@@ -330,24 +338,30 @@ impl Provider for AuthorityBoundProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        Ok(self.stream_chat_with_diagnostics(request).await?.stream)
+    }
+
+    async fn stream_chat_with_diagnostics(
+        &self,
+        request: ChatRequest,
+    ) -> Result<crate::ProviderStream> {
         self.ensure_not_revoked()?;
-        let stream = self.public_result(
+        let mut response = self.public_result(
             crate::attachments::runtime::with_async_authority_scope(
                 self.authority_fingerprint.as_str().to_owned(),
-                self.inner.stream_chat(request),
+                self.inner.stream_chat_with_diagnostics(request),
             )
             .await,
         )?;
         if self.redact_endpoint_errors {
             let inner = self.inner.clone();
-            Ok(Box::pin(stream.map(move |result| {
+            response.stream = Box::pin(response.stream.map(move |result| {
                 result.map_err(|error| {
                     redacted_endpoint_error(inner.as_ref(), error, ProviderFailureStage::MidStream)
                 })
-            })))
-        } else {
-            Ok(stream)
+            }));
         }
+        Ok(response)
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -1926,7 +1940,7 @@ mod tests {
                 let body = format!(
                     "{}{}",
                     if with_json {
-                        "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"facts\\\":[]}\"},\"finish_reason\":null}]}\n\n"
+                        "data: {\"id\":\"gen-completion_body\",\"choices\":[{\"delta\":{\"content\":\"{\\\"facts\\\":[]}\"},\"finish_reason\":null}]}\n\n"
                     } else {
                         ""
                     },
@@ -1955,7 +1969,7 @@ mod tests {
                             }
                         }
                     }
-                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Generation-Id: gen-completion_header\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
                     socket.shutdown().await.unwrap();
                 });
                 let registry =
@@ -1990,9 +2004,17 @@ mod tests {
                         ProviderStreamIncomplete::EofWithoutTerminalMarker
                     })
                 );
+                let classification = provider.classify_failure(&error).unwrap();
+                assert_eq!(classification.class, ProviderFailureClass::StreamStall);
+                assert_eq!(classification.http_status, None);
+                assert_eq!(classification.error_reason, None);
                 assert_eq!(
-                    provider.classify_failure(&error).unwrap().class,
-                    ProviderFailureClass::StreamStall
+                    classification.request_id.map(String::from).as_deref(),
+                    Some(if with_json {
+                        "gen-completion_body"
+                    } else {
+                        "gen-completion_header"
+                    })
                 );
                 assert!(!format!("{error:#?}").contains("private-marker-path"));
             }

@@ -4669,6 +4669,11 @@ pub enum ProviderFailureStage {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ProviderFailureDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_reason: Option<crate::ProviderErrorReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<crate::ProviderRequestId>,
+
     pub provider: String,
     pub model: String,
     pub transport: ProviderTransportKind,

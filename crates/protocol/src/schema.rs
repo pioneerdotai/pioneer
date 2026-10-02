@@ -2064,6 +2064,8 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("provider_transport_kind.json", ProviderTransportKind),
         schema_doc!("provider_failure_stage.json", ProviderFailureStage),
         schema_doc!("provider_failure_details.json", ProviderFailureDetails),
+        schema_doc!("provider_error_reason.json", crate::ProviderErrorReason),
+        schema_doc!("provider_request_id.json", crate::ProviderRequestId),
         schema_doc!("public_error.json", PublicError),
         schema_doc!("public_error_code.json", PublicErrorCode),
         schema_doc!("public_error_stage.json", PublicErrorStage),

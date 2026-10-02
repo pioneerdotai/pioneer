@@ -27,6 +27,7 @@ mod patch_history_handlers;
 mod permission_handlers;
 mod provider_handlers;
 mod provider_readiness;
+mod reconciliation_diagnostics;
 pub(crate) mod skills;
 mod summary;
 mod task_agent_executor;
@@ -266,6 +267,7 @@ use std::pin::Pin;
 use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
@@ -2207,6 +2209,9 @@ impl MessageProcessor {
     }
 
     async fn run_projection_delivery_resilience_worker(processor: Weak<Self>) {
+        let mut finalization_reporting = reconciliation_diagnostics::Reporter::new(
+            reconciliation_diagnostics::Operation::NativeFinalization,
+        );
         loop {
             let Some(this) = processor.upgrade() else {
                 break;
@@ -2242,14 +2247,15 @@ impl MessageProcessor {
                     ),
                 }
 
-                match crate::database::attribution::scope_database_workload_result(
+                let result = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::FinalizationRecovery,
                     retry_transient_storage_access(|| {
                         this.reconcile_prepared_native_turn_finalizations(now, 64)
                     }),
                 )
-                .await
-                {
+                .await;
+                finalization_reporting.observe(&result, Instant::now());
+                match result {
                     Ok(summary) => {
                         let committed = summary.committed_count();
                         if committed > 0 {
@@ -2272,10 +2278,7 @@ impl MessageProcessor {
                             );
                         }
                     }
-                    Err(error) => error!(
-                        error = %format!("{error:#}"),
-                        "native Turn finalization reconciler failed"
-                    ),
+                    Err(_) => {}
                 }
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
@@ -2302,6 +2305,9 @@ impl MessageProcessor {
     }
 
     async fn run_task_lifecycle_resilience_worker(processor: Weak<Self>) {
+        let mut occurrence_reporting = reconciliation_diagnostics::Reporter::new(
+            reconciliation_diagnostics::Operation::TaskRunOccurrence,
+        );
         loop {
             let Some(this) = processor.upgrade() else {
                 break;
@@ -2326,23 +2332,21 @@ impl MessageProcessor {
                     ),
                 }
 
-                match crate::database::attribution::scope_database_workload_result(
+                let result = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
                     retry_transient_storage_access(|| {
                         this.reconcile_terminal_task_run_occurrence_turns(64)
                     }),
                 )
-                .await
-                {
+                .await;
+                occurrence_reporting.observe(&result, Instant::now());
+                match result {
                     Ok(reconciled) if reconciled > 0 => info!(
                         reconciled,
                         "reconciled terminal TaskRuns with parent occurrence Turns"
                     ),
                     Ok(_) => {}
-                    Err(error) => error!(
-                        error = %format!("{error:#}"),
-                        "task parent occurrence reconciler failed"
-                    ),
+                    Err(_) => {}
                 }
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(

@@ -1798,6 +1798,7 @@ struct HookRunPersistence {
     run: Option<HookRunStoreRecord>,
     attempt: Option<HookRunAttemptStoreRecord>,
     attempt_started_instant: Option<Instant>,
+    execution_phase: HookPhase,
     durable_phase: Option<HookPhase>,
     failure_operation: Option<&'static str>,
 }
@@ -1810,7 +1811,7 @@ impl HookRunPersistence {
     ) -> Self {
         let durable_phase = durable_terminal_effect_id(&request.context).map(|_| request.phase);
         let Some(store) = store else {
-            let mut persistence = Self::disabled();
+            let mut persistence = Self::disabled(request.phase);
             persistence.durable_phase = durable_phase;
             if durable_phase.is_some() {
                 persistence.failure_operation = Some("run_store_missing");
@@ -1851,7 +1852,7 @@ impl HookRunPersistence {
             Ok(run) => (Some(run), None),
             Err(error) => {
                 tracing::error!(
-                    error = %format!("{error:#}"),
+                    error = %error,
                     phase = request.phase.as_str(),
                     "failed to create or load hook run"
                 );
@@ -1864,17 +1865,19 @@ impl HookRunPersistence {
             run,
             attempt: None,
             attempt_started_instant: None,
+            execution_phase: request.phase,
             durable_phase,
             failure_operation,
         }
     }
 
-    fn disabled() -> Self {
+    fn disabled(execution_phase: HookPhase) -> Self {
         Self {
             store: None,
             run: None,
             attempt: None,
             attempt_started_instant: None,
+            execution_phase,
             durable_phase: None,
             failure_operation: None,
         }
@@ -1884,6 +1887,7 @@ impl HookRunPersistence {
         let durable_phase = durable_terminal_effect_id(&run.context).map(|_| run.phase);
         Self {
             store: Some(store),
+            execution_phase: run.phase,
             run: Some(run),
             attempt: None,
             attempt_started_instant: None,
@@ -1892,14 +1896,15 @@ impl HookRunPersistence {
         }
     }
 
-    fn record_failure(&mut self, operation: &'static str, error: &impl fmt::Display) {
+    fn record_failure(&mut self, operation: &'static str, error: &crate::HookRunStoreError) {
+        let diagnostic = error.diagnostic();
         tracing::error!(
             error = %error,
             operation,
-            phase = self
-                .durable_phase
-                .map(|phase| phase.as_str())
-                .unwrap_or("unknown"),
+            phase = self.execution_phase.as_str(),
+            cause_class = diagnostic.cause_class.as_str(),
+            sqlite_primary_code = diagnostic.sqlite_primary_code,
+            sqlite_extended_code = diagnostic.sqlite_extended_code,
             "failed to persist hook run lifecycle"
         );
         if self.durable_phase.is_some() && self.failure_operation.is_none() {
@@ -3123,6 +3128,146 @@ mod tests {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     use std::time::Duration;
     use tokio::sync::Barrier;
+
+    fn persistence_event_fields<'a>(
+        event: &'a sentry::protocol::Event<'static>,
+    ) -> &'a BTreeMap<String, serde_json::Value> {
+        let Some(sentry::protocol::Context::Other(fields)) =
+            event.contexts.get("Rust Tracing Fields")
+        else {
+            panic!("lifecycle event must contain its structured tracing fields");
+        };
+        fields
+    }
+
+    fn capture_persistence_failure(
+        persistence: &mut HookRunPersistence,
+    ) -> sentry::protocol::Event<'static> {
+        use tracing_subscriber::prelude::*;
+        let subscriber =
+            tracing_subscriber::registry().with(sentry::integrations::tracing::layer());
+        let error = crate::HookRunStoreError::internal_with_diagnostic(
+            "failed to append hook audit events",
+            crate::HookRunStoreDiagnostic {
+                cause_class: crate::HookRunStoreCauseClass::SqliteBusy,
+                sqlite_primary_code: Some(5),
+                sqlite_extended_code: Some(517),
+            },
+        );
+        let mut events = sentry::test::with_captured_events(|| {
+            tracing::subscriber::with_default(subscriber, || {
+                persistence.record_failure("append_audit_events", &error);
+            });
+        });
+        assert_eq!(events.len(), 1);
+        let event = events.remove(0);
+        assert_eq!(event.level, sentry::Level::Error);
+        let fields = persistence_event_fields(&event);
+        assert_eq!(fields["operation"], "append_audit_events");
+        assert_eq!(fields["cause_class"], "sqlite_busy");
+        assert_eq!(fields["sqlite_primary_code"], 5);
+        assert_eq!(fields["sqlite_extended_code"], 517);
+        assert!(event.exception.values.is_empty());
+        event
+    }
+
+    #[test]
+    fn persistence_start_keeps_actual_phase_with_and_without_store() {
+        let node = HookExecutionNode {
+            order_index: 0,
+            subscription: HookSubscription::new(
+                subscription_id("sub.diagnostics"),
+                hook_id("test.diagnostics"),
+                HookPhase::TurnPrePromptCompile,
+            ),
+            handler: handler(
+                "test.diagnostics",
+                Arc::new(Mutex::new(Vec::new())),
+                Vec::new(),
+            ),
+        };
+        for has_store in [false, true] {
+            for durable in [false, true] {
+                let store = has_store
+                    .then(|| Arc::new(RecordingHookRunStore::default()) as Arc<dyn HookRunStore>);
+                let mut request = phase_request();
+                if durable {
+                    request.context.metadata.insert(
+                        HookMetadataKey::new("native_terminal_effect_id").expect("metadata key"),
+                        HookValue::Text("EFFECT_CANARY".to_owned()),
+                    );
+                }
+                let mut persistence =
+                    block_on_ready(HookRunPersistence::start(store, &node, &request));
+                assert_eq!(persistence.execution_phase, request.phase);
+                assert_eq!(persistence.durable_phase, durable.then_some(request.phase));
+                let event = capture_persistence_failure(&mut persistence);
+                assert_eq!(
+                    persistence_event_fields(&event)["phase"],
+                    request.phase.as_str()
+                );
+                assert!(
+                    !serde_json::to_string(&event)
+                        .expect("serialized event")
+                        .contains("EFFECT_CANARY")
+                );
+                if durable {
+                    assert!(matches!(
+                        persistence.ensure_healthy(),
+                        Err(HookRuntimeError::DurablePersistenceUnavailable { .. })
+                    ));
+                    assert_eq!(
+                        persistence.failure_operation,
+                        Some(if has_store {
+                            "append_audit_events"
+                        } else {
+                            "run_store_missing"
+                        })
+                    );
+                } else {
+                    assert!(persistence.ensure_healthy().is_ok());
+                    assert_eq!(persistence.failure_operation, None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recovered_persistence_uses_run_phase_independently_of_durable_effect() {
+        for durable in [false, true] {
+            let mut run = phase_21_recoverable_record(
+                "sub.diagnostics",
+                "test.diagnostics",
+                HookRunStatus::Queued,
+                0,
+                phase_21_resume_state(crate::HookRetryPolicy::default()),
+                Vec::new(),
+            )
+            .run;
+            run.phase = HookPhase::TurnPostTurn;
+            if durable {
+                run.context.metadata.insert(
+                    HookMetadataKey::new("native_terminal_effect_id").expect("metadata key"),
+                    HookValue::Text("RECOVERY_EFFECT_CANARY".to_owned()),
+                );
+            }
+            let mut persistence =
+                HookRunPersistence::from_existing(Arc::new(RecordingHookRunStore::default()), run);
+            assert_eq!(persistence.execution_phase, HookPhase::TurnPostTurn);
+            assert_eq!(
+                persistence.durable_phase,
+                durable.then_some(HookPhase::TurnPostTurn)
+            );
+            let event = capture_persistence_failure(&mut persistence);
+            assert_eq!(persistence_event_fields(&event)["phase"], "turn.post_turn");
+            assert!(
+                !serde_json::to_string(&event)
+                    .expect("serialized event")
+                    .contains("RECOVERY_EFFECT_CANARY")
+            );
+            assert_eq!(persistence.ensure_healthy().is_err(), durable);
+        }
+    }
 
     struct RecordingHookHandler {
         id: HookId,

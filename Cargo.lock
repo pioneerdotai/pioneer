@@ -9655,11 +9655,13 @@ dependencies = [
  "futures-timer",
  "futures-util",
  "hex",
+ "sentry",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
