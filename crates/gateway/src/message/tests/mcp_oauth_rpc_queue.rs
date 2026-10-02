@@ -221,7 +221,7 @@ async fn oauth_queue_cancellation_impl(
     let (mut socket, _) = connect_async(format!("ws://{ws_address}/ws"))
         .await
         .unwrap();
-    socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"oauth-install","method":"mcp/install","params":{"workspace_id":workspace_id,"enabled":replacement.is_some() || stale_rpc.is_some(),"config_json":json!({"mcpServers":{"queue":{"url":format!("{issuer}/mcp")}}}).to_string()}}).to_string().into())).await.unwrap();
+    socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"oauth-install________","method":"mcp/install","params":{"workspace_id":workspace_id,"enabled":replacement.is_some() || stale_rpc.is_some(),"config_json":json!({"mcpServers":{"queue":{"url":format!("{issuer}/mcp")}}}).to_string()}}).to_string().into())).await.unwrap();
     loop {
         let frame = tokio::time::timeout(Duration::from_secs(3), socket.next())
             .await
@@ -230,7 +230,7 @@ async fn oauth_queue_cancellation_impl(
             .unwrap();
         if let ClientMessage::Text(text) = frame {
             let value: Value = serde_json::from_str(&text).unwrap();
-            if value["id"] == "oauth-install" {
+            if value["id"] == "oauth-install________" {
                 assert!(value.get("error").is_none(), "install rejected");
                 break;
             }
@@ -280,9 +280,10 @@ async fn oauth_queue_cancellation_impl(
     }
 
     let envelope = |id: &str, action: Value| {
+        let id = pioneer_protocol::RequestId::new(id).expect("valid wire request ID");
         json!({"jsonrpc":"2.0","id":id,"method":"mcp/oauth","params":{"workspace_id":workspace_id,"server_id":server_id,"name":"queue","action":action}}).to_string()
     };
-    socket.send(ClientMessage::Text(envelope("oauth-signin", json!({"kind":"sign_in","redirect_uri":"http://127.0.0.1:37643/oauth/mcp/callback"})).into())).await.unwrap();
+    socket.send(ClientMessage::Text(envelope("oauth-signin_________", json!({"kind":"sign_in","redirect_uri":"http://127.0.0.1:37643/oauth/mcp/callback"})).into())).await.unwrap();
     let mut sign_in_accepted = false;
     let mut browser = None;
     while !sign_in_accepted || browser.is_none() {
@@ -293,7 +294,7 @@ async fn oauth_queue_cancellation_impl(
             .unwrap();
         if let ClientMessage::Text(text) = frame {
             let value: Value = serde_json::from_str(&text).unwrap();
-            if value["id"] == "oauth-signin" {
+            if value["id"] == "oauth-signin_________" {
                 assert_eq!(value["result"]["accepted"], true);
                 sign_in_accepted = true;
             }
@@ -343,7 +344,7 @@ async fn oauth_queue_cancellation_impl(
             .unwrap()
             .1
             .into_owned();
-        socket.send(ClientMessage::Text(envelope("deny-B", json!({"kind":"callback","flow_id":flow,"state":state,"issuer":issuer,"error":"access_denied"})).into())).await.unwrap();
+        socket.send(ClientMessage::Text(envelope("deny-B_______________", json!({"kind":"callback","flow_id":flow,"state":state,"issuer":issuer,"error":"access_denied"})).into())).await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if let ClientMessage::Text(text) = socket.next().await.unwrap().unwrap() {
@@ -360,7 +361,7 @@ async fn oauth_queue_cancellation_impl(
         let (mut socket_a, _) = connect_async(format!("ws://{ws_address}/ws"))
             .await
             .unwrap();
-        socket_a.send(ClientMessage::Text(envelope("signin-A", json!({"kind":"sign_in","redirect_uri":"http://127.0.0.1:37643/oauth/mcp/callback"})).into())).await.unwrap();
+        socket_a.send(ClientMessage::Text(envelope("signin-A_____________", json!({"kind":"sign_in","redirect_uri":"http://127.0.0.1:37643/oauth/mcp/callback"})).into())).await.unwrap();
         let flow_a = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if let ClientMessage::Text(text) = socket_a.next().await.unwrap().unwrap() {
@@ -380,7 +381,7 @@ async fn oauth_queue_cancellation_impl(
             .store(1, std::sync::atomic::Ordering::SeqCst);
         socket
             .send(ClientMessage::Text(
-                envelope("clear-B", json!({"kind":"disconnect"})).into(),
+                envelope("clear-B______________", json!({"kind":"disconnect"})).into(),
             ))
             .await
             .unwrap();
@@ -390,7 +391,7 @@ async fn oauth_queue_cancellation_impl(
             while !error_seen || event.is_none() {
                 if let ClientMessage::Text(text) = socket.next().await.unwrap().unwrap() {
                     let value: Value = serde_json::from_str(&text).unwrap();
-                    if value["id"] == "clear-B" {
+                    if value["id"] == "clear-B______________" {
                         assert!(value.get("error").is_some());
                         error_seen = true;
                     }
@@ -423,12 +424,12 @@ async fn oauth_queue_cancellation_impl(
         })
         .await
         .unwrap();
-        socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"details-B","method":"mcp/details","params":{"workspace_id":workspace_id,"server_id":server_id}}).to_string().into())).await.unwrap();
+        socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"details-B____________","method":pioneer_protocol::constants::methods::MCP_SERVER_DETAILS,"params":{"workspace_id":workspace_id,"server_id":server_id}}).to_string().into())).await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if let ClientMessage::Text(text) = socket.next().await.unwrap().unwrap() {
                     let value: Value = serde_json::from_str(&text).unwrap();
-                    if value["id"] == "details-B" {
+                    if value["id"] == "details-B____________" {
                         let management: pioneer_protocol::McpOAuthState = serde_json::from_value(
                             value["result"]["management"]["oauth_state"].clone(),
                         )
@@ -453,7 +454,7 @@ async fn oauth_queue_cancellation_impl(
             .store(0, std::sync::atomic::Ordering::SeqCst);
         socket
             .send(ClientMessage::Text(
-                envelope("retry-B", json!({"kind":"disconnect"})).into(),
+                envelope("retry-B______________", json!({"kind":"disconnect"})).into(),
             ))
             .await
             .unwrap();
@@ -463,7 +464,7 @@ async fn oauth_queue_cancellation_impl(
             while !acknowledged || !retired {
                 if let ClientMessage::Text(text) = socket.next().await.unwrap().unwrap() {
                     let value: Value = serde_json::from_str(&text).unwrap();
-                    if value["id"] == "retry-B" {
+                    if value["id"] == "retry-B______________" {
                         assert_eq!(value["result"]["accepted"], true);
                         acknowledged = true;
                     }
@@ -499,14 +500,14 @@ async fn oauth_queue_cancellation_impl(
             .unwrap()
             .1
             .into_owned();
-        socket.send(ClientMessage::Text(envelope("oauth-callback", json!({"kind":"callback","flow_id":flow,"state":state,"code":"queue-code-canary","issuer":issuer})).into())).await.unwrap();
+        socket.send(ClientMessage::Text(envelope("oauth-callback_______", json!({"kind":"callback","flow_id":flow,"state":state,"code":"queue-code-canary","issuer":issuer})).into())).await.unwrap();
         // Acceptance must arrive while the actual endpoint is stalled. The old
         // synchronous handler cannot send this response until token_release fires.
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let ClientMessage::Text(text) = socket.next().await.unwrap().unwrap() {
                     let value: Value = serde_json::from_str(&text).unwrap();
-                    if value["id"] == "oauth-callback" {
+                    if value["id"] == "oauth-callback_______" {
                         assert_eq!(value["result"]["accepted"], true);
                         break;
                     }
@@ -561,7 +562,7 @@ async fn oauth_queue_cancellation_impl(
             .store(mode, std::sync::atomic::Ordering::SeqCst);
         socket
             .send(ClientMessage::Text(
-                envelope("clear-failed", json!({"kind":"disconnect"})).into(),
+                envelope("clear-failed_________", json!({"kind":"disconnect"})).into(),
             ))
             .await
             .unwrap();
@@ -574,7 +575,7 @@ async fn oauth_queue_cancellation_impl(
                     let value: Value = serde_json::from_str(&text).unwrap();
                     retired |=
                         value["params"]["state"] == "retired" && value["params"]["flow_id"] == flow;
-                    if value["id"] == "clear-failed" {
+                    if value["id"] == "clear-failed_________" {
                         assert!(value.get("error").is_some());
                         failed = true;
                     }
@@ -592,12 +593,12 @@ async fn oauth_queue_cancellation_impl(
         other_read
             .uncertain_promotion
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"cleanup-details","method":"mcp/details","params":{"workspace_id":workspace_id,"server_id":server_id,"name":"queue"}}).to_string().into())).await.unwrap();
+        socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"cleanup-details______","method":pioneer_protocol::constants::methods::MCP_SERVER_DETAILS,"params":{"workspace_id":workspace_id,"server_id":server_id,"name":"queue"}}).to_string().into())).await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if let ClientMessage::Text(text) = socket.next().await.unwrap().unwrap() {
                     let value: Value = serde_json::from_str(&text).unwrap();
-                    if value["id"] == "cleanup-details" {
+                    if value["id"] == "cleanup-details______" {
                         assert_eq!(
                             value["result"]["management"]["oauth_state"],
                             "cleanup_required"
@@ -643,7 +644,7 @@ async fn oauth_queue_cancellation_impl(
         );
         socket
             .send(ClientMessage::Text(
-                envelope("clear-retry", json!({"kind":"disconnect"})).into(),
+                envelope("clear-retry__________", json!({"kind":"disconnect"})).into(),
             ))
             .await
             .unwrap();
@@ -653,7 +654,7 @@ async fn oauth_queue_cancellation_impl(
             while !cleared || !cleanup_retired {
                 if let ClientMessage::Text(text) = socket.next().await.unwrap().unwrap() {
                     let value: Value = serde_json::from_str(&text).unwrap();
-                    if value["id"] == "clear-retry" {
+                    if value["id"] == "clear-retry__________" {
                         assert_eq!(value["result"]["accepted"], true);
                         cleared = true;
                     }
@@ -733,12 +734,12 @@ async fn oauth_queue_cancellation_impl(
     };
     // Production Details precedes Cancel in this connection's sequential reader.
     // Neither the observable projection nor event validation may wait for the actor.
-    socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"oauth-details","method":"mcp/details","params":{"workspace_id":workspace_id,"server_id":server_id,"name":"queue"}}).to_string().into())).await.unwrap();
+    socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"oauth-details________","method":pioneer_protocol::constants::methods::MCP_SERVER_DETAILS,"params":{"workspace_id":workspace_id,"server_id":server_id,"name":"queue"}}).to_string().into())).await.unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let ClientMessage::Text(text) = socket.next().await.unwrap().unwrap() {
                 let value: Value = serde_json::from_str(&text).unwrap();
-                if value["id"] == "oauth-details" {
+                if value["id"] == "oauth-details________" {
                     assert!(
                         value.get("error").is_none(),
                         "Details must succeed before provider release"
@@ -779,11 +780,15 @@ async fn oauth_queue_cancellation_impl(
         if decision == OAuthState::Cancelled {
             socket
                 .send(ClientMessage::Text(
-                    envelope("commit-cancel", json!({"kind":"cancel","flow_id":flow})).into(),
+                    envelope(
+                        "commit-cancel________",
+                        json!({"kind":"cancel","flow_id":flow}),
+                    )
+                    .into(),
                 ))
                 .await
                 .unwrap();
-            await_oauth_wire_response(&mut socket, "commit-cancel").await;
+            await_oauth_wire_response(&mut socket, "commit-cancel________").await;
         } else if decision == OAuthState::TimedOut {
             *clock.now.lock().unwrap() += Duration::from_secs(4000);
         }
@@ -823,7 +828,11 @@ async fn oauth_queue_cancellation_impl(
             assert_ne!(persisted, previous);
             socket
                 .send(ClientMessage::Text(
-                    envelope("late-cancel", json!({"kind":"cancel","flow_id":flow})).into(),
+                    envelope(
+                        "late-cancel__________",
+                        json!({"kind":"cancel","flow_id":flow}),
+                    )
+                    .into(),
                 ))
                 .await
                 .unwrap();
@@ -831,7 +840,7 @@ async fn oauth_queue_cancellation_impl(
                 loop {
                     if let ClientMessage::Text(text) = socket.next().await.unwrap().unwrap() {
                         let value: Value = serde_json::from_str(&text).unwrap();
-                        if value["id"] == "late-cancel" {
+                        if value["id"] == "late-cancel__________" {
                             assert!(value.get("error").is_some());
                             break;
                         }
@@ -925,16 +934,16 @@ async fn oauth_queue_cancellation_impl(
             .await
             .unwrap();
         if new_uuid {
-            socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"replace-uninstall","method":"mcp/uninstall","params":{"workspace_id":workspace_id,"name":"queue"}}).to_string().into())).await.unwrap();
-            await_oauth_wire_response(&mut socket, "replace-uninstall").await;
+            socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"replace-uninstall____","method":"mcp/uninstall","params":{"workspace_id":workspace_id,"name":"queue"}}).to_string().into())).await.unwrap();
+            await_oauth_wire_response(&mut socket, "replace-uninstall____").await;
         }
         let resource = if new_uuid {
             format!("{issuer}/mcp")
         } else {
             format!("{issuer}/other-resource")
         };
-        socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"replace-install","method":"mcp/install","params":{"workspace_id":workspace_id,"config_json":json!({"mcpServers":{"queue":{"url":resource}}}).to_string()}}).to_string().into())).await.unwrap();
-        await_oauth_wire_response(&mut socket, "replace-install").await;
+        socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"replace-install______","method":"mcp/install","params":{"workspace_id":workspace_id,"config_json":json!({"mcpServers":{"queue":{"url":resource}}}).to_string()}}).to_string().into())).await.unwrap();
+        await_oauth_wire_response(&mut socket, "replace-install______").await;
         let current = crud_store
             .find_mcp_server_installation("workspace", &workspace_id, "queue")
             .await
@@ -984,7 +993,11 @@ async fn oauth_queue_cancellation_impl(
     }
     socket
         .send(ClientMessage::Text(
-            envelope("oauth-cancel", json!({"kind":"cancel","flow_id":flow})).into(),
+            envelope(
+                "oauth-cancel_________",
+                json!({"kind":"cancel","flow_id":flow}),
+            )
+            .into(),
         ))
         .await
         .unwrap();
@@ -995,11 +1008,11 @@ async fn oauth_queue_cancellation_impl(
         while !callback_accepted || !cancel_accepted || !cancelled {
             if let ClientMessage::Text(text) = socket.next().await.unwrap().unwrap() {
                 let value: Value = serde_json::from_str(&text).unwrap();
-                if value["id"] == "oauth-callback" {
+                if value["id"] == "oauth-callback_______" {
                     assert_eq!(value["result"]["accepted"], true);
                     assert!(callback_accepted);
                 }
-                if value["id"] == "oauth-cancel" {
+                if value["id"] == "oauth-cancel_________" {
                     assert_eq!(value["result"]["accepted"], true);
                     cancel_accepted = true;
                 }
@@ -1147,6 +1160,24 @@ async fn oauth_scope_phase(phase: &'static str) {
             .await,
         vec![connection]
     );
+    // Ready is visible in the snapshot before its authenticated status fanout
+    // finishes. Wait for the actual wire notification so the old Interactive
+    // actor cannot contribute startup lease reads to the OAuth observation.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let axum::extract::ws::Message::Text(text) = recipient.recv().await.unwrap() {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value["method"] == pioneer_protocol::constants::events::MCP_SERVER_STATUS_CHANGED
+                    && value["params"]["server"]["id"] == id
+                    && value["params"]["server"]["runtime"]["state"] == "ready"
+                {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
     while recipient.try_recv().is_ok() {}
     let scoped_store = Arc::new(store.with_maintenance_access());
     let service = crate::mcp_oauth::maintenance_service(processor.mcp_service.inner.clone());
@@ -1360,11 +1391,12 @@ async fn await_oauth_wire_response(
     >,
     id: &str,
 ) {
+    let id = pioneer_protocol::RequestId::new(id).expect("valid wire request ID");
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if let ClientMessage::Text(text) = socket.next().await.unwrap().unwrap() {
                 let value: Value = serde_json::from_str(&text).unwrap();
-                if value["id"] == id {
+                if value["id"] == id.as_str() {
                     assert!(value.get("error").is_none(), "production RPC rejected");
                     break;
                 }
@@ -1603,7 +1635,7 @@ async fn stale_rpc_replacement(
         "cancel" => json!({"kind":"cancel","flow_id":flow}),
         _ => json!({"kind":"disconnect"}),
     };
-    old_socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"stale-rpc","method":"mcp/oauth","params":{"workspace_id":workspace,"server_id":old_id,"name":"queue","action":action}}).to_string().into())).await.unwrap();
+    old_socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"stale-rpc____________","method":"mcp/oauth","params":{"workspace_id":workspace,"server_id":old_id,"name":"queue","action":action}}).to_string().into())).await.unwrap();
     tokio::time::timeout(Duration::from_secs(3), entered.notified())
         .await
         .unwrap();
@@ -1616,16 +1648,16 @@ async fn stale_rpc_replacement(
         .take();
     let (mut current_socket, _) = connect_async(format!("ws://{address}/ws")).await.unwrap();
     if new_uuid {
-        current_socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"remove-old","method":"mcp/uninstall","params":{"workspace_id":workspace,"name":"queue"}}).to_string().into())).await.unwrap();
-        await_oauth_wire_response(&mut current_socket, "remove-old").await;
+        current_socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"remove-old___________","method":"mcp/uninstall","params":{"workspace_id":workspace,"name":"queue"}}).to_string().into())).await.unwrap();
+        await_oauth_wire_response(&mut current_socket, "remove-old___________").await;
     }
     let resource = if new_uuid {
         format!("{issuer}/mcp")
     } else {
         format!("{issuer}/replacement")
     };
-    current_socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"install-current","method":"mcp/install","params":{"workspace_id":workspace,"enabled":true,"config_json":json!({"mcpServers":{"queue":{"url":resource}}}).to_string()}}).to_string().into())).await.unwrap();
-    await_oauth_wire_response(&mut current_socket, "install-current").await;
+    current_socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"install-current______","method":"mcp/install","params":{"workspace_id":workspace,"enabled":true,"config_json":json!({"mcpServers":{"queue":{"url":resource}}}).to_string()}}).to_string().into())).await.unwrap();
+    await_oauth_wire_response(&mut current_socket, "install-current______").await;
     let current = store
         .find_mcp_server_installation("workspace", workspace, "queue")
         .await
@@ -1638,7 +1670,7 @@ async fn stale_rpc_replacement(
         .runtime_snapshot("workspace", workspace)
         .await[id]
         .runtime_generation;
-    current_socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"current-signin","method":"mcp/oauth","params":{"workspace_id":workspace,"server_id":id,"name":"queue","action":{"kind":"sign_in","redirect_uri":"http://127.0.0.1:37643/oauth/mcp/callback"}}}).to_string().into())).await.unwrap();
+    current_socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"current-signin_______","method":"mcp/oauth","params":{"workspace_id":workspace,"server_id":id,"name":"queue","action":{"kind":"sign_in","redirect_uri":"http://127.0.0.1:37643/oauth/mcp/callback"}}}).to_string().into())).await.unwrap();
     let fresh = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if let ClientMessage::Text(text) = current_socket.next().await.unwrap().unwrap() {
@@ -1658,8 +1690,8 @@ async fn stale_rpc_replacement(
         .unwrap()
         .1
         .into_owned();
-    current_socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"current-callback","method":"mcp/oauth","params":{"workspace_id":workspace,"server_id":id,"name":"queue","action":{"kind":"callback","flow_id":fresh["flow_id"],"state":state,"issuer":issuer,"code":"current-code"}}}).to_string().into())).await.unwrap();
-    await_oauth_wire_response(&mut current_socket, "current-callback").await;
+    current_socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"current-callback_____","method":"mcp/oauth","params":{"workspace_id":workspace,"server_id":id,"name":"queue","action":{"kind":"callback","flow_id":fresh["flow_id"],"state":state,"issuer":issuer,"code":"current-code"}}}).to_string().into())).await.unwrap();
+    await_oauth_wire_response(&mut current_socket, "current-callback_____").await;
     token_release.notify_one();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -1691,7 +1723,7 @@ async fn stale_rpc_replacement(
         loop {
             if let ClientMessage::Text(text) = old_socket.next().await.unwrap().unwrap() {
                 let message: Value = serde_json::from_str(&text).unwrap();
-                if message["id"] == "stale-rpc" {
+                if message["id"] == "stale-rpc____________" {
                     assert!(message.get("error").is_some());
                     break;
                 }
