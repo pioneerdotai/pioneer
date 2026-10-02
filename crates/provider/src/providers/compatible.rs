@@ -1020,7 +1020,16 @@ impl OpenAiCompatibleProvider {
         &self,
         request: ChatRequest,
     ) -> Result<serde_json::Value> {
-        serde_json::to_value(self.build_chat_request(request, false)?).map_err(Into::into)
+        self.render_chat_request_mode_for_test(request, false)
+    }
+
+    #[cfg(test)]
+    pub(super) fn render_chat_request_mode_for_test(
+        &self,
+        request: ChatRequest,
+        stream: bool,
+    ) -> Result<serde_json::Value> {
+        serde_json::to_value(self.build_chat_request(request, stream)?).map_err(Into::into)
     }
 
     fn build_chat_request_from_prepared(
@@ -1454,6 +1463,103 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vendor_formats_cannot_bypass_explicit_negative_effort_capability() {
+        for format in [
+            "deepseek",
+            "zai",
+            "together",
+            "qwen",
+            "openai",
+            "string-thinking",
+            "openrouter",
+        ] {
+            let catalog = crate::generation::test_catalog_model(
+                "nvidia",
+                "negative-vendor-profile",
+                "deepseek-ai/deepseek-v4-flash-0731",
+                serde_json::json!({"reasoning":true,"api":"openai-completions","compat":{"thinkingFormat":format,"supportsReasoningEffort":false},"thinkingLevelMap":{"high":"high","max":"max"}}),
+            );
+            let provider = OpenAiCompatibleProvider::new(
+                "nvidia",
+                "https://example.test/v1",
+                "",
+                AuthStyle::Bearer,
+            );
+            let mut request = crate::generation::test_request("negative-vendor-profile");
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+            for stream in [false, true] {
+                let prepared = prepared_for(&provider, &request.messages);
+                assert!(
+                    provider
+                        .build_chat_request_with_catalog(
+                            request.clone(),
+                            stream,
+                            prepared,
+                            Some(&catalog)
+                        )
+                        .unwrap_err()
+                        .to_string()
+                        .contains("explicitly does not support")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nvidia_negative_effort_capability_matches_discovery_and_wire_even_with_maps() {
+        for fresh in [false, true] {
+            let catalog = crate::generation::test_catalog(fresh);
+            let id = "deepseek-ai/deepseek-v4-flash-0731";
+            let model = catalog.model("nvidia", id).unwrap();
+            assert_eq!(model.metadata["compat"]["supportsReasoningEffort"], false);
+            let discovered = crate::generation::test_discovery(&catalog, "nvidia", id);
+            for effort in ["high", "max"] {
+                assert!(
+                    !discovered
+                        .capabilities
+                        .reasoning
+                        .as_ref()
+                        .unwrap()
+                        .effort_options
+                        .contains(&effort.into())
+                );
+            }
+            let provider = OpenAiCompatibleProvider::new(
+                "nvidia",
+                "https://example.test/v1",
+                "",
+                AuthStyle::Bearer,
+            );
+            for reasoning in [
+                None,
+                Some(ReasoningConfig::Disabled),
+                Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::Max)),
+            ] {
+                let mut request = crate::generation::test_request(id);
+                request.reasoning = reasoning;
+                for stream in [false, true] {
+                    let prepared = prepared_for(&provider, &request.messages);
+                    let result = provider.build_chat_request_with_catalog(
+                        request.clone(),
+                        stream,
+                        prepared,
+                        Some(&catalog),
+                    );
+                    assert_eq!(result.is_ok(), reasoning.is_none());
+                    if reasoning.is_none() {
+                        let body = serde_json::to_value(result.unwrap()).unwrap();
+                        assert!(body.get("reasoning_effort").is_none());
+                        assert!(body.get("thinking").is_none());
+                        assert_eq!(body["max_tokens"], 1024);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn every_compatible_profile_preserves_prepared_cap_and_default_in_both_bodies() {
         let profiles: serde_json::Value = serde_json::from_str(include_str!(

@@ -1426,6 +1426,140 @@ fn openai_embedding_model_info(model: &OpenAiEmbeddingModelDefinition) -> Provid
 #[cfg(test)]
 mod tests {
     #[test]
+    fn discovered_51_and_52_fallback_vocabulary_agrees_with_direct_chat_bodies() {
+        for (id, xhigh) in [("gpt-5.1", false), ("gpt-5.2", true)] {
+            let entry: ApiModelEntry =
+                serde_json::from_value(serde_json::json!({"id":id})).unwrap();
+            let discovered = provider_model_from_openai_model_entry(entry);
+            assert_eq!(
+                discovered
+                    .capabilities
+                    .reasoning
+                    .as_ref()
+                    .unwrap()
+                    .effort_options
+                    .contains(&"xhigh".into()),
+                xhigh
+            );
+            for stream in [false, true] {
+                let mut request = crate::generation::test_request(id);
+                request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::XHigh));
+                let result =
+                    OpenAiProvider::build_chat_request_with_catalog(&request, vec![], stream, None);
+                assert_eq!(result.is_ok(), xhigh);
+                if xhigh {
+                    let body = serde_json::to_value(result.unwrap()).unwrap();
+                    assert_eq!(body["reasoning_effort"], "xhigh");
+                    assert_eq!(body["max_completion_tokens"], 1024);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mapped_efforts_obey_direct_chat_model_contract_in_both_modes() {
+        use crate::generation::{test_catalog_model, test_request};
+        let partial = test_catalog_model(
+            "openai",
+            "gpt-5.1",
+            "gpt-5.4",
+            serde_json::json!({"thinkingLevelMap":{}}),
+        );
+        let stale = test_catalog_model(
+            "openai",
+            "gpt-5.1",
+            "gpt-5.4",
+            serde_json::json!({"thinkingLevelMap":{"xhigh":"xhigh","max":"surprise"}}),
+        );
+        for catalog in [None, Some(&partial), Some(&stale)] {
+            for stream in [false, true] {
+                for (effort, valid) in [
+                    (ReasoningEffort::Low, true),
+                    (ReasoningEffort::High, true),
+                    (ReasoningEffort::XHigh, false),
+                    (ReasoningEffort::Max, false),
+                ] {
+                    let mut request = test_request("gpt-5.1");
+                    request.reasoning = Some(ReasoningConfig::Effort(effort));
+                    let result = OpenAiProvider::build_chat_request_with_catalog(
+                        &request,
+                        vec![],
+                        stream,
+                        catalog,
+                    );
+                    assert_eq!(result.is_ok(), valid);
+                    if valid {
+                        let body = serde_json::to_value(result.unwrap()).unwrap();
+                        assert_eq!(body["reasoning_effort"], effort.as_str());
+                        assert_eq!(body["max_completion_tokens"], 1024);
+                    }
+                }
+            }
+        }
+        let stale = test_catalog_model(
+            "openai",
+            "gpt-6-astra",
+            "gpt-5.4",
+            serde_json::json!({"thinkingLevelMap":{"off":"low"}}),
+        );
+        for catalog in [None, Some(&stale)] {
+            for off in [
+                ReasoningConfig::Disabled,
+                ReasoningConfig::Effort(ReasoningEffort::None),
+            ] {
+                let mut request = test_request("gpt-6-astra");
+                request.reasoning = Some(off);
+                for stream in [false, true] {
+                    assert!(
+                        OpenAiProvider::build_chat_request_with_catalog(
+                            &request,
+                            vec![],
+                            stream,
+                            catalog
+                        )
+                        .is_err()
+                    );
+                }
+            }
+        }
+        let mut request = test_request("gpt-5.6");
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::Max));
+        for stream in [false, true] {
+            let body = serde_json::to_value(
+                OpenAiProvider::build_chat_request_with_catalog(&request, vec![], stream, None)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["reasoning_effort"], "max");
+        }
+    }
+
+    #[test]
+    fn native_openai_honors_negative_fresh_source_temperature() {
+        let catalog = crate::generation::test_source_temperature("openai", "gpt-4.1-nano");
+        for reasoning in [
+            None,
+            Some(ReasoningConfig::Disabled),
+            Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+        ] {
+            let mut request = crate::generation::test_request("gpt-4.1-nano");
+            request.reasoning = reasoning;
+            request.temperature = Some(0.7);
+            for stream in [false, true] {
+                assert!(
+                    OpenAiProvider::build_chat_request_with_catalog(
+                        &request,
+                        vec![],
+                        stream,
+                        Some(&catalog)
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn catalog_preferred_responses_does_not_certify_unknown_chat_family() {
         use crate::catalog::ModelCatalog;
         let mut models: serde_json::Value =

@@ -253,6 +253,25 @@ impl ModelCatalog {
                 reasoning.supports_token_budget = Some(false); // no numeric product control yet
                 model.capabilities.reasoning = Some(reasoning);
             }
+            if let Some(reasoning) = model.capabilities.reasoning.as_mut() {
+                reasoning.effort_options.retain(|effort| {
+                    crate::types::ReasoningEffort::from_str(effort).is_some_and(|effort| {
+                        crate::generation::effort_supported(provider, entry, effort)
+                    })
+                });
+                if reasoning
+                    .default_effort
+                    .as_ref()
+                    .is_some_and(|effort| !reasoning.effort_options.contains(effort))
+                {
+                    reasoning.default_effort = None;
+                }
+                // Absence of an off option alone does not establish mandatory
+                // thinking (an unknown contract might support no controls).
+                if crate::generation::protocol_mandatory(provider, &entry.id) {
+                    reasoning.mandatory = Some(true);
+                }
+            }
             model.capabilities.tool_calling.get_or_insert(true);
             model
                 .capabilities

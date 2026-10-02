@@ -2,10 +2,7 @@
 //! owner may put it back on the wire.  This module derives an outbound view of
 //! completed history without changing the stored messages.
 
-use crate::{
-    CanonicalProviderRoundEnvelope, ChatMessage, ChatRequest, ProviderReplayState, ReasoningConfig,
-    Role,
-};
+use crate::{CanonicalProviderRoundEnvelope, ChatMessage, ChatRequest, ProviderReplayState, Role};
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -330,13 +327,13 @@ pub fn project_messages_for_provider(
     model: &str,
     messages: &[ChatMessage],
 ) -> Result<Vec<ChatMessage>> {
-    project_messages(provider, model, false, messages)
+    project_messages(provider, model, None, messages)
 }
 
 fn project_messages(
     provider: &str,
     model: &str,
-    reasoning_enabled: bool,
+    thinking_override: Option<bool>,
     messages: &[ChatMessage],
 ) -> Result<Vec<ChatMessage>> {
     let completed = completed_message_indexes(messages);
@@ -378,8 +375,9 @@ fn project_messages(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let deepseek_thinking =
-        provider == "deepseek" && deepseek_thinking_required(model, reasoning_enabled, &projected);
+    let deepseek_thinking = provider == "deepseek"
+        && thinking_override
+            .unwrap_or_else(|| deepseek_thinking_required(model, false, &projected));
     if !deepseek_thinking {
         return Ok(projected);
     }
@@ -479,11 +477,12 @@ pub fn project_request_for_provider(
     provider: &str,
     mut request: ChatRequest,
 ) -> Result<ChatRequest> {
-    let reasoning_enabled = matches!(request.reasoning, Some(ReasoningConfig::Effort(_)));
+    let thinking =
+        (provider == "deepseek").then(|| crate::generation::deepseek_effective_thinking(&request));
     request.messages = project_messages(
         provider,
         request.model.as_str(),
-        reasoning_enabled,
+        thinking,
         &request.messages,
     )?;
     Ok(request)

@@ -722,8 +722,21 @@ impl BedrockProvider {
         request: &ChatRequest,
         prepared: &PreparedProviderMessages,
     ) -> Result<BedrockRequest> {
+        Self::build_request_with_catalog(
+            request,
+            prepared,
+            crate::catalog::model_catalog().ok().as_deref(),
+        )
+    }
+
+    fn build_request_with_catalog(
+        request: &ChatRequest,
+        prepared: &PreparedProviderMessages,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> Result<BedrockRequest> {
         let (messages, system) = Self::convert_messages(prepared)?;
-        let generation = crate::generation::anthropic_fields("bedrock", request)?;
+        let generation =
+            crate::generation::anthropic_fields_with_catalog(catalog, "bedrock", request)?;
 
         let inference_config = if request.temperature.is_some() || request.max_tokens.is_some() {
             Some(BedrockInferenceConfig {
@@ -1099,6 +1112,196 @@ fn provider_model_from_bedrock_model_summary(m: BedrockModelSummary) -> Provider
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn converse_mandatory_and_source_denials_override_stale_metadata() {
+        let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
+        let stale = crate::generation::test_catalog_model(
+            "amazon-bedrock",
+            "anthropic.claude-fable-5",
+            "anthropic.claude-opus-4-7",
+            serde_json::json!({"reasoning":false,"thinkingLevelMap":{"off":"low"}}),
+        );
+        let mut request = crate::generation::test_request("anthropic.claude-fable-5");
+        let prepared = prepare_messages_for_provider_model(
+            "bedrock",
+            &request.model,
+            &provider.capabilities(),
+            &request.messages,
+        )
+        .unwrap();
+        for off in [
+            ReasoningConfig::Disabled,
+            ReasoningConfig::Effort(ReasoningEffort::None),
+        ] {
+            request.reasoning = Some(off);
+            assert!(
+                BedrockProvider::build_request_with_catalog(&request, &prepared, Some(&stale))
+                    .is_err()
+            );
+        }
+        let fresh = crate::generation::test_source_temperature(
+            "amazon-bedrock",
+            "anthropic.claude-sonnet-5",
+        );
+        request.model = "anthropic.claude-sonnet-5".into();
+        request.temperature = Some(0.7);
+        for reasoning in [
+            None,
+            Some(ReasoningConfig::Disabled),
+            Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+        ] {
+            request.reasoning = reasoning;
+            assert!(
+                BedrockProvider::build_request_with_catalog(&request, &prepared, Some(&fresh))
+                    .is_err()
+            );
+        }
+        request.model = "anthropic.claude-opus-4-7-opaque-alias".into();
+        request.temperature = None;
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+        assert!(BedrockProvider::build_request_with_catalog(&request, &prepared, None).is_err());
+    }
+
+    #[test]
+    fn saved_fresh_and_fallback_converse_profiles_enable_adaptive_not_manual_thinking() {
+        let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
+        for fresh in [false, true] {
+            let catalog = crate::generation::test_catalog(fresh);
+            for id in [
+                "anthropic.claude-opus-4-7",
+                "us.anthropic.claude-opus-4-7",
+                "eu.anthropic.claude-opus-4-7",
+                "anthropic.claude-opus-4-6-v1",
+            ] {
+                let mut request = crate::generation::test_request(id);
+                request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+                let prepared = prepare_messages_for_provider_model(
+                    "bedrock",
+                    id,
+                    &provider.capabilities(),
+                    &request.messages,
+                )
+                .unwrap();
+                for snapshot in [None, Some(&catalog)] {
+                    // stream_chat delegates to chat; both use this Converse constructor.
+                    let body = serde_json::to_value(
+                        BedrockProvider::build_request_with_catalog(&request, &prepared, snapshot)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        body["additionalModelRequestFields"]["thinking"]["type"],
+                        "adaptive"
+                    );
+                    assert_eq!(
+                        body["additionalModelRequestFields"]["output_config"]["effort"],
+                        "high"
+                    );
+                    assert_eq!(body["inferenceConfig"]["maxTokens"], 1024);
+                    assert!(
+                        body["additionalModelRequestFields"]
+                            .get("anthropic_version")
+                            .is_none()
+                    );
+                }
+            }
+            for id in [
+                "anthropic.claude-fable-5",
+                "us.anthropic.claude-mythos-5",
+                "anthropic.claude-mythos-preview",
+            ] {
+                let mut request = crate::generation::test_request(id);
+                let prepared = prepare_messages_for_provider_model(
+                    "bedrock",
+                    id,
+                    &provider.capabilities(),
+                    &request.messages,
+                )
+                .unwrap();
+                for off in [
+                    ReasoningConfig::Disabled,
+                    ReasoningConfig::Effort(ReasoningEffort::None),
+                ] {
+                    request.reasoning = Some(off);
+                    for snapshot in [None, Some(&catalog)] {
+                        assert!(
+                            BedrockProvider::build_request_with_catalog(
+                                &request, &prepared, snapshot
+                            )
+                            .is_err()
+                        );
+                    }
+                }
+            }
+        }
+        let mut request =
+            crate::generation::test_request("anthropic.claude-opus-4-5-20251101-v1:0");
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+        let prepared = prepare_messages_for_provider_model(
+            "bedrock",
+            &request.model,
+            &provider.capabilities(),
+            &request.messages,
+        )
+        .unwrap();
+        let body = serde_json::to_value(
+            BedrockProvider::build_request_with_catalog(&request, &prepared, None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["additionalModelRequestFields"]["output_config"]["effort"],
+            "high"
+        );
+        assert_eq!(
+            body["additionalModelRequestFields"]["anthropic_beta"][0],
+            "effort-2025-11-24"
+        );
+        assert!(
+            body["additionalModelRequestFields"]
+                .get("thinking")
+                .is_none()
+        );
+        request.model =
+            "arn:aws:bedrock:region:account:application-inference-profile/opaque".into();
+        assert!(BedrockProvider::build_request_with_catalog(&request, &prepared, None).is_err());
+    }
+
+    #[test]
+    fn converse_honors_source_temperature_denial_without_applying_claude_policy_to_nova() {
+        let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
+        let id = "amazon.nova-pro-v1:0";
+        let negative = crate::generation::test_source_temperature("amazon-bedrock", id);
+        let mut request = crate::generation::test_request(id);
+        request.temperature = Some(0.7);
+        let prepared = prepare_messages_for_provider_model(
+            "bedrock",
+            id,
+            &provider.capabilities(),
+            &request.messages,
+        )
+        .unwrap();
+        assert!(
+            BedrockProvider::build_request_with_catalog(&request, &prepared, Some(&negative))
+                .is_err()
+        );
+        let body = serde_json::to_value(
+            BedrockProvider::build_request_with_catalog(&request, &prepared, None).unwrap(),
+        )
+        .unwrap();
+        assert!(body["inferenceConfig"].get("temperature").is_some());
+        request.model = "anthropic.claude-opus-4-8".into();
+        for reasoning in [
+            None,
+            Some(ReasoningConfig::Disabled),
+            Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+        ] {
+            request.reasoning = reasoning;
+            assert!(
+                BedrockProvider::build_request_with_catalog(&request, &prepared, None).is_err()
+            );
+        }
+    }
+
     #[test]
     fn usage_normalization_requires_complete_separate_cache_counters() {
         let complete: super::BedrockUsage = serde_json::from_value(serde_json::json!({

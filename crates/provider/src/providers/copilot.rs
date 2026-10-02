@@ -936,13 +936,10 @@ mod tests {
         let mut request = crate::generation::test_request("gpt-5.4");
         request.reasoning = Some(crate::types::ReasoningConfig::Disabled);
         for stream in [false, true] {
-            let body = serde_json::to_value(
-                CopilotProvider::build_chat_request(&request, vec![], stream).unwrap(),
-            )
-            .unwrap();
-            assert_eq!(body["max_completion_tokens"], 1024);
-            assert_eq!(body["reasoning_effort"], "none");
-            assert!(body.get("max_tokens").is_none());
+            assert!(
+                CopilotProvider::build_chat_request(&request, vec![], stream).is_err(),
+                "direct OpenAI documentation does not verify private Copilot reasoning controls"
+            );
         }
         request.model = "unverified-private-model".into();
         assert!(CopilotProvider::build_chat_request(&request, vec![], false).is_err());

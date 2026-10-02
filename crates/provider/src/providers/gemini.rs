@@ -319,6 +319,18 @@ impl GeminiProvider {
         request: &ChatRequest,
         prepared: &PreparedProviderMessages,
     ) -> Result<ApiGenerateRequest> {
+        Self::build_request_with_catalog(
+            request,
+            prepared,
+            crate::catalog::model_catalog().ok().as_deref(),
+        )
+    }
+
+    fn build_request_with_catalog(
+        request: &ChatRequest,
+        prepared: &PreparedProviderMessages,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> Result<ApiGenerateRequest> {
         let mut system_parts: Vec<ApiPart> = Vec::new();
         let mut contents: Vec<ApiContent> = Vec::new();
 
@@ -461,8 +473,8 @@ impl GeminiProvider {
             })
         };
 
-        crate::generation::validate_cap("gemini", request)?;
-        let thinking_config = crate::generation::gemini_thinking(request)?
+        crate::generation::validate_cap_with_catalog(catalog, "gemini", request)?;
+        let thinking_config = crate::generation::gemini_thinking_with_catalog(catalog, request)?
             .map(serde_json::from_value)
             .transpose()?;
         let generation_config = if request.temperature.is_some()
@@ -1015,6 +1027,155 @@ fn canonical_gemini_thinking_level(level: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn latest_alias_identity_retains_25_budget_only_and_default_is_not_off() {
+        let provider = GeminiProvider::new("key");
+        let catalog = crate::generation::test_catalog(true);
+        for id in ["gemini-flash-latest", "gemini-flash-lite-latest"] {
+            let model = catalog.model("gemini", id).unwrap();
+            let resolved = model.metadata["sourceGeneration"]["resolvedModelId"]
+                .as_str()
+                .unwrap();
+            let mut request = crate::generation::test_request(id);
+            let prepared = prepare_messages_for_provider(
+                "gemini",
+                &provider.capabilities(),
+                &request.messages,
+            )
+            .unwrap();
+            let body = serde_json::to_value(
+                GeminiProvider::build_request_with_catalog(&request, &prepared, Some(&catalog))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(body["generationConfig"].get("thinkingConfig").is_none());
+            for off in [
+                ReasoningConfig::Disabled,
+                ReasoningConfig::Effort(ReasoningEffort::None),
+            ] {
+                request.reasoning = Some(off);
+                let result =
+                    GeminiProvider::build_request_with_catalog(&request, &prepared, Some(&catalog));
+                if matches!(resolved, "gemini-2.5-flash" | "gemini-2.5-flash-lite") {
+                    let body = serde_json::to_value(result.unwrap()).unwrap();
+                    assert_eq!(
+                        body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+                        0
+                    );
+                    assert!(
+                        body["generationConfig"]["thinkingConfig"]
+                            .get("thinkingLevel")
+                            .is_none()
+                    );
+                } else {
+                    assert!(result.is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_generate_content_validates_mapped_enum_and_family_before_serializing() {
+        let provider = GeminiProvider::new("key");
+        for (id, map, valid, expected) in [
+            (
+                "gemini-3.1-pro-preview",
+                serde_json::json!({"xhigh":"HIGH"}),
+                true,
+                "HIGH",
+            ),
+            (
+                "gemini-3.1-pro-preview",
+                serde_json::json!({"xhigh":"XHIGH"}),
+                false,
+                "",
+            ),
+            (
+                "gemini-3.1-pro-preview",
+                serde_json::json!({"xhigh":"MINIMAL"}),
+                false,
+                "",
+            ),
+            (
+                "gemini-3.1-pro-preview",
+                serde_json::json!({"xhigh":"MAX"}),
+                false,
+                "",
+            ),
+            (
+                "gemini-3.1-pro-preview",
+                serde_json::json!({"xhigh":"invented"}),
+                false,
+                "",
+            ),
+            ("gemini-3.1-pro-preview", serde_json::json!({}), false, ""),
+            (
+                "gemini-unknown",
+                serde_json::json!({"xhigh":"HIGH"}),
+                false,
+                "",
+            ),
+        ] {
+            let catalog = crate::generation::test_catalog_model(
+                "google",
+                id,
+                "gemini-3.1-pro-preview",
+                serde_json::json!({"thinkingLevelMap":map,"sourceGeneration":{"reasoningOptions":[{"type":"effort","values":["xhigh","MAX"]}]}}),
+            );
+            let discovered = crate::generation::test_discovery(&catalog, "gemini", id);
+            assert_eq!(
+                discovered
+                    .capabilities
+                    .reasoning
+                    .as_ref()
+                    .unwrap()
+                    .effort_options
+                    .contains(&"xhigh".into()),
+                valid
+            );
+            let mut request = crate::generation::test_request(id);
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::XHigh));
+            let prepared = prepare_messages_for_provider(
+                "gemini",
+                &provider.capabilities(),
+                &request.messages,
+            )
+            .unwrap();
+            // Both generateContent and streamGenerateContent share this prepared constructor.
+            let result =
+                GeminiProvider::build_request_with_catalog(&request, &prepared, Some(&catalog));
+            assert_eq!(result.is_ok(), valid);
+            if valid {
+                let body = serde_json::to_value(result.unwrap()).unwrap();
+                assert_eq!(
+                    body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+                    expected
+                );
+                assert_eq!(body["generationConfig"]["maxOutputTokens"], 1024);
+            }
+        }
+        let negative = crate::generation::test_source_temperature("google", "gemini-2.5-flash");
+        for reasoning in [
+            None,
+            Some(ReasoningConfig::Disabled),
+            Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+        ] {
+            let mut request = crate::generation::test_request("gemini-2.5-flash");
+            request.temperature = Some(0.7);
+            request.reasoning = reasoning;
+            let prepared = prepare_messages_for_provider(
+                "gemini",
+                &provider.capabilities(),
+                &request.messages,
+            )
+            .unwrap();
+            assert!(
+                GeminiProvider::build_request_with_catalog(&request, &prepared, Some(&negative))
+                    .is_err()
+            );
+        }
+    }
+
     #[test]
     fn generate_content_2_5_default_and_off_use_budget_without_qualitative_conversion() {
         for model in ["gemini-2.5-flash", "gemini-2.5-flash-lite"] {

@@ -317,7 +317,21 @@ impl GlmProvider {
         messages: Vec<ApiMessage>,
         stream: bool,
     ) -> Result<ApiChatRequest> {
-        let generation = crate::generation::chat_fields("glm", request)?;
+        Self::build_chat_request_with_catalog(
+            request,
+            messages,
+            stream,
+            crate::catalog::model_catalog().ok().as_deref(),
+        )
+    }
+
+    fn build_chat_request_with_catalog(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> Result<ApiChatRequest> {
+        let generation = crate::generation::chat_fields_from_catalog(catalog, "glm", request)?;
         Ok(ApiChatRequest {
             generation,
             model: request.model.clone(),
@@ -918,6 +932,78 @@ impl crate::traits::Provider for GlmProvider {
 
 #[cfg(test)]
 mod tests {
+    use crate::types::{ReasoningConfig, ReasoningEffort};
+    #[test]
+    fn saved_and_fresh_glm_53_discovery_controls_reach_normal_and_stream_bodies() {
+        for fresh in [false, true] {
+            let catalog = crate::generation::test_catalog(fresh);
+            let discovered = crate::generation::test_discovery(&catalog, "glm", "glm-5.3");
+            for effort in [
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ] {
+                assert!(
+                    discovered
+                        .capabilities
+                        .reasoning
+                        .as_ref()
+                        .unwrap()
+                        .effort_options
+                        .contains(&effort.as_str().into())
+                );
+                let mut request = crate::generation::test_request("glm-5.3");
+                request.reasoning = Some(ReasoningConfig::Effort(effort));
+                for stream in [false, true] {
+                    let body = serde_json::to_value(
+                        GlmProvider::build_chat_request_with_catalog(
+                            &request,
+                            vec![],
+                            stream,
+                            Some(&catalog),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(body["reasoning_effort"], effort.as_str());
+                    assert_eq!(body["thinking"]["type"], "enabled");
+                    assert_eq!(body["max_tokens"], 1024);
+                }
+            }
+            for off in [
+                ReasoningConfig::Disabled,
+                ReasoningConfig::Effort(ReasoningEffort::None),
+            ] {
+                let mut request = crate::generation::test_request("glm-5.3");
+                request.reasoning = Some(off);
+                for stream in [false, true] {
+                    assert!(
+                        GlmProvider::build_chat_request_with_catalog(
+                            &request,
+                            vec![],
+                            stream,
+                            Some(&catalog)
+                        )
+                        .is_err()
+                    );
+                }
+            }
+            let mut request = crate::generation::test_request("glm-5.2");
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::Low));
+            for stream in [false, true] {
+                assert!(
+                    GlmProvider::build_chat_request_with_catalog(
+                        &request,
+                        vec![],
+                        stream,
+                        Some(&catalog)
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
     #[test]
     fn glm_normal_and_streaming_bodies_preserve_default_explicit_off_and_effort() {
         let mut request = crate::generation::test_request("glm-5.2");

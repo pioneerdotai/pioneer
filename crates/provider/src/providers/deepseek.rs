@@ -3,8 +3,7 @@ use crate::{
     traits::{Provider, ProviderWarmupOutcome},
     types::{
         ChatRequest, ChatResponse, ProviderCapabilities, ProviderFailureClassification,
-        ProviderInputCapabilities, ProviderReplayState, ProviderTimeoutPolicy, ReasoningConfig,
-        Role, StreamChunk,
+        ProviderInputCapabilities, ProviderReplayState, ProviderTimeoutPolicy, Role, StreamChunk,
     },
 };
 use anyhow::{Result, anyhow};
@@ -98,16 +97,13 @@ impl DeepSeekProvider {
     }
 
     fn thinking_replay_required(&self, request: &ChatRequest) -> bool {
-        if crate::generation::selected_off(request.reasoning) {
-            return false;
-        }
-        crate::history::deepseek_thinking_required(
-            &request.model,
-            matches!(request.reasoning, Some(ReasoningConfig::Effort(_)))
-                || request.model.starts_with("deepseek-v4")
-                || matches!(request.model.as_str(), "deepseek-flash" | "deepseek-pro"),
-            &request.messages,
-        )
+        crate::generation::deepseek_effective_thinking(request)
+    }
+
+    fn prepare_request(&self, request: ChatRequest) -> Result<ChatRequest> {
+        let request = crate::history::project_request_for_provider("deepseek", request)?;
+        self.validate_request_replay(&request)?;
+        Ok(request)
     }
 
     fn validate_request_replay(&self, request: &ChatRequest) -> Result<()> {
@@ -256,8 +252,7 @@ impl Provider for DeepSeekProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let request = crate::history::project_request_for_provider(self.name(), request)?;
-        self.validate_request_replay(&request)?;
+        let request = self.prepare_request(request)?;
         let model = request.model.clone();
         let replay_required = self.thinking_replay_required(&request);
         let response = self.transport.chat(request).await?;
@@ -269,8 +264,7 @@ impl Provider for DeepSeekProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let request = crate::history::project_request_for_provider(self.name(), request)?;
-        self.validate_request_replay(&request)?;
+        let request = self.prepare_request(request)?;
         let model = request.model.clone();
         let replay_required = self.thinking_replay_required(&request);
         let stream = self.transport.stream_chat(request).await?;
@@ -292,6 +286,87 @@ impl Provider for DeepSeekProvider {
 
 #[cfg(test)]
 mod tests {
+    use crate::types::ReasoningConfig;
+    #[test]
+    fn effective_mode_prepares_completed_canonical_rounds_and_preserves_active_guards() {
+        let provider = DeepSeekProvider::new("key");
+        let mut messages = vec![
+            ChatMessage::assistant_tool_calls_with_provider_state(
+                None::<String>,
+                None::<String>,
+                vec![tool_call()],
+                None,
+            ),
+            ChatMessage::tool_result("call_1", "read_file", "observed result"),
+        ];
+        complete_round(&mut messages);
+        let canonical_bytes = serde_json::to_string(&messages).unwrap();
+        for reasoning in [
+            None,
+            Some(ReasoningConfig::Disabled),
+            Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+            Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+        ] {
+            let off = crate::generation::selected_off(reasoning);
+            for stream in [false, true] {
+                let mut request = request_with(messages.clone());
+                request.model = "deepseek-v4-flash".into();
+                request.reasoning = reasoning;
+                request.tools = Some(vec![crate::types::ToolDefinition {
+                    name: "read_file".into(),
+                    description: "Read".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }]);
+                let prepared = provider.prepare_request(request).unwrap();
+                assert_eq!(prepared.messages[0].tool_calls.is_some(), off);
+                let wire = provider
+                    .transport
+                    .render_chat_request_mode_for_test(prepared, stream)
+                    .unwrap();
+                assert_eq!(wire["stream"], stream);
+                assert!(wire.to_string().contains("observed result"));
+                assert_eq!(wire["messages"][0].get("tool_calls").is_some(), off);
+                assert_eq!(serde_json::to_string(&messages).unwrap(), canonical_bytes);
+            }
+        }
+
+        for reasoning in [
+            None,
+            Some(ReasoningConfig::Disabled),
+            Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+            Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+        ] {
+            let mut active = messages.clone();
+            for message in &mut active {
+                message.provenance = None;
+            }
+            active[0].provider_replay_state = Some(ProviderReplayState::for_model(
+                "openrouter",
+                "other-model",
+                serde_json::json!({"schema_version":1}),
+            ));
+            let mut request = request_with(active);
+            request.model = "deepseek-v4-flash".into();
+            request.reasoning = reasoning;
+            assert!(provider.prepare_request(request).is_err());
+        }
+        for protected in [false, true] {
+            let mut active = messages.clone();
+            if protected {
+                for message in &mut active {
+                    message.provenance.as_mut().unwrap().protected_input = true;
+                }
+            } else {
+                for message in &mut active {
+                    message.provenance = None;
+                }
+            }
+            let mut request = request_with(active);
+            request.model = "deepseek-v4-flash".into();
+            assert!(provider.prepare_request(request).is_err());
+        }
+    }
+
     use super::*;
     use crate::types::{
         ChatMessage, MessageProvenance, MessageSourceRef, ProviderToolCall, ReasoningEffort,
@@ -364,8 +439,7 @@ mod tests {
         provider: &DeepSeekProvider,
         request: ChatRequest,
     ) -> Result<(ChatRequest, serde_json::Value)> {
-        let request = crate::history::project_request_for_provider(provider.name(), request)?;
-        provider.validate_request_replay(&request)?;
+        let request = provider.prepare_request(request)?;
         let wire = provider
             .transport
             .render_chat_request_for_test(request.clone())?;

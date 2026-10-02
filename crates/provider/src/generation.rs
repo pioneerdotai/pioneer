@@ -10,6 +10,11 @@
 //! https://api-docs.deepseek.com/guides/thinking_mode/
 //! https://docs.z.ai/guides/capabilities/thinking-mode
 //! https://docs.z.ai/guides/llm/glm-5.2
+//! https://docs.z.ai/guides/llm/glm-5.3
+//! https://developers.openai.com/api/docs/models/gpt-5.1
+//! https://developers.openai.com/api/docs/guides/latest-model
+//! https://ai.google.dev/gemini-api/docs/generate-content/thinking
+//! https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-adaptive-thinking.html
 use anyhow::{Result, bail, ensure};
 use serde_json::{Map, Value, json};
 
@@ -27,33 +32,27 @@ pub(crate) fn selected_off(reasoning: Option<ReasoningConfig>) -> bool {
     )
 }
 
-fn entry(provider: &str, model: &str) -> Option<CatalogModel> {
-    model_catalog().ok()?.model(provider, model).cloned()
-}
-
 pub(crate) fn validate_cap(provider: &str, request: &ChatRequest) -> Result<()> {
     validate_cap_with_catalog(model_catalog().ok().as_deref(), provider, request)
 }
 
-pub(crate) fn required_cap(
+pub(crate) fn required_cap_with_catalog(
+    catalog: Option<&ModelCatalog>,
     provider: &str,
     request: &ChatRequest,
     product_default: u32,
 ) -> Result<u32> {
-    validate_cap(provider, request)?;
+    validate_cap_with_catalog(catalog, provider, request)?;
     if let Some(cap) = request.max_tokens {
         return Ok(cap);
     }
-    let catalog = model_catalog().ok();
-    let limit = catalog
-        .as_ref()
-        .and_then(|c| c.limits(provider, &request.model).max_output);
+    let limit = catalog.and_then(|c| c.limits(provider, &request.model).max_output);
     Ok(limit.map_or(product_default, |limit| {
         u64::from(product_default).min(limit) as u32
     }))
 }
 
-fn validate_cap_with_catalog(
+pub(crate) fn validate_cap_with_catalog(
     catalog: Option<&ModelCatalog>,
     provider: &str,
     request: &ChatRequest,
@@ -150,6 +149,7 @@ fn openai_fields(
     request: &ChatRequest,
     model: Option<&CatalogModel>,
 ) -> Result<Fields> {
+    validate_temperature(model, request)?;
     let id = request.model.as_str();
     let reasoner = openai_reasoner(id) || model.is_some_and(|m| m.reasoning);
     // A source's preferred Responses profile alone does not prove that an
@@ -210,62 +210,74 @@ fn openai_fields(
                 "model `{id}` does not support reasoning"
             );
         } else {
+            ensure!(
+                model
+                    .and_then(|m| m.metadata.get("compat"))
+                    .is_none_or(|c| c["supportsReasoningEffort"] != false)
+                    || selected_off(request.reasoning),
+                "selected OpenAI profile explicitly does not support reasoning effort"
+            );
             let mapped = mapped_effort(model, reasoning)?;
             let effort = mapped.unwrap_or_else(|| match reasoning {
                 ReasoningConfig::Disabled => "none".into(),
                 ReasoningConfig::Effort(e) => e.as_str().into(),
             });
-            let supported =
-                crate::reasoning_registry::reasoning_capabilities_for_model("openai", id);
-            if model
-                .and_then(|m| m.metadata.get("thinkingLevelMap"))
-                .and_then(|m| {
-                    m.get(match reasoning {
-                        ReasoningConfig::Disabled
-                        | ReasoningConfig::Effort(ReasoningEffort::None) => "off",
-                        ReasoningConfig::Effort(e) => e.as_str(),
-                    })
-                })
-                .is_none()
-            {
-                ensure!(
-                    openai_reasoner(id),
-                    "unknown OpenAI family has no documented effort mapping"
-                );
-                let allowed = if let Some(s) = supported {
-                    s.effort_options.iter().any(|e| e == &effort)
-                } else if id.starts_with("gpt-5.1") || id.starts_with("gpt-5.2") {
-                    matches!(
-                        effort.as_str(),
-                        "none" | "low" | "medium" | "high" | "xhigh"
-                    )
-                } else if id.starts_with("gpt-5.6") {
-                    matches!(
-                        effort.as_str(),
-                        "none" | "low" | "medium" | "high" | "xhigh" | "max"
-                    )
-                } else if id.starts_with("gpt-6-sol") || id.starts_with("gpt-6-luna") {
-                    matches!(
-                        effort.as_str(),
-                        "none" | "low" | "medium" | "high" | "xhigh" | "max"
-                    )
-                } else if mandatory {
-                    matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh" | "max")
-                } else if id.starts_with("gpt-5") {
-                    matches!(effort.as_str(), "minimal" | "low" | "medium" | "high")
-                } else {
-                    matches!(effort.as_str(), "low" | "medium" | "high")
-                };
-                ensure!(
-                    allowed,
-                    "model `{id}` does not support reasoning effort `{effort}`"
-                );
-            }
-            // Current OpenAI/Azure docs prohibit off for these mandatory families,
-            // even if a stale source supplies an off mapping.
+            // Validate the mapped value against the actual Chat/model/platform
+            // contract; dynamic maps cannot widen a protocol enum.
             ensure!(
-                !(mandatory && matches!(effort.as_str(), "none" | "minimal")),
+                !mandatory || !selected_off(request.reasoning),
                 "model `{id}` has mandatory reasoning"
+            );
+            ensure!(
+                openai_reasoner(id),
+                "unknown OpenAI family has no verified effort contract"
+            );
+            ensure!(
+                !selected_off(request.reasoning) || effort == "none",
+                "off mapping must disable reasoning, not select effort `{effort}`"
+            );
+            let azure = matches!(provider, "azure-openai" | "azure_openai");
+            ensure!(
+                !(azure && id.starts_with("o1-mini")),
+                "Azure o1-mini does not support reasoning_effort"
+            );
+            let allowed = if id.starts_with("gpt-5.1") {
+                matches!(effort.as_str(), "none" | "low" | "medium" | "high")
+            } else if id.starts_with("gpt-5.2")
+                || id.starts_with("gpt-5.3")
+                || id.starts_with("gpt-5.4")
+                || id.starts_with("gpt-5.5")
+            {
+                matches!(
+                    effort.as_str(),
+                    "none" | "low" | "medium" | "high" | "xhigh"
+                )
+            } else if id.starts_with("gpt-5.6") || id.starts_with("gpt-6") {
+                matches!(
+                    effort.as_str(),
+                    "none" | "low" | "medium" | "high" | "xhigh" | "max"
+                )
+            } else if id == "gpt-5" || id.starts_with("gpt-5-") {
+                matches!(effort.as_str(), "minimal" | "low" | "medium" | "high")
+            } else {
+                matches!(effort.as_str(), "low" | "medium" | "high")
+            };
+            ensure!(
+                allowed && !(mandatory && matches!(effort.as_str(), "none" | "minimal")),
+                "model `{id}` does not support reasoning effort `{effort}`"
+            );
+            ensure!(
+                !(azure && effort == "max"),
+                "Azure max effort requires Responses; this adapter uses Chat Completions"
+            );
+            ensure!(
+                !(azure
+                    && effort == "xhigh"
+                    && !(id.starts_with("gpt-6")
+                        || id.starts_with("gpt-5.6")
+                        || id.starts_with("gpt-5.5")
+                        || id.starts_with("gpt-5.4"))),
+                "Azure Chat model `{id}` does not support xhigh effort"
             );
             fields.insert("reasoning_effort".into(), json!(effort));
         }
@@ -296,9 +308,7 @@ fn chat_fields_with_model(
     request: &ChatRequest,
     model: Option<&CatalogModel>,
 ) -> Result<Fields> {
-    if matches!(provider, "openai" | "azure-openai" | "azure_openai")
-        || provider == "copilot" && openai_reasoner(&request.model)
-    {
+    if matches!(provider, "openai" | "azure-openai" | "azure_openai") {
         return openai_fields(provider, request, model);
     }
     let compat = model.and_then(|m| m.metadata.get("compat"));
@@ -361,6 +371,10 @@ fn chat_fields_with_model(
         ensure!(off, "selected catalog model does not support reasoning");
         return Ok(fields);
     }
+    ensure!(
+        off || compat.is_none_or(|c| c["supportsReasoningEffort"] != false),
+        "selected profile explicitly does not support qualitative reasoning effort"
+    );
     let mapped = mapped_effort(model, reasoning)?;
     ensure!(
         provider == "openrouter"
@@ -416,6 +430,10 @@ fn chat_fields_with_model(
         "deepseek" => {
             let id = request.model.as_str();
             ensure!(
+                provider == "deepseek" || mapped.is_some(),
+                "hosted DeepSeek profile has no verified mapping for the selected control"
+            );
+            ensure!(
                 model.is_some()
                     || id.starts_with("deepseek-v4")
                     || matches!(
@@ -446,6 +464,10 @@ fn chat_fields_with_model(
         }
         "zai" => {
             let id = request.model.to_ascii_lowercase();
+            ensure!(
+                provider == "glm" || mapped.is_some(),
+                "hosted GLM profile has no verified mapping for the selected control"
+            );
             let toggle_family = ["glm-4.5", "glm-4.6", "glm-4.7", "glm-5", "glm-5.2"]
                 .iter()
                 .any(|family| id == *family || id.starts_with(&format!("{family}-")));
@@ -479,7 +501,8 @@ fn chat_fields_with_model(
                     "this GLM model supports a thinking toggle, not qualitative effort"
                 );
                 ensure!(
-                    matches!(effort.as_str(), "high" | "max"),
+                    matches!(effort.as_str(), "high" | "max")
+                        || id.starts_with("glm-5.3") && effort == "low",
                     "unsupported GLM effort `{effort}`"
                 );
                 fields.insert("reasoning_effort".into(), json!(effort));
@@ -571,12 +594,23 @@ fn chat_fields_with_model(
     Ok(fields)
 }
 
-pub(crate) fn gemini_thinking(request: &ChatRequest) -> Result<Option<Value>> {
+pub(crate) fn gemini_thinking_with_catalog(
+    catalog: Option<&ModelCatalog>,
+    request: &ChatRequest,
+) -> Result<Option<Value>> {
+    let model = catalog.and_then(|c| c.model("gemini", &request.model));
+    validate_temperature(model, request)?;
+    gemini_thinking_with_model(model, request)
+}
+
+fn gemini_thinking_with_model(
+    model: Option<&CatalogModel>,
+    request: &ChatRequest,
+) -> Result<Option<Value>> {
     let Some(reasoning) = request.reasoning else {
         return Ok(None);
     };
     let id = request.model.as_str();
-    let model = entry("gemini", id);
     let family_id = model
         .as_ref()
         .and_then(|m| m.metadata.get("sourceGeneration"))
@@ -598,37 +632,44 @@ pub(crate) fn gemini_thinking(request: &ChatRequest) -> Result<Option<Value>> {
         !off,
         "Gemini thinking cannot be disabled for this family; omission means the server default, not off"
     );
-    let mapped = mapped_effort(model.as_ref(), reasoning)?;
+    ensure!(
+        model
+            .and_then(|m| m.metadata.get("compat"))
+            .is_none_or(|c| c["supportsReasoningEffort"] != false),
+        "selected Gemini profile explicitly does not support reasoning effort"
+    );
+    let mapped = mapped_effort(model, reasoning)?;
     let ReasoningConfig::Effort(effort) = reasoning else {
         unreachable!()
     };
     let level = mapped.unwrap_or_else(|| effort.as_str().into());
-    let registry = crate::reasoning_registry::reasoning_capabilities_for_model("gemini", family_id);
-    let source_level = model
-        .as_ref()
-        .and_then(|m| m.metadata.get("sourceGeneration"))
-        .and_then(|s| s["reasoningOptions"].as_array())
-        .is_some_and(|options| {
-            options
-                .iter()
-                .filter(|o| o["type"] == "effort")
-                .flat_map(|o| o["values"].as_array().into_iter().flatten())
-                .any(|v| v.as_str().is_some_and(|v| v.eq_ignore_ascii_case(&level)))
-        });
+    let level = level.to_ascii_uppercase();
     ensure!(
-        family_id.starts_with("gemini-3")
-            && (source_level
-                || registry.is_some_and(|r| r
-                    .effort_options
-                    .iter()
-                    .any(|e| e.eq_ignore_ascii_case(&level)))
-                || model
-                    .as_ref()
-                    .and_then(|m| m.metadata.get("thinkingLevelMap"))
-                    .is_some_and(|m| m.as_object().is_some_and(|m| m
-                        .values()
-                        .any(|v| v.as_str().is_some_and(|v| v.eq_ignore_ascii_case(&level)))))),
-        "Gemini model `{id}` does not document thinking level `{level}`"
+        matches!(level.as_str(), "MINIMAL" | "LOW" | "MEDIUM" | "HIGH"),
+        "invalid native generateContent ThinkingLevel `{level}`"
+    );
+    let allowed = if family_id.starts_with("gemini-3.1-flash-lite-image") {
+        matches!(level.as_str(), "MINIMAL" | "HIGH")
+    } else if family_id.starts_with("gemini-3-pro") {
+        matches!(level.as_str(), "LOW" | "HIGH")
+    } else if family_id.starts_with("gemini-3.1-pro")
+        || family_id.starts_with("gemini-3.7-flash")
+        || family_id.starts_with("gemini-3.8-flash")
+    {
+        matches!(level.as_str(), "LOW" | "MEDIUM" | "HIGH")
+    } else {
+        [
+            "gemini-3-flash",
+            "gemini-3.1-flash-lite",
+            "gemini-3.5-flash",
+            "gemini-3.6-flash",
+        ]
+        .iter()
+        .any(|family| family_id == *family || family_id.starts_with(&format!("{family}-")))
+    };
+    ensure!(
+        allowed,
+        "Gemini model `{id}` has no documented support for thinking level `{level}`"
     );
     Ok(Some(json!({"thinkingLevel":level.to_ascii_uppercase()})))
 }
@@ -648,70 +689,422 @@ pub(crate) fn test_request(model: &str) -> ChatRequest {
     }
 }
 
-/// Messages/Converse Claude caps include thinking and visible output. Adaptive
-/// thinking does not create a second reserve outside that cap.
-/// https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
-/// https://platform.claude.com/docs/en/build-with-claude/effort
-pub(crate) fn anthropic_fields(provider: &str, request: &ChatRequest) -> Result<Fields> {
-    validate_cap(provider, request)?;
-    let model = entry(provider, &request.model);
-    let compat = model.as_ref().and_then(|m| m.metadata.get("compat"));
+/// Explicit negative source capabilities apply to every native serializer.
+fn validate_temperature(model: Option<&CatalogModel>, request: &ChatRequest) -> Result<()> {
     if request.temperature.is_some() {
         ensure!(
-            compat.is_none_or(|c| c["supportsTemperature"] != false),
-            "Claude model does not support temperature"
+            model.is_none_or(|m| m
+                .metadata
+                .get("compat")
+                .is_none_or(|c| c["supportsTemperature"] != false)
+                && m.metadata
+                    .get("sourceGeneration")
+                    .is_none_or(|s| s["temperature"] != false)),
+            "selected model explicitly does not support temperature"
+        );
+    }
+    Ok(())
+}
+
+// Only documented Bedrock model/inference-profile forms are normalized. ARNs
+// and application profile aliases do not establish an underlying Claude family.
+fn claude_id<'a>(provider: &str, id: &'a str) -> Option<&'a str> {
+    if provider != "bedrock" {
+        return id.starts_with("claude-").then_some(id);
+    }
+    let id = ["us.", "eu.", "jp.", "au.", "global."]
+        .iter()
+        .find_map(|prefix| id.strip_prefix(prefix))
+        .unwrap_or(id);
+    let id = id.strip_prefix("anthropic.")?;
+    let known = [
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-4-6-v1",
+        "claude-sonnet-4-6",
+        "claude-opus-4-5",
+        "claude-opus-4-5-20251101-v1:0",
+        "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-mythos-5",
+        "claude-mythos-5-1",
+        "claude-mythos-preview",
+        "claude-opus-5",
+        "claude-sonnet-5",
+    ];
+    // Older dated platform IDs may disable manual thinking, but have no
+    // qualitative fallback. Catalog API identity supplies their off contract.
+    let legacy_dated = id
+        .strip_suffix("-v1:0")
+        .and_then(|id| id.rsplit_once('-'))
+        .is_some_and(|(family, date)| {
+            date.len() == 8
+                && date.bytes().all(|b| b.is_ascii_digit())
+                && [
+                    "claude-3-7-sonnet",
+                    "claude-sonnet-4",
+                    "claude-sonnet-4-5",
+                    "claude-opus-4",
+                    "claude-opus-4-1",
+                    "claude-haiku-4-5",
+                ]
+                .contains(&family)
+        });
+    (known.contains(&id) || legacy_dated).then_some(id)
+}
+
+fn claude_family(id: &str, family: &str) -> bool {
+    if id == family {
+        return true;
+    }
+    let Some(suffix) = id
+        .strip_prefix(family)
+        .and_then(|suffix| suffix.strip_prefix('-'))
+    else {
+        return false;
+    };
+    // A version component is a different family, not a dated release of this
+    // one. Avoid interpreting an unknown future 5.x model as documented 5.0.
+    if matches!(suffix, "v1" | "v1:0") {
+        return true;
+    }
+    let (date, rest) = suffix.split_once('-').unwrap_or((suffix, ""));
+    date.len() == 8
+        && date.bytes().all(|b| b.is_ascii_digit())
+        && matches!(rest, "" | "v1" | "v1:0")
+}
+
+/// Messages/Converse Claude caps include thinking and visible output. Adaptive
+/// thinking does not create a second reserve outside that cap.
+/// https://platform.claude.com/docs/en/build-with-claude/thinking
+/// https://platform.claude.com/docs/en/build-with-claude/effort
+pub(crate) fn anthropic_fields_with_catalog(
+    catalog: Option<&ModelCatalog>,
+    provider: &str,
+    request: &ChatRequest,
+) -> Result<Fields> {
+    validate_cap_with_catalog(catalog, provider, request)?;
+    anthropic_fields_with_model(
+        provider,
+        request,
+        catalog.and_then(|c| c.model(provider, &request.model)),
+    )
+}
+
+fn anthropic_fields_with_model(
+    provider: &str,
+    request: &ChatRequest,
+    model: Option<&CatalogModel>,
+) -> Result<Fields> {
+    validate_temperature(model, request)?;
+    let compat = model.and_then(|m| m.metadata.get("compat"));
+    let normalized_id = claude_id(provider, &request.model).map(|id| id.replace('.', "-"));
+    let id = normalized_id.as_deref();
+    let mandatory = id.is_some_and(|id| {
+        [
+            "claude-opus-5-5",
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+            "claude-mythos-preview",
+            "claude-sonnet-5-5",
+        ]
+        .iter()
+        .any(|family| claude_family(id, family))
+    });
+    ensure!(
+        !mandatory || !selected_off(request.reasoning),
+        "Claude family has mandatory thinking; off cannot be honored"
+    );
+    if let Some(id) = id {
+        let sampling_restricted = [
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-mythos-5",
+            "claude-mythos-5-1",
+            "claude-mythos-preview",
+        ]
+        .iter()
+        .any(|family| claude_family(id, family));
+        ensure!(
+            !sampling_restricted || request.temperature.is_none(),
+            "Claude family does not support sampling temperature, including default/off thinking"
+        );
+        // Legacy thinking and adaptive thinking also prohibit selected sampling.
+        let default_on = mandatory;
+        let thinking_selected = request.reasoning.is_some()
+            && !selected_off(request.reasoning)
+            && !claude_family(id, "claude-opus-4-5");
+        ensure!(
+            request.temperature.is_none() || !default_on && !thinking_selected,
+            "Claude thinking does not support a sampling temperature setting"
         );
     }
     let mut fields = Fields::new();
     let Some(reasoning) = request.reasoning else {
         return Ok(fields);
     };
-    ensure!(
-        provider != "bedrock" || request.model.contains("anthropic.claude"),
-        "reasoning controls for non-Claude Bedrock models are not implemented by this adapter"
-    );
-    let mut id = request.model.as_str();
-    if provider == "bedrock" {
-        id = id.split("anthropic.").nth(1).unwrap_or(id);
-        id = id.strip_suffix("-v1:0").unwrap_or(id);
+    let id = id.ok_or_else(|| {
+        anyhow::anyhow!(
+            "underlying Claude family cannot be resolved for selected reasoning controls"
+        )
+    })?;
+    let off = selected_off(request.reasoning);
+    if off && model.is_some_and(|m| !m.reasoning) {
+        return Ok(fields);
     }
-    // The current effort contract makes Opus 5.5 thinking mandatory; a stale
-    // source's off map must not override this protocol constraint.
-    ensure!(
-        !(selected_off(Some(reasoning)) && (id.contains("opus-5-5") || id.contains("opus-5.5"))),
-        "Claude Opus 5.5 has mandatory thinking"
-    );
-    if selected_off(Some(reasoning)) && model.as_ref().is_some_and(|m| !m.reasoning) {
-        return Ok(fields); // a known nonthinking model already satisfies off
-    }
-    let mapped = mapped_effort(model.as_ref(), reasoning)?;
-    let registry = crate::reasoning_registry::reasoning_capabilities_for_model("anthropic", id);
-    if selected_off(Some(reasoning)) {
+    let mapped = mapped_effort(model, reasoning)?;
+    let normalized = id
+        .strip_suffix("-v1:0")
+        .or_else(|| id.strip_suffix("-v1"))
+        .unwrap_or(id);
+    let registry_id = [
+        "claude-opus-4-5",
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-sonnet-4-6",
+    ]
+    .into_iter()
+    .find(|family| claude_family(normalized, family))
+    .unwrap_or(normalized);
+    let registry =
+        crate::reasoning_registry::reasoning_capabilities_for_model("anthropic", registry_id);
+    let adaptive = [
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-sonnet-4-6",
+        "claude-opus-5",
+        "claude-opus-5-5",
+        "claude-sonnet-5",
+        "claude-sonnet-5-5",
+        "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-mythos-5",
+        "claude-mythos-5-1",
+        "claude-mythos-preview",
+    ]
+    .iter()
+    .any(|family| claude_family(id, family));
+    if off {
         ensure!(
-            model.is_some() || registry.is_some(),
+            registry.is_some() || adaptive || model.is_some(),
             "unknown Claude off contract"
         );
         fields.insert("thinking".into(), json!({"type":"disabled"}));
         return Ok(fields);
     }
+    ensure!(
+        compat.is_none_or(|c| c["supportsReasoningEffort"] != false),
+        "profile explicitly does not support reasoning effort"
+    );
     let ReasoningConfig::Effort(effort) = reasoning else {
         unreachable!()
     };
-    let wire_effort = mapped.clone().unwrap_or_else(|| effort.as_str().into());
+    let wire = mapped.unwrap_or_else(|| effort.as_str().into());
     ensure!(
-        mapped.is_some() || registry.is_some_and(|r| r.effort_options.contains(&wire_effort)),
-        "Claude model does not document selected qualitative effort (legacy extended thinking needs a numeric budget)"
+        matches!(wire.as_str(), "low" | "medium" | "high" | "xhigh" | "max"),
+        "invalid Claude effort enum `{wire}`"
     );
-    fields.insert("output_config".into(), json!({"effort":wire_effort}));
-    if compat.is_some_and(|c| c["forceAdaptiveThinking"] == true)
-        || id.contains("opus-4-6")
-        || id.contains("sonnet-4-6")
-    {
+    // Registry supplies documented direct-model vocabulary; a map can remap a
+    // user effort but cannot widen that vocabulary or enable manual-only models.
+    let modern = [
+        "claude-opus-5",
+        "claude-opus-5-5",
+        "claude-sonnet-5",
+        "claude-sonnet-5-5",
+        "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-mythos-5",
+        "claude-mythos-5-1",
+    ]
+    .iter()
+    .any(|family| claude_family(id, family));
+    let known_effort = registry.is_some_and(|r| r.effort_options.contains(&wire)) || modern;
+    ensure!(
+        known_effort,
+        "Claude model does not document selected qualitative effort (legacy thinking needs numeric budget)"
+    );
+    if provider == "bedrock" {
         ensure!(
-            request.temperature.is_none(),
-            "adaptive thinking does not support a sampling temperature setting"
+            !claude_family(id, "claude-opus-4-8"),
+            "Bedrock Opus 4.8 adaptive profile remains unverified"
         );
+        if claude_family(id, "claude-opus-4-5") {
+            ensure!(
+                matches!(wire.as_str(), "low" | "medium" | "high"),
+                "Bedrock Opus 4.5 supports low/medium/high"
+            );
+            fields.insert("anthropic_beta".into(), json!(["effort-2025-11-24"]));
+        }
+    }
+    fields.insert("output_config".into(), json!({"effort":wire}));
+    if adaptive {
         fields.insert("thinking".into(), json!({"type":"adaptive"}));
     }
     Ok(fields)
+}
+
+/// One effective-mode decision for budget projection, history preparation and
+/// replay validation. Explicit none and Disabled both override server default.
+pub(crate) fn deepseek_effective_thinking(request: &ChatRequest) -> bool {
+    if selected_off(request.reasoning) {
+        return false;
+    }
+    crate::history::deepseek_thinking_required(
+        &request.model,
+        request.reasoning.is_some()
+            || request.model.starts_with("deepseek-v4")
+            || matches!(request.model.as_str(), "deepseek-flash" | "deepseek-pro"),
+        &request.messages,
+    )
+}
+
+/// Discovery uses the very same protocol decision as generation. This request
+/// contains no tools/sampling/cap: those per-request constraints are checked at
+/// send time; catalog limits are still read through ModelCatalog::limits.
+pub(crate) fn effort_supported(
+    provider: &str,
+    model: &CatalogModel,
+    effort: ReasoningEffort,
+) -> bool {
+    effort_supported_for_profile(provider, &model.id, Some(model), effort)
+}
+
+pub(crate) fn effort_supported_for_profile(
+    provider: &str,
+    id: &str,
+    model: Option<&CatalogModel>,
+    effort: ReasoningEffort,
+) -> bool {
+    let request = ChatRequest {
+        model: id.into(),
+        messages: vec![],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: Some(ReasoningConfig::Effort(effort)),
+        compiled_prompt: None,
+    };
+    match provider {
+        "anthropic" | "bedrock" => anthropic_fields_with_model(provider, &request, model).is_ok(),
+        "gemini" => gemini_thinking_with_model(model, &request).is_ok(),
+        _ => chat_fields_with_model(provider, &request, model).is_ok(),
+    }
+}
+
+pub(crate) fn protocol_mandatory(provider: &str, id: &str) -> bool {
+    match provider {
+        "openai" | "azure-openai" | "azure_openai" => {
+            id.starts_with("gpt-6-astra") || id.starts_with("gpt-6.1-sol")
+        }
+        "glm" => id.to_ascii_lowercase().starts_with("glm-5.3"),
+        "anthropic" | "bedrock" => claude_id(provider, id).is_some_and(|id| {
+            let id = id.replace('.', "-");
+            [
+                "claude-opus-5-5",
+                "claude-fable-5",
+                "claude-fable-5-1",
+                "claude-mythos-5",
+                "claude-mythos-5-1",
+                "claude-mythos-preview",
+                "claude-sonnet-5-5",
+            ]
+            .iter()
+            .any(|family| claude_family(&id, family))
+        }),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_catalog(fresh: bool) -> ModelCatalog {
+    if fresh {
+        use crate::catalog::generator::{SourceSnapshot, generate};
+        let source: SourceSnapshot =
+            serde_json::from_str(include_str!("../tests/fixtures/catalog/sources.json")).unwrap();
+        let generated = generate(&source, true).unwrap();
+        ModelCatalog::parse(
+            &serde_json::to_string(&generated.models).unwrap(),
+            &serde_json::to_string(&generated.provenance).unwrap(),
+        )
+        .unwrap()
+    } else {
+        ModelCatalog::parse(
+            include_str!("../tests/fixtures/catalog/models.json"),
+            include_str!("../tests/fixtures/catalog/provenance.json"),
+        )
+        .unwrap()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_catalog_model(
+    provider: &str,
+    id: &str,
+    template: &str,
+    metadata: Value,
+) -> ModelCatalog {
+    let mut models: Value =
+        serde_json::from_str(include_str!("../tests/fixtures/catalog/models.json")).unwrap();
+    let mut origins: Value =
+        serde_json::from_str(include_str!("../tests/fixtures/catalog/provenance.json")).unwrap();
+    let mut model = models[provider][template].clone();
+    model["id"] = json!(id);
+    for (key, value) in metadata.as_object().unwrap() {
+        model[key] = value.clone();
+    }
+    models[provider][id] = model;
+    origins[provider][id] = origins[provider][template].clone();
+    ModelCatalog::parse(&models.to_string(), &origins.to_string()).unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn test_discovery(
+    catalog: &ModelCatalog,
+    provider: &str,
+    id: &str,
+) -> pioneer_protocol::ProviderModelInfo {
+    let mut models = [pioneer_protocol::ProviderModelInfo {
+        id: id.into(),
+        name: None,
+        description: None,
+        created: None,
+        provider: provider.into(),
+        owned_by: None,
+        limits: Default::default(),
+        capabilities: Default::default(),
+        transcription: None,
+        pricing: None,
+        active: None,
+        family: None,
+        lifecycle_status: None,
+    }];
+    catalog.enrich(provider, &mut models);
+    models.into_iter().next().unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn test_source_temperature(provider: &str, id: &str) -> ModelCatalog {
+    use crate::catalog::generator::{SOURCE_URLS, SourceSnapshot, generate};
+    let mut source: SourceSnapshot =
+        serde_json::from_str(include_str!("../tests/fixtures/catalog/sources.json")).unwrap();
+    source.sources.get_mut(SOURCE_URLS[0]).unwrap().body[provider]["models"][id]["temperature"] =
+        json!(false);
+    let generated = generate(&source, true).unwrap();
+    ModelCatalog::parse(
+        &serde_json::to_string(&generated.models).unwrap(),
+        &serde_json::to_string(&generated.provenance).unwrap(),
+    )
+    .unwrap()
 }
