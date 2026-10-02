@@ -24123,6 +24123,57 @@ impl CrudStore {
         }))
     }
 
+    /// The latest canonical blocked transition owns this diagnostic. Never select a
+    /// job merely because it is the newest failure for the same Turn.
+    pub async fn get_blocked_turn_recovery_diagnostic(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<pioneer_protocol::RecoveryDiagnostic>> {
+        let row = self.connection.query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT e.payload, t.error, j.diagnostic FROM turn t \
+             JOIN turn_event e ON e.turn_id = t.id AND e.sequence = \
+               (SELECT MAX(sequence) FROM turn_event WHERE turn_id = t.id \
+                AND event_type IN ('turn/started', 'turn/blocked', 'turn/failed', 'turn/completed')) \
+             JOIN recovery_job j ON j.id = json_extract(e.payload, '$.payload.resume.blocked_recovery_job_id') \
+             JOIN recovery_terminalization_outbox o ON o.recovery_job_id = j.id \
+             WHERE t.id = ? AND t.status = 'blocked' AND e.event_type = 'turn/blocked' \
+             AND j.turn_id = t.id AND j.status = 'blocked' AND o.status = 'delivered' \
+             AND o.turn_id = j.turn_id AND o.item_id = j.item_id AND o.item_type = j.item_type \
+             AND o.recovery_status = j.status AND o.attempt_number = MAX(j.run_count, 1) \
+             AND o.error_message = COALESCE(j.last_error, j.reason, 'recovery reached a terminal outcome')",
+            [turn_id.into()],
+        )).await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let payload: String = row.try_get("", "payload")?;
+        let error: Option<String> = row.try_get("", "error")?;
+        let diagnostic: Option<String> = row.try_get("", "diagnostic")?;
+        let Ok(CanonicalTurnEventPayload::TurnBlocked(event)) = serde_json::from_str(&payload)
+        else {
+            return Ok(None);
+        };
+        let Some(job_id) = event
+            .resume
+            .and_then(|resume| resume.blocked_recovery_job_id)
+        else {
+            return Ok(None);
+        };
+        let diagnostic = diagnostic.as_deref().and_then(|value| {
+            serde_json::from_str::<pioneer_protocol::RecoveryDiagnostic>(value).ok()
+        });
+        Ok(diagnostic.filter(|value| {
+            value.stop_reason == Some(pioneer_protocol::RecoveryStopReason::NoProgress)
+                && value.last_failure.is_some()
+                && event.turn.id == turn_id
+                && event.turn.status == TurnStatus::Blocked
+                && event.turn.error == error
+                && error.as_deref()
+                    == Some(format!("{} (recovery job {job_id})", value.public_message()).as_str())
+        }))
+    }
+
     pub async fn get_recovery_job(&self, job_id: &str) -> Result<Option<RecoveryJobRecord>> {
         self.run_serialized_write(|| async {
             Ok(recovery_job::find_job_by_id(&self.connection, job_id)
@@ -24400,6 +24451,8 @@ impl CrudStore {
             if affected {
                 if let Some(value) = &diagnostic_json {
                     recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
+                } else if status == RecoveryJobStatus::Blocked {
+                    recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
                 }
                 enqueue_recovery_terminalization_if_required(
                     &tx,
@@ -24439,6 +24492,9 @@ impl CrudStore {
             )
             .await?;
             if affected {
+                if status == RecoveryJobStatus::Blocked {
+                    recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
+                }
                 enqueue_recovery_terminalization_if_required(
                     &tx,
                     job_id,
@@ -24494,6 +24550,8 @@ impl CrudStore {
             if affected {
                 if let Some(value) = &diagnostic_json {
                     recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
+                } else if status == RecoveryJobStatus::Blocked {
+                    recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
                 }
                 enqueue_recovery_terminalization_if_required(
                     &tx,
@@ -24558,6 +24616,8 @@ impl CrudStore {
             if affected {
                 if let Some(value) = &diagnostic_json {
                     recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
+                } else if status == RecoveryJobStatus::Blocked {
+                    recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
                 }
                 enqueue_recovery_terminalization_if_required(
                     &tx,
@@ -25792,6 +25852,15 @@ impl CrudStore {
                 current_status,
             });
         }
+        let blocked_diagnostic = job
+            .diagnostic
+            .as_deref()
+            .and_then(|value| {
+                serde_json::from_str::<pioneer_protocol::RecoveryDiagnostic>(value).ok()
+            })
+            .filter(|value| {
+                value.stop_reason == Some(pioneer_protocol::RecoveryStopReason::NoProgress)
+            });
         let terminal_error = if job_status == RecoveryJobStatus::Blocked {
             if current_status == TurnStatus::Blocked {
                 turn_model
@@ -25807,7 +25876,11 @@ impl CrudStore {
                 })?;
                 format!(
                     "{} (recovery job {})",
-                    resume.human_message, record.recovery_job_id
+                    blocked_diagnostic
+                        .as_ref()
+                        .map(|value| value.public_message())
+                        .unwrap_or_else(|| resume.human_message.clone()),
+                    record.recovery_job_id
                 )
             }
         } else {
@@ -25948,7 +26021,12 @@ impl CrudStore {
                     turn: terminal_turn
                         .clone()
                         .expect("non-terminal recovery must construct a terminal Turn"),
-                    resume: resume.cloned(),
+                    resume: resume.cloned().map(|mut resume| {
+                        if let Some(diagnostic) = &blocked_diagnostic {
+                            resume.human_message = diagnostic.public_message();
+                        }
+                        resume
+                    }),
                 })
             } else {
                 TurnEventPayload::TurnFailed(pioneer_protocol::TurnFailedNotification {
@@ -35665,6 +35743,12 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_diagnostic_rolls_back_with_outbox_and_survives_restart() {
+        for status in [RecoveryJobStatus::Exhausted, RecoveryJobStatus::Blocked] {
+            recovery_diagnostic_atomic_restart_impl(status).await;
+        }
+    }
+
+    async fn recovery_diagnostic_atomic_restart_impl(status: RecoveryJobStatus) {
         use pioneer_protocol::{
             ProviderFailureClass, ProviderFailureStage, ProviderTransportKind, RecoveryDiagnostic,
             RecoveryProviderFailure, RecoveryStopReason,
@@ -35686,6 +35770,8 @@ mod tests {
             .unwrap();
         let initial = RecoveryDiagnostic {
             last_failure: Some(RecoveryProviderFailure {
+                error_reason: None,
+                request_id: None,
                 class: ProviderFailureClass::StreamTruncated,
                 stage: ProviderFailureStage::MidStream,
                 transport: ProviderTransportKind::Stream,
@@ -35734,13 +35820,22 @@ mod tests {
             .unwrap();
         let final_diagnostic = RecoveryDiagnostic {
             last_failure: Some(RecoveryProviderFailure {
+                error_reason: Some(pioneer_protocol::ProviderErrorReason::PermissionDenied),
+                request_id: Some(
+                    pioneer_protocol::ProviderRequestId::try_from("gen-atomic_fixture".to_owned())
+                        .unwrap(),
+                ),
                 class: ProviderFailureClass::AuthOrPermission,
                 stage: ProviderFailureStage::Connect,
                 transport: ProviderTransportKind::NonStream,
                 http_status: Some(403),
                 retry_after_ms: None,
             }),
-            stop_reason: Some(RecoveryStopReason::AttemptsExhausted),
+            stop_reason: Some(if status == RecoveryJobStatus::Blocked {
+                RecoveryStopReason::NoProgress
+            } else {
+                RecoveryStopReason::AttemptsExhausted
+            }),
         };
         let raw = "raw body credential=secret https://secret.example /private/key HTTP 401";
         assert!(
@@ -35748,7 +35843,7 @@ mod tests {
                 .mark_recovery_job_terminal_after_attempt_with_diagnostic(
                     &job.id,
                     "stale_attempt",
-                    RecoveryJobStatus::Exhausted,
+                    status,
                     Some(raw.to_owned()),
                     Some(final_diagnostic.clone()),
                     1_700_000_004
@@ -35762,7 +35857,7 @@ mod tests {
                 .mark_recovery_job_terminal_after_attempt_with_diagnostic(
                     &job.id,
                     "diag_attempt",
-                    RecoveryJobStatus::Exhausted,
+                    status,
                     Some(raw.to_owned()),
                     Some(final_diagnostic.clone()),
                     1_700_000_004
@@ -35785,7 +35880,7 @@ mod tests {
                 .mark_recovery_job_terminal_after_attempt_with_diagnostic(
                     &job.id,
                     "diag_attempt",
-                    RecoveryJobStatus::Exhausted,
+                    status,
                     Some(raw.to_owned()),
                     Some(final_diagnostic.clone()),
                     1_700_000_004
@@ -35808,7 +35903,16 @@ mod tests {
         let applied = restarted
             .apply_claimed_recovery_terminalization(
                 &claims[0],
-                None,
+                (status == RecoveryJobStatus::Blocked).then(|| TurnBlockedResumeMetadata {
+                    reason_class: "execution_budget".to_owned(),
+                    human_message: "max_consecutive_no_progress_windows reached: limit=3"
+                        .to_owned(),
+                    resume_requirements: Vec::new(),
+                    resume_command: "turn.resume:turn_diag_atomic".to_owned(),
+                    blocked_recovery_job_id: Some(job.id.clone()),
+                    latest_checkpoint_id: None,
+                    can_resume_same_turn: false,
+                }),
                 RecoveryTerminalCleanupPlan {
                     runtime_generation: 77,
                     runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
@@ -35821,22 +35925,121 @@ mod tests {
             panic!("terminalization expected");
         };
         let expected = final_diagnostic.public_message();
+        let expected_turn_message = if status == RecoveryJobStatus::Blocked {
+            format!("{expected} (recovery job {})", job.id)
+        } else {
+            expected.clone()
+        };
+        let terminal_turn = applied.newly_terminal_turn.unwrap();
         assert_eq!(
-            applied.newly_terminal_turn.unwrap().error.as_deref(),
-            Some(expected.as_str())
+            terminal_turn.error.as_deref(),
+            Some(expected_turn_message.as_str())
         );
-        let serialized = serde_json::to_string(&applied.final_item.unwrap()).unwrap();
+        let serialized = serde_json::to_string(&terminal_turn).unwrap();
         assert!(serialized.contains("HTTP 403"));
-        for secret in ["credential", "secret.example", "/private", "HTTP 401"] {
+        for secret in [
+            "credential",
+            "secret.example",
+            "/private",
+            "HTTP 401",
+            "gen-atomic_fixture",
+        ] {
             assert!(!serialized.contains(secret));
         }
-        assert_eq!(
+        if status == RecoveryJobStatus::Blocked {
+            assert!(applied.final_item.is_none());
+            assert_eq!(
+                restarted
+                    .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                    .await
+                    .unwrap(),
+                Some(final_diagnostic.clone())
+            );
+            assert!(
+                restarted
+                    .get_failed_turn_recovery_diagnostic("turn_diag_atomic")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            // A stale/resumed/pending job cannot lend its facts to this result.
+            for job_status in ["pending", "active", "succeeded", "cancelled"] {
+                restarted
+                    .connection
+                    .execute_unprepared(&format!(
+                        "UPDATE recovery_job SET status = '{job_status}' WHERE id = '{}'",
+                        job.id
+                    ))
+                    .await
+                    .unwrap();
+                assert!(
+                    restarted
+                        .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
             restarted
-                .get_failed_turn_recovery_diagnostic("turn_diag_atomic")
+                .connection
+                .execute_unprepared(&format!(
+                    "UPDATE recovery_job SET status = 'blocked' WHERE id = '{}'",
+                    job.id
+                ))
                 .await
-                .unwrap(),
-            Some(final_diagnostic)
-        );
+                .unwrap();
+            restarted
+                .connection
+                .execute_unprepared(
+                    "UPDATE turn SET error = 'authorization denied' WHERE id = 'turn_diag_atomic'",
+                )
+                .await
+                .unwrap();
+            assert!(
+                restarted
+                    .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            restarted
+                .connection
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "UPDATE turn SET error = ? WHERE id = 'turn_diag_atomic'",
+                    [expected_turn_message.into()],
+                ))
+                .await
+                .unwrap();
+            restarted.connection.execute_unprepared("UPDATE turn_event SET payload = json_set(payload, '$.payload.resume.blocked_recovery_job_id', 'unrelated_job') WHERE turn_id = 'turn_diag_atomic' AND event_type = 'turn/blocked'").await.unwrap();
+            assert!(
+                restarted
+                    .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            assert_eq!(
+                restarted
+                    .get_failed_turn_recovery_diagnostic("turn_diag_atomic")
+                    .await
+                    .unwrap(),
+                Some(final_diagnostic)
+            );
+            assert!(
+                restarted
+                    .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                serde_json::to_string(&applied.final_item.unwrap())
+                    .unwrap()
+                    .contains("HTTP 403")
+            );
+        }
         assert!(
             restarted
                 .claim_due_recovery_terminalizations(1_700_000_100, 45, 10)
@@ -35849,7 +36052,7 @@ mod tests {
                 .mark_recovery_job_terminal_after_attempt_with_diagnostic(
                     &job.id,
                     "diag_attempt",
-                    RecoveryJobStatus::Exhausted,
+                    status,
                     Some("duplicate".to_owned()),
                     None,
                     1_700_000_100

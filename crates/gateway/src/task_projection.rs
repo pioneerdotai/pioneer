@@ -448,6 +448,7 @@ pub(crate) fn project_error(error: &TaskError) -> PublicTaskFailure {
         public_error.message = message;
     }
     PublicTaskFailure {
+        recovery_diagnostic: error.recovery_diagnostic.clone(),
         class: error.class,
         error: public_error,
     }
@@ -516,6 +517,7 @@ pub(crate) fn project_delivery(delivery: &TaskDelivery) -> PublicTaskDelivery {
         .map(project_error)
         .or_else(|| {
             delivery.last_error.as_deref().map(|_| PublicTaskFailure {
+                recovery_diagnostic: None,
                 class: TaskErrorClass::Internal,
                 error: crate::public_error::build_public_error(
                     pioneer_protocol::PublicErrorCode::Internal,
