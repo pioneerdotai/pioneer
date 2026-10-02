@@ -6200,13 +6200,27 @@ impl TaskAgentExecutor {
             Some(descriptor) => {
                 descriptor.task_error(Some(child_runtime.task_run_turn.run_id.clone()))
             }
-            None => task_error(
-                "child_turn_blocked",
-                reason.to_owned(),
-                TaskErrorClass::Policy,
-                Some(child_runtime.task_run_turn.run_id.clone()),
-            ),
+            None => {
+                let mut error = task_error(
+                    "child_turn_blocked",
+                    reason.to_owned(),
+                    TaskErrorClass::Policy,
+                    Some(child_runtime.task_run_turn.run_id.clone()),
+                );
+                error.recovery_diagnostic = processor
+                    .crud_store
+                    .get_blocked_turn_recovery_diagnostic(&child_runtime.task_run_turn.turn_id)
+                    .await?;
+                if let Some(message) = error.recovery_public_message() {
+                    error.class = TaskErrorClass::Provider;
+                    error.message = message;
+                }
+                error
+            }
         };
+        let block_reason = error
+            .recovery_public_message()
+            .unwrap_or_else(|| reason.to_owned());
         handle
             .record_task_run_turn_blocked(
                 blocked_task_run_turn(&child_runtime.task_run_turn, blocked_at),
@@ -6215,7 +6229,8 @@ impl TaskAgentExecutor {
             )
             .await?;
         handle.block_run(Some(error), blocked_at).await?;
-        mark_task_run_occurrence_turn_blocked(&processor, &child_runtime.lineage, reason).await?;
+        mark_task_run_occurrence_turn_blocked(&processor, &child_runtime.lineage, &block_reason)
+            .await?;
         Ok(())
     }
 

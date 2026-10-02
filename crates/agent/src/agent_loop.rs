@@ -181,6 +181,9 @@ fn recovery_execution_window_admission_error(
         ExecutionWindowTotalBudgetDecision::Continue { .. } => None,
         ExecutionWindowTotalBudgetDecision::Block(block) => Some(
             super::AgentControlError::ExecutionWindowContinuationBlocked {
+                stop_reason: (block.kind
+                    == ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveNoProgressWindows)
+                    .then_some(pioneer_protocol::RecoveryStopReason::NoProgress),
                 reason: block.reason,
             },
         ),
