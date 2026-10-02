@@ -12170,11 +12170,13 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "delayed"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let provider_entered = Arc::new(Notify::new());
+    let provider_release = Arc::new(Notify::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "delayed",
-        Arc::new(DelayedProvider {
-            delay: Duration::from_secs(30),
-            text: "too late".to_owned(),
+        Arc::new(CancellationBarrierProvider {
+            entered: provider_entered.clone(),
+            release: provider_release,
         }),
     ));
     let processor = Arc::new(MessageProcessor::new(
@@ -12264,6 +12266,18 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
         .expect("Composer should create one detached task");
     let run_id = wait_for_task_run_id(crud_store.clone(), task.id.as_str()).await;
     let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run_id.as_str()).await;
+    // Lineage creation precedes native actor admission. Cancel the running child
+    // only after registration of its original immutable cancellation context.
+    tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
+        .await
+        .expect("child provider should enter after context registration");
+    assert!(
+        crud_store
+            .native_cancellation_context(&lineage.child_turn_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
 
     thread_manager
         .thread_start_seeded(
@@ -12388,7 +12402,7 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
         cancelled_exchange
             .assistant_text
             .as_deref()
-            .is_none_or(|text| !text.contains("too late")),
+            .is_none_or(|text| !text.contains("too late") && !text.contains("released")),
         "partial or late provider output must not enter cancelled history"
     );
 
@@ -12429,7 +12443,7 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
     assert!(
         !cancelled_messages
             .iter()
-            .any(|m| m.content.contains("too late"))
+            .any(|m| m.content.contains("too late") || m.content.contains("released"))
     );
     assert!(cancelled_messages.iter().any(|m| {
         m.provenance
@@ -53696,6 +53710,22 @@ fn native_gateway_cancellation_commits_while_provider_is_blocked_and_preserves_a
     );
 }
 
+async fn wait_for_cancelled_native_actor_cleanup(
+    manager: &pioneer_agent::AgentManager,
+    thread_id: &str,
+) {
+    // cancel_turn ACKs cooperative cancellation before durable terminalization.
+    // Wait for active-control cleanup before observe_turn can use its mailbox
+    // and read the actor's completed terminal observation.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while manager.active_turn_id(thread_id).await.is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled native actor should clear active control after durable ACK");
+}
+
 async fn assert_turn_cancel_with_optional_busy_native_actor(
     busy_native: bool,
     with_effects: bool,
@@ -54096,7 +54126,7 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 .cancel_turn(thread_id, turn_id, "user clicked stop")
                 .await
                 .unwrap();
-            // Mailbox observation waits for the direct command's typed durable ACK.
+            wait_for_cancelled_native_actor_cleanup(&processor.agent_manager, thread_id).await;
             assert_eq!(
                 processor
                     .agent_manager
@@ -54278,6 +54308,8 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 0
             );
         }
+        wait_for_cancelled_native_actor_cleanup(&processor.agent_manager, "thr_000000000000000022")
+            .await;
         assert_eq!(
             processor
                 .agent_manager
@@ -54368,46 +54400,38 @@ async fn turn_cancel_cli_runtime_without_active_session_does_not_start_runtime()
 
     let thread_id = "thr_cli_cancel_no_session";
     let turn_id = "turn_cli_cancel_no_session";
-    let thread_start_request_id = generate_test_request_id("clicancel", "thread");
-    let thread_start_request = json!({
-        "jsonrpc": "2.0",
-        "id": thread_start_request_id,
-        "method": "thread/start",
-        "params": {
-            "thread_id": thread_id,
-            "workspace_id": workspace_id,
-            "model": "test-model",
-            "model_provider": "delayed"
-        }
-    });
-    processor
-        .process_request_for_connection(connection_id, &thread_start_request.to_string())
-        .await;
-    let _ = recv_response_by_id(&mut rx, thread_start_request_id.as_str()).await;
-
-    let turn_start_request_id = generate_test_request_id("clicancel", "start");
-    let turn_start_request = json!({
-        "jsonrpc": "2.0",
-        "id": turn_start_request_id,
-        "method": "turn/start",
-        "params": {
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "mode": "Chat",
-            "model": "test-model",
-            "model_provider": "delayed",
-            "input": [{"type": "text", "text": "hello"}]
-        }
-    });
-    processor
-        .process_request_for_connection(connection_id, &turn_start_request.to_string())
-        .await;
-    let _ = recv_response_and_notification_by_id_method(
-        &mut rx,
-        turn_start_request_id.as_str(),
-        events::TURN_STARTED,
+    // Model a persisted CLI turn awaiting its first runtime session. Starting an
+    // API-provider actor and grafting a CLI binding onto it would leave the
+    // native execution/context ownership inconsistent.
+    materialize_cli_runtime_turn_with_text(
+        crud_store.as_ref(),
+        &workspace_id,
+        thread_id,
+        turn_id,
+        "hello",
     )
     .await;
+    subscribe_test_connection_to_materialized_thread(
+        &processor,
+        connection_id,
+        &workspace_id,
+        thread_id,
+    )
+    .await;
+    assert!(
+        processor
+            .agent_manager
+            .turn_owner_generation(thread_id, turn_id)
+            .await
+            .is_none()
+    );
+    assert!(
+        crud_store
+            .native_cancellation_context(turn_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     let now = chrono::Utc::now().fixed_offset();
     let (_starting_binding, initial_attempt) = crud_store
