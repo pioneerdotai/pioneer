@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
@@ -154,6 +154,8 @@ struct AuthorityBoundProvider {
     authority_fingerprint: ProviderAuthorityFingerprint,
     revoked: Arc<AtomicBool>,
     redact_endpoint_errors: bool,
+    discovery_tools: RwLock<BTreeMap<String, bool>>,
+    use_public_catalog: bool,
 }
 
 /// The request's endpoint can contain a secret path. Never retain a raw
@@ -255,6 +257,46 @@ fn redacted_endpoint_error(
 }
 
 impl AuthorityBoundProvider {
+    fn model_tool_calling_with_catalog(
+        &self,
+        model: &str,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> bool {
+        let discovery = self
+            .discovery_tools
+            .read()
+            .expect("discovery tools lock")
+            .get(model)
+            .copied();
+        let source = self
+            .use_public_catalog
+            .then(|| catalog.and_then(|c| c.tool_support(self.name(), model)))
+            .flatten();
+        self.capabilities().tool_calling
+            && crate::catalog::merge_tool_support(discovery, source) != Some(false)
+    }
+
+    fn enrich_discovery(
+        &self,
+        catalog: &crate::catalog::ModelCatalog,
+        models: &mut [ProviderModelInfo],
+    ) {
+        // Keep raw discovery capability in this authority's existing instance;
+        // enrichment must never export it to another credential/endpoint scope.
+        *self.discovery_tools.write().expect("discovery tools lock") = models
+            .iter()
+            .filter_map(|m| m.capabilities.tool_calling.map(|v| (m.id.clone(), v)))
+            .collect();
+        catalog.enrich_for_tool_scope(self.inner.name(), models, self.use_public_catalog);
+    }
+
+    fn discovery_tool_snapshot(&self) -> BTreeMap<String, bool> {
+        self.discovery_tools
+            .read()
+            .expect("discovery tools lock")
+            .clone()
+    }
+
     fn ensure_not_revoked(&self) -> Result<()> {
         if self.revoked.load(Ordering::Acquire) {
             return Err(ProviderAuthorityRevoked.into());
@@ -288,7 +330,8 @@ impl Provider for AuthorityBoundProvider {
     }
 
     fn model_tool_calling(&self, model: &str) -> bool {
-        self.inner.model_tool_calling(model)
+        let catalog = crate::catalog::model_catalog().ok();
+        self.model_tool_calling_with_catalog(model, catalog.as_deref())
     }
 
     fn native_file_tool_capability(
@@ -324,7 +367,12 @@ impl Provider for AuthorityBoundProvider {
         self.public_result(
             crate::attachments::runtime::with_async_authority_scope(
                 self.authority_fingerprint.as_str().to_owned(),
-                self.inner.chat(request),
+                crate::tools::policy::with_discovery_tools(
+                    self.name(),
+                    self.use_public_catalog,
+                    self.discovery_tool_snapshot(),
+                    self.inner.chat(request),
+                ),
             )
             .await,
         )
@@ -338,7 +386,12 @@ impl Provider for AuthorityBoundProvider {
         let stream = self.public_result(
             crate::attachments::runtime::with_async_authority_scope(
                 self.authority_fingerprint.as_str().to_owned(),
-                self.inner.stream_chat(request),
+                crate::tools::policy::with_discovery_tools(
+                    self.name(),
+                    self.use_public_catalog,
+                    self.discovery_tool_snapshot(),
+                    self.inner.stream_chat(request),
+                ),
             )
             .await,
         )?;
@@ -358,7 +411,7 @@ impl Provider for AuthorityBoundProvider {
         self.ensure_not_revoked()?;
         let catalog = crate::catalog::model_catalog()?;
         let mut models = self.public_result(self.inner.list_models().await)?;
-        catalog.enrich(self.inner.name(), &mut models);
+        self.enrich_discovery(&catalog, &mut models);
         Ok(models)
     }
 
@@ -752,11 +805,18 @@ impl ProviderRegistry {
         cache.prune_expired(now, self.limits.idle_ttl);
         let access_sequence = cache.next_sequence();
         let revoked = Arc::new(AtomicBool::new(false));
+        let use_public_catalog = base_url.as_deref().is_none_or(|endpoint| {
+            crate::provider_definition(provider.name())
+                .and_then(|d| d.default_base_url)
+                .is_some_and(|stock| stock.trim_end_matches('/') == endpoint.trim_end_matches('/'))
+        });
         let provider: Arc<dyn Provider> = Arc::new(AuthorityBoundProvider {
             inner: provider,
             authority_fingerprint,
             revoked: revoked.clone(),
             redact_endpoint_errors: base_url.is_some(),
+            use_public_catalog,
+            discovery_tools: RwLock::new(BTreeMap::new()),
         });
         if !cache.make_room_for_insert(self.limits.max_cached_instances) {
             return Err(ProviderRegistryCapacityExceeded {
@@ -879,6 +939,8 @@ impl ProviderRegistry {
             authority_fingerprint: authority_fingerprint.clone(),
             revoked: revoked.clone(),
             redact_endpoint_errors: false,
+            use_public_catalog: false, // injected provider has no attested public endpoint
+            discovery_tools: RwLock::new(BTreeMap::new()),
         });
         cache.prune_expired(now, self.limits.idle_ttl);
         if cache.make_room_for_insert(self.limits.max_cached_instances) {
@@ -1074,6 +1136,108 @@ mod tests {
         let error = provider.list_models().await.unwrap_err();
         assert!(error.to_string().contains("Model catalog is not loaded"));
         assert!(provider.chat(chat_request()).await.is_ok());
+    }
+
+    struct ToolDiscoveryProvider;
+    #[async_trait]
+    impl Provider for ToolDiscoveryProvider {
+        fn name(&self) -> &str {
+            "openai"
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                tool_calling: true,
+                ..Default::default()
+            }
+        }
+        async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+            Ok(vec![crate::catalog::tool_tests::discovered(
+                "g03-positive",
+                Some(false),
+            )])
+        }
+        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+            crate::tools::policy::prepare_request(self.name(), request)?;
+            anyhow::bail!("fixture reached model boundary")
+        }
+        async fn stream_chat(
+            &self,
+            request: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+            crate::tools::policy::prepare_request(self.name(), request)?;
+            anyhow::bail!("fixture reached model boundary")
+        }
+    }
+
+    #[tokio::test]
+    async fn discovered_false_reaches_agent_consumer_and_both_authority_request_paths() {
+        let catalog = crate::catalog::tool_tests::generated_catalog();
+        let wrapper = |authority: &str| AuthorityBoundProvider {
+            inner: Arc::new(ToolDiscoveryProvider),
+            authority_fingerprint: ProviderAuthorityFingerprint(authority.into()),
+            revoked: Arc::new(AtomicBool::new(false)),
+            redact_endpoint_errors: false,
+            use_public_catalog: false,
+            discovery_tools: RwLock::new(BTreeMap::new()),
+        };
+        let mut public = wrapper("public-authority");
+        public.use_public_catalog = true;
+        // Same method as the actual agent's Provider::model_tool_calling,
+        // with an isolated source-generated snapshot rather than global state.
+        assert!(!public.model_tool_calling_with_catalog("g03-negative", Some(&catalog)));
+        assert!(public.model_tool_calling_with_catalog("g03-positive", Some(&catalog)));
+        assert!(public.model_tool_calling_with_catalog("unknown", Some(&catalog)));
+        let a = wrapper("authority-a");
+        let b = wrapper("authority-b");
+        let mut models = a.inner.list_models().await.unwrap();
+        a.enrich_discovery(&catalog, &mut models);
+        assert_eq!(models[0].capabilities.tool_calling, Some(false));
+        assert!(!a.model_tool_calling("g03-positive"));
+        assert!(b.model_tool_calling("g03-positive"));
+        let mut request = crate::tools::policy::test_request();
+        request.model = "g03-positive".into();
+        assert!(
+            a.chat(request.clone())
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("does not support tool definitions")
+        );
+        assert!(
+            a.stream_chat(request.clone())
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("does not support tool definitions")
+        );
+        assert!(
+            b.chat(request.clone())
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("fixture reached model boundary")
+        );
+        request.tool_choice = Some(crate::ToolChoice::None);
+        assert!(
+            a.chat(request)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("does not support tool definitions")
+        );
+        // A fresh discovery listing atomically replaces previous known values.
+        a.enrich_discovery(
+            &catalog,
+            &mut [crate::catalog::tool_tests::discovered(
+                "g03-positive",
+                Some(true),
+            )],
+        );
+        assert!(a.model_tool_calling("g03-positive"));
     }
 
     #[test]

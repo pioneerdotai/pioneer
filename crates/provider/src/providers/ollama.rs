@@ -685,7 +685,7 @@ mod tests {
     use crate::types::{ChatMessage, ProviderReplayState};
 
     #[test]
-    fn repeated_tool_names_return_matching_results_in_call_order() {
+    fn legacy_name_order_projection_preserves_canonical_ids() {
         let provider = OllamaProvider::new();
         let mut assistant = crate::ChatMessage::assistant("");
         assistant.tool_calls = Some(vec![

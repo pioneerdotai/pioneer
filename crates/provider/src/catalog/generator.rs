@@ -73,12 +73,15 @@ impl SourceSnapshot {
 pub struct GeneratedCatalog {
     pub models: BTreeMap<String, BTreeMap<String, Value>>,
     pub provenance: BTreeMap<String, BTreeMap<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_capabilities: Option<super::ToolCapabilities>,
 }
 impl GeneratedCatalog {
     pub fn validate(&self) -> Result<()> {
-        ModelCatalog::parse(
+        ModelCatalog::parse_with_capabilities(
             &serde_json::to_string(&self.models)?,
             &serde_json::to_string(&self.provenance)?,
+            self.tool_capabilities.clone(),
         )?;
         for (provider, models) in &self.models {
             ensure!(
@@ -272,6 +275,7 @@ pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCata
     let mut output = GeneratedCatalog {
         models: BTreeMap::new(),
         provenance: BTreeMap::new(),
+        tool_capabilities: Some(sources::tool_capabilities(snapshot)),
     };
     for candidate in candidates {
         let provider = candidate.provider().to_owned();

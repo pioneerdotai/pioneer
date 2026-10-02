@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 // Sources and profile-by-profile evidence: docs/provider-tools.md.
 pub(crate) fn native_parallel_control(provider: &str) -> bool {
+    let provider = policy_id(provider);
     matches!(
         provider,
         "openai"
@@ -23,26 +24,60 @@ pub(crate) fn native_parallel_control(provider: &str) -> bool {
     )
 }
 
-fn catalog_model(provider: &str, model: &str) -> Option<crate::catalog::CatalogModel> {
-    let provider = match provider {
-        "gemini" => "google",
-        "bedrock" => "amazon-bedrock",
-        "glm" => "zai",
-        other => other,
-    };
-    crate::catalog::model_catalog()
-        .ok()?
-        .model(provider, model)
-        .cloned()
+fn policy_id(provider: &str) -> &str {
+    crate::provider_definition(provider).map_or(provider, |d| d.name)
+}
+
+tokio::task_local! {
+    static DISCOVERY_TOOLS: (String, bool, BTreeMap<String, bool>);
+}
+
+/// Scoped to the authority-bound provider instance, never a brand-global cache.
+pub(crate) async fn with_discovery_tools<T>(
+    provider: &str,
+    use_public_catalog: bool,
+    capabilities: BTreeMap<String, bool>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    DISCOVERY_TOOLS
+        .scope(
+            (
+                policy_id(provider).to_owned(),
+                use_public_catalog,
+                capabilities,
+            ),
+            future,
+        )
+        .await
+}
+
+pub(crate) fn tool_support_with_catalog(
+    provider: &str,
+    model: &str,
+    catalog: Option<&crate::catalog::ModelCatalog>,
+) -> Option<bool> {
+    let context = DISCOVERY_TOOLS
+        .try_with(|(owner, public, c)| {
+            (owner == policy_id(provider)).then(|| (*public, c.get(model).copied()))
+        })
+        .ok()
+        .flatten();
+    let (public, discovery) = context.unwrap_or((true, None));
+    crate::catalog::merge_tool_support(
+        discovery,
+        public
+            .then(|| catalog.and_then(|c| c.tool_support(provider, model)))
+            .flatten(),
+    )
 }
 
 pub(crate) fn model_tool_support(provider: &str, model: &str) -> Option<bool> {
-    crate::catalog::model_catalog()
-        .ok()?
-        .tool_support(provider, model)
+    let catalog = crate::catalog::model_catalog().ok();
+    tool_support_with_catalog(provider, model, catalog.as_deref())
 }
 
 fn validate_tool_name(provider: &str, name: &str) -> Result<()> {
+    let provider = policy_id(provider);
     let max_name = if matches!(provider, "anthropic" | "gemini") {
         128
     } else {
@@ -60,7 +95,21 @@ fn validate_tool_name(provider: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn prepare_request(provider: &str, mut request: ChatRequest) -> Result<ChatRequest> {
+pub(crate) fn prepare_request(provider: &str, request: ChatRequest) -> Result<ChatRequest> {
+    let catalog = crate::catalog::model_catalog().ok();
+    prepare_request_with_catalog(provider, request, catalog.as_deref())
+}
+
+pub(crate) fn prepare_request_with_catalog(
+    provider: &str,
+    mut request: ChatRequest,
+    catalog: Option<&crate::catalog::ModelCatalog>,
+) -> Result<ChatRequest> {
+    let provider = policy_id(provider);
+    let use_public_catalog = DISCOVERY_TOOLS
+        .try_with(|(owner, public, _)| owner != provider || *public)
+        .unwrap_or(true);
+    let catalog = catalog.filter(|_| use_public_catalog);
     let tools = request.tools.as_deref().unwrap_or_default();
     let mut names = BTreeSet::new();
     for tool in tools {
@@ -91,6 +140,17 @@ pub(crate) fn prepare_request(provider: &str, mut request: ChatRequest) -> Resul
     }
 
     let disabled = matches!(request.tool_choice, Some(ToolChoice::None));
+    // A disabled choice does not authorize definitions on a non-tool model.
+    // Fail before sending; do not project tool history into text to evade it.
+    let has_tool_history = request
+        .messages
+        .iter()
+        .any(|m| m.role == Role::Tool || m.tool_calls.as_ref().is_some_and(|c| !c.is_empty()));
+    ensure!(
+        tools.is_empty() && !has_tool_history
+            || tool_support_with_catalog(provider, &request.model, catalog) != Some(false),
+        "provider `{provider}`: catalog/discovery model does not support tool definitions/history"
+    );
     // Converse has no None union member. Omitting the tool config is equivalent
     // for a fresh text request, but cannot safely continue toolUse/toolResult.
     if provider == "bedrock"
@@ -114,20 +174,14 @@ pub(crate) fn prepare_request(provider: &str, mut request: ChatRequest) -> Resul
         request.parallel_tool_calls = None;
         return Ok(request);
     }
-    if !disabled {
-        ensure!(
-            model_tool_support(provider, &request.model) != Some(false),
-            "provider `{provider}`: catalog model does not support tools"
-        );
-        // These families expose tools on Responses, not Chat Completions.
-        // Azure deployment aliases cannot be resolved by inspecting their name.
-        if matches!(provider, "openai" | "azure-openai")
-            && ["gpt-6-astra", "gpt-6.1-sol"]
-                .iter()
-                .any(|p| request.model == *p || request.model.starts_with(&format!("{p}-")))
-        {
-            bail!("provider `{provider}`: this model requires Responses API for tools");
-        }
+    // These families expose the tools field on Responses, not Chat, even if
+    // a caller disables new calls. Azure opaque deployments cannot be inferred.
+    if matches!(provider, "openai" | "azure-openai")
+        && ["gpt-6-astra", "gpt-6.1-sol"]
+            .iter()
+            .any(|p| request.model == *p || request.model.starts_with(&format!("{p}-")))
+    {
+        bail!("provider `{provider}`: this model requires Responses API for tools");
     }
     // Published Messages contract: these families reject forced tool use even
     // with thinking disabled. This is a protocol supplement, not a model list.
@@ -169,10 +223,12 @@ pub(crate) fn prepare_request(provider: &str, mut request: ChatRequest) -> Resul
         );
     }
     if !disabled && provider != "anthropic" {
-        let metadata_control = catalog_model(provider, &request.model)
+        let metadata_control = catalog
+            .and_then(|c| c.model(provider, &request.model))
             .and_then(|m| m.metadata.get("compat").cloned())
             .and_then(|c| c.get("supportsParallelToolCalls").and_then(|v| v.as_bool()));
-        let verified_chat_control = catalog_model(provider, &request.model)
+        let verified_chat_control = catalog
+            .and_then(|c| c.model(provider, &request.model))
             .is_some_and(|m| m.api == "openai-completions" && metadata_control == Some(true));
         let native = (native_parallel_control(provider) && metadata_control != Some(false))
             || verified_chat_control
@@ -194,6 +250,7 @@ pub(crate) fn prepare_request(provider: &str, mut request: ChatRequest) -> Resul
 }
 
 fn wire_id(provider: &str, id: &str) -> Result<String> {
+    let provider = policy_id(provider);
     ensure!(!id.is_empty(), "provider `{provider}`: empty tool call ID");
     if provider == "mistral" {
         if id.len() == 9 && id.bytes().all(|b| b.is_ascii_alphanumeric()) {
@@ -288,8 +345,10 @@ pub(crate) fn prepare_history(provider: &str, messages: &mut [ChatMessage]) -> R
     Ok(())
 }
 
-/// Ollama's native result has a tool_name but no call ID. Project results in
-/// call order, including repeated names, while retaining attachment indexes.
+/// Legacy/template-compatible projection in call order (including repeated
+/// names), retaining original attachment indexes. Current Ollama native types
+/// also support optional tool_call_id; preserving that wire field belongs to
+/// G02 R2. Ordering alone does not establish native ID association.
 pub(crate) fn ordered_tool_results(messages: &[ChatMessage]) -> Vec<usize> {
     let mut order = Vec::with_capacity(messages.len());
     let mut i = 0;
