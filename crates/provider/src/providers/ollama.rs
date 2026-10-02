@@ -52,6 +52,8 @@ struct OllamaMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OllamaToolCall>>,
 }
 
@@ -79,6 +81,7 @@ struct OllamaToolCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OllamaToolFunctionCall {
     name: String,
+    #[serde(deserialize_with = "deserialize_tool_arguments")]
     arguments: serde_json::Value,
 }
 
@@ -222,23 +225,30 @@ impl OllamaProvider {
                         .flatten(),
                     images: (!images.is_empty()).then_some(images),
                     tool_name: (m.role == Role::Tool).then(|| m.name.clone()).flatten(),
-                    tool_calls: m.tool_calls.as_ref().map(|tool_calls| {
-                        tool_calls
-                            .iter()
-                            .map(|call| OllamaToolCall {
-                                id: Some(call.id.clone()),
-                                function: OllamaToolFunctionCall {
-                                    name: call.name.clone(),
-                                    arguments: serde_json::from_str::<serde_json::Value>(
-                                        call.arguments.as_str(),
-                                    )
-                                    .unwrap_or_else(|_| {
-                                        serde_json::Value::String(call.arguments.clone())
-                                    }),
-                                },
-                            })
-                            .collect()
-                    }),
+                    // Native Message.ToolCallID is optional; preserve an existing result ID.
+                    tool_call_id: (m.role == Role::Tool)
+                        .then(|| m.tool_call_id.clone())
+                        .flatten(),
+                    tool_calls: m
+                        .tool_calls
+                        .as_ref()
+                        .map(|tool_calls| {
+                            tool_calls
+                                .iter()
+                                .map(|call| {
+                                    Ok(OllamaToolCall {
+                                        id: Some(call.id.clone()),
+                                        function: OllamaToolFunctionCall {
+                                            name: call.name.clone(),
+                                            arguments: parse_tool_arguments(
+                                                call.arguments.as_str(),
+                                            )?,
+                                        },
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>()
+                        })
+                        .transpose()?,
                 })
             })
             .collect::<Result<Vec<_>>>()
@@ -265,8 +275,7 @@ impl OllamaProvider {
             .map(|(index, call)| ProviderToolCall {
                 id: call.id.unwrap_or_else(|| format!("call_{}", index + 1)),
                 name: call.function.name,
-                arguments: serde_json::to_string(&call.function.arguments)
-                    .unwrap_or_else(|_| "{}".to_owned()),
+                arguments: call.function.arguments.to_string(),
             })
             .collect()
     }
@@ -304,6 +313,33 @@ impl OllamaProvider {
         };
         anyhow!("Ollama API error ({status}): {body}")
     }
+}
+
+// Native ToolCallFunctionArguments is map-backed, unlike Chat's string arguments.
+fn require_tool_arguments(arguments: serde_json::Value) -> Result<serde_json::Value> {
+    if !arguments.is_object() {
+        return Err(anyhow!("Ollama function arguments must be a JSON object"));
+    }
+    Ok(arguments)
+}
+
+fn parse_tool_arguments(raw: &str) -> Result<serde_json::Value> {
+    let arguments = serde_json::from_str(raw).map_err(|_| {
+        anyhow!("Ollama function arguments must be valid JSON containing an object")
+    })?;
+    require_tool_arguments(arguments)
+}
+
+// Shared by ordinary JSON and each native NDJSON response message. Missing args
+// remain a missing required field; explicit null is not normalized into {}.
+fn deserialize_tool_arguments<'de, D>(
+    deserializer: D,
+) -> std::result::Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let arguments = serde_json::Value::deserialize(deserializer)?;
+    require_tool_arguments(arguments).map_err(serde::de::Error::custom)
 }
 
 /// Normalize the base URL by stripping trailing `/api` and trailing `/`.
@@ -790,6 +826,7 @@ mod tests {
                 thinking: None,
                 images: None,
                 tool_name: None,
+                tool_call_id: None,
                 tool_calls: None,
             }],
             stream: false,
@@ -813,6 +850,7 @@ mod tests {
                 thinking: None,
                 images: None,
                 tool_name: None,
+                tool_call_id: None,
                 tool_calls: None,
             }],
             stream: false,
