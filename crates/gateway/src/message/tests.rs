@@ -4,6 +4,9 @@ mod memory_post_turn_response;
 #[path = "tests/task_capsule.rs"]
 mod task_capsule;
 
+#[path = "tests/reconciliation_workers.rs"]
+mod reconciliation_workers;
+
 use super::{
     AuthenticatedTransferOwner, CLIRuntimeMachineRequestKey, MessageProcessor,
     ProgressItemRegistry, ResilienceWorkerFailureImpact, message_future, now_timestamp_secs,
@@ -67370,7 +67373,7 @@ async fn setup_workspace_manager() -> (Arc<WorkspaceManager>, Arc<CrudStore>, St
 }
 
 /// Exercise concurrent preparation with the Gateway reader/writer contour.
-async fn setup_pooled_file_workspace_manager() -> (
+pub(super) async fn setup_pooled_file_workspace_manager() -> (
     tempfile::TempDir,
     Arc<WorkspaceManager>,
     Arc<CrudStore>,
