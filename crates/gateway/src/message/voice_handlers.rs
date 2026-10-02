@@ -365,7 +365,11 @@ impl MessageProcessor {
         )
         .await;
 
+        crate::voice::finalization::acknowledge();
         let pipeline_outcome = self.finalize_voice_session_audio(&session).await;
+        if self.voice_finalizations.shutdown.is_cancelled() {
+            return;
+        }
         // Claim the terminal outcome atomically against cancel/disconnect. The
         // native call cannot be interrupted, but a removed session must never
         // materialize its late transcript as a user turn or emit a second result.
@@ -1069,88 +1073,116 @@ impl MessageProcessor {
                 .take_session_audio(session.session_id.as_str())
                 .map_err(|error| error.into_voice_error())?
         };
-        let signal_stats = VoiceSignalStats::from_samples(audio.normalized_samples.as_slice());
-        debug!(
-            session_id = %session.session_id,
-            thread_id = %session.thread_id,
-            turn_id = %session.turn_id,
-            sample_rate_hz = audio.audio_format.sample_rate_hz,
-            buffered_chunks = audio.chunks.len(),
-            buffered_bytes = audio.buffered_bytes,
-            total_samples = signal_stats.total_samples,
-            signal_rms = signal_stats.rms,
-            signal_peak = signal_stats.peak,
-            non_zero_samples = signal_stats.non_zero_samples,
-            "voice session audio signal stats"
-        );
-        let speech_outcome = {
-            let _startup_part = pioneer_observability::turn_startup::stage(
-                &session.turn_id,
-                pioneer_observability::turn_startup::Stage::VoiceVad,
+        let supervisor = self.voice_input_supervisor.clone();
+        let session_id = session.session_id.clone();
+        let thread_id = session.thread_id.clone();
+        let turn_id = session.turn_id.clone();
+        #[cfg(test)]
+        let test_transcriber = self.voice_test_transcriber.clone();
+        // The owned finalization task awaits this call, retaining its slot and
+        // audio/engine ownership even when cancel removes terminal authority.
+        tokio::task::spawn_blocking(move || {
+            let signal_stats = VoiceSignalStats::from_samples(audio.normalized_samples.as_slice());
+            debug!(
+                session_id = %session_id,
+                thread_id = %thread_id,
+                turn_id = %turn_id,
+                sample_rate_hz = audio.audio_format.sample_rate_hz,
+                buffered_chunks = audio.chunks.len(),
+                buffered_bytes = audio.buffered_bytes,
+                total_samples = signal_stats.total_samples,
+                signal_rms = signal_stats.rms,
+                signal_peak = signal_stats.peak,
+                non_zero_samples = signal_stats.non_zero_samples,
+                "voice session audio signal stats"
             );
-            if audio.normalized_samples.is_empty() {
-                VoiceTranscriptionOutcome::NoSpeech(VoiceTranscriptionNoSpeech {
+            let speech_outcome = {
+                let _startup_part = pioneer_observability::turn_startup::stage(
+                    &turn_id,
+                    pioneer_observability::turn_startup::Stage::VoiceVad,
+                );
+                if audio.normalized_samples.is_empty() {
+                    VoiceTranscriptionOutcome::NoSpeech(VoiceTranscriptionNoSpeech {
                     reason:
                         crate::voice::transcription::VoiceTranscriptionNoSpeechReason::EmptyBuffer,
                     total_samples: 0,
                 })
-            } else {
-                let detector =
-                    EnergyVoiceActivityDetector::new(GATEWAY_VOICE_ENERGY_VAD_THRESHOLD_FLOOR)
+                } else {
+                    let detector =
+                        EnergyVoiceActivityDetector::new(GATEWAY_VOICE_ENERGY_VAD_THRESHOLD_FLOOR)
+                            .map_err(|error| VoiceError {
+                                kind: VoiceErrorKind::TranscriptionFailed,
+                                message: format!(
+                                    "failed to initialize gateway voice VAD: {error:#}"
+                                ),
+                                public_error: None,
+                            })?;
+                    let mut vad = SmoothedVoiceVad::new(detector, VoiceVadConfig::default())
                         .map_err(|error| VoiceError {
                             kind: VoiceErrorKind::TranscriptionFailed,
                             message: format!("failed to initialize gateway voice VAD: {error:#}"),
                             public_error: None,
                         })?;
-                let mut vad = SmoothedVoiceVad::new(detector, VoiceVadConfig::default()).map_err(
-                    |error| VoiceError {
-                        kind: VoiceErrorKind::TranscriptionFailed,
-                        message: format!("failed to initialize gateway voice VAD: {error:#}"),
-                        public_error: None,
-                    },
-                )?;
-                let vad_outcome = vad
-                    .segment_samples(audio.normalized_samples.as_slice())
-                    .map_err(|error| VoiceError {
-                        kind: VoiceErrorKind::TranscriptionFailed,
-                        message: format!("failed to segment voice audio: {error:#}"),
-                        public_error: None,
-                    })?;
-                PreparedSpeechBuffer::from_vad_outcome(
-                    audio.audio_format.sample_rate_hz,
-                    vad_outcome,
-                )
-            }
-        };
+                    let vad_outcome = vad
+                        .segment_samples(audio.normalized_samples.as_slice())
+                        .map_err(|error| VoiceError {
+                            kind: VoiceErrorKind::TranscriptionFailed,
+                            message: format!("failed to segment voice audio: {error:#}"),
+                            public_error: None,
+                        })?;
+                    PreparedSpeechBuffer::from_vad_outcome(
+                        audio.audio_format.sample_rate_hz,
+                        vad_outcome,
+                    )
+                }
+            };
 
-        let buffer = match speech_outcome {
-            VoiceTranscriptionOutcome::Ready(buffer) => buffer,
-            VoiceTranscriptionOutcome::NoSpeech(no_speech) => {
-                return Ok(GatewayVoiceSessionPipelineOutcome::NoSpeech {
+            let buffer = match speech_outcome {
+                VoiceTranscriptionOutcome::Ready(buffer) => buffer,
+                VoiceTranscriptionOutcome::NoSpeech(no_speech) => {
+                    return Ok(GatewayVoiceSessionPipelineOutcome::NoSpeech {
+                        no_speech,
+                        signal_stats,
+                    });
+                }
+            };
+
+            let Some(supervisor) = supervisor.as_ref() else {
+                return Err(VoiceError {
+                    kind: VoiceErrorKind::ModelUnavailable,
+                    message: "Voice Input is not configured".to_owned(),
+                    public_error: None,
+                });
+            };
+            #[cfg(test)]
+            let outcome = if let Some(fake) = test_transcriber {
+                transcribe_prepared_speech_buffer(
+                    &crate::voice::transcription::TestSpeechTranscriber(fake),
+                    buffer,
+                )
+            } else {
+                transcribe_prepared_speech_buffer(supervisor.as_ref(), buffer)
+            };
+            #[cfg(not(test))]
+            let outcome = transcribe_prepared_speech_buffer(supervisor.as_ref(), buffer);
+            match outcome {
+                Ok(Ok(transcript)) => Ok(GatewayVoiceSessionPipelineOutcome::Transcript {
+                    transcript,
+                    signal_stats,
+                }),
+                Ok(Err(no_speech)) => Ok(GatewayVoiceSessionPipelineOutcome::NoSpeech {
                     no_speech,
                     signal_stats,
-                });
+                }),
+                Err(error) => Err(error.into_voice_error()),
             }
-        };
-
-        let Some(supervisor) = self.voice_input_supervisor.as_ref() else {
-            return Err(VoiceError {
-                kind: VoiceErrorKind::ModelUnavailable,
-                message: "Voice Input is not configured".to_owned(),
-                public_error: None,
-            });
-        };
-        match transcribe_prepared_speech_buffer(supervisor.as_ref(), buffer) {
-            Ok(Ok(transcript)) => Ok(GatewayVoiceSessionPipelineOutcome::Transcript {
-                transcript,
-                signal_stats,
-            }),
-            Ok(Err(no_speech)) => Ok(GatewayVoiceSessionPipelineOutcome::NoSpeech {
-                no_speech,
-                signal_stats,
-            }),
-            Err(error) => Err(error.into_voice_error()),
-        }
+        })
+        .await
+        .map_err(|error| VoiceError {
+            kind: VoiceErrorKind::TranscriptionFailed,
+            message: format!("voice finalization worker failed: {error}"),
+            public_error: None,
+        })?
     }
 
     async fn send_voice_result<T>(

@@ -115,36 +115,20 @@ pub(crate) struct OpenAiEmbeddingModelInfo {
     pub legacy: bool,
 }
 
-pub(crate) const OPENAI_EMBEDDING_MODELS: &[OpenAiEmbeddingModelInfo] = &[
-    OpenAiEmbeddingModelInfo {
-        model: "text-embedding-3-small",
-        dimension: 1536,
-        max_batch_size: 2048,
-        max_input_tokens: OPENAI_EMBEDDING_MAX_INPUT_TOKENS,
-        legacy: false,
-    },
-    OpenAiEmbeddingModelInfo {
-        model: "text-embedding-3-large",
-        dimension: 3072,
-        max_batch_size: 2048,
-        max_input_tokens: OPENAI_EMBEDDING_MAX_INPUT_TOKENS,
-        legacy: false,
-    },
-    OpenAiEmbeddingModelInfo {
-        model: "text-embedding-ada-002",
-        dimension: 1536,
-        max_batch_size: 2048,
-        max_input_tokens: OPENAI_EMBEDDING_MAX_INPUT_TOKENS,
-        legacy: true,
-    },
-];
-
-pub(crate) fn openai_embedding_model_info(
-    model: &str,
-) -> Option<&'static OpenAiEmbeddingModelInfo> {
-    OPENAI_EMBEDDING_MODELS
-        .iter()
-        .find(|candidate| candidate.model == model)
+pub(crate) fn openai_embedding_model_info(model: &str) -> Option<OpenAiEmbeddingModelInfo> {
+    let policy = pioneer_provider::providers::embedding::EmbeddingBatchLimits::for_model(
+        "openai", model, None, None, None,
+    )
+    .ok()?;
+    Some(OpenAiEmbeddingModelInfo {
+        model: pioneer_provider::providers::embedding::known_embedding_model("openai", model)?.0,
+        dimension: policy.dimension?,
+        max_batch_size: policy.max_items,
+        max_input_tokens: policy
+            .max_input_tokens?
+            .min(OPENAI_EMBEDDING_MAX_INPUT_TOKENS),
+        legacy: model == "text-embedding-ada-002",
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,23 +139,6 @@ pub(crate) struct OpenRouterEmbeddingModelInfo {
     pub max_input_tokens: usize,
     pub custom: bool,
 }
-
-pub(crate) const OPENROUTER_KNOWN_EMBEDDING_MODELS: &[OpenAiEmbeddingModelInfo] = &[
-    OpenAiEmbeddingModelInfo {
-        model: "openai/text-embedding-3-small",
-        dimension: 1536,
-        max_batch_size: 2048,
-        max_input_tokens: OPENAI_EMBEDDING_MAX_INPUT_TOKENS,
-        legacy: false,
-    },
-    OpenAiEmbeddingModelInfo {
-        model: "openai/text-embedding-3-large",
-        dimension: 3072,
-        max_batch_size: 2048,
-        max_input_tokens: OPENAI_EMBEDDING_MAX_INPUT_TOKENS,
-        legacy: false,
-    },
-];
 
 pub(crate) fn openrouter_embedding_model_info(
     model: &str,
@@ -185,15 +152,17 @@ fn openrouter_embedding_model_info_with_input_limit(
     explicit_dimension: Option<usize>,
     explicit_max_input_tokens: Option<usize>,
 ) -> Result<OpenRouterEmbeddingModelInfo, ThreadEpisodicEmbeddingError> {
-    if let Some(info) = OPENROUTER_KNOWN_EMBEDDING_MODELS
-        .iter()
-        .find(|candidate| candidate.model == model)
+    if let Some(info) =
+        pioneer_provider::providers::embedding::known_embedding_model("openrouter", model)
+            .and_then(|(id, _)| openai_embedding_model_info(id))
     {
         return Ok(OpenRouterEmbeddingModelInfo {
-            model: info.model.to_owned(),
+            model: model.to_owned(),
             dimension: info.dimension,
             max_batch_size: info.max_batch_size,
-            max_input_tokens: explicit_max_input_tokens.unwrap_or(info.max_input_tokens),
+            max_input_tokens: explicit_max_input_tokens
+                .unwrap_or(info.max_input_tokens)
+                .min(info.max_input_tokens),
             custom: false,
         });
     }
@@ -211,7 +180,21 @@ fn openrouter_embedding_model_info_with_input_limit(
     Ok(OpenRouterEmbeddingModelInfo {
         model: model.to_owned(),
         dimension,
-        max_batch_size: 512,
+        max_batch_size: pioneer_provider::providers::embedding::EmbeddingBatchLimits::for_model(
+            OPENROUTER_PROVIDER_ID,
+            model,
+            Some(dimension),
+            None,
+            None,
+        )
+        .map_err(|error| {
+            ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                OPENROUTER_PROVIDER_ID,
+                model,
+                error.to_string(),
+            )
+        })?
+        .max_items,
         max_input_tokens: explicit_max_input_tokens
             .filter(|limit| *limit > EMBEDDING_INPUT_SPECIAL_TOKEN_RESERVE)
             .unwrap_or(OPENROUTER_FALLBACK_EMBEDDING_MAX_INPUT_TOKENS),
@@ -1638,7 +1621,22 @@ impl RemoteEmbeddingProvider {
                 OpenRouterEmbeddingModelInfo {
                     model: model.to_owned(),
                     dimension,
-                    max_batch_size: 512,
+                    max_batch_size:
+                        pioneer_provider::providers::embedding::EmbeddingBatchLimits::for_model(
+                            OPENROUTER_PROVIDER_ID,
+                            model,
+                            Some(dimension),
+                            None,
+                            None,
+                        )
+                        .map_err(|error| {
+                            ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                                OPENROUTER_PROVIDER_ID,
+                                model,
+                                error.to_string(),
+                            )
+                        })?
+                        .max_items,
                     max_input_tokens: explicit_max_input_tokens
                         .filter(|limit| *limit > EMBEDDING_INPUT_SPECIAL_TOKEN_RESERVE)
                         .unwrap_or(OPENROUTER_FALLBACK_EMBEDDING_MAX_INPUT_TOKENS),
@@ -1938,7 +1936,29 @@ impl RemoteEmbeddingProvider {
         }
 
         let mut embeddings = Vec::with_capacity(inputs.len());
-        for chunk in inputs.chunks(self.max_batch_size) {
+        let limits = pioneer_provider::providers::embedding::EmbeddingBatchLimits::for_model(
+            self.provider_id(),
+            self.model(),
+            Some(self.dimension),
+            Some(self.max_input_tokens),
+            Some(self.max_batch_size),
+        )
+        .map_err(|error| {
+            ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                self.provider_id(),
+                self.model(),
+                error.to_string(),
+            )
+        })?;
+        let batches = limits.plan(&inputs).map_err(|error| {
+            ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                self.provider_id(),
+                self.model(),
+                error.to_string(),
+            )
+        })?;
+        for range in batches {
+            let chunk = &inputs[range];
             let response =
                 self.embed_via_provider(EmbeddingRequest::new(self.model(), chunk.to_vec()))?;
             if response.embeddings.len() != chunk.len() {
@@ -2302,6 +2322,167 @@ mod tests {
         }
     }
 
+    struct ReorderingBatchProvider {
+        requests: Mutex<Vec<EmbeddingRequest>>,
+        provider: &'static str,
+        dims: usize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for ReorderingBatchProvider {
+        fn name(&self) -> &str {
+            self.provider
+        }
+        fn capabilities(&self) -> pioneer_provider::ProviderCapabilities {
+            FakeRemoteProvider::with_responses(self.provider, vec![]).capabilities()
+        }
+        async fn chat(
+            &self,
+            _: pioneer_provider::ChatRequest,
+        ) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            anyhow::bail!("unused chat")
+        }
+        async fn stream_chat(
+            &self,
+            _: pioneer_provider::ChatRequest,
+        ) -> anyhow::Result<
+            futures_util::stream::BoxStream<'static, anyhow::Result<pioneer_provider::StreamChunk>>,
+        > {
+            anyhow::bail!("unused stream")
+        }
+        async fn embed(
+            &self,
+            request: EmbeddingRequest,
+        ) -> anyhow::Result<pioneer_provider::EmbeddingResponse> {
+            let limits = pioneer_provider::providers::embedding::EmbeddingBatchLimits::for_model(
+                self.provider,
+                &request.model,
+                Some(self.dims),
+                None,
+                None,
+            )?;
+            limits.validate_request(&request.input)?;
+            let data: Vec<_> = request
+                .input
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(index, text)| {
+                    let marker = text
+                        .strip_prefix("item-")
+                        .and_then(|id| id.parse::<f32>().ok())
+                        .unwrap_or(1.0);
+                    serde_json::json!({"index":index,"embedding":vec![marker;self.dims]})
+                })
+                .collect();
+            let response = serde_json::from_value::<
+                pioneer_provider::providers::embedding::IndexedEmbeddingResponse,
+            >(serde_json::json!({"data":data}))?
+            .into_response(request.input.len())?;
+            self.requests.lock().unwrap().push(request);
+            Ok(response)
+        }
+    }
+    #[test]
+    fn g09_remote_batch_planner_is_wired_to_decorated_chunked_and_ordered_requests() {
+        for (endpoint, model, dims) in [
+            ("openai", "text-embedding-3-small", 1536),
+            ("openai", "text-embedding-3-large", 3072),
+            ("openai", "text-embedding-ada-002", 1536),
+            ("openrouter", "openai/text-embedding-3-small", 1536),
+            ("openrouter", "openai/text-embedding-3-large", 3072),
+        ] {
+            let fake = Arc::new(ReorderingBatchProvider {
+                requests: Mutex::new(vec![]),
+                provider: endpoint,
+                dims,
+            });
+            let provider = if endpoint == "openai" {
+                RemoteEmbeddingProvider::openai(model, false, true, fake.clone()).unwrap()
+            } else {
+                RemoteEmbeddingProvider::openrouter(model, None, false, true, fake.clone()).unwrap()
+            };
+            let inputs: Vec<String> = (0..400).map(|index| format!("item-{index}")).collect();
+            let vectors = provider.embed_input_batch(inputs.clone()).unwrap();
+            assert_eq!(
+                vectors.iter().map(|vector| vector[0]).collect::<Vec<_>>(),
+                (0..400).map(|i| i as f32).collect::<Vec<_>>()
+            );
+            let requests = fake.requests.lock().unwrap().clone();
+            assert!(requests.len() > 1);
+            assert_eq!(
+                requests
+                    .into_iter()
+                    .flat_map(|request| request.input)
+                    .collect::<Vec<_>>(),
+                inputs
+            );
+            // One long document goes through production preparation, flattening,
+            // batch planning, response decoding and document chunk aggregation.
+            let text = " a".repeat(390_000);
+            provider.embed_query(&text).unwrap();
+            let limits = pioneer_provider::providers::embedding::EmbeddingBatchLimits::for_model(
+                endpoint,
+                model,
+                Some(dims),
+                None,
+                None,
+            )
+            .unwrap();
+            let requests = fake.requests.lock().unwrap();
+            for request in requests
+                .iter()
+                .filter(|request| request.input[0].starts_with("Instruct:"))
+            {
+                assert!(
+                    request
+                        .input
+                        .iter()
+                        .all(|input| input.starts_with("Instruct:") && input.contains("\nQuery: "))
+                );
+                limits.validate_request(&request.input).unwrap();
+            }
+            let query_batches: Vec<_> = requests
+                .iter()
+                .filter(|request| request.input[0].starts_with("Instruct:"))
+                .collect();
+            assert!(query_batches.len() > 1);
+            assert_eq!(
+                query_batches
+                    .iter()
+                    .flat_map(|request| &request.input)
+                    .map(|text| tiktoken_rs::cl100k_base_singleton()
+                        .encode_ordinary(text)
+                        .len())
+                    .sum::<usize>()
+                    > 300_000,
+                true
+            );
+        }
+        let fake = Arc::new(ReorderingBatchProvider {
+            requests: Mutex::new(vec![]),
+            provider: "openrouter",
+            dims: 4096,
+        });
+        let custom = RemoteEmbeddingProvider::openrouter(
+            "vendor/custom",
+            Some(4096),
+            false,
+            false,
+            fake.clone(),
+        )
+        .unwrap();
+        custom.embed_batch(&["item-0", "item-1"]).unwrap();
+        assert_eq!(
+            fake.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| request.input.len())
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+    }
+
     fn embedding_response(vectors: Vec<Vec<f32>>) -> pioneer_provider::EmbeddingResponse {
         pioneer_provider::EmbeddingResponse {
             usage: None,
@@ -2508,7 +2689,9 @@ mod tests {
         let chunk_count = prepared.chunks.len();
         let fake = Arc::new(FakeRemoteProvider::with_responses(
             "openrouter",
-            vec![Ok(embedding_response(vec![vec![3.0, 4.0]; chunk_count]))],
+            (0..chunk_count)
+                .map(|_| Ok(embedding_response(vec![vec![3.0, 4.0]])))
+                .collect(),
         ));
         let provider = RemoteEmbeddingProvider::openrouter_with_max_input_tokens(
             "vendor/custom-embed",
@@ -2526,13 +2709,11 @@ mod tests {
 
         assert_eq!(embedding, vec![0.6, 0.8]);
         let requests = fake.requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].input.len(), chunk_count);
+        assert_eq!(requests.len(), chunk_count);
         assert!(
-            requests[0]
-                .input
+            requests
                 .iter()
-                .all(|input| input.len() < text.len())
+                .all(|request| request.input.len() == 1 && request.input[0].len() < text.len())
         );
     }
 

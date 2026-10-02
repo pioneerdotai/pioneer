@@ -13756,6 +13756,213 @@ impl crate::voice::supervisor::VoiceEngineLoader for TestGatewayVoiceEngineLoade
     }
 }
 
+// Regression harness uses the real owned-request dispatcher on one connection.
+// Only the speech transcriber is replaced; VAD/session/claim/admission stay real.
+struct PendingVoiceRelease(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+impl PendingVoiceRelease {
+    fn release(&self) {
+        let (released, condition) = &*self.0;
+        *released.lock().unwrap() = true;
+        condition.notify_all();
+    }
+}
+impl Drop for PendingVoiceRelease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g09_owned_voice_ingress_cancel_disconnect_and_terminal_branches() {
+    use crate::voice::transcription::{VoiceTranscriptionErrorKind, transcription_error};
+    for terminal in ["transcript", "no_speech", "runtime_error"] {
+        for action in ["cancel", "disconnect", "winner"] {
+            let (tx, mut rx) = mpsc::channel(128);
+            let sessions = Arc::new(SessionManager::new());
+            let connection_id = register_authenticated_test_connection(&sessions, tx).await;
+            let context = sessions.connection_context(connection_id).await.unwrap();
+            let (foreign_tx, mut foreign_rx) = mpsc::channel(16);
+            let foreign_id = register_authenticated_test_connection(&sessions, foreign_tx).await;
+            let foreign_context = sessions.connection_context(foreign_id).await.unwrap();
+            let (workspace_manager, crud, workspace_id) = setup_workspace_manager().await;
+            let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            let release = PendingVoiceRelease(gate.clone());
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+            let mut processor = MessageProcessor::new(
+                Arc::new(ThreadManager::new("test-model", "openai")),
+                test_provider(),
+                sessions,
+                workspace_manager,
+                crud.clone(),
+                test_gateway_secrets(),
+                test_summary_config(),
+                test_tool_loop_config(),
+            )
+            .with_voice_input_supervisor(ready_gateway_voice_supervisor("unused native stub"));
+            processor.voice_test_transcriber = Some(Arc::new(move |_buffer| {
+                entered_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                let (released, condition) = &*gate;
+                let mut flag = released.lock().unwrap();
+                while !*flag {
+                    flag = condition.wait(flag).unwrap();
+                }
+                match terminal {
+                    "runtime_error" => Err(transcription_error(
+                        VoiceTranscriptionErrorKind::RuntimeFailure,
+                        "controlled fake failure",
+                    )),
+                    "no_speech" => Ok("  ".to_owned()),
+                    _ => Ok("controlled transcript".to_owned()),
+                }
+            }));
+            let processor = Arc::new(processor);
+            let thread_id = "thr_g09_owned_voice";
+            let turn_id = "turn_g09_owned_voice";
+            let thread = start_thread_for_artifact_test(
+                &processor,
+                connection_id,
+                &mut rx,
+                &workspace_id,
+                thread_id,
+            )
+            .await;
+            let session = start_test_voice_session(
+                &processor,
+                connection_id,
+                &mut rx,
+                &workspace_id,
+                &thread.thread.id,
+                turn_id,
+                "g09start",
+            )
+            .await;
+            processor
+                .process_binary_frame_for_connection(
+                    connection_id,
+                    voice_test_frame(&session.session_id, 0, 960, 12000).as_slice(),
+                )
+                .await
+                .unwrap();
+            let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
+            let before =
+                serde_json::to_value(crud.get_thread_history(thread_id, Some(64)).await.unwrap())
+                    .unwrap();
+            let finalize=json!({"jsonrpc":"2.0","id":"g09finalize","method":"voice/session/finalize","params":{
+                "session_id":session.session_id,"context":{"workspace_id":workspace_id,"thread_id":thread_id,"turn_id":turn_id}
+            }}).to_string();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                processor
+                    .clone()
+                    .process_owned_request(context.clone(), finalize.clone()),
+            )
+            .await
+            .expect("reader must return at ACK while transcriber remains pending");
+            let ack = recv_response_by_id(&mut rx, "g09finalize").await;
+            assert_eq!(ack.result["status"], json!("transcribing"));
+            tokio::time::timeout(Duration::from_secs(5), entered_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            // Same owner repeated finalize is bounded/rejected; another connection
+            // cannot claim the authenticated owner's session (connection_id retained).
+            processor
+                .clone()
+                .process_owned_request(
+                    context.clone(),
+                    finalize.replace("g09finalize", "g09repeat"),
+                )
+                .await;
+            let _ = recv_error_by_id(&mut rx, "g09repeat").await;
+            let cancel=json!({"jsonrpc":"2.0","id":"g09foreign","method":"voice/session/cancel","params":{"session_id":session.session_id}}).to_string();
+            processor
+                .clone()
+                .process_owned_request(foreign_context, cancel.clone())
+                .await;
+            let _ = recv_error_by_id(&mut foreign_rx, "g09foreign").await;
+            assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
+            if action == "cancel" {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    processor.clone().process_owned_request(
+                        context.clone(),
+                        cancel.replace("g09foreign", "g09cancel"),
+                    ),
+                )
+                .await
+                .expect("same-connection cancel must complete BEFORE fake release");
+                let response = recv_response_by_id(&mut rx, "g09cancel").await;
+                assert_eq!(response.result["cancelled"], json!(true));
+                let event =
+                    recv_notification_by_method(&mut rx, events::VOICE_SESSION_RESULT).await;
+                let result: VoiceSessionResultNotification =
+                    serde_json::from_value(event.params.unwrap()).unwrap();
+                assert_eq!(result.outcome, VoiceSessionOutcome::Cancelled);
+            } else if action == "disconnect" {
+                processor.connection_closed(connection_id).await;
+                assert!(!processor.voice_sessions.has_active_sessions().unwrap());
+                assert!(
+                    processor
+                        .voice_session_buffers
+                        .take_session_audio(&session.session_id)
+                        .is_err()
+                );
+            }
+            release.release();
+            // Closing the tracker enables waiting for completion; it does
+            // not cancel the pipeline or forbid spawning by itself. Await exact worker completion, no sleeps.
+            processor.voice_finalizations.tasks.close();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                processor.voice_finalizations.tasks.wait(),
+            )
+            .await
+            .unwrap();
+            if action == "winner" {
+                let event =
+                    recv_notification_by_method(&mut rx, events::VOICE_SESSION_RESULT).await;
+                let result: VoiceSessionResultNotification =
+                    serde_json::from_value(event.params.unwrap()).unwrap();
+                let expected = match terminal {
+                    "transcript" => VoiceSessionOutcome::TurnStarted,
+                    "no_speech" => VoiceSessionOutcome::NoSpeech,
+                    _ => VoiceSessionOutcome::Failed,
+                };
+                assert_eq!(result.outcome, expected);
+                assert_eq!(
+                    crud.get_turn(thread_id, turn_id).await.unwrap().is_some(),
+                    terminal == "transcript"
+                );
+                processor
+                    .clone()
+                    .process_owned_request(context, cancel.replace("g09foreign", "g09latecancel"))
+                    .await;
+                let _ = recv_error_by_id(&mut rx, "g09latecancel").await;
+            } else {
+                assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
+                assert_eq!(
+                    serde_json::to_value(
+                        crud.get_thread_history(thread_id, Some(64)).await.unwrap()
+                    )
+                    .unwrap(),
+                    before
+                );
+            }
+            while let Ok(message) = rx.try_recv() {
+                if let Message::Text(text) = message {
+                    let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
+                    assert_ne!(
+                        value.get("method").and_then(JsonValue::as_str),
+                        Some(events::VOICE_SESSION_RESULT),
+                        "no second/late terminal notification"
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn ready_gateway_voice_supervisor(
     transcript: &str,
 ) -> Arc<crate::voice::supervisor::VoiceInputSupervisor> {

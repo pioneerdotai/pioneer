@@ -1,4 +1,6 @@
-use super::embedding::{ApiEmbeddingData, ApiEmbeddingUsage, ordered_vectors, validate_input};
+#[cfg(test)]
+use super::embedding::ordered_vectors;
+use super::embedding::validate_input;
 use crate::{
     attachments::{
         AttachmentOperationError, AttachmentPipelineConfig, AttachmentTransportKind,
@@ -37,8 +39,9 @@ use pioneer_protocol::{
 pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 
 #[derive(Clone, Copy)]
-struct OpenAiEmbeddingModelDefinition {
-    id: &'static str,
+pub(super) struct OpenAiEmbeddingModelDefinition {
+    pub(super) id: &'static str,
+    pub(super) dimension: usize,
     name: &'static str,
     description: &'static str,
 }
@@ -46,20 +49,29 @@ struct OpenAiEmbeddingModelDefinition {
 const OPENAI_EMBEDDING_MODELS: &[OpenAiEmbeddingModelDefinition] = &[
     OpenAiEmbeddingModelDefinition {
         id: "text-embedding-3-small",
+        dimension: 1536,
         name: "Text Embedding 3 Small",
         description: "1536-dimensional embedding model optimized for cost and latency.",
     },
     OpenAiEmbeddingModelDefinition {
         id: "text-embedding-3-large",
+        dimension: 3072,
         name: "Text Embedding 3 Large",
         description: "3072-dimensional embedding model optimized for higher retrieval quality.",
     },
     OpenAiEmbeddingModelDefinition {
         id: "text-embedding-ada-002",
+        dimension: 1536,
         name: "Text Embedding Ada 002",
         description: "Legacy 1536-dimensional embedding model.",
     },
 ];
+
+pub(super) fn embedding_model_definition(
+    id: &str,
+) -> Option<&'static OpenAiEmbeddingModelDefinition> {
+    OPENAI_EMBEDDING_MODELS.iter().find(|model| model.id == id)
+}
 
 pub struct OpenAiProvider {
     api_key: String,
@@ -241,12 +253,7 @@ struct ApiEmbeddingRequest {
     encoding_format: &'static str,
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiEmbeddingResponse {
-    data: Vec<ApiEmbeddingData>,
-    #[serde(default)]
-    usage: Option<ApiEmbeddingUsage>,
-}
+type ApiEmbeddingResponse = super::embedding::IndexedEmbeddingResponse;
 
 // ── SSE streaming response types ────────────────────────────────────────────
 
@@ -1340,6 +1347,14 @@ impl crate::traits::Provider for OpenAiProvider {
 
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
         validate_input(&request.model, &request.input)?;
+        super::embedding::EmbeddingBatchLimits::for_model(
+            "openai",
+            &request.model,
+            None,
+            None,
+            None,
+        )?
+        .validate_request(&request.input)?;
         let expected_count = request.input.len();
         let api_request = ApiEmbeddingRequest {
             model: request.model,
@@ -1366,10 +1381,7 @@ impl crate::traits::Provider for OpenAiProvider {
             "provider_response",
         )
         .await?;
-        Ok(EmbeddingResponse {
-            embeddings: ordered_vectors(response.data, expected_count)?,
-            usage: response.usage.map(Into::into),
-        })
+        response.into_response(expected_count)
     }
 }
 
@@ -1418,6 +1430,27 @@ fn openai_embedding_model_info(model: &OpenAiEmbeddingModelDefinition) -> Provid
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn g09_direct_embedding_adapter_rejects_invalid_batch_before_network() {
+        let provider = OpenAiProvider::new("unused-fixture-key");
+        for model in [
+            "text-embedding-3-small",
+            "text-embedding-3-large",
+            "text-embedding-ada-002",
+        ] {
+            let error = provider
+                .embed(EmbeddingRequest::new(model, vec!["short".to_owned(); 2048]))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("budget"));
+            let error = provider
+                .embed(EmbeddingRequest::new(model, vec![" a".repeat(8193)]))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("token budget"));
+        }
+    }
 
     #[test]
     fn embedding_wire_contract_has_actual_endpoint_model_input_encoding_and_usage() {

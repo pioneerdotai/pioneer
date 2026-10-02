@@ -1,4 +1,6 @@
-use super::embedding::{ApiEmbeddingData, ApiEmbeddingUsage, ordered_vectors, validate_input};
+#[cfg(test)]
+use super::embedding::ordered_vectors;
+use super::embedding::validate_input;
 use crate::failure::ProviderStreamIncomplete;
 use crate::{
     attachments::{
@@ -226,12 +228,7 @@ struct ApiEmbeddingRequest {
     encoding_format: &'static str,
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiEmbeddingResponse {
-    data: Vec<ApiEmbeddingData>,
-    #[serde(default)]
-    usage: Option<ApiEmbeddingUsage>,
-}
+type ApiEmbeddingResponse = super::embedding::IndexedEmbeddingResponse;
 
 // ── SSE streaming response types ────────────────────────────────────────────
 
@@ -1567,6 +1564,14 @@ impl crate::traits::Provider for OpenRouterProvider {
 
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
         validate_input(&request.model, &request.input)?;
+        super::embedding::EmbeddingBatchLimits::for_model(
+            "openrouter",
+            &request.model,
+            None,
+            None,
+            None,
+        )?
+        .validate_request(&request.input)?;
         let expected_count = request.input.len();
         let api_request = ApiEmbeddingRequest {
             model: request.model,
@@ -1594,10 +1599,7 @@ impl crate::traits::Provider for OpenRouterProvider {
             "provider_response",
         )
         .await?;
-        Ok(EmbeddingResponse {
-            embeddings: ordered_vectors(response.data, expected_count)?,
-            usage: response.usage.map(Into::into),
-        })
+        response.into_response(expected_count)
     }
 }
 
@@ -1715,6 +1717,37 @@ fn openrouter_reasoning_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn g09_direct_embedding_adapter_rejects_invalid_batch_before_network() {
+        let provider = OpenRouterProvider::new("unused-fixture-key");
+        for model in [
+            "openai/text-embedding-3-small",
+            "openai/text-embedding-3-large",
+        ] {
+            let error = provider
+                .embed(EmbeddingRequest::new(model, vec!["short".to_owned(); 2048]))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("budget"));
+            let error = provider
+                .embed(EmbeddingRequest::new(model, vec![" a".repeat(8193)]))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("token budget"));
+        }
+        assert!(
+            provider
+                .embed(EmbeddingRequest::new(
+                    "vendor/unknown",
+                    vec!["a".into(), "b".into()]
+                ))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("budget")
+        );
+    }
 
     #[test]
     fn embedding_wire_contract_has_actual_endpoint_model_input_encoding_and_usage() {

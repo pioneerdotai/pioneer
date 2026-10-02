@@ -669,6 +669,9 @@ pub struct MessageProcessor {
     voice_input_supervisor: Option<Arc<VoiceInputSupervisor>>,
     self_improvement_supervisor: Option<Arc<crate::self_improvement::supervisor::SelfImprovementSupervisor>>,
     gateway_settings_update_lock: Arc<Mutex<()>>,
+    pub(crate) voice_finalizations: crate::voice::finalization::VoiceFinalizations,
+    #[cfg(test)]
+    pub(crate) voice_test_transcriber: Option<crate::voice::transcription::TestVoiceSpeechTranscriber>,
     pub(crate) voice_sessions: GatewayVoiceSessionStore,
     pub(crate) voice_session_buffers: GatewayVoiceSessionBufferStore,
 }
@@ -1291,6 +1294,9 @@ impl MessageProcessor {
             voice_input_supervisor: None,
             self_improvement_supervisor: None,
             gateway_settings_update_lock: Arc::new(Mutex::new(())),
+            voice_finalizations: Default::default(),
+            #[cfg(test)]
+            voice_test_transcriber: None,
             voice_sessions: GatewayVoiceSessionStore::default(),
             voice_session_buffers: GatewayVoiceSessionBufferStore::default(),
         }
@@ -1540,6 +1546,13 @@ impl MessageProcessor {
                 );
             }
         }
+    }
+
+    /// Close ingress slots, suppress unclaimed outcomes, and drain the bounded
+    /// workers before database shutdown. Native calls retain ownership to completion.
+    pub async fn shutdown_voice_finalizations(&self) {
+        self.voice_finalizations.close();
+        self.voice_finalizations.tasks.wait().await;
     }
 
     pub async fn shutdown_mcp_service(&self) {
@@ -4708,6 +4721,9 @@ impl MessageProcessor {
             voice_input_supervisor: None,
             self_improvement_supervisor: None,
             gateway_settings_update_lock: Arc::new(Mutex::new(())),
+            voice_finalizations: Default::default(),
+            #[cfg(test)]
+            voice_test_transcriber: None,
             voice_sessions: GatewayVoiceSessionStore::default(),
             voice_session_buffers: GatewayVoiceSessionBufferStore::default(),
         }

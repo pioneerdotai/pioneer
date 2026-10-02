@@ -5,7 +5,7 @@ mod compatible;
 pub(crate) mod copilot;
 pub(crate) mod deepseek;
 mod echo;
-mod embedding;
+pub mod embedding;
 pub(crate) mod gemini;
 pub(crate) mod glm;
 mod local;

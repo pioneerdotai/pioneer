@@ -1114,6 +1114,7 @@ async fn run_gateway_until_shutdown_inner(
     );
     message_processor.shutdown_remote_access_supervisor().await;
     let server_shutdown_result = handle.shutdown().await;
+    message_processor.shutdown_voice_finalizations().await;
     message_processor.shutdown_cli_runtime_manager().await;
     message_processor.shutdown_mcp_service().await;
     self_improvement_supervisor.shutdown().await;
