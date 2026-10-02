@@ -2326,19 +2326,27 @@ impl MessageProcessor {
 
                 let result = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
-                    retry_transient_storage_access(|| {
-                        this.reconcile_terminal_task_run_occurrence_turns(64)
-                    }),
+                    this.reconcile_terminal_task_run_occurrence_turns(64),
                 )
                 .await;
-                occurrence_reporting.observe(&result, Instant::now());
-                match result {
-                    Ok(reconciled) if reconciled > 0 => info!(
-                        reconciled,
-                        "reconciled terminal TaskRuns with parent occurrence Turns"
-                    ),
-                    Ok(_) => {}
-                    Err(_) => {}
+                occurrence_reporting.observe_occurrences(&result, Instant::now());
+                if let Ok(summary) = result
+                    && summary.selected > 0
+                {
+                    info!(
+                        selected = summary.selected,
+                        claimed = summary.claimed,
+                        reconciled = summary.changed,
+                        lost_claims = summary.lost_claims,
+                        stale = summary.stale,
+                        unresolved = summary.unresolved,
+                        no_change = summary.no_change,
+                        claim_errors = summary.claim_errors,
+                        repair_errors = summary.repair_errors,
+                        storage_errors = summary.storage_errors,
+                        notification_errors = summary.notification_errors,
+                        "TaskRun parent occurrence reconciliation pass"
+                    );
                 }
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(

@@ -22,6 +22,7 @@ impl Operation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cause {
     Unclassified,
+    MissingDependency,
     SqliteCantOpen,
     SqliteBusy,
     SqliteLocked,
@@ -38,6 +39,7 @@ impl Cause {
     fn as_str(self) -> &'static str {
         match self {
             Self::Unclassified => "unclassified",
+            Self::MissingDependency => "missing_dependency",
             Self::SqliteCantOpen => "sqlite_cantopen",
             Self::SqliteBusy => "sqlite_busy",
             Self::SqliteLocked => "sqlite_locked",
@@ -52,7 +54,10 @@ impl Cause {
         }
     }
     fn confirmed_storage(self) -> bool {
-        !matches!(self, Self::Unclassified | Self::SqliteOther)
+        !matches!(
+            self,
+            Self::Unclassified | Self::SqliteOther | Self::MissingDependency
+        )
     }
 }
 
@@ -137,6 +142,12 @@ impl Diagnostic {
     }
 }
 
+pub(super) fn is_storage_failure(error: &anyhow::Error) -> bool {
+    Diagnostic::extract(Operation::TaskRunOccurrence, error)
+        .cause
+        .confirmed_storage()
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Episode {
     started: Instant,
@@ -188,6 +199,30 @@ impl Reporter {
                     snapshot.emit(true);
                 }
             }
+        }
+    }
+    /// Candidate failures do not make a partially successful pass recover its
+    /// reporter. Discovery failure remains a separate whole-database outcome.
+    pub(super) fn observe_occurrences(
+        &mut self,
+        result: &anyhow::Result<super::tasks::TaskRunOccurrenceReconcileSummary>,
+        now: Instant,
+    ) {
+        match result {
+            Ok(summary) if summary.first_error.is_some() => {
+                let diagnostic =
+                    Diagnostic::extract(self.operation, summary.first_error.as_ref().unwrap());
+                if let Some(snapshot) = self.failure(diagnostic, now) {
+                    snapshot.emit(false);
+                }
+            }
+            Ok(summary) if summary.unresolved > 0 => {
+                let diagnostic = Diagnostic::new(self.operation, Cause::MissingDependency);
+                if let Some(snapshot) = self.failure(diagnostic, now) {
+                    snapshot.emit(false);
+                }
+            }
+            _ => self.observe(result, now),
         }
     }
     fn failure(&mut self, diagnostic: Diagnostic, now: Instant) -> Option<Snapshot> {
