@@ -6,9 +6,11 @@ Branch: `fix/incremental-task-run-occurrence-reconcile`
 
 Base: `6022ad18c6f0aaf85d2c63f4153c8d7f3d1552fb`
 
-Тесты не запускались. Приложение не запускалось. Пользовательская БД не открывалась,
-миграции на ней не выполнялись. Это передача реализации на ревью, до отдельного
-этапа принятия и запуска тестов.
+Реализация на commit `7b9e6c5dcc0c17c913ac1d3c819bc17fe7980fe6` принята
+пользователем. Разрешён текущий этап адресных тестов; полные crate/workspace
+прогоны запрещены. Фактические результаты записаны в конце документа.
+Ниже сохранены исторические записи статического ревью: до принятия тесты не
+запускались. Приложение и пользовательская БД не запускаются/не открываются.
 
 ## Protocol
 
@@ -275,7 +277,6 @@ cargo test -p pioneer-crud occurrence_tracker
 cargo test -p pioneer-crud task_run_occurrence_terminalization
 cargo test -p pioneer-gateway task_run_occurrence_tracker
 cargo test -p pioneer-gateway reconciliation_workers
-cargo test -p pioneer-crud -p pioneer-gateway -p pioneer-migration -p pioneer-sqlite
 ```
 
 Не запускать эти команды до принятия реализации. Runtime behavior, actual restart,
@@ -306,7 +307,7 @@ WAL не измерялись. Следующий этап — независи�
 предложенных тестов; отсутствие известных незавершённых частей реализации не
 заменяет этот этап проверки.
 
-## Follow-up review
+## Follow-up review (до принятия, историческая запись)
 
 Reviewed starting commit: `0d47eb455f09537c8a5375f5db0a9d6564f53d78`.
 Доработка ведётся в той же ветке/worktree. Реализация ещё не принята.
@@ -348,3 +349,78 @@ Runtime SQL, cancellation/replay/reopen, EXPLAIN и производительн
 - `crates/gateway/src/message/tests/reconciliation_workers.rs` — summary-aware existing reporting tests.
 - `crates/gateway/src/message/tests/task_run_occurrence_tracker.rs` — 8 Gateway regression tests.
 - `TASK_RUN_OCCURRENCE_RECONCILE_REVIEW.md` — this handoff.
+
+
+## Адресная проверка после принятия
+
+Пользователь принял реализацию `7b9e6c5dcc0c17c913ac1d3c819bc17fe7980fe6`
+и отдельно разрешил только адресные тесты. Полные crate/workspace прогоны не
+выполняются. Все test-команды имеют фильтр модуля или конкретного имени;
+`--lib` ограничивает target, `--exact` используется для отдельных сценариев.
+Компиляция lib-test binary сама по себе не означает выполнение всех его тестов.
+
+Первые прогоны выявили ошибки тестовых fixtures:
+
+- CRUD: переименование `Turn.id` на проецированном Turn нарушало FK событий и
+  compaction bookkeeping. Теперь физический DML сценарий создаёт Turn через
+  штатный repository без event-history зависимостей; обязательная запись
+  `compaction_turn_creation` переносится в одной транзакции с сохранением sequence.
+  FK, триггеры и production-инварианты не отключаются.
+- CRUD: инъецированный отказ `UPDATE OF claim_token` мешал также source-trigger
+  инвалидировать token при изменении generation. Блокер снимается перед source
+  UPDATE; сохранённый снимок неудачной попытки по-прежнему проверяет stale deferral.
+- Gateway: копия Turn с principal author snapshot материализовалась от System.
+  Fixture теперь использует исходного authenticated principal. При исправлении
+  компилятор также потребовал clone principal ID из Arc; это исправлено.
+
+Production-код в этом этапе не меняется. Первоначальный CRUD-прогон: 26 passed,
+2 failed; следующий: 27 passed, 1 failed. После исправления ID-fixture отдельный
+точный тест прошёл, затем весь адресный модуль tracker: **28 passed, 0 failed**.
+Первый Gateway tracker прогон: 8 failed на создании общей fixture до сценариев.
+Окончательные результаты всех адресных групп приведены ниже.
+
+
+Все **56 уникальных адресных тестов прошли** в окончательных прогонах
+(отдельный повтор теста переноса ID не увеличивает это число):
+
+| Адресная группа | Passed | Failed |
+| --- | ---: | ---: |
+| CRUD occurrence tracker | 28 | 0 |
+| CRUD canonical occurrence terminalization | 3 | 0 |
+| Gateway occurrence tracker | 8 | 0 |
+| Gateway reconciliation workers | 3 | 0 |
+| Gateway reconciliation diagnostics | 8 | 0 |
+| CRUD native finalization/outbox, четыре точных сценария | 4 | 0 |
+| Gateway acceptance/terminal rollback, два точных сценария | 2 | 0 |
+| Всего уникальных тестов | 56 | 0 |
+
+Выполненные успешные команды:
+
+```sh
+cargo test -p pioneer-crud --lib tests::occurrence_tracker::
+cargo test -p pioneer-crud --lib tests::occurrence_tracker::both_late_inserts_deletes_and_id_moves_track_exact_current_pairs -- --exact
+cargo test -p pioneer-crud --lib tests::task_run_occurrence_terminalization_
+cargo test -p pioneer-gateway --lib message::tests::task_run_occurrence_tracker::
+cargo test -p pioneer-gateway --lib message::tests::reconciliation_workers::
+cargo test -p pioneer-gateway --lib message::reconciliation_diagnostics::tests::
+cargo test -p pioneer-crud --lib tests::native_terminal_effect_outbox_activates_atomically_and_recovers_expired_claim_after_restart -- --exact
+cargo test -p pioneer-crud --lib tests::native_terminal_effect_outbox_converges_for_acceptance_before_completion -- --exact
+cargo test -p pioneer-crud --lib tests::native_terminal_effect_outbox_converges_for_completion_before_acceptance_after_restart -- --exact
+cargo test -p pioneer-crud --lib tests::prepared_native_finalization_defers_until_its_predecessor_is_projected -- --exact
+cargo test -p pioneer-gateway --lib message::tests::task_accept_rpc_finalizes_review_candidate_and_queues_delivery -- --exact
+cargo test -p pioneer-gateway --lib message::tests::compaction_task_output_queue_failure_rolls_back_run_and_delivery_then_recovers -- --exact
+```
+
+Дополнительные проверки: `cargo fmt --all`, `cargo fmt --all -- --check`,
+`git diff --check`; проверка HEAD/ветки/status и статический просмотр fixture diff.
+Основной checkout остался чистым на исходной базе.
+
+Все БД этих сценариев — memory либо временные файловые fixtures проекта;
+пользовательская БД не открывалась, приложение не запускалось. Полные crate и
+workspace тесты, benchmarks и profiling не запускались. Проверки SQL-планов и
+reopen/cancellation выполнены в пределах написанных тестовых сценариев, а не как
+измерение производительности или полный restart приложения. Реальная panic
+внутри ремонта и потеря commit acknowledgement из-за I/O по-прежнему не
+инъецировались; ambiguous outcome проверен моделью сохранённого исходного снимка.
+Объём WAL и производительность не измерялись. Неизбирательная недоступность всех
+служебных записей storage по-прежнему не позволяет обещать durable backoff.

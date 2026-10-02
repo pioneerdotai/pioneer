@@ -164,16 +164,21 @@ async fn both_late_inserts_deletes_and_id_moves_track_exact_current_pairs() {
         turn_kind: TurnKind::TaskRun,
         ..sample_turn(&run.id)
     };
-    store
-        .materialize_turn_start(
-            &thread,
-            SandboxMode::FullAccess,
-            &occurrence,
-            &[],
-            PersistedActorRef::System,
-        )
-        .await
-        .unwrap();
+    // Exercise physical source DML on a valid Turn without event-history FK
+    // dependents. A projected Turn's identity cannot be renamed independently
+    // of those dependents; this fixture must not disable their constraints.
+    crate::repositories::turn::upsert_turn(
+        &store.connection,
+        &run.id,
+        &thread.id,
+        &occurrence,
+        None,
+        None,
+        unix_to_datetime(1_700_000_000),
+        unix_to_datetime(1_700_000_000),
+    )
+    .await
+    .unwrap();
     let first = row(&store, &run.id).await.unwrap();
     let saved = runs::Entity::find_by_id(run.id.clone())
         .one(&store.connection)
@@ -208,19 +213,42 @@ async fn both_late_inserts_deletes_and_id_moves_track_exact_current_pairs() {
     }
     let third = row(&store, &run.id).await.unwrap();
     assert!(third.generation > second.generation);
-    turns::Entity::update_many()
-        .col_expr(turns::Column::Id, Expr::val("moved_turn"))
-        .filter(turns::Column::Id.eq(&run.id))
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    assert!(row(&store, &run.id).await.is_none());
-    turns::Entity::update_many()
-        .col_expr(turns::Column::Id, Expr::val(&run.id))
-        .filter(turns::Column::Id.eq("moved_turn"))
-        .exec(&store.connection)
-        .await
-        .unwrap();
+    for (old, new) in [
+        (run.id.as_str(), "moved_turn"),
+        ("moved_turn", run.id.as_str()),
+    ] {
+        // INSERT always creates compaction bookkeeping with a non-cascading
+        // identity FK. Move that dependent atomically with this physical DML
+        // fixture, preserving its sequence and enforcing every FK throughout.
+        use pioneer_entity::compaction_turn_creation as creation;
+        let tx = store.connection.begin().await.unwrap();
+        let mut dependent = creation::Entity::find()
+            .filter(creation::Column::TurnId.eq(old))
+            .one(&tx)
+            .await
+            .unwrap()
+            .unwrap();
+        creation::Entity::delete_by_id(dependent.sequence)
+            .exec(&tx)
+            .await
+            .unwrap();
+        turns::Entity::update_many()
+            .col_expr(turns::Column::Id, Expr::val(new))
+            .filter(turns::Column::Id.eq(old))
+            .exec(&tx)
+            .await
+            .unwrap();
+        dependent.turn_id = new.to_owned();
+        creation::Entity::insert(dependent.into_active_model())
+            .exec(&tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(row(&store, "moved_turn").await.is_none());
+        if new == "moved_turn" {
+            assert!(row(&store, &run.id).await.is_none());
+        }
+    }
     assert!(row(&store, &run.id).await.unwrap().generation > third.generation);
     turns::Entity::delete_by_id(run.id.clone())
         .exec(&store.connection)
@@ -1753,6 +1781,14 @@ async fn failed_claim_deferral_fences_generation_token_due_count_and_ambiguous_s
         Deferral::StateChanged
     );
     assert_eq!(row(&store, &run.id).await.unwrap(), deferred);
+    // Source refresh must also invalidate the token. Remove the injected token
+    // write blocker before changing the source, while retaining the failed
+    // attempt's exact snapshot to test its later stale deferral.
+    maintenance
+        .connection
+        .execute_unprepared("DROP TRIGGER reject_claim")
+        .await
+        .unwrap();
     // A late result of the same refusal cannot postpone a new generation.
     runs::Entity::update_many()
         .col_expr(
@@ -1771,11 +1807,6 @@ async fn failed_claim_deferral_fences_generation_token_due_count_and_ambiguous_s
         Deferral::StateChanged
     );
     assert_eq!(row(&store, &run.id).await.unwrap(), updated);
-    maintenance
-        .connection
-        .execute_unprepared("DROP TRIGGER reject_claim")
-        .await
-        .unwrap();
     let candidate = TaskRunOccurrenceReconcileCandidate {
         run_id: run.id.clone(),
         generation: updated.generation,

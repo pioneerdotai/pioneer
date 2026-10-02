@@ -33,6 +33,11 @@ async fn fixture() -> (MessageProcessor, Arc<CrudStore>) {
     .exec(&store.database_connection())
     .await
     .unwrap();
+    // The copied Turn carries the authenticated principal's author snapshot.
+    // Preserve that same initiator rather than binding the copy to System.
+    let initiator = pioneer_protocol::PersistedActorRef::Principal(
+        authenticated_test_superuser().principal_id.clone(),
+    );
     for index in 0..66 {
         let id = format!("tracker_{index}");
         if index > 0 {
@@ -47,7 +52,7 @@ async fn fixture() -> (MessageProcessor, Arc<CrudStore>) {
                     SandboxMode::FullAccess,
                     &occurrence,
                     &[],
-                    pioneer_protocol::PersistedActorRef::System,
+                    initiator.clone(),
                 )
                 .await
                 .unwrap();
