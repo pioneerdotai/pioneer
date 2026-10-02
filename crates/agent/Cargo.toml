@@ -33,3 +33,5 @@ chrono.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+sentry = { workspace = true, features = ["test"] }
+tracing-subscriber.workspace = true
