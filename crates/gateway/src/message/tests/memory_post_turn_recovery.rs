@@ -837,9 +837,12 @@ async fn legacy_manifest_without_checkpoint_reclassifies_saved_candidate() {
         error.message.as_str(),
         "memory manifest loading failed: failure_class=invalid_stored_data failure_stage=candidates sqlite_primary_code=None sqlite_extended_code=None"
     );
+    // The worker also appends its known safe metadata to the outbox message.
     assert_eq!(
         status.last_error_message.as_deref(),
-        Some(error.message.as_str())
+        Some(
+            "memory manifest loading failed: failure_class=invalid_stored_data failure_stage=candidates sqlite_primary_code=None sqlite_extended_code=None; failure_stage=candidates; failure_class=invalid_stored_data"
+        )
     );
     assert!(
         !serde_json::to_string(&error)
@@ -1412,7 +1415,9 @@ async fn manifest_actual_active_query_failure_is_unclassified_with_sqlite_codes(
     assert_eq!(status.last_error_code.as_deref(), Some(error.code.as_str()));
     assert_eq!(
         status.last_error_message.as_deref(),
-        Some(error.message.as_str())
+        Some(
+            "memory manifest loading failed: failure_class=unclassified failure_stage=active sqlite_primary_code=Some(1) sqlite_extended_code=Some(1); failure_stage=active; failure_class=unclassified"
+        )
     );
     assert_eq!(fixture.model.call_count(), 0);
     assert!(fixture.writes.attempts.lock().unwrap().is_empty());
