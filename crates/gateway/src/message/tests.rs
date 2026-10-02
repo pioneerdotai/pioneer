@@ -3342,6 +3342,47 @@ struct DelayedProvider {
     text: String,
 }
 
+struct CancellationBarrierProvider {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl Provider for CancellationBarrierProvider {
+    fn name(&self) -> &str {
+        "delayed"
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: true,
+            embeddings: false,
+            transcription: false,
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+    async fn chat(&self, _request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(ChatResponse {
+            text: "released".to_owned(),
+            usage: None,
+            reasoning_content: None,
+            provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::Complete,
+            tool_calls: Vec::new(),
+        })
+    }
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![Ok(StreamChunk::delta(response.text))]).boxed())
+    }
+}
+
 struct RevisionProvider {
     requests: std::sync::Mutex<Vec<ChatRequest>>,
 }
@@ -4520,6 +4561,7 @@ struct Phase13RecordingHookHandler {
 struct TaskPostTurnRecordingHookHandler {
     hook_id: HookId,
     calls: Arc<std::sync::Mutex<Vec<HookHandlerRequest>>>,
+    cancellation_barrier: Option<Arc<CancellationEffectBarrier>>,
 }
 
 #[async_trait::async_trait]
@@ -4550,6 +4592,10 @@ impl HookHandler for TaskPostTurnRecordingHookHandler {
             .lock()
             .expect("Task post-turn hook calls lock")
             .push(request);
+        if let Some(barrier) = &self.cancellation_barrier {
+            barrier.hook_entered.notify_one();
+            barrier.release.acquire().await.unwrap().forget();
+        }
         Ok(HookHandlerResponse::default())
     }
 }
@@ -4666,6 +4712,13 @@ fn phase_13_hook_runtime_with_fallback(
 fn task_post_turn_recording_hook_runtime(
     calls: Arc<std::sync::Mutex<Vec<HookHandlerRequest>>>,
 ) -> Arc<HookRuntime> {
+    task_post_turn_recording_hook_runtime_with_cancellation_barrier(calls, None)
+}
+
+fn task_post_turn_recording_hook_runtime_with_cancellation_barrier(
+    calls: Arc<std::sync::Mutex<Vec<HookHandlerRequest>>>,
+    cancellation_barrier: Option<Arc<CancellationEffectBarrier>>,
+) -> Arc<HookRuntime> {
     let handlers = Arc::new(HookRegistry::new());
     let subscriptions = Arc::new(HookSubscriptionRegistry::new());
     let hook_id = HookId::new("test.task_post_turn_recorder").expect("valid hook id");
@@ -4673,6 +4726,7 @@ fn task_post_turn_recording_hook_runtime(
         .register_handler(Arc::new(TaskPostTurnRecordingHookHandler {
             hook_id: hook_id.clone(),
             calls,
+            cancellation_barrier,
         }))
         .expect("Task post-turn hook registers");
     subscriptions
@@ -12119,11 +12173,13 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "delayed"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let provider_entered = Arc::new(Notify::new());
+    let provider_release = Arc::new(Notify::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "delayed",
-        Arc::new(DelayedProvider {
-            delay: Duration::from_secs(30),
-            text: "too late".to_owned(),
+        Arc::new(CancellationBarrierProvider {
+            entered: provider_entered.clone(),
+            release: provider_release,
         }),
     ));
     let processor = Arc::new(MessageProcessor::new(
@@ -12213,6 +12269,18 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
         .expect("Composer should create one detached task");
     let run_id = wait_for_task_run_id(crud_store.clone(), task.id.as_str()).await;
     let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run_id.as_str()).await;
+    // Lineage creation precedes native actor admission. Cancel the running child
+    // only after registration of its original immutable cancellation context.
+    tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
+        .await
+        .expect("child provider should enter after context registration");
+    assert!(
+        crud_store
+            .native_cancellation_context(&lineage.child_turn_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
 
     thread_manager
         .thread_start_seeded(
@@ -12337,7 +12405,7 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
         cancelled_exchange
             .assistant_text
             .as_deref()
-            .is_none_or(|text| !text.contains("too late")),
+            .is_none_or(|text| !text.contains("too late") && !text.contains("released")),
         "partial or late provider output must not enter cancelled history"
     );
 
@@ -12378,7 +12446,7 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
     assert!(
         !cancelled_messages
             .iter()
-            .any(|m| m.content.contains("too late"))
+            .any(|m| m.content.contains("too late") || m.content.contains("released"))
     );
     assert!(cancelled_messages.iter().any(|m| {
         m.provenance
@@ -53638,21 +53706,62 @@ fn turn_cancel_interrupts_running_turn_and_is_idempotent() {
 }
 
 async fn assert_turn_cancel_interrupts_running_turn_and_is_idempotent() {
-    let (tx, mut rx) = mpsc::channel(16);
+    assert_turn_cancel_with_optional_busy_native_actor(false, false, false).await;
+}
+
+#[test]
+fn native_gateway_cancellation_commits_while_provider_is_blocked_and_preserves_actor() {
+    run_standard_stack_message_test(
+        "native cancellation with blocked provider",
+        assert_turn_cancel_with_optional_busy_native_actor(true, false, false),
+    );
+}
+
+async fn wait_for_cancelled_native_actor_cleanup(
+    manager: &pioneer_agent::AgentManager,
+    thread_id: &str,
+) {
+    // cancel_turn ACKs cooperative cancellation before durable terminalization.
+    // Wait for active-control cleanup before observe_turn can use its mailbox
+    // and read the actor's completed terminal observation.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while manager.active_turn_id(thread_id).await.is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled native actor should clear active control after durable ACK");
+}
+
+async fn assert_turn_cancel_with_optional_busy_native_actor(
+    busy_native: bool,
+    with_effects: bool,
+    resume_direct: bool,
+) {
+    let (tx, mut rx) = mpsc::channel(256);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "delayed"));
     let thread_manager_for_assert = thread_manager.clone();
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "delayed",
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let provider: Arc<dyn Provider> = if busy_native {
+        Arc::new(CancellationBarrierProvider {
+            entered: entered.clone(),
+            release: release.clone(),
+        })
+    } else {
         Arc::new(DelayedProvider {
             delay: Duration::from_secs(30),
             text: "too late".to_owned(),
-        }),
+        })
+    };
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "delayed", provider,
     ));
     let crud_store_for_assert = crud_store.clone();
-    let processor = MessageProcessor::new(
+    let processor = Arc::new(MessageProcessor::new(
         thread_manager,
         provider_registry,
         session_manager,
@@ -53661,7 +53770,16 @@ async fn assert_turn_cancel_interrupts_running_turn_and_is_idempotent() {
         test_gateway_secrets(),
         test_summary_config(),
         test_tool_loop_config(),
-    );
+    ));
+    let post_turn_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cleanup_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let effect_barrier = Arc::new(CancellationEffectBarrier {
+        hook_entered: Notify::new(),
+        cleanup_entered: Notify::new(),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let mut committed_events = None;
+    let mut preserved_blocked_rows = Vec::new();
 
     let thread_request_id = generate_test_request_id("turncancel", "thread");
     let thread_start_request = json!({
@@ -53732,6 +53850,302 @@ async fn assert_turn_cancel_interrupts_running_turn_and_is_idempotent() {
     )
     .await;
 
+    if with_effects {
+        install_recoverable_test_hook_runtime(
+            &processor,
+            task_post_turn_recording_hook_runtime_with_cancellation_barrier(
+                post_turn_calls.clone(),
+                Some(effect_barrier.clone()),
+            ),
+        )
+        .await;
+        processor
+            .agent_manager
+            .set_post_turn_hook_dispatch_policy(pioneer_agent::AgentPostTurnHookDispatchPolicy {
+                on_interrupted: true,
+                ..Default::default()
+            })
+            .await;
+        processor
+            .agent_manager
+            .set_task_tool_provider(Some(Arc::new(CancellationCleanupProvider {
+                calls: cleanup_calls.clone(),
+                barrier: effect_barrier.clone(),
+            })))
+            .await;
+    }
+
+    if busy_native {
+        let thread_id = "thr_000000000000000022";
+        let turn_id = "turn_000000000000000022";
+        ensure_test_superuser_execution_authority(processor.crud_store.as_ref()).await;
+        let mut authority = crate::authorization::ExecutionAuthorizationContext::for_test(
+            authenticated_test_superuser().as_ref(),
+            &workspace_id,
+            thread_id,
+            &default_test_permission_profile(),
+            None,
+        );
+        authority.bind_test_provider_authority(
+            "delayed",
+            "test-model",
+            processor
+                .provider_registry
+                .authority_fingerprint_for_workspace(&workspace_id, "delayed")
+                .unwrap()
+                .as_str(),
+        );
+        assert!(
+            processor
+                .crud_store
+                .set_turn_execution_authorization_context(
+                    turn_id,
+                    &authority.to_persisted_json().unwrap()
+                )
+                .await
+                .unwrap()
+        );
+        for cycle in 0..if resume_direct { 2 } else { 1 } {
+            processor
+                .agent_manager
+                .ensure_thread(thread_id, &workspace_id)
+                .await
+                .unwrap();
+            committed_events = processor.agent_manager.subscribe_committed(thread_id).await;
+            processor
+                .ensure_agent_listener_task(thread_id)
+                .await
+                .unwrap();
+            processor
+                .agent_manager
+                .start_turn_with_hook_context_permission_profile_and_security_snapshot(
+                    thread_id,
+                    turn_id,
+                    if with_effects {
+                        ThreadMode::Agent
+                    } else {
+                        ThreadMode::Chat
+                    },
+                    pioneer_agent::AgentTurnHookRuntimeContext::default(),
+                    "test-model",
+                    "delayed",
+                    HashMap::new(),
+                    pioneer_skills::SkillCatalogSnapshot {
+                        version: 1,
+                        generated_at_unix: 0,
+                        skills: Vec::new(),
+                    },
+                    vec![UserInput::Text {
+                        text: "hello".to_owned(),
+                        text_elements: Vec::new(),
+                    }],
+                    Vec::new(),
+                    Vec::new(),
+                    HashMap::new(),
+                    Vec::new(),
+                    default_test_permission_profile(),
+                    test_full_access_execution_security_snapshot(),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            // The provider cannot finish until release; it stays unreleased throughout cancellation.
+            assert!(
+                crud_store_for_assert
+                    .native_cancellation_context(turn_id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+
+            if resume_direct && cycle == 0 {
+                processor.agent_manager.remove_thread(thread_id).await;
+                let context = crud_store_for_assert
+                    .native_cancellation_context(turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut blocked_plan = context.preparation.clone();
+                blocked_plan.batch_id.push_str(":blocked");
+                for effect in &mut blocked_plan.effects {
+                    effect.effect_id = effect
+                        .effect_id
+                        .replace(":cancellation-effect:", ":terminal-effect:");
+                    match &mut effect.payload {
+                        pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                            request,
+                            ..
+                        } => {
+                            let mut phase: pioneer_hooks::HookPhaseRequest =
+                                serde_json::from_value(request.clone()).unwrap();
+                            let pioneer_hooks::HookInputPayload::TurnPostTurn(input) =
+                                &mut phase.input.payload
+                            else {
+                                panic!("hook input");
+                            };
+                            input.status = pioneer_hooks::TurnPostTurnStatus::Blocked;
+                            *request = serde_json::to_value(phase).unwrap();
+                        }
+                        pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
+                            reason,
+                            ..
+                        } => *reason = "parent turn blocked".into(),
+                        _ => panic!("executable original plan"),
+                    }
+                }
+                // Real ordinary preparation, canonical Blocked and activation.
+                crud_store_for_assert
+                    .prepare_native_terminal_effects(blocked_plan.clone(), now_timestamp_secs())
+                    .await
+                    .unwrap();
+                let (_, mut blocked) = crud_store_for_assert
+                    .get_turn(thread_id, turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                blocked.status = TurnStatus::Blocked;
+                processor
+                    .materialize_native_agent_turn_event(
+                        pioneer_crud::CanonicalTurnEventPayload::TurnBlocked(
+                            pioneer_protocol::TurnBlockedNotification {
+                                workspace_id: workspace_id.clone(),
+                                thread_id: thread_id.into(),
+                                turn: blocked,
+                                resume: None,
+                            },
+                        ),
+                        now_timestamp_secs(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::join!(
+                        effect_barrier.hook_entered.notified(),
+                        effect_barrier.cleanup_entered.notified()
+                    );
+                })
+                .await
+                .unwrap();
+                let db = crud_store_for_assert.database_connection();
+                let mut claimed_rows = Vec::new();
+                for effect in &blocked_plan.effects {
+                    let row = pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(
+                        effect.effect_id.clone(),
+                    )
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert!(row.terminal_committed_at.is_some());
+                    assert_eq!(row.attempt_count, 1);
+                    claimed_rows.push(row);
+                }
+                effect_barrier.release.add_permits(2);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while processor
+                        .native_terminal_effect_kick_running
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                for before in claimed_rows {
+                    let after = pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(
+                        before.effect_id.clone(),
+                    )
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(after.status, "succeeded");
+                    assert_eq!(
+                        after.payload_identity_sha256,
+                        before.payload_identity_sha256
+                    );
+                    assert_eq!(after.gate_kind, before.gate_kind);
+                    assert_eq!(after.attempt_count, before.attempt_count);
+                    assert_eq!(after.terminal_committed_at, before.terminal_committed_at);
+                    preserved_blocked_rows.push(after);
+                }
+                let now = now_timestamp_secs();
+                let job = crud_store_for_assert
+                    .enqueue_recovery_job(
+                        turn_id.into(),
+                        "reasoning_resume".into(),
+                        pioneer_protocol::TurnItemType::Reasoning,
+                        None,
+                        pioneer_protocol::RecoveryTrigger::Timeout,
+                        pioneer_protocol::RecoveryAction::BlockResumable,
+                        None,
+                        None,
+                        None,
+                        None,
+                        0,
+                        0,
+                        json!({}),
+                        json!({"base_backoff_secs":0,"max_wall_clock_secs":60}),
+                        now,
+                    )
+                    .await
+                    .unwrap();
+                crud_store_for_assert
+                    .mark_recovery_job_terminal(
+                        &job.id,
+                        pioneer_protocol::RecoveryJobStatus::Blocked,
+                        None,
+                        now,
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    crud_store_for_assert
+                        .resume_blocked_turn_recovery(
+                            thread_id,
+                            turn_id,
+                            Some(&job.id),
+                            now,
+                            processor.turn_execution_owner_id.as_ref(),
+                            now + 100
+                        )
+                        .await
+                        .unwrap(),
+                    pioneer_crud::BlockedTurnRecoveryResumeOutcome::Resumed(_)
+                ));
+                assert_eq!(
+                    crud_store_for_assert
+                        .native_cancellation_context(turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .preparation,
+                    context.preparation
+                );
+            }
+        }
+        if resume_direct {
+            processor
+                .agent_manager
+                .cancel_turn(thread_id, turn_id, "user clicked stop")
+                .await
+                .unwrap();
+            wait_for_cancelled_native_actor_cleanup(&processor.agent_manager, thread_id).await;
+            assert_eq!(
+                processor
+                    .agent_manager
+                    .observe_turn(thread_id, turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                pioneer_agent::ExecutionTurnStatus::Interrupted
+            );
+        }
+    }
     let turn_cancel_request_id = generate_test_request_id("turncancel", "stop1");
     let turn_cancel_request = json!({
         "jsonrpc": "2.0",
@@ -53802,6 +54216,165 @@ async fn assert_turn_cancel_interrupts_running_turn_and_is_idempotent() {
         .expect("interrupted turn should be persisted");
     assert_eq!(persisted_turn.status, TurnStatus::Interrupted);
     assert_eq!(persisted_turn.error.as_deref(), Some("user clicked stop"));
+    if busy_native {
+        assert!(
+            crud_store_for_assert
+                .native_cancellation_was_accepted("turn_000000000000000022")
+                .await
+                .unwrap()
+        );
+        if with_effects {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(
+                    effect_barrier.hook_entered.notified(),
+                    effect_barrier.cleanup_entered.notified()
+                );
+            })
+            .await
+            .unwrap();
+            // Existing workers have claimed both rows but barriers prevent completion.
+            // Receipt, marker and original bounded payloads must already be durable.
+            let context = crud_store_for_assert
+                .native_cancellation_context("turn_000000000000000022")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(context.preparation.effects.len(), 2);
+            let expected = pioneer_agent::post_turn::prepare_native_cancellation(
+                context.preparation.clone(),
+                "user clicked stop",
+            )
+            .unwrap();
+            let db = crud_store_for_assert.database_connection();
+            for effect in &expected.effects {
+                let row = pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(
+                    effect.effect_id.clone(),
+                )
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(row.terminal_committed_at.is_some());
+                assert_eq!(
+                    serde_json::from_str::<pioneer_protocol::NativeTerminalEffectPayload>(
+                        &row.payload_json
+                    )
+                    .unwrap(),
+                    effect.payload
+                );
+            }
+            let marker = pioneer_entity::turn_event_projection_stream_state::Entity::find_by_id(
+                "turn_000000000000000022",
+            )
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(marker.accepted_terminal_event_id, context.accepted_event_id);
+            effect_barrier.release.add_permits(2);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while processor
+                    .native_terminal_effect_kick_running
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                crud_store_for_assert
+                    .native_terminal_effect_stats()
+                    .await
+                    .unwrap()
+                    .succeeded,
+                if resume_direct { 4 } else { 2 }
+            );
+            assert_eq!(
+                post_turn_calls.lock().unwrap().len(),
+                if resume_direct { 2 } else { 1 }
+            );
+            assert_eq!(
+                cleanup_calls.lock().unwrap().len(),
+                if resume_direct { 2 } else { 1 }
+            );
+            assert_eq!(
+                processor
+                    .process_due_native_terminal_effects(chrono::Utc::now().timestamp(), 8)
+                    .await
+                    .unwrap(),
+                0
+            );
+        } else {
+            assert_eq!(
+                crud_store_for_assert
+                    .native_terminal_effect_stats()
+                    .await
+                    .unwrap()
+                    .ready,
+                0
+            );
+        }
+        wait_for_cancelled_native_actor_cleanup(&processor.agent_manager, "thr_000000000000000022")
+            .await;
+        assert_eq!(
+            processor
+                .agent_manager
+                .observe_turn("thr_000000000000000022", "turn_000000000000000022")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            pioneer_agent::ExecutionTurnStatus::Interrupted
+        );
+        assert_eq!(
+            processor.agent_manager.health_snapshot().await.dead_actors,
+            0
+        );
+        if let Some(events) = committed_events.as_mut() {
+            while let Ok(event) = events.try_recv() {
+                assert!(
+                    !matches!(event, pioneer_protocol::AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } if preparation.turn_id == "turn_000000000000000022")
+                );
+            }
+        }
+        let restarted = pioneer_crud::CrudStore::new(crud_store_for_assert.database_connection());
+        let now = now_timestamp_secs();
+        assert_eq!(
+            restarted
+                .claim_due_native_terminal_effects(now, 30, 2)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        for before in &preserved_blocked_rows {
+            let after = pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(
+                before.effect_id.clone(),
+            )
+            .one(&restarted.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                &after, before,
+                "cancellation/replay must preserve the entire completed Blocked row"
+            );
+        }
+        // Actor generation survives the confirmed cancellation; teardown is explicit.
+        assert!(
+            processor
+                .agent_manager
+                .thread_generation("thr_000000000000000022")
+                .await
+                .is_some()
+        );
+        processor
+            .agent_manager
+            .remove_thread("thr_000000000000000022")
+            .await;
+        release.notify_one();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -53834,46 +54407,64 @@ async fn turn_cancel_cli_runtime_without_active_session_does_not_start_runtime()
 
     let thread_id = "thr_cli_cancel_no_session";
     let turn_id = "turn_cli_cancel_no_session";
-    let thread_start_request_id = generate_test_request_id("clicancel", "thread");
-    let thread_start_request = json!({
-        "jsonrpc": "2.0",
-        "id": thread_start_request_id,
-        "method": "thread/start",
-        "params": {
-            "thread_id": thread_id,
-            "workspace_id": workspace_id,
-            "model": "test-model",
-            "model_provider": "delayed"
-        }
-    });
-    processor
-        .process_request_for_connection(connection_id, &thread_start_request.to_string())
-        .await;
-    let _ = recv_response_by_id(&mut rx, thread_start_request_id.as_str()).await;
-
-    let turn_start_request_id = generate_test_request_id("clicancel", "start");
-    let turn_start_request = json!({
-        "jsonrpc": "2.0",
-        "id": turn_start_request_id,
-        "method": "turn/start",
-        "params": {
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "mode": "Chat",
-            "model": "test-model",
-            "model_provider": "delayed",
-            "input": [{"type": "text", "text": "hello"}]
-        }
-    });
-    processor
-        .process_request_for_connection(connection_id, &turn_start_request.to_string())
-        .await;
-    let _ = recv_response_and_notification_by_id_method(
-        &mut rx,
-        turn_start_request_id.as_str(),
-        events::TURN_STARTED,
+    // Model a persisted CLI turn awaiting its first runtime session. Starting an
+    // API-provider actor and grafting a CLI binding onto it would leave the
+    // native execution/context ownership inconsistent.
+    materialize_cli_runtime_turn_with_text(
+        crud_store.as_ref(),
+        &workspace_id,
+        thread_id,
+        turn_id,
+        "hello",
     )
     .await;
+    subscribe_test_connection_to_materialized_thread(
+        &processor,
+        connection_id,
+        &workspace_id,
+        thread_id,
+    )
+    .await;
+    // Subscription seeds a new session and clears its in-memory turns. Restore
+    // the durable turn afterwards, as terminal lifecycle recovery does.
+    let persisted = crud_store
+        .get_thread_model(thread_id)
+        .await
+        .expect("persisted CLI cancellation thread should load")
+        .expect("persisted CLI cancellation thread should exist");
+    let sandbox_mode = crud_store
+        .get_thread_sandbox_mode(thread_id)
+        .await
+        .expect("persisted CLI cancellation sandbox should load");
+    processor
+        .thread_manager
+        .system_thread_restore_persisted(persisted, sandbox_mode)
+        .await
+        .expect("CLI cancellation should restore its durable turn into local state");
+    assert_eq!(
+        processor
+            .thread_manager
+            .turn_get(thread_id, turn_id)
+            .await
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+    assert!(
+        processor
+            .agent_manager
+            .turn_owner_generation(thread_id, turn_id)
+            .await
+            .is_none()
+    );
+    assert!(
+        crud_store
+            .native_cancellation_context(turn_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     let now = chrono::Utc::now().fixed_offset();
     let (_starting_binding, initial_attempt) = crud_store
@@ -77531,3 +78122,405 @@ mod task_delivery_cancellation;
 
 #[path = "tests/memory_post_turn_recovery.rs"]
 mod memory_post_turn_recovery;
+
+struct CancellationEffectBarrier {
+    hook_entered: Notify,
+    cleanup_entered: Notify,
+    release: tokio::sync::Semaphore,
+}
+struct CancellationCleanupProvider {
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+    barrier: Arc<CancellationEffectBarrier>,
+}
+#[async_trait::async_trait]
+impl TaskToolProvider for CancellationCleanupProvider {
+    fn terminal_cleanup_runtime_contract(&self) -> &'static str {
+        "test.native-cancellation-cleanup.v1"
+    }
+    async fn materialize_task_tools(
+        &self,
+        _: TaskTurnContext,
+    ) -> Result<pioneer_agent::TaskToolMaterialization, String> {
+        Ok(pioneer_agent::TaskToolMaterialization {
+            bundles: Vec::new(),
+            diagnostics: Vec::new(),
+        })
+    }
+    async fn pending_attached_tasks(
+        &self,
+        _: TaskTurnContext,
+    ) -> Result<Vec<pioneer_agent::PendingAttachedTask>, String> {
+        Ok(Vec::new())
+    }
+    async fn review_required_attached_task_observations(
+        &self,
+        _: TaskTurnContext,
+    ) -> Result<Vec<pioneer_agent::ReviewRequiredTaskObservation>, String> {
+        Ok(Vec::new())
+    }
+    async fn terminal_attached_task_observations(
+        &self,
+        _: TaskTurnContext,
+    ) -> Result<Vec<pioneer_agent::TerminalTaskObservation>, String> {
+        Ok(Vec::new())
+    }
+    async fn cleanup_attached_tasks(&self, _: TaskTurnContext, _: String) -> Result<(), String> {
+        Err("durable cleanup must use idempotent adapter".into())
+    }
+    async fn cleanup_attached_tasks_idempotent(
+        &self,
+        effect: &str,
+        context: TaskTurnContext,
+        reason: String,
+    ) -> Result<(), String> {
+        assert_eq!(context.turn_id, "turn_000000000000000022");
+        assert!(matches!(
+            reason.as_str(),
+            "parent turn cancelled: user clicked stop" | "parent turn blocked"
+        ));
+        let new = {
+            let mut calls = self.calls.lock().unwrap();
+            if calls.iter().any(|id| id == effect) {
+                false
+            } else {
+                calls.push(effect.to_owned());
+                true
+            }
+        };
+        if new {
+            self.barrier.cleanup_entered.notify_one();
+            self.barrier.release.acquire().await.unwrap().forget();
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn native_gateway_cancellation_persists_and_processes_hook_cleanup_without_repeat_preparation_or_error()
+ {
+    // One isolated current-thread runtime keeps the scoped tracing subscriber
+    // active for actor/listener/worker tasks without installing a global subscriber.
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            use tracing_subscriber::prelude::*;
+            let events = sentry::test::with_captured_events(|| {
+                let subscriber = tracing_subscriber::registry()
+                    .with(pioneer_observability::sentry_tracing_layer());
+                tracing::subscriber::with_default(subscriber, || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    runtime.block_on(assert_turn_cancel_with_optional_busy_native_actor(
+                        true, true, false,
+                    ));
+                    runtime.shutdown_timeout(Duration::from_secs(5));
+                });
+            });
+            for event in events {
+                let json = serde_json::to_string(&event).unwrap();
+                assert!(!json.contains("durable agent-loop event was permanently rejected"));
+                assert!(!json.contains("durable event commit was exhausted"));
+                assert!(!json.contains("terminal durable event commit was exhausted"));
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn native_direct_cancellation_after_activated_blocked_resume_preserves_old_worker_rows() {
+    run_standard_stack_message_test(
+        "direct cancellation after activated Blocked resume",
+        assert_turn_cancel_with_optional_busy_native_actor(true, true, true),
+    );
+}
+
+#[test]
+fn native_cancellation_race_fallback_preserves_materialization_error_and_requires_durable_ack() {
+    run_standard_stack_message_test("native cancellation turn_finish race", async {
+        use super::agent_runtime::native_preparation_failure_tests::open_fixture_database;
+        // Capture an actual typed driver BUSY before constructing the race. No
+        // notification, provider work or barrier wait occurs under this lock.
+        let directory = tempfile::tempdir().unwrap();
+        let url = pioneer_sqlite::sqlite_connection_url(&directory.path().join("race.sqlite"));
+        let owner = open_fixture_database(&url).await;
+        let contender = open_fixture_database(&url).await;
+        owner
+            .execute_unprepared("CREATE TABLE fact(id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        let tx = owner.begin().await.unwrap();
+        tx.execute_unprepared("INSERT INTO fact VALUES(1)")
+            .await
+            .unwrap();
+        let busy = contender
+            .execute_unprepared("INSERT INTO fact VALUES(2)")
+            .await
+            .unwrap_err();
+        tx.rollback().await.unwrap();
+        owner.close().await.unwrap();
+        contender.close().await.unwrap();
+        for case in 0..3 {
+            let busy_native = false;
+            let (tx, mut rx) = mpsc::channel(256);
+            let session_manager = Arc::new(SessionManager::new());
+            let connection_id =
+                register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+            let thread_manager = Arc::new(ThreadManager::new("o4-mini", "delayed"));
+            let thread_manager_for_assert = thread_manager.clone();
+            let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let provider: Arc<dyn Provider> = if busy_native {
+                Arc::new(CancellationBarrierProvider {
+                    entered: entered.clone(),
+                    release: release.clone(),
+                })
+            } else {
+                Arc::new(DelayedProvider {
+                    delay: Duration::from_secs(30),
+                    text: "too late".to_owned(),
+                })
+            };
+            let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+                "delayed", provider,
+            ));
+            let crud_store_for_assert = crud_store.clone();
+            let processor = Arc::new(MessageProcessor::new(
+                thread_manager,
+                provider_registry,
+                session_manager,
+                workspace_manager,
+                crud_store,
+                test_gateway_secrets(),
+                test_summary_config(),
+                test_tool_loop_config(),
+            ));
+            let thread_request_id = generate_test_request_id("turncancel", "thread");
+            let thread_start_request = json!({
+                "jsonrpc": "2.0",
+                "id": thread_request_id,
+                "method": "thread/start",
+                "params": {
+                    "thread_id": "thr_000000000000000022",
+                    "workspace_id": workspace_id,
+                    "model": "test-model",
+                    "model_provider": "delayed"
+                }
+            });
+            processor
+                .process_request_for_connection(connection_id, &thread_start_request.to_string())
+                .await;
+            let _ = recv_response_by_id(&mut rx, thread_request_id.as_str()).await;
+
+            // Cancellation is the control-plane operation under test. Seed an admitted,
+            // durable in-progress Turn directly so the assertion does not depend on the
+            // separate launch-admission surface (which has its own exhaustive tests).
+            let turn_outcome = thread_manager_for_assert
+                .turn_start(
+                    connection_id,
+                    pioneer_protocol::TurnStartParams {
+                        agent_delegation_routes: Vec::new(),
+                        thread_id: "thr_000000000000000022".to_owned(),
+                        turn_id: "turn_000000000000000022".to_owned(),
+                        input: vec![UserInput::Text {
+                            text: "hello".to_owned(),
+                            text_elements: Vec::new(),
+                        }],
+                        capabilities: Vec::new(),
+                        model: Some("test-model".to_owned()),
+                        model_provider: Some("delayed".to_owned()),
+                        sandbox_policy: None,
+                        mode: Some(ThreadMode::Agent),
+                        agent_launch: None,
+                        reply_to_turn_id: None,
+                        mentioned_principal_ids: Vec::new(),
+                        execution_backend: Some(AgentExecutionBackend::ApiProvider {
+                            provider: "delayed".to_owned(),
+                        }),
+                        reasoning: None,
+                        permission_profile: None,
+                        cli_runtime_options: None,
+                    },
+                )
+                .await
+                .expect("turn cancellation fixture should seed an in-progress Turn");
+            crud_store_for_assert
+                .materialize_turn_start(
+                    &turn_outcome.materialization.thread,
+                    turn_outcome.materialization.sandbox_mode,
+                    &turn_outcome.materialization.turn,
+                    &turn_outcome.materialization.input,
+                    pioneer_protocol::PersistedActorRef::Principal(
+                        authenticated_test_superuser().principal_id.clone(),
+                    ),
+                )
+                .await
+                .expect("turn cancellation fixture should persist the in-progress Turn");
+            wait_for_thread_manager_turn_status(
+                thread_manager_for_assert.as_ref(),
+                "thr_000000000000000022",
+                "turn_000000000000000022",
+                TurnStatus::InProgress,
+            )
+            .await;
+
+            let thread_id = "thr_000000000000000022";
+            let turn_id = "turn_000000000000000022";
+            let original = pioneer_protocol::NativeTerminalEffectPreparation {
+                batch_id: format!("{turn_id}:original-cancellation"),
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.into(),
+                turn_id: turn_id.into(),
+                runtime_generation: 1,
+                effects: Vec::new(),
+            };
+            crud_store_for_assert
+                .persist_native_cancellation_context(
+                    original,
+                    processor.turn_execution_owner_id.as_ref(),
+                    now_timestamp_secs(),
+                    true,
+                )
+                .await
+                .unwrap();
+            let read_completed = Arc::new(Notify::new());
+            let continue_finish = Arc::new(Notify::new());
+            *processor.native_cancellation_finish_barrier.lock().await =
+                Some((read_completed.clone(), continue_finish.clone()));
+            let operation = processor.commit_turn_interrupted_with_recovery_disposition(
+                thread_id.into(),
+                turn_id.into(),
+                "cancel".into(),
+                None,
+                false,
+            );
+            let orchestrator = async {
+                read_completed.notified().await;
+                // The original read saw InProgress. This contender changes only
+                // local state, so the first operation's turn_finish must fail.
+                processor
+                    .thread_manager
+                    .turn_finish(
+                        thread_id,
+                        turn_id,
+                        if case == 2 {
+                            TurnStatus::Completed
+                        } else {
+                            TurnStatus::Interrupted
+                        },
+                        Some("racing finish".into()),
+                    )
+                    .await
+                    .unwrap();
+                if case == 0 {
+                    *processor
+                        .native_cancellation_materialization_failure
+                        .lock()
+                        .await = Some(busy.clone());
+                } else if case == 1 {
+                    // A real competing canonical completion makes subsequent
+                    // cancellation materialization fail its durable fence.
+                    let (_, mut completed) = crud_store_for_assert
+                        .get_turn(thread_id, turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    completed.status = TurnStatus::Completed;
+                    crud_store_for_assert
+                        .materialize_native_agent_turn_event_owned(
+                            pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(
+                                TurnCompletedNotification {
+                                    workspace_id: workspace_id.clone(),
+                                    thread_id: thread_id.into(),
+                                    turn: completed,
+                                },
+                            ),
+                            now_timestamp_secs(),
+                            None,
+                            processor.turn_execution_owner_id.as_ref(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                continue_finish.notify_one();
+            };
+            let (result, ()) = tokio::join!(operation, orchestrator);
+            let rejection = result.unwrap_err();
+            assert_eq!(rejection.is_retryable(), case == 0);
+            assert_eq!(
+                rejection.code(),
+                if case == 0 {
+                    "storage_temporarily_unavailable"
+                } else if case == 1 {
+                    "native_preparation_rejected"
+                } else {
+                    "interruption_transition_rejected"
+                }
+            );
+            assert!(
+                !crud_store_for_assert
+                    .native_cancellation_was_accepted(turn_id)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                crud_store_for_assert
+                    .get_turn(thread_id, turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .status,
+                if case == 1 {
+                    TurnStatus::Completed
+                } else {
+                    TurnStatus::InProgress
+                }
+            );
+            assert!(
+                crud_store_for_assert
+                    .native_cancellation_receipt_owned(
+                        turn_id,
+                        processor.turn_execution_owner_id.as_ref()
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            if case == 0 {
+                // Failure did not issue a durable ACK. A fresh call must really
+                // materialize the locally Interrupted result and obtain receipt.
+                processor
+                    .commit_turn_interrupted_with_recovery_disposition(
+                        thread_id.into(),
+                        turn_id.into(),
+                        "retry".into(),
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    crud_store_for_assert
+                        .native_cancellation_was_accepted(turn_id)
+                        .await
+                        .unwrap()
+                );
+                assert_eq!(
+                    crud_store_for_assert
+                        .get_turn(thread_id, turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .1
+                        .status,
+                    TurnStatus::Interrupted
+                );
+            }
+        }
+    });
+}

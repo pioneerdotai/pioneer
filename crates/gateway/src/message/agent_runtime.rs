@@ -333,7 +333,8 @@ fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::TurnFailed { thread_id, .. }
         | AgentDurableEvent::TurnBlocked { thread_id, .. }
         | AgentDurableEvent::TurnInterrupted { thread_id, .. } => Some(thread_id.as_str()),
-        AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
+        AgentDurableEvent::NativeCancellationContextPrepared { preparation, .. }
+        | AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
             Some(preparation.thread_id.as_str())
         }
         AgentDurableEvent::TurnPermissionAudit { event } => Some(event.thread_id.as_str()),
@@ -392,7 +393,8 @@ fn durable_event_turn_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::TurnFailed { turn_id, .. }
         | AgentDurableEvent::TurnBlocked { turn_id, .. }
         | AgentDurableEvent::TurnInterrupted { turn_id, .. } => Some(turn_id.as_str()),
-        AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
+        AgentDurableEvent::NativeCancellationContextPrepared { preparation, .. }
+        | AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
             Some(preparation.turn_id.as_str())
         }
         AgentDurableEvent::TurnPermissionAudit { event } => Some(event.turn_id.as_str()),
@@ -482,6 +484,63 @@ fn terminal_durable_event_status(event: &AgentDurableEvent) -> Option<TurnStatus
         AgentDurableEvent::TurnBlocked { .. } => Some(TurnStatus::Blocked),
         AgentDurableEvent::TurnInterrupted { .. } => Some(TurnStatus::Interrupted),
         _ => None,
+    }
+}
+
+// Same SeaORM -> SQLx driver chain used by the existing memory write mapper.
+// SQLite extended codes preserve the primary BUSY/LOCKED code in the low byte.
+fn native_preparation_has_typed_sqlite_lock(error: &anyhow::Error) -> bool {
+    use sea_orm::{DbErr, RuntimeErr, SqlxError};
+    let Some(db_error) = error.downcast_ref::<DbErr>() else {
+        return false;
+    };
+    let (DbErr::Conn(RuntimeErr::SqlxError(cause))
+    | DbErr::Exec(RuntimeErr::SqlxError(cause))
+    | DbErr::Query(RuntimeErr::SqlxError(cause))) = db_error
+    else {
+        return false;
+    };
+    let SqlxError::Database(database) = cause.as_ref() else {
+        return false;
+    };
+    database
+        .code()
+        .and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(native_preparation_sqlite_code_is_lock)
+}
+
+fn native_preparation_sqlite_code_is_lock(code: i32) -> bool {
+    matches!(code & 0xff, 5 | 6)
+}
+
+fn confirm_owned_cancellation_lookup(
+    result: anyhow::Result<bool>,
+) -> Result<bool, DurableCommitRejection> {
+    result.map_err(classify_native_preparation_error)
+}
+
+fn classify_native_preparation_error(error: anyhow::Error) -> DurableCommitRejection {
+    if error
+        .downcast_ref::<pioneer_crud::NativeCancellationContextUnavailable>()
+        .is_some()
+    {
+        return DurableCommitRejection::permanent(
+            "cancellation_context_missing",
+            "required immutable native cancellation context is unavailable",
+        );
+    }
+    if native_preparation_has_typed_sqlite_lock(&error)
+        || pioneer_sqlite::is_anyhow_sqlite_transient_access(&error)
+    {
+        DurableCommitRejection::retryable(
+            "storage_temporarily_unavailable",
+            "native preparation could not access storage",
+        )
+    } else {
+        DurableCommitRejection::permanent(
+            "native_preparation_rejected",
+            "native immutable preparation was rejected",
+        )
     }
 }
 
@@ -1287,10 +1346,19 @@ impl MessageProcessor {
                 let already_committed = if let Some(turn_id) = durable_event_turn_id(&event) {
                     match self.guard_execution_commit(turn_id).await {
                         Ok(_) => false,
-                        Err(error) => match classify_durable_commit_guard_error(&event, &error) {
-                            Ok(already_committed) => already_committed,
-                            Err(rejection) => {
-                                pioneer_observability::record_native_lifecycle_event(
+                        Err(error) => {
+                            if !event.is_terminal()
+                                && error.downcast_ref::<crate::authorization::ExecutionTurnNotInProgress>()
+                                    .is_some_and(|e| e.status() == TurnStatus::Interrupted)
+                                && confirm_owned_cancellation_lookup(self.crud_store.native_cancellation_was_accepted_owned(
+                                    turn_id, self.turn_execution_owner_id.as_ref()
+                                ).await)? {
+                                return Err(DurableCommitRejection::superseded_by_durable_interruption());
+                            }
+                            match classify_durable_commit_guard_error(&event, &error) {
+                                Ok(already_committed) => already_committed,
+                                Err(rejection) => {
+                                    pioneer_observability::record_native_lifecycle_event(
                                     pioneer_observability::NativeLifecycleEventMetric {
                                         stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
                                         outcome: pioneer_observability::NativeLifecycleOutcome::Rejected,
@@ -1298,22 +1366,102 @@ impl MessageProcessor {
                                         elapsed: None,
                                     },
                                 );
-                                warn!(
-                                    rejection_code = rejection.code(),
-                                    retryable = rejection.is_retryable(),
-                                    error = %format!("{error:#}"),
-                                    "durable agent event failed its execution commit guard"
-                                );
-                                return Err(rejection);
+                                    warn!(
+                                        rejection_code = rejection.code(),
+                                        retryable = rejection.is_retryable(),
+                                        error = %format!("{error:#}"),
+                                        "durable agent event failed its execution commit guard"
+                                    );
+                                    return Err(rejection);
+                                }
                             }
-                        },
+                        }
                     }
                 } else {
                     false
                 };
                 let commit_started = Instant::now();
-                let committed =
-                    already_committed || self.persist_durable_agent_event(event.clone()).await;
+                let typed_commit = match &event {
+                    AgentDurableEvent::TurnInterrupted {
+                        thread_id,
+                        turn_id,
+                        reason,
+                        recovery,
+                    } => {
+                        if already_committed {
+                            Some(Ok(()))
+                        } else {
+                            let user_reason = self
+                                .user_turn_cancel_intents
+                                .lock()
+                                .await
+                                .get(&(thread_id.clone(), turn_id.clone()))
+                                .cloned();
+                            let user_cancellation = user_reason.is_some();
+                            Some(
+                                self.commit_turn_interrupted_with_recovery_disposition(
+                                    thread_id.clone(),
+                                    turn_id.clone(),
+                                    user_reason.unwrap_or_else(|| reason.clone()),
+                                    recovery.clone(),
+                                    user_cancellation,
+                                )
+                                .await,
+                            )
+                        }
+                    }
+                    AgentDurableEvent::NativeCancellationContextPrepared {
+                        preparation,
+                        initial_turn,
+                    } => Some(
+                        self.crud_store
+                            .persist_native_cancellation_context(
+                                preparation.clone(),
+                                self.turn_execution_owner_id.as_ref(),
+                                now_timestamp_secs(),
+                                *initial_turn,
+                            )
+                            .await
+                            .map_err(classify_native_preparation_error),
+                    ),
+                    AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => Some(
+                        match self
+                            .crud_store
+                            .prepare_native_terminal_effects(
+                                preparation.clone(),
+                                now_timestamp_secs(),
+                            )
+                            .await
+                        {
+                            Ok(()) => Ok(()),
+                            Err(error) => {
+                                if confirm_owned_cancellation_lookup(
+                                    self.crud_store
+                                        .native_cancellation_was_accepted_owned(
+                                            &preparation.turn_id,
+                                            self.turn_execution_owner_id.as_ref(),
+                                        )
+                                        .await,
+                                )? {
+                                    Err(DurableCommitRejection::superseded_by_durable_interruption(
+                                    ))
+                                } else {
+                                    Err(classify_native_preparation_error(error))
+                                }
+                            }
+                        },
+                    ),
+                    _ => None,
+                };
+                let typed_rejection = typed_commit
+                    .as_ref()
+                    .and_then(|result| result.as_ref().err())
+                    .cloned();
+                let committed = if let Some(result) = typed_commit {
+                    result.is_ok()
+                } else {
+                    already_committed || self.persist_durable_agent_event(event.clone()).await
+                };
                 pioneer_observability::record_native_lifecycle_event(
                     pioneer_observability::NativeLifecycleEventMetric {
                         stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
@@ -1366,10 +1514,12 @@ impl MessageProcessor {
                 if committed {
                     Ok(())
                 } else {
-                    Err(DurableCommitRejection::retryable(
-                        "projection_failed",
-                        "gateway could not project the durable agent event",
-                    ))
+                    Err(typed_rejection.unwrap_or_else(|| {
+                        DurableCommitRejection::retryable(
+                            "projection_failed",
+                            "gateway could not project the durable agent event",
+                        )
+                    }))
                 }
             }),
         };
@@ -2691,7 +2841,7 @@ impl MessageProcessor {
         Ok(())
     }
 
-    async fn materialize_native_agent_turn_event(
+    pub(super) async fn materialize_native_agent_turn_event(
         &self,
         event: pioneer_crud::CanonicalTurnEventPayload,
         event_timestamp_secs: i64,
@@ -2703,6 +2853,69 @@ impl MessageProcessor {
                 | pioneer_crud::CanonicalTurnEventPayload::TurnFailed(_)
                 | pioneer_crud::CanonicalTurnEventPayload::TurnBlocked(_)
         );
+        #[cfg(test)]
+        if matches!(&event, pioneer_crud::CanonicalTurnEventPayload::TurnFailed(n)
+            if n.turn.status == TurnStatus::Interrupted)
+            && let Some(error) = self
+                .native_cancellation_materialization_failure
+                .lock()
+                .await
+                .take()
+        {
+            // Fault at the materialization boundary, before any DB capacity.
+            return Err(error.into());
+        }
+        let cancellation = if let pioneer_crud::CanonicalTurnEventPayload::TurnFailed(notification) =
+            &event
+            && notification.turn.status == TurnStatus::Interrupted
+        {
+            match self
+                .crud_store
+                .native_cancellation_context(&notification.turn.id)
+                .await?
+            {
+                Some(context) => {
+                    let preparation = pioneer_agent::post_turn::prepare_native_cancellation(
+                        context.preparation.clone(),
+                        notification
+                            .turn
+                            .error
+                            .as_deref()
+                            .unwrap_or("turn interrupted"),
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                    Some((context, preparation))
+                }
+                None => {
+                    let execution = self
+                        .crud_store
+                        .get_turn_execution(&notification.turn.id)
+                        .await?;
+                    if execution.as_ref().is_some_and(|e| {
+                        matches!(
+                            e.executor_kind,
+                            pioneer_crud::TurnExecutorKind::NativeAgent
+                                | pioneer_crud::TurnExecutorKind::ApiProvider
+                        )
+                    }) || self
+                        .agent_manager
+                        .turn_owner_generation(&notification.thread_id, &notification.turn.id)
+                        .await
+                        .is_some()
+                        || self
+                            .crud_store
+                            .get_turn_runtime_snapshot(&notification.turn.id)
+                            .await?
+                            .is_some()
+                    {
+                        return Err(pioneer_crud::NativeCancellationContextUnavailable.into());
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let crud_store = Arc::clone(&self.crud_store);
         let turn_execution_owner_id = Arc::clone(&self.turn_execution_owner_id);
         // Projection is one durable transaction, but it is reached from several
@@ -2714,6 +2927,17 @@ impl MessageProcessor {
             crate::database::attribution::scope_database_workload_result(
                 pioneer_observability::DatabaseWorkload::TurnEventCommit,
                 async move {
+                    if let Some((context, preparation)) = cancellation {
+                        return crud_store
+                            .materialize_native_cancellation_owned(
+                                event,
+                                event_timestamp_secs,
+                                context,
+                                preparation,
+                                turn_execution_owner_id.as_ref(),
+                            )
+                            .await;
+                    }
                     crud_store
                         .materialize_native_agent_turn_event_owned(
                             event,
@@ -3944,6 +4168,20 @@ impl MessageProcessor {
                     true
                 })
             }
+            AgentDurableEvent::NativeCancellationContextPrepared {
+                preparation,
+                initial_turn,
+            } => message_future(async move {
+                self.crud_store
+                    .persist_native_cancellation_context(
+                        preparation,
+                        self.turn_execution_owner_id.as_ref(),
+                        now_timestamp_secs(),
+                        initial_turn,
+                    )
+                    .await
+                    .is_ok()
+            }),
             AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
                 message_future(async move {
                     let thread_id = preparation.thread_id.clone();
@@ -8282,6 +8520,27 @@ impl MessageProcessor {
             .await
     }
 
+    async fn observe_accepted_native_cancellation(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        generation: Option<u64>,
+    ) {
+        self.retire_execution_progress_state(turn_id).await;
+        if let Some(generation) = generation
+            && let Ok(Some(receipt)) = self
+                .crud_store
+                .native_cancellation_receipt_owned(turn_id, self.turn_execution_owner_id.as_ref())
+                .await
+            && receipt.thread_id == thread_id
+        {
+            let _ = self
+                .agent_manager
+                .observe_durable_cancellation(receipt, generation)
+                .await;
+        }
+    }
+
     pub(super) async fn mark_turn_interrupted(
         &self,
         thread_id: String,
@@ -8330,10 +8589,68 @@ impl MessageProcessor {
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
         user_cancellation: bool,
     ) -> bool {
+        match self
+            .commit_turn_interrupted_with_recovery_disposition(
+                thread_id,
+                turn_id,
+                reason,
+                recovery,
+                user_cancellation,
+            )
+            .await
+        {
+            Ok(()) => true,
+            Err(rejection) => {
+                if rejection.is_retryable() {
+                    warn!(
+                        commit_error_code = rejection.code(),
+                        event_kind = "turn_interrupted",
+                        "native controller cancellation remains pending after transient rejection"
+                    );
+                } else {
+                    error!(
+                        attempt = 1_u32,
+                        commit_error_code = rejection.code(),
+                        event_kind = "turn_interrupted",
+                        "native controller cancellation was permanently rejected"
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    pub(super) async fn commit_turn_interrupted_with_recovery_disposition(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        reason: String,
+        recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
+        user_cancellation: bool,
+    ) -> Result<(), DurableCommitRejection> {
         let terminal_actor_generation = self
             .agent_manager
             .turn_owner_generation(thread_id.as_str(), turn_id.as_str())
             .await;
+        if let Some(accepted) = self
+            .crud_store
+            .native_cancellation_accepted_notification_owned(
+                &turn_id,
+                self.turn_execution_owner_id.as_ref(),
+            )
+            .await
+            .map_err(classify_native_preparation_error)?
+        {
+            self.thread_manager
+                .commit_terminal_turn(&thread_id, &accepted.turn)
+                .await
+                .map_err(|_| {
+                    DurableCommitRejection::permanent(
+                        "terminal_result_conflict",
+                        "local interruption conflicts with accepted canonical result",
+                    )
+                })?;
+        }
         if let Some((workspace_id, current_turn)) = self
             .thread_manager
             .turn_get(thread_id.as_str(), turn_id.as_str())
@@ -8360,8 +8677,14 @@ impl MessageProcessor {
                         error = %format!("{error:#}"),
                         "failed to confirm idempotent interrupted Turn commit"
                     );
-                    return false;
+                    return Err(classify_native_preparation_error(error));
                 }
+                self.observe_accepted_native_cancellation(
+                    &thread_id,
+                    &turn_id,
+                    terminal_actor_generation,
+                )
+                .await;
                 if user_cancellation
                     && let Err(error) = self
                         .task_agent_executor
@@ -8380,11 +8703,14 @@ impl MessageProcessor {
                         "failed to reconcile already-interrupted child task turn as cancelled"
                     );
                 }
-                return true;
+                return Ok(());
             }
             if current_turn.status != TurnStatus::InProgress {
                 self.retire_execution_progress_state(turn_id.as_str()).await;
-                return false;
+                return Err(DurableCommitRejection::permanent(
+                    "terminal_result_conflict",
+                    "interruption conflicts with an accepted terminal result",
+                ));
             }
         }
 
@@ -8395,7 +8721,12 @@ impl MessageProcessor {
                 .await
             {
                 Ok(true) => {}
-                Ok(false) => return false,
+                Ok(false) => {
+                    return Err(DurableCommitRejection::permanent(
+                        "recovery_attempt_stale",
+                        "interruption recovery ownership changed",
+                    ));
+                }
                 Err(error) => {
                     warn!(
                         thread_id,
@@ -8405,8 +8736,17 @@ impl MessageProcessor {
                         error = %format!("{error:#}"),
                         "failed to verify recovery interruption context"
                     );
-                    return false;
+                    return Err(classify_native_preparation_error(error));
                 }
+            }
+        }
+
+        #[cfg(test)]
+        {
+            let barrier = self.native_cancellation_finish_barrier.lock().await.take();
+            if let Some((read_completed, continue_finish)) = barrier {
+                read_completed.notify_one();
+                continue_finish.notified().await;
             }
         }
 
@@ -8422,14 +8762,38 @@ impl MessageProcessor {
         {
             Ok(outcome) => outcome,
             Err(error) => {
-                if let Some((_workspace_id, current_turn)) = self
+                if let Some((workspace_id, current_turn)) = self
                     .thread_manager
                     .turn_get(thread_id.as_str(), turn_id.as_str())
                     .await
                     && current_turn.status == TurnStatus::Interrupted
                 {
-                    self.retire_execution_progress_state(turn_id.as_str()).await;
-                    return true;
+                    match self
+                        .materialize_native_agent_turn_event(
+                            pioneer_crud::CanonicalTurnEventPayload::TurnFailed(
+                                TurnFailedNotification {
+                                    workspace_id,
+                                    thread_id: thread_id.clone(),
+                                    turn: current_turn,
+                                },
+                            ),
+                            now_timestamp_secs(),
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            self.observe_accepted_native_cancellation(
+                                &thread_id,
+                                &turn_id,
+                                terminal_actor_generation,
+                            )
+                            .await;
+                            self.retire_execution_progress_state(turn_id.as_str()).await;
+                            return Ok(());
+                        }
+                        Err(error) => return Err(classify_native_preparation_error(error)),
+                    }
                 }
                 warn!(
                     thread_id,
@@ -8437,7 +8801,10 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to mark turn as interrupted"
                 );
-                return false;
+                return Err(DurableCommitRejection::permanent(
+                    "interruption_transition_rejected",
+                    "interruption could not confirm a terminal transition",
+                ));
             }
         };
 
@@ -8472,9 +8839,11 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to persist turn/interrupted event"
                 );
-                return false;
+                return Err(classify_native_preparation_error(error));
             }
         }
+        self.observe_accepted_native_cancellation(&thread_id, &turn_id, terminal_actor_generation)
+            .await;
         self.finalize_agent_execution_for_turn(&turn_failed.turn, "cancelled")
             .await;
 
@@ -8607,7 +8976,7 @@ impl MessageProcessor {
                     .await;
             }
         }
-        true
+        Ok(())
     }
 
     pub(super) async fn mark_turn_failed_with_recovery(
@@ -9572,4 +9941,9 @@ mod user_message_attachment_tests {
                 if capability.pack_id == pack_id && capability.label == "Authoritative Pack"
         ));
     }
+}
+
+#[cfg(test)]
+pub(super) mod native_preparation_failure_tests {
+    include!("native_preparation_failure_tests.rs");
 }

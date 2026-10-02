@@ -266,6 +266,7 @@ pub(crate) async fn compaction_materialize_lifecycle(
             TurnEventProjectionContext {
                 item_started_deadlines: None,
                 enqueue_optional_deliveries: true,
+                native_cancellation: None,
             },
             None,
             Some(guard),

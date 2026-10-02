@@ -571,6 +571,10 @@ pub struct MessageProcessor {
     predispatch_cli_turn_read_failures: Arc<Mutex<HashSet<String>>>,
     #[cfg(test)]
     claude_boundary_write_failures: Arc<Mutex<HashSet<String>>>,
+    #[cfg(test)]
+    native_cancellation_finish_barrier: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    #[cfg(test)]
+    native_cancellation_materialization_failure: Arc<Mutex<Option<sea_orm::DbErr>>>,
     workspace_compaction_settings: Arc<StdRwLock<std::collections::BTreeMap<String, crate::settings::WorkspaceCompactionSettings>>>,
     agent_listener_tasks: Arc<Mutex<HashMap<String, AgentListenerTask>>>,
     agent_listener_generation: Arc<AtomicU64>,
@@ -1163,6 +1167,10 @@ impl MessageProcessor {
             predispatch_cli_turn_read_failures: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             claude_boundary_write_failures: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            native_cancellation_finish_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            native_cancellation_materialization_failure: Arc::new(Mutex::new(None)),
             workspace_compaction_settings: Arc::new(StdRwLock::new(
                 std::collections::BTreeMap::new(),
             )),
@@ -4563,6 +4571,10 @@ impl MessageProcessor {
             predispatch_cli_turn_read_failures: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             claude_boundary_write_failures: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            native_cancellation_finish_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            native_cancellation_materialization_failure: Arc::new(Mutex::new(None)),
             workspace_compaction_settings: Arc::new(StdRwLock::new(
                 std::collections::BTreeMap::new(),
             )),
