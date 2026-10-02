@@ -86,9 +86,9 @@ pub use store::{
     HOOK_RUN_RESUME_SCHEMA_VERSION, HookAuditEventStoreRecord, HookRecoverableRunRecord,
     HookRecoveryScan, HookRetrySchedule, HookRunAttemptStoreCompletion, HookRunAttemptStoreRecord,
     HookRunInputSnapshot, HookRunResumePayload, HookRunResumeReference, HookRunResumeState,
-    HookRunScope, HookRunScopeKind, HookRunStore, HookRunStoreCompletion, HookRunStoreError,
-    HookRunStoreRecord, HookRunStoreResult, NewHookAuditEventStoreRecord,
-    NewHookRunAttemptStoreRecord, NewHookRunStoreRecord,
+    HookRunScope, HookRunScopeKind, HookRunStore, HookRunStoreCauseClass, HookRunStoreCompletion,
+    HookRunStoreDiagnostic, HookRunStoreError, HookRunStoreRecord, HookRunStoreResult,
+    NewHookAuditEventStoreRecord, NewHookRunAttemptStoreRecord, NewHookRunStoreRecord,
 };
 pub use subscription::{
     HookFilterSet, HookSubscription, HookSubscriptionDependencies, HookSubscriptionVisibility,

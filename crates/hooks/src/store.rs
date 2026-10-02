@@ -12,12 +12,54 @@ use std::fmt;
 
 pub type HookRunStoreResult<T> = Result<T, HookRunStoreError>;
 
+/// Bounded diagnostics only; never stores a database error or its message.
+/// This classification does not determine retryability or execution policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HookRunStoreCauseClass {
+    #[default]
+    Unclassified,
+    SqliteBusy,
+    SqliteLocked,
+    SqliteCantOpen,
+    SqliteConstraint,
+    SqliteOther,
+}
+
+impl HookRunStoreCauseClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unclassified => "unclassified",
+            Self::SqliteBusy => "sqlite_busy",
+            Self::SqliteLocked => "sqlite_locked",
+            Self::SqliteCantOpen => "sqlite_cantopen",
+            Self::SqliteConstraint => "sqlite_constraint",
+            Self::SqliteOther => "sqlite_other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HookRunStoreDiagnostic {
+    pub cause_class: HookRunStoreCauseClass,
+    pub sqlite_primary_code: Option<i32>,
+    pub sqlite_extended_code: Option<i32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookRunStoreError {
-    Unavailable { message: String },
-    Conflict { message: String },
-    InvalidRecord { message: String },
-    Internal { message: String },
+    Unavailable {
+        message: String,
+    },
+    Conflict {
+        message: String,
+    },
+    InvalidRecord {
+        message: String,
+    },
+    Internal {
+        message: String,
+        diagnostic: Option<HookRunStoreDiagnostic>,
+    },
 }
 
 impl HookRunStoreError {
@@ -42,6 +84,24 @@ impl HookRunStoreError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal {
             message: message.into(),
+            diagnostic: None,
+        }
+    }
+
+    pub fn internal_with_diagnostic(
+        message: impl Into<String>,
+        diagnostic: HookRunStoreDiagnostic,
+    ) -> Self {
+        Self::Internal {
+            message: message.into(),
+            diagnostic: Some(diagnostic),
+        }
+    }
+
+    pub fn diagnostic(&self) -> HookRunStoreDiagnostic {
+        match self {
+            Self::Internal { diagnostic, .. } => diagnostic.unwrap_or_default(),
+            _ => HookRunStoreDiagnostic::default(),
         }
     }
 
@@ -50,7 +110,7 @@ impl HookRunStoreError {
             Self::Unavailable { message }
             | Self::Conflict { message }
             | Self::InvalidRecord { message }
-            | Self::Internal { message } => message.as_str(),
+            | Self::Internal { message, .. } => message.as_str(),
         }
     }
 }
@@ -65,7 +125,7 @@ impl fmt::Display for HookRunStoreError {
             Self::InvalidRecord { message } => {
                 write!(formatter, "invalid hook run store record: {message}")
             }
-            Self::Internal { message } => {
+            Self::Internal { message, .. } => {
                 write!(formatter, "hook run store internal error: {message}")
             }
         }
@@ -476,6 +536,32 @@ pub trait HookRunStore: Send + Sync {
 mod tests {
     use super::*;
     use crate::{HookInputPayload, HookPolicySet, HookPromptContextSet};
+
+    #[test]
+    fn diagnostics_preserve_internal_variant_display_and_value_traits() {
+        let diagnostic = HookRunStoreDiagnostic {
+            cause_class: HookRunStoreCauseClass::SqliteLocked,
+            sqlite_primary_code: Some(6),
+            sqlite_extended_code: Some(262),
+        };
+        let error = HookRunStoreError::internal_with_diagnostic("safe message", diagnostic);
+        assert_eq!(error.clone(), error);
+        assert_eq!(error.diagnostic(), diagnostic);
+        assert!(matches!(error, HookRunStoreError::Internal { .. }));
+        assert_eq!(
+            error.to_string(),
+            HookRunStoreError::internal("safe message").to_string()
+        );
+        assert!(std::error::Error::source(&error).is_none());
+        for error in [
+            HookRunStoreError::internal("internal"),
+            HookRunStoreError::conflict("conflict"),
+            HookRunStoreError::invalid_record("invalid"),
+            HookRunStoreError::unavailable("unavailable"),
+        ] {
+            assert_eq!(error.diagnostic(), HookRunStoreDiagnostic::default());
+        }
+    }
 
     #[test]
     fn phase_21_resume_state_roundtrips_as_typed_snapshot() {

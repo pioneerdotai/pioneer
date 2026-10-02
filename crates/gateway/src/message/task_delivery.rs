@@ -1591,6 +1591,8 @@ mod recovery_failure_tests {
         );
         let diagnostic = pioneer_protocol::RecoveryDiagnostic {
             last_failure: Some(pioneer_protocol::RecoveryProviderFailure {
+                error_reason: None,
+                request_id: None,
                 class: pioneer_protocol::ProviderFailureClass::AuthOrPermission,
                 stage: pioneer_protocol::ProviderFailureStage::Connect,
                 transport: pioneer_protocol::ProviderTransportKind::NonStream,

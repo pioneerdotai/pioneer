@@ -666,14 +666,25 @@ enum RestoredRecoveryTurnUnavailable {
     MissingRuntimeSnapshot,
     MissingExecutionSecuritySnapshot,
     SnapshotMismatch,
-    SnapshotInvalid { error: String },
-    ExecutionWindowContinuationBlocked { reason: String },
+    SnapshotInvalid {
+        error: String,
+    },
+    ExecutionWindowContinuationBlocked {
+        reason: String,
+        stop_reason: Option<pioneer_protocol::RecoveryStopReason>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExecutionWindowContinuationAdmission {
-    Open { window_index: u32 },
-    Block { total_windows: u32, reason: String },
+    Open {
+        window_index: u32,
+    },
+    Block {
+        total_windows: u32,
+        reason: String,
+        stop_reason: Option<pioneer_protocol::RecoveryStopReason>,
+    },
 }
 
 impl RestoredRecoveryTurnUnavailable {
@@ -694,7 +705,7 @@ impl RestoredRecoveryTurnUnavailable {
             Self::SnapshotInvalid { error } => Some(format!(
                 "cannot restore recovery after agent loop loss because durable turn runtime snapshot is invalid: {error}"
             )),
-            Self::ExecutionWindowContinuationBlocked { reason } => Some(reason.clone()),
+            Self::ExecutionWindowContinuationBlocked { reason, .. } => Some(reason.clone()),
             Self::TurnNotFound | Self::TurnNotInProgress => None,
         }
     }
@@ -2413,9 +2424,19 @@ impl RecoveryCoordinator {
                 .await
             {
                 Ok(ExecutionWindowContinuationAdmission::Open { window_index }) => window_index,
-                Ok(ExecutionWindowContinuationAdmission::Block { reason, .. }) => {
+                Ok(ExecutionWindowContinuationAdmission::Block {
+                    reason,
+                    stop_reason,
+                    ..
+                }) => {
                     return self
-                        .block_active_recovery(job, active_attempt_id, reason, now_unix)
+                        .block_active_recovery(
+                            job,
+                            active_attempt_id,
+                            reason,
+                            stop_reason,
+                            now_unix,
+                        )
                         .await;
                 }
                 Err(error) => {
@@ -2465,6 +2486,7 @@ impl RecoveryCoordinator {
                         format!(
                             "automatic recovery cannot safely replay the provider history: {error:#}"
                         ),
+                        None,
                         now_unix,
                     )
                     .await;
@@ -2479,7 +2501,11 @@ impl RecoveryCoordinator {
             )
             .await?;
         if let Some(context) = execution_checkpoint_context.as_ref()
-            && let ExecutionWindowContinuationAdmission::Block { reason, .. } = self
+            && let ExecutionWindowContinuationAdmission::Block {
+                reason,
+                stop_reason,
+                ..
+            } = self
                 .execution_window_continuation_admission_for_turn(
                     job.turn_id.as_str(),
                     Some(context.window_index),
@@ -2487,7 +2513,7 @@ impl RecoveryCoordinator {
                 .await?
         {
             return self
-                .block_active_recovery(job, active_attempt_id, reason, now_unix)
+                .block_active_recovery(job, active_attempt_id, reason, stop_reason, now_unix)
                 .await;
         }
         let continue_generation =
@@ -2683,8 +2709,18 @@ impl RecoveryCoordinator {
                         }
                         RestoredRecoveryTurnRequestLookup::Unavailable(unavailable) => {
                             if let Some(reason) = unavailable.lost_loop_block_reason() {
+                                let stop_reason = match unavailable {
+                                    RestoredRecoveryTurnUnavailable::ExecutionWindowContinuationBlocked { stop_reason, .. } => stop_reason,
+                                    _ => None,
+                                };
                                 return self
-                                    .block_active_recovery(job, active_attempt_id, reason, now_unix)
+                                    .block_active_recovery(
+                                        job,
+                                        active_attempt_id,
+                                        reason,
+                                        stop_reason,
+                                        now_unix,
+                                    )
                                     .await;
                             }
                         }
@@ -2731,16 +2767,25 @@ impl RecoveryCoordinator {
         job: RecoveryJobRecord,
         active_attempt_id: String,
         reason: String,
+        stop_reason: Option<pioneer_protocol::RecoveryStopReason>,
         now_unix: i64,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let diagnostic = stop_reason.map(|stop_reason| terminal_diagnostic(&job, stop_reason));
+        // Keep the last provider failure separate from the reason retries stopped.
+        let last_error = if diagnostic.is_some() {
+            job.last_error.clone().or_else(|| job.reason.clone())
+        } else {
+            Some(reason.clone())
+        };
         let mut events = Vec::new();
         if self
             .crud_store
-            .mark_recovery_job_terminal_after_attempt(
+            .mark_recovery_job_terminal_after_attempt_with_diagnostic(
                 job.id.as_str(),
                 active_attempt_id.as_str(),
                 RecoveryJobStatus::Blocked,
-                Some(reason.clone()),
+                last_error,
+                diagnostic,
                 now_unix,
             )
             .await?
@@ -2793,9 +2838,19 @@ impl RecoveryCoordinator {
         attempt_number: u32,
         now_unix: i64,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
-        if let AgentControlError::ExecutionWindowContinuationBlocked { reason } = &error {
+        if let AgentControlError::ExecutionWindowContinuationBlocked {
+            reason,
+            stop_reason,
+        } = &error
+        {
             return self
-                .block_active_recovery(job, active_attempt_id, reason.clone(), now_unix)
+                .block_active_recovery(
+                    job,
+                    active_attempt_id,
+                    reason.clone(),
+                    *stop_reason,
+                    now_unix,
+                )
                 .await;
         }
 
@@ -3185,9 +3240,16 @@ impl RecoveryCoordinator {
             ExecutionWindowContinuationAdmission::Open { window_index } => {
                 request.execution_window_index = window_index;
             }
-            ExecutionWindowContinuationAdmission::Block { reason, .. } => {
+            ExecutionWindowContinuationAdmission::Block {
+                reason,
+                stop_reason,
+                ..
+            } => {
                 return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
-                    RestoredRecoveryTurnUnavailable::ExecutionWindowContinuationBlocked { reason },
+                    RestoredRecoveryTurnUnavailable::ExecutionWindowContinuationBlocked {
+                        reason,
+                        stop_reason,
+                    },
                 ));
             }
         }
@@ -3544,6 +3606,7 @@ impl RecoveryCoordinator {
                     && usage.total_tool_calls >= u64::from(limit)
                 {
                     return Ok(ExecutionWindowContinuationAdmission::Block {
+                        stop_reason: None,
                         total_windows: usage.total_windows,
                         reason: format!(
                             "max_total_tool_calls_per_turn reached: limit={limit}, observed={}",
@@ -3555,6 +3618,7 @@ impl RecoveryCoordinator {
                     && usage.total_wall_clock_ms >= limit
                 {
                     return Ok(ExecutionWindowContinuationAdmission::Block {
+                        stop_reason: None,
                         total_windows: usage.total_windows,
                         reason: format!(
                             "max_total_wall_clock_ms_per_turn reached: limit={limit}, observed={}",
@@ -3567,6 +3631,7 @@ impl RecoveryCoordinator {
                     && usage.total_provider_tokens >= limit
                 {
                     return Ok(ExecutionWindowContinuationAdmission::Block {
+                        stop_reason: None,
                         total_windows: usage.total_windows,
                         reason: format!(
                             "max_total_provider_tokens_per_turn reached: limit={limit}, observed={}",
@@ -3582,6 +3647,7 @@ impl RecoveryCoordinator {
                     .max(1);
                 if usage.consecutive_no_progress_windows >= limit {
                     return Ok(ExecutionWindowContinuationAdmission::Block {
+                        stop_reason: Some(pioneer_protocol::RecoveryStopReason::NoProgress),
                         total_windows: usage.total_windows,
                         reason: execution_window_no_progress_reason(
                             limit,
@@ -3595,6 +3661,7 @@ impl RecoveryCoordinator {
                 total_windows,
                 max_windows_per_turn,
             } => Ok(ExecutionWindowContinuationAdmission::Block {
+                stop_reason: None,
                 total_windows,
                 reason: execution_window_limit_reason(total_windows, max_windows_per_turn),
             }),
@@ -6226,6 +6293,8 @@ mod tests {
 
     fn provider_failure(class: ProviderFailureClass, message: &str) -> ProviderFailureDetails {
         ProviderFailureDetails {
+            error_reason: None,
+            request_id: None,
             provider: "test-provider".to_owned(),
             model: "test-model".to_owned(),
             transport: ProviderTransportKind::NonStream,
@@ -7250,6 +7319,7 @@ mod tests {
             admission,
             super::ExecutionWindowContinuationAdmission::Block {
                 total_windows: 3,
+                stop_reason: Some(pioneer_protocol::RecoveryStopReason::NoProgress),
                 ref reason,
             } if reason.contains("max_consecutive_no_progress_windows")
         ));
@@ -7678,6 +7748,7 @@ mod tests {
             super::RestoredRecoveryTurnRequestLookup::Unavailable(
                 super::RestoredRecoveryTurnUnavailable::ExecutionWindowContinuationBlocked {
                     ref reason,
+                    ..
                 }
             ) if reason.contains("limit=1, observed=1")
         ));
