@@ -1052,14 +1052,40 @@ async fn close_admitted_task_turn_on_error<T>(
     turn_id: &str,
     result: Result<T>,
 ) -> Result<T> {
+    close_admitted_task_turn_on_error_with_start_failure(
+        processor, thread_id, turn_id, result, None,
+    )
+    .await
+}
+
+async fn close_admitted_task_turn_on_error_with_start_failure<T>(
+    processor: &Arc<MessageProcessor>,
+    thread_id: &str,
+    turn_id: &str,
+    result: Result<T>,
+    start_failure: Option<&pioneer_tasks::TaskStartFailureDescriptor>,
+) -> Result<T> {
     let Err(error) = result else {
         return result;
     };
     let reason = "task_turn_admission_failed".to_owned();
-    if !processor
-        .mark_turn_blocked(thread_id.to_owned(), turn_id.to_owned(), reason.clone())
-        .await
-    {
+    let closed = match start_failure {
+        Some(descriptor) => {
+            processor
+                .mark_task_turn_blocked_on_start_failure(
+                    thread_id.to_owned(),
+                    turn_id.to_owned(),
+                    descriptor,
+                )
+                .await
+        }
+        None => {
+            processor
+                .mark_turn_blocked(thread_id.to_owned(), turn_id.to_owned(), reason.clone())
+                .await
+        }
+    };
+    if !closed {
         warn!(
             thread_id,
             turn_id,
@@ -2274,18 +2300,38 @@ impl TaskAgentExecutor {
                 .await
                 .map_err(|error| anyhow!("task CLI runtime preparation task failed: {error}"))
                 .and_then(|result| result);
-                let prepared = close_admitted_task_turn_on_error(
-                    processor, &child_thread_id, &child_turn_id, prepared,
+                let prepared = prepared.map_err(|error| {
+                    if error.downcast_ref::<pioneer_tasks::TaskStartFailure>().is_some() {
+                        error
+                    } else {
+                        pioneer_tasks::TaskStartFailure::from_error(
+                            pioneer_tasks::TaskStartStage::CliPreparation, error,
+                        ).into()
+                    }
+                });
+                let descriptor = prepared.as_ref().err()
+                    .and_then(|error| error.downcast_ref::<pioneer_tasks::TaskStartFailure>())
+                    .map(|failure| failure.descriptor().clone());
+                let prepared = close_admitted_task_turn_on_error_with_start_failure(
+                    processor, &child_thread_id, &child_turn_id, prepared, descriptor.as_ref(),
                 ).await;
                 let prepared = match prepared {
                     Ok(prepared) => prepared,
-                    Err(error) => {
-                        if processor
+                    Err(mut error) => {
+                        if let Some(current) = processor
                             .crud_store
                             .get_task_run(run.id.as_str())
                             .await?
-                            .is_some_and(|current| current.status.is_terminal())
+                            .filter(|current| current.status.is_terminal())
                         {
+                            // Cleanup may have committed the original Blocked
+                            // transition. Report that cause once, but never
+                            // report a preparation superseded by cancellation.
+                            if current.status == pioneer_protocol::TaskRunStatus::Blocked {
+                                error.downcast_mut::<pioneer_tasks::TaskStartFailure>()
+                                    .expect("Task preparation failure is typed")
+                                    .report_in_place();
+                            }
                             #[cfg(test)]
                             processor.task_cli_terminal_preparation_finished.notify_one();
                             return Ok(TaskExecutorStartOutcome::Started);

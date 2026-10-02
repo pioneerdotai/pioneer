@@ -195,14 +195,17 @@ async fn run_gateway_start_failure(
             .execute_raw(Statement::from_string(
                 DatabaseBackend::Sqlite,
                 "CREATE TRIGGER pioneer9_child_failure BEFORE INSERT ON task_event \
-             WHEN NEW.event_type = 'task/run/turn/failed' \
+             WHEN NEW.event_type IN ('task/run/turn/failed', 'task/run/turn/blocked') \
              BEGIN SELECT RAISE(ABORT, 'pioneer9 child failure persistence'); END;"
                     .to_owned(),
             ))
             .await
             .unwrap();
     }
-    if matches!(case, PreparationFailure::Cleanup) {
+    if matches!(
+        case,
+        PreparationFailure::Cleanup | PreparationFailure::RetryFrozen
+    ) {
         use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
         store
             .database_connection()
@@ -216,6 +219,10 @@ async fn run_gateway_start_failure(
             .await
             .unwrap();
     }
+    let mut wakes = processor
+        .task_runtime
+        .event_bus()
+        .subscribe(Default::default());
     let created = create_task_for_test(&processor, params).await.unwrap();
     let run_id = created.run.as_ref().unwrap().id.clone();
     if matches!(case, PreparationFailure::TerminalHistory) {
@@ -251,25 +258,38 @@ async fn run_gateway_start_failure(
         // Terminal dispatch never replaces cancellation with start failure.
         return (response.runs[0].error.clone(), run_id);
     }
-    let mut saved = None;
-    for _ in 0..512 {
-        let response = store.get_task(&created.task.id).await.unwrap().unwrap();
-        let terminal_committed = matches!(case, PreparationFailure::RetryFrozen)
-            || store
-                .get_task_occurrence_contract_by_run(&run_id)
-                .await
-                .unwrap()
-                .is_some_and(|occurrence| {
-                    occurrence.status == pioneer_protocol::TaskOccurrenceStatus::Failed
-                });
-        if response.runs[0].status == pioneer_protocol::TaskRunStatus::Failed && terminal_committed
-        {
-            saved = Some(response);
-            break;
-        }
-        tokio::task::yield_now().await;
+    let expected_status = if matches!(
+        case,
+        PreparationFailure::Cleanup
+            | PreparationFailure::RetryFrozen
+            | PreparationFailure::ChildPersistence
+    ) {
+        TaskRunStatus::Failed
+    } else {
+        TaskRunStatus::Blocked
+    };
+    if expected_status == TaskRunStatus::Blocked {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            processor.task_cli_terminal_preparation_finished.notified(),
+        )
+        .await
+        .expect("blocked preparation must finish its reporting and cleanup within 30 seconds");
     }
-    let saved = saved.expect("scheduler must persist the failed start without activation");
+    let saved = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let response = store.get_task(&created.task.id).await.unwrap().unwrap();
+            if response.runs[0].status == expected_status {
+                return response;
+            }
+            assert_ne!(
+                wakes.recv().await,
+                pioneer_tasks::TaskEventWakeDelivery::Closed
+            );
+        }
+    })
+    .await
+    .expect("preparation must commit its terminal Task state within 30 seconds");
     assert_eq!(
         saved.runs.len(),
         if matches!(case, PreparationFailure::RetryFrozen) {
@@ -299,7 +319,8 @@ async fn run_gateway_start_failure(
         .await
         .unwrap();
     let child_error = events.events.iter().find_map(|event| match &event.payload {
-        TaskEventPayload::TaskRunTurnFailed { error, .. } => error.as_ref(),
+        TaskEventPayload::TaskRunTurnFailed { error, .. }
+        | TaskEventPayload::TaskRunTurnBlocked { error, .. } => error.as_ref(),
         _ => None,
     });
     if matches!(case, PreparationFailure::ChildPersistence) {
@@ -317,7 +338,10 @@ async fn run_gateway_start_failure(
             .await
             .unwrap()
             .unwrap();
-        if matches!(case, PreparationFailure::Cleanup) {
+        if matches!(
+            case,
+            PreparationFailure::Cleanup | PreparationFailure::RetryFrozen
+        ) {
             assert_eq!(
                 turn.status,
                 TurnStatus::InProgress,
@@ -329,7 +353,14 @@ async fn run_gateway_start_failure(
                 "existing close-admitted cleanup must run"
             );
         }
-        assert_eq!(child.status, TaskRunTurnStatus::Failed);
+        assert_eq!(
+            child.status,
+            if expected_status == TaskRunStatus::Blocked {
+                TaskRunTurnStatus::Blocked
+            } else {
+                TaskRunTurnStatus::Failed
+            }
+        );
     }
     if matches!(case, PreparationFailure::RetryFrozen) {
         let accepted = store
@@ -355,23 +386,20 @@ async fn run_gateway_start_failure(
             .process_due_once(retry.ready_at.unwrap())
             .await
             .unwrap();
-        let mut retried = None;
-        for _ in 0..512 {
-            let response = store.get_task(&saved.task.id).await.unwrap().unwrap();
-            let terminal_committed = store
-                .get_task_occurrence_contract_by_run(&retry.id)
-                .await
-                .unwrap()
-                .is_some_and(|occurrence| {
-                    occurrence.status == pioneer_protocol::TaskOccurrenceStatus::Failed
-                });
-            if response.runs[1].status == TaskRunStatus::Failed && terminal_committed {
-                retried = Some(response);
-                break;
+        let retried = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let response = store.get_task(&saved.task.id).await.unwrap().unwrap();
+                if response.runs[1].status == TaskRunStatus::Failed {
+                    return response;
+                }
+                assert_ne!(
+                    wakes.recv().await,
+                    pioneer_tasks::TaskEventWakeDelivery::Closed
+                );
             }
-            tokio::task::yield_now().await;
-        }
-        let retried = retried.expect("configured retry completes");
+        })
+        .await
+        .expect("configured retry must commit its failed state within 30 seconds");
         assert_eq!(retried.runs.len(), 2, "retry budget is unchanged");
         assert!(
             processor
@@ -616,6 +644,26 @@ fn external_rpc_and_voice_admission_keep_their_safe_public_responses() {
     let (_, events) = capture_task_start(async {
         let mut harness =
             setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
+        let params = detached_cli_task_create_params(
+            &harness.workspace_id,
+            "pioneer9-voice-parent",
+            "pioneer9-voice-turn",
+            &harness.runtime_id,
+            CLIAgentRuntimeKind::Codex,
+            "gpt-5",
+            "safe voice input",
+        );
+        ensure_task_create_parent_turn_for_test(&harness.processor, &params)
+            .await
+            .unwrap();
+        subscribe_test_connection_to_materialized_thread(
+            &harness.processor,
+            harness.connection_id,
+            &harness.workspace_id,
+            "pioneer9-voice-parent",
+        )
+        .await;
+        while harness.rx.try_recv().is_ok() {}
         let request_id = RequestId::new("R".repeat(21)).unwrap();
         harness
             .processor
@@ -623,7 +671,7 @@ fn external_rpc_and_voice_admission_keep_their_safe_public_responses() {
                 harness.connection_id,
                 request_id.clone(),
                 &TurnStartSuccessResponse::TurnStart,
-                "test-thread",
+                "pioneer9-voice-parent",
                 "test-turn",
                 TurnStartFailure::protocol_invalid_input(CANARY),
             )
@@ -646,7 +694,7 @@ fn external_rpc_and_voice_admission_keep_their_safe_public_responses() {
                 &TurnStartSuccessResponse::VoiceSessionFinalizeAccepted {
                     session_id: "test-voice".to_owned(),
                 },
-                "test-thread",
+                "pioneer9-voice-parent",
                 "test-turn",
                 TurnStartFailure::protocol_invalid_input(CANARY),
             )
@@ -676,9 +724,12 @@ fn gateway_terminal_run_during_history_preparation_keeps_cancellation() {
         PreparationFailure::TerminalHistory,
     ));
     assert!(
-        events.is_empty(),
-        "superseded preparation must not fail the cancelled run"
+        !events
+            .iter()
+            .any(|event| event.message.as_deref() == Some("Task preparation or launch failed")),
+        "superseded preparation must not report a Task start failure"
     );
+    assert_safe_events(&events);
 }
 
 #[test]
@@ -1023,6 +1074,18 @@ fn reviewer_real_completion_live_keeps_pending_and_safe_breadcrumbs() {
         let (harness, processor) = review_cli_fixture().await;
         let (task, child) =
             create_review_cli_child(&harness, &processor, "live-reviewer", true, true).await;
+        let run_id = task.run.as_ref().unwrap().id.clone();
+        let frozen_before = harness
+            .crud_store
+            .get_task_run_conversation_snapshot(&run_id)
+            .await
+            .unwrap()
+            .expect("CLI preparation freezes its conversation before activation");
+        let runtime_before = harness
+            .crud_store
+            .get_turn_runtime_snapshot(&child.child_turn_id)
+            .await
+            .unwrap();
         let attempts = processor
             .task_cli_preparation_attempts
             .load(Ordering::SeqCst);
@@ -1072,14 +1135,21 @@ fn reviewer_real_completion_live_keeps_pending_and_safe_breadcrumbs() {
             harness.cli_session.turn_starts.lock().await.len(),
             activations
         );
-        assert!(
-            harness
-                .crud_store
-                .get_turn_runtime_snapshot(&child.child_turn_id)
-                .await
-                .unwrap()
-                .is_some(),
-            "pending reconciliation retains its runtime input"
+        let frozen_after = harness
+            .crud_store
+            .get_task_run_conversation_snapshot(run_id)
+            .await
+            .unwrap()
+            .expect("pending reconciliation retains its frozen input");
+        assert_eq!(frozen_after, frozen_before);
+        let runtime_after = harness
+            .crud_store
+            .get_turn_runtime_snapshot(&child.child_turn_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime_after, runtime_before,
+            "pending reconciliation must preserve any provider runtime snapshot that existed"
         );
         tracing::error!("reviewer live breadcrumb checkpoint");
     });
@@ -1130,7 +1200,7 @@ fn reviewer_background_batch_preserves_ownership_progress_and_no_new_immediate_r
             let (poison, poison_child) =
                 create_review_cli_child(&harness, &processor, "batch-poison", true, true).await;
             let (healthy, healthy_child) =
-                create_review_cli_child(&harness, &processor, "batch-healthy", false, false).await;
+                create_review_cli_child(&harness, &processor, "batch-healthy", true, false).await;
             let independent = if mixed {
                 Some(
                     create_review_cli_child(
@@ -1208,7 +1278,7 @@ fn reviewer_background_batch_preserves_ownership_progress_and_no_new_immediate_r
                     .unwrap()
                     .unwrap()
                     .status,
-                TaskRunStatus::Succeeded,
+                TaskRunStatus::WaitingReview,
                 "healthy row after poison makes durable progress"
             );
             assert_eq!(
@@ -1232,6 +1302,16 @@ fn reviewer_background_batch_preserves_ownership_progress_and_no_new_immediate_r
                     TaskRunStatus::Running
                 );
             }
+            let healthy_turn = harness
+                .crud_store
+                .get_task_run_turn_by_turn(
+                    &healthy_child.child_thread_id,
+                    &healthy_child.child_turn_id,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(healthy_turn.status, TaskRunTurnStatus::CandidateCreated);
             let safe_batch = format!("{error}");
             tasks::report_task_child_reconciliation_error(error);
             safe_batch
@@ -1545,11 +1625,17 @@ fn reviewer_late_cli_preparation_preserves_blocked_transition_and_safe_storage_e
             .task_cli_history_revalidation_failure
             .lock()
             .unwrap() = Some(cantopen_with_private_context().await);
-        assert!(
-            processor
-                .complete_turn(child.child_thread_id, child.child_turn_id, None)
-                .await
-        );
+        persist_completed_child(&harness, &child, now_timestamp_secs()).await;
+        let error = processor
+            .task_agent_executor
+            .reconcile_child_turn_completed(
+                &child.child_thread_id,
+                &child.child_turn_id,
+                super::super::TaskChildReconciliationOrigin::Live,
+            )
+            .await
+            .expect_err("late reviewer preparation remains a failed completion");
+        assert!(error.downcast_ref::<TaskStartFailure>().is_some());
         let run_id = &task.run.unwrap().id;
         let error = assert_persisted_late_cli_failure(
             &processor,
