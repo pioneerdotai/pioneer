@@ -697,7 +697,7 @@ async fn load_pending_payload_rows(
         .query_all_raw(Statement::from_sql_and_values(
             db.get_database_backend(),
             format!(
-                "SELECT rowid AS zstd_rowid, length({column}) AS payload_bytes \
+                "SELECT rowid AS zstd_rowid, length(CAST({column} AS BLOB)) AS payload_bytes \
                  FROM {table} WHERE {dict_column} IS NULL \
                  ORDER BY rowid LIMIT ?",
                 column = config.column,
@@ -754,7 +754,7 @@ async fn load_pending_payload_rows(
                         target.{column} AS payload \
                  FROM {table} AS target \
                  JOIN selected ON selected.zstd_rowid = target.rowid \
-                              AND selected.payload_bytes = length(target.{column}) \
+                              AND selected.payload_bytes = length(CAST(target.{column} AS BLOB)) \
                  WHERE target.{dict_column} IS NULL ORDER BY target.rowid",
                 column = config.column,
                 table = config.backing_table,
@@ -1289,11 +1289,11 @@ fn now_datetime() -> DateTimeWithTimeZone {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPRESSION_BATCH_MAX_ROWS, COMPRESSION_BATCH_MAX_SOURCE_BYTES,
-        PERIODIC_MAINTENANCE_SLICE_SECONDS, TURN_EVENT_PAYLOAD, TURN_ITEM_PAYLOAD,
-        ZSTD_PAYLOAD_COLUMNS, apply_prepared_payload_rows, ensure_compression_schema,
-        load_compression_dictionary, load_pending_payload_rows, prepare_payload_rows,
-        run_periodic_maintenance_once, run_startup_once,
+        COMPRESSION_BATCH_MAX_ROWS, COMPRESSION_BATCH_MAX_SOURCE_BYTES, DICTIONARY_SAMPLE_MAX_ROWS,
+        DICTIONARY_SAMPLE_MAX_SOURCE_BYTES, PERIODIC_MAINTENANCE_SLICE_SECONDS, TURN_EVENT_PAYLOAD,
+        TURN_ITEM_PAYLOAD, ZSTD_PAYLOAD_COLUMNS, apply_prepared_payload_rows,
+        ensure_compression_schema, load_compression_dictionary, load_pending_payload_rows,
+        prepare_payload_rows, run_periodic_maintenance_once, run_startup_once,
     };
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{CrudStore, find_projection_meta};
@@ -1303,6 +1303,305 @@ mod tests {
     };
     use std::sync::Arc;
     use tokio::sync::Notify;
+
+    #[derive(Default)]
+    struct BudgetSchedulingObserver {
+        reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadEvent>>,
+        writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+    }
+
+    impl pioneer_sqlite::SqliteReadObserver for BudgetSchedulingObserver {
+        fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+            self.reads.lock().unwrap().push(event);
+        }
+    }
+
+    impl pioneer_sqlite::SqliteWriteObserver for BudgetSchedulingObserver {
+        fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+            self.writes.lock().unwrap().push(event);
+        }
+    }
+
+    struct BudgetFixture {
+        _directory: tempfile::TempDir,
+        store: CrudStore,
+        observer: Arc<BudgetSchedulingObserver>,
+        payloads: Vec<Vec<String>>,
+    }
+
+    async fn budget_fixture(texts: &[&str]) -> BudgetFixture {
+        use pioneer_sqlite::{SqliteDatabase, SqliteWriteExecutor};
+        use sea_orm::ConnectOptions;
+
+        pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zstd-byte-budget.sqlite");
+        let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
+        options.max_connections(1).sqlx_logging(false);
+        let writer = Database::connect(options).await.unwrap();
+        Migrator::up(&writer, None).await.unwrap();
+        writer
+            .execute_unprepared("PRAGMA journal_mode=WAL")
+            .await
+            .unwrap();
+        insert_turn_events(&writer, texts.len() as i64).await;
+        insert_turn_items(&writer, texts.len() as i64).await;
+        let mut options =
+            ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
+        options
+            .max_connections(2)
+            .sqlx_logging(false)
+            .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
+        let reader = Database::connect(options).await.unwrap();
+        let observer = Arc::new(BudgetSchedulingObserver::default());
+        let database = SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            observer.clone(),
+        );
+        assert!(database.reader_query_only_enabled().await.unwrap());
+        let store = CrudStore::new(database.clone());
+        let mut payloads = Vec::new();
+        for &config in ZSTD_PAYLOAD_COLUMNS {
+            let mut expected = Vec::new();
+            for (index, &text) in texts.iter().enumerate() {
+                let (id, payload) =
+                    if config == TURN_EVENT_PAYLOAD {
+                        (format!("event_{index}"), serde_json::json!({
+                        "kind": "test_event", "payload": {"sequence": index, "content": text}
+                    }).to_string())
+                    } else {
+                        (
+                            format!("turn_item_zstd_item_{index}"),
+                            serde_json::to_string(&TurnItem::AgentMessage {
+                                id: format!("item_{index}"),
+                                text: text.to_owned(),
+                                phase: AgentMessagePhase::FinalAnswer,
+                                markdown: None,
+                                markdown_version: None,
+                            })
+                            .unwrap(),
+                        )
+                    };
+                database
+                    .execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        format!("UPDATE {} SET payload=? WHERE id=?", config.table),
+                        [payload.clone().into(), id.into()],
+                    ))
+                    .await
+                    .unwrap();
+                expected.push(payload);
+            }
+            payloads.push(expected);
+        }
+        ensure_compression_schema(
+            &store,
+            ZSTD_PAYLOAD_COLUMNS,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        observer.reads.lock().unwrap().clear();
+        observer.writes.lock().unwrap().clear();
+        BudgetFixture {
+            _directory: directory,
+            store,
+            observer,
+            payloads,
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_zstd_utf8_budgets_cover_compression_and_dictionary_sampling() {
+        let ascii = "a".repeat(420_000);
+        let utf8 = "汉😀".repeat(60_000);
+        let texts = (0..22)
+            .map(|index| {
+                if index % 2 == 0 {
+                    ascii.as_str()
+                } else {
+                    utf8.as_str()
+                }
+            })
+            .collect::<Vec<_>>();
+        let fixture = budget_fixture(&texts).await;
+        let db = fixture
+            .store
+            .with_maintenance_access()
+            .database_connection();
+        for (index, &config) in ZSTD_PAYLOAD_COLUMNS.iter().enumerate() {
+            for (max_rows, max_bytes) in [
+                (
+                    COMPRESSION_BATCH_MAX_ROWS,
+                    COMPRESSION_BATCH_MAX_SOURCE_BYTES,
+                ),
+                (
+                    DICTIONARY_SAMPLE_MAX_ROWS,
+                    DICTIONARY_SAMPLE_MAX_SOURCE_BYTES,
+                ),
+            ] {
+                let rows = load_pending_payload_rows(&db, config, max_rows, max_bytes)
+                    .await
+                    .unwrap();
+                let mut bytes = 0;
+                let expected = fixture.payloads[index]
+                    .iter()
+                    .take(max_rows)
+                    .take_while(|payload| {
+                        bytes += payload.len();
+                        bytes <= max_bytes
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    rows.iter().map(|row| row.payload.len()).sum::<usize>() <= max_bytes,
+                    "{} must obey its byte budget",
+                    config.label()
+                );
+                assert_eq!(
+                    rows.iter().map(|row| &row.payload).collect::<Vec<_>>(),
+                    expected,
+                    "both discovery and payload revalidation must count UTF-8 bytes"
+                );
+            }
+        }
+        assert!(
+            fixture.observer.writes.lock().unwrap().is_empty(),
+            "bounded discovery must use the reader"
+        );
+        let reads = fixture.observer.reads.lock().unwrap();
+        assert!(reads.iter().any(|event| matches!(
+            event,
+            pioneer_sqlite::SqliteReadEvent::OperationFinished {
+                class: pioneer_sqlite::SqliteReadClass::Maintenance,
+                ..
+            }
+        )));
+        assert!(reads.iter().all(|event| !matches!(
+            event,
+            pioneer_sqlite::SqliteReadEvent::OperationFinished {
+                class: pioneer_sqlite::SqliteReadClass::Interactive,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn bounded_zstd_utf8_oversized_row_progress_is_restart_safe() {
+        let oversized = "汉😀".repeat(1_000);
+        let fixture = budget_fixture(&[&oversized, "following ASCII row", "后续😀行"]).await;
+        let db = fixture
+            .store
+            .with_maintenance_access()
+            .database_connection();
+        for (index, &config) in ZSTD_PAYLOAD_COLUMNS.iter().enumerate() {
+            let first = load_pending_payload_rows(&db, config, COMPRESSION_BATCH_MAX_ROWS, 4096)
+                .await
+                .unwrap();
+            assert_eq!(
+                first.len(),
+                1,
+                "an oversized first row must be admitted alone"
+            );
+            assert_eq!(first[0].payload, fixture.payloads[index][0]);
+            assert!(first[0].payload.len() > 4096);
+            let prepared = prepare_payload_rows(first, 1, None).unwrap();
+            assert_eq!(
+                apply_prepared_payload_rows(&db, config, -1, &prepared)
+                    .await
+                    .unwrap(),
+                (1, 0)
+            );
+            assert_eq!(
+                apply_prepared_payload_rows(&db, config, -1, &prepared)
+                    .await
+                    .unwrap(),
+                (0, 1),
+                "replaying the prepared row must not apply it twice"
+            );
+            // A new store resumes from the durable dictionary markers, rather
+            // than an in-memory cursor that could strand the remaining rows.
+            let restarted =
+                CrudStore::new(fixture.store.database_connection()).with_maintenance_access();
+            let tail = load_pending_payload_rows(
+                &restarted.database_connection(),
+                config,
+                COMPRESSION_BATCH_MAX_ROWS,
+                4096,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                tail.iter().map(|row| &row.payload).collect::<Vec<_>>(),
+                fixture.payloads[index][1..].iter().collect::<Vec<_>>()
+            );
+            let prepared = prepare_payload_rows(tail, 1, None).unwrap();
+            let failing_id = if config == TURN_EVENT_PAYLOAD {
+                "event_2"
+            } else {
+                "turn_item_zstd_item_2"
+            };
+            db.execute_unprepared(&format!(
+                "CREATE TRIGGER zstd_budget_fail BEFORE UPDATE OF payload ON {} \
+                 WHEN OLD.id='{failing_id}' BEGIN SELECT RAISE(ABORT, 'test batch rollback'); END",
+                config.backing_table,
+            ))
+            .await
+            .unwrap();
+            assert!(
+                apply_prepared_payload_rows(&db, config, -1, &prepared)
+                    .await
+                    .is_err()
+            );
+            db.execute_unprepared("DROP TRIGGER zstd_budget_fail")
+                .await
+                .unwrap();
+            let retry = load_pending_payload_rows(&db, config, COMPRESSION_BATCH_MAX_ROWS, 4096)
+                .await
+                .unwrap();
+            assert_eq!(
+                retry.iter().map(|row| &row.payload).collect::<Vec<_>>(),
+                fixture.payloads[index][1..].iter().collect::<Vec<_>>(),
+                "a failure on the second row must roll back the first row too"
+            );
+            assert_eq!(
+                apply_prepared_payload_rows(&db, config, -1, &prepared)
+                    .await
+                    .unwrap(),
+                (2, 0)
+            );
+            let rows = db
+                .query_all_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    format!("SELECT payload FROM {} ORDER BY id", config.table),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.try_get::<String>("", "payload").unwrap())
+                    .collect::<Vec<_>>(),
+                fixture.payloads[index]
+            );
+            assert!(
+                load_pending_payload_rows(&db, config, COMPRESSION_BATCH_MAX_ROWS, 4096)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let writes = fixture.observer.writes.lock().unwrap();
+        assert!(writes.iter().any(|event| matches!(
+            event,
+            pioneer_sqlite::SqliteWriteEvent::Acquired {
+                class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                ..
+            }
+        )));
+        assert!(writes.iter().all(|event| !matches!(event,
+            pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } if *class != pioneer_sqlite::SqliteWriteClass::Maintenance
+        )));
+    }
 
     #[tokio::test]
     async fn startup_schema_enables_transparent_reads_without_compressing_the_backlog() {
