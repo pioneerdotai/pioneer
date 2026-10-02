@@ -14,6 +14,8 @@ mod task_terminal;
 pub use repositories::task_run_occurrence_reconcile::{
     OCCURRENCE_RECONCILE_BUDGET, OCCURRENCE_RECONCILE_INITIAL_BACKOFF_SECS,
     OCCURRENCE_RECONCILE_MAX_ATTEMPT_COUNT, OCCURRENCE_RECONCILE_MAX_BACKOFF_SECS,
+    TaskRunOccurrenceClaimDeferral, TaskRunOccurrenceClaimFailure,
+    TaskRunOccurrenceClaimFailurePhase, TaskRunOccurrenceClock,
     TaskRunOccurrenceReconcileCandidate, TaskRunOccurrenceReconcileClaim,
 };
 #[cfg(any(test, feature = "test-support"))]

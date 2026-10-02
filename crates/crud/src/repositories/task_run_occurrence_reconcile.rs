@@ -30,6 +30,65 @@ pub struct TaskRunOccurrenceReconcileClaim {
     pub next_attempt_at: i64,
 }
 
+/// The clock is read after writer admission. Implementations must be immediate,
+/// nonblocking clock reads, with no I/O or database work.
+pub type TaskRunOccurrenceClock<'a> = dyn Fn() -> i64 + Send + Sync + 'a;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskRunOccurrenceClaimFailurePhase {
+    AdvisoryRead,
+    Reservation,
+    CommitOutcomeUnknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskRunOccurrenceClaimDeferral {
+    NoSnapshot,
+    Deferred,
+    StateChanged,
+    Failed,
+}
+
+#[derive(Debug)]
+pub struct TaskRunOccurrenceClaimFailure {
+    pub phase: TaskRunOccurrenceClaimFailurePhase,
+    pub deferral: TaskRunOccurrenceClaimDeferral,
+    pub error: anyhow::Error,
+    pub deferral_error: Option<anyhow::Error>,
+}
+
+impl std::fmt::Display for TaskRunOccurrenceClaimFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TaskRun occurrence claim failed")
+    }
+}
+
+impl std::error::Error for TaskRunOccurrenceClaimFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
+pub(crate) struct FailedClaim {
+    pub error: anyhow::Error,
+    pub phase: TaskRunOccurrenceClaimFailurePhase,
+    // Exact pre-attempt state. This must never be replaced by a fresh read on
+    // error: that could defer another holder or a newly generated candidate.
+    pub snapshot: Option<pending::Model>,
+}
+
+pub(crate) async fn has_pending<C: ConnectionTrait>(db: &C) -> Result<bool> {
+    let query = Query::select()
+        .expr(Expr::val(1))
+        .from(pending::Entity)
+        .limit(1)
+        .to_owned();
+    Ok(db
+        .query_one_raw(db.get_database_backend().build(&query))
+        .await?
+        .is_some())
+}
+
 pub(crate) fn due_query(now: i64, limit: u64) -> SelectStatement {
     Query::select()
         .columns([pending::Column::RunId, pending::Column::Generation])
@@ -137,53 +196,123 @@ pub(crate) fn retry_delay(attempt: i32) -> i64 {
     )
 }
 
+fn snapshot_filter(row: &pending::Model) -> sea_orm::Condition {
+    let condition = sea_orm::Condition::all()
+        .add(pending::Column::RunId.eq(row.run_id.clone()))
+        .add(pending::Column::Generation.eq(row.generation))
+        .add(pending::Column::NextAttemptAt.eq(row.next_attempt_at))
+        .add(pending::Column::AttemptCount.eq(row.attempt_count));
+    match row.claim_token.as_ref() {
+        Some(token) => condition.add(pending::Column::ClaimToken.eq(token.clone())),
+        None => condition.add(pending::Column::ClaimToken.is_null()),
+    }
+}
+
+fn next_attempt_count(row: &pending::Model) -> i32 {
+    std::cmp::min(
+        row.attempt_count.saturating_add(1),
+        OCCURRENCE_RECONCILE_MAX_ATTEMPT_COUNT,
+    )
+}
+
 pub(crate) async fn claim(
     db: &SqliteDatabase,
     candidate: &TaskRunOccurrenceReconcileCandidate,
     token: String,
-    now: i64,
-) -> Result<Option<TaskRunOccurrenceReconcileClaim>> {
-    // Fetch and compute the backoff before acquiring the writer. The complete
-    // advisory row is fenced by the conditional update in the short transaction.
-    let Some(row) = pending::Entity::find_by_id(candidate.run_id.clone())
+    clock: &TaskRunOccurrenceClock<'_>,
+) -> std::result::Result<Option<TaskRunOccurrenceReconcileClaim>, FailedClaim> {
+    let row = pending::Entity::find_by_id(candidate.run_id.clone())
         .one(db)
-        .await?
-    else {
+        .await
+        .map_err(|error| FailedClaim {
+            error: error.into(),
+            phase: TaskRunOccurrenceClaimFailurePhase::AdvisoryRead,
+            snapshot: None,
+        })?;
+    let Some(row) = row else {
         return Ok(None);
     };
-    if row.generation != candidate.generation || row.next_attempt_at > now {
+    if row.generation != candidate.generation || row.next_attempt_at > clock() {
         return Ok(None);
     }
-    let attempt_count = std::cmp::min(
-        row.attempt_count.saturating_add(1),
-        OCCURRENCE_RECONCILE_MAX_ATTEMPT_COUNT,
-    );
-    let next_attempt_at = now.saturating_add(retry_delay(attempt_count));
-    let claim = TaskRunOccurrenceReconcileClaim {
-        run_id: row.run_id.clone(),
+    let attempt_count = next_attempt_count(&row);
+    let delay = retry_delay(attempt_count);
+    let failure = |error: sea_orm::DbErr, phase| FailedClaim {
+        error: error.into(),
+        phase,
+        snapshot: Some(row.clone()),
+    };
+    let tx = db
+        .begin()
+        .await
+        .map_err(|error| failure(error, TaskRunOccurrenceClaimFailurePhase::Reservation))?;
+    // Admission may have waited arbitrarily long. Only this immediate clock
+    // read and bounded arithmetic happen under the writer; delay policy/token
+    // were prepared before admission. Each candidate uses its own fresh time.
+    let reserved_at = clock();
+    let next_attempt_at = reserved_at.saturating_add(delay);
+    let update = pending::Entity::update_many()
+        .col_expr(pending::Column::ClaimToken, Expr::val(token.clone()))
+        .col_expr(pending::Column::AttemptCount, Expr::val(attempt_count))
+        .col_expr(pending::Column::NextAttemptAt, Expr::val(next_attempt_at))
+        .filter(snapshot_filter(&row))
+        .filter(pending::Column::NextAttemptAt.lte(reserved_at));
+    let affected = match update.exec(&tx).await {
+        Ok(result) => result.rows_affected,
+        Err(error) => {
+            // Release writer capacity before the separate deferral. Even if
+            // rollback fails, its CAS can only change the original snapshot.
+            let _ = tx.rollback().await;
+            return Err(failure(
+                error,
+                TaskRunOccurrenceClaimFailurePhase::Reservation,
+            ));
+        }
+    };
+    tx.commit().await.map_err(|error| {
+        failure(
+            error,
+            TaskRunOccurrenceClaimFailurePhase::CommitOutcomeUnknown,
+        )
+    })?;
+    Ok((affected == 1).then_some(TaskRunOccurrenceReconcileClaim {
+        run_id: row.run_id,
         generation: row.generation,
         claim_token: token,
         attempt_count,
         next_attempt_at,
-    };
+    }))
+}
+
+pub(crate) async fn defer_failed_claim(
+    db: &SqliteDatabase,
+    snapshot: &pending::Model,
+    clock: &TaskRunOccurrenceClock<'_>,
+) -> Result<TaskRunOccurrenceClaimDeferral> {
+    let attempt_count = next_attempt_count(snapshot);
+    let delay = retry_delay(attempt_count);
     let tx = db.begin().await?;
-    let mut update = pending::Entity::update_many()
-        .col_expr(
-            pending::Column::ClaimToken,
-            Expr::val(claim.claim_token.clone()),
-        )
+    let reserved_at = clock();
+    // Deliberately do not SET claim_token. A candidate-specific trigger may
+    // reject token writes while ordinary due/count bookkeeping still works.
+    // Exact snapshot CAS also makes ambiguous successful claim commits safe:
+    // their new token/due/count cannot match, so no new holder is postponed.
+    let affected = pending::Entity::update_many()
         .col_expr(pending::Column::AttemptCount, Expr::val(attempt_count))
-        .col_expr(pending::Column::NextAttemptAt, Expr::val(next_attempt_at))
-        .filter(pending::Column::RunId.eq(row.run_id))
-        .filter(pending::Column::Generation.eq(row.generation))
-        .filter(pending::Column::NextAttemptAt.eq(row.next_attempt_at))
-        .filter(pending::Column::NextAttemptAt.lte(now))
-        .filter(pending::Column::AttemptCount.eq(row.attempt_count));
-    update = match row.claim_token {
-        Some(token) => update.filter(pending::Column::ClaimToken.eq(token)),
-        None => update.filter(pending::Column::ClaimToken.is_null()),
-    };
-    let affected = update.exec(&tx).await?.rows_affected;
+        .col_expr(
+            pending::Column::NextAttemptAt,
+            Expr::val(reserved_at.saturating_add(delay)),
+        )
+        .filter(snapshot_filter(snapshot))
+        .filter(pending::Column::NextAttemptAt.lte(reserved_at))
+        .exec(&tx)
+        .await?
+        .rows_affected;
+    // No retry with a refreshed snapshot, including an ambiguous commit here.
     tx.commit().await?;
-    Ok((affected == 1).then_some(claim))
+    Ok(if affected == 1 {
+        TaskRunOccurrenceClaimDeferral::Deferred
+    } else {
+        TaskRunOccurrenceClaimDeferral::StateChanged
+    })
 }

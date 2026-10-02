@@ -2342,9 +2342,15 @@ impl MessageProcessor {
                         unresolved = summary.unresolved,
                         no_change = summary.no_change,
                         claim_errors = summary.claim_errors,
+                        claim_deferrals = summary.claim_deferrals,
+                        claim_deferral_conflicts = summary.claim_deferral_conflicts,
+                        claim_deferral_errors = summary.claim_deferral_errors,
+                        claim_without_snapshot = summary.claim_without_snapshot,
+                        claim_commit_unknown = summary.claim_commit_unknown,
                         repair_errors = summary.repair_errors,
                         storage_errors = summary.storage_errors,
                         notification_errors = summary.notification_errors,
+                        queue_state_errors = summary.queue_state_errors,
                         "TaskRun parent occurrence reconciliation pass"
                     );
                 }

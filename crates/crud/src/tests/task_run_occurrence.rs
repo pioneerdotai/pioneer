@@ -34,7 +34,7 @@ async fn claimed(store: &CrudStore) -> TaskRunOccurrenceReconcileClaim {
         .unwrap();
     assert_eq!(candidates.len(), 1);
     store
-        .claim_task_run_occurrence_reconcile(&candidates[0], NOW)
+        .claim_task_run_occurrence_reconcile(&candidates[0], &|| NOW)
         .await
         .unwrap()
         .unwrap()
@@ -285,8 +285,8 @@ async fn one_holder_at_a_time_reclaim_new_token_and_old_holder_cannot_commit() {
         .unwrap()
         .remove(0);
     let (a, b) = tokio::join!(
-        store.claim_task_run_occurrence_reconcile(&candidate, NOW),
-        store.claim_task_run_occurrence_reconcile(&candidate, NOW)
+        store.claim_task_run_occurrence_reconcile(&candidate, &|| NOW),
+        store.claim_task_run_occurrence_reconcile(&candidate, &|| NOW)
     );
     let (a, b) = (a.unwrap(), b.unwrap());
     assert_eq!(usize::from(a.is_some()) + usize::from(b.is_some()), 1);
@@ -295,13 +295,13 @@ async fn one_holder_at_a_time_reclaim_new_token_and_old_holder_cannot_commit() {
     assert_eq!(first.next_attempt_at, NOW + 5);
     assert!(
         store
-            .claim_task_run_occurrence_reconcile(&candidate, NOW + 4)
+            .claim_task_run_occurrence_reconcile(&candidate, &|| NOW + 4)
             .await
             .unwrap()
             .is_none()
     );
     let second = store
-        .claim_task_run_occurrence_reconcile(&candidate, NOW + 5)
+        .claim_task_run_occurrence_reconcile(&candidate, &|| NOW + 5)
         .await
         .unwrap()
         .unwrap();
@@ -522,7 +522,7 @@ async fn source_rollback_and_projection_failure_roll_back_tracker_and_event() {
                 run_id: run.id.clone(),
                 generation: claim.generation,
             },
-            claim.next_attempt_at,
+            &|| claim.next_attempt_at,
         )
         .await
         .unwrap()
@@ -538,7 +538,7 @@ async fn source_rollback_and_projection_failure_roll_back_tracker_and_event() {
 }
 
 #[tokio::test]
-async fn abandoned_claim_and_poison_missing_thread_keep_backoff_and_allow_later_repair() {
+async fn poison_missing_thread_keeps_backoff_and_allows_later_repair() {
     let (store, thread, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     turns::Entity::update_many()
         .col_expr(turns::Column::ThreadId, Expr::val("missing_thread"))
@@ -558,9 +558,6 @@ async fn abandoned_claim_and_poison_missing_thread_keep_backoff_and_allow_later_
         row(&store, &run.id).await.unwrap().next_attempt_at,
         claim.next_attempt_at
     );
-    // Cancellation and panic after the durable claim require no failure write.
-    let abandoned = tokio::spawn(async move { panic!("after claim") });
-    assert!(abandoned.await.unwrap_err().is_panic());
     assert!(
         store
             .discover_task_run_occurrence_reconcile(NOW, 64)
@@ -587,7 +584,7 @@ async fn abandoned_claim_and_poison_missing_thread_keep_backoff_and_allow_later_
                 run_id: run.id.clone(),
                 generation: current.generation,
             },
-            claim.next_attempt_at,
+            &|| claim.next_attempt_at,
         )
         .await
         .unwrap()
@@ -1125,6 +1122,8 @@ struct Routes {
     writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
     maintenance_queued: tokio::sync::Notify,
     watch_claim: std::sync::atomic::AtomicBool,
+    critical_queued: tokio::sync::Notify,
+    watch_repair: std::sync::atomic::AtomicBool,
 }
 impl pioneer_sqlite::SqliteReadObserver for Routes {
     fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
@@ -1146,6 +1145,17 @@ impl pioneer_sqlite::SqliteWriteObserver for Routes {
             )
         {
             self.maintenance_queued.notify_one();
+        }
+        if self.watch_repair.load(Ordering::SeqCst)
+            && matches!(
+                event,
+                pioneer_sqlite::SqliteWriteEvent::Enqueued {
+                    class: pioneer_sqlite::SqliteWriteClass::Critical,
+                    ..
+                }
+            )
+        {
+            self.critical_queued.notify_one();
         }
     }
 }
@@ -1265,7 +1275,7 @@ async fn reopen_retains_pending_generation_claim_and_backoff_without_completed_l
         .unwrap()
         .remove(0);
     let next = store
-        .claim_task_run_occurrence_reconcile(&candidate, claim.next_attempt_at)
+        .claim_task_run_occurrence_reconcile(&candidate, &|| claim.next_attempt_at)
         .await
         .unwrap()
         .unwrap();
@@ -1326,8 +1336,11 @@ async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_execu
     routes.watch_claim.store(true, Ordering::SeqCst);
     let worker = store.clone();
     let c = candidate.clone();
-    let waiting =
-        tokio::spawn(async move { worker.claim_task_run_occurrence_reconcile(&c, NOW).await });
+    let waiting = tokio::spawn(async move {
+        worker
+            .claim_task_run_occurrence_reconcile(&c, &|| NOW)
+            .await
+    });
     tokio::time::timeout(Duration::from_secs(5), routes.maintenance_queued.notified())
         .await
         .unwrap();
@@ -1347,7 +1360,7 @@ async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_execu
     routes.reads.lock().unwrap().clear();
     routes.writes.lock().unwrap().clear();
     let claim = store
-        .claim_task_run_occurrence_reconcile(&candidate, NOW)
+        .claim_task_run_occurrence_reconcile(&candidate, &|| NOW)
         .await
         .unwrap()
         .unwrap();
@@ -1362,22 +1375,76 @@ async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_execu
     assert!(routes.writes.lock().unwrap().iter().all(|e| !matches!(e,SqliteWriteEvent::Enqueued {class,..} if *class!=SqliteWriteClass::Maintenance)));
     routes.reads.lock().unwrap().clear();
     routes.writes.lock().unwrap().clear();
+    let events_before = pioneer_entity::turn_event::Entity::find()
+        .filter(pioneer_entity::turn_event::Column::TurnId.eq(&id))
+        .all(&store.connection)
+        .await
+        .unwrap();
+    let turn_before = turns::Entity::find_by_id(&id)
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    let pending_before = row(&store, &id).await.unwrap();
+    let hold = store
+        .with_maintenance_access()
+        .connection
+        .begin()
+        .await
+        .unwrap();
+    routes.watch_repair.store(true, Ordering::SeqCst);
     let worker = store.clone();
-    let abandoned = claim.clone();
+    let attempt = claim.clone();
     let cancellation = tokio::spawn(async move {
-        let _claim = abandoned;
-        std::future::pending::<()>().await;
+        worker
+            .reconcile_claimed_task_run_occurrence(&attempt, NOW)
+            .await
     });
+    // Critical admission occurs only after actual event preparation completes.
+    tokio::time::timeout(Duration::from_secs(5), routes.critical_queued.notified())
+        .await
+        .unwrap();
+    assert!(store.get_task_run(&id).await.unwrap().is_some());
     cancellation.abort();
     assert!(cancellation.await.unwrap_err().is_cancelled());
+    assert!(routes.writes.lock().unwrap().iter().any(|e| matches!(e,
+        SqliteWriteEvent::Cancelled {class:SqliteWriteClass::Critical,queue,..} if queue.critical == 0)));
+    hold.rollback().await.unwrap();
     assert_eq!(
-        row(&store, &id).await.unwrap().next_attempt_at,
-        claim.next_attempt_at
+        turns::Entity::find_by_id(&id)
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap(),
+        turn_before
     );
-    routes.reads.lock().unwrap().clear();
     assert_eq!(
-        worker
-            .reconcile_claimed_task_run_occurrence(&claim, NOW)
+        pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(&id))
+            .all(&store.connection)
+            .await
+            .unwrap(),
+        events_before
+    );
+    assert_eq!(row(&store, &id).await.unwrap(), pending_before);
+    assert!(
+        store
+            .discover_task_run_occurrence_reconcile(NOW, 64)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let next = store
+        .claim_task_run_occurrence_reconcile(&candidate, &|| claim.next_attempt_at)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(next.claim_token, claim.claim_token);
+    routes.reads.lock().unwrap().clear();
+    routes.writes.lock().unwrap().clear();
+    assert_eq!(
+        store
+            .reconcile_claimed_task_run_occurrence(&next, claim.next_attempt_at)
             .await
             .unwrap(),
         TaskRunOccurrenceTerminalizationOutcome::Changed
@@ -1479,7 +1546,7 @@ async fn changed_after_discovery_loses_claim_and_reincarnation_cannot_accept_old
     turn_status(&store, &run.id, "failed").await;
     assert!(
         store
-            .claim_task_run_occurrence_reconcile(&candidate, NOW)
+            .claim_task_run_occurrence_reconcile(&candidate, &|| NOW)
             .await
             .unwrap()
             .is_none()
@@ -1523,7 +1590,7 @@ async fn attempt_count_saturates_but_poison_row_stays_retryable_forever() {
     let mut now = NOW;
     for attempt in 1..=24 {
         let claim = store
-            .claim_task_run_occurrence_reconcile(&candidate, now)
+            .claim_task_run_occurrence_reconcile(&candidate, &|| now)
             .await
             .unwrap()
             .unwrap();
@@ -1627,7 +1694,7 @@ async fn auxiliary_native_effect_payload_edit_with_same_hash_timestamp_rolls_bac
                 run_id: run.id.clone(),
                 generation: claim.generation,
             },
-            claim.next_attempt_at,
+            &|| claim.next_attempt_at,
         )
         .await
         .unwrap()
@@ -1639,4 +1706,365 @@ async fn auxiliary_native_effect_payload_edit_with_same_hash_timestamp_rolls_bac
             .unwrap(),
         TaskRunOccurrenceTerminalizationOutcome::Changed
     );
+}
+
+#[tokio::test]
+async fn failed_claim_deferral_fences_generation_token_due_count_and_ambiguous_success() {
+    use crate::{
+        TaskRunOccurrenceClaimDeferral as Deferral, TaskRunOccurrenceClaimFailurePhase as Phase,
+    };
+    let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
+    let maintenance = store.with_maintenance_access();
+    let candidate = store
+        .discover_task_run_occurrence_reconcile(NOW, 64)
+        .await
+        .unwrap()
+        .remove(0);
+    // SQLite trigger DDL has no SeaQuery builder. This rejects only token SET,
+    // preserving ordinary service bookkeeping writes for the same candidate.
+    maintenance.connection.execute_unprepared("CREATE TRIGGER reject_claim BEFORE UPDATE OF claim_token ON task_run_occurrence_reconcile_pending BEGIN SELECT RAISE(ABORT,'individual claim refusal'); END").await.unwrap();
+    let failure = match queue::claim(
+        &maintenance.connection,
+        &candidate,
+        "rejected".into(),
+        &|| NOW,
+    )
+    .await
+    {
+        Err(failure) => failure,
+        _ => panic!("claim must be rejected"),
+    };
+    assert_eq!(failure.phase, Phase::Reservation);
+    let snapshot = failure.snapshot.unwrap();
+    assert_eq!(
+        queue::defer_failed_claim(&maintenance.connection, &snapshot, &|| NOW)
+            .await
+            .unwrap(),
+        Deferral::Deferred
+    );
+    let deferred = row(&store, &run.id).await.unwrap();
+    assert_eq!(deferred.attempt_count, 1);
+    assert_eq!(deferred.next_attempt_at, NOW + 5);
+    assert_eq!(deferred.claim_token, snapshot.claim_token);
+    assert_eq!(
+        queue::defer_failed_claim(&maintenance.connection, &snapshot, &|| NOW + 100)
+            .await
+            .unwrap(),
+        Deferral::StateChanged
+    );
+    assert_eq!(row(&store, &run.id).await.unwrap(), deferred);
+    // A late result of the same refusal cannot postpone a new generation.
+    runs::Entity::update_many()
+        .col_expr(
+            runs::Column::ErrorJson,
+            Expr::val("{\"message\":\"changed\"}"),
+        )
+        .filter(runs::Column::Id.eq(&run.id))
+        .exec(&store.connection)
+        .await
+        .unwrap();
+    let updated = row(&store, &run.id).await.unwrap();
+    assert_eq!(
+        queue::defer_failed_claim(&maintenance.connection, &deferred, &|| NOW + 100)
+            .await
+            .unwrap(),
+        Deferral::StateChanged
+    );
+    assert_eq!(row(&store, &run.id).await.unwrap(), updated);
+    maintenance
+        .connection
+        .execute_unprepared("DROP TRIGGER reject_claim")
+        .await
+        .unwrap();
+    let candidate = TaskRunOccurrenceReconcileCandidate {
+        run_id: run.id.clone(),
+        generation: updated.generation,
+    };
+    let first = store
+        .claim_task_run_occurrence_reconcile(&candidate, &|| NOW + 5)
+        .await
+        .unwrap()
+        .unwrap();
+    let old_holder_snapshot = row(&store, &run.id).await.unwrap();
+    let second = store
+        .claim_task_run_occurrence_reconcile(&candidate, &|| first.next_attempt_at)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(first.claim_token, second.claim_token);
+    let current = row(&store, &run.id).await.unwrap();
+    assert_eq!(
+        queue::defer_failed_claim(&maintenance.connection, &old_holder_snapshot, &|| NOW + 100)
+            .await
+            .unwrap(),
+        Deferral::StateChanged
+    );
+    // Model a lost commit acknowledgement: the successful token/due/count are
+    // durable, but the caller holds only its pre-commit snapshot for deferral.
+    assert_eq!(
+        queue::defer_failed_claim(&maintenance.connection, &updated, &|| NOW + 100)
+            .await
+            .unwrap(),
+        Deferral::StateChanged
+    );
+    assert_eq!(row(&store, &run.id).await.unwrap(), current);
+}
+
+#[tokio::test]
+async fn unavailable_bookkeeping_is_reported_without_claim_or_durable_backoff_promise() {
+    use crate::{
+        TaskRunOccurrenceClaimDeferral as Deferral, TaskRunOccurrenceClaimFailure,
+        TaskRunOccurrenceClaimFailurePhase as Phase,
+    };
+    let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
+    let candidate = store
+        .discover_task_run_occurrence_reconcile(NOW, 64)
+        .await
+        .unwrap()
+        .remove(0);
+    let before = row(&store, &run.id).await.unwrap();
+    // Reject every service update, including the fallback deferral. Trigger
+    // DDL is SQLite-specific; no production invariant is changed by this test.
+    store.connection.execute_unprepared("CREATE TRIGGER reject_bookkeeping BEFORE UPDATE ON task_run_occurrence_reconcile_pending BEGIN SELECT RAISE(ABORT,'bookkeeping unavailable'); END").await.unwrap();
+    let failure = store
+        .claim_task_run_occurrence_reconcile(&candidate, &|| NOW)
+        .await
+        .unwrap_err()
+        .downcast::<TaskRunOccurrenceClaimFailure>()
+        .unwrap();
+    assert_eq!(failure.phase, Phase::Reservation);
+    assert_eq!(failure.deferral, Deferral::Failed);
+    assert!(failure.deferral_error.is_some());
+    assert_eq!(row(&store, &run.id).await.unwrap(), before);
+    store.connection.clone().close().await.unwrap();
+    let failure = store
+        .claim_task_run_occurrence_reconcile(&candidate, &|| NOW)
+        .await
+        .unwrap_err()
+        .downcast::<TaskRunOccurrenceClaimFailure>()
+        .unwrap();
+    assert_eq!(failure.phase, Phase::AdvisoryRead);
+    assert_eq!(failure.deferral, Deferral::NoSnapshot);
+}
+
+#[tokio::test]
+async fn claim_uses_time_after_discovery_instead_of_the_advisory_clock() {
+    let (store, _, _) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
+    let clock = std::sync::atomic::AtomicI64::new(NOW);
+    let candidate = store
+        .discover_task_run_occurrence_reconcile(clock.load(Ordering::SeqCst), 64)
+        .await
+        .unwrap()
+        .remove(0);
+    clock.store(NOW + 100, Ordering::SeqCst);
+    let claim = store
+        .claim_task_run_occurrence_reconcile(&candidate, &|| clock.load(Ordering::SeqCst))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.next_attempt_at, NOW + 105);
+    assert_eq!(
+        row(&store, &candidate.run_id)
+            .await
+            .unwrap()
+            .next_attempt_at,
+        NOW + 105
+    );
+}
+
+#[tokio::test]
+async fn claim_and_failed_claim_deferral_use_time_after_waiting_for_writer() {
+    use std::time::Duration;
+    let path = std::env::temp_dir().join(format!(
+        "pioneer-occurrence-clock-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let routes = Arc::new(Routes::default());
+    let store = disk_store(&path, routes.clone()).await;
+    let id = populate_disk_pair(&store).await;
+    let candidate = store
+        .discover_task_run_occurrence_reconcile(NOW, 64)
+        .await
+        .unwrap()
+        .remove(0);
+    let clock = Arc::new(std::sync::atomic::AtomicI64::new(NOW));
+    let hold = store.connection.begin().await.unwrap();
+    routes.watch_claim.store(true, Ordering::SeqCst);
+    let worker = store.clone();
+    let c = candidate.clone();
+    let time = clock.clone();
+    let waiting = tokio::spawn(async move {
+        worker
+            .claim_task_run_occurrence_reconcile(&c, &|| time.load(Ordering::SeqCst))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), routes.maintenance_queued.notified())
+        .await
+        .unwrap();
+    clock.store(NOW + 100, Ordering::SeqCst);
+    hold.rollback().await.unwrap();
+    let claim = waiting.await.unwrap().unwrap().unwrap();
+    assert_eq!(claim.next_attempt_at, NOW + 105);
+    let snapshot = row(&store, &id).await.unwrap();
+    clock.store(claim.next_attempt_at, Ordering::SeqCst);
+    routes.watch_claim.store(false, Ordering::SeqCst);
+    let hold = store.connection.begin().await.unwrap();
+    routes.watch_claim.store(true, Ordering::SeqCst);
+    let worker = store.clone();
+    let time = clock.clone();
+    let waiting = tokio::spawn(async move {
+        queue::defer_failed_claim(
+            &worker.with_maintenance_access().connection,
+            &snapshot,
+            &|| time.load(Ordering::SeqCst),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), routes.maintenance_queued.notified())
+        .await
+        .unwrap();
+    clock.store(NOW + 200, Ordering::SeqCst);
+    hold.rollback().await.unwrap();
+    assert_eq!(
+        waiting.await.unwrap().unwrap(),
+        crate::TaskRunOccurrenceClaimDeferral::Deferred
+    );
+    let row = row(&store, &id).await.unwrap();
+    assert_eq!(row.attempt_count, 2);
+    assert_eq!(row.next_attempt_at, NOW + 210);
+    assert_eq!(row.claim_token.as_deref(), Some(claim.claim_token.as_str()));
+    remove_disk_fixture(store, path).await;
+}
+
+#[tokio::test]
+async fn background_repair_waits_for_predecessor_then_retries_without_source_pair_change() {
+    let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
+    let run_before = runs::Entity::find_by_id(&run.id)
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    let turn_before = turns::Entity::find_by_id(&run.id)
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    mark_first_turn_projection_failed(&store, &run.id, NOW + 1).await;
+    let claim = claimed(&store).await;
+    let events_before = pioneer_entity::turn_event::Entity::find()
+        .filter(pioneer_entity::turn_event::Column::TurnId.eq(&run.id))
+        .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+        .all(&store.connection)
+        .await
+        .unwrap();
+    assert_eq!(events_before.len(), 1);
+    assert!(
+        store
+            .reconcile_claimed_task_run_occurrence(&claim, NOW)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        row(&store, &run.id).await.unwrap().next_attempt_at,
+        claim.next_attempt_at
+    );
+    assert_eq!(
+        pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(&run.id))
+            .all(&store.connection)
+            .await
+            .unwrap(),
+        events_before
+    );
+    // Reproject the real predecessor using the existing prepared projection
+    // and receipt/watermark transaction. Status/id/binding stay unchanged.
+    assert_eq!(
+        store
+            .replay_due_turn_event_projections(NOW + 1, 64)
+            .await
+            .unwrap()
+            .projected,
+        1
+    );
+    let turn_after = turns::Entity::find_by_id(&run.id)
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(turn_after.status, turn_before.status);
+    assert_eq!(
+        runs::Entity::find_by_id(&run.id)
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap(),
+        run_before
+    );
+    assert_eq!(
+        row(&store, &run.id).await.unwrap().generation,
+        claim.generation
+    );
+    let candidate = TaskRunOccurrenceReconcileCandidate {
+        run_id: run.id.clone(),
+        generation: claim.generation,
+    };
+    assert!(
+        store
+            .claim_task_run_occurrence_reconcile(&candidate, &|| NOW + 4)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let next = store
+        .claim_task_run_occurrence_reconcile(&candidate, &|| claim.next_attempt_at)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .reconcile_claimed_task_run_occurrence(&next, claim.next_attempt_at)
+            .await
+            .unwrap(),
+        TaskRunOccurrenceTerminalizationOutcome::Changed
+    );
+    assert_eq!(
+        store
+            .reconcile_claimed_task_run_occurrence(&claim, claim.next_attempt_at)
+            .await
+            .unwrap(),
+        TaskRunOccurrenceTerminalizationOutcome::StaleClaim
+    );
+    assert_eq!(
+        store
+            .compare_and_materialize_task_run_occurrence_terminal(&run.id, NOW + 6)
+            .await
+            .unwrap(),
+        TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent
+    );
+    let events = pioneer_entity::turn_event::Entity::find()
+        .filter(pioneer_entity::turn_event::Column::TurnId.eq(&run.id))
+        .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+        .all(&store.connection)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].id, events_before[0].id);
+    assert_eq!(events[1].sequence, events[0].sequence + 1);
+    let stream = pioneer_entity::turn_event_projection_stream_state::Entity::find_by_id(&run.id)
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stream.projected_through_sequence, events[1].sequence);
+    let receipts = pioneer_entity::turn_event_projection_state::Entity::find()
+        .filter(pioneer_entity::turn_event_projection_state::Column::TurnId.eq(&run.id))
+        .order_by_asc(pioneer_entity::turn_event_projection_state::Column::Sequence)
+        .all(&store.connection)
+        .await
+        .unwrap();
+    assert_eq!(receipts.len(), 2);
+    assert!(receipts.iter().all(|receipt| receipt.status == "projected"));
+    assert_eq!(receipts[0].sequence, events[0].sequence);
+    assert_eq!(receipts[1].sequence, events[1].sequence);
+    assert!(row(&store, &run.id).await.is_none());
 }

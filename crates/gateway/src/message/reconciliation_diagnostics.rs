@@ -201,8 +201,9 @@ impl Reporter {
             }
         }
     }
-    /// Candidate failures do not make a partially successful pass recover its
-    /// reporter. Discovery failure remains a separate whole-database outcome.
+    /// Only an observed empty pending set closes an occurrence episode. Idle
+    /// backoff passes neither add failures nor recover. The empty observation
+    /// is a point-in-time fact; later source writes can start a new episode.
     pub(super) fn observe_occurrences(
         &mut self,
         result: &anyhow::Result<super::tasks::TaskRunOccurrenceReconcileSummary>,
@@ -222,7 +223,9 @@ impl Reporter {
                     snapshot.emit(false);
                 }
             }
-            _ => self.observe(result, now),
+            Ok(summary) if summary.pending == Some(false) => self.observe(result, now),
+            Ok(_) => {}
+            Err(_) => self.observe(result, now),
         }
     }
     fn failure(&mut self, diagnostic: Diagnostic, now: Instant) -> Option<Snapshot> {

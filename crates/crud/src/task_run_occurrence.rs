@@ -34,14 +34,43 @@ impl CrudStore {
     pub async fn claim_task_run_occurrence_reconcile(
         &self,
         candidate: &TaskRunOccurrenceReconcileCandidate,
-        now: i64,
+        clock: &TaskRunOccurrenceClock<'_>,
     ) -> Result<Option<TaskRunOccurrenceReconcileClaim>> {
         // Token generation precedes both the reader and the writer acquisition.
         let token = generate_id(DB_ID_LEN);
         let maintenance = self.with_maintenance_access();
         // No operation-wide retry: an ambiguous commit must never cause a
         // second reservation. The persisted due time handles later passes.
-        queue::claim(&maintenance.connection, candidate, token, now).await
+        match queue::claim(&maintenance.connection, candidate, token, clock).await {
+            Ok(claim) => Ok(claim),
+            Err(failure) => {
+                let (deferral, deferral_error) = match failure.snapshot.as_ref() {
+                    Some(snapshot) => {
+                        match queue::defer_failed_claim(&maintenance.connection, snapshot, clock)
+                            .await
+                        {
+                            Ok(outcome) => (outcome, None),
+                            Err(error) => (TaskRunOccurrenceClaimDeferral::Failed, Some(error)),
+                        }
+                    }
+                    None => (TaskRunOccurrenceClaimDeferral::NoSnapshot, None),
+                };
+                Err(TaskRunOccurrenceClaimFailure {
+                    phase: failure.phase,
+                    deferral,
+                    error: failure.error,
+                    deferral_error,
+                }
+                .into())
+            }
+        }
+    }
+
+    /// A bounded service-table observation, including rows still in backoff.
+    /// False describes this read's snapshot, not all future source writes.
+    pub async fn has_pending_task_run_occurrence_reconcile(&self) -> Result<bool> {
+        let maintenance = self.with_maintenance_access();
+        queue::has_pending(&maintenance.connection).await
     }
 
     pub async fn reconcile_claimed_task_run_occurrence(

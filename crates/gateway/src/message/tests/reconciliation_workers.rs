@@ -4,7 +4,7 @@ use sentry::SentryFutureExt;
 use tracing::instrument::WithSubscriber;
 use tracing_subscriber::prelude::*;
 
-fn local_capture() -> (
+pub(super) fn local_capture() -> (
     Arc<sentry::Hub>,
     Arc<sentry::test::TestTransport>,
     tracing::Dispatch,

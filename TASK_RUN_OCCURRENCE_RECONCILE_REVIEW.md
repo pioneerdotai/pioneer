@@ -23,12 +23,20 @@ Base: `6022ad18c6f0aaf85d2c63f4153c8d7f3d1552fb`
 3. Discovery читает только индексированный due-набор; один SELECT, максимум 64
    пары run_id/generation. Каждый выбранный кандидат расходует бюджет.
 4. Claim генерирует токен до DB capacity, читает точную advisory pending-строку,
-   вычисляет backoff вне writer и условно обновляет её в короткой Maintenance
-   транзакции. Условие включает generation, прежние due/count/token и due<=now.
+   вычисляет величину задержки вне writer и условно обновляет её в короткой
+   Maintenance транзакции. Время резервирования считывается после writer admission;
+   срок равен этому актуальному времени плюс выбранная задержка, отдельно для
+   каждого кандидата. Условие включает generation, прежние due/count/token и due<=now.
    `rows_affected==1` и успешный commit необходимы для подготовки ремонта.
 5. Backoff уже durable до parsing/serialization. Claim не повторяется автоматически
    при неоднозначной ошибке commit. Повторная попытка возможна по новому due time;
    повторный захват одной generation обязательно меняет token.
+   Отказ с точным pre-attempt снимком запускает одну отдельную Maintenance CAS-
+   отсрочку due/count, без SET token, без ремонта и без повторного claim/discovery.
+   CAS ограждает run_id/generation/token/due/count, включая NULL token; результат
+   старой ошибки не может изменить новую generation или другого holder. Успешный
+   claim с потерянным commit acknowledgement уже изменил снимок и не откладывается.
+   Ошибка read без снимка и ошибка самой отсрочки явно отражаются в summary.
 6. Общая подготовка канонического Turn event выполняется на readers. Обычный
    Task-event fanout использует тот же commit. Background добавляет ожидаемый
    generation/token; сам ремонт имеет Maintenance reads / Critical writes.
@@ -45,6 +53,11 @@ Base: `6022ad18c6f0aaf85d2c63f4153c8d7f3d1552fb`
     storage errors/notification errors. Reporter учитывает partial failure при Ok
     summary; typed storage failure имеет приоритет перед poison error. Diagnostics
     не включают IDs, SQL, payload или raw errors. Уведомления идут после commit.
+11. После batch один Maintenance SELECT 1 FROM pending LIMIT 1 проверяет всю
+    текущую работу, включая backoff. Только успешно наблюдаемое отсутствие pending
+    при отсутствии новых ошибок закрывает occurrence episode. Idle с pending или
+    неизвестным состоянием не добавляет failures и не сообщает recovery. Ошибка
+    probe остаётся ошибкой summary. Native Reporter::observe не изменён.
 
 ## Schema
 
@@ -141,6 +154,39 @@ blocked Run снимает pending; последующее terminal DML выда
 Subscriber send helpers по прежнему best-effort; summary считает ошибки DB lookup
 при подготовке fanout, а не все недоставленные сообщения отдельным подписчикам.
 
+## Claim failure and observation boundaries
+
+Claim errors различаются по фазам advisory read / reservation / commit outcome
+unknown; summary отдельно считает durable deferrals, CAS conflicts, failures of
+bookkeeping и отсутствие снимка. Typed storage classification отделяет доступность
+storage от индивидуальных отказов/poison errors. Superseded advisory — обычный
+проигранный claim, без error и без обновления новой строки.
+
+При неоднозначном claim commit подготовка запрещена. Отсрочка использует только
+исходный снимок: уже committed token/count/due не совпадут; если claim не committed,
+прежнее состояние допускает guarded отсрочку. Неоднозначный commit самой отсрочки
+считается ошибкой/unknown, без повторной записи или перечитывания нового снимка.
+Следующий проход наблюдает фактическое durable состояние.
+
+Durable backoff гарантируется только после подтверждённого claim/deferral commit.
+Если storage не позволяет сохранить служебную отсрочку либо не удалось получить
+пригодный исходный снимок, этот результат явно виден; постоянную отсрочку обещать
+нельзя. Cancellation/panic до такого commit также не даёт этой гарантии. После
+успешного commit её обеспечивают persistent due/count независимо от error log.
+
+Production clock — текущие UTC Unix seconds; тесты передают синхронный управляемый
+clock, в том числе AtomicI64, изменяемый после observer notification о постановке
+операции в очередь. Clock читается сразу после begin/admission; он не выполняет
+I/O/DB work. Дополнительная работа под writer — immediate clock read и bounded
+arithmetic; token и policy подготовлены до capacity. Discovery time не используется как claim deadline.
+Это время доступности следующего захвата, без дополнительного acquisition timeout.
+
+Empty-queue probe описывает собственный snapshot после batch. Поздняя конкурентная
+source write может создать новую работу после этого наблюдения; recovery сообщает
+разрешение наблюдаемой очереди в тот момент, а не гарантирует отсутствие будущих
+расхождений. Read error/unknown не выдаются за пустую очередь. Критерий намеренно
+консервативен: даже другой нерешённый pending удерживает occurrence episode.
+
 ## Backoff and cost model
 
 Policy constants: initial=5 seconds, cap=300 seconds, count cap=16. Последовательность
@@ -148,8 +194,9 @@ Policy constants: initial=5 seconds, cap=300 seconds, count cap=16. Послед
 worker poll и конечный период проверки poison rows; это не измеренные значения.
 Нет окончательного удаления poison rows.
 
-- Empty set: один due SELECT за проход; нет обхода истории, новых persistent rows
-  или discovery write. Singleton хранится постоянно.
+- Empty set: один due SELECT и один LIMIT 1 pending-existence SELECT за проход;
+  нет обхода истории, новых persistent rows или discovery write. Singleton
+  хранится постоянно. Probe не делает COUNT или JOIN.
 - Normal terminal transition: точечные PK probes в триггерах; возможны sequence
   UPDATE и pending INSERT, затем pending DELETE при отдельной Turn projection.
   Кратковременное расхождение всё равно пишет pending/index/counter в WAL, даже
@@ -157,6 +204,13 @@ worker poll и конечный период проверки poison rows; эт�
 - Backlog: одна строка на несовпадающую пару плюс PK/due index; максимум 64 advisory
   кандидата за проход. Каждый успешный claim отдельно пишет token/count/due и due
   index в WAL. Каждая выбранная строка учитывается, включая failed/lost claims.
+- Failed claim: при наличии снимка ещё одна короткая Maintenance транзакция
+  условно записывает count/due и due index в WAL. Не SET token, не доменный ремонт,
+  не журнал; CAS conflict не меняет строку. Неудачная/неоднозначная запись не
+  подтверждает durable отсрочку. Сам failed claim также мог выполнить временные
+  операции SQLite; точный WAL объём не измерен.
+- Every completed pass: один дополнительный pending existence read; он не
+  пополняет 64-candidate budget и не повторяет discovery.
 - Source edits pending: generation/token меняются, count/due остаются назначенными.
 - Restart: обычное открытие и due query; без history replay этого механизма,
   bootstrap scan, backfill, cursor, high watermark, checkpoint или fallback.
@@ -171,16 +225,48 @@ worker poll и конечный период проверки poison rows; эт�
 Новый CRUD модуль `crates/crud/src/tests/task_run_occurrence.rs` покрывает predicate
 matrix/unknown/NULL, same-status error, late insert/delete/ID/ABA, recovery DML,
 resume, terminal commit без fanout, replay, generation/token races, equal timestamps,
-source/projection rollback, missing Thread, abandonment, attempt saturation,
+source/projection rollback, missing Thread, actual repair cancellation, attempt saturation,
 migration install/down/rollback marker/no backfill, overflow/missing singleton,
 disk reopen, scheduling/cancellation/read-only/RETURNING, native effect payload fence.
 EXPLAIN tests проверяют empty set, 4096 deferred rows и due backlog: covering due
 index и отсутствие TEMP B-TREE. Эти assertions ещё не выполнялись.
 
 Gateway `message/tests/task_run_occurrence_tracker.rs` покрывает poison progress,
-64-candidate budget (including a claim error recognized by the existing transient retry classifier), partial-success reporting, low-cardinality diagnostics и
+64-candidate budget (including persistent refusals of the first 64 claims and a
+claim error recognized by the existing transient retry classifier), partial-success
+reporting, idle-backoff recovery semantics, low-cardinality diagnostics и
 post-commit notification failure. Existing occurrence и reconciliation_workers
 tests переведены на новый summary и pending discovery.
+
+После замечаний ревью добавлены 5 CRUD tests:
+
+- failed_claim_deferral_fences_generation_token_due_count_and_ambiguous_success;
+- unavailable_bookkeeping_is_reported_without_claim_or_durable_backoff_promise;
+- claim_uses_time_after_discovery_instead_of_the_advisory_clock;
+- claim_and_failed_claim_deferral_use_time_after_waiting_for_writer;
+- background_repair_waits_for_predecessor_then_retries_without_source_pair_change.
+
+Scheduling test теперь отменяет настоящую reconcile future после подготовки и
+Critical enqueue: проверяет Cancelled queue, отсутствие Turn/event commit,
+сохранённый pending/due, доступные readers и последующий успешный delayed claim.
+Искусственные panic-future и pending-future, только хранящие claim, удалены.
+Реальная panic посреди ремонта новым кодом не инъецируется и не заявляется как
+проверенный regression scenario. Ambiguous commit тест моделирует потерянный
+acknowledgement успешного commit исходным снимком, без fault injection commit I/O.
+
+Добавлены 4 Gateway tests:
+
+- sixty_four_persistent_claim_refusals_defer_and_allow_candidates_after_budget_to_progress;
+- long_pass_uses_each_claim_reservation_time_instead_of_batch_start;
+- occurrence_reporting_waits_through_idle_backoff_until_background_or_event_repair_resolves_queue;
+- failed_pending_observation_and_unknown_state_never_report_occurrence_recovery.
+
+Existing transient-classifier test теперь оставляет блокер на idle-проходы,
+проверяет durable отсрочку, а затем снимает его и ремонтирует строку в due time.
+Native reporter сохранён и проверяется независимо. Ошибка pending probe в тесте
+получена закрытием isolated store и передана в тот же summary handler; закрытие
+не инъецируется посреди production batch. Все эти tests лишь написаны.
+
 
 После отдельного принятия ревьюером предлагается выполнить:
 
@@ -195,7 +281,7 @@ cargo test -p pioneer-crud -p pioneer-gateway -p pioneer-migration -p pioneer-sq
 Не запускать эти команды до принятия реализации. Runtime behavior, actual restart,
 EXPLAIN assertions и производительность сейчас не подтверждены выполнением.
 
-## Performed validation
+## Performed validation (initial reviewed commit)
 
 - Проверены применимые AGENTS.md, исходный HEAD/status, branches и worktrees.
   Task worktree создан от указанного актуального HEAD. Основной checkout остался
@@ -220,6 +306,27 @@ WAL не измерялись. Следующий этап — независи�
 предложенных тестов; отсутствие известных незавершённых частей реализации не
 заменяет этот этап проверки.
 
+## Follow-up review
+
+Reviewed starting commit: `0d47eb455f09537c8a5375f5db0a9d6564f53d78`.
+Доработка ведётся в той же ветке/worktree. Реализация ещё не принята.
+Выполнены:
+
+- Проверка применимых AGENTS.md, HEAD/branch/status: старт с reviewed commit,
+  task worktree чистый; основной checkout чистый на исходном base.
+- `cargo fmt --all`, `cargo fmt --all -- --check`, `git diff --check` — успешно.
+- `cargo check -p pioneer-crud -p pioneer-gateway -p pioneer-migration --tests` —
+  успешно, без выполнения тестов. Предварительная компиляция нашла test-only
+  partial move при close; исправлено на close клонированного scoped handle.
+- Статический просмотр всего updated diff, claim/deferral CAS, observer границ,
+  ограниченного probe и неизменённого native Reporter::observe.
+- Поиск старого `list_mismatched_terminal_task_run_occurrence_ids` в crates —
+  отсутствуют реализация и ссылки.
+
+Тесты не запускались. Приложение и пользовательская БД не запускались/не открывались.
+Runtime SQL, cancellation/replay/reopen, EXPLAIN и производительность не подтверждены
+выполнением. Передача только на повторное ревью; принятие и запуск tests отдельно.
+
 ## Changed files
 
 - `crates/migration/src/m20261002_000001_task_run_occurrence_reconcile.rs` — schema/triggers/up/down.
@@ -233,11 +340,11 @@ WAL не измерялись. Следующий этап — независи�
 - `crates/crud/src/repositories/mod.rs` — repository registration.
 - `crates/crud/src/task_run_occurrence.rs` — scoped protocol and common event repair.
 - `crates/crud/src/lib.rs` — remove historical discovery, export protocol, update existing tests.
-- `crates/crud/src/tests/task_run_occurrence.rs` — 23 focused regression tests.
+- `crates/crud/src/tests/task_run_occurrence.rs` — 28 focused regression tests.
 - `crates/gateway/src/message/tasks.rs` — bounded pass/summary and post-commit fanout.
 - `crates/gateway/src/message/mod.rs` — remove batch retry, report counts/partial success.
 - `crates/gateway/src/message/reconciliation_diagnostics.rs` — bounded categories and partial failure.
 - `crates/gateway/src/message/tests.rs` — test registration and existing assertions.
 - `crates/gateway/src/message/tests/reconciliation_workers.rs` — summary-aware existing reporting tests.
-- `crates/gateway/src/message/tests/task_run_occurrence_tracker.rs` — 4 Gateway regression tests.
+- `crates/gateway/src/message/tests/task_run_occurrence_tracker.rs` — 8 Gateway regression tests.
 - `TASK_RUN_OCCURRENCE_RECONCILE_REVIEW.md` — this handoff.
