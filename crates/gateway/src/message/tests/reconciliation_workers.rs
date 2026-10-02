@@ -4,6 +4,203 @@ use sentry::SentryFutureExt;
 use tracing::instrument::WithSubscriber;
 use tracing_subscriber::prelude::*;
 
+#[tokio::test]
+async fn native_turn_event_delivery_kick_uses_background_database_scope() {
+    assert_native_kick_database_scope(false).await;
+}
+
+#[tokio::test]
+async fn native_terminal_effect_kick_uses_background_database_scope() {
+    assert_native_kick_database_scope(true).await;
+}
+
+async fn assert_native_kick_database_scope(terminal_effects: bool) {
+    use pioneer_sqlite::{
+        SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteClass, SqliteWriteEvent,
+        SqliteWriteExecutor,
+    };
+    use sea_orm::{ConnectOptions, DbBackend, Statement};
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("native-kick.sqlite");
+    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
+    options.max_connections(1).sqlx_logging(false);
+    let writer = Database::connect(options).await.unwrap();
+    let (_, _, workspace) = setup_workspace_manager_with_connection(writer.clone()).await;
+    writer
+        .execute_unprepared("PRAGMA journal_mode=WAL")
+        .await
+        .unwrap();
+    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
+    options
+        .max_connections(2)
+        .sqlx_logging(false)
+        .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
+    let reader = Database::connect(options).await.unwrap();
+    let observer = Arc::new(NativeSchedulingObserver::default());
+    let database = SqliteDatabase::from_executor_with_read_observer(
+        reader,
+        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        observer.clone(),
+    );
+    let store = Arc::new(CrudStore::new(database.clone()));
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("test-model", "openai")),
+        test_provider(),
+        Arc::new(SessionManager::new()),
+        Arc::new(WorkspaceManager::new(database.clone())),
+        store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    );
+    if !terminal_effects {
+        materialize_cli_runtime_turn_with_text(
+            &store,
+            &workspace,
+            "kick-thread",
+            "kick-turn",
+            "input",
+        )
+        .await;
+        let (_, mut turn) = store
+            .get_turn("kick-thread", "kick-turn")
+            .await
+            .unwrap()
+            .unwrap();
+        turn.status = TurnStatus::Completed;
+        store
+            .materialize_native_agent_turn_event(
+                pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
+                    workspace_id: workspace,
+                    thread_id: "kick-thread".into(),
+                    turn,
+                }),
+                now_timestamp_secs(),
+                None,
+            )
+            .await
+            .unwrap();
+        let row = database
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM turn_event_delivery \
+             WHERE turn_id='kick-turn' AND consumer='live_notification' \
+             AND status='pending'"
+                    .to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<i64>("", "count").unwrap(), 1);
+    }
+
+    // Occupy the single maintenance slot while leaving another physical reader
+    // free for foreground queries. A real kick must queue at this limiter.
+    let held = database.maintenance().begin_read().await.unwrap();
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    let running = if terminal_effects {
+        processor.kick_native_terminal_effects();
+        &processor.native_terminal_effect_kick_running
+    } else {
+        processor.kick_native_turn_event_deliveries();
+        &processor.native_turn_event_delivery_kick_running
+    };
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if observer.reads.lock().unwrap().iter().any(|event| {
+                matches!(
+                    event,
+                    SqliteReadEvent::AdmissionEnqueued {
+                        class: SqliteReadClass::Maintenance,
+                        ..
+                    }
+                )
+            }) {
+                break;
+            }
+            assert!(
+                running.load(Ordering::Acquire),
+                "background kick bypassed maintenance admission"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        observer.writes.lock().unwrap().is_empty(),
+        "discovery must wait before writing"
+    );
+    let query_only = timeout(
+        Duration::from_secs(10),
+        database.reader_query_only_enabled(),
+    )
+    .await
+    .expect("foreground read must proceed while the kick waits")
+    .unwrap();
+    assert!(query_only, "the physical reader must remain query-only");
+    assert_eq!(
+        processor.crud_store.database_connection().read_class(),
+        SqliteReadClass::Interactive
+    );
+    observer.reads.lock().unwrap().clear();
+    drop(held);
+    timeout(Duration::from_secs(10), async {
+        while running.load(Ordering::Acquire) {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background kick must drain after maintenance admission is released");
+
+    let reads = observer.reads.lock().unwrap().clone();
+    assert!(reads.iter().any(|event| matches!(
+        event,
+        SqliteReadEvent::OperationFinished {
+            class: SqliteReadClass::Maintenance,
+            ..
+        }
+    )));
+    assert!(reads.iter().all(|event| !matches!(
+        event,
+        SqliteReadEvent::OperationFinished {
+            class: SqliteReadClass::Interactive,
+            ..
+        }
+    )));
+    let writes = observer.writes.lock().unwrap().clone();
+    assert!(writes.iter().any(|event| matches!(
+        event,
+        SqliteWriteEvent::Acquired {
+            class: SqliteWriteClass::Critical,
+            ..
+        }
+    )));
+    assert!(writes.iter().all(|event| !matches!(event,
+        SqliteWriteEvent::Acquired { class, .. } if *class != SqliteWriteClass::Critical
+    )));
+    if !terminal_effects {
+        let row = database
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM turn_event_delivery \
+                 WHERE turn_id='kick-turn' AND consumer='live_notification' \
+                 AND status='delivered'"
+                    .to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.try_get::<i64>("", "count").unwrap(),
+            1,
+            "kick must acknowledge the committed live event"
+        );
+    }
+}
+
 fn local_capture() -> (
     Arc<sentry::Hub>,
     Arc<sentry::test::TestTransport>,
