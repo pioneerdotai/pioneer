@@ -880,20 +880,10 @@ async fn dispatch_run_to_executor(
             );
             handle.fail_run(Some(error), now).await?;
         }
-        Err(error) => {
-            error!(
-                run_id = run.id,
-                error = %format!("{error:#}"),
-                failure_class = "task_executor_start_failed",
-                "task executor failed to start run"
-            );
+        Err(mut error) => {
+            let descriptor = crate::TaskStartFailure::report_for_scheduler(&mut error);
             let now = now_timestamp_secs();
-            let task_error = task_error(
-                "task_executor_start_failed",
-                format!("{error:#}"),
-                TaskErrorClass::Internal,
-                Some(run.id.clone()),
-            );
+            let task_error = descriptor.task_error(Some(run.id.clone()));
             handle.fail_run(Some(task_error), now).await?;
         }
     }

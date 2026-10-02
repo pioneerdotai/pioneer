@@ -34751,13 +34751,18 @@ async fn failed_task_thread_delivery_is_a_sanitized_system_state_without_work_gr
         .deliveries
         .first()
         .expect("failed result should still have a delivered notification");
-    assert!(
-        delivery
-            .error_snapshot
-            .as_ref()
-            .is_some_and(|error| error.message.contains("internal path /srv/pioneer")),
-        "the durable Task diagnostic must retain the real internal cause"
+    let saved_error = delivery
+        .error_snapshot
+        .as_ref()
+        .expect("failed delivery keeps a safe descriptor");
+    assert_eq!(saved_error.code, "task_executor_start_unclassified_failed");
+    assert_eq!(
+        saved_error.class,
+        pioneer_protocol::TaskErrorClass::Internal
     );
+    assert_eq!(saved_error.message, "Task preparation or launch failed.");
+    let encoded = serde_json::to_string(saved_error).unwrap();
+    assert!(!encoded.contains("internal path /srv/pioneer"));
     let delivered_turn_id = delivery
         .delivered_turn_id
         .as_deref()
@@ -34775,7 +34780,7 @@ async fn failed_task_thread_delivery_is_a_sanitized_system_state_without_work_gr
     );
     assert_eq!(
         delivered_turn.error.as_deref(),
-        Some("Scheduled task could not start.")
+        Some("Scheduled task failed.")
     );
     assert!(
         !delivered_turn
@@ -34800,9 +34805,7 @@ async fn failed_task_thread_delivery_is_a_sanitized_system_state_without_work_gr
         .expect("delivery timeline blocks should query");
     assert!(blocks.iter().any(|block| {
         block.block_kind == pioneer_crud::BLOCK_KIND_SYSTEM
-            && block
-                .metadata_json
-                .contains("Scheduled task could not start.")
+            && block.metadata_json.contains("Scheduled task failed.")
     }));
     assert!(
         blocks
@@ -77531,3 +77534,6 @@ mod task_delivery_cancellation;
 
 #[path = "tests/memory_post_turn_recovery.rs"]
 mod memory_post_turn_recovery;
+
+#[path = "tests/task_start_failure.rs"]
+mod task_start_failure;
