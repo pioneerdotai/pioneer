@@ -1,0 +1,776 @@
+//! Unexecuted regression fixtures exercise the production async admission and
+//! budget pipeline. Only docs/catalog inputs and HTTP delivery are fixtures.
+use super::{
+    admission::{self, AdmissionState},
+    runtime,
+};
+use crate::{
+    AttachmentDataSource, ChatMessage, ChatRequest, InputContentType, MessageAttachment,
+    MessageContentPart, ProviderCapabilities,
+};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use serde_json::{Value, json};
+use std::{io::Cursor, sync::Arc};
+
+pub(crate) fn image(format: image::ImageFormat, width: u32, height: u32) -> Vec<u8> {
+    let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(width, height));
+    let mut bytes = Cursor::new(Vec::new());
+    image.write_to(&mut bytes, format).unwrap();
+    bytes.into_inner()
+}
+pub(crate) fn pdf(pages: usize) -> Vec<u8> {
+    use lopdf::{Object, Stream, dictionary};
+    let mut d = lopdf::Document::with_version("1.5");
+    let pages_id = d.new_object_id();
+    let font =
+        d.add_object(dictionary! {"Type"=>"Font","Subtype"=>"Type1","BaseFont"=>"Helvetica"});
+    let resources = d.add_object(dictionary! {"Font"=>dictionary!{"F1"=>font}});
+    let content = d.add_object(Stream::new(
+        dictionary! {},
+        b"BT /F1 12 Tf (Evidence) Tj ET".to_vec(),
+    ));
+    let mut children = Vec::new();
+    for _ in 0..pages {
+        children.push(Object::Reference(d.add_object(
+            dictionary! {"Type"=>"Page","Parent"=>pages_id,"Contents"=>content},
+        )));
+    }
+    d.objects.insert(pages_id,dictionary!{"Type"=>"Pages","Kids"=>children,"Count"=>pages as i64,"Resources"=>resources,"MediaBox"=>vec![0.into(),0.into(),612.into(),792.into()]}.into());
+    let catalog = d.add_object(dictionary! {"Type"=>"Catalog","Pages"=>pages_id});
+    d.trailer.set("Root", catalog);
+    let mut bytes = vec![];
+    d.save_to(&mut bytes).unwrap();
+    bytes
+}
+pub(crate) fn wav() -> Vec<u8> {
+    // Valid 16-bit mono PCM, 8000 Hz, one second; not a truncated magic header.
+    let data = 16000u32;
+    let mut b = Vec::new();
+    b.extend(b"RIFF");
+    b.extend((36 + data).to_le_bytes());
+    b.extend(b"WAVEfmt ");
+    b.extend(16u32.to_le_bytes());
+    b.extend(1u16.to_le_bytes());
+    b.extend(1u16.to_le_bytes());
+    b.extend(8000u32.to_le_bytes());
+    b.extend(16000u32.to_le_bytes());
+    b.extend(2u16.to_le_bytes());
+    b.extend(16u16.to_le_bytes());
+    b.extend(b"data");
+    b.extend(data.to_le_bytes());
+    b.resize(44 + data as usize, 0);
+    b
+}
+pub(crate) fn mp3() -> &'static [u8] {
+    include_bytes!("../../tests/fixtures/capabilities/opencode-yup-06.mp3")
+}
+pub(crate) fn video() -> &'static [u8] {
+    include_bytes!("../../tests/fixtures/capabilities/opencode-tabs.mp4")
+}
+pub(crate) fn part(kind: InputContentType, mime: &str, bytes: &[u8]) -> MessageContentPart {
+    let a = MessageAttachment {
+        mime_type: mime.into(),
+        name: None,
+        size_bytes: None,
+        sha256: None,
+        source: AttachmentDataSource::Bytes {
+            base64_data: STANDARD.encode(bytes),
+        },
+        artifact: None,
+    };
+    match kind {
+        InputContentType::Image => MessageContentPart::image(a),
+        InputContentType::File => MessageContentPart::file(a),
+        InputContentType::Audio => MessageContentPart::audio(a),
+        InputContentType::Video => MessageContentPart::video(a),
+        InputContentType::Text => unreachable!(),
+    }
+}
+pub(crate) fn attachment(part: &MessageContentPart) -> &MessageAttachment {
+    match part {
+        MessageContentPart::Image { image } => image,
+        MessageContentPart::File { file } => file,
+        MessageContentPart::Audio { audio } => audio,
+        MessageContentPart::Video { video } => video,
+        _ => panic!("expected attachment"),
+    }
+}
+pub(crate) fn request(model: &str, parts: Vec<MessageContentPart>) -> ChatRequest {
+    let mut message = ChatMessage::user_parts(parts);
+    message.content = "analyze".into();
+    ChatRequest {
+        model: model.into(),
+        messages: vec![message],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    }
+}
+pub(crate) fn state(provider: &str, model: &str, constraints: Value) -> AdmissionState {
+    let mut models: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/capabilities/models.json"
+    ))
+    .unwrap();
+    let key = match provider {
+        "gemini" => "google",
+        "bedrock" => "amazon-bedrock",
+        _ => provider,
+    };
+    if !models[key][model].is_null() {
+        models[key][model]["inputConstraints"] = constraints;
+    }
+    let c = crate::catalog::ModelCatalog::parse(
+        &serde_json::to_string(&models).unwrap(),
+        include_str!("../../tests/fixtures/capabilities/provenance.json"),
+    )
+    .unwrap();
+    AdmissionState::for_test(Arc::new(c))
+}
+pub(crate) async fn scoped<T>(
+    state: Arc<AdmissionState>,
+    operation: impl std::future::Future<Output = T>,
+) -> T {
+    // The tests use registered providers and the identical scope path as the
+    // AuthorityBoundProvider. No unknown-provider test-double bypass applies.
+    admission::scope(
+        state,
+        runtime::with_async_authority_scope("regression-authority".into(), operation),
+    )
+    .await
+}
+pub(crate) fn capabilities() -> ProviderCapabilities {
+    use crate::{InputTypeSupport, ProviderInputCapabilities};
+    ProviderCapabilities {
+        input_types: ProviderInputCapabilities {
+            text: true,
+            image: InputTypeSupport::data_url_inline_only(),
+            file: InputTypeSupport::native_inline_only(),
+            audio: InputTypeSupport::native_inline_only(),
+            video: InputTypeSupport::data_url_inline_only(),
+        },
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn effective_discovery_narrows_catalog_and_instance_evidence_does_not_leak() {
+    let png = image(image::ImageFormat::Png, 1, 1);
+    let caps = capabilities();
+    let narrowed_state = Arc::new(state("groq", "vision", json!({})));
+    let discovered=serde_json::from_value(json!({"id":"vision","provider":"groq","limits":{},"capabilities":{"input_modalities":["text"],"vision":true}})).unwrap();
+    narrowed_state.replace_discovery(vec![discovered]);
+    assert!(
+        scoped(
+            narrowed_state,
+            super::input_estimate::prepare(
+                "groq",
+                &caps,
+                request(
+                    "vision",
+                    vec![part(InputContentType::Image, "image/png", &png)]
+                )
+            )
+        )
+        .await
+        .is_err()
+    );
+    let local = Arc::new(state("groq", "media", json!({})));
+    local.replace_discovery(vec![serde_json::from_value(json!({"id":"deployment-one","provider":"custom","limits":{},"capabilities":{"input_modalities":["text","image"]}})).unwrap()]);
+    let prepared = scoped(
+        local.clone(),
+        super::input_estimate::prepare(
+            "custom",
+            &caps,
+            request(
+                "deployment-one",
+                vec![part(InputContentType::Image, "image/png", &png)],
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(prepared.media.len(), 1);
+    let other = Arc::new(state("groq", "media", json!({})));
+    assert!(
+        scoped(
+            other,
+            super::prepare_messages_for_provider_async(
+                "custom",
+                "deployment-one",
+                &caps,
+                &prepared.request.messages
+            )
+        )
+        .await
+        .is_err()
+    );
+    let unknown = Arc::new(state("groq", "media", json!({})));
+    unknown.replace_discovery(vec![
+        serde_json::from_value(
+            json!({"id":"deployment-unknown","provider":"custom","limits":{},"capabilities":{}}),
+        )
+        .unwrap(),
+    ]);
+    assert!(
+        scoped(
+            unknown,
+            super::input_estimate::prepare(
+                "custom",
+                &caps,
+                request(
+                    "deployment-unknown",
+                    vec![part(InputContentType::Image, "image/png", &png)]
+                )
+            )
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn effective_mime_actual_bytes_aliases_and_strict_policy_reach_admission() {
+    let caps = capabilities();
+    let png = image(image::ImageFormat::Png, 1, 1);
+    let jpeg = image(image::ImageFormat::Jpeg, 1, 1);
+    let gif = image(image::ImageFormat::Gif, 1, 1);
+    let s = Arc::new(state("groq", "vision", json!({})));
+    let p = scoped(
+        s.clone(),
+        super::input_estimate::prepare(
+            "groq",
+            &caps,
+            request(
+                "vision",
+                vec![part(InputContentType::Image, " IMAGE/PNG ", &png)],
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        attachment(&p.request.messages[0].content_parts[0]).mime_type,
+        "image/png"
+    );
+    let p = scoped(
+        s,
+        super::input_estimate::prepare(
+            "groq",
+            &caps,
+            request(
+                "vision",
+                vec![part(InputContentType::Image, "image/png", &jpeg)],
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        attachment(&p.request.messages[0].content_parts[0]).mime_type,
+        "image/jpeg"
+    );
+    let narrowed = Arc::new(state(
+        "groq",
+        "vision",
+        json!({"image":{"mimeTypes":["image/png"]}}),
+    ));
+    assert!(
+        scoped(
+            narrowed,
+            super::input_estimate::prepare(
+                "groq",
+                &caps,
+                request(
+                    "vision",
+                    vec![part(InputContentType::Image, "image/png", &jpeg)]
+                )
+            )
+        )
+        .await
+        .is_err()
+    );
+    let gemini = Arc::new(state("gemini", "media", json!({})));
+    assert!(
+        scoped(
+            gemini,
+            super::input_estimate::prepare(
+                "gemini",
+                &caps,
+                request(
+                    "media",
+                    vec![part(InputContentType::Image, "image/png", &gif)]
+                )
+            )
+        )
+        .await
+        .is_err()
+    );
+    let mut strict = state("groq", "vision", json!({}));
+    let mut config = super::default_attachment_pipeline_config();
+    config.normalization.strict_mime_match = true;
+    strict.pipeline_config = Some(config);
+    assert!(
+        scoped(
+            Arc::new(strict),
+            super::input_estimate::prepare(
+                "groq",
+                &caps,
+                request(
+                    "vision",
+                    vec![part(InputContentType::Image, "image/png", &jpeg)]
+                )
+            )
+        )
+        .await
+        .is_err()
+    );
+    for mime in ["audio/wav", " AUDIO/X-WAV "] {
+        let s = Arc::new(state("openrouter", "media", json!({})));
+        let p = scoped(
+            s,
+            super::input_estimate::prepare(
+                "openrouter",
+                &caps,
+                request("media", vec![part(InputContentType::Audio, mime, &wav())]),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            attachment(&p.request.messages[0].content_parts[0]).mime_type,
+            "audio/wav"
+        );
+    }
+}
+
+#[tokio::test]
+async fn authorized_path_and_url_pins_survive_budget_renderer_and_replay_without_io() {
+    use crate::providers::OpenAiCompatibleProvider;
+    use crate::{InputTypeSupport, Provider};
+    for ingress in ["path", "url"] {
+        let bytes = image(image::ImageFormat::Png, 1, 1);
+        let mut state = state("groq", "vision", json!({"image":{"sources":[ingress]}}));
+        let mut config = super::default_attachment_pipeline_config();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &bytes).unwrap();
+        config.security.enforce_path_allowlist = true;
+        config.security.allowed_path_roots = vec![file.path().parent().unwrap().into()];
+        config.security.allow_url_sources = true;
+        config.security.url_allowed_domains = vec!["example.com".into()];
+        state.pipeline_config = Some(config);
+        let url = "https://example.com/evidence.png";
+        state
+            .url_fixtures
+            .write()
+            .unwrap()
+            .insert(url.into(), bytes.clone());
+        let state = Arc::new(state);
+        let mut req = request(
+            "vision",
+            vec![part(InputContentType::Image, "image/png", &bytes)],
+        );
+        if let MessageContentPart::Image { image } = &mut req.messages[0].content_parts[0] {
+            image.source = if ingress == "path" {
+                AttachmentDataSource::Path {
+                    path: file.path().display().to_string(),
+                }
+            } else {
+                AttachmentDataSource::Url { url: url.into() }
+            };
+        }
+        let provider = OpenAiCompatibleProvider::new(
+            "groq",
+            "https://example.com/v1",
+            "unused",
+            crate::providers::AuthStyle::Bearer,
+        )
+        .with_input_capabilities(crate::ProviderInputCapabilities {
+            text: true,
+            image: InputTypeSupport::data_url_inline_only(),
+            file: InputTypeSupport::disabled(),
+            audio: InputTypeSupport::disabled(),
+            video: InputTypeSupport::disabled(),
+        });
+        let budget = scoped(state.clone(), provider.prepare_input_budget(req))
+            .await
+            .unwrap();
+        assert_eq!(budget.media.len(), 1);
+        std::fs::write(file.path(), b"changed file").unwrap();
+        state.url_fixtures.write().unwrap().clear();
+        let expected = attachment(&budget.request.messages[0].content_parts[0])
+            .sha256
+            .clone();
+        for stream in [false, true, false] {
+            let wire = scoped(
+                state.clone(),
+                provider.render_chat_request_async_for_test(budget.request.clone(), stream),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                wire["messages"][0]["content"][1]["image_url"]["url"],
+                format!("data:image/png;base64,{}", STANDARD.encode(&bytes))
+            );
+            let replay = scoped(
+                state.clone(),
+                provider.prepare_input_budget(budget.request.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                attachment(&replay.request.messages[0].content_parts[0]).sha256,
+                expected
+            );
+        }
+        assert_eq!(
+            state.url_reads.load(std::sync::atomic::Ordering::Relaxed),
+            usize::from(ingress == "url")
+        );
+        let other = Arc::new(self::state(
+            "groq",
+            "vision",
+            json!({"image":{"sources":[ingress]}}),
+        ));
+        assert!(
+            scoped(other, provider.prepare_input_budget(budget.request.clone()))
+                .await
+                .is_err()
+        );
+        let mut tampered = budget.request.clone();
+        if let MessageContentPart::Image { image } = &mut tampered.messages[0].content_parts[0] {
+            image.source = AttachmentDataSource::Bytes {
+                base64_data: STANDARD.encode(self::image(image::ImageFormat::Png, 2, 1)),
+            };
+            image.sha256 = None;
+            image.size_bytes = None;
+        }
+        assert!(
+            scoped(state.clone(), provider.prepare_input_budget(tampered))
+                .await
+                .is_err()
+        );
+        let denied = request(
+            "vision",
+            vec![part(
+                InputContentType::Image,
+                "image/png",
+                &self::image(image::ImageFormat::Png, 3, 1),
+            )],
+        );
+        assert!(
+            scoped(state, provider.prepare_input_budget(denied))
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_limit_boundaries_use_all_history_and_actual_structure() {
+    let caps = capabilities();
+    for (provider, n, accepted) in [
+        ("groq", 3, true),
+        ("groq", 4, false),
+        ("anthropic", 20, true),
+        ("anthropic", 21, true),
+    ] {
+        let s = Arc::new(state(provider, "media", json!({})));
+        let png = image(image::ImageFormat::Png, 1, 1);
+        let req = request(
+            "media",
+            (0..n)
+                .map(|_| part(InputContentType::Image, "image/png", &png))
+                .collect(),
+        );
+        assert_eq!(
+            scoped(s, super::input_estimate::prepare(provider, &caps, req))
+                .await
+                .is_ok(),
+            accepted
+        );
+    }
+    for (n, width, accepted) in [
+        (20, 8000, true),
+        (20, 8001, false),
+        (21, 2000, true),
+        (21, 2001, false),
+    ] {
+        let s = Arc::new(state("anthropic", "media", json!({})));
+        let png = image(image::ImageFormat::Png, width, 1);
+        let mut req = request(
+            "media",
+            vec![part(InputContentType::Image, "image/png", &png)],
+        );
+        // Resent earlier turns count too, not just the latest turn.
+        req.messages = (0..n).map(|_| req.messages[0].clone()).collect();
+        assert_eq!(
+            scoped(s, super::input_estimate::prepare("anthropic", &caps, req))
+                .await
+                .is_ok(),
+            accepted
+        );
+    }
+    for (pages, accepted) in [(1000, true), (1001, false)] {
+        let s = Arc::new(state("gemini", "media", json!({})));
+        let req = request(
+            "media",
+            vec![part(InputContentType::File, "application/pdf", &pdf(pages))],
+        );
+        assert_eq!(
+            scoped(s, super::input_estimate::prepare("gemini", &caps, req))
+                .await
+                .is_ok(),
+            accepted
+        );
+    }
+}
+
+pub(crate) fn representation(
+    provider: &str,
+    kind: InputContentType,
+    mime: &str,
+) -> anyhow::Result<()> {
+    super::contracts::validate_representation(
+        provider,
+        kind,
+        crate::Role::User,
+        mime,
+        &crate::AttachmentDataSource::Bytes {
+            base64_data: String::new(),
+        },
+    )
+}
+
+#[tokio::test]
+async fn count_and_duration_boundary_constraints_are_native_admission_not_token_billing() {
+    let caps = capabilities();
+    let png = image(image::ImageFormat::Png, 1, 1);
+    for (context, count, accepted) in [
+        (200_000, 100, true),
+        (200_000, 101, false),
+        (1_000_000, 600, true),
+        (1_000_000, 601, false),
+    ] {
+        let mut s = state("anthropic", "media", json!({}));
+        let mut config = super::default_attachment_pipeline_config();
+        config.max_attachments_per_request = 700;
+        s.pipeline_config = Some(config);
+        s.replace_discovery(vec![serde_json::from_value(json!({"id":"media","provider":"anthropic","limits":{"context_window":context},"capabilities":{}})).unwrap()]);
+        let req = request(
+            "media",
+            (0..count)
+                .map(|_| part(InputContentType::Image, "image/png", &png))
+                .collect(),
+        );
+        assert_eq!(
+            scoped(
+                Arc::new(s),
+                super::input_estimate::prepare("anthropic", &caps, req)
+            )
+            .await
+            .is_ok(),
+            accepted
+        );
+    }
+    // WAV has exactly 8000 PCM frames at 8000 Hz; allow the estimator's
+    // conservative final-frame interval, never a base64-length token estimate.
+    let duration = super::input_estimate::duration_millis(&wav(), "audio/wav").unwrap();
+    for (limit, accepted) in [(duration, true), (duration - 1, false)] {
+        let s = Arc::new(state(
+            "openrouter",
+            "media",
+            json!({"audio":{"maxDurationMillis":limit}}),
+        ));
+        assert_eq!(
+            scoped(
+                s,
+                super::input_estimate::prepare(
+                    "openrouter",
+                    &caps,
+                    request(
+                        "media",
+                        vec![part(InputContentType::Audio, "audio/wav", &wav())]
+                    )
+                )
+            )
+            .await
+            .is_ok(),
+            accepted
+        );
+    }
+    for (declared, actual, strict, accepted) in [
+        ("audio/wav", mp3().to_vec(), false, true),
+        ("audio/wav", mp3().to_vec(), true, false),
+        ("audio/mp3", wav(), false, true),
+        ("audio/mp3", wav(), true, false),
+    ] {
+        let mut s = state("openrouter", "media", json!({}));
+        let mut config = super::default_attachment_pipeline_config();
+        config.normalization.strict_mime_match = strict;
+        s.pipeline_config = Some(config);
+        let result = scoped(
+            Arc::new(s),
+            super::input_estimate::prepare(
+                "openrouter",
+                &caps,
+                request(
+                    "media",
+                    vec![part(InputContentType::Audio, declared, &actual)],
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(result.is_ok(), accepted);
+        if let Ok(p) = result {
+            assert_eq!(
+                attachment(&p.request.messages[0].content_parts[0]).mime_type,
+                super::normalize::sniff_mime_from_bytes(&actual).unwrap()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn groq_payload_cap_counts_the_entire_normal_and_stream_json() {
+    use crate::{InputTypeSupport, Provider};
+    let provider = crate::providers::OpenAiCompatibleProvider::new(
+        "groq",
+        "https://example.com/v1",
+        "unused",
+        crate::providers::AuthStyle::Bearer,
+    )
+    .with_input_capabilities(crate::ProviderInputCapabilities {
+        text: true,
+        image: InputTypeSupport::data_url_inline_only(),
+        file: InputTypeSupport::disabled(),
+        audio: InputTypeSupport::disabled(),
+        video: InputTypeSupport::disabled(),
+    });
+    let s = Arc::new(state("groq", "vision", json!({})));
+    let base = request(
+        "vision",
+        vec![part(
+            InputContentType::Image,
+            "image/png",
+            &image(image::ImageFormat::Png, 1, 1),
+        )],
+    );
+    let budget = scoped(s.clone(), provider.prepare_input_budget(base))
+        .await
+        .unwrap();
+    for stream in [false, true] {
+        let wire = scoped(
+            s.clone(),
+            provider.render_chat_request_async_for_test(budget.request.clone(), stream),
+        )
+        .await
+        .unwrap();
+        let overhead = serde_json::to_vec(&wire).unwrap().len() - "analyze".len();
+        for (size, accepted) in [
+            (20_000_000 - overhead, true),
+            (20_000_001 - overhead, false),
+        ] {
+            let mut req = budget.request.clone();
+            req.messages[0].content = "a".repeat(size);
+            assert_eq!(
+                scoped(
+                    s.clone(),
+                    provider.render_chat_request_async_for_test(req, stream)
+                )
+                .await
+                .is_ok(),
+                accepted
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn pinned_conflicts_accept_images_through_registered_async_model_admission() {
+    let cases: Vec<Value> = serde_json::from_str(include_str!(
+        "../../tests/fixtures/capabilities/attachment-conflicts.json"
+    ))
+    .unwrap();
+    let original: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/capabilities/models.json"
+    ))
+    .unwrap();
+    let origins: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/capabilities/provenance.json"
+    ))
+    .unwrap();
+    let caps = capabilities();
+    let png = image(image::ImageFormat::Png, 1, 1);
+    for case in cases {
+        let provider = match case["provider"].as_str().unwrap() {
+            "amazon-bedrock" => "bedrock",
+            "togetherai" => "together",
+            other => other,
+        };
+        let key = if provider == "bedrock" {
+            "amazon-bedrock"
+        } else {
+            provider
+        };
+        let id = case["id"].as_str().unwrap();
+        let mut model = original["groq"]["vision"].clone();
+        model["id"] = json!(id);
+        model["provider"] = json!(key);
+        model["api"] = json!(if provider == "bedrock" {
+            "bedrock-converse-stream"
+        } else {
+            "openai-completions"
+        });
+        model["input"] = case["source"]["modalities"]["input"].clone();
+        model["sourceMetadata"] = case["source"].clone();
+        model["inputOrigin"] = json!({"kind":"source"});
+        let c = crate::catalog::ModelCatalog::parse(
+            &json!({key:{id:model}}).to_string(),
+            &json!({key:{id:origins["groq"]["vision"]}}).to_string(),
+        )
+        .unwrap();
+        let state = Arc::new(AdmissionState::for_test(Arc::new(c)));
+        assert!(
+            scoped(
+                state,
+                super::input_estimate::prepare(
+                    provider,
+                    &caps,
+                    request(id, vec![part(InputContentType::Image, "image/png", &png)])
+                )
+            )
+            .await
+            .is_ok(),
+            "{provider}/{id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn effective_audio_mime_restriction_rejects_actual_mp3_despite_wav_declaration() {
+    let caps = capabilities();
+    let s = Arc::new(state(
+        "openrouter",
+        "media",
+        json!({"audio":{"mimeTypes":["audio/wav"]}}),
+    ));
+    assert!(
+        scoped(
+            s,
+            super::input_estimate::prepare(
+                "openrouter",
+                &caps,
+                request(
+                    "media",
+                    vec![part(InputContentType::Audio, "audio/wav", mp3())]
+                )
+            )
+        )
+        .await
+        .is_err()
+    );
+}

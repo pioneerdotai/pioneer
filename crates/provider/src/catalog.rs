@@ -3,6 +3,7 @@
 mod fetch;
 mod input;
 pub use input::InputCapabilityState;
+pub(crate) use input::effective_input_model;
 pub mod generator;
 pub mod runtime;
 use std::{
@@ -162,6 +163,10 @@ impl ModelCatalog {
     /// User overrides are applied by the workspace resolver after discovery.
     pub fn enrich(&self, provider: &str, models: &mut [ProviderModelInfo]) {
         for model in models {
+            if let Some(input) = &model.capabilities.input_modalities {
+                model.capabilities.vision =
+                    Some(input.iter().any(|v| v.eq_ignore_ascii_case("image")));
+            }
             let Some(entry) = self.model(provider, &model.id) else {
                 continue;
             };
@@ -180,15 +185,35 @@ impl ModelCatalog {
             }
             model.capabilities.thinking.get_or_insert(entry.reasoning);
             model.capabilities.tool_calling.get_or_insert(true);
-            if entry.input_is_known() {
-                model
-                    .capabilities
-                    .input_modalities
-                    .get_or_insert_with(|| entry.input.clone());
-                model.capabilities.vision.get_or_insert_with(|| {
-                    entry.input.iter().any(|v| v.eq_ignore_ascii_case("image"))
-                });
-            }
+            let effective = effective_input_model(provider, &model.id, Some(entry), Some(model))
+                .expect("catalog model");
+            let input = model
+                .capabilities
+                .input_modalities
+                .clone()
+                .or_else(|| entry.input_is_known().then(|| entry.input.clone()));
+            model.capabilities.input_modalities = input.map(|input| {
+                input
+                    .into_iter()
+                    .filter(|name| {
+                        let kind = match name.to_ascii_lowercase().as_str() {
+                            "image" => crate::InputContentType::Image,
+                            "audio" => crate::InputContentType::Audio,
+                            "video" => crate::InputContentType::Video,
+                            "file" | "pdf" | "document" => crate::InputContentType::File,
+                            "text" => crate::InputContentType::Text,
+                            _ => return true,
+                        };
+                        effective.input_capability(kind) != InputCapabilityState::Unsupported
+                    })
+                    .collect()
+            });
+            model.capabilities.vision =
+                match effective.input_capability(crate::InputContentType::Image) {
+                    InputCapabilityState::Supported => Some(true),
+                    InputCapabilityState::Unsupported => Some(false),
+                    InputCapabilityState::Unknown => None,
+                };
             if let Some(output) = entry
                 .metadata
                 .get("output")

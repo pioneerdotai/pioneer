@@ -632,3 +632,51 @@ mod media_propagation_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod partial_source_tests {
+    use super::*;
+    #[test]
+    fn positive_vercel_vision_tag_is_partial_while_explicit_input_array_is_complete() {
+        let mut snapshot: SourceSnapshot =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                .unwrap();
+        snapshot.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":"fixture/vision-tag","tags":["tool-use","vision"]}));
+        snapshot.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"].as_array_mut().unwrap().push(json!({"id":"fixture/vision-array","tags":["tool-use","vision"],"input_modalities":["text","image"]}));
+        let generated = generate(&snapshot, true).unwrap();
+        let catalog = ModelCatalog::parse(
+            &serde_json::to_string(&generated.models).unwrap(),
+            &serde_json::to_string(&generated.provenance).unwrap(),
+        )
+        .unwrap();
+        use super::super::InputCapabilityState;
+        use crate::InputContentType;
+        let partial = catalog
+            .model("vercel-ai-gateway", "fixture/vision-tag")
+            .unwrap();
+        assert_eq!(
+            partial.input_capability(InputContentType::Image),
+            InputCapabilityState::Supported
+        );
+        for kind in [
+            InputContentType::Audio,
+            InputContentType::Video,
+            InputContentType::File,
+        ] {
+            assert_eq!(
+                partial.input_capability(kind),
+                InputCapabilityState::Unknown
+            );
+        }
+        assert_eq!(
+            catalog
+                .model("vercel-ai-gateway", "fixture/vision-array")
+                .unwrap()
+                .input_capability(InputContentType::Audio),
+            InputCapabilityState::Unsupported
+        );
+    }
+}

@@ -154,6 +154,7 @@ struct AuthorityBoundProvider {
     authority_fingerprint: ProviderAuthorityFingerprint,
     revoked: Arc<AtomicBool>,
     redact_endpoint_errors: bool,
+    input_admission: Arc<crate::attachments::admission::AdmissionState>,
 }
 
 /// The request's endpoint can contain a secret path. Never retain a raw
@@ -311,9 +312,12 @@ impl Provider for AuthorityBoundProvider {
     ) -> Result<crate::attachments::PreparedInputBudget> {
         self.ensure_not_revoked()?;
         self.public_result(
-            crate::attachments::runtime::with_async_authority_scope(
-                self.authority_fingerprint.as_str().to_owned(),
-                self.inner.prepare_input_budget(request),
+            crate::attachments::admission::scope(
+                self.input_admission.clone(),
+                crate::attachments::runtime::with_async_authority_scope(
+                    self.authority_fingerprint.as_str().to_owned(),
+                    self.inner.prepare_input_budget(request),
+                ),
             )
             .await,
         )
@@ -322,9 +326,12 @@ impl Provider for AuthorityBoundProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         self.ensure_not_revoked()?;
         self.public_result(
-            crate::attachments::runtime::with_async_authority_scope(
-                self.authority_fingerprint.as_str().to_owned(),
-                self.inner.chat(request),
+            crate::attachments::admission::scope(
+                self.input_admission.clone(),
+                crate::attachments::runtime::with_async_authority_scope(
+                    self.authority_fingerprint.as_str().to_owned(),
+                    self.inner.chat(request),
+                ),
             )
             .await,
         )
@@ -336,9 +343,12 @@ impl Provider for AuthorityBoundProvider {
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
         self.ensure_not_revoked()?;
         let stream = self.public_result(
-            crate::attachments::runtime::with_async_authority_scope(
-                self.authority_fingerprint.as_str().to_owned(),
-                self.inner.stream_chat(request),
+            crate::attachments::admission::scope(
+                self.input_admission.clone(),
+                crate::attachments::runtime::with_async_authority_scope(
+                    self.authority_fingerprint.as_str().to_owned(),
+                    self.inner.stream_chat(request),
+                ),
             )
             .await,
         )?;
@@ -358,6 +368,9 @@ impl Provider for AuthorityBoundProvider {
         self.ensure_not_revoked()?;
         let catalog = crate::catalog::model_catalog()?;
         let mut models = self.public_result(self.inner.list_models().await)?;
+        // Keep original endpoint evidence before catalog enrichment. Requests
+        // never discover implicitly and cannot widen catalog negatives.
+        self.input_admission.replace_discovery(models.clone());
         catalog.enrich(self.inner.name(), &mut models);
         Ok(models)
     }
@@ -757,6 +770,7 @@ impl ProviderRegistry {
             authority_fingerprint,
             revoked: revoked.clone(),
             redact_endpoint_errors: base_url.is_some(),
+            input_admission: Arc::new(Default::default()),
         });
         if !cache.make_room_for_insert(self.limits.max_cached_instances) {
             return Err(ProviderRegistryCapacityExceeded {
@@ -879,6 +893,7 @@ impl ProviderRegistry {
             authority_fingerprint: authority_fingerprint.clone(),
             revoked: revoked.clone(),
             redact_endpoint_errors: false,
+            input_admission: Arc::new(Default::default()),
         });
         cache.prune_expired(now, self.limits.idle_ttl);
         if cache.make_room_for_insert(self.limits.max_cached_instances) {

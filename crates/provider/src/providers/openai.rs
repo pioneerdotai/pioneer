@@ -1879,13 +1879,14 @@ mod media_contract_tests {
     #[test]
     fn chat_pdf_inline_bytes_and_internal_owned_upload_use_different_fields() {
         let provider = OpenAiProvider::new("unused");
+        let pdf_bytes = crate::attachments::regression::pdf(1);
         let file = MessageAttachment {
             mime_type: "application/pdf".into(),
             name: Some("doc.pdf".into()),
             size_bytes: None,
             sha256: None,
             source: AttachmentDataSource::Bytes {
-                base64_data: "JVBERi0xLjc=".into(),
+                base64_data: BASE64.encode(&pdf_bytes),
             },
             artifact: None,
         };
@@ -1901,7 +1902,7 @@ mod media_contract_tests {
             OpenAiProvider::build_file_part(&prepared.attachments[0]).unwrap(),
         )
         .unwrap();
-        assert_eq!(inline["file"]["file_data"], "JVBERi0xLjc=");
+        assert_eq!(inline["file"]["file_data"], BASE64.encode(&pdf_bytes));
         assert_eq!(inline["file"]["filename"], "doc.pdf");
         assert!(inline["file"].get("file_id").is_none());
         // Simulate the existing authority-scoped upload's result AFTER bytes

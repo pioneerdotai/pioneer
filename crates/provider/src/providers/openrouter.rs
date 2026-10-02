@@ -418,24 +418,18 @@ impl OpenRouterProvider {
         }
     }
 
-    fn audio_format_from_mime(mime: &str) -> String {
-        let normalized = mime
-            .split(';')
-            .next()
-            .unwrap_or(mime)
-            .trim()
-            .to_ascii_lowercase();
-        let subtype = normalized
-            .split('/')
-            .nth(1)
-            .unwrap_or(normalized.as_str())
-            .trim();
-        match subtype {
-            "x-wav" => "wav".to_owned(),
-            "mpga" => "mp3".to_owned(),
-            "x-m4a" | "mp4" => "m4a".to_owned(),
-            "x-aiff" => "aiff".to_owned(),
-            other => other.to_owned(),
+    fn audio_format_from_mime(mime: &str) -> Result<&'static str> {
+        // Official SDK file-url-utils.ts; finite encoded formats, not arbitrary subtypes.
+        let mime = crate::attachments::normalized_media_mime(mime)?;
+        match crate::attachments::canonical_media_mime(&mime) {
+            "audio/wav" | "audio/x-wav" => Ok("wav"),
+            "audio/mpeg" | "audio/mp3" | "audio/mpga" => Ok("mp3"),
+            "audio/mp4" | "audio/x-m4a" => Ok("m4a"),
+            "audio/aiff" | "audio/x-aiff" => Ok("aiff"),
+            "audio/flac" => Ok("flac"),
+            "audio/ogg" => Ok("ogg"),
+            "audio/aac" => Ok("aac"),
+            _ => Err(anyhow!("unsupported OpenRouter encoded audio MIME")),
         }
     }
 
@@ -522,7 +516,8 @@ impl OpenRouterProvider {
                     parts.push(ApiContentPart::InputAudio {
                         input_audio: ApiInputAudioPart {
                             data: BASE64.encode(attachment_bytes(attachment)?),
-                            format: Self::audio_format_from_mime(attachment.mime_type.as_str()),
+                            format: Self::audio_format_from_mime(attachment.mime_type.as_str())?
+                                .to_owned(),
                         },
                     });
                 }
@@ -2118,13 +2113,14 @@ mod media_contract_tests {
     #[test]
     fn chat_gateway_pdf_uses_mime_data_url_and_audio_mp4_maps_to_m4a() {
         let provider = OpenRouterProvider::new("unused");
+        let pdf_bytes = crate::attachments::regression::pdf(1);
         let file = MessageAttachment {
             mime_type: "application/pdf".into(),
             name: Some("doc.pdf".into()),
             size_bytes: None,
             sha256: None,
             source: AttachmentDataSource::Bytes {
-                base64_data: "JVBERi0xLjc=".into(),
+                base64_data: BASE64.encode(&pdf_bytes),
             },
             artifact: None,
         };
@@ -2142,11 +2138,100 @@ mod media_contract_tests {
         .unwrap();
         assert_eq!(
             inline["file"]["file_data"],
-            "data:application/pdf;base64,JVBERi0xLjc="
+            format!("data:application/pdf;base64,{}", BASE64.encode(&pdf_bytes))
         );
         assert_eq!(
-            OpenRouterProvider::audio_format_from_mime("audio/mp4"),
+            OpenRouterProvider::audio_format_from_mime("audio/mp4").unwrap(),
             "m4a"
         );
+    }
+}
+
+#[cfg(test)]
+mod encoded_audio_regressions {
+    use super::*;
+    use crate::Provider;
+    use crate::attachments::regression as fixture;
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn encoded_wav_mp3_aliases_reach_async_admission_and_native_wire_unchanged() {
+        let provider = OpenRouterProvider::new("unused");
+        for (mime, bytes, format) in [
+            ("audio/wav", fixture::wav(), "wav"),
+            (" AUDIO/X-WAV ", fixture::wav(), "wav"),
+            ("audio/mpeg", fixture::mp3().to_vec(), "mp3"),
+            ("audio/mp3", fixture::mp3().to_vec(), "mp3"),
+        ] {
+            let state = Arc::new(fixture::state("openrouter", "media", serde_json::json!({})));
+            let req = fixture::request(
+                "media",
+                vec![fixture::part(InputContentType::Audio, mime, &bytes)],
+            );
+            let budget = fixture::scoped(state.clone(), provider.prepare_input_budget(req))
+                .await
+                .unwrap();
+            let prepared = fixture::scoped(
+                state,
+                crate::attachments::prepare_messages_for_provider_async(
+                    "openrouter",
+                    "media",
+                    &provider.capabilities(),
+                    &budget.request.messages,
+                ),
+            )
+            .await
+            .unwrap();
+            let wire =
+                serde_json::to_value(OpenRouterProvider::convert_messages(&prepared).unwrap())
+                    .unwrap();
+            assert_eq!(wire[0]["content"][1]["input_audio"]["format"], format);
+            assert_eq!(
+                wire[0]["content"][1]["input_audio"]["data"],
+                BASE64.encode(&bytes)
+            );
+        }
+    }
+    #[test]
+    fn finite_renderer_mapping_matches_all_declared_encoded_aliases() {
+        for (mime, format) in [
+            ("audio/wav", "wav"),
+            ("audio/x-wav", "wav"),
+            ("audio/wave", "wav"),
+            ("audio/mpeg", "mp3"),
+            ("audio/mp3", "mp3"),
+            ("audio/mpga", "mp3"),
+            ("audio/mp4", "m4a"),
+            ("audio/m4a", "m4a"),
+            ("audio/x-m4a", "m4a"),
+            ("audio/aiff", "aiff"),
+            ("audio/x-aiff", "aiff"),
+            ("audio/flac", "flac"),
+            ("audio/x-flac", "flac"),
+            ("audio/ogg", "ogg"),
+            ("audio/vorbis", "ogg"),
+            ("audio/aac", "aac"),
+            ("audio/x-aac", "aac"),
+        ] {
+            assert_eq!(
+                OpenRouterProvider::audio_format_from_mime(mime).unwrap(),
+                format
+            );
+            // Normalization, not transcoding; serialized format is finite.
+            let wire =
+                serde_json::to_value(OpenRouterProvider::audio_format_from_mime(mime).unwrap())
+                    .unwrap();
+            assert_eq!(wire, format);
+            assert!(fixture::representation("openrouter", InputContentType::Audio, mime).is_ok());
+        }
+        for mime in [
+            "audio/made-up",
+            "audio/pcm16",
+            "audio/pcm24",
+            "video/mp4",
+            "",
+            "audio/mpeg;unexpected",
+        ] {
+            assert!(OpenRouterProvider::audio_format_from_mime(mime).is_err());
+        }
     }
 }

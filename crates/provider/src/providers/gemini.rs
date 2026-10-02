@@ -1639,13 +1639,19 @@ mod media_contract_tests {
             ("audio/wav", 2),
             ("video/mp4", 3),
         ] {
+            let bytes = match kind {
+                0 => crate::attachments::regression::image(image::ImageFormat::Png, 1, 1),
+                1 => crate::attachments::regression::pdf(1),
+                2 => crate::attachments::regression::wav(),
+                _ => crate::attachments::regression::video().to_vec(),
+            };
             let attachment = MessageAttachment {
                 mime_type: mime.into(),
                 name: None,
                 size_bytes: None,
                 sha256: None,
                 source: AttachmentDataSource::Bytes {
-                    base64_data: "AQIDBA==".into(),
+                    base64_data: BASE64.encode(&bytes),
                 },
                 artifact: None,
             };
@@ -1665,9 +1671,67 @@ mod media_contract_tests {
             assert!(native.file_data.is_none());
             let inline = native.inline_data.unwrap();
             assert_eq!(inline.mime_type, mime);
-            assert_eq!(inline.data, "AQIDBA==");
+            assert_eq!(inline.data, BASE64.encode(&bytes));
             // Canonical ApiPart JSON field names are the g02 dependency. This
             // fixture asserts representation without blessing snake_case wire.
         }
+    }
+}
+
+#[cfg(test)]
+mod async_media_admission_regressions {
+    use super::*;
+    use crate::Provider;
+    use crate::attachments::regression as fixture;
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn four_typed_inputs_are_budgeted_pinned_and_rendered_on_generate_content() {
+        let provider = GeminiProvider::new("unused");
+        let state = Arc::new(fixture::state("gemini", "media", serde_json::json!({})));
+        let req = fixture::request(
+            "media",
+            vec![
+                fixture::part(
+                    InputContentType::Image,
+                    "image/png",
+                    &fixture::image(image::ImageFormat::Png, 1, 1),
+                ),
+                fixture::part(InputContentType::File, "application/pdf", &fixture::pdf(1)),
+                fixture::part(InputContentType::Audio, "audio/wav", &fixture::wav()),
+                fixture::part(InputContentType::Video, "video/mp4", fixture::video()),
+            ],
+        );
+        let budget = fixture::scoped(state.clone(), provider.prepare_input_budget(req))
+            .await
+            .unwrap();
+        assert_eq!(budget.media.len(), 4);
+        let prepared = fixture::scoped(
+            state,
+            crate::attachments::prepare_messages_for_provider_async(
+                "gemini",
+                "media",
+                &provider.capabilities(),
+                &budget.request.messages,
+            ),
+        )
+        .await
+        .unwrap();
+        let body = GeminiProvider::build_request_from_prepared(&budget.request, &prepared).unwrap();
+        let parts = &body.contents[0].parts;
+        for (index, mime) in ["image/png", "application/pdf", "audio/wav", "video/mp4"]
+            .into_iter()
+            .enumerate()
+        {
+            let native = parts[index + 1].inline_data.as_ref().unwrap();
+            assert_eq!(native.mime_type, mime);
+            let crate::AttachmentDataSource::Bytes { base64_data } =
+                &fixture::attachment(&budget.request.messages[0].content_parts[index]).source
+            else {
+                panic!("must pin")
+            };
+            assert_eq!(&native.data, base64_data);
+        }
+        // Canonical ApiPart JSON field casing remains the explicit G02
+        // dependency; this fixture verifies typed representation, not acceptance.
     }
 }

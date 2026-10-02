@@ -781,7 +781,7 @@ pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
             c.model["reasoning"] = json!(has(&m["tags"], "reasoning"));
             c.model["input"] = m["input_modalities"].as_array().map(|v| json!(v))
                 .unwrap_or_else(|| if has(&m["tags"], "vision") {json!(["text", "image"])} else {json!([])});
-            c.model["inputOrigin"] = json!({"kind":if m["input_modalities"].is_array() || has(&m["tags"], "vision"){"source"}else{"fallback"},"expression":"vercel.input_modalities or positive vision tag"});
+            c.model["inputOrigin"] = json!({"kind":if m["input_modalities"].is_array(){"source"}else if has(&m["tags"], "vision"){"partial"}else{"fallback"},"expression":"vercel.input_modalities or positive vision tag"});
             c.model["sourceMetadata"] = json!({"tags":m["tags"],"input_modalities":m["input_modalities"]});
             c.model["output"] = m["output_modalities"].clone();
             (c.model["contextWindow"], c.context_origin) =

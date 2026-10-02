@@ -89,10 +89,17 @@ enum ApiMessageContentBlock {
     },
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: ToolResultContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum ToolResultContent {
+    Text(String),
+    Blocks(Vec<ApiMessageContentBlock>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -318,7 +325,8 @@ impl AnthropicProvider {
             Some(system_parts.join("\n\n"))
         };
 
-        let mut api_messages = Vec::new();
+        let mut api_messages: Vec<ApiMessage> = Vec::new();
+        let mut previous_tool = false;
         for (message_index, m) in prepared.messages.iter().enumerate() {
             if m.role == Role::System {
                 continue;
@@ -342,7 +350,7 @@ impl AnthropicProvider {
                         .unwrap_or_else(|| "tool".to_owned());
                     content.push(ApiMessageContentBlock::ToolResult {
                         tool_use_id,
-                        content: m.content.clone(),
+                        content: ToolResultContent::Text(m.content.clone()),
                         is_error: None,
                     });
                 }
@@ -388,15 +396,16 @@ impl AnthropicProvider {
             let attachments = prepared
                 .attachments_for_message(message_index)
                 .collect::<Vec<_>>();
+            let mut media = Vec::new();
             for attachment in attachments {
                 match attachment.kind {
                     InputContentType::Image => {
-                        content.push(ApiMessageContentBlock::Image {
+                        media.push(ApiMessageContentBlock::Image {
                             source: Self::convert_media_source(attachment)?,
                         });
                     }
                     InputContentType::File => {
-                        content.push(ApiMessageContentBlock::Document {
+                        media.push(ApiMessageContentBlock::Document {
                             source: Self::convert_media_source(attachment)?,
                         });
                     }
@@ -409,6 +418,33 @@ impl AnthropicProvider {
                 }
             }
 
+            if m.role == Role::Tool {
+                if !media.is_empty() {
+                    let mut blocks = Vec::new();
+                    if !m.content.is_empty() {
+                        blocks.push(ApiMessageContentBlock::Text {
+                            text: m.content.clone(),
+                        });
+                    }
+                    blocks.extend(media);
+                    if let ApiMessageContentBlock::ToolResult { content, .. } = &mut content[0] {
+                        *content = ToolResultContent::Blocks(blocks);
+                    }
+                }
+                // A parallel round's results form one immediately following
+                // user turn; media remains owned by its tool_use_id.
+                if previous_tool {
+                    api_messages
+                        .last_mut()
+                        .expect("previous tool turn")
+                        .content
+                        .extend(content);
+                    continue;
+                }
+            } else {
+                content.extend(media);
+            }
+            previous_tool = m.role == Role::Tool;
             api_messages.push(ApiMessage {
                 role: role.to_owned(),
                 content,
@@ -1594,37 +1630,103 @@ mod tests {
 #[cfg(test)]
 mod media_contract_tests {
     use super::*;
-    use crate::{AttachmentDataSource, MessageAttachment, MessageContentPart};
-    use crate::{ChatMessage, Provider};
-    #[test]
-    fn tool_result_media_survives_as_native_user_blocks_after_the_result() {
-        let mut message = ChatMessage::tool_result("call-1", "screenshot", "ok");
-        message
-            .content_parts
-            .push(MessageContentPart::image(MessageAttachment {
-                mime_type: "image/png".into(),
-                name: None,
-                size_bytes: None,
-                sha256: None,
-                source: AttachmentDataSource::Bytes {
-                    base64_data: "AQIDBA==".into(),
-                },
-                artifact: None,
-            }));
+    use crate::attachments::regression as fixture;
+    use crate::{Provider, ProviderToolCall};
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn parallel_tool_media_stays_nested_and_next_round_history_is_preserved() {
         let provider = AnthropicProvider::new("unused");
-        let prepared = crate::attachments::prepare_messages_for_provider(
-            "anthropic",
-            &provider.capabilities(),
-            &[message],
-        )
-        .unwrap();
-        let (_, messages) = AnthropicProvider::prepare_messages(&prepared).unwrap();
-        let wire = serde_json::to_value(&messages).unwrap();
-        assert_eq!(wire[0]["role"], "user");
-        assert_eq!(wire[0]["content"][0]["type"], "tool_result");
-        assert_eq!(wire[0]["content"][0]["tool_use_id"], "call-1");
-        assert_eq!(wire[0]["content"][1]["type"], "image");
-        assert_eq!(wire[0]["content"][1]["source"]["type"], "base64");
-        assert_eq!(wire[0]["content"][1]["source"]["data"], "AQIDBA==");
+        let state = Arc::new(fixture::state("anthropic", "media", serde_json::json!({})));
+        let calls = |ids: &[&str]| {
+            ids.iter()
+                .map(|id| ProviderToolCall {
+                    id: (*id).into(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                })
+                .collect()
+        };
+        let mut a = crate::ChatMessage::tool_result("A", "read", "A text");
+        a.content_parts.push(fixture::part(
+            InputContentType::Image,
+            "image/png",
+            &fixture::image(image::ImageFormat::Png, 1, 1),
+        ));
+        let mut b = crate::ChatMessage::tool_result("B", "read", "B text");
+        b.content_parts.push(fixture::part(
+            InputContentType::File,
+            "application/pdf",
+            &fixture::pdf(1),
+        ));
+        let mut c = crate::ChatMessage::tool_result("C", "read", "C text");
+        c.content_parts.push(fixture::part(
+            InputContentType::Image,
+            "image/png",
+            &fixture::image(image::ImageFormat::Png, 2, 1),
+        ));
+        let mut request = fixture::request("media", vec![]);
+        request.messages = vec![
+            crate::ChatMessage::assistant_tool_calls(None::<String>, calls(&["A", "B"])),
+            a,
+            b,
+            crate::ChatMessage::assistant_tool_calls(None::<String>, calls(&["C"])),
+            c,
+            crate::ChatMessage::assistant("finished"),
+        ];
+        let budget = fixture::scoped(state.clone(), provider.prepare_input_budget(request))
+            .await
+            .unwrap();
+        assert_eq!(budget.media.len(), 3);
+        for _ in 0..2 {
+            // Same prepared history used for normal, stream and replay serialization.
+            let prepared = fixture::scoped(
+                state.clone(),
+                crate::attachments::prepare_messages_for_provider_async(
+                    "anthropic",
+                    "media",
+                    &provider.capabilities(),
+                    &budget.request.messages,
+                ),
+            )
+            .await
+            .unwrap();
+            let (_, messages) = AnthropicProvider::prepare_messages(&prepared).unwrap();
+            let mut wire = serde_json::to_value(messages).unwrap();
+            assert_eq!(wire.as_array().unwrap().len(), 5);
+            assert_eq!(wire[1]["role"], "user");
+            assert_eq!(wire[1]["content"].as_array().unwrap().len(), 2);
+            for (index, id, kind, text) in
+                [(0, "A", "image", "A text"), (1, "B", "document", "B text")]
+            {
+                let result = &wire[1]["content"][index];
+                assert_eq!(result["type"], "tool_result");
+                assert_eq!(result["tool_use_id"], id);
+                assert_eq!(result["content"][0]["text"], text);
+                assert_eq!(result["content"][1]["type"], kind);
+            }
+            for (turn, index, id, message_index) in [(1, 0, "A", 1), (1, 1, "B", 2), (3, 0, "C", 4)]
+            {
+                let crate::AttachmentDataSource::Bytes { base64_data } =
+                    &fixture::attachment(&budget.request.messages[message_index].content_parts[0])
+                        .source
+                else {
+                    panic!("budget must pin bytes")
+                };
+                assert_eq!(
+                    wire[turn]["content"][index]["content"][1]["source"]["data"],
+                    *base64_data
+                );
+                wire[turn]["content"][index]["content"][1]["source"]["data"] =
+                    serde_json::json!(format!("<{id}>"));
+            }
+            let expected: serde_json::Value = serde_json::from_str(include_str!(
+                "../../tests/fixtures/capabilities/anthropic-parallel-results.json"
+            ))
+            .unwrap();
+            assert_eq!(wire, expected);
+            assert_eq!(wire[2]["role"], "assistant");
+            assert_eq!(wire[3]["content"][0]["tool_use_id"], "C");
+            assert_eq!(wire[4]["content"][0]["text"], "finished");
+        }
     }
 }

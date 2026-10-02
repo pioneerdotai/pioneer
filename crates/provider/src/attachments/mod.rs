@@ -1,3 +1,4 @@
+pub(crate) mod admission;
 mod budget;
 mod contracts;
 mod errors;
@@ -6,6 +7,8 @@ mod normalize;
 mod observability;
 mod plan;
 mod registry;
+#[cfg(test)]
+pub(crate) mod regression;
 mod resolve;
 pub(crate) mod runtime;
 mod security;
@@ -21,6 +24,8 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 pub(crate) use contracts::MediaInputRejection;
+pub(crate) use normalize::canonical_mime as canonical_media_mime;
+pub(crate) use normalize::normalize_mime as normalized_media_mime;
 use std::sync::Arc;
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
@@ -137,14 +142,28 @@ pub async fn prepare_messages_for_provider_async(
     messages: &[ChatMessage],
 ) -> Result<PreparedProviderMessages> {
     // Reject mismatches before I/O and retain this snapshot through materialization.
-    let catalog = if messages.iter().any(ChatMessage::has_attachments)
+    let state = admission::current();
+    let entry = if messages.iter().any(ChatMessage::has_attachments)
         && crate::definition::provider_definition(provider_name).is_some()
     {
-        let catalog = crate::catalog::model_catalog().context(MediaInputRejection(
-            "model catalog is unavailable; retry after catalog refresh",
-        ))?;
-        contracts::validate_model_inputs(provider_name, model, capabilities, messages, &catalog)?;
-        Some(catalog)
+        #[cfg(test)]
+        let fixture_catalog = state.as_ref().and_then(|s| s.catalog.clone());
+        #[cfg(not(test))]
+        let fixture_catalog: Option<Arc<crate::catalog::ModelCatalog>> = None;
+        let catalog = fixture_catalog
+            .map(Ok)
+            .unwrap_or_else(crate::catalog::model_catalog)
+            .context(MediaInputRejection(
+                "model catalog is unavailable; retry after catalog refresh",
+            ))?;
+        let entry = admission::effective_model(provider_name, model, &catalog);
+        contracts::validate_effective_model_inputs(
+            provider_name,
+            capabilities,
+            messages,
+            entry.as_ref(),
+        )?;
+        entry
     } else {
         None
     };
@@ -163,35 +182,39 @@ pub async fn prepare_messages_for_provider_async(
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         runtime::with_blocking_authority_scope(authority_fingerprint, || {
-            let config = default_attachment_pipeline_config();
-            let prepared = prepare_messages_for_provider_target(
-                provider_name.as_str(),
-                Some(model.as_str()),
-                &capabilities,
-                messages.as_slice(),
-                &config,
-            )?;
-            if let Some(catalog) = catalog {
-                let entry = catalog
-                    .model(&provider_name, &model)
-                    .ok_or_else(|| anyhow::anyhow!("model input metadata is unavailable"))?;
-                for attachment in &prepared.attachments {
-                    contracts::validate_materialized_constraints(entry, attachment).context(
-                        MediaInputRejection(
-                            "materialized media violates catalog size/duration/MIME limits",
-                        ),
-                    )?;
+            admission::blocking_scope(state, || {
+                #[cfg(test)]
+                let config = admission::current()
+                    .and_then(|s| s.pipeline_config.clone())
+                    .unwrap_or_else(default_attachment_pipeline_config);
+                #[cfg(not(test))]
+                let config = default_attachment_pipeline_config();
+                let prepared = prepare_messages_for_provider_target(
+                    provider_name.as_str(),
+                    Some(model.as_str()),
+                    &capabilities,
+                    messages.as_slice(),
+                    &config,
+                )?;
+                if let Some(entry) = entry.as_ref() {
+                    for attachment in &prepared.attachments {
+                        contracts::validate_materialized_constraints(entry, attachment).context(
+                            MediaInputRejection(
+                                "materialized media violates catalog size/duration/MIME limits",
+                            ),
+                        )?;
+                    }
+                    contracts::validate_model_media_limits(
+                        &provider_name,
+                        entry,
+                        &prepared.attachments,
+                    )
+                    .context(MediaInputRejection(
+                        "media input exceeds the native model PDF/media limit",
+                    ))?;
                 }
-                contracts::validate_model_media_limits(
-                    &provider_name,
-                    entry,
-                    &prepared.attachments,
-                )
-                .context(MediaInputRejection(
-                    "media input exceeds the native model PDF/media limit",
-                ))?;
-            }
-            Ok(prepared)
+                Ok(prepared)
+            })
         })
     })
     .await
@@ -874,6 +897,7 @@ pub(crate) fn validate_inline_payload(provider: &str, value: &impl serde::Serial
     let limit = match provider {
         "anthropic" => 32_000_000,
         "gemini" => 100_000_000,
+        "groq" => 20_000_000,
         _ => return Ok(()),
     };
     struct Counter {

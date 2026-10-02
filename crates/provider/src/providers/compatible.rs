@@ -998,7 +998,25 @@ impl OpenAiCompatibleProvider {
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
-        self.build_chat_request_from_prepared(request, stream, prepared)
+        let has_image = prepared
+            .attachments
+            .iter()
+            .any(|a| a.kind == InputContentType::Image);
+        let body = self.build_chat_request_from_prepared(request, stream, prepared)?;
+        if self.name == "groq" && has_image {
+            crate::attachments::validate_inline_payload("groq", &body)?;
+        }
+        Ok(body)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn render_chat_request_async_for_test(
+        &self,
+        request: ChatRequest,
+        stream: bool,
+    ) -> Result<serde_json::Value> {
+        serde_json::to_value(self.build_chat_request_async(request, stream).await?)
+            .map_err(Into::into)
     }
 
     #[cfg(test)]

@@ -435,11 +435,11 @@ mod tests {
                 "file" => MessageContentPart::file(MessageAttachment {
                     mime_type: "application/pdf".to_owned(),
                     name: Some("doc.pdf".to_owned()),
-                    size_bytes: Some(4),
+                    size_bytes: None,
                     sha256: None,
                     source: AttachmentDataSource::Bytes {
                         base64_data: base64::engine::general_purpose::STANDARD
-                            .encode([1u8, 2, 3, 4]),
+                            .encode(crate::attachments::regression::pdf(1)),
                     },
                     artifact: None,
                 }),
@@ -456,22 +456,22 @@ mod tests {
                 "audio" => MessageContentPart::audio(MessageAttachment {
                     mime_type: "audio/wav".to_owned(),
                     name: Some("a.wav".to_owned()),
-                    size_bytes: Some(4),
+                    size_bytes: None,
                     sha256: None,
                     source: AttachmentDataSource::Bytes {
                         base64_data: base64::engine::general_purpose::STANDARD
-                            .encode([1u8, 2, 3, 4]),
+                            .encode(crate::attachments::regression::wav()),
                     },
                     artifact: None,
                 }),
                 "video" => MessageContentPart::video(MessageAttachment {
                     mime_type: "video/mp4".to_owned(),
                     name: Some("v.mp4".to_owned()),
-                    size_bytes: Some(4),
+                    size_bytes: None,
                     sha256: None,
                     source: AttachmentDataSource::Bytes {
                         base64_data: base64::engine::general_purpose::STANDARD
-                            .encode([1u8, 2, 3, 4]),
+                            .encode(crate::attachments::regression::video()),
                     },
                     artifact: None,
                 }),

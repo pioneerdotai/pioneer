@@ -528,7 +528,14 @@ impl BedrockProvider {
                         "application/pdf" => "pdf".to_owned(),
                         _ => normalize_format(subtype),
                     },
-                    name: attachment.name.clone(),
+                    // Artifact filename remains in PreparedAttachment metadata. The
+                    // API display name is neutral and satisfies 1..200/charset.
+                    // https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_DocumentBlock.html
+                    name: format!(
+                        "Document {}-{}",
+                        attachment.message_index + 1,
+                        attachment.part_index + 1
+                    ),
                     source,
                 }),
                 audio: None,
@@ -688,6 +695,11 @@ impl BedrockProvider {
                     }
 
                     for attachment in prepared.attachments_for_message(message_index) {
+                        if msg.role == Role::Tool && attachment.kind == InputContentType::File {
+                            return Err(anyhow!(
+                                "Converse Tool document has no sibling text; nested tool result text is insufficient"
+                            ));
+                        }
                         content.push(Self::attachment_block(attachment)?);
                     }
 
@@ -1829,16 +1841,20 @@ mod media_contract_tests {
         for (mime, part, union, expected) in [
             ("text/plain", 0, "document", "txt"),
             ("audio/x-wav", 1, "audio", "wav"),
-            ("audio/x-m4a", 1, "audio", "m4a"),
             ("video/mp4", 2, "video", "mp4"),
         ] {
+            let bytes = match part {
+                0 => b"document evidence".to_vec(),
+                1 => crate::attachments::regression::wav(),
+                _ => crate::attachments::regression::video().to_vec(),
+            };
             let attachment = MessageAttachment {
                 mime_type: mime.into(),
                 name: None,
                 size_bytes: None,
                 sha256: None,
                 source: AttachmentDataSource::Bytes {
-                    base64_data: "AQIDBA==".into(),
+                    base64_data: BASE64.encode(&bytes),
                 },
                 artifact: None,
             };
@@ -1860,7 +1876,7 @@ mod media_contract_tests {
             )
             .unwrap();
             assert_eq!(wire[union]["format"], expected);
-            assert_eq!(wire[union]["source"]["bytes"], "AQIDBA==");
+            assert_eq!(wire[union]["source"]["bytes"], BASE64.encode(&bytes));
         }
     }
     #[test]
@@ -1883,5 +1899,96 @@ mod media_contract_tests {
                 .vision,
             Some(false)
         );
+    }
+}
+
+#[cfg(test)]
+mod document_projection_regressions {
+    use super::*;
+    use crate::attachments::regression as fixture;
+    use crate::{MessageContentPart, Provider, ProviderToolCall};
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn neutral_display_names_and_actual_user_sibling_text_are_validated() {
+        let provider = BedrockProvider::new("unused", "unused", "us-east-1");
+        for name in [
+            None,
+            Some("file.pdf".to_owned()),
+            Some("../do_bad[things]   now.pdf".to_owned()),
+            Some(" ".repeat(300)),
+            Some("x".repeat(300)),
+        ] {
+            let state = Arc::new(fixture::state("bedrock", "media", serde_json::json!({})));
+            let mut req = fixture::request(
+                "media",
+                vec![fixture::part(
+                    InputContentType::File,
+                    "application/pdf",
+                    &fixture::pdf(1),
+                )],
+            );
+            if let MessageContentPart::File { file } = &mut req.messages[0].content_parts[0] {
+                file.name = name;
+            }
+            let budget = fixture::scoped(state.clone(), provider.prepare_input_budget(req))
+                .await
+                .unwrap();
+            let prepared = fixture::scoped(
+                state,
+                crate::attachments::prepare_messages_for_provider_async(
+                    "bedrock",
+                    "media",
+                    &provider.capabilities(),
+                    &budget.request.messages,
+                ),
+            )
+            .await
+            .unwrap();
+            let (messages, _) = BedrockProvider::convert_messages(&prepared).unwrap();
+            let wire = serde_json::to_value(messages).unwrap();
+            assert_eq!(wire[0]["content"][0]["text"], "analyze");
+            let display = wire[0]["content"][1]["document"]["name"].as_str().unwrap();
+            assert_eq!(display, "Document 1-1");
+            assert!(display.len() <= 200);
+            assert!(
+                display
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || " -()[]".contains(c))
+            );
+            assert!(prepared.attachments[0].name.ends_with(".pdf"));
+        }
+        for role in [Role::User, Role::Tool] {
+            let state = Arc::new(fixture::state("bedrock", "media", serde_json::json!({})));
+            let mut req = fixture::request(
+                "media",
+                vec![fixture::part(
+                    InputContentType::File,
+                    "application/pdf",
+                    &fixture::pdf(1),
+                )],
+            );
+            if role == Role::Tool {
+                req.messages[0].role = Role::Tool;
+                req.messages[0].tool_call_id = Some("document-call".into());
+                req.messages.insert(
+                    0,
+                    crate::ChatMessage::assistant_tool_calls(
+                        None::<String>,
+                        vec![ProviderToolCall {
+                            id: "document-call".into(),
+                            name: "read".into(),
+                            arguments: "{}".into(),
+                        }],
+                    ),
+                );
+            } else {
+                req.messages[0].content = "   ".into();
+            }
+            assert!(
+                fixture::scoped(state, provider.prepare_input_budget(req))
+                    .await
+                    .is_err()
+            );
+        }
     }
 }

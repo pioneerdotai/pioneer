@@ -42,6 +42,7 @@ pub(crate) async fn prepare(
     )
     .await?;
     super::ensure_no_unrendered_attachments(provider, &prepared)?;
+    let admission = super::admission::current();
     let provider = provider.to_owned();
     // Header/document parsing and base64 encoding remain outside async workers
     // and outside every DB scope. The pipeline bounds both count and bytes.
@@ -67,6 +68,9 @@ pub(crate) async fn prepare(
             // Pin the bytes that were actually estimated. A later provider pass
             // can neither re-fetch an edited URL nor reopen a changed file.
             // Exact artifact identity is preserved for the existing upload cache.
+            if let Some(state) = &admission {
+                state.pin(&attachment)?;
+            }
             target.source = AttachmentDataSource::Bytes {
                 base64_data: STANDARD.encode(bytes),
             };
