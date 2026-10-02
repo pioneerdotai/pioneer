@@ -4448,11 +4448,36 @@ mod tests {
             .disconnect_managed(&a, &installation, 7, &workspace)
             .await
             .unwrap();
-        assert!(service.oauth().state(&a).await.is_none());
+        // Confirmed management Clear retains a credential-free signed-out
+        // admission. It must not look like an unprobed installation that can
+        // start anonymous OAuth recovery on the next reconciliation.
         assert_eq!(
-            service.runtime_snapshot("workspace", &workspace).await[&b].runtime_generation,
-            before
+            service
+                .oauth()
+                .management_projection(&a, &installation)
+                .await,
+            (Some(pioneer_mcp_oauth::OAuthState::AuthRequired), false)
         );
+        for account in [a.clone(), format!("{a}::promotion")] {
+            assert!(
+                !pioneer_keystore::SecretStore::exists(
+                    &secrets.inner,
+                    &pioneer_keystore::SecretId::mcp_oauth(&account).unwrap(),
+                )
+                .unwrap(),
+                "confirmed Clear must remove the account and promotion fence"
+            );
+        }
+        let error = pioneer_mcp::McpOAuthProvider::client(service.oauth(), &a, &installation)
+            .await
+            .err()
+            .expect("signed-out admission must not restore an OAuth client");
+        assert_eq!(error.state, DomainRuntimeState::AuthRequired);
+        assert!(!service.task_exists(&a).await);
+        let snapshot = service.runtime_snapshot("workspace", &workspace).await;
+        assert_eq!(snapshot[&a].state, DomainRuntimeState::Disabled);
+        assert_eq!(snapshot[&b].state, DomainRuntimeState::Ready);
+        assert_eq!(snapshot[&b].runtime_generation, before);
         service.shutdown().await;
     }
     struct OwnedConnectConnector {
