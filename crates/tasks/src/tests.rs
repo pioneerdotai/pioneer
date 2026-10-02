@@ -4214,6 +4214,349 @@ async fn recurring_due_trigger_with_active_serial_run_skips_fire_and_moves_next_
 }
 
 #[tokio::test]
+async fn long_missed_cron_recovers_latest_and_skip_without_duplicate_runs() {
+    let runtime = runtime().await;
+    for policy in [None, Some(TaskTriggerCatchUpPolicy::skip_missed())] {
+        let response = runtime
+            .service()
+            .create_task(
+                TaskCreateContext::default(),
+                create_params(TaskTriggerSpec::Cron {
+                    cron_expr: "* * * * *".to_owned(),
+                    timezone: "UTC".to_owned(),
+                    catch_up_policy: policy,
+                }),
+            )
+            .await
+            .expect("cron task should create");
+        let first = response.trigger.next_fire_at.unwrap();
+        let latest = first + 20_000 * 60;
+        let expected_runs = usize::from(policy.is_none());
+        assert_eq!(
+            runtime.process_due_once(latest + 5).await.unwrap(),
+            expected_runs
+        );
+        let task = runtime
+            .service()
+            .get_task(pioneer_protocol::TaskGetParams {
+                task_id: response.task.id,
+            })
+            .await
+            .unwrap();
+        assert_eq!(task.runs.len(), expected_runs);
+        assert_eq!(task.triggers[0].last_fire_at, Some(latest));
+        assert_eq!(task.triggers[0].next_fire_at, Some(latest + 60));
+        assert_eq!(task.triggers[0].status, TaskTriggerStatus::Active);
+        assert_eq!(runtime.process_due_once(latest + 5).await.unwrap(), 0);
+    }
+}
+
+#[tokio::test]
+async fn invalid_cron_is_isolated_without_blocking_scheduled_or_retry_work() {
+    let runtime = runtime().await;
+    runtime
+        .register_executor(Arc::new(FailingSystemExecutor))
+        .await;
+    let mut retry_params = create_params(TaskTriggerSpec::Immediate);
+    retry_params.retry_policy = Some(TaskRetryPolicy {
+        max_attempts: 2,
+        backoff: TaskRetryBackoffKind::Fixed,
+        initial_delay_seconds: Some(5),
+        max_delay_seconds: None,
+        retry_on: vec![TaskErrorClass::Internal],
+    });
+    let retry = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), retry_params)
+        .await
+        .unwrap();
+    let before_retry = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: retry.task.id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(before_retry.runs.len(), 2);
+    assert_eq!(before_retry.runs[1].status, TaskRunStatus::Queued);
+
+    let invalid = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Cron {
+                cron_expr: "* * * * *".to_owned(),
+                timezone: "UTC".to_owned(),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .unwrap();
+    // Model an invalid historical schedule through the existing event seam.
+    // The malformed expression still decodes, so the scheduler can isolate
+    // its owning Task without changing normal creation validation.
+    let mut trigger = invalid.trigger;
+    trigger.spec = TaskTriggerSpec::Cron {
+        cron_expr: "invalid".to_owned(),
+        timezone: "UTC".to_owned(),
+        catch_up_policy: None,
+    };
+    trigger.next_fire_at = Some(1);
+    runtime
+        .service()
+        .append_event(
+            TaskEventPayload::TaskRescheduled {
+                task_id: invalid.task.id.clone(),
+                trigger,
+                rescheduled_at: 1,
+                reason: TaskRescheduleReason::UserRequested,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    runtime
+        .register_executor(Arc::new(CompletingSystemExecutor))
+        .await;
+    let scheduled = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::ScheduledAt {
+                scheduled_at: 2,
+                timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .unwrap();
+    let now = 4_000_000_000;
+    assert_eq!(runtime.process_due_once(now).await.unwrap(), 2);
+    let blocked = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: invalid.task.id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(blocked.task.status, TaskStatus::Blocked);
+    assert!(blocked.runs.is_empty());
+    assert_eq!(blocked.triggers[0].status, TaskTriggerStatus::Paused);
+    assert_eq!(blocked.triggers[0].next_fire_at, None);
+    assert_eq!(
+        blocked.task.error.as_ref().unwrap().code,
+        "task_trigger_schedule_invalid"
+    );
+    let scheduled = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: scheduled.task.id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(scheduled.runs[0].status, TaskRunStatus::Succeeded);
+    let retried = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: retry.task.id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(retried.runs.len(), 2);
+    assert_eq!(retried.runs[1].status, TaskRunStatus::Succeeded);
+    assert_eq!(runtime.process_due_once(now).await.unwrap(), 0);
+    let restarted = TaskRuntime::new(runtime.service().store());
+    assert_eq!(restarted.process_due_once(now).await.unwrap(), 0);
+    let events = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id: invalid.task.id,
+            after_sequence: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .events
+            .iter()
+            .filter(|event| matches!(event.payload, TaskEventPayload::TaskBlocked { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn stale_cron_failure_does_not_block_a_repaired_spec_with_the_same_fire_time() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Cron {
+                cron_expr: "* * * * *".to_owned(),
+                timezone: "UTC".to_owned(),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .unwrap();
+    let mut stale = response.trigger.clone();
+    stale.spec = TaskTriggerSpec::Cron {
+        cron_expr: "invalid".to_owned(),
+        timezone: "UTC".to_owned(),
+        catch_up_policy: None,
+    };
+    let now = stale.next_fire_at.unwrap();
+    stale.updated_at = now - 1;
+    runtime
+        .service()
+        .append_event(
+            TaskEventPayload::TaskRescheduled {
+                task_id: response.task.id.clone(),
+                trigger: stale.clone(),
+                rescheduled_at: now - 1,
+                reason: TaskRescheduleReason::UserRequested,
+            },
+            now - 1,
+        )
+        .await
+        .unwrap();
+    let mut repaired = stale.clone();
+    repaired.updated_at = now;
+    repaired.spec = TaskTriggerSpec::Cron {
+        cron_expr: "*/2 * * * *".to_owned(),
+        timezone: "UTC".to_owned(),
+        catch_up_policy: None,
+    };
+    runtime
+        .service()
+        .append_event(
+            TaskEventPayload::TaskRescheduled {
+                task_id: response.task.id.clone(),
+                trigger: repaired,
+                rescheduled_at: now,
+                reason: TaskRescheduleReason::UserRequested,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    let error = TaskError {
+        code: "task_trigger_schedule_invalid".to_owned(),
+        message: "stale calculation failure".to_owned(),
+        class: TaskErrorClass::Validation,
+        details: None,
+        failed_run_id: None,
+    };
+    let appended = runtime
+        .service()
+        .store()
+        .block_task_for_due_trigger_failure(&stale, error, now)
+        .await
+        .unwrap();
+    assert!(appended.is_empty());
+    let task = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: response.task.id,
+        })
+        .await
+        .unwrap();
+    assert_ne!(task.task.status, TaskStatus::Blocked);
+    assert_eq!(task.triggers[0].status, TaskTriggerStatus::Active);
+    assert_eq!(task.triggers[0].next_fire_at, stale.next_fire_at);
+}
+
+#[tokio::test]
+async fn cron_failure_quarantine_rolls_back_and_can_be_retried_atomically() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Cron {
+                cron_expr: "* * * * *".to_owned(),
+                timezone: "UTC".to_owned(),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .unwrap();
+    let store = runtime.service().store().with_maintenance_access();
+    let database = store.database_connection();
+    let now = response.trigger.next_fire_at.unwrap();
+    let error = TaskError {
+        code: "task_trigger_schedule_invalid".to_owned(),
+        message: "test schedule failure".to_owned(),
+        class: TaskErrorClass::Validation,
+        details: None,
+        failed_run_id: None,
+    };
+    // Fail the trigger pause after the TaskBlocked event has started being
+    // projected. Both the canonical event and every projection must roll back.
+    database
+        .execute_unprepared(
+            "CREATE TRIGGER reject_trigger_pause BEFORE UPDATE OF status ON task_trigger \
+         WHEN NEW.status = 'paused' BEGIN SELECT RAISE(ABORT, 'test pause failure'); END",
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .block_task_for_due_trigger_failure(&response.trigger, error.clone(), now)
+            .await
+            .is_err()
+    );
+    let after_failure = store.get_task(&response.task.id).await.unwrap().unwrap();
+    assert_ne!(after_failure.task.status, TaskStatus::Blocked);
+    assert_eq!(after_failure.triggers[0].status, TaskTriggerStatus::Active);
+    assert_eq!(after_failure.triggers[0].next_fire_at, Some(now));
+    assert!(
+        !store
+            .get_task_events(&response.task.id, None)
+            .await
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| matches!(event.payload, TaskEventPayload::TaskBlocked { .. }))
+    );
+    // Acquiring the writer again also proves the failed transaction released it.
+    database
+        .execute_unprepared("DROP TRIGGER reject_trigger_pause")
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .block_task_for_due_trigger_failure(&response.trigger, error.clone(), now)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let blocked = store.get_task(&response.task.id).await.unwrap().unwrap();
+    assert_eq!(blocked.task.status, TaskStatus::Blocked);
+    assert_eq!(blocked.triggers[0].status, TaskTriggerStatus::Paused);
+    assert!(
+        store
+            .block_task_for_due_trigger_failure(&response.trigger, error, now)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .get_task_events(&response.task.id, None)
+            .await
+            .unwrap()
+            .events
+            .iter()
+            .filter(|event| matches!(event.payload, TaskEventPayload::TaskBlocked { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn daily_cron_catches_up_latest_missed_once_and_advances_to_next_day() {
     let runtime = runtime().await;
     let response = runtime
@@ -7940,4 +8283,48 @@ async fn immediate_dispatch_inherits_request_scope_and_scheduler_keeps_maintenan
     observer.assert_scope(SqliteReadClass::Interactive, SqliteWriteClass::Interactive);
     assert_eq!(runtime.process_due_once(4_000_000_000).await.unwrap(), 1);
     observer.assert_scope(SqliteReadClass::Maintenance, SqliteWriteClass::Maintenance);
+
+    let invalid = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Cron {
+                cron_expr: "* * * * *".to_owned(),
+                timezone: "UTC".to_owned(),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .unwrap();
+    let mut trigger = invalid.trigger;
+    let now = trigger.next_fire_at.unwrap();
+    trigger.spec = TaskTriggerSpec::Cron {
+        cron_expr: "invalid".to_owned(),
+        timezone: "UTC".to_owned(),
+        catch_up_policy: None,
+    };
+    runtime
+        .service()
+        .append_event(
+            TaskEventPayload::TaskRescheduled {
+                task_id: invalid.task.id.clone(),
+                trigger,
+                rescheduled_at: now,
+                reason: TaskRescheduleReason::UserRequested,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    observer.assert_scope(SqliteReadClass::Interactive, SqliteWriteClass::Interactive);
+    assert_eq!(runtime.process_due_once(now).await.unwrap(), 0);
+    observer.assert_scope(SqliteReadClass::Maintenance, SqliteWriteClass::Maintenance);
+    let invalid = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: invalid.task.id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(invalid.task.status, TaskStatus::Blocked);
 }
