@@ -946,6 +946,10 @@ impl OpenAiCompatibleProvider {
                 state.provider
             )
         })?;
+        anyhow::ensure!(
+            crate::continuation::retention(state) != crate::continuation::Retention::Unsupported,
+            "unsupported {provider_name} continuation: unrecognized native state must not be discarded by the readable replay schema"
+        );
         let replay = serde_json::from_value::<CompatibleAssistantReplayState>(payload.clone())
             .map_err(|error| anyhow!("invalid {provider_name} replay state: {error}"))?;
         if replay.schema_version != COMPATIBLE_REPLAY_STATE_SCHEMA_VERSION {
@@ -1439,6 +1443,20 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unknown_signed_extension_is_refused_by_production_compatible_decoder() {
+        let state = ProviderReplayState::for_model(
+            "deepseek",
+            "deepseek-reasoner",
+            serde_json::json!({"schema_version":1,"assistant_message":{"content":"answer","reasoning_content":"readable","tool_calls":[],"signature":"unknown opaque"}}),
+        );
+        assert!(OpenAiCompatibleProvider::decode_replay_state(&state, "deepseek").is_err());
+        assert_eq!(
+            state.payload["assistant_message"]["signature"],
+            "unknown opaque"
+        );
+    }
+
     #[test]
     fn deepseek_non_tool_stream_keeps_native_empty_reasoning_field() {
         let chunks = finish_compatible_stream(

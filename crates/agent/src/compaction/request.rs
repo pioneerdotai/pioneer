@@ -45,6 +45,7 @@ impl NativeRequestProjection {
                 "summary cannot replace system instructions"
             );
         }
+        pioneer_provider::continuation::validate_compaction(&request.messages, &compact)?;
         if !compact.is_empty() {
             let mut pending = BTreeMap::new();
             for (index, message) in request.messages.iter().enumerate() {
@@ -302,40 +303,80 @@ mod tests {
     }
 
     #[test]
-    fn summary_retains_signed_and_redacted_native_tail_for_each_owner() {
-        for (owner, payload) in [
+    fn summary_signed_tail_requires_a_documented_non_binding_profile() {
+        for (owner, model, payload, accepted) in [
             (
                 "anthropic",
-                serde_json::json!({"schema_version":2,"blocks":[
-                    {"type":"thinking","thinking":"","signature":"signed"},
-                    {"type":"redacted_thinking","data":"redacted"},
-                    {"type":"text","text":"answer"}
-                ]}),
+                "claude-sonnet-5-5",
+                serde_json::json!({"schema_version":2,"blocks":[{"type":"thinking","thinking":"","signature":"signed"},{"type":"redacted_thinking","data":"opaque"},{"type":"text","text":"answer"}]}),
+                false,
+            ),
+            (
+                "anthropic",
+                "claude-sonnet-4-6",
+                serde_json::json!({"schema_version":2,"blocks":[{"type":"thinking","thinking":"","signature":"signed"}]}),
+                true,
+            ),
+            (
+                "bedrock",
+                "anthropic.claude-sonnet-4-6",
+                serde_json::json!({"blocks":[{"reasoningText":{"text":"","signature":"signed"}}]}),
+                false,
             ),
             (
                 "gemini",
-                serde_json::json!({"schema_version":2,"parts":[
-                    {"text":"answer"},{"text":"","thoughtSignature":"signed"}
-                ]}),
+                "gemini-3-flash",
+                serde_json::json!({"schema_version":2,"parts":[{"text":"answer"},{"text":"","thoughtSignature":"signed"}]}),
+                true,
             ),
         ] {
             let mut req = request();
             let mut tail = ChatMessage::assistant("answer");
             tail.provider_replay_state = Some(pioneer_provider::ProviderReplayState::for_model(
-                owner, "fixture", payload,
+                owner, model, payload,
             ));
-            req.messages = vec![ChatMessage::user("old work"), tail.clone()];
-            let result = NativeRequestProjection::new(
-                req,
-                [0],
+            req.messages = vec![
+                ChatMessage::user("original prefix"),
+                tail.clone(),
+                ChatMessage::user("new turn"),
+            ];
+            let unchanged = NativeRequestProjection::full(
+                req.clone(),
                 vec![],
                 ModelBudget::new(Some(32768), None, None),
                 false,
             )
-            .unwrap()
-            .evaluate("summary")
             .unwrap();
-            assert_eq!(result.request.messages[1], tail);
+            assert_eq!(unchanged.request.messages[1], tail);
+            let rewrite = NativeRequestProjection::new(
+                req.clone(),
+                [0],
+                vec![],
+                ModelBudget::new(Some(32768), None, None),
+                false,
+            );
+            assert_eq!(rewrite.is_ok(), accepted);
+            if let Ok(projection) = rewrite {
+                assert_eq!(
+                    projection
+                        .evaluate("changed prefix")
+                        .unwrap()
+                        .request
+                        .messages[1],
+                    tail
+                );
+            }
+            // No old signed state left: ordinary whole-history summary remains supported.
+            assert!(
+                NativeRequestProjection::new(
+                    req,
+                    [0, 1],
+                    vec![],
+                    ModelBudget::new(Some(32768), None, None),
+                    false
+                )
+                .is_ok()
+            );
         }
     }
 

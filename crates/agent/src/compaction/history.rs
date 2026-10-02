@@ -200,7 +200,7 @@ impl NativeHistoryLayout {
             unit.complete &= calls == outcomes;
         }
         // A completed call/result pair is not necessarily the end of the
-        // assistant turn. Anthropic/Gemini/DeepSeek continuation may still need
+        // assistant turn. The selected native continuation profile may still need
         // state from earlier rounds of that same turn. Mark those units pending
         // until a final assistant response is present; Emergency respects this
         // correctness boundary as it already respects incomplete tool pairs.
@@ -231,7 +231,8 @@ impl NativeHistoryLayout {
                         .is_some_and(|calls| !calls.is_empty()),
                 );
                 if message.provider_replay_state.as_ref().is_some_and(|state| {
-                    matches!(state.provider.as_str(), "anthropic" | "gemini" | "deepseek")
+                    pioneer_provider::continuation::retention(state)
+                        != pioneer_provider::continuation::Retention::Ordinary
                 }) {
                     native_turns.insert(key);
                 }
@@ -335,6 +336,127 @@ mod tests {
         assert_eq!(closed.message_indexes[1], [1, 2]);
         assert_eq!(closed.message_indexes[2], [3, 4]);
     }
+    #[test]
+    fn retention_uses_actual_state_with_hot_and_cold_scopes_in_both_planner_modes() {
+        use pioneer_compaction::{CompactionMode, CoverageDomain, ModelBudget, plan_compaction};
+        use pioneer_provider::ProviderReplayState;
+        for (provider, model, payload, required) in [
+            (
+                "bedrock",
+                "anthropic.claude-sonnet-4-6",
+                serde_json::json!({"blocks":[{"reasoningText":{"text":"","signature":"signed"}},{"redactedContent":"opaque"}]}),
+                true,
+            ),
+            (
+                "openrouter",
+                "anthropic/claude-sonnet-5.5",
+                serde_json::json!({"reasoning_details":[{"type":"reasoning.encrypted","format":"anthropic-claude-v1","data":"opaque"}]}),
+                true,
+            ),
+            (
+                "anthropic",
+                "claude-sonnet-4-6",
+                serde_json::json!({"schema_version":2,"blocks":[{"type":"text","text":"ordinary"},{"type":"tool_use","id":"call","name":"read","input":{}}]}),
+                false,
+            ),
+            (
+                "gemini",
+                "gemini-2.5-flash",
+                serde_json::json!({"schema_version":2,"parts":[{"functionCall":{"name":"read","args":{}}}]}),
+                false,
+            ),
+            (
+                "anthropic",
+                "unknown-generation",
+                serde_json::json!({"blocks":[{"type":"redacted_thinking","data":"opaque"}]}),
+                true,
+            ),
+            (
+                "deepseek",
+                "deepseek-v4-flash",
+                serde_json::json!({"schema_version":1,"assistant_message":{"reasoning_content":"","content":null,"tool_calls":[]}}),
+                true,
+            ),
+        ] {
+            for hot in [false, true] {
+                let mut input = ChatMessage::user("active");
+                origin(&mut input, "input", "input", true);
+                let mut messages = vec![input];
+                for round in 0..2 {
+                    let id = format!("call-{round}");
+                    let mut assistant = ChatMessage::assistant_tool_calls_with_provider_state(
+                        None::<String>,
+                        None::<String>,
+                        vec![ProviderToolCall {
+                            id: id.clone(),
+                            name: "read".into(),
+                            arguments: "{}".into(),
+                        }],
+                        Some(ProviderReplayState::for_model(
+                            provider,
+                            model,
+                            payload.clone(),
+                        )),
+                    );
+                    origin(
+                        &mut assistant,
+                        &format!("round-{round}"),
+                        &format!("a-{round}"),
+                        false,
+                    );
+                    let mut result = ChatMessage::tool_result(id, "read", "outcome");
+                    origin(
+                        &mut result,
+                        &format!("round-{round}"),
+                        &format!("r-{round}"),
+                        false,
+                    );
+                    messages.extend([assistant, result]);
+                }
+                for message in &mut messages {
+                    let origin = message.provenance.as_mut().unwrap();
+                    origin.sources[0].scope = if hot {
+                        match message.role {
+                            Role::User => "pending-input:turn",
+                            Role::Tool => "pending-tool:turn",
+                            _ => "pending-assistant:turn",
+                        }
+                    } else {
+                        "context:turn"
+                    }
+                    .into();
+                    origin.sources[0].version = if hot { "" } else { "revision:1" }.into();
+                }
+                let layout =
+                    NativeHistoryLayout::from_messages("ws", "thread", &messages, &[100; 5])
+                        .unwrap();
+                assert_eq!(layout.units[1].complete, !required, "{provider}/{hot}");
+                for mode in [CompactionMode::Normal, CompactionMode::Emergency] {
+                    let plan = plan_compaction(
+                        &layout.units,
+                        &ModelBudget::new(Some(32768), None, None),
+                        256,
+                        0,
+                        512,
+                        mode,
+                        CoverageDomain::WorkingContext,
+                        true,
+                        "fixture",
+                    );
+                    assert_eq!(plan.is_err(), required, "{provider}/{hot}/{mode:?}");
+                }
+                let mut final_message = ChatMessage::assistant("final");
+                origin(&mut final_message, "final", "final", false);
+                final_message.provenance.as_mut().unwrap().sources[0].scope = "context:turn".into();
+                messages.push(final_message);
+                let closed =
+                    NativeHistoryLayout::from_messages("ws", "thread", &messages, &[100; 6])
+                        .unwrap();
+                assert!(closed.units.iter().all(|unit| unit.complete));
+            }
+        }
+    }
+
     #[test]
     fn whole_round_remains_pending_until_outcome_and_preserves_intervening_steering() {
         let mut assistant = ChatMessage::assistant_tool_calls(

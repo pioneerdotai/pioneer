@@ -1,3 +1,6 @@
+#[path = "tests/history_continuation.rs"]
+mod history_continuation;
+
 #[path = "tests/memory_post_turn_response.rs"]
 mod memory_post_turn_response;
 

@@ -446,6 +446,69 @@ async fn metadata(
     }
     Ok(records)
 }
+/// Exact UI copies for one durable final envelope. Event identity/version is
+/// captured through the repository's released, bounded metadata pages.
+pub(crate) struct FinalResponseAliasEvidence {
+    pub(crate) aliases: Vec<MessageSourceAlias>,
+    pub(crate) ready: bool,
+}
+
+pub(crate) async fn final_response_aliases(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    represented: &SourceRef,
+    final_id: &str,
+    reasoning_id: Option<&str>,
+) -> Result<FinalResponseAliasEvidence> {
+    let fence = store.compaction_history_read_fence().await?;
+    let mut aliases = Vec::new();
+    let mut final_seen = false;
+    let mut reasoning_seen = reasoning_id.is_none();
+    let mut after = 0;
+    loop {
+        let page = store
+            .compaction_source_metadata_page_at_fence(
+                workspace,
+                thread,
+                turn,
+                PagedSource::Event,
+                after,
+                fence.event_order,
+            )
+            .await?;
+        for event in page.entries {
+            if event
+                .item_id
+                .as_deref()
+                .is_some_and(|id| id == final_id || Some(id) == reasoning_id)
+                && !matches!(
+                    event.projection_kind.as_deref(),
+                    Some("start" | "technical")
+                )
+            {
+                final_seen |= event.item_id.as_deref() == Some(final_id);
+                reasoning_seen |= event.item_id.as_deref() == reasoning_id;
+                aliases.push(MessageSourceAlias {
+                    represented_thread_id: thread.into(),
+                    represented_source: runtime_source_ref(represented),
+                    thread_id: thread.into(),
+                    source: runtime_source_ref(&event.reference),
+                });
+            }
+        }
+        if page.next_sequence <= after {
+            break;
+        }
+        after = page.next_sequence;
+    }
+    Ok(FinalResponseAliasEvidence {
+        aliases,
+        ready: final_seen && reasoning_seen,
+    })
+}
+
 fn origin(
     workspace: &str,
     thread: &str,
@@ -649,10 +712,20 @@ fn historical_artifact_part(artifact: pioneer_protocol::ArtifactRef) -> MessageC
         MessageContentPart::File { file: attachment }
     }
 }
+fn runtime_source_ref(source: &SourceRef) -> MessageSourceRef {
+    MessageSourceRef {
+        scope: source.scope.clone(),
+        id: source.id.clone(),
+        version: source.version.clone(),
+    }
+}
+
 struct Round {
     sequence: i64,
     envelope: CanonicalProviderRoundEnvelope,
     assistant_source: SourceRef,
+    response_aliases: Vec<MessageSourceAlias>,
+    response_copies_ready: bool,
     results: BTreeMap<String, (SourceRef, ChatMessage)>,
 }
 fn finish_round(
@@ -687,6 +760,11 @@ fn finish_round(
             &round.envelope.round_id,
             vec![round.assistant_source],
         ));
+        let origin = message.provenance.as_mut().expect("canonical origin");
+        origin.source_aliases = round.response_aliases;
+        // The ACK precedes UI append. A concurrent capture must not publish a
+        // checkpoint before exact copy revisions exist; later reads retry it.
+        origin.complete &= round.response_copies_ready;
         output.push((round.sequence, vec![message]));
         return Ok(());
     }
@@ -1013,8 +1091,9 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
                             version: represented.1.version.clone(),
                         },
                     }
-                ) && represented.1.scope.starts_with("input:")
-                    && alias.source.scope.starts_with("input:"),
+                ) && ((represented.1.scope.starts_with("input:")
+                    && alias.source.scope.starts_with("input:"))
+                    || alias.is_response_copy()),
                 "checkpoint input alias is outside its exact leaf closure"
             );
             checkpoint_evidence.add_alias(alias);
@@ -1692,6 +1771,9 @@ async fn load_line_history_inner(
                     Some("input" | "input_revision")
                 )
             });
+        // Exact relationship discovery may use all captured metadata, even
+        // when the selected view excludes the UI copy's payload.
+        let mut alias_events = events.clone();
         events.retain(|event| {
             !is_covered(&event.reference)
                 && !event.item_id.as_ref().is_some_and(|item| {
@@ -1749,10 +1831,25 @@ async fn load_line_history_inner(
                 Some("input" | "input_revision")
             )
         });
-        events_by_turn.push((events, has_event_input, has_authoritative_event_input));
+        let refreshed: BTreeMap<_, _> = events
+            .iter()
+            .map(|event| (event.reference.clone(), event))
+            .collect();
+        for original in &mut alias_events {
+            if let Some(event) = refreshed.get(&original.reference) {
+                original.item_id = event.item_id.clone();
+                original.projection_kind = event.projection_kind.clone();
+            }
+        }
+        events_by_turn.push((
+            events,
+            alias_events,
+            has_event_input,
+            has_authoritative_event_input,
+        ));
     }
     let mut history = Vec::new();
-    for (turn, (events, has_event_input, has_authoritative_event_input)) in
+    for (turn, (events, alias_events, has_event_input, has_authoritative_event_input)) in
         turns.into_iter().zip(events_by_turn)
     {
         // A later terminal transition cannot expose the pending portion of an
@@ -1968,8 +2065,47 @@ async fn load_line_history_inner(
                                     .get(&envelope.round_id)
                                     .copied()
                                     .unwrap_or(row.sequence),
-                                envelope,
+                                response_copies_ready: alias_events.iter().any(|event| {
+                                    event.item_id.as_ref() == Some(&envelope.round_id)
+                                        && !matches!(
+                                            event.projection_kind.as_deref(),
+                                            Some("start" | "technical")
+                                        )
+                                }) && row.item_id.as_ref().is_none_or(
+                                    |item| {
+                                        alias_events.iter().any(|event| {
+                                            event.item_id.as_ref() == Some(item)
+                                                && !matches!(
+                                                    event.projection_kind.as_deref(),
+                                                    Some("start" | "technical")
+                                                )
+                                        })
+                                    },
+                                ),
+                                response_aliases: if envelope.calls.is_empty() {
+                                    alias_events
+                                        .iter()
+                                        .filter(|event| {
+                                            event.item_id.as_ref().is_some_and(|item| {
+                                                item == &envelope.round_id
+                                                    || row.item_id.as_ref() == Some(item)
+                                            }) && !matches!(
+                                                event.projection_kind.as_deref(),
+                                                Some("start" | "technical")
+                                            )
+                                        })
+                                        .map(|event| MessageSourceAlias {
+                                            represented_thread_id: thread.into(),
+                                            represented_source: runtime_source_ref(&row.reference),
+                                            thread_id: thread.into(),
+                                            source: runtime_source_ref(&event.reference),
+                                        })
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                },
                                 assistant_source: row.reference,
+                                envelope,
                                 results: BTreeMap::new(),
                             });
                         } else {
@@ -2482,6 +2618,8 @@ mod tests {
                     id: "source".into(),
                     version: "revision:1".into(),
                 },
+                response_aliases: vec![],
+                response_copies_ready: true,
                 results: BTreeMap::new(),
             },
             false,
@@ -2678,6 +2816,8 @@ mod tests {
                     version: "revision:1".into(),
                 },
                 results: BTreeMap::new(),
+                response_aliases: vec![],
+                response_copies_ready: true,
             };
             assert!(finish_round("ws", "thread", "turn", round, true, &mut Vec::new()).is_err());
         }
@@ -2737,6 +2877,8 @@ mod tests {
                 version: "revision:1".into(),
             },
             results: BTreeMap::new(),
+            response_aliases: vec![],
+            response_copies_ready: true,
         };
         let mut output = Vec::new();
         finish_round("ws", "thread", "turn", round, false, &mut output).unwrap();

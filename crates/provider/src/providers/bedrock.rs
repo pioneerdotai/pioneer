@@ -274,6 +274,7 @@ struct BedrockModelLifecycle {
 // ── Provider struct ────────────────────────────────────────────────────────
 
 pub struct BedrockProvider {
+    replay_authority: String,
     access_key_id: String,
     secret_access_key: String,
     session_token: Option<String>,
@@ -387,6 +388,7 @@ impl BedrockProvider {
         timeout_policy: ProviderTimeoutPolicy,
     ) -> Self {
         Self {
+            replay_authority: pioneer_protocol::generate_id(32),
             access_key_id: access_key_id.into(),
             secret_access_key: secret_access_key.into(),
             session_token: None,
@@ -419,6 +421,7 @@ impl BedrockProvider {
         timeout_policy: ProviderTimeoutPolicy,
     ) -> Self {
         Self {
+            replay_authority: pioneer_protocol::generate_id(32),
             access_key_id: access_key_id.into(),
             secret_access_key: secret_access_key.into(),
             session_token: Some(session_token.into()),
@@ -445,6 +448,7 @@ impl BedrockProvider {
         let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
         Ok(Self {
+            replay_authority: pioneer_protocol::generate_id(32),
             access_key_id,
             secret_access_key,
             session_token,
@@ -718,6 +722,26 @@ impl BedrockProvider {
         BedrockToolConfig { tools, tool_choice }
     }
 
+    fn build_native_request(
+        &self,
+        request: &ChatRequest,
+        prepared: &PreparedProviderMessages,
+    ) -> Result<BedrockRequest> {
+        let body = Self::build_request(request, prepared)?;
+        crate::continuation::validate_prefix(
+            &serde_json::to_value(&body)?,
+            prepared
+                .messages
+                .iter()
+                .filter(|m| m.role != Role::System)
+                .enumerate()
+                .filter_map(|(i, m)| m.provider_replay_state.clone().map(|s| (i, s))),
+            &request.model,
+            &self.replay_authority,
+        )?;
+        Ok(body)
+    }
+
     fn build_request(
         request: &ChatRequest,
         prepared: &PreparedProviderMessages,
@@ -887,7 +911,8 @@ impl crate::traits::Provider for BedrockProvider {
         )
         .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let bedrock_request = Self::build_request(&request, &prepared)?;
+        let bedrock_request = self.build_native_request(&request, &prepared)?;
+        let prefix_body = serde_json::to_value(&bedrock_request)?;
 
         let body = serde_json::to_vec(&bedrock_request)?;
         let url_str = self.converse_url(&request.model);
@@ -972,7 +997,7 @@ impl crate::traits::Provider for BedrockProvider {
         } else {
             Some(reasoning_parts.join(""))
         };
-        let provider_replay_state = if replay_blocks.is_empty() {
+        let mut provider_replay_state = if replay_blocks.is_empty() {
             None
         } else {
             Some(ProviderReplayState::new(
@@ -986,6 +1011,15 @@ impl crate::traits::Provider for BedrockProvider {
             && reasoning_content.as_deref().unwrap_or_default().is_empty()
         {
             return Err(anyhow!("no response from Bedrock"));
+        }
+
+        if let Some(state) = provider_replay_state.as_mut() {
+            crate::continuation::bind_prefix(
+                state,
+                &request.model,
+                &self.replay_authority,
+                &prefix_body,
+            )?;
         }
 
         Ok(ChatResponse {
@@ -1122,6 +1156,80 @@ fn provider_model_from_bedrock_model_summary(m: BedrockModelSummary) -> Provider
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn production_converse_body_requires_previous_messages_and_durable_authority() {
+        use super::super::history_test_support::request;
+        let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
+        let mut req = request(vec![
+            ChatMessage::system("rules"),
+            ChatMessage::user("first"),
+        ]);
+        req.model = "anthropic.claude-sonnet-4-6".into();
+        req.tools = Some(vec![crate::ToolDefinition {
+            name: "read".into(),
+            description: "read".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }]);
+        let build = |p: &BedrockProvider, r: &ChatRequest| {
+            let prepared = prepare_messages_for_provider_model(
+                p.name(),
+                &r.model,
+                &p.capabilities(),
+                &r.rendered_messages_with_compiled_prompt(),
+            )?;
+            p.build_native_request(r, &prepared)
+                .map(|body| serde_json::to_value(body).unwrap())
+        };
+        let sent = build(&provider, &req).unwrap();
+        for blocks in [
+            serde_json::json!([{"reasoningText":{"text":"reason","signature":"synthetic"}}]),
+            serde_json::json!([{"redactedContent":"opaque"}]),
+        ] {
+            let mut state = ProviderReplayState::for_model(
+                "bedrock",
+                &req.model,
+                serde_json::json!({"blocks":blocks}),
+            );
+            crate::continuation::bind_prefix(
+                &mut state,
+                &req.model,
+                &provider.replay_authority,
+                &sent,
+            )
+            .unwrap();
+            let mut answer = ChatMessage::assistant("answer");
+            answer.provider_replay_state = Some(state);
+            let answer: ChatMessage =
+                serde_json::from_value(serde_json::to_value(answer).unwrap()).unwrap();
+            let mut next = req.clone();
+            next.messages.extend([answer, ChatMessage::user("next")]);
+            assert!(build(&provider, &next).is_ok());
+            for change in 0..4 {
+                let mut changed = next.clone();
+                match change {
+                    0 => changed.messages[1].content = "summary replaces previous message".into(),
+                    1 => changed.messages[0].content = "retry system refresh".into(),
+                    2 => {
+                        changed.tools.as_mut().unwrap()[0].parameters =
+                            serde_json::json!({"type":"string"})
+                    }
+                    _ => {
+                        changed.messages[2]
+                            .provider_replay_state
+                            .as_mut()
+                            .unwrap()
+                            .payload
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("prefix_proof");
+                    }
+                }
+                assert!(build(&provider, &changed).is_err());
+            }
+            assert!(build(&BedrockProvider::new("AKID", "SECRET", "us-east-1"), &next).is_err());
+        }
+    }
+
     #[test]
     fn usage_normalization_requires_complete_separate_cache_counters() {
         let complete: super::BedrockUsage = serde_json::from_value(serde_json::json!({

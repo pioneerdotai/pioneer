@@ -406,6 +406,13 @@ impl GeminiProvider {
                     if msg.role == Role::Assistant
                         && let Some(state) = msg.provider_replay_state.as_ref()
                     {
+                        if crate::continuation::retention(state)
+                            == crate::continuation::Retention::Unsupported
+                        {
+                            anyhow::bail!(
+                                "Gemini native continuation profile/signature requirement is unproven; unsigned required state cannot be replayed"
+                            );
+                        }
                         let payload = state
                             .payload_for("gemini")
                             .ok_or_else(|| anyhow!("foreign Gemini replay state"))?;

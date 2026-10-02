@@ -546,6 +546,16 @@ impl OpenRouterProvider {
     }
 
     fn convert_messages(prepared: &PreparedProviderMessages) -> Result<Vec<ApiMessage>> {
+        for message in &prepared.messages {
+            if let Some(state) = message.provider_replay_state.as_ref() {
+                anyhow::ensure!(
+                    crate::continuation::retention(state)
+                        != crate::continuation::Retention::Unsupported,
+                    "OpenRouter opaque native replay unsupported: upstream prefix/account authority is not exposed by this Chat transport"
+                );
+            }
+        }
+
         let mut rendered = Vec::new();
         for (message_index, message) in prepared.messages.iter().enumerate() {
             let attachments = prepared
@@ -1604,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_messages_replays_openrouter_reasoning_details_unchanged() {
+    fn unknown_encrypted_relay_state_is_preserved_but_refused_before_native_send() {
         let reasoning_details = serde_json::json!([
             {
                 "type": "reasoning.encrypted",
@@ -1642,11 +1652,14 @@ mod tests {
             &[assistant],
         )
         .unwrap();
-        let api_messages = OpenRouterProvider::convert_messages(&prepared).unwrap();
-
+        assert!(OpenRouterProvider::convert_messages(&prepared).is_err());
         assert_eq!(
-            api_messages[0].reasoning_details,
-            serde_json::from_value::<Vec<serde_json::Value>>(reasoning_details).ok()
+            prepared.messages[0]
+                .provider_replay_state
+                .as_ref()
+                .unwrap()
+                .payload["reasoning_details"],
+            reasoning_details
         );
     }
 

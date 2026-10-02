@@ -3998,7 +3998,32 @@ impl RecoveryCoordinator {
         rows.retain(|row| !verified_legacy.contains(&row.sequence));
         // Capture the exact round/item mapping before the existing recovery
         // assembler orders results and synthesizes safe interrupted observations.
-        let origins = retained_history_origins(&workspace, &thread, turn_id, &rows, &sources)?;
+        let mut origins = retained_history_origins(&workspace, &thread, turn_id, &rows, &sources)?;
+        for row in rows.iter().filter(|row| row.source == "assistant_round") {
+            let Ok(envelope) = serde_json::from_str::<
+                pioneer_provider::CanonicalProviderRoundEnvelope,
+            >(&row.payload) else {
+                continue;
+            };
+            if envelope.calls.is_empty() {
+                if let (Some(round), Some(source)) =
+                    (origins.get_mut(&row.sequence), sources.get(&row.sequence))
+                {
+                    let evidence = crate::compaction::final_response_aliases(
+                        &self.crud_store,
+                        &workspace,
+                        &thread,
+                        turn_id,
+                        source,
+                        &envelope.round_id,
+                        row.item_id.as_deref(),
+                    )
+                    .await?;
+                    round.assistant.source_aliases = evidence.aliases;
+                    round.assistant.complete &= evidence.ready;
+                }
+            }
+        }
         // A terminal shell item is acknowledged before the replay row. Recover
         // that known outcome if the process stopped between the two appends.
         let recorded_items = rows

@@ -35,6 +35,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 pub struct AnthropicProvider {
+    replay_authority: String,
     api_key: String,
     base_url: String,
     timeout_policy: ProviderTimeoutPolicy,
@@ -296,6 +297,7 @@ impl AnthropicProvider {
         timeout_policy: ProviderTimeoutPolicy,
     ) -> Self {
         Self {
+            replay_authority: pioneer_protocol::generate_id(32),
             api_key: api_key.into(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             timeout_policy,
@@ -393,6 +395,53 @@ impl AnthropicProvider {
         })
     }
     /// Extract system messages and render the remaining native history.
+    fn build_native_request(
+        &self,
+        request: &ChatRequest,
+        prepared: &PreparedProviderMessages,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        if self.base_url != BASE_URL
+            && prepared.messages.iter().any(|message| {
+                message.provider_replay_state.as_ref().is_some_and(|state| {
+                    crate::continuation::retention(state)
+                        != crate::continuation::Retention::Ordinary
+                })
+            })
+        {
+            anyhow::bail!(
+                "native thinking replay through a custom Messages relay lacks documented prefix/account authority"
+            );
+        }
+        let (system, messages) = Self::prepare_messages(prepared)?;
+        let body = ApiChatRequest {
+            model: request.model.clone(),
+            messages,
+            max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            temperature: request.temperature,
+            system,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: request.tool_choice.clone().map(Self::convert_tool_choice),
+            output_config: Self::output_config(request.reasoning),
+            stream,
+        };
+        crate::continuation::validate_prefix(
+            &serde_json::to_value(&body)?,
+            prepared
+                .messages
+                .iter()
+                .filter(|m| m.role != Role::System)
+                .enumerate()
+                .filter_map(|(i, m)| m.provider_replay_state.clone().map(|s| (i, s))),
+            &request.model,
+            &self.replay_authority,
+        )?;
+        Ok(body)
+    }
+
     fn prepare_messages(
         prepared: &PreparedProviderMessages,
     ) -> Result<(Option<String>, Vec<ApiMessage>)> {
@@ -643,22 +692,8 @@ impl crate::traits::Provider for AnthropicProvider {
         )
         .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let (system, messages) = Self::prepare_messages(&prepared)?;
-
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages,
-            max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-            temperature: request.temperature,
-            system,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            output_config: Self::output_config(request.reasoning),
-            stream: false,
-        };
+        let api_request = self.build_native_request(&request, &prepared, false)?;
+        let prefix_body = serde_json::to_value(&api_request)?;
 
         let request_builder = self
             .client
@@ -681,7 +716,21 @@ impl crate::traits::Provider for AnthropicProvider {
             "provider_response",
         )
         .await?;
-        Self::decode_response(api_response)
+        let mut response = Self::decode_response(api_response)?;
+        if let Some(state) = response.provider_replay_state.as_mut() {
+            if self.base_url != BASE_URL
+                && crate::continuation::retention(state) != crate::continuation::Retention::Ordinary
+            {
+                state.payload["api_profile"] = serde_json::json!("unverified-relay");
+            }
+            crate::continuation::bind_prefix(
+                state,
+                &request.model,
+                &self.replay_authority,
+                &prefix_body,
+            )?;
+        }
+        Ok(response)
     }
 
     async fn stream_chat(
@@ -696,22 +745,8 @@ impl crate::traits::Provider for AnthropicProvider {
         )
         .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let (system, messages) = Self::prepare_messages(&prepared)?;
-
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages,
-            max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-            temperature: request.temperature,
-            system,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            output_config: Self::output_config(request.reasoning),
-            stream: true,
-        };
+        let api_request = self.build_native_request(&request, &prepared, true)?;
+        let prefix_body = serde_json::to_value(&api_request)?;
 
         let request_builder = self
             .client
@@ -735,6 +770,9 @@ impl crate::traits::Provider for AnthropicProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
+        let replay_authority = self.replay_authority.clone();
+        let unverified_relay = self.base_url != BASE_URL;
+        let replay_model = request.model.clone();
         tokio::spawn(async move {
             use std::collections::{BTreeMap, HashSet};
 
@@ -828,13 +866,28 @@ impl crate::traits::Provider for AnthropicProvider {
                                 }
                                 if !replay_blocks.is_empty() {
                                     let blocks = replay_blocks.into_values().collect::<Vec<_>>();
+                                    let mut state = ProviderReplayState::new(
+                                        "anthropic",
+                                        serde_json::json!({ "schema_version": 2, "blocks": blocks }),
+                                    );
+                                    if unverified_relay
+                                        && crate::continuation::retention(&state)
+                                            != crate::continuation::Retention::Ordinary
+                                    {
+                                        state.payload["api_profile"] =
+                                            serde_json::json!("unverified-relay");
+                                    }
+                                    if let Err(error) = crate::continuation::bind_prefix(
+                                        &mut state,
+                                        &replay_model,
+                                        &replay_authority,
+                                        &prefix_body,
+                                    ) {
+                                        let _ = tx.send(Err(error)).await;
+                                        return;
+                                    }
                                     if tx
-                                        .send(Ok(StreamChunk::provider_replay_state(
-                                            ProviderReplayState::new(
-                                                "anthropic",
-                                                serde_json::json!({ "schema_version": 2, "blocks": blocks }),
-                                            ),
-                                        )))
+                                        .send(Ok(StreamChunk::provider_replay_state(state)))
                                         .await
                                         .is_err()
                                     {
@@ -1086,6 +1139,123 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
 
 #[cfg(test)]
 mod tests {
+    // Synthetic signatures exercise our policy, never vendor cryptography.
+    #[test]
+    fn production_native_body_enforces_durable_prefix_and_instance_authority() {
+        use super::super::history_test_support::request;
+        let provider = AnthropicProvider::new("test-key");
+        let mut req = request(vec![ChatMessage::user("first")]);
+        req.model = "claude-sonnet-5-5".into();
+        req.compiled_prompt = Some(CompiledPromptPayload {
+            stable_system_text: "rules".into(),
+            dynamic_system_text: "time=one".into(),
+            boundary_marker: "boundary".into(),
+            full_system_text: "rules\ntime=one".into(),
+        });
+        req.tools = Some(vec![crate::ToolDefinition {
+            name: "read".into(),
+            description: "read".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }]);
+        let build = |p: &AnthropicProvider, r: &ChatRequest| {
+            let prepared = prepare_messages_for_provider_model(
+                p.name(),
+                &r.model,
+                &p.capabilities(),
+                &r.rendered_messages_with_compiled_prompt(),
+            )?;
+            p.build_native_request(r, &prepared, false)
+                .map(|body| serde_json::to_value(body).unwrap())
+        };
+        let sent = build(&provider, &req).unwrap();
+        let response: ApiChatResponse = serde_json::from_value(serde_json::json!({
+            "id":"response", "content":[{"type":"thinking","thinking":"reason","signature":"synthetic"},{"type":"redacted_thinking","data":"opaque"},{"type":"text","text":"answer"}],
+            "stop_reason":"end_turn", "usage":{"input_tokens":1,"output_tokens":1}
+        })).unwrap();
+        let decoded = AnthropicProvider::decode_response(response).unwrap();
+        let mut state = decoded.provider_replay_state.unwrap();
+        crate::continuation::bind_prefix(&mut state, &req.model, &provider.replay_authority, &sent)
+            .unwrap();
+        let mut answer = ChatMessage::assistant("answer");
+        answer.provider_replay_state = Some(state);
+        complete(&mut answer);
+        // Exactly the durable roundtrip used by cold history, retaining proof.
+        let answer: ChatMessage =
+            serde_json::from_value(serde_json::to_value(answer).unwrap()).unwrap();
+        req.messages.push(answer.clone());
+        req.messages
+            .push(ChatMessage::user("next normal user turn"));
+        assert!(build(&provider, &req).is_ok());
+        for change in 0..5 {
+            let mut changed = req.clone();
+            match change {
+                0 => changed
+                    .compiled_prompt
+                    .as_mut()
+                    .unwrap()
+                    .full_system_text
+                    .push_str("timestamp refresh"),
+                1 => {
+                    changed.compiled_prompt.as_mut().unwrap().full_system_text =
+                        "new instructions".into()
+                }
+                2 => {
+                    changed.tools.as_mut().unwrap()[0].parameters =
+                        serde_json::json!({"type":"object","required":["path"]})
+                }
+                3 => changed.messages[0].content = "rewritten prefix".into(),
+                _ => {
+                    changed.messages[1]
+                        .provider_replay_state
+                        .as_mut()
+                        .unwrap()
+                        .payload
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("prefix_proof");
+                }
+            }
+            assert!(
+                build(&provider, &changed).is_err(),
+                "changed timestamp/system/tools/retry/legacy {change}"
+            );
+        }
+        let restarted = AnthropicProvider::new("test-key");
+        assert!(
+            build(&restarted, &req).is_err(),
+            "restart/fork has no verified account authority"
+        );
+        let mut foreign = req.clone();
+        foreign.model = "claude-opus-4-6".into();
+        assert!(
+            build(&provider, &foreign).is_ok(),
+            "completed foreign-model state is projected as portable history"
+        );
+        assert!(
+            answer
+                .provider_replay_state
+                .unwrap()
+                .payload
+                .get("prefix_proof")
+                .is_some()
+        );
+        let mut unbound = req.clone();
+        unbound.model = "claude-opus-4-6".into();
+        let state = unbound.messages[1].provider_replay_state.as_mut().unwrap();
+        state.model = Some(unbound.model.clone());
+        state
+            .payload
+            .as_object_mut()
+            .unwrap()
+            .remove("prefix_proof");
+        unbound.compiled_prompt.as_mut().unwrap().full_system_text =
+            "changed unbound profile".into();
+        assert!(
+            build(&provider, &unbound).is_ok(),
+            "documented old generation does not bind prefix"
+        );
+    }
+
     #[test]
     fn full_native_response_survives_storage_and_replays_without_regrouping() {
         let response: ApiChatResponse = serde_json::from_str(include_str!(
