@@ -304,21 +304,15 @@ fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8>
     hmac_sha256(&k_service, b"aws4_request")
 }
 
-/// Build an AWS SigV4 `Authorization` header value.
-///
-/// Returns `(authorization_header_value, amz_date)`.
-fn sign_request(
+/// The exact request used by the signer, separately inspectable from the
+/// transmitted URL. Keep this single construction path for all operations.
+fn canonical_request(
     method: &str,
     url: &Url,
     body: &[u8],
-    access_key_id: &str,
-    secret_access_key: &str,
     session_token: Option<&str>,
-    region: &str,
-    service: &str,
-    datetime: &str, // e.g. "20260319T120000Z"
-) -> String {
-    let date = &datetime[..8]; // "20260319"
+    datetime: &str,
+) -> (String, String) {
     let host = url.host_str().unwrap_or_default();
     // AWS's non-S3 default signs a second URI encoding of the escaped path.
     // Preserve separators while encoding the percent bytes in model IDs/ARNs.
@@ -358,7 +352,24 @@ fn sign_request(
     let canonical_request = format!(
         "{method}\n{path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
     );
+    (canonical_request, signed_headers)
+}
 
+/// Build an AWS SigV4 `Authorization` header value.
+fn sign_request(
+    method: &str,
+    url: &Url,
+    body: &[u8],
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: Option<&str>,
+    region: &str,
+    service: &str,
+    datetime: &str, // e.g. "20260319T120000Z"
+) -> String {
+    let date = &datetime[..8];
+    let (canonical_request, signed_headers) =
+        canonical_request(method, url, body, session_token, datetime);
     let scope = format!("{date}/{region}/{service}/aws4_request");
     let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
 
@@ -411,12 +422,21 @@ impl BedrockProvider {
         if session.is_some_and(|token| token.trim().is_empty()) {
             anyhow::bail!("AWS_SESSION_TOKEN must be nonempty when supplied");
         }
-        if region.is_empty()
+        // AWS Bedrock bindRegion uses Smithy's host-label validation. Retain
+        // this adapter's lowercase region contract; require one DNS label,
+        // 1..=63 ASCII bytes, with alphanumeric boundaries, not a region list.
+        // https://github.com/aws/smithy-go/blob/9b28af0b8afffb9debb149a07df6fc40edc6e529/endpoints/private/rulesfn/uri.go
+        // https://github.com/aws/smithy-go/blob/9b28af0b8afffb9debb149a07df6fc40edc6e529/transport/http/host.go
+        if !(1..=63).contains(&region.len())
+            || region.starts_with('-')
+            || region.ends_with('-')
             || !region
                 .bytes()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
         {
-            anyhow::bail!("Bedrock requires a valid AWS region");
+            anyhow::bail!(
+                "Bedrock requires an AWS region that is a lowercase DNS label (1-63 bytes, alphanumeric start/end)"
+            );
         }
         Ok(())
     }
@@ -1195,6 +1215,10 @@ fn provider_model_from_bedrock_model_summary(m: BedrockModelSummary) -> Provider
 }
 
 #[cfg(test)]
+#[path = "bedrock_signing_tests.rs"]
+mod signing_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn usage_normalization_requires_complete_separate_cache_counters() {
@@ -1224,6 +1248,198 @@ mod tests {
     fn bedrock_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    // Restore every AWS connection input even when an assertion panics, while
+    // holding the same lock as the pre-existing environment tests.
+    struct BedrockTestEnvironment {
+        saved: [(&'static str, Option<std::ffi::OsString>); 5],
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl BedrockTestEnvironment {
+        fn new() -> Self {
+            let lock = bedrock_env_lock()
+                .lock()
+                .expect("bedrock env lock poisoned");
+            let saved = [
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "AWS_REGION",
+                "AWS_DEFAULT_REGION",
+            ]
+            .map(|name| (name, std::env::var_os(name)));
+            Self { saved, _lock: lock }
+        }
+
+        fn set(&self, name: &str, value: Option<&str>) {
+            assert!(self.saved.iter().any(|(saved, _)| *saved == name));
+            // SAFETY: test-only AWS mutations are serialized by bedrock_env_lock.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    impl Drop for BedrockTestEnvironment {
+        fn drop(&mut self) {
+            // SAFETY: the environment lock remains held until restoration ends.
+            unsafe {
+                for (name, value) in &self.saved {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bedrock_region_requires_one_bounded_dns_label() {
+        for region in [
+            "",
+            "-",
+            "-us-east-1",
+            "us-east-1-",
+            "region.invalid",
+            "us_east_1",
+            &"a".repeat(64),
+        ] {
+            let error = BedrockProvider::validate_connection_values(
+                "dummy-access",
+                "dummy-secret",
+                Some("dummy-session"),
+                region,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("DNS label"));
+            assert!(!error.to_string().contains("dummy"));
+        }
+        // A label bound, not an allowlist of regions currently offered by AWS.
+        for region in [
+            "us-east-1",
+            "us-gov-west-1",
+            "cn-north-1",
+            "a",
+            &"a".repeat(63),
+        ] {
+            assert!(
+                BedrockProvider::validate_connection_values(
+                    "dummy-access",
+                    "dummy-secret",
+                    Some("dummy-session"),
+                    region,
+                )
+                .is_ok(),
+                "{region}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_bedrock_regions_fail_lifecycle_before_network() {
+        for region in [
+            "-",
+            "-us-east-1",
+            "us-east-1-",
+            "region.invalid",
+            &"a".repeat(64),
+        ] {
+            let provider = BedrockProvider::new("dummy-access", "dummy-secret", region);
+            let request = ChatRequest {
+                model: "model:0".into(),
+                messages: vec![ChatMessage::user("dummy")],
+                temperature: None,
+                max_tokens: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                compiled_prompt: None,
+            };
+            for error in [
+                provider.list_models().await.unwrap_err(),
+                provider.warmup().await.unwrap_err(),
+                provider.chat(request.clone()).await.unwrap_err(),
+            ] {
+                assert!(error.to_string().contains("DNS label"));
+            }
+            let error = match provider.stream_chat(request).await {
+                Err(error) => error,
+                Ok(_) => panic!("invalid region must fail before stream setup"),
+            };
+            assert!(error.to_string().contains("DNS label"));
+        }
+    }
+
+    #[test]
+    fn bedrock_region_environment_availability_and_validation_agree() {
+        let env = BedrockTestEnvironment::new();
+        env.set("AWS_ACCESS_KEY_ID", Some("dummy-access"));
+        env.set("AWS_SECRET_ACCESS_KEY", Some("dummy-secret"));
+        env.set("AWS_SESSION_TOKEN", Some("dummy-session"));
+        env.set("AWS_DEFAULT_REGION", Some("cn-north-1"));
+        let definition = crate::provider_definition("bedrock").unwrap();
+        for (region, valid) in [
+            ("-", false),
+            ("-us-east-1", false),
+            ("us-east-1-", false),
+            ("region.invalid", false),
+            (&"a".repeat(64), false),
+            ("us-east-1", true),
+            ("us-gov-west-1", true),
+            ("cn-north-1", true),
+        ] {
+            env.set("AWS_REGION", Some(region));
+            assert_eq!(
+                BedrockProvider::environment_is_configured(),
+                valid,
+                "{region}"
+            );
+            assert_eq!(
+                crate::provider_is_available(true, true, true, definition),
+                valid,
+                "{region}"
+            );
+            let provider = BedrockProvider::from_env();
+            assert_eq!(provider.is_ok(), valid, "{region}");
+            assert_eq!(
+                BedrockProvider::new("dummy-access", "dummy-secret", region)
+                    .validate_connection()
+                    .is_ok(),
+                valid
+            );
+            if let Ok(provider) = provider {
+                assert_eq!(
+                    provider.region, region,
+                    "AWS_REGION must outrank the fallback"
+                );
+                assert_eq!(provider.session_token.as_deref(), Some("dummy-session"));
+            }
+        }
+        env.set("AWS_REGION", None);
+        assert_eq!(BedrockProvider::from_env().unwrap().region, "cn-north-1");
+        env.set("AWS_DEFAULT_REGION", Some("-"));
+        assert!(!BedrockProvider::environment_is_configured());
+        assert!(!crate::provider_is_available(
+            false, false, false, definition
+        ));
+        assert!(BedrockProvider::from_env().is_err());
+        env.set("AWS_DEFAULT_REGION", None);
+        assert_eq!(BedrockProvider::from_env().unwrap().region, "us-east-1");
+        assert!(BedrockProvider::environment_is_configured());
+        env.set("AWS_SESSION_TOKEN", Some(""));
+        assert!(!BedrockProvider::environment_is_configured());
+        env.set("AWS_SESSION_TOKEN", None);
+        assert!(BedrockProvider::environment_is_configured());
+        env.set("AWS_SECRET_ACCESS_KEY", None);
+        assert!(!BedrockProvider::environment_is_configured());
+        assert!(!crate::provider_is_available(true, true, true, definition));
     }
 
     fn prepared_for(messages: &[ChatMessage]) -> crate::attachments::PreparedProviderMessages {
@@ -1502,55 +1718,29 @@ mod tests {
 
     #[test]
     fn from_env_reads_variables() {
-        let _env_guard = bedrock_env_lock()
-            .lock()
-            .expect("bedrock env lock poisoned");
-        // Temporarily set env vars for test.
-        // SAFETY: test-only; these env vars are not used by other threads in tests.
-        unsafe {
-            std::env::set_var("AWS_ACCESS_KEY_ID", "env-akid");
-            std::env::set_var("AWS_SECRET_ACCESS_KEY", "env-secret");
-            std::env::set_var("AWS_SESSION_TOKEN", "env-token");
-            std::env::set_var("AWS_REGION", "ap-southeast-1");
-        }
-
+        let env = BedrockTestEnvironment::new();
+        env.set("AWS_ACCESS_KEY_ID", Some("env-akid"));
+        env.set("AWS_SECRET_ACCESS_KEY", Some("env-secret"));
+        env.set("AWS_SESSION_TOKEN", Some("env-token"));
+        env.set("AWS_REGION", Some("ap-southeast-1"));
         let provider = BedrockProvider::from_env().unwrap();
         assert_eq!(provider.access_key_id, "env-akid");
         assert_eq!(provider.secret_access_key, "env-secret");
         assert_eq!(provider.session_token.as_deref(), Some("env-token"));
         assert_eq!(provider.region, "ap-southeast-1");
-
-        // Clean up
-        unsafe {
-            std::env::remove_var("AWS_ACCESS_KEY_ID");
-            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-            std::env::remove_var("AWS_SESSION_TOKEN");
-            std::env::remove_var("AWS_REGION");
-        }
     }
 
     #[test]
     fn from_env_defaults_region() {
-        let _env_guard = bedrock_env_lock()
-            .lock()
-            .expect("bedrock env lock poisoned");
-        // SAFETY: test-only; these env vars are not used by other threads in tests.
-        unsafe {
-            std::env::set_var("AWS_ACCESS_KEY_ID", "akid");
-            std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
-            std::env::remove_var("AWS_SESSION_TOKEN");
-            std::env::remove_var("AWS_REGION");
-            std::env::remove_var("AWS_DEFAULT_REGION");
-        }
-
+        let env = BedrockTestEnvironment::new();
+        env.set("AWS_ACCESS_KEY_ID", Some("akid"));
+        env.set("AWS_SECRET_ACCESS_KEY", Some("secret"));
+        env.set("AWS_SESSION_TOKEN", None);
+        env.set("AWS_REGION", None);
+        env.set("AWS_DEFAULT_REGION", None);
         let provider = BedrockProvider::from_env().unwrap();
         assert_eq!(provider.region, "us-east-1");
         assert!(provider.session_token.is_none());
-
-        unsafe {
-            std::env::remove_var("AWS_ACCESS_KEY_ID");
-            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-        }
     }
 
     #[test]

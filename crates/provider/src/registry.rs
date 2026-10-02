@@ -1142,6 +1142,67 @@ mod tests {
     }
 
     #[test]
+    fn glm_profiles_and_aliases_keep_native_file_tools_after_factory_and_registry() {
+        let registry = ProviderRegistry::new(|_| "dummy-key".to_owned());
+        for alias in [
+            "glm",
+            "zhipu",
+            "bigmodel",
+            "glm-cn",
+            "zhipu-cn",
+            "zai",
+            "glm-global",
+            "zhipu-global",
+            "z.ai",
+            "z-ai",
+            "glm-coding",
+            "glm-coding-cn",
+            "zhipu-coding",
+            "zai-coding-cn",
+            "zai-coding",
+            "glm-coding-global",
+            "zai-coding-plan",
+        ] {
+            let canonical = crate::definition::provider_definition(alias).unwrap().name;
+            let direct = crate::factory::create_provider(alias, "dummy-key").unwrap();
+            let scoped = registry
+                .get_or_create_for_workspace("fixture", alias)
+                .unwrap();
+            for provider in [direct.as_ref(), scoped.as_ref()] {
+                assert_eq!(provider.name(), canonical, "{alias}");
+                assert!(provider.capabilities().tool_calling, "{alias}");
+                let capability = provider.native_file_tool_capability("glm-5.2");
+                assert_eq!(capability.provider, canonical, "{alias}");
+                assert_eq!(capability.model, "glm-5.2");
+                assert_eq!(
+                    capability.patch_shape,
+                    crate::NativePatchWireShape::JsonFunction
+                );
+                assert!(capability.read_file && capability.apply_patch, "{alias}");
+                assert!(capability.is_supported());
+                let schema = crate::apply_patch_tool_schema(capability.patch_shape);
+                assert_eq!(schema["type"], "object");
+                assert_eq!(schema["required"], serde_json::json!(["patch"]));
+                assert_eq!(schema["properties"]["patch"]["type"], "string");
+                assert_eq!(schema["additionalProperties"], false);
+                for missing in ["", " ", "unknown", "unsupported"] {
+                    let unavailable = provider.native_file_tool_capability(missing);
+                    assert_eq!(unavailable.provider, canonical);
+                    assert_eq!(
+                        unavailable.patch_shape,
+                        crate::NativePatchWireShape::Unavailable
+                    );
+                    assert!(!unavailable.read_file && !unavailable.apply_patch);
+                }
+            }
+            assert!(scoped.authority_fingerprint().is_some());
+        }
+        assert!(crate::factory::create_provider("unknown-glm-profile", "dummy-key").is_err());
+        let unknown = crate::select_native_file_tool_capability("unknown-glm-profile", "glm-5.2");
+        assert!(!unknown.read_file && !unknown.apply_patch);
+    }
+
+    #[test]
     fn glm_global_and_coding_profiles_resolve_separate_credential_authorities() {
         let names = Arc::new(Mutex::new(Vec::new()));
         let captured = names.clone();
