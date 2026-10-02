@@ -261,6 +261,26 @@ async fn oauth_queue_cancellation_impl(
         .await
         .expect("enabled queue must be Ready before the targeted stale-event barrier");
     } else {
+        // Install responds before its runtime reload finishes. Observe the
+        // disabled projection without assuming that the snapshot exists yet.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if processor
+                    .mcp_service
+                    .runtime_snapshot("workspace", &workspace_id)
+                    .await
+                    .get(&server_id)
+                    .is_some_and(|snapshot| {
+                        snapshot.state == pioneer_mcp::McpRuntimeState::Disabled
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("disabled installation must finish runtime reconciliation");
         assert_eq!(
             processor
                 .mcp_service
@@ -1220,7 +1240,21 @@ async fn oauth_scope_phase(phase: &'static str) {
             loop {
                 let frame = recipient.recv().await.unwrap();
                 if let axum::extract::ws::Message::Text(text) = frame {
-                    if text.contains("controlled_refresh_failure") {
+                    let notification: Value = serde_json::from_str(&text).unwrap();
+                    if notification["method"]
+                        == pioneer_protocol::constants::events::MCP_SERVER_STATUS_CHANGED
+                        && notification["params"]["server"]["id"] == id
+                        && notification["params"]["server"]["runtime"]["state"] == "degraded"
+                    {
+                        let snapshot = processor
+                            .mcp_service
+                            .runtime_snapshot("workspace", &workspace_id)
+                            .await[id]
+                            .clone();
+                        assert_eq!(
+                            snapshot.last_error.as_deref(),
+                            Some("controlled_refresh_failure")
+                        );
                         break;
                     }
                 }
@@ -1693,6 +1727,24 @@ async fn stale_rpc_replacement(
     current_socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0","id":"current-callback_____","method":"mcp/oauth","params":{"workspace_id":workspace,"server_id":id,"name":"queue","action":{"kind":"callback","flow_id":fresh["flow_id"],"state":state,"issuer":issuer,"code":"current-code"}}}).to_string().into())).await.unwrap();
     await_oauth_wire_response(&mut current_socket, "current-callback_____").await;
     token_release.notify_one();
+    // The fake MCP connector can be Ready before OAuth persistence completes.
+    // Callback acceptance and a runtime generation are not durable sign-in.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let ClientMessage::Text(text) = current_socket.next().await.unwrap().unwrap() {
+                let notification: Value = serde_json::from_str(&text).unwrap();
+                if notification["method"] == pioneer_protocol::constants::events::MCP_OAUTH_CHANGED
+                    && notification["params"]["flow_id"] == fresh["flow_id"]
+                    && notification["params"]["server_id"] == id
+                    && notification["params"]["state"] == "authorized"
+                {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("current consent must durably authorize before releasing the stale RPC");
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let snapshot = processor
