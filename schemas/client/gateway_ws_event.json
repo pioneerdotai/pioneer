@@ -3539,6 +3539,22 @@
             "kind",
             "params"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "mcp_o_auth_changed"
+            },
+            "params": {
+              "$ref": "#/$defs/McpOAuthNotification"
+            }
+          },
+          "required": [
+            "kind",
+            "params"
+          ]
         }
       ]
     },
@@ -14437,6 +14453,71 @@
       "required": [
         "revision",
         "workspace_id"
+      ]
+    },
+    "McpOAuthNotification": {
+      "type": "object",
+      "properties": {
+        "authorization_url": {
+          "description": "Authorization URLs contain ephemeral state. Debug must redact them.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diagnostic": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "flow_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "scope_kind": {
+          "$ref": "#/$defs/McpScopeKind"
+        },
+        "server_id": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/McpOAuthState"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "server_id",
+        "name",
+        "scope_kind",
+        "state"
+      ]
+    },
+    "McpOAuthState": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "preparing",
+        "awaiting_callback",
+        "exchanging",
+        "resolving",
+        "retired",
+        "cleanup_required",
+        "authorized",
+        "auth_required",
+        "insufficient_scope",
+        "denied",
+        "cancelled",
+        "timed_out",
+        "failed"
       ]
     }
   }

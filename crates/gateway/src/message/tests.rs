@@ -1,3 +1,9 @@
+#[path = "tests/task_run_occurrence_tracker.rs"]
+mod task_run_occurrence_tracker;
+
+#[path = "tests/mcp_oauth_rpc_queue.rs"]
+mod mcp_oauth_rpc_queue;
+
 #[path = "tests/memory_post_turn_response.rs"]
 mod memory_post_turn_response;
 
@@ -19907,7 +19913,8 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         processor
             .reconcile_terminal_task_run_occurrence_turns(10)
             .await
-            .expect("terminal occurrence reconciliation should succeed"),
+            .expect("terminal occurrence reconciliation should succeed")
+            .changed,
         0,
         "live task-event projection should already terminalize the occurrence"
     );
@@ -19919,7 +19926,8 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         processor
             .reconcile_terminal_task_run_occurrence_turns(10)
             .await
-            .expect("terminal occurrence reconciliation should succeed"),
+            .expect("terminal occurrence reconciliation should succeed")
+            .changed,
         0,
         "delivery must not own parent occurrence terminalization"
     );
@@ -19927,7 +19935,8 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         processor
             .reconcile_terminal_task_run_occurrence_turns(10)
             .await
-            .expect("idempotent terminal occurrence reconciliation should succeed"),
+            .expect("idempotent terminal occurrence reconciliation should succeed")
+            .changed,
         0,
         "an already repaired occurrence must not be counted or polled again"
     );
@@ -26291,6 +26300,18 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
         } else {
             processor.clone()
         };
+        // Next-turn admission requires a loaded thread. Explicitly reopen the
+        // persisted thread through the authorized path in every cleanup case
+        // before testing reuse of the same CLI runtime session and its lease.
+        open_persisted_child_for_test(
+            &next_processor,
+            connection,
+            &mut rx,
+            &workspace,
+            &thread,
+            &format!("pending-heartbeat-resume-{case}"),
+        )
+        .await;
         let next = format!("pending-heartbeat-next-{case}");
         let next_id = generate_test_request_id("pending-heartbeat-next", &next);
         let next_context = sessions.connection_context(connection).await.unwrap();

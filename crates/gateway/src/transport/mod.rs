@@ -11,3 +11,6 @@ pub(crate) use restricted::{
 };
 
 pub use server::spawn_server;
+
+#[cfg(test)]
+pub(crate) use server::run_normal_connection;

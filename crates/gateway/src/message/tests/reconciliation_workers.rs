@@ -201,7 +201,7 @@ async fn assert_native_kick_database_scope(terminal_effects: bool) {
     }
 }
 
-fn local_capture() -> (
+pub(super) fn local_capture() -> (
     Arc<sentry::Hub>,
     Arc<sentry::test::TestTransport>,
     tracing::Dispatch,
@@ -350,9 +350,9 @@ async fn real_complete_reconciliation_results_recover_only_their_reporter() {
         let result = background
             .reconcile_terminal_task_run_occurrence_turns(64)
             .await;
-        assert_eq!(result.as_ref().unwrap(), &0);
-        occurrence.observe(&result, now);
-        occurrence.observe(&result, now);
+        assert_eq!(result.as_ref().unwrap().changed, 0);
+        occurrence.observe_occurrences(&result, now);
+        occurrence.observe_occurrences(&result, now);
         tracing::error!("after occurrence success");
     }
     .with_subscriber(dispatch)

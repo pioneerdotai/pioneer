@@ -143,3 +143,20 @@ load_details_failed = "MCP サーバー詳細を読み込めませんでした: 
 policy_update_failed = "MCP ポリシーを更新できませんでした: %{error}"
 restart_failed = "MCP サーバーを再起動できませんでした: %{error}"
 uninstall_failed = "MCP サーバーをアンインストールできませんでした: %{error}"
+
+[mcp.oauth]
+callback_port_invalid = "コールバックポートの設定が無効です。desktop.mcp_oauth.callback_port を確認し、80 を除く 1～65535 の整数を指定してください。修正後に Desktop を再起動してください。"
+configuration_load_failed = "Desktop の設定を読み込めませんでした。設定ファイルを確認し、修正後に Desktop を再起動してください。"
+sign_in = "ログイン"
+disconnect = "アカウントを切断"
+open_link = "ログインページを開く"
+failed = "ログインに失敗しました。再試行してください。"
+browser_failed = "ブラウザを開けません。ログインリンクを使用してください。"
+callback_unavailable = "ログイン用のポートを使用できません。他のアプリを閉じ、このログインをキャンセルして再試行してください。"
+registration_required = "このプロバイダーには登録済みの OAuth クライアントが必要です。サーバー設定にクライアント ID を追加してください。"
+redirect_mismatch = "ログイン先のアドレスが保存済みのものと異なります。元のデバイスを使うか、アカウントを切断して再度ログインしてください。"
+recovering = "接続が一時的に利用できません。Pioneer が再試行します。"
+
+clear_sign_in = "ログインをリセット"
+prepare_failed = "ログインを準備できませんでした。コールバックのポートを使用しているアプリを閉じ、再度ログインしてください。"
+client_auth_unsupported = "このOAuthクライアントの認証方式はサポートされていません。登録設定を確認してください。"
