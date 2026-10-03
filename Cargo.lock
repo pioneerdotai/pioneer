@@ -9165,6 +9165,7 @@ dependencies = [
  "pioneer-runtime-events",
  "pioneer-skills",
  "pioneer-tools",
+ "sentry",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -9172,6 +9173,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
