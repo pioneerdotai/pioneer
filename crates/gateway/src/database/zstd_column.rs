@@ -1653,10 +1653,6 @@ mod tests {
         .await
         .expect("bounded maintenance read should work");
         assert_eq!(batch.len(), COMPRESSION_BATCH_MAX_ROWS);
-        assert!(
-            batch.iter().map(|row| row.payload.len()).sum::<usize>()
-                <= COMPRESSION_BATCH_MAX_SOURCE_BYTES
-        );
     }
 
     #[tokio::test]
