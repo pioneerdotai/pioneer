@@ -127,6 +127,18 @@ impl MessageProcessor {
             root_thread.model.as_str(),
             None,
         )?;
+        let contract = self
+            .crud_store
+            .get_task_actor_contract(task_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Agent Task actor contract is unavailable"))?;
+        let launch = contract
+            .launch
+            .ok_or_else(|| anyhow::anyhow!("Agent Task launch is unavailable"))?;
+        if !launch.execution.selected_capabilities.is_empty() {
+            request.capabilities =
+                super::agent_action_tools::task_launch_selection_capabilities(&launch.execution)?;
+        }
         request.capabilities = self
             .normalize_turn_skill_capabilities(
                 response.task.workspace_id.as_str(),
@@ -288,12 +300,13 @@ impl MessageProcessor {
                 else {
                     self.send_error(
                         request_context.connection_id(),
-                        crate::public_error::agent_rpc_error(
+                        crate::public_error::expected_agent_rpc_error(
                             Some(request_id.clone()),
                             INVALID_PARAMS_CODE,
                             pioneer_protocol::PublicErrorCode::InvalidInput,
                             pioneer_protocol::PublicErrorStage::Admission,
-                            "thread delivery requires delivery_policy.thread_id",
+                            "task_create",
+                            "invalid_delivery_policy",
                         ),
                     )
                     .await;
@@ -660,12 +673,13 @@ impl MessageProcessor {
                     Ok(_) => {
                         self.send_error(
                             connection_id,
-                            crate::public_error::agent_rpc_error(
+                            crate::public_error::expected_agent_rpc_error(
                                 Some(request_id),
                                 INVALID_REQUEST_CODE,
                                 pioneer_protocol::PublicErrorCode::NotFound,
                                 pioneer_protocol::PublicErrorStage::Admission,
-                                "task creator turn does not belong to the authorized initiating thread",
+                                "task_create",
+                                "creator_turn_scope_mismatch",
                             ),
                         )
                         .await;
@@ -723,7 +737,7 @@ impl MessageProcessor {
             .map(|proof| proof.collaboration_root_thread_id())
             .or(current_thread_id);
         if let Some(policy) = params.delivery_policy.as_mut()
-            && let Err(error) = crate::task_delivery_policy::resolve_task_delivery_policy(
+            && let Err(_error) = crate::task_delivery_policy::resolve_task_delivery_policy(
                 policy,
                 crate::task_delivery_policy::TaskDeliveryThreadContext {
                     current_thread_id,
@@ -734,12 +748,13 @@ impl MessageProcessor {
         {
             self.send_error(
                 connection_id,
-                crate::public_error::agent_rpc_error(
+                crate::public_error::expected_agent_rpc_error(
                     Some(request_id),
                     INVALID_PARAMS_CODE,
                     pioneer_protocol::PublicErrorCode::InvalidInput,
                     pioneer_protocol::PublicErrorStage::Admission,
-                    error,
+                    "task_create",
+                    "invalid_delivery_policy",
                 ),
             )
             .await;
@@ -766,12 +781,13 @@ impl MessageProcessor {
             else {
                 self.send_error(
                     connection_id,
-                    crate::public_error::agent_rpc_error(
+                    crate::public_error::expected_agent_rpc_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         pioneer_protocol::PublicErrorCode::InvalidInput,
                         pioneer_protocol::PublicErrorStage::Admission,
-                        "agent task requires an exact initiating thread",
+                        "task_create",
+                        "missing_initiating_thread",
                     ),
                 )
                 .await;
@@ -841,15 +857,16 @@ impl MessageProcessor {
                     None,
                 ) {
                     Ok(request) => request,
-                    Err(error) => {
+                    Err(_error) => {
                         self.send_error(
                             connection_id,
-                            crate::public_error::agent_rpc_error(
+                            crate::public_error::expected_agent_rpc_error(
                                 Some(request_id),
                                 INVALID_REQUEST_CODE,
                                 pioneer_protocol::PublicErrorCode::InvalidInput,
                                 pioneer_protocol::PublicErrorStage::Admission,
-                                format!("invalid task execution intent: {error}"),
+                                "task_create",
+                                "invalid_execution_intent",
                             ),
                         )
                         .await;

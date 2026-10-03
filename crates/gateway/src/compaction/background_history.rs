@@ -6,7 +6,7 @@ use pioneer_compaction::{
     CompactionMode, CompactionSettings, CoverageDomain, ModelBudget, ModelSelection, Transport,
     coverage_domain_for, effective_selection, plan_compaction,
 };
-use pioneer_crud::compaction::{HistoryCheckDiagnostic, HistoryCheckOutcome, ManifestEntry};
+use pioneer_crud::compaction::{HistoryCheckDiagnostic, HistoryCheckOutcome};
 use pioneer_provider::{ChatRequest, ReasoningConfig, ReasoningEffort};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -295,6 +295,7 @@ pub(crate) async fn prepare_completed_history_owned(
         .await?;
         super::history::normalize_task_input_copies(&store, workspace, &mut messages).await?;
         super::origins::validate_message_origins(&store, workspace, &messages).await?;
+        super::frozen::order_history_by_creation(&store, workspace, &mut messages).await?;
         diagnostic.stage = "target_configuration".into();
         let catalog = match current.transport {
             Transport::Codex => "openai-codex".to_owned(),
@@ -502,6 +503,7 @@ pub(crate) async fn prepare_completed_history_owned(
             fixed_input_tokens,
             &full.request.messages,
         ))?));
+        let manifest = super::admission::history_manifest(&full.request.messages, &layout, &plan)?;
         let projection = BackgroundHistoryTarget {
             projection: NativeRequestProjection::new(
                 full.request,
@@ -513,23 +515,6 @@ pub(crate) async fn prepare_completed_history_owned(
             budget,
             fixed_input_tokens,
         };
-        let mut manifest = Vec::new();
-        for (reference_only, units) in [(false, &plan.compact), (true, &plan.retain)] {
-            for unit in units {
-                for source in &layout.units[*unit].sources {
-                    let source_thread = layout.source_threads.get(source).ok_or_else(|| {
-                        anyhow::anyhow!("completed history source owner is missing")
-                    })?;
-                    manifest.push(ManifestEntry {
-                        ordinal: manifest.len() as u64,
-                        unit: *unit as u64,
-                        reference_only,
-                        thread_id: source_thread.clone(),
-                        source: source.clone(),
-                    });
-                }
-            }
-        }
         diagnostic.stage = "admission".into();
         let snapshot = admit_operation(
             &store,

@@ -800,6 +800,10 @@ pub struct AgentExecutionSelection {
     pub skill_ids: Vec<SkillId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_server_ids: Vec<String>,
+    /// Exact normalized capabilities for a durable Task launch. Legacy launches
+    /// use skill_ids and mcp_server_ids when this field is empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_capabilities: Vec<crate::TurnCapability>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -954,8 +958,89 @@ mod tests {
                 permission_profile: None,
                 skill_ids: Vec::new(),
                 mcp_server_ids: Vec::new(),
+                selected_capabilities: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn serialized_launch_capabilities_fit_the_closed_launch_schema() {
+        let mut launch = launch(AgentExecutionProfileSelection::InheritParent);
+        launch.execution.selected_capabilities = vec![crate::TurnCapability {
+            id: crate::mcp_tool_capability_key(crate::McpScopeKind::Workspace, "resend", "send"),
+            kind: crate::TurnCapabilityKind::McpTool {
+                server_name: "resend".to_owned(),
+                raw_tool_name: "send".to_owned(),
+                scope_kind: crate::McpScopeKind::Workspace,
+            },
+            label: None,
+        }];
+        let serialized = serde_json::to_value(&launch).expect("launch should serialize");
+        let schema = serde_json::to_value(schemars::schema_for!(AgentLaunchSelection))
+            .expect("launch schema should serialize");
+        let checked_in: Value =
+            serde_json::from_str(include_str!("../../../schemas/agent_launch_selection.json"))
+                .expect("checked-in launch schema should parse");
+        assert_eq!(
+            schema, checked_in,
+            "checked-in launch schema must be current"
+        );
+        let execution_document =
+            serde_json::to_value(schemars::schema_for!(AgentExecutionSelection)).unwrap();
+        let checked_in_execution: Value = serde_json::from_str(include_str!(
+            "../../../schemas/agent_execution_selection.json"
+        ))
+        .expect("checked-in execution schema should parse");
+        assert_eq!(execution_document, checked_in_execution);
+
+        let execution_schema = &schema["$defs"]["AgentExecutionSelection"];
+        assert_eq!(execution_schema["additionalProperties"], false);
+        for key in serialized["execution"]
+            .as_object()
+            .expect("serialized execution should be an object")
+            .keys()
+        {
+            assert!(
+                execution_schema["properties"].get(key).is_some(),
+                "serialized execution field `{key}` is absent from its closed schema"
+            );
+        }
+        assert_eq!(
+            execution_schema["properties"]["selectedCapabilities"]["items"]["$ref"],
+            "#/$defs/TurnCapability"
+        );
+        let capability = &serialized["execution"]["selectedCapabilities"][0];
+        for key in capability
+            .as_object()
+            .expect("capability should be an object")
+            .keys()
+        {
+            assert!(
+                schema["$defs"]["TurnCapability"]["properties"]
+                    .get(key)
+                    .is_some()
+            );
+        }
+        let kind = &capability["kind"];
+        assert!(
+            schema["$defs"]["TurnCapabilityKind"]["oneOf"]
+                .as_array()
+                .expect("capability kind variants")
+                .iter()
+                .any(
+                    |variant| variant["properties"]["type"]["const"] == kind["type"]
+                        && kind
+                            .as_object()
+                            .expect("capability kind should be an object")
+                            .keys()
+                            .all(|key| variant["properties"].get(key).is_some())
+                )
+        );
+        assert_eq!(kind["type"], "mcpTool");
+        assert_eq!(
+            serde_json::from_value::<AgentLaunchSelection>(serialized).unwrap(),
+            launch
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! this module cannot infer coverage from summary text or a turn count.
 use super::history::NativeHistoryLayout;
 use anyhow::{Result, ensure};
-use pioneer_compaction::{SourceRef, SourceRole};
+use pioneer_compaction::{CoverageDomain, SourceRef, SourceRole};
 use pioneer_provider::{ChatMessage, MessageSourceAlias, MessageSourceIdentity, MessageSourceRef};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,6 +20,7 @@ pub struct AcceptedContextBranch<'a> {
     /// versions identify publication-time records rather than today's rows.
     /// No entry means unknown coverage, never an empty summary.
     pub checkpoints: &'a BTreeMap<ScopedHistorySource, BTreeSet<ScopedHistorySource>>,
+    pub checkpoint_domains: &'a BTreeMap<ScopedHistorySource, CoverageDomain>,
 }
 
 struct Unit {
@@ -29,6 +30,7 @@ struct Unit {
     input_aliases: ExactInputClaims,
     own: bool,
     checkpoint: bool,
+    checkpoint_domain: Option<CoverageDomain>,
 }
 
 pub type ExactMessageSource = (String, MessageSourceRef);
@@ -75,6 +77,17 @@ impl ExactInputClaims {
         );
     }
 
+    fn proves(&self, copy: &ExactMessageSource, owner: &ExactMessageSource) -> bool {
+        !self.ambiguous.contains(copy)
+            && copy.1.scope.starts_with("input:")
+            && owner.1.scope.starts_with("input:")
+            && copy.1.version == owner.1.version
+            && self
+                .owners
+                .get(copy)
+                .is_some_and(|owners| owners.len() == 1 && owners.contains(owner))
+    }
+
     pub fn aliases(&self) -> Vec<MessageSourceAlias> {
         self.owners
             .iter()
@@ -98,6 +111,83 @@ impl ExactInputClaims {
             })
             .collect()
     }
+}
+
+fn exact_input(source: &ScopedHistorySource) -> ExactMessageSource {
+    (
+        source.thread.clone(),
+        MessageSourceRef {
+            scope: source.source.scope.clone(),
+            id: source.source.id.clone(),
+            version: source.source.version.clone(),
+        },
+    )
+}
+
+pub fn summary_covers(
+    covering: &BTreeSet<ScopedHistorySource>,
+    covered: &BTreeSet<ScopedHistorySource>,
+    claims: &ExactInputClaims,
+) -> bool {
+    covered.is_subset(&summary_comparison_leaves(covering, claims))
+}
+
+pub fn summary_comparison_leaves(
+    covering: &BTreeSet<ScopedHistorySource>,
+    claims: &ExactInputClaims,
+) -> BTreeSet<ScopedHistorySource> {
+    // This is an in-memory admission view; stored checkpoint coverage stays exact.
+    let scoped = |source: &ExactMessageSource| ScopedHistorySource {
+        thread: source.0.clone(),
+        source: SourceRef {
+            scope: source.1.scope.clone(),
+            id: source.1.id.clone(),
+            version: source.1.version.clone(),
+        },
+    };
+    let mut edges = Vec::new();
+    for (copy, owners) in &claims.owners {
+        let Some(owner) = owners.iter().next() else {
+            continue;
+        };
+        if claims.proves(copy, owner) {
+            edges.push((scoped(copy), scoped(owner)));
+        }
+    }
+    let mut comparable = covering.clone();
+    loop {
+        let previous_len = comparable.len();
+        for (copy, owner) in &edges {
+            if comparable.contains(copy) {
+                comparable.insert(owner.clone());
+            }
+            if comparable.contains(owner) {
+                comparable.insert(copy.clone());
+            }
+        }
+        if comparable.len() == previous_len {
+            break;
+        }
+    }
+    comparable
+}
+
+pub fn summary_copy_preference(
+    leaves: &BTreeSet<ScopedHistorySource>,
+    claims: &ExactInputClaims,
+) -> usize {
+    leaves
+        .iter()
+        .filter(|leaf| {
+            let copy = exact_input(leaf);
+            claims.owners.get(&copy).is_some_and(|owners| {
+                owners
+                    .iter()
+                    .next()
+                    .is_some_and(|owner| claims.proves(&copy, owner))
+            })
+        })
+        .count()
 }
 
 fn collect_raw_source_aliases(
@@ -380,9 +470,35 @@ pub fn compose_context(
                 input_aliases.mark_competing_owners();
                 apply_raw_source_aliases(&mut incoming_messages, &input_aliases)?;
             }
+            let checkpoint_sources = unit
+                .sources
+                .iter()
+                .filter(|source| source.scope.starts_with("checkpoint:"))
+                .collect::<Vec<_>>();
+            let checkpoint_domain =
+                if let [source] = checkpoint_sources.as_slice() {
+                    let scoped = ScopedHistorySource {
+                        thread: layout.source_threads[*source].clone(),
+                        source: (*source).clone(),
+                    };
+                    Some(*branch.checkpoint_domains.get(&scoped).ok_or_else(|| {
+                        anyhow::anyhow!("checkpoint coverage domain is unavailable")
+                    })?)
+                } else {
+                    None
+                };
             let mut duplicate = None;
             let mut replaced = Vec::new();
             for (index, previous) in units.iter().enumerate() {
+                if checkpoint
+                    && previous.checkpoint
+                    && (checkpoint_domain.is_none()
+                        || checkpoint_domain != previous.checkpoint_domain
+                        || (!previous.leaves.is_subset(&leaves)
+                            && !leaves.is_subset(&previous.leaves)))
+                {
+                    continue;
+                }
                 if previous.identities.is_disjoint(&identities) {
                     continue;
                 }
@@ -440,6 +556,7 @@ pub fn compose_context(
                     input_aliases,
                     own,
                     checkpoint,
+                    checkpoint_domain,
                 };
                 if unit.checkpoint {
                     apply_checkpoint_aliases(&mut unit)?;
@@ -449,8 +566,88 @@ pub fn compose_context(
         }
         branch_offset += branch.messages.len();
     }
+    let mut claims = ExactInputClaims::default();
+    for unit in &units {
+        claims.merge(unit.input_aliases.clone());
+    }
+    let mut keep = vec![true; units.len()];
+    for left in 0..units.len() {
+        if !keep[left] || !units[left].checkpoint {
+            continue;
+        }
+        for right in left + 1..units.len() {
+            if !keep[right]
+                || !units[right].checkpoint
+                || units[left].checkpoint_domain.is_none()
+                || units[left].checkpoint_domain != units[right].checkpoint_domain
+            {
+                continue;
+            }
+            let left_covers = summary_covers(&units[left].leaves, &units[right].leaves, &claims);
+            let right_covers = summary_covers(&units[right].leaves, &units[left].leaves, &claims);
+            match (left_covers, right_covers) {
+                (true, false) => keep[right] = false,
+                (false, true) => {
+                    keep[left] = false;
+                    break;
+                }
+                (true, true) => {
+                    if summary_copy_preference(&units[left].leaves, &claims)
+                        >= summary_copy_preference(&units[right].leaves, &claims)
+                    {
+                        keep[right] = false;
+                    } else {
+                        keep[left] = false;
+                        break;
+                    }
+                }
+                (false, false) => {}
+            }
+        }
+    }
+    // A removed summary can be the only carrier of one side of a competing
+    // input claim. Keep that conflict on the summary which covered it, even
+    // when an independent copy was sufficient to remove the old summary.
+    let mut transferred_conflicts = BTreeMap::<usize, BTreeSet<ExactMessageSource>>::new();
+    for (index, unit) in units.iter().enumerate() {
+        if keep[index] || !unit.checkpoint {
+            continue;
+        }
+        let conflicts = unit
+            .input_aliases
+            .owners
+            .keys()
+            .chain(&unit.input_aliases.ambiguous)
+            .filter(|copy| claims.ambiguous.contains(*copy))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if conflicts.is_empty() {
+            continue;
+        }
+        let survivor = units
+            .iter()
+            .enumerate()
+            .find(|(other, candidate)| {
+                keep[*other]
+                    && candidate.checkpoint_domain == unit.checkpoint_domain
+                    && summary_covers(&candidate.leaves, &unit.leaves, &claims)
+            })
+            .map(|(other, _)| other)
+            .ok_or_else(|| anyhow::anyhow!("removed summary lost its covering checkpoint"))?;
+        transferred_conflicts
+            .entry(survivor)
+            .or_default()
+            .extend(conflicts);
+    }
+    for (index, conflicts) in transferred_conflicts {
+        units[index].input_aliases.ambiguous.extend(conflicts);
+        apply_checkpoint_aliases(&mut units[index])?;
+    }
     let mut messages = Vec::new();
-    for unit in units {
+    for (unit, keep) in units.into_iter().zip(keep) {
+        if !keep {
+            continue;
+        }
         for (index, mut message) in unit.messages {
             let origin = message
                 .provenance
@@ -469,6 +666,16 @@ pub fn compose_context(
 mod tests {
     use super::*;
     use pioneer_provider::{MessageProvenance, MessageSourceAlias, MessageSourceRef};
+
+    fn test_domains(
+        checkpoints: &BTreeMap<ScopedHistorySource, BTreeSet<ScopedHistorySource>>,
+    ) -> BTreeMap<ScopedHistorySource, CoverageDomain> {
+        checkpoints
+            .keys()
+            .cloned()
+            .map(|source| (source, CoverageDomain::WorkingContext))
+            .collect()
+    }
 
     fn input_source(turn: &str, id: &str, revision: u64) -> MessageSourceRef {
         MessageSourceRef {
@@ -498,6 +705,79 @@ mod tests {
             inherited,
         });
         message
+    }
+
+    fn summary_leaf(id: &str) -> ScopedHistorySource {
+        ScopedHistorySource {
+            thread: "parent".into(),
+            source: SourceRef {
+                scope: "input:turn".into(),
+                id: id.into(),
+                version: "input-revision:1".into(),
+            },
+        }
+    }
+
+    fn test_summary(id: &str, aliases: &[(&str, &str)]) -> ChatMessage {
+        let mut summary = message("parent", id, true);
+        let origin = summary.provenance.as_mut().unwrap();
+        origin.sources[0].scope = "checkpoint:owner".into();
+        origin.source_aliases = aliases
+            .iter()
+            .map(|(copy, owner)| MessageSourceAlias {
+                represented_thread_id: "parent".into(),
+                represented_source: input_source("turn", owner, 1),
+                thread_id: "parent".into(),
+                source: input_source("turn", copy, 1),
+            })
+            .collect();
+        summary
+    }
+
+    fn summary_closure(
+        summary: &ChatMessage,
+        leaves: &[&str],
+    ) -> BTreeMap<ScopedHistorySource, BTreeSet<ScopedHistorySource>> {
+        let origin = summary.provenance.as_ref().unwrap();
+        let source = &origin.sources[0];
+        BTreeMap::from([(
+            ScopedHistorySource {
+                thread: origin.thread_id.clone(),
+                source: SourceRef {
+                    scope: source.scope.clone(),
+                    id: source.id.clone(),
+                    version: source.version.clone(),
+                },
+            },
+            leaves.iter().map(|id| summary_leaf(id)).collect(),
+        )])
+    }
+
+    fn compose_summaries(items: &[(&ChatMessage, &[&str], CoverageDomain)]) -> Vec<ChatMessage> {
+        let messages = items
+            .iter()
+            .map(|(summary, _, _)| vec![(*summary).clone()])
+            .collect::<Vec<_>>();
+        let closures = items
+            .iter()
+            .map(|(summary, leaves, _)| summary_closure(summary, leaves))
+            .collect::<Vec<_>>();
+        let domains = items
+            .iter()
+            .zip(&closures)
+            .map(|((_, _, domain), closure)| {
+                closure.keys().cloned().map(|key| (key, *domain)).collect()
+            })
+            .collect::<Vec<BTreeMap<_, _>>>();
+        let branches = (0..items.len())
+            .map(|index| AcceptedContextBranch {
+                thread: "parent",
+                messages: &messages[index],
+                checkpoints: &closures[index],
+                checkpoint_domains: &domains[index],
+            })
+            .collect::<Vec<_>>();
+        compose_context("ws", "child", &branches).unwrap()
     }
 
     fn input_message(with_alias: bool) -> ChatMessage {
@@ -564,6 +844,7 @@ mod tests {
         let without = vec![input_message(false)];
         let with = vec![input_message(true)];
         let checkpoints = BTreeMap::new();
+        let domains = test_domains(&checkpoints);
         for branches in [
             [without.as_slice(), with.as_slice()],
             [with.as_slice(), without.as_slice()],
@@ -577,6 +858,7 @@ mod tests {
                         thread: "parent",
                         messages,
                         checkpoints: &checkpoints,
+                        checkpoint_domains: &domains,
                     })
                     .collect::<Vec<_>>(),
             )
@@ -639,11 +921,13 @@ mod tests {
                         thread: "parent",
                         messages: &summary,
                         checkpoints: &closure,
+                        checkpoint_domains: &test_domains(&closure),
                     },
                     AcceptedContextBranch {
                         thread: "parent",
                         messages: &raw,
                         checkpoints: &empty,
+                        checkpoint_domains: &test_domains(&empty),
                     },
                 ]
             } else {
@@ -652,11 +936,13 @@ mod tests {
                         thread: "parent",
                         messages: &raw,
                         checkpoints: &empty,
+                        checkpoint_domains: &test_domains(&empty),
                     },
                     AcceptedContextBranch {
                         thread: "parent",
                         messages: &summary,
                         checkpoints: &closure,
+                        checkpoint_domains: &test_domains(&closure),
                     },
                 ]
             };
@@ -674,6 +960,7 @@ mod tests {
                     thread: "parent",
                     messages: &composed,
                     checkpoints: &closure,
+                    checkpoint_domains: &test_domains(&closure),
                 }],
             )
             .unwrap();
@@ -762,11 +1049,13 @@ mod tests {
                         thread: "parent",
                         messages: &v1,
                         checkpoints: &v1_closure,
+                        checkpoint_domains: &test_domains(&v1_closure),
                     },
                     AcceptedContextBranch {
                         thread: "parent",
                         messages: &raw,
                         checkpoints: &empty,
+                        checkpoint_domains: &test_domains(&empty),
                     },
                 ]
             } else {
@@ -775,11 +1064,13 @@ mod tests {
                         thread: "parent",
                         messages: &raw,
                         checkpoints: &empty,
+                        checkpoint_domains: &test_domains(&empty),
                     },
                     AcceptedContextBranch {
                         thread: "parent",
                         messages: &v1,
                         checkpoints: &v1_closure,
+                        checkpoint_domains: &test_domains(&v1_closure),
                     },
                 ]
             };
@@ -804,15 +1095,16 @@ mod tests {
                     thread: "parent",
                     messages: &composed,
                     checkpoints: &v1_closure,
+                    checkpoint_domains: &test_domains(&v1_closure),
                 }],
             )
             .unwrap();
             assert_eq!(repeated, composed);
         }
         let (v2, v2_closure) = checkpoint("S_v2", "input-revision:2", true);
-        for (first, first_closure, second, second_closure, expected) in [
-            (&v1, &v1_closure, &v2, &v2_closure, 0),
-            (&v2, &v2_closure, &v1, &v1_closure, 1),
+        for (first, first_closure, second, second_closure) in [
+            (&v1, &v1_closure, &v2, &v2_closure),
+            (&v2, &v2_closure, &v1, &v1_closure),
         ] {
             let composed = compose_context(
                 "ws",
@@ -822,24 +1114,29 @@ mod tests {
                         thread: "parent",
                         messages: first,
                         checkpoints: first_closure,
+                        checkpoint_domains: &test_domains(first_closure),
                     },
                     AcceptedContextBranch {
                         thread: "parent",
                         messages: second,
                         checkpoints: second_closure,
+                        checkpoint_domains: &test_domains(second_closure),
                     },
                 ],
             )
             .unwrap();
-            assert_eq!(composed.len(), 1);
+            // The checkpoints name different exact revisions of A. Neither
+            // can remove the other, and B's alias stays on A@v2 alone.
+            assert_eq!(composed.len(), 2);
             assert_eq!(
-                composed[0]
-                    .provenance
-                    .as_ref()
-                    .unwrap()
-                    .source_aliases
-                    .len(),
-                expected
+                composed
+                    .iter()
+                    .map(|message| {
+                        let origin = message.provenance.as_ref().unwrap();
+                        (origin.sources[0].id.clone(), origin.source_aliases.len())
+                    })
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([("S_v1".into(), 0), ("S_v2".into(), 1)])
             );
         }
     }
@@ -905,6 +1202,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         for order in [[0, 1], [1, 0]] {
+            let domains = closures.iter().map(test_domains).collect::<Vec<_>>();
             let composed = compose_context(
                 "ws",
                 "destination",
@@ -912,6 +1210,7 @@ mod tests {
                     thread: "parent",
                     messages: &branches[index],
                     checkpoints: &closures[index],
+                    checkpoint_domains: &domains[index],
                 }),
             )
             .unwrap();
@@ -1000,6 +1299,7 @@ mod tests {
             )]),
         ];
         for order in [[0, 1], [1, 0]] {
+            let domains = closures.iter().map(test_domains).collect::<Vec<_>>();
             let composed = compose_context(
                 "ws",
                 "destination",
@@ -1007,6 +1307,7 @@ mod tests {
                     thread: "parent",
                     messages: &branches[index],
                     checkpoints: &closures[index],
+                    checkpoint_domains: &domains[index],
                 }),
             )
             .unwrap();
@@ -1026,6 +1327,7 @@ mod tests {
                     thread: "parent",
                     messages: &composed,
                     checkpoints: &closures[1],
+                    checkpoint_domains: &test_domains(&closures[1]),
                 }],
             )
             .unwrap();
@@ -1038,6 +1340,7 @@ mod tests {
         let a = vec![conflicting_input_message("A")];
         let c = vec![conflicting_input_message("C")];
         let checkpoints = BTreeMap::new();
+        let domains = test_domains(&checkpoints);
         for branches in [[a.as_slice(), c.as_slice()], [c.as_slice(), a.as_slice()]] {
             let composed = compose_context(
                 "ws",
@@ -1048,6 +1351,7 @@ mod tests {
                         thread: "parent",
                         messages,
                         checkpoints: &checkpoints,
+                        checkpoint_domains: &domains,
                     })
                     .collect::<Vec<_>>(),
             )
@@ -1084,6 +1388,7 @@ mod tests {
             vec![message]
         });
         let checkpoints = BTreeMap::new();
+        let domains = test_domains(&checkpoints);
         for order in [[0, 1], [1, 0]] {
             let composed = compose_context(
                 "ws",
@@ -1092,6 +1397,7 @@ mod tests {
                     thread: "parent",
                     messages: &branches[index],
                     checkpoints: &checkpoints,
+                    checkpoint_domains: &domains,
                 }),
             )
             .unwrap();
@@ -1116,11 +1422,13 @@ mod tests {
                     thread: "A",
                     messages: &a,
                     checkpoints: &closures,
+                    checkpoint_domains: &test_domains(&closures),
                 },
                 AcceptedContextBranch {
                     thread: "B",
                     messages: &b,
                     checkpoints: &closures,
+                    checkpoint_domains: &test_domains(&closures),
                 },
             ],
         )
@@ -1160,12 +1468,14 @@ mod tests {
                     AcceptedContextBranch {
                         thread: "A",
                         messages: &a,
-                        checkpoints: &closures
+                        checkpoints: &closures,
+                        checkpoint_domains: &test_domains(&closures),
                     },
                     AcceptedContextBranch {
                         thread: "B",
                         messages: &b,
-                        checkpoints: &closures
+                        checkpoints: &closures,
+                        checkpoint_domains: &test_domains(&closures),
                     },
                 ]
             )
@@ -1179,7 +1489,8 @@ mod tests {
                 &[AcceptedContextBranch {
                     thread: "B",
                     messages: &b,
-                    checkpoints: &closures
+                    checkpoints: &closures,
+                    checkpoint_domains: &test_domains(&closures),
                 }]
             )
             .is_err()
@@ -1221,11 +1532,13 @@ mod tests {
                     thread: "parent",
                     messages: &history[..60],
                     checkpoints: &closures,
+                    checkpoint_domains: &test_domains(&closures),
                 },
                 AcceptedContextBranch {
                     thread: "parent",
                     messages: &summary,
                     checkpoints: &closures,
+                    checkpoint_domains: &test_domains(&closures),
                 },
             ],
         )
@@ -1287,11 +1600,13 @@ mod tests {
                     thread: "parent",
                     messages: std::slice::from_ref(&a),
                     checkpoints: &closures,
+                    checkpoint_domains: &test_domains(&closures),
                 },
                 AcceptedContextBranch {
                     thread: "parent",
                     messages: std::slice::from_ref(&b),
                     checkpoints: &closures,
+                    checkpoint_domains: &test_domains(&closures),
                 },
             ],
         )
@@ -1336,6 +1651,7 @@ mod tests {
                 thread: "A",
                 messages: &history,
                 checkpoints: &closures,
+                checkpoint_domains: &test_domains(&closures),
             }],
         )
         .unwrap();
@@ -1354,5 +1670,193 @@ mod tests {
                 .iter()
                 .all(|message| message.provenance.as_ref().unwrap().unit_id != "pending")
         );
+    }
+
+    #[test]
+    fn confirmed_copies_select_covering_summary_in_both_orders_and_again() {
+        let old = test_summary("S_A", &[("B", "A"), ("C", "A")]);
+        let covering = test_summary("S_BC", &[]);
+        for reverse in [false, true] {
+            let items = if reverse {
+                [
+                    (&covering, &["B", "C"][..], CoverageDomain::WorkingContext),
+                    (&old, &["A"][..], CoverageDomain::WorkingContext),
+                ]
+            } else {
+                [
+                    (&old, &["A"][..], CoverageDomain::WorkingContext),
+                    (&covering, &["B", "C"][..], CoverageDomain::WorkingContext),
+                ]
+            };
+            let selected = compose_summaries(&items);
+            assert_eq!(selected.len(), 1);
+            assert_eq!(
+                selected[0].provenance.as_ref().unwrap().sources[0].id,
+                "S_BC"
+            );
+            let repeated = compose_summaries(&[
+                (&selected[0], &["B", "C"], CoverageDomain::WorkingContext),
+                (&old, &["A"], CoverageDomain::WorkingContext),
+            ]);
+            assert_eq!(repeated.len(), 1);
+            assert_eq!(
+                repeated[0].provenance.as_ref().unwrap().sources[0].id,
+                "S_BC"
+            );
+        }
+        let copy_b = test_summary("S_B", &[]);
+        let copy_c = test_summary("S_C", &[]);
+        for (first, first_leaf, second, second_leaf) in
+            [(&copy_b, "B", &copy_c, "C"), (&copy_c, "C", &copy_b, "B")]
+        {
+            let selected = compose_summaries(&[
+                (&old, &["A"], CoverageDomain::WorkingContext),
+                (first, &[first_leaf], CoverageDomain::WorkingContext),
+                (second, &[second_leaf], CoverageDomain::WorkingContext),
+            ]);
+            assert_eq!(selected.len(), 1);
+            assert_eq!(
+                selected[0].provenance.as_ref().unwrap().sources[0].id,
+                first.provenance.as_ref().unwrap().sources[0].id
+            );
+        }
+    }
+
+    #[test]
+    fn summary_comparison_preserves_partial_unproven_and_other_domain_history() {
+        let old = test_summary("S_A", &[("B", "A"), ("C", "A")]);
+        let covering = test_summary("S_BC", &[]);
+        let working = CoverageDomain::WorkingContext;
+        assert_eq!(
+            compose_summaries(&[
+                (&old, &["A", "unique"], working),
+                (&covering, &["B", "C", "other_unique"], working),
+            ])
+            .len(),
+            2
+        );
+        let unproven = test_summary("S_A", &[]);
+        assert_eq!(
+            compose_summaries(&[
+                (&unproven, &["A"], working),
+                (&covering, &["B", "C"], working),
+            ])
+            .len(),
+            2
+        );
+        let mut claims = ExactInputClaims::default();
+        claims.add_alias(&old.provenance.as_ref().unwrap().source_aliases[0]);
+        let mut revised_copy = summary_leaf("B");
+        revised_copy.source.version = "input-revision:2".into();
+        assert!(!summary_covers(
+            &BTreeSet::from([revised_copy]),
+            &BTreeSet::from([summary_leaf("A")]),
+            &claims,
+        ));
+        let mut chain = ExactInputClaims::default();
+        let b_to_a = test_summary("S_A", &[("B", "A")]);
+        chain.add_alias(&b_to_a.provenance.as_ref().unwrap().source_aliases[0]);
+        let a_to_root = test_summary("S_root", &[("A", "root")]);
+        chain.add_alias(&a_to_root.provenance.as_ref().unwrap().source_aliases[0]);
+        assert!(summary_covers(
+            &BTreeSet::from([summary_leaf("B")]),
+            &BTreeSet::from([summary_leaf("root")]),
+            &chain,
+        ));
+        let conflict = test_summary("S_other", &[("A", "other")]);
+        chain.add_alias(&conflict.provenance.as_ref().unwrap().source_aliases[0]);
+        chain.mark_competing_owners();
+        assert!(!summary_covers(
+            &BTreeSet::from([summary_leaf("B")]),
+            &BTreeSet::from([summary_leaf("root")]),
+            &chain,
+        ));
+        let revised = test_summary("S_A_revised", &[]);
+        let mut revised_closure = summary_closure(&revised, &["A"]);
+        let mut revised_leaf = summary_leaf("A");
+        revised_leaf.source.version = "input-revision:2".into();
+        *revised_closure.values_mut().next().unwrap() = BTreeSet::from([revised_leaf]);
+        let old_closure = summary_closure(&old, &["A"]);
+        let old_messages = [old.clone()];
+        let revised_messages = [revised];
+        let different_revisions = compose_context(
+            "ws",
+            "child",
+            &[
+                AcceptedContextBranch {
+                    thread: "parent",
+                    messages: &old_messages,
+                    checkpoints: &old_closure,
+                    checkpoint_domains: &test_domains(&old_closure),
+                },
+                AcceptedContextBranch {
+                    thread: "parent",
+                    messages: &revised_messages,
+                    checkpoints: &revised_closure,
+                    checkpoint_domains: &test_domains(&revised_closure),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(different_revisions.len(), 2);
+        assert_eq!(
+            compose_summaries(&[
+                (&old, &["A"], CoverageDomain::OwnContribution),
+                (&covering, &["B", "C"], working),
+            ])
+            .len(),
+            2
+        );
+        let conflict = test_summary("S_X", &[("B", "X")]);
+        for reverse in [false, true] {
+            let mut branches = vec![
+                (&old, &["A"][..], working),
+                (&covering, &["B", "C"][..], working),
+                (&conflict, &["X"][..], working),
+            ];
+            if reverse {
+                branches.reverse();
+            }
+            let selected = compose_summaries(&branches);
+            let ids = |messages: &[ChatMessage]| {
+                messages
+                    .iter()
+                    .map(|message| message.provenance.as_ref().unwrap().sources[0].id.clone())
+                    .collect::<BTreeSet<_>>()
+            };
+            assert_eq!(
+                ids(&selected),
+                BTreeSet::from(["S_BC".into(), "S_X".into()])
+            );
+            let b = MessageSourceIdentity {
+                thread_id: "parent".into(),
+                source: input_source("turn", "B", 1),
+            };
+            assert!(selected.iter().any(|message| {
+                message
+                    .provenance
+                    .as_ref()
+                    .unwrap()
+                    .ambiguous_input_aliases
+                    .contains(&b)
+            }));
+            let mut closures = summary_closure(&covering, &["B", "C"]);
+            closures.extend(summary_closure(&conflict, &["X"]));
+            let repeated = compose_context(
+                "ws",
+                "grandchild",
+                &[AcceptedContextBranch {
+                    thread: "child",
+                    messages: &selected,
+                    checkpoints: &closures,
+                    checkpoint_domains: &test_domains(&closures),
+                }],
+            )
+            .unwrap();
+            assert_eq!(
+                ids(&repeated),
+                BTreeSet::from(["S_BC".into(), "S_X".into()])
+            );
+        }
     }
 }

@@ -31,6 +31,7 @@ members = [
   "crates/entity",
   "crates/migration",
   "crates/mcp",
+  "crates/mcp-oauth",
   "crates/memory",
   "crates/protocol",
   "crates/provider",
@@ -44,7 +45,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.54.0"
+version = "0.55.0"
 edition = "2024"
 license = "MIT"
 authors = ["Pioneer Contributors"]
@@ -81,6 +82,7 @@ pioneer-cli = { path = "crates/cli" }
 pioneer-crud = { path = "crates/crud" }
 pioneer-entity = { path = "crates/entity" }
 pioneer-migration = { path = "crates/migration" }
+pioneer-mcp-oauth = { path = "crates/mcp-oauth" }
 pioneer-mcp = { path = "crates/mcp" }
 pioneer-memory = { path = "crates/memory" }
 pioneer-protocol = { path = "crates/protocol" }
@@ -178,7 +180,7 @@ sys-locale = "0.3"
 reqwest = { version = "0.13", features = ["json", "query", "stream", "multipart", "blocking", "socks", "gzip"] }
 bytes = "1"
 http = "1"
-rathole = { git = "https://github.com/pioneerdotai/relay.git", rev = "93e0ddccab7cb6c255b417c391ef649a4f7554a7", version = "0.6.0", default-features = false, features = ["client"] }
+rathole = { git = "https://github.com/pioneerdotai/relay.git", version = "0.6.1", default-features = false, features = ["client"] }
 
 # Crypto
 hmac = "0.13"
@@ -204,5 +206,5 @@ rusqlite = { version = "0.39", default-features = false, features = ["functions"
 zstd = { version = "0.14", features = ["experimental"] }
 
 # MCP
-rmcp = { version = "3.5", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+rmcp = { version = "3.5", default-features = false, features = ["auth", "client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 process-wrap = { version = "10", features = ["tokio1"] }

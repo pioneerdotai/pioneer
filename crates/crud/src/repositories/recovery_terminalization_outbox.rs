@@ -26,6 +26,8 @@ pub async fn enqueue_for_terminal_job<C: ConnectionTrait>(
     job: &recovery_job::Model,
     now: DateTimeWithTimeZone,
 ) -> Result<()> {
+    // Internal transition fingerprint only. Public terminalization renders the
+    // typed job diagnostic; legacy last_error must never be used as public prose.
     let error_message = job
         .last_error
         .clone()

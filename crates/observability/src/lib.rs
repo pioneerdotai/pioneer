@@ -397,7 +397,9 @@ fn load_local_dotenv() {
     });
 }
 
-fn sentry_tracing_layer<S>() -> impl tracing_subscriber::Layer<S>
+/// Production event mapper, also usable with thread-local subscribers for local capture.
+#[doc(hidden)]
+pub fn sentry_tracing_layer<S>() -> impl tracing_subscriber::Layer<S>
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
 {
@@ -430,6 +432,10 @@ where
         ));
     }
     if should_demote_rmcp_transport_worker_failure(
+        event.metadata().level(),
+        event.metadata().target(),
+        fields.message.as_deref(),
+    ) || should_demote_rmcp_common_stream_request_failure(
         event.metadata().level(),
         event.metadata().target(),
         fields.message.as_deref(),
@@ -541,6 +547,30 @@ fn should_demote_rmcp_transport_worker_failure(
                 || is_rmcp_streamable_http_auth_rejection(message)
                 || is_rmcp_streamable_http_transport_connect_failure(message)
                 || is_rmcp_streamable_http_initialized_notification_send_failure(message)
+        })
+}
+
+// rmcp 3.5.0 reports this common GET/SSE opening failure from a task with
+// request_id=None. Its worker then warns and continues; retain the diagnostic
+// as a breadcrumb without changing the SDK's local ERROR or transport behavior.
+fn should_demote_rmcp_common_stream_request_failure(
+    level: &tracing::Level,
+    target: &str,
+    message: Option<&str>,
+) -> bool {
+    const PREFIX: &str = "fail to get common stream: Client error: error sending request for url (";
+    *level == tracing::Level::ERROR
+        && target == "rmcp::transport::streamable_http_client"
+        && message.is_some_and(|message| {
+            message
+                .strip_prefix(PREFIX)
+                .and_then(|rest| rest.strip_suffix(')'))
+                .is_some_and(|address| {
+                    !address.is_empty()
+                        && !address
+                            .chars()
+                            .any(|c| c.is_whitespace() || matches!(c, '(' | ')'))
+                })
         })
 }
 
@@ -760,6 +790,7 @@ mod tests {
         should_demote_gpui_closed_window_activation_event,
         should_demote_gpui_closed_window_teardown_error,
         should_demote_rathole_client_control_channel_retry,
+        should_demote_rmcp_common_stream_request_failure,
         should_demote_rmcp_transport_worker_failure,
         should_demote_tantivy_reader_commit_reload_not_found, should_ignore_otlp_internal_event,
         should_keep_otlp_network_diagnostic,
@@ -840,6 +871,141 @@ mod tests {
                 "worker quit with fatal: unexpected server response: expect initialized, accepted, when process initialize response",
             ),
         ));
+    }
+
+    const COMMON_STREAM_TARGET: &str = "rmcp::transport::streamable_http_client";
+    const POSTHOG_COMMON_STREAM_FAILURE: &str = "fail to get common stream: Client error: error sending request for url (https://mcp.posthog.com/mcp)";
+
+    #[test]
+    fn demotes_only_the_fixed_rmcp_common_stream_request_failure_template() {
+        for message in [
+            POSTHOG_COMMON_STREAM_FAILURE,
+            "fail to get common stream: Client error: error sending request for url (https://mcp.axiom.co/mcp)",
+            "fail to get common stream: Client error: error sending request for url (http://localhost:8123/other/path?mode=sse)",
+        ] {
+            assert!(
+                should_demote_rmcp_common_stream_request_failure(
+                    &tracing::Level::ERROR,
+                    COMMON_STREAM_TARGET,
+                    Some(message),
+                ),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_common_stream_request_failure_with_other_metadata() {
+        for target in [
+            "pioneer_gateway",
+            "rmcp::transport::worker",
+            "rmcp::transport::streamable_http_client::other",
+        ] {
+            assert!(!should_demote_rmcp_common_stream_request_failure(
+                &tracing::Level::ERROR,
+                target,
+                Some(POSTHOG_COMMON_STREAM_FAILURE),
+            ));
+        }
+        for level in [
+            tracing::Level::WARN,
+            tracing::Level::INFO,
+            tracing::Level::DEBUG,
+            tracing::Level::TRACE,
+        ] {
+            assert!(!should_demote_rmcp_common_stream_request_failure(
+                &level,
+                COMMON_STREAM_TARGET,
+                Some(POSTHOG_COMMON_STREAM_FAILURE),
+            ));
+        }
+        assert!(!should_demote_rmcp_common_stream_request_failure(
+            &tracing::Level::ERROR,
+            COMMON_STREAM_TARGET,
+            None,
+        ));
+    }
+
+    #[test]
+    fn keeps_other_rmcp_streamable_http_failures_outside_the_new_rule() {
+        for message in [
+            "fail to send initialized notification: Client error: error sending request for url (https://mcp.posthog.com/mcp)",
+            "prefix: fail to get common stream: Client error: error sending request for url (https://mcp.posthog.com/mcp)",
+            "fail to get common stream: Client error: error sending request for url (https://mcp.posthog.com/mcp), when call tools/list",
+            "fail to get common stream: Client error: error sending request for url (https://mcp.posthog.com/mcp) (diagnostic tail)",
+            "fail to get common stream: Client error: error sending request for url (https://mcp.posthog.com/mcp),diagnostic)",
+            "fail to get common stream: Client error: error sending request for url ()",
+            "fail to get common stream: Client error: error sending request for url (https://mcp.posthog.com/mcp",
+            "fail to get common stream: AuthRequired(www-authenticate)",
+            "fail to get common stream: InsufficientScope(read)",
+            "fail to get common stream: Client error: HTTP status client error (401 Unauthorized) for url (https://mcp.posthog.com/mcp)",
+            "fail to get common stream: Client error: HTTP status client error (403 Forbidden) for url (https://mcp.posthog.com/mcp)",
+            "fail to get common stream: UnexpectedServerResponse(HTTP 403 Forbidden)",
+            "fail to get common stream: unexpected server response: HTTP 401 Unauthorized",
+            "fail to get common stream: UnexpectedContentType(text/html)",
+            "fail to get common stream: Unexpected content type: Some(\"text/html\")",
+            "fail to get common stream: Deserialize error: expected value at line 1 column 1",
+            "fail to get common stream: TokioJoinError(task panicked)",
+            "fail to get common stream: Tokio join error: task panicked",
+            "fail to get common stream: unknown failure",
+            "fail to get common stream: Client error: unknown failure",
+            "Client error: error sending request for url (https://mcp.posthog.com/mcp), when call tools/list",
+            "Client error: error sending request for url (https://mcp.posthog.com/mcp), when call tools/call",
+            "streamable HTTP response stream closed before its final response",
+            "fail to get common stream: unexpected end of stream",
+        ] {
+            assert!(
+                !should_demote_rmcp_common_stream_request_failure(
+                    &tracing::Level::ERROR,
+                    COMMON_STREAM_TARGET,
+                    Some(message),
+                ),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_sentry_mapper_retains_common_stream_breadcrumb_and_neighboring_error() {
+        // Share the existing consent-test lock without mutating consent or
+        // installing a global subscriber/client. The test helper creates a fresh
+        // hub and replaces the transport with TestTransport (no network sends).
+        let _guard = super::telemetry::tests::TELEMETRY_TEST_LOCK
+            .lock()
+            .expect("telemetry test lock");
+        let events = sentry::test::with_captured_events(|| {
+            let subscriber = tracing_subscriber::registry().with(super::sentry_tracing_layer());
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::error!(target: "rmcp::transport::streamable_http_client",
+                    "fail to get common stream: Client error: error sending request for url ({})",
+                    "https://mcp.posthog.com/mcp"
+                );
+                tracing::error!(target: "rmcp::transport::streamable_http_client",
+                    "fail to get common stream: unexpected server response: HTTP 401 Unauthorized"
+                );
+            });
+        });
+
+        assert_eq!(
+            events.len(),
+            1,
+            "only the neighboring ERROR is a Sentry event"
+        );
+        let event = &events[0];
+        assert_eq!(event.level, sentry::Level::Error);
+        assert_eq!(event.logger.as_deref(), Some(COMMON_STREAM_TARGET));
+        assert_eq!(
+            event.message.as_deref(),
+            Some("fail to get common stream: unexpected server response: HTTP 401 Unauthorized")
+        );
+        assert_eq!(event.breadcrumbs.len(), 1);
+        let breadcrumb = &event.breadcrumbs.values[0];
+        assert_eq!(breadcrumb.level, sentry::Level::Error);
+        assert_eq!(breadcrumb.category.as_deref(), Some(COMMON_STREAM_TARGET));
+        assert_eq!(
+            breadcrumb.message.as_deref(),
+            Some(POSTHOG_COMMON_STREAM_FAILURE)
+        );
     }
 
     #[test]
@@ -1147,6 +1313,16 @@ mod tests {
             Some(
                 "Failed to run the control channel: Authentication failed: pioneer_gateway: Incorrect token. Retry in 1s...",
             ),
+        ));
+    }
+
+    #[test]
+    fn keeps_single_typed_rathole_rejection_as_event() {
+        assert!(!should_demote_rathole_client_control_channel_retry(
+            &tracing::Level::ERROR,
+            "rathole::client",
+            None,
+            Some("Remote access control channel rejected"),
         ));
     }
 

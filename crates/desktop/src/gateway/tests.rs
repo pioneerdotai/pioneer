@@ -370,6 +370,7 @@ pub(crate) fn test_config() -> AppConfig {
             },
         },
         desktop: DesktopConfig {
+            mcp_oauth: Default::default(),
             gateway: GatewayRuntimeConfig {
                 connect_timeout_ms: 300,
                 startup_timeout_ms: 10_000,

@@ -1,5 +1,6 @@
 pub mod apply_patch;
 mod argument_normalizer;
+mod builtin_argument_validator;
 mod classifier;
 mod context;
 mod domain;
@@ -1559,7 +1560,7 @@ mod tests {
 
         let effect_calls = Arc::new(Mutex::new(Vec::new()));
         let mut effect_bundle = ToolExtensionBundle::default();
-        for target in ["task_create", "agent_start"] {
+        for target in ["task_create", "threads_turn_start"] {
             effect_bundle.specs.push(ConfiguredToolSpec::new(
                 ToolSpec::new(
                     target,
@@ -1592,7 +1593,7 @@ mod tests {
                     agent_proxy,
                     skill_root.as_path(),
                     SkillDynamicToolKind::FunctionProxy,
-                    serde_json::json!({"target_tool": "agent_start"}),
+                    serde_json::json!({"target_tool": "threads_turn_start"}),
                 ),
             ],
             None,
@@ -1661,7 +1662,7 @@ mod tests {
         );
         assert_eq!(
             *effect_calls.lock().expect("effect calls"),
-            vec!["task_create".to_owned(), "agent_start".to_owned()],
+            vec!["task_create".to_owned(), "threads_turn_start".to_owned()],
             "each target side effect must execute exactly once"
         );
     }

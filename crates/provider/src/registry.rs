@@ -162,6 +162,7 @@ struct AuthorityBoundProvider {
 struct RedactedEndpointError {
     message: &'static str,
     classification: ProviderFailureClassification,
+    incomplete: Option<crate::failure::ProviderStreamIncomplete>,
 }
 
 impl Display for RedactedEndpointError {
@@ -173,7 +174,13 @@ impl Display for RedactedEndpointError {
     }
 }
 
-impl Error for RedactedEndpointError {}
+impl Error for RedactedEndpointError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.incomplete
+            .as_ref()
+            .map(|cause| cause as &(dyn Error + 'static))
+    }
+}
 
 fn endpoint_error_status(error: &anyhow::Error) -> Option<u16> {
     if let Some(status) = error.downcast_ref::<crate::types::ProviderHttpErrorBodyTooLarge>() {
@@ -210,7 +217,10 @@ fn redacted_endpoint_error(
         .as_ref()
         .and_then(|classification| classification.http_status)
         .or_else(|| endpoint_error_status(&error));
-    let is_network = error.chain().any(|cause| cause.is::<reqwest::Error>());
+    let is_network = error.chain().any(|cause| cause.is::<reqwest::Error>())
+        || adapter_classification
+            .as_ref()
+            .is_some_and(|value| value.is_network_error);
     let raw_message = format!("{error:#}");
     let lower = raw_message.to_ascii_lowercase();
     let provider_code = extract_provider_code(&raw_message);
@@ -225,6 +235,11 @@ fn redacted_endpoint_error(
     }
     let mut classification =
         adapter_classification.unwrap_or_else(|| ProviderFailureClassification::new(class));
+    // Preserve the old custom-endpoint reqwest fallback even when the adapter
+    // has already discarded the unsafe source and retained only transport facts.
+    if classification.class == ProviderFailureClass::Unknown && classification.is_network_error {
+        classification.class = ProviderFailureClass::NetworkTransient;
+    }
     classification.http_status = classification.http_status.or(status);
     // `retry-after` is useful for recovery. Retain only the numeric interval.
     classification.retry_after_ms = classification
@@ -242,6 +257,7 @@ fn redacted_endpoint_error(
     RedactedEndpointError {
         message,
         classification,
+        incomplete: crate::failure::provider_stream_incomplete(&error),
     }
     .into()
 }
@@ -322,24 +338,30 @@ impl Provider for AuthorityBoundProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        Ok(self.stream_chat_with_diagnostics(request).await?.stream)
+    }
+
+    async fn stream_chat_with_diagnostics(
+        &self,
+        request: ChatRequest,
+    ) -> Result<crate::ProviderStream> {
         self.ensure_not_revoked()?;
-        let stream = self.public_result(
+        let mut response = self.public_result(
             crate::attachments::runtime::with_async_authority_scope(
                 self.authority_fingerprint.as_str().to_owned(),
-                self.inner.stream_chat(request),
+                self.inner.stream_chat_with_diagnostics(request),
             )
             .await,
         )?;
         if self.redact_endpoint_errors {
             let inner = self.inner.clone();
-            Ok(Box::pin(stream.map(move |result| {
+            response.stream = Box::pin(response.stream.map(move |result| {
                 result.map_err(|error| {
                     redacted_endpoint_error(inner.as_ref(), error, ProviderFailureStage::MidStream)
                 })
-            })))
-        } else {
-            Ok(stream)
+            }));
         }
+        Ok(response)
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -1901,6 +1923,152 @@ mod tests {
         assert_eq!(classification.class, ProviderFailureClass::RateLimit);
         assert_eq!(classification.http_status, Some(429));
         assert_eq!(classification.retry_after_ms, Some(3000));
+    }
+
+    #[tokio::test]
+    async fn openrouter_completion_marker_survives_endpoint_redaction() {
+        use crate::failure::{ProviderStreamIncomplete, provider_stream_incomplete};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        for done in [false, true] {
+            for with_json in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!(
+                    "http://{}/private-marker-path/v1",
+                    listener.local_addr().unwrap()
+                );
+                let body = format!(
+                    "{}{}",
+                    if with_json {
+                        "data: {\"id\":\"gen-completion_body\",\"choices\":[{\"delta\":{\"content\":\"{\\\"facts\\\":[]}\"},\"finish_reason\":null}]}\n\n"
+                    } else {
+                        ""
+                    },
+                    if done { "data: [DONE]\n\n" } else { "" }
+                );
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = socket.read(&mut buf).await.unwrap();
+                        assert!(n > 0);
+                        request.extend_from_slice(&buf[..n]);
+                        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&request[..end]);
+                            let length: usize = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (key, value) = line.split_once(':')?;
+                                    key.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse().unwrap())
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Generation-Id: gen-completion_header\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                });
+                let registry =
+                    ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+                        |_, _| Ok("key".into()),
+                        |_, _| Ok(None),
+                        move |_, _| Ok(Some(url.clone())),
+                        ProviderTimeoutPolicy::default(),
+                    );
+                let provider = registry
+                    .get_or_create_for_workspace("a", "openrouter")
+                    .unwrap();
+                let mut stream = provider.stream_chat(chat_request()).await.unwrap();
+                let mut text = String::new();
+                let error = loop {
+                    match stream.next().await {
+                        Some(Ok(chunk)) => {
+                            assert!(!chunk.is_final);
+                            text.push_str(&chunk.delta);
+                        }
+                        Some(Err(error)) => break error,
+                        None => panic!("adapter must report incomplete completion"),
+                    }
+                };
+                server.await.unwrap();
+                assert_eq!(text, if with_json { "{\"facts\":[]}" } else { "" });
+                assert_eq!(
+                    provider_stream_incomplete(&error),
+                    Some(if done {
+                        ProviderStreamIncomplete::DoneWithoutFinishReason
+                    } else {
+                        ProviderStreamIncomplete::EofWithoutTerminalMarker
+                    })
+                );
+                let classification = provider.classify_failure(&error).unwrap();
+                assert_eq!(classification.class, ProviderFailureClass::StreamStall);
+                assert_eq!(classification.http_status, None);
+                assert_eq!(classification.error_reason, None);
+                assert_eq!(
+                    classification.request_id.map(String::from).as_deref(),
+                    Some(if with_json {
+                        "gen-completion_body"
+                    } else {
+                        "gen-completion_header"
+                    })
+                );
+                assert!(!format!("{error:#?}").contains("private-marker-path"));
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_redaction_does_not_invent_incomplete_completion_for_neighbor_errors() {
+        use crate::failure::provider_stream_incomplete;
+        let provider = EchoProvider::new();
+        for (message, class) in [
+            ("connection reset", ProviderFailureClass::NetworkTransient),
+            (
+                "API error (429 Too Many Requests): rate limit",
+                ProviderFailureClass::RateLimit,
+            ),
+            (
+                "API error (403 Forbidden): permission denied",
+                ProviderFailureClass::AuthOrPermission,
+            ),
+            (
+                "API error (400 Bad Request): invalid request",
+                ProviderFailureClass::ProviderRejected,
+            ),
+            ("stream stall", ProviderFailureClass::StreamStall),
+            (
+                "malformed OpenRouter SSE frame",
+                ProviderFailureClass::StreamStall,
+            ),
+            (
+                "provider sent payload after finish_reason",
+                ProviderFailureClass::StreamStall,
+            ),
+            // Identical text alone is deliberately insufficient proof.
+            (
+                "provider stream ended before a terminal marker",
+                ProviderFailureClass::StreamStall,
+            ),
+        ] {
+            let error = redacted_endpoint_error(
+                &provider,
+                anyhow::anyhow!(message),
+                ProviderFailureStage::MidStream,
+            );
+            assert!(provider_stream_incomplete(&error).is_none());
+            assert_eq!(
+                error
+                    .downcast_ref::<RedactedEndpointError>()
+                    .unwrap()
+                    .classification
+                    .class,
+                class
+            );
+        }
     }
 
     #[tokio::test]

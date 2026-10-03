@@ -662,6 +662,7 @@ async fn persist_task_reviewer_execution_graph(
         permission_profile: None,
         skill_ids: Vec::new(),
         mcp_server_ids: Vec::new(),
+        selected_capabilities: Vec::new(),
     };
     let policy = crate::authorization::AgentWorkResourcePolicy::default();
     let result = processor
@@ -1720,7 +1721,7 @@ impl TaskAgentExecutor {
         };
         let normalized_selected_capabilities = if let Some(selection) = launch_selection.as_ref() {
             let requested =
-                super::agent_action_tools::launch_selection_capabilities(&selection.execution)
+                super::agent_action_tools::task_launch_selection_capabilities(&selection.execution)
                     .context("persisted Task launch capabilities are invalid")?;
             Some(
                 processor
@@ -4622,12 +4623,15 @@ impl TaskAgentExecutor {
                 &handle,
                 &child_runtime.task_run_turn,
                 TaskRunTurnStatus::Failed,
-                Some(task_error(
-                    "reviewer_turn_failed",
-                    error_message.to_owned(),
-                    TaskErrorClass::Unknown,
-                    Some(child_runtime.task_run_turn.run_id.clone()),
-                )),
+                Some(
+                    task_turn_failure_error(
+                        &processor,
+                        "reviewer_turn_failed",
+                        error_message,
+                        &child_runtime.task_run_turn,
+                    )
+                    .await?,
+                ),
                 failed_at,
             )
             .await?;
@@ -5236,12 +5240,15 @@ impl TaskAgentExecutor {
                         &handle,
                         &task_run_turn,
                         target_status,
-                        Some(task_error(
-                            "reviewer_turn_failed",
-                            error_message,
-                            TaskErrorClass::Unknown,
-                            Some(task_run_turn.run_id.clone()),
-                        )),
+                        Some(
+                            task_turn_failure_error(
+                                &processor,
+                                "reviewer_turn_failed",
+                                &error_message,
+                                &task_run_turn,
+                            )
+                            .await?,
+                        ),
                         failed_at,
                     )
                     .await?;
@@ -6019,12 +6026,14 @@ impl TaskAgentExecutor {
             .with_database_class(SqliteWriteClass::Critical);
         let handle = handle.with_critical_writes();
         let failed_at = now_timestamp_secs();
-        let error = task_error(
+        let error = task_turn_failure_error(
+            &processor,
             "child_turn_failed",
-            error_message.to_owned(),
-            TaskErrorClass::Unknown,
-            Some(child_runtime.task_run_turn.run_id.clone()),
-        );
+            error_message,
+            &child_runtime.task_run_turn,
+        )
+        .await?;
+        let parent_error = error.message.clone();
         record_task_run_turn_failure(
             &handle,
             &child_runtime.task_run_turn,
@@ -6037,7 +6046,7 @@ impl TaskAgentExecutor {
         mark_task_run_occurrence_turn_failed(
             &processor,
             &child_runtime.lineage,
-            "child_turn_failed",
+            parent_error.as_str(),
         )
         .await?;
         Ok(())
@@ -6093,12 +6102,23 @@ impl TaskAgentExecutor {
             .with_database_class(SqliteWriteClass::Critical);
         let handle = handle.with_critical_writes();
         let blocked_at = now_timestamp_secs();
-        let error = task_error(
+        let mut error = task_error(
             "child_turn_blocked",
             reason.to_owned(),
             TaskErrorClass::Policy,
             Some(child_runtime.task_run_turn.run_id.clone()),
         );
+        error.recovery_diagnostic = processor
+            .crud_store
+            .get_blocked_turn_recovery_diagnostic(&child_runtime.task_run_turn.turn_id)
+            .await?;
+        if let Some(message) = error.recovery_public_message() {
+            error.class = TaskErrorClass::Provider;
+            error.message = message;
+        }
+        let block_reason = error
+            .recovery_public_message()
+            .unwrap_or_else(|| reason.to_owned());
         handle
             .record_task_run_turn_blocked(
                 blocked_task_run_turn(&child_runtime.task_run_turn, blocked_at),
@@ -6107,7 +6127,8 @@ impl TaskAgentExecutor {
             )
             .await?;
         handle.block_run(Some(error), blocked_at).await?;
-        mark_task_run_occurrence_turn_blocked(&processor, &child_runtime.lineage, reason).await?;
+        mark_task_run_occurrence_turn_blocked(&processor, &child_runtime.lineage, &block_reason)
+            .await?;
         Ok(())
     }
 
@@ -8746,6 +8767,7 @@ fn invalid_structured_result_error(
         )
     };
     Some(TaskError {
+        recovery_diagnostic: None,
         code: "task_agent_result_extraction_failed".to_owned(),
         message,
         class: TaskErrorClass::Validation,
@@ -8993,7 +9015,7 @@ async fn resolved_task_execution_turn_settings(
     let capabilities = match launch {
         Some(launch) => {
             let requested =
-                super::agent_action_tools::launch_selection_capabilities(&launch.execution)
+                super::agent_action_tools::task_launch_selection_capabilities(&launch.execution)
                     .context("pinned Task launch capabilities are invalid")?;
             processor
                 .normalize_turn_skill_capabilities(task.workspace_id.as_str(), requested.as_slice())
@@ -10723,6 +10745,28 @@ async fn load_task_agent_skill_overlay(
     }
 }
 
+async fn task_turn_failure_error(
+    processor: &MessageProcessor,
+    code: &str,
+    message: &str,
+    turn: &TaskRunTurn,
+) -> Result<TaskError> {
+    let mut error = task_error(
+        code,
+        message,
+        TaskErrorClass::Unknown,
+        Some(turn.run_id.clone()),
+    );
+    error.recovery_diagnostic = processor
+        .crud_store
+        .get_failed_turn_recovery_diagnostic(&turn.turn_id)
+        .await?;
+    if let Some(message) = error.recovery_public_message() {
+        error.message = message;
+    }
+    Ok(error)
+}
+
 fn task_error(
     code: impl Into<String>,
     _message: impl Into<String>,
@@ -10731,6 +10775,7 @@ fn task_error(
 ) -> TaskError {
     let code = code.into();
     TaskError {
+        recovery_diagnostic: None,
         message: code.clone(),
         code,
         class,

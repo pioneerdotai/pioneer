@@ -8,6 +8,7 @@ pub const MEMORY_DOMAIN_TOOL_NAMES: &[&str] = &[
     "memory_forget",
 ];
 pub const TASK_DOMAIN_TOOL_NAMES: &[&str] = &[
+    "threads_start_options",
     "task_create",
     "task_wait",
     "task_result",
@@ -24,7 +25,13 @@ pub const TASK_DOMAIN_TOOL_NAMES: &[&str] = &[
 ];
 pub const ARTIFACT_DOMAIN_TOOL_NAMES: &[&str] =
     &["artifact_prepare", "artifact_register", "artifact_read"];
-pub const THREADS_DOMAIN_TOOL_NAMES: &[&str] = &["threads_tools_result_read"];
+pub const THREADS_DOMAIN_TOOL_NAMES: &[&str] = &[
+    "threads_tools_result_read",
+    "threads_start_options",
+    "thread_message_send",
+    "thread_create",
+    "threads_turn_start",
+];
 pub const COMPUTER_USE_DOMAIN_TOOL_NAMES: &[&str] = &["computer_use"];
 pub const REQUEST_TOOLS_REASON_MAX_CHARS: usize = 512;
 
@@ -36,6 +43,7 @@ pub const REQUEST_TOOLS_DOMAIN_VALUES: &[&str] = &[
     BuiltinToolDomain::ComputerUse.as_str(),
 ];
 
+// Domain membership can overlap; tool registration still uses each name once.
 pub const BUILTIN_TOOL_DOMAIN_MAP: [(BuiltinToolDomain, &'static [&'static str]); 5] = [
     (BuiltinToolDomain::Threads, THREADS_DOMAIN_TOOL_NAMES),
     (BuiltinToolDomain::Memory, MEMORY_DOMAIN_TOOL_NAMES),
@@ -232,6 +240,7 @@ mod tests {
         assert_eq!(
             BuiltinToolDomain::Task.tool_names(),
             [
+                "threads_start_options",
                 "task_create",
                 "task_wait",
                 "task_result",
@@ -245,6 +254,16 @@ mod tests {
                 "task_reschedule",
                 "task_pause",
                 "task_resume",
+            ]
+        );
+        assert_eq!(
+            BuiltinToolDomain::Threads.tool_names(),
+            [
+                "threads_tools_result_read",
+                "threads_start_options",
+                "thread_message_send",
+                "thread_create",
+                "threads_turn_start",
             ]
         );
         assert_eq!(
@@ -278,10 +297,9 @@ mod tests {
     }
 
     #[test]
-    fn domain_map_names_are_unique() {
-        let mut names = HashSet::new();
-
+    fn domain_map_names_are_unique_within_each_domain() {
         for (_, tool_names) in builtin_tool_domain_map() {
+            let mut names = HashSet::new();
             for name in *tool_names {
                 assert!(names.insert(*name), "duplicate domain tool name: {name}");
             }

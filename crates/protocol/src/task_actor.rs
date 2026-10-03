@@ -908,6 +908,7 @@ mod tests {
                 permission_profile: None,
                 skill_ids: Vec::new(),
                 mcp_server_ids: Vec::new(),
+                selected_capabilities: Vec::new(),
             },
         });
         value.requested_identity_json = Some(serde_json::to_string(&requested).unwrap());

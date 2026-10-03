@@ -857,6 +857,7 @@ pub(crate) async fn resolve_workspace_task_launch(
                 permission_profile: None,
                 skill_ids: Vec::new(),
                 mcp_server_ids: Vec::new(),
+                selected_capabilities: Vec::new(),
             },
         });
     Ok((canonical, Some((identity, profile))))
@@ -914,6 +915,17 @@ pub(crate) fn pin_launch_selection_capabilities(
     Ok(())
 }
 
+/// Pin the exact selection for an immediate Task after its inherited
+/// and additional capabilities have been merged and normalized.
+pub(crate) fn pin_immediate_task_capabilities(
+    launch: &mut pioneer_protocol::AgentLaunchSelection,
+    capabilities: &[pioneer_protocol::TurnCapability],
+) -> anyhow::Result<()> {
+    pin_launch_selection_capabilities(launch, capabilities)?;
+    launch.execution.selected_capabilities = capabilities.to_vec();
+    Ok(())
+}
+
 /// Compile the capability portion of the common agent domain launch contract
 /// into the canonical Turn representation. The selection carries stable
 /// Skill IDs and canonical MCP server capability IDs; labels and runtime
@@ -966,6 +978,66 @@ pub(crate) fn launch_selection_capabilities(
         });
     }
     Ok(capabilities)
+}
+
+/// Read the exact Task selection when one was pinned; older Tasks retain the
+/// server-only launch contract.
+pub(crate) fn task_launch_selection_capabilities(
+    selection: &pioneer_protocol::AgentExecutionSelection,
+) -> anyhow::Result<Vec<pioneer_protocol::TurnCapability>> {
+    use pioneer_protocol::TurnCapabilityKind;
+
+    if !selection.selected_capabilities.is_empty() {
+        let mut skill_ids = Vec::new();
+        let mut mcp_server_ids = Vec::new();
+        let mut capability_ids = Vec::new();
+        for capability in &selection.selected_capabilities {
+            if capability_ids.contains(&capability.id) {
+                anyhow::bail!("persisted Task launch contains duplicate capabilities");
+            }
+            capability_ids.push(capability.id.clone());
+            match &capability.kind {
+                TurnCapabilityKind::Skill {
+                    skill_id,
+                    pack_id: None,
+                } if capability.id == pioneer_protocol::skill_capability_key(skill_id) => {
+                    skill_ids.push(skill_id.clone());
+                }
+                TurnCapabilityKind::McpServer { name, scope_kind }
+                    if capability.id
+                        == pioneer_protocol::mcp_server_capability_key(*scope_kind, name) =>
+                {
+                    let id = capability.id.clone();
+                    if !mcp_server_ids.contains(&id) {
+                        mcp_server_ids.push(id);
+                    }
+                }
+                TurnCapabilityKind::McpTool {
+                    server_name,
+                    raw_tool_name,
+                    scope_kind,
+                } if capability.id
+                    == pioneer_protocol::mcp_tool_capability_key(
+                        *scope_kind,
+                        server_name,
+                        raw_tool_name,
+                    ) =>
+                {
+                    let id = pioneer_protocol::mcp_server_capability_key(*scope_kind, server_name);
+                    if !mcp_server_ids.contains(&id) {
+                        mcp_server_ids.push(id);
+                    }
+                }
+                _ => anyhow::bail!("persisted Task launch capability is not normalized"),
+            }
+        }
+        if skill_ids != selection.skill_ids || mcp_server_ids != selection.mcp_server_ids {
+            anyhow::bail!("persisted Task launch capabilities differ from its grant selection");
+        }
+        return Ok(selection.selected_capabilities.clone());
+    }
+
+    launch_selection_capabilities(selection)
 }
 
 pub(crate) fn root_agent_execution_id_for_turn(turn_id: &str) -> String {
@@ -1487,6 +1559,7 @@ pub(crate) async fn prepare_root_agent_execution_admission(
                     permission_profile: None,
                     skill_ids: Vec::new(),
                     mcp_server_ids: Vec::new(),
+                    selected_capabilities: Vec::new(),
                 },
             });
     let start_options = pioneer_protocol::AgentStartOptionsProjection {
@@ -1847,7 +1920,7 @@ pub(crate) async fn materialize(
     };
 
     // Target options are required by message as well as launch actions. The
-    // catalog still capability-filters agent_start_options/agent_start, while
+    // catalog still capability-filters threads_start_options/threads_turn_start, while
     // every projected mutation receives the same immutable opaque targets.
     let options = Some(binding.options.clone());
     let initiating_thread_id = Some(
@@ -2294,14 +2367,10 @@ impl ToolHandler for AgentActionToolHandler {
                     ToolPayload::Function { arguments } => serde_json::from_value(arguments),
                     ToolPayload::Custom { input } => serde_json::from_str(input.as_str()),
                     _ => {
-                        return Err(ToolError::invalid_arguments(
-                            AgentPublicOutcome::AgentActionNotAllowed.as_str(),
-                        ));
+                        return Err(ToolError::invalid_arguments("agent_invalid_arguments"));
                     }
                 }
-                .map_err(|_| {
-                    ToolError::invalid_arguments(AgentPublicOutcome::AgentActionNotAllowed.as_str())
-                })?;
+                .map_err(|_| ToolError::invalid_arguments("agent_invalid_arguments"))?;
                 let options = self.options.as_ref().ok_or_else(|| {
                     ToolError::execution_failed("agent start options are unavailable")
                 })?;
@@ -3713,7 +3782,11 @@ pub(crate) async fn authorize_task_observations(
 
 pub(crate) fn adapter_tool_error(error: AgentToolAdapterError) -> ToolError {
     match error {
+        AgentToolAdapterError::InvalidArguments => {
+            ToolError::invalid_arguments("agent_invalid_arguments")
+        }
         AgentToolAdapterError::InvalidInput(_) => {
+            // Preserve the existing non-disclosing launch restriction outcome.
             ToolError::invalid_arguments(AgentPublicOutcome::AgentActionNotAllowed.as_str())
         }
         AgentToolAdapterError::OptionsUnavailable => {
@@ -3745,7 +3818,7 @@ pub(crate) fn adapter_tool_error(error: AgentToolAdapterError) -> ToolError {
 
 /// Model-facing tool failures must never echo database/provider errors, raw
 /// target identifiers, host metadata, or authored payloads. Preserve only the
-/// fixed agent domain outcome vocabulary produced by the canonical adapter;
+/// fixed agent domain outcomes and explicitly classified decoding errors;
 /// collapse every other detail at this final disclosure boundary.
 pub(crate) fn sanitize_agent_tool_error(error: ToolError) -> ToolError {
     fn stable_outcome(message: &str) -> Option<&'static str> {
@@ -3778,6 +3851,11 @@ pub(crate) fn sanitize_agent_tool_error(error: ToolError) -> ToolError {
     }
 
     match error {
+        // This exact public code is assigned at decoding boundaries. Unknown
+        // InvalidArguments also include semantic failures after decoding.
+        ToolError::InvalidArguments(message) if message == "agent_invalid_arguments" => {
+            ToolError::invalid_arguments("agent_invalid_arguments")
+        }
         ToolError::InvalidArguments(message) => ToolError::invalid_arguments(
             stable_outcome(message.as_str())
                 .unwrap_or(AgentPublicOutcome::AgentActionNotAllowed.as_str()),
@@ -3891,6 +3969,50 @@ mod tests {
             payload.to_string(),
             "tool execution failed: agent_action_payload_limit_exceeded"
         );
+    }
+
+    #[test]
+    fn decoding_errors_remain_arguments_while_authorization_denial_remains_denial() {
+        let invalid =
+            sanitize_agent_tool_error(adapter_tool_error(AgentToolAdapterError::InvalidArguments));
+        assert!(matches!(invalid, ToolError::InvalidArguments(_)));
+        assert_eq!(
+            invalid.to_string(),
+            "invalid arguments: agent_invalid_arguments"
+        );
+        let direct_decode =
+            sanitize_agent_tool_error(ToolError::invalid_arguments("agent_invalid_arguments"));
+        assert_eq!(
+            direct_decode.to_string(),
+            "invalid arguments: agent_invalid_arguments"
+        );
+        let denied = sanitize_agent_tool_error(adapter_tool_error(AgentToolAdapterError::Action(
+            crate::authorization::AgentActionServiceError::NotAuthorized("hidden policy detail"),
+        )));
+        assert_eq!(
+            denied.to_string(),
+            "tool execution failed: agent_action_not_allowed"
+        );
+    }
+
+    #[test]
+    fn semantic_argument_errors_keep_the_non_disclosing_fallback() {
+        let secret = "secret://workspace/private-skill/internal-data";
+        for message in [
+            format!("child Agent launch capabilities are unavailable: {secret}"),
+            format!("invalid child Agent launch capabilities: {secret}"),
+            "agent action idempotency key was reused with different input".to_owned(),
+            secret.to_owned(),
+            // Mentioning a public code inside raw text does not classify it.
+            format!("agent_invalid_arguments: {secret}"),
+        ] {
+            let public = sanitize_agent_tool_error(ToolError::invalid_arguments(message));
+            assert_eq!(
+                public.to_string(),
+                "invalid arguments: agent_action_not_allowed"
+            );
+            assert!(!public.to_string().contains(secret));
+        }
     }
 
     #[test]

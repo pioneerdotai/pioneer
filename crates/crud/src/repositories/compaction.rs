@@ -188,6 +188,7 @@ pub struct SourceRecord {
     pub item_id: Option<String>,
     pub reference: SourceRef,
     pub sequence: i64,
+    pub created_at: sea_orm::prelude::DateTimeWithTimeZone,
     pub payload: Option<String>,
     pub incomplete: bool,
 }
@@ -409,6 +410,38 @@ pub(crate) async fn compaction_source_metadata_page_at_fence(
         .await
 }
 
+pub(crate) async fn compaction_item_created_at(
+    store: &CrudStore,
+    workspace: &str,
+    thread_id: &str,
+    turn_id: &str,
+    id: &str,
+) -> Result<Option<sea_orm::prelude::DateTimeWithTimeZone>> {
+    Ok(turn_item::Entity::find_by_id(id)
+        .join(
+            JoinType::InnerJoin,
+            turn_item::Entity::belongs_to(turn::Entity)
+                .from(turn_item::Column::TurnId)
+                .to(turn::Column::Id)
+                .into(),
+        )
+        .join(
+            JoinType::InnerJoin,
+            turn::Entity::belongs_to(thread::Entity)
+                .from(turn::Column::ThreadId)
+                .to(thread::Column::Id)
+                .into(),
+        )
+        .filter(turn_item::Column::TurnId.eq(turn_id))
+        .filter(turn::Column::ThreadId.eq(thread_id))
+        .filter(thread::Column::WorkspaceId.eq(workspace))
+        .select_only()
+        .column(turn_item::Column::CreatedAt)
+        .into_tuple::<sea_orm::prelude::DateTimeWithTimeZone>()
+        .one(&store.connection)
+        .await?)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn compaction_source_page_inner<C: ConnectionTrait>(
     db: &C,
@@ -473,6 +506,7 @@ struct CanonicalProjection<E: EntityTrait, P = SourcePaging> {
 
 struct SourcePaging {
     sequence: Expr,
+    created_at: Expr,
     source_type: Expr,
     item_id: Expr,
     tool_name: Expr,
@@ -484,6 +518,7 @@ struct SourcePaging {
 struct CanonicalSourceMetadata {
     id: String,
     sequence: i64,
+    created_at: sea_orm::prelude::DateTimeWithTimeZone,
     source_type: String,
     item_id: Option<String>,
     tool_name: Option<String>,
@@ -513,6 +548,7 @@ async fn read_source_page<C: ConnectionTrait, E: EntityTrait>(
         .select_only()
         .column(projection.id)
         .expr_as(projection.paging.sequence.clone(), "sequence")
+        .expr_as(projection.paging.created_at, "created_at")
         .expr_as(projection.paging.source_type, "source_type")
         .expr_as(projection.paging.item_id, "item_id")
         .expr_as(projection.paging.tool_name, "tool_name")
@@ -580,6 +616,7 @@ async fn read_source_page<C: ConnectionTrait, E: EntityTrait>(
                 version: format!("{}:{}", kind.version_prefix(), row.revision),
             },
             sequence: row.sequence,
+            created_at: row.created_at,
             incomplete: payload.is_none(),
             payload,
         });
@@ -644,6 +681,7 @@ fn turn_input_projection(
         )),
         paging: SourcePaging {
             sequence: Expr::col((turn_input::Entity, turn_input::Column::InputIndex)).add(1),
+            created_at: Expr::col((turn_input::Entity, turn_input::Column::CreatedAt)),
             source_type: Expr::col((turn_input::Entity, turn_input::Column::InputType)),
             item_id: null.clone(),
             tool_name: null.clone(),
@@ -731,6 +769,7 @@ fn turn_event_projection(
         )),
         paging: SourcePaging {
             sequence: Expr::col((turn_event::Entity, turn_event::Column::Sequence)),
+            created_at: Expr::col((turn_event::Entity, turn_event::Column::CreatedAt)),
             source_type: Expr::col((turn_event::Entity, turn_event::Column::EventType)),
             item_id: current_projection(compaction_event_revision::Column::ItemId),
             tool_name: null.clone(),
@@ -807,6 +846,10 @@ fn turn_llm_context_projection(
         )),
         paging: SourcePaging {
             sequence: Expr::col((turn_llm_context::Entity, turn_llm_context::Column::Sequence)),
+            created_at: Expr::col((
+                turn_llm_context::Entity,
+                turn_llm_context::Column::CreatedAt,
+            )),
             source_type: Expr::col((turn_llm_context::Entity, turn_llm_context::Column::Source)),
             item_id: Expr::col((turn_llm_context::Entity, turn_llm_context::Column::ItemId)),
             tool_name: Expr::col((turn_llm_context::Entity, turn_llm_context::Column::ToolName)),

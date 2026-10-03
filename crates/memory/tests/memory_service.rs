@@ -1469,7 +1469,10 @@ async fn semantic_write_requires_evidence() {
         .write_semantic_memory(user_context(325), params)
         .await
         .expect_err("semantic writes without evidence must fail");
-    assert!(error.to_string().contains("requires evidence"));
+    assert_eq!(
+        error.downcast_ref::<pioneer_memory::MemoryWriteFailure>(),
+        Some(&pioneer_memory::MemoryWriteFailure::InvalidInput),
+    );
 }
 
 #[tokio::test]

@@ -354,8 +354,18 @@ impl TaskToolProvider for GatewayTaskToolProvider {
                         }),
                     error_message: run
                         .and_then(|run| run.error.as_ref())
-                        .map(|error| error.message.clone())
-                        .or_else(|| item.task.error.as_ref().map(|error| error.message.clone())),
+                        .map(|error| {
+                            error
+                                .recovery_public_message()
+                                .unwrap_or_else(|| error.message.clone())
+                        })
+                        .or_else(|| {
+                            item.task.error.as_ref().map(|error| {
+                                error
+                                    .recovery_public_message()
+                                    .unwrap_or_else(|| error.message.clone())
+                            })
+                        }),
                     child_thread_id: item.child_thread_id.clone(),
                     child_turn_id: item.child_turn_id.clone(),
                 }
@@ -560,13 +570,17 @@ impl TaskToolProvider for GatewayTaskToolProvider {
                     }),
                 error_message: run
                     .and_then(|run| run.error.as_ref())
-                    .map(|error| error.message.clone())
+                    .map(|error| {
+                        error
+                            .recovery_public_message()
+                            .unwrap_or_else(|| error.message.clone())
+                    })
                     .or_else(|| {
-                        response
-                            .task
-                            .error
-                            .as_ref()
-                            .map(|error| error.message.clone())
+                        response.task.error.as_ref().map(|error| {
+                            error
+                                .recovery_public_message()
+                                .unwrap_or_else(|| error.message.clone())
+                        })
                     }),
                 child_thread_id: child_anchor.child_thread_id,
                 child_turn_id: child_anchor.child_turn_id,
@@ -1227,6 +1241,61 @@ impl ToolHandler for TaskToolHandler {
 }
 
 impl TaskToolHandler {
+    async fn merged_immediate_task_capabilities(
+        &self,
+        agent_launch: &pioneer_protocol::AgentLaunchSelection,
+    ) -> Result<Vec<pioneer_protocol::TurnCapability>, ToolError> {
+        let snapshot = self
+            .processor
+            .crud_store
+            .get_turn_runtime_snapshot(self.context.turn_id.as_str())
+            .await
+            .map_err(|error| {
+                ToolError::execution_failed(format!(
+                    "failed to load parent Turn capabilities: {error:#}"
+                ))
+            })?
+            .filter(|snapshot| {
+                snapshot.workspace_id == self.context.workspace_id
+                    && snapshot.thread_id == self.context.thread_id
+            })
+            .ok_or_else(|| {
+                ToolError::execution_failed("parent Turn capability snapshot is unavailable")
+            })?;
+        let mut capabilities = crate::turn_runtime_snapshot::restored_execution_capabilities(
+            snapshot.capabilities_json.as_str(),
+        )
+        .map_err(|error| {
+            ToolError::execution_failed(format!("parent Turn capabilities are invalid: {error:#}"))
+        })?;
+        let requested = crate::message::agent_action_tools::launch_selection_capabilities(
+            &agent_launch.execution,
+        )
+        .map_err(|error| {
+            ToolError::invalid_arguments(format!(
+                "invalid child Agent launch capabilities: {error:#}"
+            ))
+        })?;
+        capabilities = merge_task_capabilities(capabilities, requested);
+        if capabilities.len() > pioneer_protocol::TURN_EXECUTION_CAPABILITY_MAX_COUNT {
+            return Err(ToolError::invalid_arguments(
+                "immediate Task capabilities exceed the Turn limit",
+            ));
+        }
+        self.processor
+            .normalize_turn_skill_capabilities(
+                self.context.workspace_id.as_str(),
+                capabilities.as_slice(),
+            )
+            .await
+            .map(|normalized| normalized.execution)
+            .map_err(|error| {
+                ToolError::invalid_arguments(format!(
+                    "immediate Task capabilities are unavailable: {error}"
+                ))
+            })
+    }
+
     async fn handle_in_fresh_task(
         &self,
         invocation: ToolInvocation,
@@ -1285,6 +1354,29 @@ impl TaskToolHandler {
             other => Err(ToolError::NotFound(other.to_owned())),
         }
     }
+}
+
+fn merge_task_capabilities(
+    mut inherited: Vec<pioneer_protocol::TurnCapability>,
+    additional: Vec<pioneer_protocol::TurnCapability>,
+) -> Vec<pioneer_protocol::TurnCapability> {
+    inherited.extend(additional);
+    inherited.sort_by(|left, right| left.id.cmp(&right.id));
+    inherited.dedup_by(|left, right| left.id == right.id);
+    inherited
+}
+
+fn inherits_task_capabilities(
+    trigger_kind: TaskTriggerKind,
+    target: Option<&pioneer_protocol::AgentStartTarget>,
+) -> bool {
+    trigger_kind == TaskTriggerKind::Immediate
+        && matches!(
+            target,
+            Some(pioneer_protocol::AgentStartTarget::CurrentThread)
+                | Some(pioneer_protocol::AgentStartTarget::SameCapsuleThread { .. })
+                | None
+        )
 }
 
 impl TaskToolHandler {
@@ -1558,7 +1650,6 @@ impl TaskToolHandler {
             .agent_action_binding(self.context.turn_id.as_str())
             .await
             .ok_or_else(task_tool_authorization_error)?;
-        params.launch = Some(server_launch.clone());
         let nested_task = params.parent_task_id.is_some();
         let immediate_detached = trigger_kind == TaskTriggerKind::Immediate
             && params
@@ -1573,9 +1664,6 @@ impl TaskToolHandler {
                     .attachment
                 })
                 == TaskAttachmentMode::Detached;
-        let execution_admission = authorization
-            .authorize_execution_intent(self.processor.as_ref(), &params)
-            .await?;
         let mut create_context = pioneer_tasks::TaskCreateContext::default();
         // Agent-authored Task creation is bound to the exact execution that
         // owns this turn.  Do not reuse the initiating human principal as the
@@ -1626,7 +1714,6 @@ impl TaskToolHandler {
             create_context.work_graph_root_execution_id =
                 Some(creator_work_graph_root_execution_id);
         }
-        create_context.launch_selection = Some(server_launch.clone());
         let (identity, profile) = if matches!(
             server_launch.agent,
             pioneer_protocol::AgentIdentitySelection::ServerDerivedEphemeral { .. }
@@ -1732,6 +1819,28 @@ impl TaskToolHandler {
                     .map(|return_route_id| (route.route_id.clone(), return_route_id.clone()));
             }
         }
+        let inherit_capabilities =
+            inherits_task_capabilities(trigger_kind, prepared.normalized.target.as_ref());
+        let mut persisted_launch = server_launch.clone();
+        if inherit_capabilities {
+            let capabilities = self
+                .merged_immediate_task_capabilities(&server_launch)
+                .await?;
+            crate::message::agent_action_tools::pin_immediate_task_capabilities(
+                &mut persisted_launch,
+                &capabilities,
+            )
+            .map_err(|error| {
+                ToolError::invalid_arguments(format!(
+                    "invalid immediate Task capabilities: {error:#}"
+                ))
+            })?;
+        }
+        params.launch = Some(persisted_launch.clone());
+        create_context.launch_selection = Some(persisted_launch);
+        let execution_admission = authorization
+            .authorize_execution_intent(self.processor.as_ref(), &params)
+            .await?;
         let agent_action_projection = plan.projection;
         create_context.agent_action_commit = Some(plan.input);
         if let Some((ingress_route_id, return_route_id)) = routed_task_return {
@@ -1855,7 +1964,6 @@ impl TaskToolHandler {
         trace: pioneer_tools::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let attempt_id = invocation.attempt_id;
-        let current_call_id = invocation.call_id.clone();
         let input: TaskWaitToolInput = decode_tool_args(invocation)?;
         let mut params = input.into_params()?;
 
@@ -1871,13 +1979,6 @@ impl TaskToolHandler {
 
         if let Some(guard_output) = self
             .non_waitable_scheduled_guard(&signature, &params)
-            .await?
-        {
-            return Ok(function_output(guard_output));
-        }
-
-        if let Some(guard_output) = self
-            .duplicate_wait_guard(signature.clone(), &params, current_call_id.as_str())
             .await?
         {
             return Ok(function_output(guard_output));
@@ -1948,60 +2049,6 @@ impl TaskToolHandler {
             non_waitable,
             waitable_task_ids,
             !params.run_ids.is_empty(),
-        )))
-    }
-
-    async fn duplicate_wait_guard(
-        &self,
-        signature: TaskWaitSignature,
-        params: &pioneer_protocol::TaskWaitParams,
-        current_call_id: &str,
-    ) -> Result<Option<JsonValue>, ToolError> {
-        let prior = prior_wait_calls_for_signature(
-            &self.processor,
-            &self.context,
-            &signature,
-            current_call_id,
-        )
-        .await
-        .map_err(task_runtime_tool_error)?;
-        if prior.is_empty() {
-            return Ok(None);
-        }
-
-        let mut state_params = params.clone();
-        state_params.timeout_ms = Some(0);
-        state_params.return_completed = false;
-        state_params.return_pending = false;
-        let state = self
-            .processor
-            .task_runtime
-            .service()
-            .wait_tasks(pioneer_tasks::TaskWaitContext::default(), state_params)
-            .await
-            .map_err(task_runtime_tool_error)?;
-
-        if !duplicate_wait_should_block(
-            &prior,
-            state.terminal_count,
-            state.pending_count,
-            state.review_required_count,
-        ) {
-            return Ok(None);
-        }
-        let last = prior
-            .last()
-            .expect("prior wait list checked as non-empty before last()");
-
-        Ok(Some(task_wait_guard_output(
-            &signature,
-            last.item_id.as_str(),
-            state.total_count,
-            state.terminal_count,
-            state.pending_count,
-            state.review_required_count,
-            last.timed_out,
-            prior.len(),
         )))
     }
 
@@ -2440,14 +2487,23 @@ impl TaskToolHandler {
             .get_task(params)
             .await
             .map_err(task_runtime_tool_error)?;
-        let payload = serde_json::to_value(
-            crate::task_projection::project_task_get_with_configuration(
-                &response,
-                false,
-                configuration_allowed,
-            ),
-        )
-        .map_err(|error| ToolError::execution_failed(format!("failed to project task: {error}")))?;
+        let run_ids = response
+            .runs
+            .iter()
+            .map(|run| run.id.clone())
+            .collect::<Vec<_>>();
+        let observations = self
+            .processor
+            .crud_store
+            .list_task_run_execution_observations(&run_ids)
+            .await
+            .map_err(task_runtime_tool_error)?;
+        let payload = task_get_tool_output(
+            &response,
+            configuration_allowed,
+            &observations,
+            now_timestamp_secs(),
+        )?;
         Ok(function_output(payload))
     }
 
@@ -3024,13 +3080,14 @@ struct TaskCreateToolInput {
     /// Short concrete objective for the task executor. Put durable run instructions in instructions, task data in inputText/input, and result format in outputInstructions.
     goal: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Opaque destination from agent_start_options. Omit for the current
+    /// Opaque destination from threads_start_options. Omit for the current
     /// thread. A routed option is revalidated at Task commit and again for
     /// every occurrence; raw thread or route ids are never accepted here.
     target_option_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Optional child identity/profile selection from agent_start_options.
-    /// Omit to inherit the currently bound agent identity and profile.
+    /// Optional child identity/profile and additional Skill/MCP selection from
+    /// threads_start_options. Immediate tasks in the current capsule inherit the
+    /// current Turn's selected capabilities. Empty lists keep that inheritance.
     launch: Option<AgentToolLaunchSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Omit for an immediate attached subagent. Use this object directly; do not wrap it in spec, schedule, or triggerInput. For daily scheduled work choose the cron trigger kind and fill its leaf fields.
@@ -3333,7 +3390,7 @@ struct TaskWaitToolInput {
     #[serde(default)]
     #[schemars(length(max = 64), inner(length(min = 21, max = 21)))]
     run_ids: Vec<String>,
-    /// Optional timeout in milliseconds.
+    /// Optional window in milliseconds for this wait call. A timeout does not stop the run; active targets may be waited on again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     timeout_ms: Option<u64>,
@@ -3788,7 +3845,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
     vec![
         task_tool_spec(
             TASK_CREATE_TOOL,
-            "Create a durable task or subagent. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and delivers the result to the origin thread. For scheduled, interval, and cron work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
+            "Create a durable task or attached subagent for delegation. threads_turn_start starts a thread turn without creating a task. For explicit launch or destination selection, call threads_start_options from the task domain; inherited launch needs no lookup. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. The runtime carries the current Turn's selected Skills and MCP into immediate subagents in the same capsule, including background subagents; launch selections add to that set. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and delivers the result to the origin thread. For scheduled, interval, and cron work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
             task_create_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Arguments,
@@ -3800,7 +3857,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_WAIT_TOOL,
-            "Wait for progress from one or more active attached task ids or run ids using the task event bus. By default it returns as soon as any target is terminal or ready for review. For an authorized reviewer, each reviewRequired item includes reviewer-safe reviewContent from the exact immutable candidate. Inspect that content before task_accept or task_revise. If reviewContent is truncated, or must be read again after recovery/compaction, call task_result with the returned candidateId and continue with nextCursor. Then handle the candidate and call task_wait again for remaining active runs. Use all_terminal only when an intentional barrier without intermediate result handling is required. timeoutMs limits only this observation window and returns timedOut=true without cancelling the tasks or failing the parent Turn. When timeoutMs is omitted, confirmed target activity keeps the durable wait alive until its condition is satisfied. Do not call task_wait after creating scheduled, interval, or cron tasks when task_create returned waitable=false/runId=null; confirm the schedule instead. Repeat task_wait only after the prior call timed out or after its returned terminal/review-required progress was handled.",
+            "Wait for one or more active attached task ids or run ids using the task event bus. By default it returns as soon as any target is terminal or ready for review. For an authorized reviewer, each reviewRequired item includes reviewer-safe reviewContent from the exact immutable candidate. Inspect that content before task_accept or task_revise. If reviewContent is truncated, or must be read again after recovery/compaction, call task_result with the returned candidateId and continue with nextCursor. Then handle the candidate and call task_wait again for remaining active runs. Use all_terminal only when an intentional barrier without intermediate result handling is required. timeoutMs limits only this observation window: timedOut=true does not cancel, stop, or diagnose a child, and active targets may be waited on again after a timeout. A run's own timeout appears in its run status and error. When timeoutMs is omitted, confirmed target activity keeps the durable wait alive until its condition is satisfied. Do not call task_wait after creating scheduled, interval, or cron tasks when task_create returned waitable=false/runId=null; confirm the schedule instead.",
             task_wait_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Transient,
@@ -3857,7 +3914,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_GET_TOOL,
-            "Get durable task status, runs, triggers, and dependencies by stable taskId within the authorized root-thread capsule, including tasks from earlier executions. An access error does not mean the task is absent or cancelled. When the current execution may manage the exact task, the response also includes a safe configuration view with exact ordinary schedules, executor instructions, output instructions, and lifecycle/delivery/retry/timeout/concurrency settings. Secret webhook URLs, task input, external-trigger filters, internal host paths, raw diagnostics, and execution-security snapshots are never returned; executor instructions are returned exactly as authored.",
+            "Get durable task status, runs, triggers, and dependencies by stable taskId within the authorized root-thread capsule, including tasks from earlier executions. Each run has an execution observation with its status, heartbeatAt, lastActivityAt when confirmed task progress was recorded for the current attempt, and observedAt. A null execution status means no execution row was observed; null activity means unknown, not stalled. A heartbeat shows periodic liveness, not meaningful work progress. A running run has not finished; an unchanged updatedAt or missing result does not prove it is stuck. Do not cancel or repeat work solely because task_get stays the same or a result takes time. An access error does not mean the task is absent or cancelled. When the current execution may manage the exact task, the response also includes a safe configuration view with exact ordinary schedules, executor instructions, output instructions, and lifecycle/delivery/retry/timeout/concurrency settings. Secret webhook URLs, task input, external-trigger filters, internal host paths, raw diagnostics, and execution-security snapshots are never returned; executor instructions are returned exactly as authored.",
             task_id_schema(),
             safe_read_recovery(),
         ),
@@ -4545,12 +4602,6 @@ impl TaskWaitSignature {
         }
     }
 
-    fn from_arguments(arguments: &JsonValue) -> Option<Self> {
-        let input = serde_json::from_value::<TaskWaitToolInput>(arguments.clone()).ok()?;
-        let params = input.into_params().ok()?;
-        Some(Self::from_params(&params))
-    }
-
     fn to_json(&self) -> JsonValue {
         json!({
             "taskIds": self.task_ids,
@@ -4558,111 +4609,6 @@ impl TaskWaitSignature {
             "mode": wait_mode_label(self.mode),
         })
     }
-}
-
-#[derive(Debug, Clone)]
-struct PriorWaitCall {
-    item_id: String,
-    timed_out: bool,
-    terminal_count: u32,
-    pending_count: u32,
-    review_required_count: u32,
-}
-
-async fn prior_wait_calls_for_signature(
-    processor: &Arc<MessageProcessor>,
-    context: &TaskTurnContext,
-    signature: &TaskWaitSignature,
-    current_call_id: &str,
-) -> anyhow::Result<Vec<PriorWaitCall>> {
-    let parent_items = processor
-        .crud_store
-        .list_turn_items_by_type(context.turn_id.as_str(), "dynamic_tool_call")
-        .await?;
-
-    let mut prior_calls = Vec::<PriorWaitCall>::new();
-    for item in parent_items {
-        let Some(prior) = prior_wait_call_from_item(item, signature, current_call_id) else {
-            continue;
-        };
-        if let Some(existing) = prior_calls
-            .iter_mut()
-            .find(|existing| existing.item_id == prior.item_id)
-        {
-            *existing = prior;
-        } else {
-            prior_calls.push(prior);
-        }
-    }
-    Ok(prior_calls)
-}
-
-fn prior_wait_call_from_item(
-    item: TurnItem,
-    signature: &TaskWaitSignature,
-    current_call_id: &str,
-) -> Option<PriorWaitCall> {
-    let TurnItem::DynamicToolCall {
-        id,
-        tool_name,
-        arguments,
-        status,
-        storage,
-        ..
-    } = item
-    else {
-        return None;
-    };
-    if id == current_call_id || tool_name != TASK_WAIT_TOOL || status != ToolCallStatus::Completed {
-        return None;
-    }
-    if TaskWaitSignature::from_arguments(&arguments).as_ref() != Some(signature) {
-        return None;
-    }
-    let wait_result = wait_result_from_storage(&storage)?;
-    Some(PriorWaitCall {
-        item_id: id,
-        timed_out: wait_result
-            .get("timedOut")
-            .and_then(JsonValue::as_bool)
-            .unwrap_or(false),
-        terminal_count: json_u32(&wait_result, "terminalCount"),
-        pending_count: json_u32(&wait_result, "pendingCount"),
-        review_required_count: json_u32(&wait_result, "reviewRequiredCount"),
-    })
-}
-
-fn duplicate_wait_should_block(
-    prior: &[PriorWaitCall],
-    terminal_count: u32,
-    pending_count: u32,
-    review_required_count: u32,
-) -> bool {
-    if prior.is_empty() || pending_count == 0 || review_required_count > 0 {
-        return false;
-    }
-    let last = prior
-        .last()
-        .expect("prior wait list checked as non-empty before last()");
-    if terminal_count != last.terminal_count
-        || pending_count != last.pending_count
-        || review_required_count != last.review_required_count
-    {
-        return false;
-    }
-    if last.timed_out {
-        return prior
-            .iter()
-            .filter(|entry| {
-                entry.timed_out
-                    && entry.terminal_count == terminal_count
-                    && entry.pending_count == pending_count
-                    && entry.review_required_count == review_required_count
-            })
-            .count()
-            >= 2;
-    }
-    true
 }
 
 fn wait_result_from_storage(storage: &ToolStoragePayload) -> Option<JsonValue> {
@@ -4690,14 +4636,6 @@ fn mutation_idempotency_key_for_item(
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .or_else(|| Some(format!("{tool_name}:{item_id}")))
-}
-
-fn json_u32(value: &JsonValue, key: &str) -> u32 {
-    value
-        .get(key)
-        .and_then(JsonValue::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or_default()
 }
 
 fn task_create_tool_output(response: &TaskCreateResponse, anchor: &TaskTurnItem) -> JsonValue {
@@ -5001,33 +4939,32 @@ fn task_wait_tool_output(
     output
 }
 
-fn task_wait_guard_output(
-    signature: &TaskWaitSignature,
-    previous_wait_item_id: &str,
-    total_count: u32,
-    terminal_count: u32,
-    pending_count: u32,
-    review_required_count: u32,
-    previous_timed_out: bool,
-    prior_wait_count: usize,
-) -> JsonValue {
-    json!({
-        "repeatedWait": true,
-        "waitSignature": signature.to_json(),
-        "previousWaitItemId": previous_wait_item_id,
-        "mode": wait_mode_label(signature.mode),
-        "totalCount": total_count,
-        "terminalCount": terminal_count,
-        "pendingCount": pending_count,
-        "reviewRequiredCount": review_required_count,
-        "previousTimedOut": previous_timed_out,
-        "priorWaitCount": prior_wait_count,
-        "recommendation": if previous_timed_out {
-            "cancel_detach_or_return_partial_result"
-        } else {
-            "wait_for_timeline_change_or_cancel"
-        },
-    })
+fn task_get_tool_output(
+    response: &TaskGetResponse,
+    configuration_allowed: bool,
+    observations: &[pioneer_crud::TaskRunExecutionObservationRecord],
+    observed_at: i64,
+) -> Result<JsonValue, ToolError> {
+    let by_run = observations
+        .iter()
+        .map(|observation| (observation.run_id.as_str(), observation))
+        .collect::<BTreeMap<_, _>>();
+    let mut projected = crate::task_projection::project_task_get_with_configuration(
+        response,
+        false,
+        configuration_allowed,
+    );
+    for run in &mut projected.runs {
+        let observation = by_run.get(run.id.as_str()).copied();
+        run.execution = Some(pioneer_protocol::PublicTaskRunExecutionObservation {
+            status: observation.map(|value| value.status),
+            heartbeat_at: observation.and_then(|value| value.heartbeat_at),
+            last_activity_at: observation.and_then(|value| value.last_activity_at),
+            observed_at,
+        });
+    }
+    serde_json::to_value(projected)
+        .map_err(|error| ToolError::execution_failed(format!("failed to project task: {error}")))
 }
 
 fn task_wait_non_waitable_output(
@@ -5440,6 +5377,9 @@ fn result_preview(result: Option<&TaskResult>) -> Option<String> {
 
 fn error_preview(error: Option<&TaskError>) -> Option<String> {
     error.map(|error| {
+        if let Some(message) = error.recovery_public_message() {
+            return message;
+        }
         match error.class {
             pioneer_protocol::TaskErrorClass::Cancelled => "Task was cancelled.",
             pioneer_protocol::TaskErrorClass::Timeout => "Task execution timed out.",
@@ -5509,28 +5449,123 @@ mod tests {
     use sea_orm::ConnectionTrait;
     use std::path::PathBuf;
 
-    fn prior(timed_out: bool, terminal_count: u32) -> PriorWaitCall {
-        PriorWaitCall {
-            item_id: "wait_item".to_owned(),
-            timed_out,
-            terminal_count,
-            pending_count: 3,
-            review_required_count: 0,
+    #[test]
+    fn attached_task_launch_keeps_exact_inherited_capabilities_across_nested_launches() {
+        use pioneer_protocol::{McpScopeKind, TurnCapability, TurnCapabilityKind};
+
+        let skill = |letter: &str| {
+            let skill_id = pioneer_protocol::SkillId::new(letter.repeat(21)).unwrap();
+            TurnCapability {
+                id: pioneer_protocol::skill_capability_key(&skill_id),
+                kind: TurnCapabilityKind::Skill {
+                    skill_id,
+                    pack_id: None,
+                },
+                label: None,
+            }
+        };
+        let tool = TurnCapability {
+            id: pioneer_protocol::mcp_tool_capability_key(
+                McpScopeKind::Workspace,
+                "resend",
+                "send",
+            ),
+            kind: TurnCapabilityKind::McpTool {
+                server_name: "resend".to_owned(),
+                raw_tool_name: "send".to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            },
+            label: None,
+        };
+        let server = TurnCapability {
+            id: pioneer_protocol::mcp_server_capability_key(McpScopeKind::Workspace, "resend"),
+            kind: TurnCapabilityKind::McpServer {
+                name: "resend".to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            },
+            label: None,
+        };
+        // The parent snapshot has already expanded a package to individual
+        // Skills. A repeated child selection must not expand it again.
+        let inherited = vec![skill("A"), skill("B"), tool.clone()];
+        assert_eq!(
+            merge_task_capabilities(inherited.clone(), Vec::new()),
+            merge_task_capabilities(Vec::new(), inherited.clone())
+        );
+        let merged =
+            merge_task_capabilities(inherited, vec![skill("B"), skill("C"), server.clone()]);
+        assert_eq!(merged.len(), 5);
+        let mut launch = AgentToolLaunchSelection {
+            identity: AgentToolIdentityChoice::InheritParent,
+            profile: AgentToolProfileChoice::InheritParent,
+            reasoning: None,
+            permission_profile: None,
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
         }
+        .into_server_selection();
+        crate::message::agent_action_tools::pin_immediate_task_capabilities(&mut launch, &merged)
+            .unwrap();
+        let persisted: pioneer_protocol::AgentLaunchSelection =
+            serde_json::from_str(&serde_json::to_string(&launch).unwrap()).unwrap();
+        let child = crate::message::agent_action_tools::task_launch_selection_capabilities(
+            &persisted.execution,
+        )
+        .unwrap();
+        assert_eq!(child, merged);
+        assert!(child.contains(&tool));
+        assert!(child.contains(&server));
+        assert_eq!(persisted.execution.mcp_server_ids, vec![server.id]);
+        assert_eq!(merge_task_capabilities(child.clone(), child), merged);
+        let mut invalid = persisted.execution;
+        invalid.mcp_server_ids.clear();
+        assert!(
+            crate::message::agent_action_tools::task_launch_selection_capabilities(&invalid)
+                .is_err(),
+            "a persisted exact tool must remain inside its authorized server grant"
+        );
+
+        let mut tool_only_launch = AgentToolLaunchSelection {
+            identity: AgentToolIdentityChoice::InheritParent,
+            profile: AgentToolProfileChoice::InheritParent,
+            reasoning: None,
+            permission_profile: None,
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+        }
+        .into_server_selection();
+        crate::message::agent_action_tools::pin_immediate_task_capabilities(
+            &mut tool_only_launch,
+            &[tool.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            crate::message::agent_action_tools::task_launch_selection_capabilities(
+                &tool_only_launch.execution
+            )
+            .unwrap(),
+            vec![tool]
+        );
     }
 
-    fn prior_with_review(
-        timed_out: bool,
-        terminal_count: u32,
-        review_required_count: u32,
-    ) -> PriorWaitCall {
-        PriorWaitCall {
-            item_id: "wait_item".to_owned(),
-            timed_out,
-            terminal_count,
-            pending_count: 0,
-            review_required_count,
-        }
+    #[test]
+    fn task_capability_inheritance_stays_with_immediate_same_capsule_work() {
+        assert!(inherits_task_capabilities(TaskTriggerKind::Immediate, None));
+        assert!(inherits_task_capabilities(
+            TaskTriggerKind::Immediate,
+            Some(&pioneer_protocol::AgentStartTarget::SameCapsuleThread {
+                thread_id: "sibling".to_owned(),
+            })
+        ));
+        assert!(!inherits_task_capabilities(TaskTriggerKind::Cron, None));
+        assert!(!inherits_task_capabilities(
+            TaskTriggerKind::Immediate,
+            Some(&pioneer_protocol::AgentStartTarget::RoutedThread {
+                route_id: pioneer_protocol::AgentDelegationRouteId::new("R12345678901234567890")
+                    .unwrap(),
+                thread_id: "other-capsule".to_owned(),
+            })
+        ));
     }
 
     #[test]
@@ -5572,7 +5607,12 @@ mod tests {
 
         assert_eq!(
             actual.as_slice(),
-            pioneer_tools::BuiltinToolDomain::Task.tool_names()
+            pioneer_tools::BuiltinToolDomain::Task
+                .tool_names()
+                .iter()
+                .copied()
+                .filter(|name| name.starts_with("task_"))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -6134,6 +6174,7 @@ mod tests {
             }),
             extraction_error: (status == TaskResultCandidateStatus::ExtractionFailed).then(|| {
                 TaskError {
+                    recovery_diagnostic: None,
                     code: "extraction_failed".to_owned(),
                     message: "could not extract task result".to_owned(),
                     class: pioneer_protocol::TaskErrorClass::Validation,
@@ -6209,6 +6250,84 @@ mod tests {
             result_candidates: Vec::new(),
             result_review_events: Vec::new(),
         }
+    }
+
+    #[test]
+    fn task_get_model_output_keeps_execution_evidence_separate_from_run_timestamps() {
+        let mut running = sample_run(TaskRunStatus::Running);
+        running.updated_at = 900;
+        let mut waiting_review = sample_run(TaskRunStatus::WaitingReview);
+        waiting_review.id = "run_review_1234567890".to_owned();
+        let mut queued = sample_run(TaskRunStatus::Queued);
+        queued.id = "run_queued_1234567890".to_owned();
+        let response = sample_task_response(
+            TaskStatus::Running,
+            vec![running.clone(), waiting_review.clone(), queued.clone()],
+            None,
+        );
+        let observations = vec![
+            pioneer_crud::TaskRunExecutionObservationRecord {
+                run_id: running.id.clone(),
+                status: pioneer_protocol::TaskRunExecutionStatus::Running,
+                heartbeat_at: Some(120),
+                last_activity_at: None,
+            },
+            pioneer_crud::TaskRunExecutionObservationRecord {
+                run_id: waiting_review.id.clone(),
+                status: pioneer_protocol::TaskRunExecutionStatus::WaitingReview,
+                heartbeat_at: Some(130),
+                last_activity_at: Some(125),
+            },
+        ];
+
+        let output = task_get_tool_output(&response, false, &observations, 200)
+            .expect("task_get output should project");
+
+        assert_eq!(output["runs"][0]["execution"]["status"], "running");
+        assert_eq!(output["runs"][0]["execution"]["heartbeatAt"], 120);
+        assert_eq!(
+            output["runs"][0]["execution"]["lastActivityAt"],
+            JsonValue::Null
+        );
+        assert_eq!(output["runs"][0]["updatedAt"], 900);
+        assert_eq!(output["runs"][1]["execution"]["status"], "waiting_review");
+        assert_eq!(output["runs"][1]["execution"]["lastActivityAt"], 125);
+        assert_eq!(output["runs"][2]["execution"]["status"], JsonValue::Null);
+        assert_eq!(
+            output["runs"][2]["execution"]["heartbeatAt"],
+            JsonValue::Null
+        );
+        assert_eq!(
+            output["runs"][2]["execution"]["lastActivityAt"],
+            JsonValue::Null
+        );
+        assert_eq!(output["runs"][2]["execution"]["observedAt"], 200);
+        assert_eq!(output["operator"], JsonValue::Null);
+        assert_eq!(output["configuration"], JsonValue::Null);
+        assert!(output["runs"][0]["execution"].get("workerId").is_none());
+
+        let raw = output.to_string();
+        let arguments = json!({"taskId": response.task.id});
+        let outcome = pioneer_tools::ToolOutcome::ok();
+        let policy = pioneer_tools::ToolOutputPolicySnapshot::for_tool_name(TASK_GET_TOOL);
+        let projected = pioneer_tools::project_tool_result(pioneer_tools::ToolProjectionInput {
+            call_id: "call_task_get",
+            tool_name: TASK_GET_TOOL,
+            arguments: &arguments,
+            raw_output_text: &raw,
+            raw_output_json: &output,
+            success: true,
+            outcome: &outcome,
+            output_policy: &policy,
+            output_projection: &pioneer_tools::ToolOutputProjectionKind::DynamicGeneric,
+        });
+        let pioneer_tools::ToolResultView::Json { value, truncated } = projected.llm_view else {
+            panic!("task_get should reach the model as structured JSON");
+        };
+        assert!(!truncated);
+        assert_eq!(value["runs"][0]["execution"]["heartbeatAt"], 120);
+        assert_eq!(value["runs"][1]["execution"]["lastActivityAt"], 125);
+        assert_eq!(value["runs"][2]["execution"]["status"], JsonValue::Null);
     }
 
     #[test]
@@ -6550,48 +6669,6 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_wait_guard_blocks_same_pending_state() {
-        assert!(duplicate_wait_should_block(&[prior(false, 0)], 0, 3, 0));
-    }
-
-    #[test]
-    fn duplicate_wait_guard_allows_terminal_progress() {
-        assert!(!duplicate_wait_should_block(&[prior(false, 0)], 1, 2, 0));
-    }
-
-    #[test]
-    fn duplicate_wait_guard_allows_review_required_progress() {
-        assert!(!duplicate_wait_should_block(&[prior(false, 0)], 0, 0, 1));
-        assert!(!duplicate_wait_should_block(
-            &[prior_with_review(false, 0, 0)],
-            0,
-            1,
-            1
-        ));
-    }
-
-    #[test]
-    fn duplicate_wait_guard_allows_review_to_revision_running_transition() {
-        assert!(!duplicate_wait_should_block(
-            &[prior_with_review(false, 0, 1)],
-            0,
-            1,
-            0
-        ));
-    }
-
-    #[test]
-    fn duplicate_wait_guard_allows_one_timeout_retry_then_blocks() {
-        assert!(!duplicate_wait_should_block(&[prior(true, 0)], 0, 3, 0));
-        assert!(duplicate_wait_should_block(
-            &[prior(true, 0), prior(true, 0)],
-            0,
-            3,
-            0
-        ));
-    }
-
-    #[test]
     fn task_wait_tool_input_defaults_to_review_aware_mode() {
         let input: TaskWaitToolInput = serde_json::from_value(json!({
             "taskIds": ["task_1234567890123456"]
@@ -6601,16 +6678,6 @@ mod tests {
         let params = input.into_params().expect("input should convert");
 
         assert_eq!(params.mode, TaskWaitMode::AnyTerminalOrReviewRequired);
-    }
-
-    #[test]
-    fn task_wait_signature_from_arguments_uses_tool_default_mode() {
-        let signature = TaskWaitSignature::from_arguments(&json!({
-            "taskIds": ["task_1234567890123456"]
-        }))
-        .expect("signature should decode");
-
-        assert_eq!(signature.mode, TaskWaitMode::AnyTerminalOrReviewRequired);
     }
 
     #[test]

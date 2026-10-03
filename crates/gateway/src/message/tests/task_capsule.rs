@@ -11,13 +11,36 @@ fn capsule_step(
     step: usize,
     calls: Vec<ProviderToolCall>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<TurnItem>> + Send>> {
+    capsule_step_with_rounds(
+        workspace_manager,
+        store,
+        workspace,
+        thread,
+        step,
+        vec![calls],
+    )
+}
+
+fn capsule_step_with_rounds(
+    workspace_manager: Arc<WorkspaceManager>,
+    store: Arc<CrudStore>,
+    workspace: &str,
+    thread: &str,
+    step: usize,
+    rounds: Vec<Vec<ProviderToolCall>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<TurnItem>> + Send>> {
     let workspace = workspace.to_owned();
     let thread = thread.to_owned();
+    let calls = rounds.iter().flatten().cloned().collect::<Vec<_>>();
     Box::pin(async move {
-        let provider = Arc::new(SequencedToolProvider::new(
-            calls.clone(),
+        let mut provider = SequencedToolProvider::new(
+            rounds.first().cloned().unwrap_or_default(),
             r#"<task_result>{"summary":"capsule step completed"}</task_result>"#,
-        ));
+        );
+        if rounds.len() > 1 {
+            provider = provider.with_tool_call_rounds(rounds);
+        }
+        let provider = Arc::new(provider);
         let processor = Arc::new(MessageProcessor::new(
             Arc::new(ThreadManager::new("test-model", "openai")),
             Arc::new(pioneer_provider::ProviderRegistry::with_provider(
@@ -128,6 +151,26 @@ fn assert_outcome(items: &[TurnItem], name: &str, expected_success: bool) {
     if expected_success {
         assert_eq!(*status, ToolCallStatus::Completed);
     }
+}
+
+fn wait_outputs(items: &[TurnItem]) -> Vec<serde_json::Value> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            TurnItem::DynamicToolCall {
+                tool_name, storage, ..
+            } if tool_name == "task_wait" => match storage {
+                ToolStoragePayload::Metadata { metadata } => {
+                    metadata.to_json().get("sanitizedResult").cloned()
+                }
+                ToolStoragePayload::Summary(summary) => {
+                    summary.metadata.to_json().get("sanitizedResult").cloned()
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
@@ -308,10 +351,183 @@ fn durable_task_management_survives_new_executions_and_runtime_reconstruction() 
             vec![call(
                 11,
                 "task_wait",
-                json!({"taskIds":[target],"timeoutMs":0}),
+                json!({"taskIds":[target],"timeoutMs":1}),
             )],
         )
         .await;
         assert_outcome(&items, "task_wait", true);
+    });
+}
+
+#[test]
+fn task_wait_repeats_timed_out_observations_for_task_and_run_ids() {
+    run_standard_stack_message_test("Repeated task wait", async {
+        let temp = tempfile::tempdir().unwrap();
+        let connection = Database::connect(format!(
+            "sqlite://{}?mode=rwc",
+            temp.path().join("wait.sqlite3").display()
+        ))
+        .await
+        .unwrap();
+        let (manager, store, workspace) = setup_workspace_manager_with_connection(connection).await;
+        let thread = "task_wait_repeat_root";
+        let mut task_ids = Vec::new();
+        let mut run_ids = Vec::new();
+        for index in 0..2 {
+            let title = format!("Wait target {index}");
+            let items = capsule_step(
+                manager.clone(),
+                store.clone(),
+                &workspace,
+                thread,
+                index,
+                vec![call(
+                    index,
+                    "task_create",
+                    json!({
+                        "title": title,
+                        "goal": "Remain queued for an observation test",
+                        "instructions": ["Report when started."],
+                        "outputInstructions": "Return a short report.",
+                        "trigger": {"kind": "cron", "cronExpr": "0 5 * * *", "timezone": "UTC"},
+                        "deliveryPolicy": {"mode": "none", "includeResult": false, "format": "summary"}
+                    }),
+                )],
+            )
+            .await;
+            assert_outcome(&items, "task_create", true);
+            let tasks = store
+                .list_tasks(pioneer_protocol::TaskListParams {
+                    workspace_id: workspace.clone(),
+                    limit: Some(20),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let task = tasks.iter().find(|task| task.title == title).unwrap();
+            task_ids.push(task.id.clone());
+        }
+
+        let future = capsule_step(
+            manager.clone(),
+            store.clone(),
+            &workspace,
+            thread,
+            2,
+            vec![call(
+                2,
+                "task_wait",
+                json!({"taskIds": [task_ids[0]], "timeoutMs": 1}),
+            )],
+        )
+        .await;
+        let future_output = wait_outputs(&future);
+        assert_eq!(future_output.len(), 1);
+        assert_eq!(future_output[0]["waitable"], false);
+        assert_eq!(future_output[0]["nonWaitable"].as_array().unwrap().len(), 1);
+        assert_eq!(future_output[0]["timedOut"], false);
+
+        let timestamp = now_timestamp_secs();
+        for task_id in &task_ids {
+            let run_id = pioneer_protocol::generate_id(21);
+            store
+                .append_task_event(
+                    TaskEventPayload::RunCreated {
+                        run: TaskRun {
+                            id: run_id.clone(),
+                            task_id: task_id.clone(),
+                            trigger_id: None,
+                            parent_run_id: None,
+                            run_group_id: run_id.clone(),
+                            attempt_number: 1,
+                            retry_of_run_id: None,
+                            ready_at: Some(timestamp),
+                            run_number: 1,
+                            status: TaskRunStatus::Queued,
+                            executor_kind: TaskExecutorKind::Agent,
+                            started_at: None,
+                            completed_at: None,
+                            heartbeat_at: None,
+                            locked_by: None,
+                            lock_expires_at: None,
+                            result: None,
+                            error: None,
+                            created_at: timestamp,
+                            updated_at: timestamp,
+                        },
+                        agent_spec: None,
+                    },
+                    timestamp,
+                )
+                .await
+                .unwrap();
+            run_ids.push(run_id);
+        }
+
+        for (step, arguments) in [
+            (3, json!({"taskIds": task_ids, "timeoutMs": 1})),
+            (4, json!({"runIds": run_ids, "timeoutMs": 1})),
+        ] {
+            let rounds = (0..4)
+                .map(|round| vec![call(step * 10 + round, "task_wait", arguments.clone())])
+                .collect();
+            let items = capsule_step_with_rounds(
+                manager.clone(),
+                store.clone(),
+                &workspace,
+                thread,
+                step,
+                rounds,
+            )
+            .await;
+            let outputs = wait_outputs(&items);
+            assert_eq!(
+                outputs.len(),
+                4,
+                "every wait should reach the handler: {items:?}"
+            );
+            for output in outputs {
+                assert_eq!(output["timedOut"], true);
+                assert_eq!(output["pendingCount"], 2);
+                assert!(output.get("recommendation").is_none());
+                assert!(output.get("repeatedWait").is_none());
+            }
+        }
+        for task_id in &task_ids {
+            let state = store.get_task(task_id).await.unwrap().unwrap();
+            assert_eq!(state.task.status, TaskStatus::Scheduled);
+            assert_eq!(state.runs[0].status, TaskRunStatus::Queued);
+        }
+
+        store
+            .append_task_event(
+                TaskEventPayload::RunCompleted {
+                    task_id: task_ids[0].clone(),
+                    run_id: run_ids[0].clone(),
+                    result: None,
+                    completed_at: timestamp + 1,
+                },
+                timestamp + 1,
+            )
+            .await
+            .unwrap();
+        let completed = capsule_step(
+            manager,
+            store,
+            &workspace,
+            thread,
+            5,
+            vec![call(
+                5,
+                "task_wait",
+                json!({"runIds": run_ids, "timeoutMs": 1}),
+            )],
+        )
+        .await;
+        let completed_output = wait_outputs(&completed);
+        assert_eq!(completed_output.len(), 1);
+        assert_eq!(completed_output[0]["terminalCount"], 1);
+        assert_eq!(completed_output[0]["pendingCount"], 1);
+        assert_eq!(completed_output[0]["timedOut"], false);
     });
 }

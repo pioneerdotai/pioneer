@@ -632,10 +632,12 @@ fn hook_tool_names_to_strings(tool_names: &[HookToolName]) -> Vec<&str> {
 #[derive(Default)]
 struct TestMemoryWriteProvider {
     manifest_calls: Arc<Mutex<usize>>,
+    manifest_failures: Mutex<std::collections::VecDeque<crate::MemoryManifestFailure>>,
     write_calls: Arc<Mutex<usize>>,
     write_params: Arc<Mutex<Vec<MemorySemanticWriteParams>>>,
     write_contexts: Arc<Mutex<Vec<MemoryTurnContext>>>,
     response: Option<MemorySemanticWriteResponse>,
+    failures: Mutex<std::collections::VecDeque<Option<crate::MemoryWriteFailure>>>,
 }
 
 impl TestMemoryWriteProvider {
@@ -671,11 +673,14 @@ impl AgentMemoryWriteProvider for TestMemoryWriteProvider {
         &self,
         _context: MemoryTurnContext,
         _request: MemoryManifestRequest,
-    ) -> Result<MemoryManifest, String> {
+    ) -> Result<MemoryManifest, crate::MemoryManifestFailure> {
         *self
             .manifest_calls
             .lock()
             .expect("manifest call lock poisoned") += 1;
+        if let Some(failure) = self.manifest_failures.lock().unwrap().pop_front() {
+            return Err(failure);
+        }
         Ok(MemoryManifest::default())
     }
 
@@ -683,7 +688,7 @@ impl AgentMemoryWriteProvider for TestMemoryWriteProvider {
         &self,
         context: MemoryTurnContext,
         params: MemorySemanticWriteParams,
-    ) -> Result<MemorySemanticWriteResponse, String> {
+    ) -> Result<MemorySemanticWriteResponse, crate::MemoryWriteFailure> {
         *self.write_calls.lock().expect("write call lock poisoned") += 1;
         self.write_contexts
             .lock()
@@ -693,6 +698,14 @@ impl AgentMemoryWriteProvider for TestMemoryWriteProvider {
             .lock()
             .expect("write params lock poisoned")
             .push(params);
+        if let Some(Some(failure)) = self
+            .failures
+            .lock()
+            .expect("failure sequence lock")
+            .pop_front()
+        {
+            return Err(failure);
+        }
         Ok(self
             .response
             .clone()

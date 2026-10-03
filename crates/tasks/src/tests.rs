@@ -121,6 +121,7 @@ impl TaskExecutor for FailingSystemExecutor {
         handle
             .fail_run(
                 Some(TaskError {
+                    recovery_diagnostic: None,
                     code: "test_failure".to_owned(),
                     message: "test failure".to_owned(),
                     class: TaskErrorClass::Internal,
@@ -155,6 +156,7 @@ impl TaskExecutor for FailingSystemExecutor {
 
 #[derive(Clone)]
 struct SlowAgentExecutor {
+    store: Arc<CrudStore>,
     starts: Arc<AtomicUsize>,
     release: Arc<Notify>,
 }
@@ -173,6 +175,7 @@ impl TaskExecutor for SlowAgentExecutor {
     ) -> TaskRuntimeResult<TaskExecutorStartOutcome> {
         self.starts.fetch_add(1, Ordering::SeqCst);
         self.release.notified().await;
+        persist_mock_agent_execution(self.store.clone(), &run).await;
         handle.mark_started(run.created_at).await?;
         handle
             .complete_run(
@@ -201,6 +204,7 @@ impl TaskExecutor for SlowAgentExecutor {
 
 #[derive(Clone)]
 struct LineageRecordingAgentExecutor {
+    store: Arc<CrudStore>,
     starts: Arc<AtomicUsize>,
     recoveries: Arc<AtomicUsize>,
     release: Arc<Notify>,
@@ -267,6 +271,7 @@ impl TaskExecutor for LineageRecordingAgentExecutor {
             .link_child_thread_with_runtime(lineage, binding, task_run_turn, run.created_at)
             .await?;
         self.release.notified().await;
+        persist_mock_agent_execution(self.store.clone(), &run).await;
         handle
             .complete_run(
                 Some(TaskResult {
@@ -322,6 +327,7 @@ impl TaskExecutor for CancellationFailingSystemExecutor {
         handle
             .fail_run(
                 Some(TaskError {
+                    recovery_diagnostic: None,
                     code: "child_turn_cancelled".to_owned(),
                     message: "task cancelled".to_owned(),
                     class: TaskErrorClass::Cancelled,
@@ -543,6 +549,7 @@ fn test_agent_launch_facts() -> (
             permission_profile: None,
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),
+            selected_capabilities: Vec::new(),
         },
     };
     let child_launch_grant = pioneer_protocol::ChildAgentLaunchGrantSet::new(
@@ -843,6 +850,44 @@ async fn persist_test_child_agent_execution(runtime: &TaskRuntime, execution_id:
     .expect("test child Agent execution should persist");
 }
 
+async fn persist_mock_agent_execution(store: Arc<CrudStore>, run: &TaskRun) {
+    let fixture_runtime = TaskRuntime::new(store.clone());
+    persist_test_agent_turn(
+        &fixture_runtime,
+        TEST_PARENT_EXECUTION_ID,
+        TEST_PARENT_THREAD_ID,
+        TEST_PARENT_TURN_ID,
+        None,
+    )
+    .await;
+    let execution = store
+        .load_execution_for_run(&run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    persist_test_child_agent_execution(&fixture_runtime, &execution.id).await;
+    let db = store.database_connection();
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "UPDATE agent_execution SET parent_task_id=? WHERE id=?",
+        [run.task_id.clone().into(), execution.id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let mut occurrence = store
+        .get_task_occurrence_contract_by_run(&run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    occurrence.agent_execution_id = Some(execution.id);
+    occurrence.work_graph_root_execution_id = Some(TEST_PARENT_EXECUTION_ID.into());
+    occurrence.root_resource_scope_id = Some(TEST_PARENT_EXECUTION_ID.into());
+    store
+        .upsert_task_occurrence_contract(&occurrence, run.created_at)
+        .await
+        .unwrap();
+}
+
 /// Produces the explicit positive authority seed required by Agent Tasks in
 /// service-level tests. The Tasks crate deliberately treats the serialized
 /// authorization context as opaque; Gateway integration tests exercise the
@@ -1118,6 +1163,7 @@ async fn create_waiting_review_agent_task_with_policy(
         }),
         extraction_error: (candidate_status == TaskResultCandidateStatus::ExtractionFailed).then(
             || TaskError {
+                recovery_diagnostic: None,
                 code: "extraction_failed".to_owned(),
                 message: "candidate extraction failed".to_owned(),
                 class: TaskErrorClass::Validation,
@@ -3020,6 +3066,7 @@ async fn agent_run_is_atomically_claimed_before_spawn() {
     let release = Arc::new(Notify::new());
     runtime
         .register_executor(Arc::new(SlowAgentExecutor {
+            store: runtime.service().store(),
             starts: starts.clone(),
             release: release.clone(),
         }))
@@ -3106,6 +3153,7 @@ async fn running_agent_recovery_reuses_one_execution_and_one_child_lineage() {
     let release = Arc::new(Notify::new());
     runtime
         .register_executor(Arc::new(LineageRecordingAgentExecutor {
+            store: runtime.service().store(),
             starts: starts.clone(),
             recoveries: recoveries.clone(),
             release: release.clone(),
@@ -3245,6 +3293,7 @@ async fn starting_agent_recovery_reuses_reserved_execution_identity() {
         .expect("execution should reserve");
     runtime
         .register_executor(Arc::new(LineageRecordingAgentExecutor {
+            store: runtime.service().store(),
             starts: Arc::new(AtomicUsize::new(0)),
             recoveries: recoveries.clone(),
             release: Arc::new(Notify::new()),
@@ -4215,8 +4264,11 @@ async fn recurring_due_trigger_with_active_serial_run_skips_fire_and_moves_next_
 
 #[tokio::test]
 async fn long_missed_cron_recovers_latest_and_skip_without_duplicate_runs() {
-    let runtime = runtime().await;
     for policy in [None, Some(TaskTriggerCatchUpPolicy::skip_missed())] {
+        let runtime = runtime().await;
+        runtime
+            .register_executor(Arc::new(CompletingSystemExecutor))
+            .await;
         let response = runtime
             .service()
             .create_task(
@@ -4230,12 +4282,25 @@ async fn long_missed_cron_recovers_latest_and_skip_without_duplicate_runs() {
             .await
             .expect("cron task should create");
         let first = response.trigger.next_fire_at.unwrap();
+        let healthy = runtime
+            .service()
+            .create_task(
+                TaskCreateContext::default(),
+                create_params(TaskTriggerSpec::ScheduledAt {
+                    scheduled_at: first + 1,
+                    timezone: Some("UTC".to_owned()),
+                    catch_up_policy: None,
+                }),
+            )
+            .await
+            .unwrap();
         let latest = first + 20_000 * 60;
         let expected_runs = usize::from(policy.is_none());
         assert_eq!(
             runtime.process_due_once(latest + 5).await.unwrap(),
-            expected_runs
+            expected_runs + 1
         );
+        assert_eq!(runtime.process_due_once(latest + 5).await.unwrap(), 0);
         let task = runtime
             .service()
             .get_task(pioneer_protocol::TaskGetParams {
@@ -4244,10 +4309,21 @@ async fn long_missed_cron_recovers_latest_and_skip_without_duplicate_runs() {
             .await
             .unwrap();
         assert_eq!(task.runs.len(), expected_runs);
+        if let Some(run) = task.runs.first() {
+            assert_eq!(run.status, TaskRunStatus::Succeeded);
+        }
         assert_eq!(task.triggers[0].last_fire_at, Some(latest));
         assert_eq!(task.triggers[0].next_fire_at, Some(latest + 60));
         assert_eq!(task.triggers[0].status, TaskTriggerStatus::Active);
-        assert_eq!(runtime.process_due_once(latest + 5).await.unwrap(), 0);
+        let healthy = runtime
+            .service()
+            .get_task(pioneer_protocol::TaskGetParams {
+                task_id: healthy.task.id,
+            })
+            .await
+            .unwrap();
+        assert_eq!(healthy.runs.len(), 1);
+        assert_eq!(healthy.runs[0].status, TaskRunStatus::Succeeded);
     }
 }
 
@@ -4443,6 +4519,7 @@ async fn stale_cron_failure_does_not_block_a_repaired_spec_with_the_same_fire_ti
         .await
         .unwrap();
     let error = TaskError {
+        recovery_diagnostic: None,
         code: "task_trigger_schedule_invalid".to_owned(),
         message: "stale calculation failure".to_owned(),
         class: TaskErrorClass::Validation,
@@ -4487,6 +4564,7 @@ async fn cron_failure_quarantine_rolls_back_and_can_be_retried_atomically() {
     let database = store.database_connection();
     let now = response.trigger.next_fire_at.unwrap();
     let error = TaskError {
+        recovery_diagnostic: None,
         code: "task_trigger_schedule_invalid".to_owned(),
         message: "test schedule failure".to_owned(),
         class: TaskErrorClass::Validation,
@@ -5195,6 +5273,7 @@ async fn scheduled_agent_task_executes_from_version_one_child_launch_grant_witho
     let release = Arc::new(Notify::new());
     runtime
         .register_executor(Arc::new(SlowAgentExecutor {
+            store: runtime.service().store(),
             starts: starts.clone(),
             release: release.clone(),
         }))
@@ -5609,6 +5688,7 @@ async fn blocked_agent_task_requires_readmission_and_resumes_atomically() {
             TaskEventPayload::TaskBlocked {
                 task_id: response.task.id.clone(),
                 error: Some(TaskError {
+                    recovery_diagnostic: None,
                     code: "authorization_missing".to_owned(),
                     message: "execution admission is missing".to_owned(),
                     class: TaskErrorClass::Policy,
@@ -7595,6 +7675,7 @@ async fn projector_does_not_regress_cancelled_task_after_late_failure_events() {
             task_id: task_id.clone(),
             run_id: run_id.clone(),
             error: Some(TaskError {
+                recovery_diagnostic: None,
                 code: "child_turn_cancelled".to_owned(),
                 message: "task cancelled".to_owned(),
                 class: TaskErrorClass::Cancelled,
@@ -7606,6 +7687,7 @@ async fn projector_does_not_regress_cancelled_task_after_late_failure_events() {
         TaskEventPayload::TaskFailed {
             task_id: task_id.clone(),
             error: Some(TaskError {
+                recovery_diagnostic: None,
                 code: "child_turn_cancelled".to_owned(),
                 message: "task cancelled".to_owned(),
                 class: TaskErrorClass::Cancelled,
@@ -7682,6 +7764,7 @@ async fn projector_replay_run_started_after_terminal_run_is_noop() {
                 task_id: task_id.clone(),
                 run_id: run_id.clone(),
                 error: Some(TaskError {
+                    recovery_diagnostic: None,
                     code: "late_failure".to_owned(),
                     message: "late failure".to_owned(),
                     class: TaskErrorClass::Internal,
@@ -8328,3 +8411,8 @@ async fn immediate_dispatch_inherits_request_scope_and_scheduler_keeps_maintenan
         .unwrap();
     assert_eq!(invalid.task.status, TaskStatus::Blocked);
 }
+
+#[path = "tests_delivery_lifecycle.rs"]
+mod delivery_lifecycle;
+#[path = "tests/terminal_delivery.rs"]
+mod terminal_delivery;

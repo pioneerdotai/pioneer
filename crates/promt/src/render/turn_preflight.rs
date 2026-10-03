@@ -57,6 +57,7 @@ pub fn render_turn_preflight_prompt(input: &TurnPreflightPromptInput) -> String 
             "\nTool visibility output contract for tools.visibleTools:\n",
             "- `tools.visibleTools` is required and must be the complete list of hidden builtin tools to reveal before the main model round.\n",
             "- `tools.visibleTools` must contain exact tool names from `tools.candidateTools[].name`, never domains.\n",
+            "- A candidate's `domain` and optional `additionalDomains` show where the same tool can be requested; list its name at most once.\n",
             "- Do not include `tools.coreTools`; core tools are already visible and the runtime adds them separately.\n",
             "- `diagnostics` is optional. When present, it is a top-level array of objects with `code` and optional `message`.\n",
         ),

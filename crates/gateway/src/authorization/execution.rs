@@ -221,6 +221,12 @@ impl ExecutionAdmissionRequest {
             execution_backend: launch.and_then(|launch| launch.execution_backend.clone()),
             capabilities: launch
                 .map(|launch| launch.capabilities.clone())
+                .or_else(|| {
+                    params
+                        .launch
+                        .as_ref()
+                        .map(|selection| selection.execution.selected_capabilities.clone())
+                })
                 .unwrap_or_default(),
             artifacts: input_sources.artifacts,
             has_local_attachment_sources: input_sources.has_local_paths,
@@ -2132,7 +2138,7 @@ impl ExecutionAuthorizationContext {
                 return Ok(Some(parent_turn_id.to_owned()));
             }
 
-            // A direct `agent_start` Turn has the same two-actor shape as a
+            // A direct `threads_turn_start` Turn has the same two-actor shape as a
             // Task child without a TaskRun: the canonical input author is the
             // parent AgentExecution, while the durable response binding and
             // runtime authority belong to the newly admitted child. Resolve

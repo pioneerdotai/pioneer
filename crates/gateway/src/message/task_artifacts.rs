@@ -538,6 +538,7 @@ fn task_value_str(value: &TaskValue) -> Option<&str> {
 
 fn task_artifact_error(message: impl Into<String>, failed_run_id: Option<String>) -> TaskError {
     TaskError {
+        recovery_diagnostic: None,
         code: "task_artifact_invalid".to_owned(),
         message: message.into(),
         class: TaskErrorClass::Validation,

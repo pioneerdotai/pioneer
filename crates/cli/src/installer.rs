@@ -1987,6 +1987,62 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn install_reports_preserve_transient_download_classification_after_output_failure() {
+        struct FailedWriter(std::io::ErrorKind);
+
+        impl std::io::Write for FailedWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(self.0, "controlled report failure"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                panic!("report writer must not flush after a failed write");
+            }
+        }
+
+        for name in ["install", "update", "self-update"] {
+            let (options, _) = crate::parse_install_command_options(name, std::iter::empty())
+                .expect("install command options");
+            for kind in [
+                std::io::ErrorKind::BrokenPipe,
+                std::io::ErrorKind::PermissionDenied,
+            ] {
+                let original = anyhow::Error::new(super::InstallerTransientDownloadError {
+                    url: "https://example.invalid/asset".into(),
+                    attempts: 4,
+                    last_error: "connection timeout".into(),
+                })
+                .context("resolve install source");
+                let error = crate::finish_install_result(
+                    options.command,
+                    Err(original),
+                    true,
+                    &mut FailedWriter(kind),
+                )
+                .expect_err("transient installation failure remains a failed command");
+
+                assert!(is_transient_download_error(&error));
+                assert!(
+                    error
+                        .downcast_ref::<super::InstallerTransientDownloadError>()
+                        .is_some()
+                );
+                assert!(format!("{error:#}").contains("resolve install source"));
+                assert_eq!(
+                    crate::install_error_code(options.command, &format!("{error:#}")),
+                    "download_transient_network_failure"
+                );
+                assert_eq!(
+                    error
+                        .downcast_ref::<crate::InstallFailureReportError>()
+                        .is_some(),
+                    kind != std::io::ErrorKind::BrokenPipe
+                );
+            }
+        }
+    }
+
+    #[test]
     fn parses_prefixed_checksum_line() {
         let path = unique_temp_path("checksum-prefixed");
         fs::write(
@@ -2171,7 +2227,7 @@ mod tests {
         let destination = temp_dir.path().join("gateway.gz");
 
         download_release_asset_with_policy(
-            &test_http_client_with_timeout(Duration::from_millis(50)),
+            &test_http_client(),
             url.as_str(),
             destination.as_path(),
             immediate_retry_policy(2),
@@ -2566,22 +2622,19 @@ fi
     fn spawn_timeout_then_success(body: &'static [u8]) -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test HTTP server");
         let address = listener.local_addr().expect("test HTTP server address");
-        let delayed_response = http_response(200, "OK", b"late");
         let success_response = http_response(200, "OK", body);
         let server = thread::spawn(move || {
             let (mut first_stream, _) = listener.accept().expect("accept first HTTP request");
             read_http_request(&mut first_stream);
-            let delayed_writer = thread::spawn(move || {
-                thread::sleep(Duration::from_millis(200));
-                let _ = first_stream.write_all(&delayed_response);
-            });
-
+            // Keep the first connection open without replying until the retry
+            // arrives. This forces a request timeout without racing a sleep
+            // against the client's deadline or starving the successful retry.
             let (mut second_stream, _) = listener.accept().expect("accept retry HTTP request");
             read_http_request(&mut second_stream);
             second_stream
                 .write_all(&success_response)
                 .expect("write successful retry response");
-            delayed_writer.join().expect("delayed response writer");
+            drop(first_stream);
         });
         (format!("http://{address}/asset"), server)
     }
@@ -2604,13 +2657,22 @@ fi
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set request read timeout");
         let mut request = [0_u8; 4096];
-        let read = stream.read(&mut request).expect("read HTTP request");
-        assert!(
-            request[..read]
-                .windows(4)
-                .any(|window| window == b"\r\n\r\n"),
-            "request headers should be complete"
-        );
+        let mut read = 0;
+        // TCP may split headers across reads, even on loopback.
+        while !request[..read]
+            .windows(4)
+            .any(|window| window == b"\r\n\r\n")
+        {
+            assert!(read < request.len(), "request headers exceed fixture limit");
+            let received = stream
+                .read(&mut request[read..])
+                .expect("read HTTP request");
+            assert!(
+                received > 0,
+                "connection closed before request headers completed"
+            );
+            read += received;
+        }
     }
 
     fn http_response(status: u16, reason: &str, body: &[u8]) -> Vec<u8> {

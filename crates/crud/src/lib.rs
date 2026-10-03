@@ -7,7 +7,24 @@ mod memory;
 mod model_history;
 mod projector;
 mod repositories;
+mod task_delivery_lifecycle;
 mod task_events;
+mod task_run_occurrence;
+mod task_terminal;
+pub use repositories::task_run_occurrence_reconcile::{
+    OCCURRENCE_RECONCILE_BUDGET, OCCURRENCE_RECONCILE_INITIAL_BACKOFF_SECS,
+    OCCURRENCE_RECONCILE_MAX_ATTEMPT_COUNT, OCCURRENCE_RECONCILE_MAX_BACKOFF_SECS,
+    TaskRunOccurrenceClaimDeferral, TaskRunOccurrenceClaimFailure,
+    TaskRunOccurrenceClaimFailurePhase, TaskRunOccurrenceClock,
+    TaskRunOccurrenceReconcileCandidate, TaskRunOccurrenceReconcileClaim,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use task_delivery_lifecycle::TaskDeliveryCommitTestKind;
+pub use task_delivery_lifecycle::{TaskDeliveryTransition, TaskDeliveryTransitionOutcome};
+pub use task_terminal::{
+    PreparedTaskTerminalTransition, TaskTerminalCommitOutcome, TaskTerminalCommitStatus,
+    TaskTerminalConflict,
+};
 mod task_projector;
 mod thread_episodic;
 mod timeline_live_projection;
@@ -936,7 +953,9 @@ pub use crate::repositories::execution_admission_lease::{
     ExecutionAdmissionClass, ExecutionAdmissionQuotaPolicy, ExecutionQuotaBucket,
     ExecutionQuotaCeilings, NewExecutionAdmissionLease,
 };
-pub use crate::repositories::native_terminal_effect_outbox::NativeTerminalEffectStats;
+pub use crate::repositories::native_terminal_effect_outbox::{
+    HandlerCheckpointInvalid, NativeTerminalEffectStats,
+};
 pub use crate::repositories::turn_admission::NewTurnAdmission;
 pub use crate::repositories::turn_execution::{
     NewTurnExecution, TurnExecutionRecord, TurnExecutionStatus, TurnExecutorKind,
@@ -1012,6 +1031,8 @@ pub struct ClaimedNativeTerminalEffectRecord {
     pub attempt_count: u16,
     pub max_attempts: u16,
     pub claim_token: String,
+    /// Captured from the durable marker for this fenced attempt.
+    pub legacy_manifest_revalidation: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1182,6 +1203,7 @@ pub use crate::repositories::task_execution_admission::{
 pub use crate::repositories::task_run_conversation_snapshot::{
     NewTaskRunConversationSnapshot, TaskRunConversationSnapshotRecord,
 };
+pub use crate::repositories::task_run_execution::TaskRunExecutionObservationRecord;
 pub use crate::repositories::turn::TurnExecutionSecuritySnapshotRecord;
 pub use crate::repositories::turn_cli_runtime_instruction::{
     CliRuntimeInstructionProjectionRecord, NewCliRuntimeInstructionProjection,
@@ -1943,6 +1965,8 @@ impl RepairSummary {
 
 #[derive(Debug, Clone)]
 pub struct RecoveryJobRecord {
+    pub last_failure_attempt_id: Option<String>,
+    pub diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
     pub id: String,
     pub turn_id: String,
     pub item_id: String,
@@ -2561,6 +2585,10 @@ pub struct TurnMcpProjectionRecord {
 
 #[derive(Clone)]
 pub struct CrudStore {
+    #[cfg(any(test, feature = "test-support"))]
+    delivery_commit_test_gate: std::sync::Arc<
+        std::sync::Mutex<Option<task_delivery_lifecycle::TaskDeliveryCommitTestGate>>,
+    >,
     connection: SqliteDatabase,
     projector: TurnProjector,
     task_projector: TaskProjector,
@@ -2596,6 +2624,8 @@ pub struct DueTaskTriggerReconciliation {
 /// authoritative TaskRun aggregate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskRunOccurrenceTerminalizationOutcome {
+    /// The preparation or durable generation/token was superseded. Normal deferral.
+    StaleClaim,
     Changed,
     AlreadyConsistent,
     NotFound,
@@ -4141,6 +4171,8 @@ impl CrudStore {
     pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
         Self {
             connection: connection.into(),
+            #[cfg(any(test, feature = "test-support"))]
+            delivery_commit_test_gate: std::sync::Arc::new(std::sync::Mutex::new(None)),
             projector: TurnProjector::new(),
             task_projector: TaskProjector::new(),
         }
@@ -14319,227 +14351,6 @@ impl CrudStore {
             .transpose()
     }
 
-    /// Find TaskRun occurrence Turns that disagree with their authoritative
-    /// terminal TaskRun. This includes false terminalization by generic Turn
-    /// recovery, not only occurrences left `in_progress`.
-    pub async fn list_mismatched_terminal_task_run_occurrence_ids(
-        &self,
-        limit: u64,
-    ) -> Result<Vec<String>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let rows = self
-            .connection
-            .query_all_raw(Statement::from_sql_and_values(
-                self.connection.get_database_backend(),
-                "SELECT occurrence.id AS run_id \
-                 FROM \"turn\" occurrence \
-                 INNER JOIN task_run run ON run.id = occurrence.id \
-                 WHERE occurrence.turn_kind = 'task_run' \
-                   AND ((run.status = 'succeeded' AND occurrence.status <> 'completed') \
-                     OR (run.status IN ('failed', 'timed_out') AND occurrence.status <> 'failed') \
-                     OR (run.status = 'blocked' AND occurrence.status <> 'blocked') \
-                     OR (run.status = 'cancelled' AND occurrence.status <> 'interrupted')) \
-                 ORDER BY occurrence.updated_at ASC, occurrence.id ASC LIMIT ?"
-                    .to_owned(),
-                [i64::try_from(limit).unwrap_or(i64::MAX).into()],
-            ))
-            .await
-            .context("failed to list TaskRun occurrence Turns with mismatched terminal state")?;
-        rows.into_iter()
-            .map(|row| row.try_get("", "run_id").map_err(Into::into))
-            .collect()
-    }
-
-    /// Atomically compare the canonical occurrence Turn (`Turn.id == TaskRun.id`)
-    /// with its authoritative terminal TaskRun and materialize the terminal Turn
-    /// event only when their statuses differ.
-    pub async fn compare_and_materialize_task_run_occurrence_terminal(
-        &self,
-        run_id: &str,
-        fallback_completed_at: i64,
-    ) -> Result<TaskRunOccurrenceTerminalizationOutcome> {
-        let run_id = run_id.to_owned();
-        self.run_serialized_write(|| {
-            self.compare_and_materialize_task_run_occurrence_terminal_once(
-                run_id.clone(),
-                fallback_completed_at,
-            )
-        })
-        .await
-    }
-
-    async fn compare_and_materialize_task_run_occurrence_terminal_once(
-        &self,
-        run_id: String,
-        fallback_completed_at: i64,
-    ) -> Result<TaskRunOccurrenceTerminalizationOutcome> {
-        let Some(prepared_run_model) =
-            task_run::find_run_by_id(&self.connection, run_id.as_str()).await?
-        else {
-            return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-        };
-        let run = task_run_from_db_model(prepared_run_model.clone())?;
-        let (desired_status, desired_error) = match run.status {
-            TaskRunStatus::Succeeded => (TurnStatus::Completed, None),
-            TaskRunStatus::Failed | TaskRunStatus::TimedOut => (
-                TurnStatus::Failed,
-                run.error.as_ref().map(|error| error.message.clone()),
-            ),
-            TaskRunStatus::Blocked => (
-                TurnStatus::Blocked,
-                run.error.as_ref().map(|error| error.message.clone()),
-            ),
-            TaskRunStatus::Cancelled => (
-                TurnStatus::Interrupted,
-                run.error.as_ref().map(|error| error.message.clone()),
-            ),
-            TaskRunStatus::Queued
-            | TaskRunStatus::Starting
-            | TaskRunStatus::Running
-            | TaskRunStatus::Waiting
-            | TaskRunStatus::WaitingReview => {
-                bail!(
-                    "TaskRun `{}` is not terminal and cannot terminalize its occurrence Turn",
-                    run.id
-                );
-            }
-        };
-        let Some(prepared_turn_model) =
-            turn::find_turn_by_id(&self.connection, run.id.as_str()).await?
-        else {
-            return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-        };
-        if turn_kind_from_db(prepared_turn_model.turn_kind.as_str()) != Some(TurnKind::TaskRun) {
-            return Ok(TaskRunOccurrenceTerminalizationOutcome::InvalidBinding);
-        }
-        let current_status = turn_status_from_db(prepared_turn_model.status.as_str())
-            .with_context(|| format!("occurrence Turn `{}` has an unknown status", run.id))?;
-        if current_status == desired_status {
-            return Ok(TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent);
-        }
-        let Some(prepared_thread_model) =
-            thread::find_thread_by_id(&self.connection, prepared_turn_model.thread_id.as_str())
-                .await?
-        else {
-            return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-        };
-        let Some(mut terminal_turn) = turn_from_db_model(prepared_turn_model.clone())? else {
-            bail!("occurrence Turn `{}` has an unknown status", run.id);
-        };
-        terminal_turn.status = desired_status;
-        terminal_turn.error = desired_error;
-        let terminal_event = match desired_status {
-            TurnStatus::Completed => {
-                TurnEventPayload::TurnCompleted(pioneer_protocol::TurnCompletedNotification {
-                    workspace_id: prepared_thread_model.workspace_id.clone(),
-                    thread_id: prepared_thread_model.id.clone(),
-                    turn: terminal_turn,
-                })
-            }
-            TurnStatus::Failed | TurnStatus::Interrupted => {
-                TurnEventPayload::TurnFailed(pioneer_protocol::TurnFailedNotification {
-                    workspace_id: prepared_thread_model.workspace_id.clone(),
-                    thread_id: prepared_thread_model.id.clone(),
-                    turn: terminal_turn,
-                })
-            }
-            TurnStatus::Blocked => {
-                TurnEventPayload::TurnBlocked(pioneer_protocol::TurnBlockedNotification {
-                    workspace_id: prepared_thread_model.workspace_id.clone(),
-                    thread_id: prepared_thread_model.id.clone(),
-                    turn: terminal_turn,
-                    resume: None,
-                })
-            }
-            TurnStatus::InProgress => unreachable!("TaskRun terminal status mapping"),
-        };
-        let completed_at = run.completed_at.unwrap_or(fallback_completed_at);
-        let created_at = unix_to_datetime(completed_at);
-        let claim_expires_at =
-            unix_to_datetime(completed_at.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
-        let terminal_event = prepare_projected_turn_event_for_permanent_storage(
-            &self.connection,
-            terminal_event,
-            created_at,
-        )
-        .await?;
-
-        let transaction = self
-            .connection
-            .begin()
-            .await
-            .context("failed to begin TaskRun occurrence terminalization transaction")?;
-
-        let result = async {
-            let Some(run_model) = task_run::find_run_by_id(&transaction, run_id.as_str()).await?
-            else {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-            };
-            if run_model.status != prepared_run_model.status
-                || run_model.updated_at != prepared_run_model.updated_at
-            {
-                anyhow::bail!("TaskRun changed during occurrence terminalization preparation");
-            }
-
-            // The occurrence identity is canonical and does not depend on
-            // optional/legacy lineage rows: Turn.id is exactly TaskRun.id.
-            let Some(turn_model) = turn::find_turn_by_id(&transaction, run_id.as_str()).await?
-            else {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-            };
-            if turn_kind_from_db(turn_model.turn_kind.as_str()) != Some(TurnKind::TaskRun) {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::InvalidBinding);
-            }
-            let current_status = turn_status_from_db(turn_model.status.as_str())
-                .with_context(|| format!("occurrence Turn `{run_id}` has an unknown status"))?;
-            if current_status == desired_status {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent);
-            }
-            if turn_model.status != prepared_turn_model.status
-                || turn_model.updated_at != prepared_turn_model.updated_at
-            {
-                anyhow::bail!("occurrence Turn changed during terminalization preparation");
-            }
-            let thread_model =
-                thread::find_thread_by_id(&transaction, turn_model.thread_id.as_str()).await?;
-            let Some(thread_model) = thread_model else {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-            };
-            if thread_model.id != prepared_thread_model.id
-                || thread_model.workspace_id != prepared_thread_model.workspace_id
-            {
-                anyhow::bail!("occurrence Thread changed during terminalization preparation");
-            }
-            self.append_and_project_turn_event_in_transaction(
-                &transaction,
-                terminal_event,
-                created_at,
-                claim_expires_at,
-                false,
-            )
-            .await?;
-
-            Ok(TaskRunOccurrenceTerminalizationOutcome::Changed)
-        }
-        .await;
-
-        match result {
-            Ok(outcome) => {
-                transaction
-                    .commit()
-                    .await
-                    .context("failed to commit TaskRun occurrence terminalization transaction")?;
-                Ok(outcome)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
     pub async fn claim_task_run_execution_for_dispatch(
         &self,
         run_id: &str,
@@ -15099,6 +14910,20 @@ impl CrudStore {
             .await?
             .map(task_run_execution_from_db_model)
             .transpose()
+    }
+
+    pub async fn list_task_run_execution_observations(
+        &self,
+        run_ids: &[String],
+    ) -> Result<Vec<TaskRunExecutionObservationRecord>> {
+        let mut observations = Vec::new();
+        for chunk in run_ids.chunks(128) {
+            observations.extend(
+                task_run_execution::list_execution_observations_for_runs(&self.connection, chunk)
+                    .await?,
+            );
+        }
+        Ok(observations)
     }
 
     pub async fn claim_execution(
@@ -16473,7 +16298,11 @@ impl CrudStore {
                     .map(|policy| policy.mode)
                     .unwrap_or(pioneer_protocol::TaskDeliveryMode::None),
                 result_preview: result.and_then(|result| result.summary.clone()),
-                error_preview: error.map(|error| bounded_preview(error.message.as_str(), 240)),
+                error_preview: error.map(|error| {
+                    error
+                        .recovery_public_message()
+                        .unwrap_or_else(|| bounded_preview(error.message.as_str(), 240))
+                }),
                 task,
                 trigger: Some(trigger),
                 latest_run,
@@ -23872,6 +23701,7 @@ impl CrudStore {
             let row = recovery_job::enqueue_recovery_job(
                 &self.connection,
                 recovery_job::NewRecoveryJob {
+                    diagnostic_json: None,
                     turn_id: turn_id.clone(),
                     item_id: item_id.clone(),
                     item_type,
@@ -23920,6 +23750,47 @@ impl CrudStore {
         policy_snapshot: serde_json::Value,
         now_unix: i64,
     ) -> Result<AtomicRecoveryJobEnqueueOutcome> {
+        self.enqueue_recovery_job_with_diagnostic_if_no_unresolved(
+            turn_id,
+            item_id,
+            item_type,
+            source_attempt_id,
+            trigger,
+            action,
+            reason,
+            error_class,
+            transport_stage,
+            retry_after_ms,
+            provider_attempt_number,
+            max_attempts,
+            policy_json,
+            policy_snapshot,
+            None,
+            now_unix,
+        )
+        .await
+    }
+
+    pub async fn enqueue_recovery_job_with_diagnostic_if_no_unresolved(
+        &self,
+        turn_id: String,
+        item_id: String,
+        item_type: TurnItemType,
+        source_attempt_id: Option<String>,
+        trigger: RecoveryTrigger,
+        action: RecoveryAction,
+        reason: Option<String>,
+        error_class: Option<ProviderFailureClass>,
+        transport_stage: Option<ProviderFailureStage>,
+        retry_after_ms: Option<i64>,
+        provider_attempt_number: i64,
+        max_attempts: i64,
+        policy_json: serde_json::Value,
+        policy_snapshot: serde_json::Value,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        now_unix: i64,
+    ) -> Result<AtomicRecoveryJobEnqueueOutcome> {
+        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         self.run_serialized_write(|| async {
             let tx = self
                 .connection
@@ -23947,6 +23818,7 @@ impl CrudStore {
                 let row = recovery_job::enqueue_recovery_job(
                     &tx,
                     recovery_job::NewRecoveryJob {
+                        diagnostic_json: diagnostic_json.clone(),
                         turn_id: turn_id.clone(),
                         item_id: item_id.clone(),
                         item_type,
@@ -24051,6 +23923,86 @@ impl CrudStore {
         .await
     }
 
+    /// Only the diagnostic that actually produced this failed Turn may cross into Task.
+    /// A pending/resumed job, unrelated failure or legacy raw text cannot qualify.
+    pub async fn get_failed_turn_recovery_diagnostic(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<pioneer_protocol::RecoveryDiagnostic>> {
+        let row = self
+            .connection
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "SELECT j.diagnostic, t.error FROM recovery_job j JOIN turn t ON t.id = j.turn_id \
+             WHERE j.turn_id = ? AND t.status = 'failed' AND j.status IN ('failed', 'exhausted') \
+             ORDER BY j.updated_at DESC, j.id DESC LIMIT 1",
+                [turn_id.into()],
+            ))
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let diagnostic: Option<String> = row.try_get("", "diagnostic")?;
+        let error: Option<String> = row.try_get("", "error")?;
+        let diagnostic = diagnostic.as_deref().and_then(|value| {
+            serde_json::from_str::<pioneer_protocol::RecoveryDiagnostic>(value).ok()
+        });
+        Ok(diagnostic.filter(|value| {
+            value.stop_reason.is_some() && error.as_deref() == Some(value.public_message().as_str())
+        }))
+    }
+
+    /// The latest canonical blocked transition owns this diagnostic. Never select a
+    /// job merely because it is the newest failure for the same Turn.
+    pub async fn get_blocked_turn_recovery_diagnostic(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<pioneer_protocol::RecoveryDiagnostic>> {
+        let row = self.connection.query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT e.payload, t.error, j.diagnostic FROM turn t \
+             JOIN turn_event e ON e.turn_id = t.id AND e.sequence = \
+               (SELECT MAX(sequence) FROM turn_event WHERE turn_id = t.id \
+                AND event_type IN ('turn/started', 'turn/blocked', 'turn/failed', 'turn/completed')) \
+             JOIN recovery_job j ON j.id = json_extract(e.payload, '$.payload.resume.blocked_recovery_job_id') \
+             JOIN recovery_terminalization_outbox o ON o.recovery_job_id = j.id \
+             WHERE t.id = ? AND t.status = 'blocked' AND e.event_type = 'turn/blocked' \
+             AND j.turn_id = t.id AND j.status = 'blocked' AND o.status = 'delivered' \
+             AND o.turn_id = j.turn_id AND o.item_id = j.item_id AND o.item_type = j.item_type \
+             AND o.recovery_status = j.status AND o.attempt_number = MAX(j.run_count, 1) \
+             AND o.error_message = COALESCE(j.last_error, j.reason, 'recovery reached a terminal outcome')",
+            [turn_id.into()],
+        )).await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let payload: String = row.try_get("", "payload")?;
+        let error: Option<String> = row.try_get("", "error")?;
+        let diagnostic: Option<String> = row.try_get("", "diagnostic")?;
+        let Ok(CanonicalTurnEventPayload::TurnBlocked(event)) = serde_json::from_str(&payload)
+        else {
+            return Ok(None);
+        };
+        let Some(job_id) = event
+            .resume
+            .and_then(|resume| resume.blocked_recovery_job_id)
+        else {
+            return Ok(None);
+        };
+        let diagnostic = diagnostic.as_deref().and_then(|value| {
+            serde_json::from_str::<pioneer_protocol::RecoveryDiagnostic>(value).ok()
+        });
+        Ok(diagnostic.filter(|value| {
+            value.stop_reason == Some(pioneer_protocol::RecoveryStopReason::NoProgress)
+                && value.last_failure.is_some()
+                && event.turn.id == turn_id
+                && event.turn.status == TurnStatus::Blocked
+                && event.turn.error == error
+                && error.as_deref()
+                    == Some(format!("{} (recovery job {job_id})", value.public_message()).as_str())
+        }))
+    }
+
     pub async fn get_recovery_job(&self, job_id: &str) -> Result<Option<RecoveryJobRecord>> {
         self.run_serialized_write(|| async {
             Ok(recovery_job::find_job_by_id(&self.connection, job_id)
@@ -24069,6 +24021,29 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
+        self.mark_recovery_job_retrying_with_diagnostic(
+            job_id,
+            active_attempt_id,
+            next_run_at_unix,
+            budget_origin_after_cooldown_unix,
+            last_error,
+            None,
+            now_unix,
+        )
+        .await
+    }
+
+    pub async fn mark_recovery_job_retrying_with_diagnostic(
+        &self,
+        job_id: &str,
+        active_attempt_id: &str,
+        next_run_at_unix: i64,
+        budget_origin_after_cooldown_unix: Option<i64>,
+        last_error: Option<String>,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        now_unix: i64,
+    ) -> Result<bool> {
+        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         let last_error_value = last_error.clone();
         self.run_serialized_write(|| async {
             recovery_job::mark_job_retrying(
@@ -24078,6 +24053,7 @@ impl CrudStore {
                 unix_to_datetime(next_run_at_unix),
                 budget_origin_after_cooldown_unix.map(unix_to_datetime),
                 last_error_value.clone(),
+                diagnostic_json.clone(),
                 unix_to_datetime(now_unix),
             )
             .await
@@ -24193,6 +24169,22 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
+        self.mark_due_pending_recovery_job_terminal_if_turn_idle_with_diagnostic(
+            job_id, action, status, last_error, None, now_unix,
+        )
+        .await
+    }
+
+    pub async fn mark_due_pending_recovery_job_terminal_if_turn_idle_with_diagnostic(
+        &self,
+        job_id: &str,
+        action: RecoveryAction,
+        status: RecoveryJobStatus,
+        last_error: Option<String>,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        now_unix: i64,
+    ) -> Result<bool> {
+        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         let last_error_value = last_error.clone();
         self.run_serialized_write(|| async {
             let tx = self
@@ -24216,6 +24208,11 @@ impl CrudStore {
                     return Err(error);
                 }
             };
+            if affected {
+                if let Some(value) = &diagnostic_json {
+                    recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
+                }
+            }
             if affected
                 && let Err(error) = enqueue_recovery_terminalization_if_required(
                     &tx,
@@ -24243,6 +24240,27 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
+        self.mark_claimed_recovery_job_terminal_with_diagnostic(
+            job_id,
+            claim_token,
+            status,
+            last_error,
+            None,
+            now_unix,
+        )
+        .await
+    }
+
+    pub async fn mark_claimed_recovery_job_terminal_with_diagnostic(
+        &self,
+        job_id: &str,
+        claim_token: &str,
+        status: RecoveryJobStatus,
+        last_error: Option<String>,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        now_unix: i64,
+    ) -> Result<bool> {
+        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         let last_error_value = last_error.clone();
         self.run_serialized_write(|| async {
             let tx = self
@@ -24260,6 +24278,11 @@ impl CrudStore {
             )
             .await?;
             if affected {
+                if let Some(value) = &diagnostic_json {
+                    recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
+                } else if status == RecoveryJobStatus::Blocked {
+                    recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
+                }
                 enqueue_recovery_terminalization_if_required(
                     &tx,
                     job_id,
@@ -24298,6 +24321,9 @@ impl CrudStore {
             )
             .await?;
             if affected {
+                if status == RecoveryJobStatus::Blocked {
+                    recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
+                }
                 enqueue_recovery_terminalization_if_required(
                     &tx,
                     job_id,
@@ -24320,6 +24346,21 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
+        self.mark_malformed_active_recovery_job_terminal_with_diagnostic(
+            job_id, status, last_error, None, now_unix,
+        )
+        .await
+    }
+
+    pub async fn mark_malformed_active_recovery_job_terminal_with_diagnostic(
+        &self,
+        job_id: &str,
+        status: RecoveryJobStatus,
+        last_error: Option<String>,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        now_unix: i64,
+    ) -> Result<bool> {
+        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         let last_error_value = last_error.clone();
         self.run_serialized_write(|| async {
             let tx = self
@@ -24336,6 +24377,11 @@ impl CrudStore {
             )
             .await?;
             if affected {
+                if let Some(value) = &diagnostic_json {
+                    recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
+                } else if status == RecoveryJobStatus::Blocked {
+                    recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
+                }
                 enqueue_recovery_terminalization_if_required(
                     &tx,
                     job_id,
@@ -24359,6 +24405,27 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
+        self.mark_recovery_job_terminal_after_attempt_with_diagnostic(
+            job_id,
+            active_attempt_id,
+            status,
+            last_error,
+            None,
+            now_unix,
+        )
+        .await
+    }
+
+    pub async fn mark_recovery_job_terminal_after_attempt_with_diagnostic(
+        &self,
+        job_id: &str,
+        active_attempt_id: &str,
+        status: RecoveryJobStatus,
+        last_error: Option<String>,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        now_unix: i64,
+    ) -> Result<bool> {
+        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         let last_error_value = last_error.clone();
         self.run_serialized_write(|| async {
             let tx = self
@@ -24376,6 +24443,11 @@ impl CrudStore {
             )
             .await?;
             if affected {
+                if let Some(value) = &diagnostic_json {
+                    recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
+                } else if status == RecoveryJobStatus::Blocked {
+                    recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
+                }
                 enqueue_recovery_terminalization_if_required(
                     &tx,
                     job_id,
@@ -24527,9 +24599,7 @@ impl CrudStore {
                                 && native_terminal_effect_outbox::payload_sha256_hex(checkpoint)
                                     == expected_sha256 => {}
                         _ => {
-                            bail!(
-                                "native terminal-effect handler checkpoint failed integrity validation"
-                            );
+                            return Err(HandlerCheckpointInvalid { class: "checkpoint_integrity" }.into());
                         }
                     }
                     if !matches!(
@@ -24561,6 +24631,8 @@ impl CrudStore {
                     {
                         bail!("native terminal-effect retry state is invalid");
                     }
+                    let legacy_manifest_revalidation = row.last_error_code.as_deref()
+                        == Some("memory.post_turn_extractor.legacy_manifest_revalidate");
                     Ok(ClaimedNativeTerminalEffectRecord {
                         effect_id: row.effect_id,
                         workspace_id: row.workspace_id,
@@ -24571,11 +24643,20 @@ impl CrudStore {
                         attempt_count,
                         max_attempts,
                         claim_token: claimed.claim_token.clone(),
+                        legacy_manifest_revalidation,
                     })
                 })();
                 match decoded {
                     Ok(record) => valid.push(record),
-                    Err(_error) => {
+                    Err(error) => {
+                        // Claim validation serves every terminal-effect kind. Hook ownership
+                        // is established by the executor, not by this generic quarantine path.
+                        let code = "invalid_persisted_effect";
+                        let message = if let Some(invalid) = error.downcast_ref::<HandlerCheckpointInvalid>() {
+                            format!("persisted checkpoint failed integrity validation; failure_stage=checkpoint_integrity; failure_class={}", invalid.class)
+                        } else {
+                            "persisted native terminal-effect row failed schema validation".to_owned()
+                        };
                         // One malformed durable row must not poison every
                         // valid claim in the bounded batch. Quarantine it with
                         // a typed, non-payload diagnostic under the same claim
@@ -24584,8 +24665,8 @@ impl CrudStore {
                             &self.connection,
                             effect_id.as_str(),
                             claimed.claim_token.as_str(),
-                            "invalid_persisted_effect",
-                            "persisted native terminal-effect row failed schema validation",
+                            code,
+                            &message,
                             false,
                             now,
                             now,
@@ -25603,6 +25684,15 @@ impl CrudStore {
                 current_status,
             });
         }
+        let blocked_diagnostic = job
+            .diagnostic
+            .as_deref()
+            .and_then(|value| {
+                serde_json::from_str::<pioneer_protocol::RecoveryDiagnostic>(value).ok()
+            })
+            .filter(|value| {
+                value.stop_reason == Some(pioneer_protocol::RecoveryStopReason::NoProgress)
+            });
         let terminal_error = if job_status == RecoveryJobStatus::Blocked {
             if current_status == TurnStatus::Blocked {
                 turn_model
@@ -25618,25 +25708,22 @@ impl CrudStore {
                 })?;
                 format!(
                     "{} (recovery job {})",
-                    resume.human_message, record.recovery_job_id
+                    blocked_diagnostic
+                        .as_ref()
+                        .map(|value| value.public_message())
+                        .unwrap_or_else(|| resume.human_message.clone()),
+                    record.recovery_job_id
                 )
             }
         } else {
-            let status_label = match job_status {
-                RecoveryJobStatus::Exhausted => "exhausted",
-                RecoveryJobStatus::Failed => "failed",
-                RecoveryJobStatus::Blocked => unreachable!("handled above"),
-                RecoveryJobStatus::Pending
-                | RecoveryJobStatus::Active
-                | RecoveryJobStatus::Succeeded
-                | RecoveryJobStatus::Cancelled => {
-                    unreachable!("non-terminal recovery status was rejected before terminalization")
-                }
-            };
-            format!(
-                "recovery {status_label} for item `{}`: {}",
-                record.item_id, record.error_message
-            )
+            job.diagnostic
+                .as_deref()
+                .and_then(|value| {
+                    serde_json::from_str::<pioneer_protocol::RecoveryDiagnostic>(value).ok()
+                })
+                .filter(|value| value.stop_reason.is_some())
+                .unwrap_or_default()
+                .public_message()
         };
         let already_terminal = current_status == desired_status;
         let cleanup_reason = terminal_error.chars().take(4_096).collect::<String>();
@@ -25705,7 +25792,7 @@ impl CrudStore {
                 mentions: collaboration.mentions,
                 message_revision: collaboration.message_revision,
                 message_deleted: collaboration.message_deleted,
-                error: Some(terminal_error),
+                error: Some(terminal_error.clone()),
                 prompt_manifest,
                 permission_profile,
             })
@@ -25733,7 +25820,7 @@ impl CrudStore {
                 terminalize_turn_item_payload(
                     &mut item,
                     TurnItemTerminalState::Failed {
-                        reason: Some(record.error_message.clone()),
+                        reason: Some(terminal_error.clone()),
                     },
                 );
                 let notification = pioneer_protocol::ItemCompletedNotification {
@@ -25766,7 +25853,12 @@ impl CrudStore {
                     turn: terminal_turn
                         .clone()
                         .expect("non-terminal recovery must construct a terminal Turn"),
-                    resume: resume.cloned(),
+                    resume: resume.cloned().map(|mut resume| {
+                        if let Some(diagnostic) = &blocked_diagnostic {
+                            resume.human_message = diagnostic.public_message();
+                        }
+                        resume
+                    }),
                 })
             } else {
                 TurnEventPayload::TurnFailed(pioneer_protocol::TurnFailedNotification {
@@ -29470,11 +29562,47 @@ impl CrudStore {
         events: Vec<task_event::PreparedTaskEvent>,
         event_timestamp_secs: i64,
     ) -> Result<Vec<AppendedTaskEvent>> {
+        self.append_task_events_in_connection_with_delivery_policy(
+            db,
+            events,
+            event_timestamp_secs,
+            false,
+        )
+        .await
+    }
+
+    async fn append_task_events_with_delivery_cancellation<C: ConnectionTrait + Sync>(
+        &self,
+        db: &C,
+        events: Vec<task_event::PreparedTaskEvent>,
+        at: i64,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        self.append_task_events_in_connection_with_delivery_policy(db, events, at, true)
+            .await
+    }
+
+    async fn append_task_events_in_connection_with_delivery_policy<C: ConnectionTrait + Sync>(
+        &self,
+        db: &C,
+        events: Vec<task_event::PreparedTaskEvent>,
+        event_timestamp_secs: i64,
+        delivery_cancellation: bool,
+    ) -> Result<Vec<AppendedTaskEvent>> {
         let created_at = unix_to_datetime(event_timestamp_secs);
         let mut appended_events = Vec::with_capacity(events.len());
         let mut batch_run_turns = HashMap::<String, PreparedLegacyTaskRunTurn>::new();
 
         for event in events {
+            let mut event = if delivery_cancellation {
+                let Some(event) =
+                    task_delivery_lifecycle::preflight_cancellation(db, event).await?
+                else {
+                    continue;
+                };
+                event
+            } else {
+                event
+            };
             // Only state-independent work (validation, serialization and CPU
             // projection preparation) is performed before writer admission.
             // Database-dependent preparation is deliberately sequential here:
@@ -29488,15 +29616,20 @@ impl CrudStore {
                     batch_run_turns.insert(turn.run_id.clone(), turn);
                 }
             }
-            let delivery_authority = match event.payload() {
-                TaskEventPayload::DeliveryQueued { delivery }
-                | TaskEventPayload::DeliveryStarted { delivery, .. }
-                | TaskEventPayload::DeliveryDelivered { delivery, .. }
-                | TaskEventPayload::DeliveryFailed { delivery, .. }
-                | TaskEventPayload::DeliveryCancelled { delivery, .. } => Some(
-                    crate::task_projector::prepare_task_delivery_authority(db, delivery).await?,
-                ),
-                _ => None,
+            let delivery_authority = if let Some(authority) = event.take_delivery_authority() {
+                Some(authority)
+            } else {
+                match event.payload() {
+                    TaskEventPayload::DeliveryQueued { delivery }
+                    | TaskEventPayload::DeliveryStarted { delivery, .. }
+                    | TaskEventPayload::DeliveryDelivered { delivery, .. }
+                    | TaskEventPayload::DeliveryFailed { delivery, .. }
+                    | TaskEventPayload::DeliveryCancelled { delivery, .. } => Some(
+                        crate::task_projector::prepare_task_delivery_authority(db, delivery)
+                            .await?,
+                    ),
+                    _ => None,
+                }
             };
             let event = event.preflight_idempotency(db).await?;
             let (gate_resolution, legacy_candidate, legacy_review) = self
@@ -31058,6 +31191,11 @@ fn infer_timeout_reason(
 
 fn recovery_job_record_from_model(model: pioneer_entity::recovery_job::Model) -> RecoveryJobRecord {
     RecoveryJobRecord {
+        last_failure_attempt_id: model.last_failure_attempt_id,
+        diagnostic: model
+            .diagnostic
+            .as_deref()
+            .and_then(|value| serde_json::from_str(value).ok()),
         id: model.id,
         turn_id: model.turn_id,
         item_id: model.item_id,
@@ -31120,6 +31258,8 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    #[path = "task_run_occurrence.rs"]
+    mod occurrence_tracker;
     use super::{
         AgentExecutionInput, AgentResourceStateInput, ArtifactBindingTargetRecord,
         AtomicRecoveryJobEnqueueOutcome, BLOCK_KIND_APPROVAL, BLOCK_KIND_USER_MESSAGE,
@@ -31145,8 +31285,9 @@ mod tests {
         SkillPackInstallationRecord, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
         THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES,
         TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES, TaskEventPayload, TaskOwnedTurnResumeOutcome,
-        TaskRunChildAnchor, TaskRunOccurrenceTerminalizationOutcome, ThreadAgentsDocError,
-        ThreadAgentsDocSaveReason, ThreadAgentsDocStatus, ThreadEpisodicActiveWriteSegmentRequest,
+        TaskRunChildAnchor, TaskRunOccurrenceReconcileCandidate,
+        TaskRunOccurrenceTerminalizationOutcome, ThreadAgentsDocError, ThreadAgentsDocSaveReason,
+        ThreadAgentsDocStatus, ThreadEpisodicActiveWriteSegmentRequest,
         ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleWriteState,
         ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility, ThreadEpisodicSourceActorRole,
         ThreadEpisodicSourceRuntimeKind, ThreadEpisodicWorkspaceActiveWriteSegmentRequest,
@@ -31584,6 +31725,161 @@ mod tests {
             )
             .await
             .expect("test Task occurrence contract should persist");
+    }
+
+    #[tokio::test]
+    async fn task_execution_observation_uses_current_attempt_activity_and_heartbeat() {
+        let workspace_id = "ws_task_observation";
+        let store = test_store_with_workspace(workspace_id).await;
+        let timestamp = 1_700_020_000;
+        ensure_test_agent_identity(&store, workspace_id, timestamp).await;
+        let mut task = sample_task(timestamp);
+        task.id = "task_observation".to_owned();
+        task.workspace_id = workspace_id.to_owned();
+        let mut run = sample_task_run(timestamp);
+        run.id = "run_observation".to_owned();
+        run.task_id = task.id.clone();
+        run.trigger_id = None;
+        run.run_group_id = run.id.clone();
+        store
+            .append_task_events(
+                vec![
+                    TaskEventPayload::TaskCreated { task: task.clone() },
+                    TaskEventPayload::RunCreated {
+                        run: run.clone(),
+                        agent_spec: None,
+                    },
+                ],
+                timestamp,
+            )
+            .await
+            .expect("task and run should project");
+        let execution = store
+            .reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::Agent, timestamp)
+            .await
+            .expect("execution should reserve");
+        attach_test_agent_execution_contract(
+            &store,
+            workspace_id,
+            task.id.as_str(),
+            run.id.as_str(),
+            execution.id.as_str(),
+            "thread_observation",
+            timestamp,
+        )
+        .await;
+
+        let observe = || async {
+            store
+                .list_task_run_execution_observations(&[run.id.clone()])
+                .await
+        };
+        let initial = observe().await.expect("initial observation should load");
+        assert_eq!(initial[0].status, TaskRunExecutionStatus::Reserved);
+        assert_eq!(initial[0].heartbeat_at, None);
+        assert_eq!(initial[0].last_activity_at, None);
+
+        store
+            .mark_execution_running(execution.id.as_str(), timestamp + 1, None)
+            .await
+            .expect("execution should start");
+        pioneer_entity::agent_execution_resource_state::Entity::update_many()
+            .col_expr(
+                pioneer_entity::agent_execution_resource_state::Column::Status,
+                Expr::value("running"),
+            )
+            .filter(
+                pioneer_entity::agent_execution_resource_state::Column::ExecutionId
+                    .eq(execution.id.clone()),
+            )
+            .exec(&store.connection)
+            .await
+            .expect("test resource attempt should start");
+        store
+            .heartbeat_execution_for_agent_attempt(execution.id.as_str(), 1, timestamp + 2, None)
+            .await
+            .expect("heartbeat should persist");
+        let heartbeat_only = observe().await.expect("heartbeat observation should load");
+        assert_eq!(heartbeat_only[0].heartbeat_at, Some(timestamp + 2));
+        assert_eq!(heartbeat_only[0].last_activity_at, None);
+
+        assert!(
+            store
+                .record_agent_execution_progress(
+                    execution.id.as_str(),
+                    1,
+                    "{}",
+                    timestamp + 3,
+                    None
+                )
+                .await
+                .expect("progress should persist")
+        );
+        let active = observe().await.expect("activity observation should load");
+        assert_eq!(active[0].last_activity_at, Some(timestamp + 3));
+
+        let mut occurrence = store
+            .get_task_occurrence_contract_by_run(run.id.as_str())
+            .await
+            .expect("occurrence should load")
+            .expect("occurrence should exist");
+        occurrence.retry_attempt = 1;
+        store
+            .upsert_task_occurrence_contract(&occurrence, timestamp + 4)
+            .await
+            .expect("current attempt should advance");
+        let retry = observe().await.expect("retry observation should load");
+        assert_eq!(retry[0].status, TaskRunExecutionStatus::Running);
+        assert_eq!(retry[0].heartbeat_at, None);
+        assert_eq!(retry[0].last_activity_at, None);
+
+        super::insert_agent_resource_state(
+            &store.connection,
+            &AgentResourceStateInput {
+                id: format!("resource-{}-2", execution.id),
+                execution_id: execution.id.clone(),
+                attempt_generation: 2,
+                branch_key: format!("task:{}:{}", task.id, run.id),
+                fair_order: 1,
+                now: unix_to_datetime(timestamp + 4),
+            },
+        )
+        .await
+        .expect("new resource attempt should persist");
+        pioneer_entity::agent_execution_resource_state::Entity::update_many()
+            .col_expr(
+                pioneer_entity::agent_execution_resource_state::Column::Status,
+                Expr::value("running"),
+            )
+            .filter(
+                pioneer_entity::agent_execution_resource_state::Column::ExecutionId
+                    .eq(execution.id.clone()),
+            )
+            .filter(pioneer_entity::agent_execution_resource_state::Column::AttemptGeneration.eq(2))
+            .exec(&store.connection)
+            .await
+            .expect("new resource attempt should start");
+        store
+            .heartbeat_execution_for_agent_attempt(execution.id.as_str(), 2, timestamp + 5, None)
+            .await
+            .expect("new attempt heartbeat should persist");
+        assert!(
+            store
+                .record_agent_execution_progress(
+                    execution.id.as_str(),
+                    2,
+                    "{}",
+                    timestamp + 6,
+                    None
+                )
+                .await
+                .expect("new attempt progress should persist")
+        );
+        let resumed = observe()
+            .await
+            .expect("new attempt observation should load");
+        assert_eq!(resumed[0].heartbeat_at, Some(timestamp + 5));
+        assert_eq!(resumed[0].last_activity_at, Some(timestamp + 6));
     }
 
     async fn test_store_with_started_turn(
@@ -33620,6 +33916,56 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_terminal_effect_checkpoint_is_quarantined_before_handler_execution() {
+        assert_terminal_checkpoint_quarantine(serde_json::json!({"schema_version": 1}), false)
+            .await;
+    }
+
+    fn checkpoint_test_hook_snapshot(hook_id: &str) -> serde_json::Value {
+        let hook_id = pioneer_hooks::HookId::new(hook_id).unwrap();
+        let subscription = pioneer_hooks::HookSubscription::new(
+            pioneer_hooks::HookSubscriptionId::new("test.post_turn").unwrap(),
+            hook_id.clone(),
+            pioneer_hooks::HookPhase::TurnPostTurn,
+        );
+        let descriptor = pioneer_hooks::HookHandlerDescriptor {
+            hook_id,
+            hook_kind: pioneer_hooks::HookKind::new("memory").unwrap(),
+            supported_phases: vec![pioneer_hooks::HookPhase::TurnPostTurn],
+            version: 1,
+            input_contract_version: 1,
+            output_contract_version: 1,
+            default_execution_policy: Default::default(),
+            default_failure_policy: pioneer_hooks::HookFailurePolicy::BestEffort,
+            capabilities: pioneer_hooks::HookCapabilities::new([
+                pioneer_hooks::HookCapability::new("idempotent_side_effect").unwrap(),
+            ]),
+        };
+        serde_json::json!({"schema_version":1, "subscriptions":[subscription], "handlers":[descriptor]})
+    }
+
+    #[tokio::test]
+    async fn checkpoint_quarantine_is_generic_even_with_memory_subscription() {
+        assert_terminal_checkpoint_quarantine(
+            checkpoint_test_hook_snapshot("memory.post_turn_extractor"),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_quarantine_does_not_attribute_other_hook_or_kind_to_memory() {
+        assert_terminal_checkpoint_quarantine(
+            checkpoint_test_hook_snapshot("test.other_post_turn"),
+            false,
+        )
+        .await;
+        assert_terminal_checkpoint_quarantine(serde_json::json!({}), true).await;
+    }
+
+    async fn assert_terminal_checkpoint_quarantine(
+        runtime_snapshot: serde_json::Value,
+        cleanup: bool,
+    ) {
         let timestamp = 1_700_005_250;
         let workspace_id = "ws_terminal_effect_bad_checkpoint";
         let thread_id = "thr_terminal_effect_bad_checkpoint";
@@ -33635,16 +33981,52 @@ mod tests {
                     thread_id: thread_id.to_owned(),
                     turn_id: turn_id.to_owned(),
                     runtime_generation: 1,
-                    effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
-                        effect_id: effect_id.clone(),
-                        effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
-                        gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
-                        payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
-                            request: serde_json::json!({"phase": "turn.post_turn"}),
-                            runtime_snapshot: serde_json::json!({"schema_version": 1}),
+                    effects: vec![
+                        pioneer_protocol::NativeTerminalEffectSpec {
+                            effect_id: effect_id.clone(),
+                            effect_kind: if cleanup {
+                                pioneer_protocol::NativeTerminalEffectKind::AttachedTaskCleanup
+                            } else {
+                                pioneer_protocol::NativeTerminalEffectKind::PostTurnHook
+                            },
+                            gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                            payload: if cleanup {
+                                pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
+                                    reason: "parent turn completed".to_owned(),
+                                    runtime_contract: "pioneer.test.attached-task-cleanup.v1"
+                                        .to_owned(),
+                                }
+                            } else {
+                                pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                                    request: serde_json::json!({"phase": "turn.post_turn"}),
+                                    runtime_snapshot,
+                                }
+                            },
+                            max_attempts: 3,
                         },
-                        max_attempts: 3,
-                    }],
+                        pioneer_protocol::NativeTerminalEffectSpec {
+                            effect_id: format!("{turn_id}:terminal-effect:healthy"),
+                            effect_kind: if cleanup {
+                                pioneer_protocol::NativeTerminalEffectKind::PostTurnHook
+                            } else {
+                                pioneer_protocol::NativeTerminalEffectKind::AttachedTaskCleanup
+                            },
+                            gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                            payload: if cleanup {
+                                pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                                    request: serde_json::json!({}),
+                                    runtime_snapshot: serde_json::json!({}),
+                                }
+                            } else {
+                                pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
+                                    reason: "completed".to_owned(),
+                                    runtime_contract: "pioneer.test.attached-task-cleanup.v1"
+                                        .to_owned(),
+                                }
+                            },
+                            max_attempts: 3,
+                        },
+                    ],
                 },
                 timestamp,
             )
@@ -33670,7 +34052,11 @@ mod tests {
             )
             .col_expr(
                 pioneer_entity::native_terminal_effect_outbox::Column::HandlerCheckpointSha256,
-                Expr::value(Some("0".repeat(64))),
+                Expr::value(Some(if cleanup {
+                    native_terminal_effect_outbox::payload_sha256_hex(r#"{"schema_version":1}"#)
+                } else {
+                    "0".repeat(64)
+                })),
             )
             .filter(
                 pioneer_entity::native_terminal_effect_outbox::Column::EffectId
@@ -33680,13 +34066,28 @@ mod tests {
             .await
             .expect("fault injection should corrupt the durable checkpoint hash");
 
+        let healthy = store
+            .claim_due_native_terminal_effects(timestamp + 1, 10, 10)
+            .await
+            .expect("corrupt checkpoint should be quarantined without poisoning its batch");
+        assert_eq!(
+            healthy.len(),
+            1,
+            "only the healthy obligation may reach a handler"
+        );
+        assert_eq!(
+            healthy[0].effect_id,
+            format!("{turn_id}:terminal-effect:healthy")
+        );
         assert!(
             store
-                .claim_due_native_terminal_effects(timestamp + 1, 10, 1)
+                .complete_native_terminal_effect(
+                    &healthy[0].effect_id,
+                    &healthy[0].claim_token,
+                    timestamp + 2
+                )
                 .await
-                .expect("corrupt checkpoint should be quarantined")
-                .is_empty(),
-            "a corrupt checkpoint must never reach a hook handler"
+                .unwrap()
         );
         let quarantined = store
             .native_terminal_effect_status(effect_id.as_str())
@@ -33697,6 +34098,31 @@ mod tests {
         assert_eq!(
             quarantined.last_error_code.as_deref(),
             Some("invalid_persisted_effect")
+        );
+        let persisted =
+            pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(effect_id)
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(persisted.next_run_at.is_none());
+        assert_eq!(
+            persisted.handler_checkpoint_json.as_deref(),
+            Some(r#"{"schema_version":1}"#)
+        );
+        assert_eq!(
+            store
+                .requeue_retryable_unresolved_native_terminal_effects(timestamp + 7200, 10)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            store
+                .claim_due_native_terminal_effects(timestamp + 7200, 10, 10)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -34484,6 +34910,18 @@ mod tests {
 
     #[tokio::test]
     async fn retryable_post_turn_effect_reopens_after_bounded_cooldown() {
+        for code in [
+            "memory.post_turn_extractor.provider_network_transient",
+            "memory.post_turn_extractor.provider_stream_stall",
+            "memory.post_turn_extractor.provider_stream_truncated",
+            "memory.post_turn_extractor.provider_rate_limited",
+            "memory.post_turn_extractor.provider_5xx",
+        ] {
+            assert_neighbor_post_turn_effect_reopens(code).await;
+        }
+    }
+
+    async fn assert_neighbor_post_turn_effect_reopens(code: &str) {
         let timestamp = 1_700_040_000;
         let workspace_id = "ws_post_turn_reopen";
         let thread_id = "thr_post_turn_reopen";
@@ -34538,7 +34976,7 @@ mod tests {
                 .fail_native_terminal_effect(
                     effect_id.as_str(),
                     first.claim_token.as_str(),
-                    "memory.post_turn_extractor.provider_network_transient",
+                    code,
                     "provider request failed (network_transient)",
                     true,
                     timestamp + 2,
@@ -34573,6 +35011,383 @@ mod tests {
         assert_eq!(reopened.effect_id, effect_id);
         assert_eq!(reopened.attempt_count, 1);
         assert_eq!(reopened.max_attempts, 8);
+    }
+
+    #[tokio::test]
+    async fn memory_write_recovery_is_classified_and_legacy_revalidation_is_bounded() {
+        for (code, checkpoint, delay, expected, revalidated_code) in [
+            (
+                "memory.post_turn_extractor.write_invalid_input",
+                true,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_domain_rejected",
+                true,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_unclassified",
+                true,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_storage_transient",
+                true,
+                3_602,
+                1,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                true,
+                3_602,
+                1,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                true,
+                3_602,
+                1,
+                "memory.post_turn_extractor.write_storage_transient",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                false,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                true,
+                3_599,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.write_failed",
+                true,
+                86_401,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.legacy_write_revalidate",
+                true,
+                3_602,
+                0,
+                "memory.post_turn_extractor.write_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_domain_rejected",
+                false,
+                3_602,
+                0,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_invalid_stored_data",
+                false,
+                3_602,
+                0,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_unclassified",
+                false,
+                3_602,
+                0,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_storage_transient",
+                false,
+                3_602,
+                1,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_failed",
+                false,
+                3_602,
+                1,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_failed",
+                true,
+                3_602,
+                1,
+                "memory.post_turn_extractor.manifest_domain_rejected",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_failed",
+                false,
+                3_602,
+                1,
+                "memory.post_turn_extractor.manifest_invalid_stored_data",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_failed",
+                false,
+                3_602,
+                1,
+                "memory.post_turn_extractor.manifest_storage_transient",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_failed",
+                false,
+                3_599,
+                0,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_failed",
+                false,
+                86_401,
+                0,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.legacy_manifest_revalidate",
+                false,
+                3_602,
+                0,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            ("effect_timeout", false, 3_602, 1, "effect_timeout"),
+            (
+                "memory.post_turn_extractor.provider_network_transient",
+                false,
+                3_602,
+                1,
+                "effect_timeout",
+            ),
+        ] {
+            let timestamp = 1_700_040_000;
+            let workspace_id = "ws_post_turn_reopen";
+            let thread_id = "thr_post_turn_reopen";
+            let turn_id = "turn_post_turn_reopen";
+            let (store, _, mut terminal_turn) =
+                test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+            let store = store.with_maintenance_access();
+            let effect_id = format!("{turn_id}:terminal-effect:post-turn");
+            store
+                .prepare_native_terminal_effects(
+                    pioneer_protocol::NativeTerminalEffectPreparation {
+                        batch_id: format!("{turn_id}:batch:post-turn-reopen"),
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        runtime_generation: 1,
+                        effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+                            effect_id: effect_id.clone(),
+                            effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
+                            gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                            payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                                request: serde_json::json!({}),
+                                runtime_snapshot: serde_json::json!({}),
+                            },
+                            max_attempts: 1,
+                        }],
+                    },
+                    timestamp,
+                )
+                .await
+                .expect("post-turn effect should prepare");
+            terminal_turn.status = TurnStatus::Completed;
+            store
+                .materialize_turn_completed(
+                    TurnCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn: terminal_turn,
+                    },
+                    timestamp + 1,
+                )
+                .await
+                .expect("terminal commit should activate post-turn effect");
+
+            let first = store
+                .claim_due_native_terminal_effects(timestamp + 1, 10, 1)
+                .await
+                .expect("first attempt should claim")
+                .pop()
+                .expect("first attempt must exist");
+            if checkpoint {
+                store.store_native_terminal_effect_handler_checkpoint(
+                    &effect_id, &first.claim_token, r#"{"schema_version":1,"raw_json":"{\"facts\":[]}","model":"model","model_provider":"provider"}"#, timestamp + 1,
+                ).await.unwrap();
+            }
+            assert!(
+                store
+                    .fail_native_terminal_effect(
+                        effect_id.as_str(),
+                        first.claim_token.as_str(),
+                        code,
+                        "safe write failure",
+                        matches!(
+                            code,
+                            "memory.post_turn_extractor.write_storage_transient"
+                                | "memory.post_turn_extractor.write_failed"
+                        ),
+                        timestamp + 2,
+                        timestamp + 1,
+                    )
+                    .await
+                    .expect("exhausted transient failure should persist")
+            );
+            assert_eq!(
+                store
+                    .native_terminal_effect_status(effect_id.as_str())
+                    .await
+                    .expect("status should load")
+                    .expect("effect should exist")
+                    .status,
+                "unresolved"
+            );
+            assert_eq!(
+                store
+                    .requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 0)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                store
+                    .requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 1)
+                    .await
+                    .unwrap(),
+                expected,
+                "{code}, delay={delay}"
+            );
+            if expected == 0 {
+                assert!(
+                    store
+                        .claim_due_native_terminal_effects(timestamp + delay, 10, 1)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                continue;
+            }
+            // Repeat discovery through a newly scoped handle, as after restart.
+            assert_eq!(
+                store
+                    .with_maintenance_access()
+                    .requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 1)
+                    .await
+                    .unwrap(),
+                0
+            );
+            let reopened = store
+                .claim_due_native_terminal_effects(timestamp + delay, 10, 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(reopened.effect_id, effect_id);
+            assert_eq!(
+                reopened.legacy_manifest_revalidation,
+                code == "memory.post_turn_extractor.manifest_failed"
+            );
+            assert!(
+                !store
+                    .fail_native_terminal_effect(
+                        &effect_id,
+                        &first.claim_token,
+                        "stale_owner",
+                        "stale result",
+                        false,
+                        timestamp + delay,
+                        timestamp + delay
+                    )
+                    .await
+                    .unwrap()
+            );
+
+            if matches!(
+                code,
+                "memory.post_turn_extractor.write_failed"
+                    | "memory.post_turn_extractor.manifest_failed"
+            ) {
+                assert_eq!(
+                    reopened.max_attempts, 1,
+                    "legacy revalidation must not expand the budget"
+                );
+                assert_eq!(reopened.attempt_count, reopened.max_attempts);
+                assert_eq!(
+                    store
+                        .native_terminal_effect_status(&effect_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .last_error_code
+                        .as_deref(),
+                    Some(if code == "memory.post_turn_extractor.manifest_failed" {
+                        "memory.post_turn_extractor.legacy_manifest_revalidate"
+                    } else {
+                        "memory.post_turn_extractor.legacy_write_revalidate"
+                    })
+                );
+                assert_eq!(
+                    store
+                        .native_terminal_effect_handler_checkpoint(
+                            &effect_id,
+                            &reopened.claim_token
+                        )
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    checkpoint
+                );
+                // The revalidated cause replaces the legacy marker and stays terminal.
+                store
+                    .fail_native_terminal_effect(
+                        &effect_id,
+                        &reopened.claim_token,
+                        revalidated_code,
+                        "safe classified failure",
+                        matches!(
+                            revalidated_code,
+                            "memory.post_turn_extractor.write_storage_transient"
+                                | "memory.post_turn_extractor.manifest_storage_transient"
+                        ),
+                        timestamp + delay + 1,
+                        timestamp + delay,
+                    )
+                    .await
+                    .unwrap();
+                let reclassified_recovery = store
+                    .requeue_retryable_unresolved_native_terminal_effects(
+                        timestamp + delay + 3_601,
+                        1,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    reclassified_recovery,
+                    u64::from(matches!(
+                        revalidated_code,
+                        "memory.post_turn_extractor.write_storage_transient"
+                            | "memory.post_turn_extractor.manifest_storage_transient"
+                    ),)
+                );
+            } else {
+                assert_eq!(
+                    reopened.max_attempts, 8,
+                    "preserve existing transient recovery budget"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -34896,6 +35711,327 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_diagnostic_rolls_back_with_outbox_and_survives_restart() {
+        for status in [RecoveryJobStatus::Exhausted, RecoveryJobStatus::Blocked] {
+            recovery_diagnostic_atomic_restart_impl(status).await;
+        }
+    }
+
+    async fn recovery_diagnostic_atomic_restart_impl(status: RecoveryJobStatus) {
+        use pioneer_protocol::{
+            ProviderFailureClass, ProviderFailureStage, ProviderTransportKind, RecoveryDiagnostic,
+            RecoveryProviderFailure, RecoveryStopReason,
+        };
+        let (store, _, _) =
+            test_store_with_started_turn("ws_diag_atomic", "thr_diag_atomic", "turn_diag_atomic")
+                .await;
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: "ws_diag_atomic".to_owned(),
+                    thread_id: "thr_diag_atomic".to_owned(),
+                    turn_id: "turn_diag_atomic".to_owned(),
+                    item: safe_web_fetch_item("tool_diag_atomic"),
+                },
+                1_700_000_001,
+            )
+            .await
+            .unwrap();
+        let initial = RecoveryDiagnostic {
+            last_failure: Some(RecoveryProviderFailure {
+                error_reason: None,
+                request_id: None,
+                class: ProviderFailureClass::StreamTruncated,
+                stage: ProviderFailureStage::MidStream,
+                transport: ProviderTransportKind::Stream,
+                http_status: None,
+                retry_after_ms: None,
+            }),
+            stop_reason: None,
+        };
+        let job = match store
+            .enqueue_recovery_job_with_diagnostic_if_no_unresolved(
+                "turn_diag_atomic".to_owned(),
+                "tool_diag_atomic".to_owned(),
+                TurnItemType::WebFetch,
+                None,
+                RecoveryTrigger::ProviderError,
+                RecoveryAction::RetryWithBackoff,
+                Some("raw initial secret".to_owned()),
+                Some(ProviderFailureClass::StreamTruncated),
+                Some(ProviderFailureStage::MidStream),
+                None,
+                0,
+                2,
+                serde_json::json!({}),
+                serde_json::json!({}),
+                Some(initial.clone()),
+                1_700_000_002,
+            )
+            .await
+            .unwrap()
+        {
+            AtomicRecoveryJobEnqueueOutcome::Created(job) => job,
+            _ => panic!("new job expected"),
+        };
+        let claimed = store
+            .claim_due_recovery_jobs(1_700_000_003, 45, 1)
+            .await
+            .unwrap();
+        store
+            .mark_claimed_recovery_job_active(
+                &job.id,
+                claimed[0].claim_token.as_deref().unwrap(),
+                "diag_attempt",
+                1_700_000_003,
+            )
+            .await
+            .unwrap();
+        let final_diagnostic = RecoveryDiagnostic {
+            last_failure: Some(RecoveryProviderFailure {
+                error_reason: Some(pioneer_protocol::ProviderErrorReason::PermissionDenied),
+                request_id: Some(
+                    pioneer_protocol::ProviderRequestId::try_from("gen-atomic_fixture".to_owned())
+                        .unwrap(),
+                ),
+                class: ProviderFailureClass::AuthOrPermission,
+                stage: ProviderFailureStage::Connect,
+                transport: ProviderTransportKind::NonStream,
+                http_status: Some(403),
+                retry_after_ms: None,
+            }),
+            stop_reason: Some(if status == RecoveryJobStatus::Blocked {
+                RecoveryStopReason::NoProgress
+            } else {
+                RecoveryStopReason::AttemptsExhausted
+            }),
+        };
+        let raw = "raw body credential=secret https://secret.example /private/key HTTP 401";
+        assert!(
+            !store
+                .mark_recovery_job_terminal_after_attempt_with_diagnostic(
+                    &job.id,
+                    "stale_attempt",
+                    status,
+                    Some(raw.to_owned()),
+                    Some(final_diagnostic.clone()),
+                    1_700_000_004
+                )
+                .await
+                .unwrap()
+        );
+        store.connection.execute_unprepared("CREATE TRIGGER reject_diag_outbox BEFORE INSERT ON recovery_terminalization_outbox BEGIN SELECT RAISE(ABORT, 'test outbox failure'); END;").await.unwrap();
+        assert!(
+            store
+                .mark_recovery_job_terminal_after_attempt_with_diagnostic(
+                    &job.id,
+                    "diag_attempt",
+                    status,
+                    Some(raw.to_owned()),
+                    Some(final_diagnostic.clone()),
+                    1_700_000_004
+                )
+                .await
+                .is_err()
+        );
+        let rolled_back = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(rolled_back.status, RecoveryJobStatus::Active);
+        assert_eq!(rolled_back.run_count, 0);
+        assert_eq!(rolled_back.diagnostic, Some(initial));
+        assert!(rolled_back.last_failure_attempt_id.is_none());
+        store
+            .connection
+            .execute_unprepared("DROP TRIGGER reject_diag_outbox")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .mark_recovery_job_terminal_after_attempt_with_diagnostic(
+                    &job.id,
+                    "diag_attempt",
+                    status,
+                    Some(raw.to_owned()),
+                    Some(final_diagnostic.clone()),
+                    1_700_000_004
+                )
+                .await
+                .unwrap()
+        );
+        let restarted = CrudStore::new(store.database_connection());
+        let terminal = restarted.get_recovery_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(terminal.diagnostic.as_ref(), Some(&final_diagnostic));
+        assert_eq!(
+            terminal.error_class,
+            Some(ProviderFailureClass::StreamTruncated)
+        );
+        let claims = restarted
+            .claim_due_recovery_terminalizations(1_700_000_005, 45, 10)
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        let applied = restarted
+            .apply_claimed_recovery_terminalization(
+                &claims[0],
+                (status == RecoveryJobStatus::Blocked).then(|| TurnBlockedResumeMetadata {
+                    reason_class: "execution_budget".to_owned(),
+                    human_message: "max_consecutive_no_progress_windows reached: limit=3"
+                        .to_owned(),
+                    resume_requirements: Vec::new(),
+                    resume_command: "turn.resume:turn_diag_atomic".to_owned(),
+                    blocked_recovery_job_id: Some(job.id.clone()),
+                    latest_checkpoint_id: None,
+                    can_resume_same_turn: false,
+                }),
+                RecoveryTerminalCleanupPlan {
+                    runtime_generation: 77,
+                    runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
+                },
+                1_700_000_005,
+            )
+            .await
+            .unwrap();
+        let RecoveryTerminalizationApplyOutcome::Applied(applied) = applied else {
+            panic!("terminalization expected");
+        };
+        let expected = final_diagnostic.public_message();
+        let expected_turn_message = if status == RecoveryJobStatus::Blocked {
+            format!("{expected} (recovery job {})", job.id)
+        } else {
+            expected.clone()
+        };
+        let terminal_turn = applied.newly_terminal_turn.unwrap();
+        assert_eq!(
+            terminal_turn.error.as_deref(),
+            Some(expected_turn_message.as_str())
+        );
+        let serialized = serde_json::to_string(&terminal_turn).unwrap();
+        assert!(serialized.contains("HTTP 403"));
+        for secret in [
+            "credential",
+            "secret.example",
+            "/private",
+            "HTTP 401",
+            "gen-atomic_fixture",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
+        if status == RecoveryJobStatus::Blocked {
+            assert!(applied.final_item.is_none());
+            assert_eq!(
+                restarted
+                    .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                    .await
+                    .unwrap(),
+                Some(final_diagnostic.clone())
+            );
+            assert!(
+                restarted
+                    .get_failed_turn_recovery_diagnostic("turn_diag_atomic")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            // A stale/resumed/pending job cannot lend its facts to this result.
+            for job_status in ["pending", "active", "succeeded", "cancelled"] {
+                restarted
+                    .connection
+                    .execute_unprepared(&format!(
+                        "UPDATE recovery_job SET status = '{job_status}' WHERE id = '{}'",
+                        job.id
+                    ))
+                    .await
+                    .unwrap();
+                assert!(
+                    restarted
+                        .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            restarted
+                .connection
+                .execute_unprepared(&format!(
+                    "UPDATE recovery_job SET status = 'blocked' WHERE id = '{}'",
+                    job.id
+                ))
+                .await
+                .unwrap();
+            restarted
+                .connection
+                .execute_unprepared(
+                    "UPDATE turn SET error = 'authorization denied' WHERE id = 'turn_diag_atomic'",
+                )
+                .await
+                .unwrap();
+            assert!(
+                restarted
+                    .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            restarted
+                .connection
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "UPDATE turn SET error = ? WHERE id = 'turn_diag_atomic'",
+                    [expected_turn_message.into()],
+                ))
+                .await
+                .unwrap();
+            restarted.connection.execute_unprepared("UPDATE turn_event SET payload = json_set(payload, '$.payload.resume.blocked_recovery_job_id', 'unrelated_job') WHERE turn_id = 'turn_diag_atomic' AND event_type = 'turn/blocked'").await.unwrap();
+            assert!(
+                restarted
+                    .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            assert_eq!(
+                restarted
+                    .get_failed_turn_recovery_diagnostic("turn_diag_atomic")
+                    .await
+                    .unwrap(),
+                Some(final_diagnostic)
+            );
+            assert!(
+                restarted
+                    .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                serde_json::to_string(&applied.final_item.unwrap())
+                    .unwrap()
+                    .contains("HTTP 403")
+            );
+        }
+        assert!(
+            restarted
+                .claim_due_recovery_terminalizations(1_700_000_100, 45, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !restarted
+                .mark_recovery_job_terminal_after_attempt_with_diagnostic(
+                    &job.id,
+                    "diag_attempt",
+                    status,
+                    Some("duplicate".to_owned()),
+                    None,
+                    1_700_000_100
+                )
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_recovery_job_outbox_atomically_closes_item_and_turn_after_restart() {
         let (store, _, _) = test_store_with_started_turn(
             "ws_recovery_terminal_outbox",
@@ -35004,6 +36140,15 @@ mod tests {
             .expect("turn lookup should succeed")
             .expect("turn should exist");
         assert_eq!(terminal.status, TurnStatus::Failed);
+        assert_eq!(terminal.error.as_deref(), Some("Recovery failed."));
+        assert!(
+            restarted
+                .get_failed_turn_recovery_diagnostic("turn_recovery_outbox")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
         let item = turn::find_turn_item(
             &restarted.connection,
             "turn_recovery_outbox",
@@ -41365,10 +42510,13 @@ mod tests {
 
         assert_eq!(
             store
-                .list_mismatched_terminal_task_run_occurrence_ids(10)
+                .discover_task_run_occurrence_reconcile(i64::MAX, 10)
                 .await
-                .expect("mismatched occurrences should list"),
-            vec![run.id.clone()],
+                .expect("due tracked occurrences should list"),
+            vec![TaskRunOccurrenceReconcileCandidate {
+                run_id: run.id.clone(),
+                generation: 1
+            }],
         );
         assert_eq!(
             store
@@ -41392,11 +42540,11 @@ mod tests {
         );
         assert!(
             store
-                .list_mismatched_terminal_task_run_occurrence_ids(10)
+                .discover_task_run_occurrence_reconcile(i64::MAX, 10)
                 .await
-                .expect("reconciled occurrences should list")
+                .expect("due tracked occurrences should list")
                 .is_empty(),
-            "a repaired occurrence must leave the polling candidate set",
+            "a repaired occurrence must leave the durable pending set",
         );
         let occurrence = store
             .get_turn("thr_task", run.id.as_str())

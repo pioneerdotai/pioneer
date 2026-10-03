@@ -41,6 +41,10 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     pub resolution_pending: bool,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub diagnostic: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub last_failure_attempt_id: Option<String>,
     #[sea_orm(has_one)]
     pub recovery_terminalization_outbox: HasOne<super::recovery_terminalization_outbox::Entity>,
 }

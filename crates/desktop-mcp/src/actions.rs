@@ -62,7 +62,7 @@ impl McpCatalogView {
     pub(crate) fn uninstall_mcp_server(&mut self, server_id: String, cx: &mut Context<Self>) {
         self.send(McpIntent::Remove { server_id }, cx);
     }
-    fn send(&mut self, intent: McpIntent, cx: &mut Context<Self>) {
+    pub(crate) fn send(&mut self, intent: McpIntent, cx: &mut Context<Self>) {
         if let Some(w) = self.input.navigation_input.workspace_id() {
             if self.client.mcp_intent(w, intent).is_err() {
                 self.presentation_error = Some(t!("mcp.error.gateway_not_connected").to_string());

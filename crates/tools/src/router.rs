@@ -25,7 +25,7 @@ use pioneer_provider::{NativePatchPayload, NativePatchWireShape};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use tokio_util::sync::CancellationToken;
 
 const APPLY_PATCH_ARGUMENT_OVERHEAD_BYTES: usize = 64 * 1024;
@@ -62,6 +62,7 @@ impl ToolCall {
 pub struct ToolRouter {
     registry: ToolRegistry,
     specs: HashMap<String, ConfiguredToolSpec>,
+    argument_validators: HashMap<String, OnceLock<Result<jsonschema::Validator, ()>>>,
     visibility: ToolVisibilitySnapshot,
     event_bus: ToolEventBus,
     turn_id: String,
@@ -95,6 +96,11 @@ impl ToolRouter {
         turn_id: impl Into<String>,
         blocked_tool_names: Arc<RwLock<BTreeMap<String, String>>>,
     ) -> Self {
+        let argument_validators = specs
+            .iter()
+            .filter(|spec| builtin_schema_arguments(spec))
+            .map(|spec| (spec.spec.name.clone(), OnceLock::new()))
+            .collect();
         let specs = specs
             .into_iter()
             .map(|spec| (spec.spec.name.clone(), spec))
@@ -102,6 +108,7 @@ impl ToolRouter {
         Self {
             registry,
             specs,
+            argument_validators,
             visibility,
             event_bus,
             turn_id: turn_id.into(),
@@ -352,14 +359,58 @@ impl ToolRouter {
         tool_name: &str,
         arguments: &str,
     ) -> Result<(ToolPayload, Vec<crate::ToolArgumentCoercion>), ToolError> {
-        match configured.spec.payload_kind {
-            PayloadKind::Function => {
-                let parsed = parse_json_arguments(arguments)?;
-                let normalized = normalize_tool_arguments_for_tool(
-                    tool_name,
+        // Validate before deriving execution metadata or entering permission /
+        // handler execution. Custom payloads retain their dedicated parsers.
+        let builtin = builtin_schema_arguments(configured);
+        let parsed_builtin = if builtin {
+            let parsed = parse_json_arguments(arguments).map_err(|_| {
+                ToolError::invalid_arguments("builtin_argument_json_parse_error: expected valid JSON; validationComplete=false")
+            })?;
+            let normalized = if configured.spec.payload_kind == PayloadKind::Function {
+                crate::argument_normalizer::normalize_builtin_arguments(
                     parsed,
                     &configured.spec.parameters,
-                )?;
+                )?
+            } else {
+                crate::ToolArgumentNormalization {
+                    arguments: parsed,
+                    coercions: Vec::new(),
+                }
+            };
+            let validator = self
+                .argument_validators
+                .get(tool_name)
+                .expect("builtin validator slot")
+                .get_or_init(|| {
+                    crate::builtin_argument_validator::compile(&configured.spec.parameters)
+                })
+                .as_ref()
+                .map_err(|_| {
+                    ToolError::internal(
+                        "builtin argument schema unavailable; validationComplete=false",
+                    )
+                })?;
+            crate::builtin_argument_validator::validate(
+                &normalized.arguments,
+                &configured.spec.parameters,
+                validator,
+            )?;
+            Some(normalized)
+        } else {
+            None
+        };
+        match configured.spec.payload_kind {
+            PayloadKind::Function => {
+                let normalized = if let Some(normalized) = parsed_builtin {
+                    normalized
+                } else {
+                    let parsed = parse_json_arguments(arguments)?;
+                    normalize_tool_arguments_for_tool(
+                        tool_name,
+                        parsed,
+                        &configured.spec.parameters,
+                    )?
+                };
                 if tool_name == REQUEST_TOOLS_TOOL_NAME {
                     parse_request_tools_domains(&normalized.arguments)
                         .map_err(ToolError::invalid_arguments)?;
@@ -403,25 +454,20 @@ impl ToolRouter {
                 }
             }
             PayloadKind::LocalShell => {
-                let parsed = parse_json_arguments(arguments)?;
+                let parsed = match parsed_builtin {
+                    Some(normalized) => normalized.arguments,
+                    None => parse_json_arguments(arguments)?,
+                };
                 if tool_name == "write_stdin" {
-                    let args =
-                        serde_json::from_value::<WriteStdinArgs>(parsed).map_err(|error| {
-                            ToolError::invalid_arguments(format!(
-                                "failed to parse write_stdin arguments: {error}"
-                            ))
-                        })?;
+                    let args = serde_json::from_value::<WriteStdinArgs>(parsed)
+                        .map_err(|error| residual_decode_error(builtin, "write_stdin", error))?;
                     Ok((
                         ToolPayload::LocalShell(LocalShellPayload::WriteStdin(args)),
                         Vec::new(),
                     ))
                 } else {
-                    let args =
-                        serde_json::from_value::<ExecCommandArgs>(parsed).map_err(|error| {
-                            ToolError::invalid_arguments(format!(
-                                "failed to parse {tool_name} arguments: {error}"
-                            ))
-                        })?;
+                    let args = serde_json::from_value::<ExecCommandArgs>(parsed)
+                        .map_err(|error| residual_decode_error(builtin, tool_name, error))?;
                     Ok((
                         ToolPayload::LocalShell(LocalShellPayload::ExecCommand(args)),
                         Vec::new(),
@@ -429,7 +475,10 @@ impl ToolRouter {
                 }
             }
             PayloadKind::ToolSearch => {
-                let parsed = parse_json_arguments(arguments)?;
+                let parsed = match parsed_builtin {
+                    Some(normalized) => normalized.arguments,
+                    None => parse_json_arguments(arguments)?,
+                };
                 let query = parsed
                     .get("query")
                     .and_then(JsonValue::as_str)
@@ -577,6 +626,28 @@ impl ToolRouter {
             ToolIdempotencyMode::RequiresKey => None,
             ToolIdempotencyMode::SessionBound => Self::derive_session_scope_key(tool_name, payload),
         }
+    }
+}
+
+// MCP catalog bindings and dynamic skill provenance are materialized by the
+// existing providers, independently of names and output projection policies.
+fn builtin_schema_arguments(configured: &ConfiguredToolSpec) -> bool {
+    matches!(
+        configured.spec.payload_kind,
+        PayloadKind::Function | PayloadKind::LocalShell | PayloadKind::ToolSearch
+    ) && matches!(configured.payload_binding, ToolPayloadBinding::Function)
+        && configured.spec.permission_metadata.dynamic_skill.is_none()
+}
+
+fn residual_decode_error(builtin: bool, tool_name: &str, error: serde_json::Error) -> ToolError {
+    if builtin {
+        // Schema-valid mathematical integers may still fail serde's u64
+        // representation requirements. Preserve rejection without echoing values.
+        ToolError::invalid_arguments(
+            "builtin_argument_deserialization_error: arguments could not be decoded according to the tool contract",
+        )
+    } else {
+        ToolError::invalid_arguments(format!("failed to parse {tool_name} arguments: {error}"))
     }
 }
 
@@ -844,8 +915,125 @@ mod tests {
             })
             .expect_err("plain string should be rejected for object field");
 
-        assert!(error.to_string().contains("$.trigger"));
-        assert!(error.to_string().contains("must be a JSON object"));
+        assert!(error.to_string().contains("$/trigger"));
+        assert!(error.to_string().contains(r#""expected":"object""#));
+    }
+
+    #[test]
+    fn mcp_keeps_legacy_normalization_and_does_not_acquire_builtin_validation() {
+        let schema = serde_json::json!({"type": "object", "properties": {
+            "a": {"type": "array"}, "b": {"type": "array"}, "n": {"type": "integer"}
+        }});
+        let mut spec = configured_function_spec_with_schema("external", schema);
+        spec.spec.payload_kind = PayloadKind::Mcp;
+        spec.payload_binding = ToolPayloadBinding::Mcp {
+            server_id: "server".into(),
+            server_name: "server".into(),
+            raw_tool_name: "external".into(),
+            catalog_version: "1".into(),
+            snapshot_version: 1,
+            read_only_hint: None,
+            destructive_hint: None,
+            open_world_hint: None,
+        };
+        let router = router_with_specs(vec![spec]);
+        let error = router
+            .build_tool_call(RawToolCall {
+                call_id: "c".into(),
+                tool_name: "external".into(),
+                arguments: r#"{"a":"bad","b":"bad"}"#.into(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("$.a"));
+        assert!(!error.contains("$.b"));
+        assert!(!error.contains("builtin_argument_schema_error"));
+        let call = router
+            .build_tool_call(RawToolCall {
+                call_id: "c".into(),
+                tool_name: "external".into(),
+                arguments: r#"{"a":"[]","n":false}"#.into(),
+            })
+            .unwrap();
+        match call.payload {
+            ToolPayload::Mcp { arguments, .. } => {
+                assert_eq!(arguments["a"], serde_json::json!([]));
+                assert_eq!(arguments["n"], false);
+            }
+            _ => panic!("expected MCP payload"),
+        }
+    }
+
+    #[test]
+    fn dynamic_skill_provenance_keeps_legacy_argument_path() {
+        let mut spec = configured_function_spec_with_schema(
+            "dynamic",
+            serde_json::json!({
+                "type": "object", "properties": {"n": {"type": "integer"}}
+            }),
+        );
+        spec.spec.permission_metadata.dynamic_skill = Some(crate::DynamicSkillPermissionMetadata {
+            kind: crate::DynamicSkillPermissionKind::FunctionProxy,
+            skill_id: pioneer_protocol::SkillId::new("mvg02zVNGWuw5z5C4nYDo").unwrap(),
+            skill_owner: None,
+            skill_slug: "fixture".into(),
+            skill_fingerprint: "fixture".into(),
+            source_kind: "fixture".into(),
+            trust_level: "fixture".into(),
+            target_tool: None,
+            configured_method: None,
+            configured_url: None,
+        });
+        let router = router_with_specs(vec![spec]);
+        assert!(!router.argument_validators.contains_key("dynamic"));
+        router
+            .build_tool_call(RawToolCall {
+                call_id: "c".into(),
+                tool_name: "dynamic".into(),
+                arguments: r#"{"n":false}"#.into(),
+            })
+            .expect("dynamic schema validation is unchanged");
+    }
+
+    #[test]
+    fn shell_arguments_are_validated_together_before_serde_decode() {
+        let spec = crate::builtin_tool_specs()
+            .into_iter()
+            .find(|spec| spec.spec.name == "exec_command")
+            .unwrap();
+        let router = router_with_specs(vec![spec]);
+        let error = router
+            .build_tool_call(RawToolCall {
+                call_id: "c".into(),
+                tool_name: "exec_command".into(),
+                arguments: r#"{"command":false,"tty":1,"yield_time_ms":"bad"}"#.into(),
+            })
+            .unwrap_err();
+        let ToolError::InvalidArguments(message) = error else {
+            panic!("expected arguments error")
+        };
+        let diagnostics: JsonValue = serde_json::from_str(&message).unwrap();
+        assert_eq!(diagnostics["diagnostics"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn builtin_json_parse_failure_cannot_echo_values_or_claim_field_validation() {
+        let router = router_with_specs(vec![configured_function_spec_with_schema(
+            "builtin",
+            serde_json::json!({"type": "object"}),
+        )]);
+        let error = router
+            .build_tool_call(RawToolCall {
+                call_id: "c".into(),
+                tool_name: "builtin".into(),
+                arguments: r#"{"secret": secret-provider-message}"#.into(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("json_parse_error"));
+        assert!(error.contains("validationComplete=false"));
+        assert!(!error.contains("secret"));
+        assert!(!error.contains("diagnostics"));
     }
 
     #[test]

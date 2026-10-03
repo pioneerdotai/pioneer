@@ -927,7 +927,7 @@ impl ThreadManager {
     }
 
     /// Starts an Agent-authored child Turn without taking the interactive
-    /// foreground-start gate. A model can only call `agent_start` while its
+    /// foreground-start gate. A model can only call `threads_turn_start` while its
     /// parent Turn is still running, and routed collaborative targets may also
     /// have an active Turn. These child Turns remain ordinary conversation
     /// Turns, are independently cancellable, and keep the Thread active until

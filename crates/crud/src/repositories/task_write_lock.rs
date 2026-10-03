@@ -65,6 +65,25 @@ pub async fn list_locks_by_run<C: ConnectionTrait>(
         .context("failed to list task write locks by run")
 }
 
+/// Terminal batches are bounded by the atomic event quantum. Read one extra
+/// lock to reject an oversized transition before reserving the writer.
+pub async fn list_terminal_locks_by_run<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+) -> Result<Vec<task_write_lock::Model>> {
+    let rows = task_write_lock::Entity::find()
+        .filter(task_write_lock::Column::RunId.eq(run_id.to_owned()))
+        .filter(task_write_lock::Column::Status.is_in(["pending", "acquired", "blocked"]))
+        .order_by_asc(task_write_lock::Column::CreatedAt)
+        .limit(65)
+        .all(db)
+        .await?;
+    if rows.len() > 64 {
+        anyhow::bail!("terminal task transition exceeds its lock quantum");
+    }
+    Ok(rows)
+}
+
 pub async fn list_active_locks_for_workspace<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,

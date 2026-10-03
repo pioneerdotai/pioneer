@@ -77,6 +77,19 @@ impl DesktopRuntimeCoordinator {
             return;
         }
         let core = ClientCore::shared();
+        core.set_mcp_oauth_shell(Arc::new(
+            crate::platform::mcp_oauth::DesktopMcpOAuthShell::new(
+                pioneer_config::AppConfig::load()
+                    .map(|config| config.desktop.mcp_oauth)
+                    .map_err(|error| {
+                        if pioneer_config::is_mcp_oauth_callback_port_error(&error) {
+                            pioneer_client::mcp::oauth::OAuthPreparationError::InvalidCallbackPort
+                        } else {
+                            pioneer_client::mcp::oauth::OAuthPreparationError::ConfigurationLoad
+                        }
+                    }),
+            ),
+        ));
         let effect_router = Arc::new(DesktopPlatformEffectRouter);
         let storage_adapter = DesktopSessionStorageAdapter::start(core.clone(), &effect_router);
         let binding_router = cx.new(|cx| DesktopClientBindingRouter::new(core.clone(), cx));

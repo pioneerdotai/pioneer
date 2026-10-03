@@ -7,6 +7,11 @@ mod debug;
 mod extractor_ontology;
 pub mod hooks;
 mod lifecycle;
+mod manifest_failure;
+pub use manifest_failure::{
+    MemoryManifestFailure, MemoryManifestFailureClass, MemoryManifestFailureStage,
+    is_invalid_stored_memory_data,
+};
 mod memvid;
 mod ownership_route;
 mod policy;
@@ -19,6 +24,8 @@ mod service;
 mod thread_episodic;
 mod thread_episodic_embedding;
 mod write;
+mod write_failure;
+pub use write_failure::MemoryWriteFailure;
 
 pub use backend::{
     BackendDeleteRequest, BackendDeleteResult, BackendGetRequest, BackendPayload,

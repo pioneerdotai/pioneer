@@ -426,6 +426,10 @@ impl MemoryPostTurnExtractorRequest {
 
 #[async_trait::async_trait]
 pub trait AgentMemoryPostTurnExtractorProvider: Send + Sync {
+    /// Providers that own durable checkpoints must validate the typed response
+    /// with `validate_memory_post_turn_response_format` before publication and
+    /// after replay decoding. Fresh format failures may retry within the outbox
+    /// budget; invalid immutable checkpoints must fail permanently.
     async fn extract_post_turn_memory_json(
         &self,
         context: MemoryPostTurnExtractorContext,
@@ -439,13 +443,13 @@ pub trait AgentMemoryWriteProvider: Send + Sync {
         &self,
         context: MemoryTurnContext,
         request: MemoryManifestRequest,
-    ) -> Result<MemoryManifest, String>;
+    ) -> Result<MemoryManifest, crate::MemoryManifestFailure>;
 
     async fn write_semantic_memory(
         &self,
         context: MemoryTurnContext,
         params: MemorySemanticWriteParams,
-    ) -> Result<MemorySemanticWriteResponse, String>;
+    ) -> Result<MemorySemanticWriteResponse, crate::MemoryWriteFailure>;
 }
 
 #[async_trait::async_trait]
