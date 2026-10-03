@@ -13658,10 +13658,48 @@ impl CrudStore {
             self.append_due_trigger_task_events_once(
                 trigger_id.to_owned(),
                 expected_next_fire_at,
+                None,
                 now,
                 events.clone(),
                 occurrence_contracts.clone(),
                 reserve_executions.clone(),
+            )
+        })
+        .await
+    }
+
+    /// Quarantine a Task only if the failed schedule is still current. The
+    /// caller calculates outside database capacity; a user can repair the
+    /// spec without changing its next fire time before this commit. Prepare
+    /// the repository's canonical spec JSON here, then revalidate it and the
+    /// Task identity inside the existing atomic due-trigger transaction.
+    pub async fn block_task_for_due_trigger_failure(
+        &self,
+        trigger: &TaskTrigger,
+        error: TaskError,
+        now: i64,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        let Some(expected_next_fire_at) = trigger.next_fire_at else {
+            return Ok(Vec::new());
+        };
+        let expected_snapshot = (
+            trigger.task_id.clone(),
+            serde_json::to_string(&trigger.spec)?,
+        );
+        let events = vec![TaskEventPayload::TaskBlocked {
+            task_id: trigger.task_id.clone(),
+            error: Some(error),
+            blocked_at: now,
+        }];
+        self.run_serialized_write(|| {
+            self.append_due_trigger_task_events_once(
+                trigger.id.clone(),
+                expected_next_fire_at,
+                Some(expected_snapshot.clone()),
+                now,
+                events.clone(),
+                Vec::new(),
+                Vec::new(),
             )
         })
         .await
@@ -29261,6 +29299,7 @@ impl CrudStore {
         &self,
         trigger_id: String,
         expected_next_fire_at: i64,
+        expected_snapshot: Option<(String, String)>,
         now: i64,
         events: Vec<TaskEventPayload>,
         occurrence_contracts: Vec<pioneer_protocol::TaskOccurrenceContract>,
@@ -29290,6 +29329,11 @@ impl CrudStore {
                 || trigger.next_fire_at.map(|value| value.timestamp())
                     != Some(expected_next_fire_at)
                 || expected_next_fire_at > now
+                || expected_snapshot
+                    .as_ref()
+                    .is_some_and(|(task_id, spec_json)| {
+                        &trigger.task_id != task_id || &trigger.spec_json != spec_json
+                    })
             {
                 return Ok(Vec::new());
             }
