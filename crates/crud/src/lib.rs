@@ -31844,6 +31844,15 @@ mod tests {
         turn_id: &str,
     ) -> (CrudStore, Thread, Turn) {
         let store = test_store_with_workspace(workspace_id).await;
+        start_test_turn(store, workspace_id, thread_id, turn_id).await
+    }
+
+    async fn start_test_turn(
+        store: CrudStore,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> (CrudStore, Thread, Turn) {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             workspace_id: workspace_id.to_owned(),
@@ -32699,26 +32708,24 @@ mod tests {
         assert_eq!(candidates[0].turn_id, "turn_legacy_native_evidence");
     }
 
-    #[tokio::test]
-    async fn native_optional_delivery_retries_without_reordering_a_turn() {
-        let (store, _, _) = test_store_with_started_turn(
-            "ws_native_outbox_order",
-            "thr_native_outbox_order",
-            "turn_native_outbox_order",
-        )
-        .await;
-        for index in 1..=2 {
+    async fn append_optional_delivery_test_items(
+        store: &CrudStore,
+        thread: &Thread,
+        turn_id: &str,
+        count: i64,
+    ) {
+        for index in 1..=count {
             store
                 .materialize_native_agent_turn_event(
                     CanonicalTurnEventPayload::ItemCompleted(ItemCompletedNotification {
-                        workspace_id: "ws_native_outbox_order".to_owned(),
-                        thread_id: "thr_native_outbox_order".to_owned(),
-                        turn_id: "turn_native_outbox_order".to_owned(),
+                        workspace_id: thread.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn_id: turn_id.to_owned(),
                         item: TurnItem::SystemEvent {
-                            id: format!("native_outbox_order_{index}"),
+                            id: format!("{turn_id}_item_{index}"),
                             level: SystemEventLevel::Info,
                             message: format!("committed {index}"),
-                            code: Some("native.outbox.order".to_owned()),
+                            code: None,
                             details: None,
                         },
                     }),
@@ -32726,58 +32733,462 @@ mod tests {
                     None,
                 )
                 .await
-                .expect("native event should commit with outbox");
+                .expect("native item should enqueue both optional consumers");
         }
+    }
 
-        let first = store
-            .claim_due_turn_event_deliveries("live_notification", 1_700_000_110, 10)
-            .await
-            .expect("first delivery should claim");
-        assert_eq!(first.len(), 1, "only the causal predecessor may be claimed");
+    #[tokio::test]
+    async fn native_optional_delivery_filters_blocked_turns_before_the_batch_limit() {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_delivery_fairness",
+            "thr_delivery_fairness",
+            "turn_a_delivery_fairness",
+        )
+        .await;
+        append_optional_delivery_test_items(&store, &thread, &turn.id, 4).await;
+        let healthy_turns = ["turn_b_delivery_fairness", "turn_c_delivery_fairness"];
+        for turn_id in healthy_turns {
+            let mut healthy = turn.clone();
+            healthy.id = turn_id.to_owned();
+            store
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &healthy,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("independent turn should start");
+            append_optional_delivery_test_items(&store, &thread, turn_id, 1).await;
+        }
+        let store = store.with_maintenance_access();
+        let now = 1_700_000_110;
+        let consumers = ["live_notification", "thread_episodic"];
+        let mut heads = Vec::new();
+        for consumer in consumers {
+            let head = store
+                .claim_due_turn_event_deliveries(consumer, now, 1)
+                .await
+                .unwrap();
+            assert_eq!(head.len(), 1);
+            assert_eq!(head[0].event.turn_id, turn.id);
+            heads.push(head.into_iter().next().unwrap());
+        }
         assert!(
             store
                 .fail_turn_event_delivery(
-                    first[0].id.as_str(),
-                    first[0].claim_token.as_str(),
-                    first[0].attempt_count,
-                    "injected live failure".to_owned(),
-                    1_700_000_110,
+                    &heads[0].id,
+                    &heads[0].claim_token,
+                    heads[0].attempt_count,
+                    "injected backoff".to_owned(),
+                    now,
                 )
                 .await
-                .expect("failure should persist")
+                .unwrap()
         );
-        assert!(
-            store
-                .claim_due_turn_event_deliveries("live_notification", 1_700_000_110, 10)
+        // Live's predecessor is in retry backoff; episodic's is still leased.
+        // Their due successors must not consume either consumer's batch slots.
+        for consumer in consumers {
+            let ready = store
+                .claim_due_turn_event_deliveries(consumer, now, 2)
                 .await
-                .expect("backoff lookup should succeed")
-                .is_empty(),
-            "a later event cannot overtake a failed predecessor during backoff"
-        );
-
-        let retried = store
-            .claim_due_turn_event_deliveries("live_notification", 1_700_000_111, 10)
+                .unwrap();
+            assert_eq!(ready.len(), 2, "blocked turn must not starve other turns");
+            assert_eq!(
+                ready
+                    .iter()
+                    .map(|claim| claim.event.turn_id.as_str())
+                    .collect::<Vec<_>>(),
+                healthy_turns
+            );
+            for claim in ready {
+                assert!(
+                    store
+                        .complete_turn_event_delivery(&claim.id, &claim.claim_token, now)
+                        .await
+                        .unwrap()
+                );
+            }
+            assert!(
+                store
+                    .claim_due_turn_event_deliveries(consumer, now, 2)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "successors must still wait for their own predecessor"
+            );
+        }
+        let retry = store
+            .claim_due_turn_event_deliveries(consumers[0], now + 1, 2)
             .await
-            .expect("failed predecessor should become due");
-        assert_eq!(retried.len(), 1);
-        assert_eq!(retried[0].id, first[0].id);
+            .unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].id, heads[0].id);
+        heads[0] = retry.into_iter().next().unwrap();
+        // A fresh store sees the durable claims and advances each turn in order.
+        let restored = CrudStore::new(store.database_connection());
+        for head in heads {
+            assert!(
+                restored
+                    .complete_turn_event_delivery(&head.id, &head.claim_token, now + 1)
+                    .await
+                    .unwrap()
+            );
+            for offset in 1..=3 {
+                let next = restored
+                    .claim_due_turn_event_deliveries(&head.consumer, now + 1, 2)
+                    .await
+                    .unwrap();
+                assert_eq!(next.len(), 1, "only one event per turn can be in flight");
+                assert_eq!(next[0].event.turn_id, turn.id);
+                assert_eq!(next[0].event.sequence, head.event.sequence + offset);
+                assert!(
+                    restored
+                        .complete_turn_event_delivery(&next[0].id, &next[0].claim_token, now + 1)
+                        .await
+                        .unwrap()
+                );
+            }
+            assert!(
+                restored
+                    .claim_due_turn_event_deliveries(&head.consumer, now + 1, 2)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_optional_delivery_reclaims_expired_heads_and_fences_stale_claims() {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_delivery_expiry",
+            "thr_delivery_expiry",
+            "turn_delivery_expiry",
+        )
+        .await;
+        append_optional_delivery_test_items(&store, &thread, &turn.id, 2).await;
+        let now = 1_700_000_110;
+        let first = store
+            .claim_due_turn_event_deliveries("live_notification", now, 10)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
         assert!(
             store
+                .claim_due_turn_event_deliveries("live_notification", now + 119, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let restored = CrudStore::new(store.database_connection());
+        let recovered = restored
+            .claim_due_turn_event_deliveries("live_notification", now + 120, 10)
+            .await
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, first[0].id);
+        assert_ne!(recovered[0].claim_token, first[0].claim_token);
+        assert!(
+            !restored
+                .complete_turn_event_delivery(&first[0].id, &first[0].claim_token, now + 120)
+                .await
+                .unwrap(),
+            "expired owner cannot complete a reclaimed head"
+        );
+        assert!(
+            restored
                 .complete_turn_event_delivery(
-                    retried[0].id.as_str(),
-                    retried[0].claim_token.as_str(),
-                    1_700_000_111,
+                    &recovered[0].id,
+                    &recovered[0].claim_token,
+                    now + 120
                 )
                 .await
-                .expect("retry completion should persist")
+                .unwrap()
         );
-
-        let successor = store
-            .claim_due_turn_event_deliveries("live_notification", 1_700_000_112, 10)
+        let next = restored
+            .claim_due_turn_event_deliveries("live_notification", now + 120, 10)
             .await
-            .expect("successor lookup should succeed");
-        assert_eq!(successor.len(), 1);
-        assert!(successor[0].event.sequence > retried[0].event.sequence);
+            .unwrap();
+        assert_eq!(next.len(), 1);
+        assert!(next[0].event.sequence > recovered[0].event.sequence);
+    }
+
+    #[tokio::test]
+    async fn native_optional_delivery_exhausted_head_unblocks_only_its_consumer() {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_delivery_exhausted",
+            "thr_delivery_exhausted",
+            "turn_delivery_exhausted",
+        )
+        .await;
+        append_optional_delivery_test_items(&store, &thread, &turn.id, 2).await;
+        let mut now = 1_700_000_110;
+        let mut head = None;
+        for attempt in 0..10 {
+            let claims = store
+                .claim_due_turn_event_deliveries("live_notification", now, 2)
+                .await
+                .unwrap();
+            assert_eq!(claims.len(), 1);
+            assert_eq!(claims[0].attempt_count, attempt);
+            let expected = head.get_or_insert_with(|| claims[0].id.clone());
+            assert_eq!(&claims[0].id, expected);
+            assert!(
+                store
+                    .fail_turn_event_delivery(
+                        &claims[0].id,
+                        &claims[0].claim_token,
+                        claims[0].attempt_count,
+                        "poison delivery".to_owned(),
+                        now,
+                    )
+                    .await
+                    .unwrap()
+            );
+            now += 2_i64.pow(attempt.min(8) as u32);
+        }
+        let exhausted = pioneer_entity::turn_event_delivery::Entity::find_by_id(head.unwrap())
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(exhausted.status, "exhausted");
+        let live = store
+            .claim_due_turn_event_deliveries("live_notification", now, 2)
+            .await
+            .unwrap();
+        let episodic = store
+            .claim_due_turn_event_deliveries("thread_episodic", now, 2)
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(episodic.len(), 1);
+        assert_eq!(live[0].event.sequence, exhausted.sequence + 1);
+        assert_eq!(episodic[0].event.sequence, exhausted.sequence);
+    }
+
+    #[derive(Default)]
+    struct OptionalDeliveryDatabaseObserver {
+        reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadClass>>,
+        events: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+        enqueued: tokio::sync::Notify,
+    }
+
+    impl pioneer_sqlite::SqliteReadObserver for OptionalDeliveryDatabaseObserver {
+        fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+            if let pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } = event {
+                self.reads.lock().unwrap().push(class);
+            }
+        }
+    }
+
+    impl pioneer_sqlite::SqliteWriteObserver for OptionalDeliveryDatabaseObserver {
+        fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+            self.events.lock().unwrap().push(event);
+            if matches!(event, pioneer_sqlite::SqliteWriteEvent::Enqueued { .. }) {
+                self.enqueued.notify_one();
+            }
+        }
+    }
+
+    impl OptionalDeliveryDatabaseObserver {
+        async fn wait_for_enqueued(&self, count: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let ready = self
+                        .events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|event| {
+                            matches!(event, pioneer_sqlite::SqliteWriteEvent::Enqueued { .. })
+                        })
+                        .count()
+                        >= count;
+                    if ready {
+                        break;
+                    }
+                    self.enqueued.notified().await;
+                }
+            })
+            .await
+            .expect("delivery claims should reach the writer queue");
+        }
+    }
+
+    struct OptionalDeliveryDatabasePath(std::path::PathBuf);
+
+    impl Drop for OptionalDeliveryDatabasePath {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_optional_delivery_preserves_scoped_routes_and_cancels_queued_claims() {
+        use pioneer_sqlite::{
+            SqliteDatabase, SqliteReadClass, SqliteWriteClass, SqliteWriteEvent,
+            SqliteWriteExecutor, sqlite_read_only_connection_url,
+        };
+        use sea_orm::{ConnectOptions, TransactionTrait};
+
+        let path = OptionalDeliveryDatabasePath(std::env::temp_dir().join(format!(
+            "pioneer-delivery-route-{}.sqlite",
+            uuid::Uuid::new_v4()
+        )));
+        let mut writer_options =
+            ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.0.display()));
+        writer_options.max_connections(1);
+        let writer = Database::connect(writer_options).await.unwrap();
+        Migrator::up(&writer, None).await.unwrap();
+        writer
+            .execute_unprepared("PRAGMA journal_mode=WAL")
+            .await
+            .unwrap();
+        let mut reader_options = ConnectOptions::new(sqlite_read_only_connection_url(&path.0));
+        reader_options.max_connections(2);
+        reader_options.map_sqlx_sqlite_opts(|options| {
+            options
+                .read_only(true)
+                .create_if_missing(false)
+                .pragma("query_only", "ON")
+        });
+        let reader = Database::connect(reader_options).await.unwrap();
+        let observer = Arc::new(OptionalDeliveryDatabaseObserver::default());
+        let database = SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            observer.clone(),
+        );
+        database.validate_reader().await.unwrap();
+        let interactive = CrudStore::new(database.clone());
+        let timestamp = unix_to_datetime(1_700_000_000);
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set("ws_delivery_scope".to_owned()),
+            name: Set("Delivery scope fixture".to_owned()),
+            is_active: Set(true),
+            is_current: Set(true),
+            created_at: Set(timestamp),
+            updated_at: Set(timestamp),
+        })
+        .exec(&interactive.connection)
+        .await
+        .unwrap();
+        let (interactive, thread, turn) = start_test_turn(
+            interactive,
+            "ws_delivery_scope",
+            "thr_delivery_scope",
+            "turn_delivery_scope",
+        )
+        .await;
+        append_optional_delivery_test_items(&interactive, &thread, &turn.id, 2).await;
+        observer.reads.lock().unwrap().clear();
+        observer.events.lock().unwrap().clear();
+        let maintenance = interactive.with_maintenance_access();
+        for (store, consumer, read, write) in [
+            (
+                &interactive,
+                "live_notification",
+                SqliteReadClass::Interactive,
+                SqliteWriteClass::Interactive,
+            ),
+            (
+                &maintenance,
+                "thread_episodic",
+                SqliteReadClass::Maintenance,
+                SqliteWriteClass::Maintenance,
+            ),
+        ] {
+            let claims = store
+                .claim_due_turn_event_deliveries(consumer, 1_700_000_110, 2)
+                .await
+                .unwrap();
+            assert_eq!(claims.len(), 1);
+            let reads = std::mem::take(&mut *observer.reads.lock().unwrap());
+            assert!(!reads.is_empty() && reads.iter().all(|class| *class == read));
+            let events = std::mem::take(&mut *observer.events.lock().unwrap());
+            assert_eq!(
+                events
+                    .iter()
+                    .filter_map(|event| match event {
+                        SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                vec![write]
+            );
+            assert!(
+                store
+                    .complete_turn_event_delivery(
+                        &claims[0].id,
+                        &claims[0].claim_token,
+                        1_700_000_110
+                    )
+                    .await
+                    .unwrap()
+            );
+            observer.events.lock().unwrap().clear();
+        }
+
+        let transaction = database.with_critical_writes().begin().await.unwrap();
+        observer.events.lock().unwrap().clear();
+        let cancelled = tokio::spawn({
+            let store = maintenance.clone();
+            async move {
+                store
+                    .claim_due_turn_event_deliveries("live_notification", 1_700_000_110, 2)
+                    .await
+            }
+        });
+        observer.wait_for_enqueued(1).await;
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        assert!(observer.events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            SqliteWriteEvent::Cancelled {
+                class: SqliteWriteClass::Maintenance,
+                queue,
+                ..
+            } if queue.maintenance == 0
+        )));
+        let mut pending = Vec::new();
+        for (store, consumer) in [
+            (interactive, "live_notification"),
+            (maintenance, "thread_episodic"),
+        ] {
+            pending.push(tokio::spawn(async move {
+                store
+                    .claim_due_turn_event_deliveries(consumer, 1_700_000_110, 2)
+                    .await
+            }));
+        }
+        observer.wait_for_enqueued(3).await;
+        transaction.rollback().await.unwrap();
+        for claim in pending {
+            assert_eq!(claim.await.unwrap().unwrap().len(), 1);
+        }
+        let events = observer.events.lock().unwrap();
+        let acquired = events
+            .iter()
+            .filter_map(|event| match event {
+                SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(acquired.len(), 2);
+        assert!(acquired.contains(&SqliteWriteClass::Interactive));
+        assert!(acquired.contains(&SqliteWriteClass::Maintenance));
+        assert!(matches!(
+            events.last(),
+            Some(SqliteWriteEvent::Released { queue, .. })
+                if queue.interactive == 0 && queue.maintenance == 0 && queue.critical == 0
+        ));
+        drop(events);
+        database.close().await.unwrap();
     }
 
     #[tokio::test]
