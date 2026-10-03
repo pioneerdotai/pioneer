@@ -1,3 +1,6 @@
+#[path = "tests/task_run_occurrence_tracker.rs"]
+mod task_run_occurrence_tracker;
+
 #[path = "tests/mcp_oauth_rpc_queue.rs"]
 mod mcp_oauth_rpc_queue;
 
@@ -19910,7 +19913,8 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         processor
             .reconcile_terminal_task_run_occurrence_turns(10)
             .await
-            .expect("terminal occurrence reconciliation should succeed"),
+            .expect("terminal occurrence reconciliation should succeed")
+            .changed,
         0,
         "live task-event projection should already terminalize the occurrence"
     );
@@ -19922,7 +19926,8 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         processor
             .reconcile_terminal_task_run_occurrence_turns(10)
             .await
-            .expect("terminal occurrence reconciliation should succeed"),
+            .expect("terminal occurrence reconciliation should succeed")
+            .changed,
         0,
         "delivery must not own parent occurrence terminalization"
     );
@@ -19930,7 +19935,8 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         processor
             .reconcile_terminal_task_run_occurrence_turns(10)
             .await
-            .expect("idempotent terminal occurrence reconciliation should succeed"),
+            .expect("idempotent terminal occurrence reconciliation should succeed")
+            .changed,
         0,
         "an already repaired occurrence must not be counted or polled again"
     );

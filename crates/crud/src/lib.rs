@@ -9,7 +9,15 @@ mod projector;
 mod repositories;
 mod task_delivery_lifecycle;
 mod task_events;
+mod task_run_occurrence;
 mod task_terminal;
+pub use repositories::task_run_occurrence_reconcile::{
+    OCCURRENCE_RECONCILE_BUDGET, OCCURRENCE_RECONCILE_INITIAL_BACKOFF_SECS,
+    OCCURRENCE_RECONCILE_MAX_ATTEMPT_COUNT, OCCURRENCE_RECONCILE_MAX_BACKOFF_SECS,
+    TaskRunOccurrenceClaimDeferral, TaskRunOccurrenceClaimFailure,
+    TaskRunOccurrenceClaimFailurePhase, TaskRunOccurrenceClock,
+    TaskRunOccurrenceReconcileCandidate, TaskRunOccurrenceReconcileClaim,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub use task_delivery_lifecycle::TaskDeliveryCommitTestKind;
 pub use task_delivery_lifecycle::{TaskDeliveryTransition, TaskDeliveryTransitionOutcome};
@@ -2616,6 +2624,8 @@ pub struct DueTaskTriggerReconciliation {
 /// authoritative TaskRun aggregate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskRunOccurrenceTerminalizationOutcome {
+    /// The preparation or durable generation/token was superseded. Normal deferral.
+    StaleClaim,
     Changed,
     AlreadyConsistent,
     NotFound,
@@ -14301,227 +14311,6 @@ impl CrudStore {
             .await?
             .map(task_run_from_db_model)
             .transpose()
-    }
-
-    /// Find TaskRun occurrence Turns that disagree with their authoritative
-    /// terminal TaskRun. This includes false terminalization by generic Turn
-    /// recovery, not only occurrences left `in_progress`.
-    pub async fn list_mismatched_terminal_task_run_occurrence_ids(
-        &self,
-        limit: u64,
-    ) -> Result<Vec<String>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let rows = self
-            .connection
-            .query_all_raw(Statement::from_sql_and_values(
-                self.connection.get_database_backend(),
-                "SELECT occurrence.id AS run_id \
-                 FROM \"turn\" occurrence \
-                 INNER JOIN task_run run ON run.id = occurrence.id \
-                 WHERE occurrence.turn_kind = 'task_run' \
-                   AND ((run.status = 'succeeded' AND occurrence.status <> 'completed') \
-                     OR (run.status IN ('failed', 'timed_out') AND occurrence.status <> 'failed') \
-                     OR (run.status = 'blocked' AND occurrence.status <> 'blocked') \
-                     OR (run.status = 'cancelled' AND occurrence.status <> 'interrupted')) \
-                 ORDER BY occurrence.updated_at ASC, occurrence.id ASC LIMIT ?"
-                    .to_owned(),
-                [i64::try_from(limit).unwrap_or(i64::MAX).into()],
-            ))
-            .await
-            .context("failed to list TaskRun occurrence Turns with mismatched terminal state")?;
-        rows.into_iter()
-            .map(|row| row.try_get("", "run_id").map_err(Into::into))
-            .collect()
-    }
-
-    /// Atomically compare the canonical occurrence Turn (`Turn.id == TaskRun.id`)
-    /// with its authoritative terminal TaskRun and materialize the terminal Turn
-    /// event only when their statuses differ.
-    pub async fn compare_and_materialize_task_run_occurrence_terminal(
-        &self,
-        run_id: &str,
-        fallback_completed_at: i64,
-    ) -> Result<TaskRunOccurrenceTerminalizationOutcome> {
-        let run_id = run_id.to_owned();
-        self.run_serialized_write(|| {
-            self.compare_and_materialize_task_run_occurrence_terminal_once(
-                run_id.clone(),
-                fallback_completed_at,
-            )
-        })
-        .await
-    }
-
-    async fn compare_and_materialize_task_run_occurrence_terminal_once(
-        &self,
-        run_id: String,
-        fallback_completed_at: i64,
-    ) -> Result<TaskRunOccurrenceTerminalizationOutcome> {
-        let Some(prepared_run_model) =
-            task_run::find_run_by_id(&self.connection, run_id.as_str()).await?
-        else {
-            return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-        };
-        let run = task_run_from_db_model(prepared_run_model.clone())?;
-        let (desired_status, desired_error) = match run.status {
-            TaskRunStatus::Succeeded => (TurnStatus::Completed, None),
-            TaskRunStatus::Failed | TaskRunStatus::TimedOut => (
-                TurnStatus::Failed,
-                run.error.as_ref().map(|error| error.message.clone()),
-            ),
-            TaskRunStatus::Blocked => (
-                TurnStatus::Blocked,
-                run.error.as_ref().map(|error| error.message.clone()),
-            ),
-            TaskRunStatus::Cancelled => (
-                TurnStatus::Interrupted,
-                run.error.as_ref().map(|error| error.message.clone()),
-            ),
-            TaskRunStatus::Queued
-            | TaskRunStatus::Starting
-            | TaskRunStatus::Running
-            | TaskRunStatus::Waiting
-            | TaskRunStatus::WaitingReview => {
-                bail!(
-                    "TaskRun `{}` is not terminal and cannot terminalize its occurrence Turn",
-                    run.id
-                );
-            }
-        };
-        let Some(prepared_turn_model) =
-            turn::find_turn_by_id(&self.connection, run.id.as_str()).await?
-        else {
-            return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-        };
-        if turn_kind_from_db(prepared_turn_model.turn_kind.as_str()) != Some(TurnKind::TaskRun) {
-            return Ok(TaskRunOccurrenceTerminalizationOutcome::InvalidBinding);
-        }
-        let current_status = turn_status_from_db(prepared_turn_model.status.as_str())
-            .with_context(|| format!("occurrence Turn `{}` has an unknown status", run.id))?;
-        if current_status == desired_status {
-            return Ok(TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent);
-        }
-        let Some(prepared_thread_model) =
-            thread::find_thread_by_id(&self.connection, prepared_turn_model.thread_id.as_str())
-                .await?
-        else {
-            return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-        };
-        let Some(mut terminal_turn) = turn_from_db_model(prepared_turn_model.clone())? else {
-            bail!("occurrence Turn `{}` has an unknown status", run.id);
-        };
-        terminal_turn.status = desired_status;
-        terminal_turn.error = desired_error;
-        let terminal_event = match desired_status {
-            TurnStatus::Completed => {
-                TurnEventPayload::TurnCompleted(pioneer_protocol::TurnCompletedNotification {
-                    workspace_id: prepared_thread_model.workspace_id.clone(),
-                    thread_id: prepared_thread_model.id.clone(),
-                    turn: terminal_turn,
-                })
-            }
-            TurnStatus::Failed | TurnStatus::Interrupted => {
-                TurnEventPayload::TurnFailed(pioneer_protocol::TurnFailedNotification {
-                    workspace_id: prepared_thread_model.workspace_id.clone(),
-                    thread_id: prepared_thread_model.id.clone(),
-                    turn: terminal_turn,
-                })
-            }
-            TurnStatus::Blocked => {
-                TurnEventPayload::TurnBlocked(pioneer_protocol::TurnBlockedNotification {
-                    workspace_id: prepared_thread_model.workspace_id.clone(),
-                    thread_id: prepared_thread_model.id.clone(),
-                    turn: terminal_turn,
-                    resume: None,
-                })
-            }
-            TurnStatus::InProgress => unreachable!("TaskRun terminal status mapping"),
-        };
-        let completed_at = run.completed_at.unwrap_or(fallback_completed_at);
-        let created_at = unix_to_datetime(completed_at);
-        let claim_expires_at =
-            unix_to_datetime(completed_at.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
-        let terminal_event = prepare_projected_turn_event_for_permanent_storage(
-            &self.connection,
-            terminal_event,
-            created_at,
-        )
-        .await?;
-
-        let transaction = self
-            .connection
-            .begin()
-            .await
-            .context("failed to begin TaskRun occurrence terminalization transaction")?;
-
-        let result = async {
-            let Some(run_model) = task_run::find_run_by_id(&transaction, run_id.as_str()).await?
-            else {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-            };
-            if run_model.status != prepared_run_model.status
-                || run_model.updated_at != prepared_run_model.updated_at
-            {
-                anyhow::bail!("TaskRun changed during occurrence terminalization preparation");
-            }
-
-            // The occurrence identity is canonical and does not depend on
-            // optional/legacy lineage rows: Turn.id is exactly TaskRun.id.
-            let Some(turn_model) = turn::find_turn_by_id(&transaction, run_id.as_str()).await?
-            else {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-            };
-            if turn_kind_from_db(turn_model.turn_kind.as_str()) != Some(TurnKind::TaskRun) {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::InvalidBinding);
-            }
-            let current_status = turn_status_from_db(turn_model.status.as_str())
-                .with_context(|| format!("occurrence Turn `{run_id}` has an unknown status"))?;
-            if current_status == desired_status {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent);
-            }
-            if turn_model.status != prepared_turn_model.status
-                || turn_model.updated_at != prepared_turn_model.updated_at
-            {
-                anyhow::bail!("occurrence Turn changed during terminalization preparation");
-            }
-            let thread_model =
-                thread::find_thread_by_id(&transaction, turn_model.thread_id.as_str()).await?;
-            let Some(thread_model) = thread_model else {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-            };
-            if thread_model.id != prepared_thread_model.id
-                || thread_model.workspace_id != prepared_thread_model.workspace_id
-            {
-                anyhow::bail!("occurrence Thread changed during terminalization preparation");
-            }
-            self.append_and_project_turn_event_in_transaction(
-                &transaction,
-                terminal_event,
-                created_at,
-                claim_expires_at,
-                false,
-            )
-            .await?;
-
-            Ok(TaskRunOccurrenceTerminalizationOutcome::Changed)
-        }
-        .await;
-
-        match result {
-            Ok(outcome) => {
-                transaction
-                    .commit()
-                    .await
-                    .context("failed to commit TaskRun occurrence terminalization transaction")?;
-                Ok(outcome)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
     }
 
     pub async fn claim_task_run_execution_for_dispatch(
@@ -31425,6 +31214,8 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    #[path = "task_run_occurrence.rs"]
+    mod occurrence_tracker;
     use super::{
         AgentExecutionInput, AgentResourceStateInput, ArtifactBindingTargetRecord,
         AtomicRecoveryJobEnqueueOutcome, BLOCK_KIND_APPROVAL, BLOCK_KIND_USER_MESSAGE,
@@ -31450,8 +31241,9 @@ mod tests {
         SkillPackInstallationRecord, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
         THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES,
         TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES, TaskEventPayload, TaskOwnedTurnResumeOutcome,
-        TaskRunChildAnchor, TaskRunOccurrenceTerminalizationOutcome, ThreadAgentsDocError,
-        ThreadAgentsDocSaveReason, ThreadAgentsDocStatus, ThreadEpisodicActiveWriteSegmentRequest,
+        TaskRunChildAnchor, TaskRunOccurrenceReconcileCandidate,
+        TaskRunOccurrenceTerminalizationOutcome, ThreadAgentsDocError, ThreadAgentsDocSaveReason,
+        ThreadAgentsDocStatus, ThreadEpisodicActiveWriteSegmentRequest,
         ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleWriteState,
         ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility, ThreadEpisodicSourceActorRole,
         ThreadEpisodicSourceRuntimeKind, ThreadEpisodicWorkspaceActiveWriteSegmentRequest,
@@ -42674,10 +42466,13 @@ mod tests {
 
         assert_eq!(
             store
-                .list_mismatched_terminal_task_run_occurrence_ids(10)
+                .discover_task_run_occurrence_reconcile(i64::MAX, 10)
                 .await
-                .expect("mismatched occurrences should list"),
-            vec![run.id.clone()],
+                .expect("due tracked occurrences should list"),
+            vec![TaskRunOccurrenceReconcileCandidate {
+                run_id: run.id.clone(),
+                generation: 1
+            }],
         );
         assert_eq!(
             store
@@ -42701,11 +42496,11 @@ mod tests {
         );
         assert!(
             store
-                .list_mismatched_terminal_task_run_occurrence_ids(10)
+                .discover_task_run_occurrence_reconcile(i64::MAX, 10)
                 .await
-                .expect("reconciled occurrences should list")
+                .expect("due tracked occurrences should list")
                 .is_empty(),
-            "a repaired occurrence must leave the polling candidate set",
+            "a repaired occurrence must leave the durable pending set",
         );
         let occurrence = store
             .get_turn("thr_task", run.id.as_str())
