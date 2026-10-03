@@ -1155,7 +1155,10 @@ impl SecretStore for FailingStore {
                 "injected readback failure".into(),
             ));
         }
-        if let Some(barrier) = self.pre_stage_read.lock().unwrap().clone() {
+        // Release the fixture mutex before blocking so other reads are only
+        // serialized by the production refresh guard.
+        let barrier = self.pre_stage_read.lock().unwrap().clone();
+        if let Some(barrier) = barrier {
             if barrier.armed.swap(false, Ordering::SeqCst) {
                 barrier.entered.notify_one();
                 let mut released = barrier.released.lock().unwrap();
@@ -1529,9 +1532,6 @@ async fn independent_managers_share_file_refresh_guard_and_reload_rotated_token(
     h.service.shutdown().await;
     let path = std::env::temp_dir().join(format!("pioneer-oauth-test-{}", uuid::Uuid::new_v4()));
     let persistence = OAuthPersistence::new(h.store.clone(), Some(path.clone()));
-    let mut record = persistence.read("installation").await.unwrap().unwrap();
-    record.credentials.as_mut().unwrap().token_received_at = Some(1);
-    persistence.write("installation", record).await.unwrap();
     let a = McpOAuthService::new(persistence.clone(), h.sink.clone()).unwrap();
     let b = McpOAuthService::new(persistence.clone(), h.sink.clone()).unwrap();
     let ca = a
@@ -1544,16 +1544,41 @@ async fn independent_managers_share_file_refresh_guard_and_reload_rotated_token(
         .await
         .unwrap()
         .unwrap();
-    let (ra, rb) = tokio::join!(ca.get_access_token(), cb.get_access_token());
-    let tokens = std::collections::HashSet::from([ra.unwrap(), rb.unwrap()]);
-    // rmcp 3.5 serializes refresh but deliberately does not skip an explicit
-    // refresh after waiting. Both managers must use the latest rotating token.
+    // Explicit refresh must perform two rotations; get_access_token() can
+    // legitimately reuse the fresh token saved by the first manager.
+    let read = Arc::new(PreStageRead::default());
+    *h.store.pre_stage_read.lock().unwrap() = Some(read.clone());
+    read.armed.store(true, Ordering::SeqCst);
+    let first = tokio::spawn(async move { ca.auth_manager.lock().await.refresh_token().await });
+    let entered = tokio::time::timeout(Duration::from_secs(3), read.entered.notified()).await;
+    if entered.is_err() {
+        read.resume();
+    }
+    entered.expect("first refresh must read credentials while holding the refresh guard");
+
+    let mut second = Box::pin(async { cb.auth_manager.lock().await.refresh_token().await });
+    let pending = tokio::time::timeout(Duration::from_millis(20), &mut second)
+        .await
+        .is_err();
+    read.resume();
+    assert!(pending, "second manager bypassed the shared refresh guard");
+    let (ra, rb) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("both refreshes must complete after the credential read releases");
+    let tokens = std::collections::HashSet::from([
+        serde_json::to_value(ra.unwrap().unwrap()).unwrap()["access_token"].clone(),
+        serde_json::to_value(rb.unwrap()).unwrap()["access_token"].clone(),
+    ]);
+    // The waiting manager must reload the rotated refresh token under the guard.
     assert_eq!(
         tokens,
         std::collections::HashSet::from(["access-1".into(), "access-2".into()])
     );
     assert_eq!(h.server.data.refreshes.load(Ordering::SeqCst), 2);
     let requests = h.server.data.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
     assert_eq!(requests[1].1["refresh_token"], "refresh-0");
     assert_eq!(requests[2].1["refresh_token"], "refresh-1");
     drop(requests);
