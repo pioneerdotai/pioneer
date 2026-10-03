@@ -478,11 +478,12 @@ async fn public_mcp_connects_without_oauth_or_browser() {
 async fn successful_public_connection_retires_install_intent_without_terminal_oauth_ui() {
     let h = Harness::new(false).await;
     h.service.shutdown().await;
+    let clock = Arc::new(JumpClock(Mutex::new(std::time::SystemTime::now())));
     let service = McpOAuthService::with_options(
         h.persistence.clone(),
         h.sink.clone(),
         OAuthServiceOptions {
-            install_timeout: Duration::from_millis(100),
+            clock: clock.clone(),
             poll_interval: Duration::from_millis(5),
             ..Default::default()
         },
@@ -501,15 +502,122 @@ async fn successful_public_connection_retires_install_intent_without_terminal_oa
         )
         .await
         .unwrap();
+    // Expire the unused install only after the real HTTP connection completes.
+    // Its setup must not race an artificial 100 ms OAuth deadline.
+    clock.jump_after_sleep();
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(h.sink.browsers(), 0);
-    assert!(!h.sink.events.lock().unwrap().iter().any(|event| matches!(
-        event.state,
-        OAuthState::Preparing | OAuthState::Cancelled | OAuthState::TimedOut | OAuthState::Failed
-    )));
+    let states: Vec<_> = h
+        .sink
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|event| event.state)
+        .collect();
+    assert!(
+        !states.iter().any(|state| matches!(
+            state,
+            OAuthState::Preparing
+                | OAuthState::Cancelled
+                | OAuthState::TimedOut
+                | OAuthState::Failed
+        )),
+        "unexpected OAuth states: {states:?}"
+    );
     session.shutdown().await;
     service.shutdown().await;
 }
+#[tokio::test]
+async fn public_connection_retires_install_intent_after_a_contended_worker_read() {
+    let h = Harness::new(false).await;
+    h.service.shutdown().await;
+    let clock = Arc::new(JumpClock(Mutex::new(std::time::SystemTime::now())));
+    let service = McpOAuthService::with_options(
+        h.persistence.clone(),
+        h.sink.clone(),
+        OAuthServiceOptions {
+            clock: clock.clone(),
+            poll_interval: Duration::from_millis(5),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service
+        .begin_install("installation", &h.server.installation(), 10, REDIRECT)
+        .await
+        .unwrap();
+
+    let read = Arc::new(PreStageRead::default());
+    *h.store.pre_stage_read.lock().unwrap() = Some(read.clone());
+    read.armed.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(3), read.entered.notified())
+        .await
+        .expect("worker must hold the entry while reading credentials");
+
+    let installation = h.server.installation();
+    let mut retirement =
+        Box::pin(service.connection_established("installation", &installation, false));
+    let pending = tokio::time::timeout(Duration::from_millis(20), &mut retirement)
+        .await
+        .is_err();
+    read.resume();
+    if pending {
+        tokio::time::timeout(Duration::from_secs(3), retirement)
+            .await
+            .expect("public install retirement must finish after the read releases");
+    }
+    clock.jump_after_sleep();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let states: Vec<_> = h
+        .sink
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|event| event.state)
+        .collect();
+    assert!(
+        states.is_empty(),
+        "retired public install emitted {states:?}"
+    );
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_connection_preserves_inflight_oauth_preparation() {
+    let h = Harness::new(true).await;
+    h.service
+        .begin_install("installation", &h.server.installation(), 10, REDIRECT)
+        .await
+        .unwrap();
+    let read = Arc::new(PreStageRead::default());
+    *h.store.pre_stage_read.lock().unwrap() = Some(read.clone());
+    read.armed.store(true, Ordering::SeqCst);
+    h.service.challenge("installation", "Bearer", false).await;
+    tokio::time::timeout(Duration::from_secs(3), read.entered.notified())
+        .await
+        .expect("OAuth preparation must hold the entry while reading credentials");
+
+    let installation = h.server.installation();
+    let completed = tokio::time::timeout(
+        Duration::from_secs(1),
+        h.service
+            .connection_established("installation", &installation, false),
+    )
+    .await
+    .is_ok();
+    read.resume();
+    assert!(completed, "public connection waited behind active consent");
+    let event = h.sink.browser().await;
+    assert_eq!(event.state, OAuthState::AwaitingCallback);
+    h.service
+        .cancel("installation", 10, event.flow_id.as_deref().unwrap())
+        .await
+        .unwrap();
+    h.service.shutdown().await;
+}
+
 #[tokio::test]
 async fn protected_install_starts_one_browser_flow_and_callback_connects() {
     let h = Harness::new(true).await;

@@ -2551,17 +2551,41 @@ impl McpOAuthProvider for McpOAuthService {
         {
             return;
         }
-        let Ok(mut data) = entry.data.try_lock() else {
-            return;
+        let operation = {
+            let active = entry
+                .active_flow
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(active) = active
+                .as_ref()
+                .filter(|active| !active.started && active.terminal_decision.is_none())
+            else {
+                return;
+            };
+            active.id.clone()
         };
-        if data.status == OAuthState::Idle && data.manager.is_none() && data.flow.is_none() {
+        // A background credential read may own the entry temporarily. Retiring
+        // an unused install must not be lost merely because that read is busy.
+        let mut data = tokio::select! {
+            _ = entry.cancellation.cancelled() => return,
+            data = entry.data.lock() => data,
+        };
+        let mut active = entry
+            .active_flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !entry.cancellation.is_cancelled()
+            && data.status == OAuthState::Idle
+            && data.manager.is_none()
+            && data.flow.is_none()
+            && active.as_ref().is_some_and(|active| {
+                active.id == operation && !active.started && active.terminal_decision.is_none()
+            })
+        {
             // A public server completed initialization/catalog discovery. Its
             // unused install intent must not produce a timeout/login later.
             data.intent = None;
-            *entry
-                .active_flow
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *active = None;
         }
     }
 
