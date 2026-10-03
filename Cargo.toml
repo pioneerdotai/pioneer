@@ -31,6 +31,7 @@ members = [
   "crates/entity",
   "crates/migration",
   "crates/mcp",
+  "crates/mcp-oauth",
   "crates/memory",
   "crates/protocol",
   "crates/provider",
@@ -81,6 +82,7 @@ pioneer-cli = { path = "crates/cli" }
 pioneer-crud = { path = "crates/crud" }
 pioneer-entity = { path = "crates/entity" }
 pioneer-migration = { path = "crates/migration" }
+pioneer-mcp-oauth = { path = "crates/mcp-oauth" }
 pioneer-mcp = { path = "crates/mcp" }
 pioneer-memory = { path = "crates/memory" }
 pioneer-protocol = { path = "crates/protocol" }
@@ -204,5 +206,5 @@ rusqlite = { version = "0.39", default-features = false, features = ["functions"
 zstd = { version = "0.14", features = ["experimental"] }
 
 # MCP
-rmcp = { version = "3.5", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+rmcp = { version = "3.5", default-features = false, features = ["auth", "client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 process-wrap = { version = "10", features = ["tokio1"] }

@@ -109,6 +109,7 @@ pub mod methods {
     pub const SKILLS_POLICY_LIST: &str = "skills/policy/list";
     pub const SKILLS_POLICY_SET: &str = "skills/policy/set";
     pub const MCP_LIST: &str = "mcp/list";
+    pub const MCP_OAUTH: &str = "mcp/oauth";
     pub const MCP_INSTALL: &str = "mcp/install";
     pub const MCP_POLICY_SET: &str = "mcp/policy/set";
     pub const MCP_SERVER_RESTART: &str = "mcp/server/restart";
@@ -268,6 +269,7 @@ pub mod methods {
         SKILLS_POLICY_SET,
         MCP_LIST,
         MCP_INSTALL,
+        MCP_OAUTH,
         MCP_POLICY_SET,
         MCP_SERVER_RESTART,
         MCP_UNINSTALL,
@@ -387,6 +389,7 @@ pub mod events {
     pub const CONTEXT_COMPRESSED: &str = "context/compressed";
     pub const SKILLS_CHANGED: &str = "skills/changed";
     pub const SKILLS_UPLOAD_CHUNK_ACK: &str = "skills/upload/chunk_ack";
+    pub const MCP_OAUTH_CHANGED: &str = "mcp/oauth/changed";
     pub const MCP_CHANGED: &str = "mcp/changed";
     pub const MCP_SERVER_STATUS_CHANGED: &str = "mcp/server/status_changed";
     pub const MCP_SERVER_CATALOG_CHANGED: &str = "mcp/server/catalog_changed";

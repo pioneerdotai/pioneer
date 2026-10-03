@@ -126,6 +126,7 @@ pub(crate) fn format_status_human(report: &SecretsStatusReport) -> String {
         report.counts.model_catalog_proxy
     );
     let _ = writeln!(output, "MCP secrets: {}", report.counts.mcp_secret);
+    let _ = writeln!(output, "MCP OAuth records: {}", report.counts.mcp_oauth);
     let _ = writeln!(output, "User JWT tokens: {}", report.counts.user_jwt_token);
     let _ = writeln!(
         output,
@@ -164,6 +165,9 @@ pub(crate) fn format_garbage_collection_human(report: &McpSecretGarbageCollectio
     let _ = writeln!(output, "Stored MCP refs: {}", report.stored_refs);
     let _ = writeln!(output, "Orphan refs: {}", report.orphan_refs);
     let _ = writeln!(output, "Deleted refs: {}", report.deleted_refs);
+    let _ = writeln!(output, "Stored OAuth records: {}", report.oauth_stored);
+    let _ = writeln!(output, "Orphan OAuth records: {}", report.oauth_orphans);
+    let _ = writeln!(output, "Deleted OAuth records: {}", report.oauth_deleted);
     let _ = writeln!(output, "Failed deletes: {}", report.failed_deletes.len());
     if !report.failed_deletes.is_empty() {
         let _ = writeln!(output, "Failed delete refs:");
@@ -301,6 +305,7 @@ mod tests {
         assert!(output.contains("Provider API keys: 1"));
         assert!(output.contains("Model catalog proxies: 1"));
         assert!(output.contains("MCP secrets: 2"));
+        assert!(output.contains("MCP OAuth records: 1"));
         assert!(output.contains("MCP orphan refs: 1"));
         assert!(output.contains("runtime_home: ok"));
         assert!(!output.contains("sk-provider-secret"));
@@ -323,6 +328,9 @@ mod tests {
     #[test]
     fn gc_human_output_contains_counts_and_failures_without_values() {
         let report = McpSecretGarbageCollectionReport {
+            oauth_stored: 2,
+            oauth_orphans: 1,
+            oauth_deleted: 0,
             dry_run: true,
             active_refs: 2,
             stored_refs: 3,
@@ -338,6 +346,9 @@ mod tests {
 
         assert!(output.contains("MCP secret garbage collection: dry-run"));
         assert!(output.contains("Orphan refs: 1"));
+        assert!(output.contains("Stored OAuth records: 2"));
+        assert!(output.contains("Orphan OAuth records: 1"));
+        assert!(output.contains("Deleted OAuth records: 0"));
         assert!(output.contains("orphan_ref"));
         assert!(!output.contains("mcp-secret-value"));
     }
@@ -348,9 +359,13 @@ mod tests {
         assert!(status_json.contains("storage_path"));
         assert!(status_json.contains("provider_api_key"));
         assert!(status_json.contains("model_catalog_proxy"));
+        assert!(status_json.contains("\"mcp_oauth\":1"));
         assert!(!status_json.contains("sk-provider-secret"));
 
         let gc_json = serde_json::to_string(&McpSecretGarbageCollectionReport {
+            oauth_stored: 2,
+            oauth_orphans: 1,
+            oauth_deleted: 0,
             dry_run: true,
             active_refs: 0,
             stored_refs: 1,
@@ -360,6 +375,9 @@ mod tests {
         })
         .expect("gc json");
         assert!(gc_json.contains("dry_run"));
+        assert!(gc_json.contains("\"oauth_stored\":2"));
+        assert!(gc_json.contains("\"oauth_orphans\":1"));
+        assert!(gc_json.contains("\"oauth_deleted\":0"));
     }
 
     fn status_fixture() -> SecretsStatusReport {
@@ -376,6 +394,7 @@ mod tests {
                 cli_runtime_proxy: 1,
                 model_catalog_proxy: 1,
                 mcp_secret: 2,
+                mcp_oauth: 1,
                 user_jwt_token: 0,
                 gateway_access_jwt_signing_key: 1,
                 gateway_auth_credential_hmac_key: 1,
@@ -383,7 +402,7 @@ mod tests {
                 desktop_gateway_session: 1,
                 unknown: 0,
             },
-            total_entries: 9,
+            total_entries: 10,
             permissions: vec![SecretPermissionHealthReport {
                 path: PathBuf::from("/tmp/pioneer"),
                 target: "runtime_home".to_owned(),
