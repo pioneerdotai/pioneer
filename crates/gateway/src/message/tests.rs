@@ -1,3 +1,6 @@
+#[path = "tests/mcp_oauth_rpc_queue.rs"]
+mod mcp_oauth_rpc_queue;
+
 #[path = "tests/memory_post_turn_response.rs"]
 mod memory_post_turn_response;
 
@@ -26291,6 +26294,18 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
         } else {
             processor.clone()
         };
+        // Next-turn admission requires a loaded thread. Explicitly reopen the
+        // persisted thread through the authorized path in every cleanup case
+        // before testing reuse of the same CLI runtime session and its lease.
+        open_persisted_child_for_test(
+            &next_processor,
+            connection,
+            &mut rx,
+            &workspace,
+            &thread,
+            &format!("pending-heartbeat-resume-{case}"),
+        )
+        .await;
         let next = format!("pending-heartbeat-next-{case}");
         let next_id = generate_test_request_id("pending-heartbeat-next", &next);
         let next_context = sessions.connection_context(connection).await.unwrap();

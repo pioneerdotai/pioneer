@@ -11,6 +11,7 @@ mod details;
 mod dialog_lifetime;
 mod dialogs;
 mod list;
+mod oauth;
 mod sidebar;
 mod table;
 pub use catalog::{McpCatalogConfig, McpCatalogView};
