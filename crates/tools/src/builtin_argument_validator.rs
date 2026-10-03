@@ -106,15 +106,15 @@ fn record_error(
     depth: usize,
 ) {
     if matches!(
-        error.kind,
-        ValidationErrorKind::AnyOf | ValidationErrorKind::OneOfNotValid
+        error.kind(),
+        ValidationErrorKind::AnyOf { .. } | ValidationErrorKind::OneOfNotValid { .. }
     ) {
         if depth < MAX_COMPOSITE_DEPTH {
             if let Some((pointer, validator)) =
                 selected_alternative(&error, schema, schema_base, branch_validators, complete)
             {
-                let base = format!("{instance_base}{}", error.instance_path);
-                for child in validator.iter_errors(&error.instance) {
+                let base = format!("{instance_base}{}", error.instance_path());
+                for child in validator.iter_errors(error.instance()) {
                     // This validator's root is a reference to the selected slice.
                     record_error(
                         child,
@@ -136,11 +136,11 @@ fn record_error(
             *composite_details_truncated = true; // The full validator completed; only detail expansion is bounded.
         }
     }
-    let (code, expected) = describe(&error.kind);
-    if validation_unavailable(&error.kind) {
+    let (code, expected) = describe(error.kind());
+    if validation_unavailable(error.kind()) {
         *complete = false;
     }
-    let pointer = format!("{instance_base}{}", error.instance_path);
+    let pointer = format!("{instance_base}{}", error.instance_path());
     if let Some(properties) =
         grouped_false_schema_properties(&error, schema, schema_base, arguments, &pointer)
     {
@@ -157,7 +157,7 @@ fn record_error(
     // These library errors group independent unexpected properties/items.
     // Expand them without exposing model-authored dynamic property names.
     if let ValidationErrorKind::AdditionalProperties { unexpected }
-    | ValidationErrorKind::UnevaluatedProperties { unexpected } = &error.kind
+    | ValidationErrorKind::UnevaluatedProperties { unexpected } = error.kind()
     {
         for name in unexpected {
             record(Diagnostic {
@@ -165,7 +165,7 @@ fn record_error(
                 code,
                 expected: expected.clone(),
                 actual_type: error
-                    .instance
+                    .instance()
                     .get(name)
                     .map(value_type)
                     .unwrap_or("unknown"),
@@ -173,8 +173,8 @@ fn record_error(
         }
         return;
     }
-    if let ValidationErrorKind::AdditionalItems { limit } = &error.kind {
-        if let Some(items) = error.instance.as_array() {
+    if let ValidationErrorKind::AdditionalItems { limit } = error.kind() {
+        if let Some(items) = error.instance().as_array() {
             for (index, item) in items.iter().enumerate().skip(*limit) {
                 record(Diagnostic {
                     path: safe_path(&format!("{pointer}/{index}"), arguments, &names),
@@ -187,14 +187,14 @@ fn record_error(
         }
     }
     let mut path = safe_path(&pointer, arguments, &names);
-    let actual_type = if let ValidationErrorKind::Required { property } = &error.kind {
+    let actual_type = if let ValidationErrorKind::Required { property } = error.kind() {
         if let Some(name) = property.as_str() {
             path.push('/');
             path.push_str(&escape(name)); // Schema-authored required property.
         }
         "missing"
     } else {
-        value_type(&error.instance)
+        value_type(error.instance())
     };
     let diagnostic = Diagnostic {
         path,
@@ -221,16 +221,16 @@ fn selected_alternative(
         let mut root_type_mismatch = false;
         let mut literal_failures = BTreeSet::new();
         let mut branch_complete = true;
-        for failure in validator.iter_errors(&error.instance) {
-            branch_complete &= !validation_unavailable(&failure.kind);
-            match failure.kind {
+        for failure in validator.iter_errors(error.instance()) {
+            branch_complete &= !validation_unavailable(failure.kind());
+            match failure.kind() {
                 ValidationErrorKind::Type { .. }
-                    if failure.instance_path.to_string().is_empty() =>
+                    if failure.instance_path().to_string().is_empty() =>
                 {
                     root_type_mismatch = true;
                 }
                 ValidationErrorKind::Constant { .. } | ValidationErrorKind::Enum { .. } => {
-                    literal_failures.insert(failure.instance_path.to_string());
+                    literal_failures.insert(failure.instance_path().to_string());
                 }
                 _ => {}
             }
@@ -260,7 +260,7 @@ fn selected_alternative(
             {
                 continue;
             }
-            let Some(value) = error.instance.pointer(path) else {
+            let Some(value) = error.instance().pointer(path) else {
                 continue;
             };
             let tokens = path.split('/').skip(1).collect::<Vec<_>>();
@@ -293,7 +293,7 @@ fn grouped_false_schema_properties<'a>(
     arguments: &'a Value,
     pointer: &str,
 ) -> Option<&'a serde_json::Map<String, Value>> {
-    if !matches!(error.kind, ValidationErrorKind::FalseSchema) {
+    if !matches!(error.kind(), ValidationErrorKind::FalseSchema) {
         return None;
     }
     let location = validation_schema_location(schema, schema_base, error)?;
@@ -310,7 +310,7 @@ fn grouped_false_schema_properties<'a>(
     // jsonschema's no-properties shortcut reports the first property's value
     // at its containing object's path. A genuine false schema reports the
     // instance at that path; keep that error intact, including keyword-like names.
-    if instance == error.instance.as_ref() {
+    if instance == error.instance().as_ref() {
         return None;
     }
     instance.as_object()
@@ -321,7 +321,9 @@ fn validation_schema_location(
     base: &str,
     error: &ValidationError<'_>,
 ) -> Option<String> {
-    let path = error.schema_path.to_string();
+    // Diagnostic expansion needs the traversal path, including local $ref
+    // steps; schema_path() now reports the canonical location instead.
+    let path = error.evaluation_path().to_string();
     let path = if base.is_empty() {
         path.as_str()
     } else {
@@ -339,10 +341,14 @@ fn slice_validator(
         return Some(validator.clone());
     }
     // Cache size depends on schema locations, not invalid array element count.
-    let resource = jsonschema::Resource::from_contents(schema.clone()).ok()?;
+    let registry = jsonschema::Registry::new()
+        .add(SCHEMA_RESOURCE, schema.clone())
+        .ok()?
+        .prepare()
+        .ok()?;
     let validator = Arc::new(
         jsonschema::options()
-            .with_resource(SCHEMA_RESOURCE, resource)
+            .with_registry(&registry)
             .build(&serde_json::json!({"$ref": format!("{SCHEMA_RESOURCE}#{pointer}")}))
             .ok()?,
     );
@@ -423,9 +429,10 @@ fn schema_location(root: &Value, base: &str, path: &str) -> Option<String> {
 fn validation_unavailable(kind: &ValidationErrorKind) -> bool {
     match kind {
         ValidationErrorKind::BacktrackLimitExceeded { .. }
+        | ValidationErrorKind::RegexEngineFailure { .. }
         | ValidationErrorKind::Referencing(_)
         | ValidationErrorKind::Custom { .. } => true,
-        ValidationErrorKind::PropertyNames { error } => validation_unavailable(&error.kind),
+        ValidationErrorKind::PropertyNames { error } => validation_unavailable(error.kind()),
         _ => false,
     }
 }
@@ -449,8 +456,10 @@ fn describe(kind: &ValidationErrorKind) -> (&'static str, String) {
             );
         }
         Required { .. } => ("required", "present required property"),
-        AnyOf => ("anyOf", "match at least one schema alternative"),
-        OneOfNotValid | OneOfMultipleValid => ("oneOf", "match exactly one schema alternative"),
+        AnyOf { .. } => ("anyOf", "match at least one schema alternative"),
+        OneOfNotValid { .. } | OneOfMultipleValid { .. } => {
+            ("oneOf", "match exactly one schema alternative")
+        }
         AdditionalProperties { .. } | UnevaluatedProperties { .. } => {
             ("additionalProperties", "only properties allowed by schema")
         }
@@ -482,7 +491,10 @@ fn describe(kind: &ValidationErrorKind) -> (&'static str, String) {
         ContentEncoding { .. } | ContentMediaType { .. } | FromUtf8 { .. } => {
             ("content", "content matching schema")
         }
-        BacktrackLimitExceeded { .. } | Referencing(_) | Custom { .. } => (
+        BacktrackLimitExceeded { .. }
+        | RegexEngineFailure { .. }
+        | Referencing(_)
+        | Custom { .. } => (
             "validation_unavailable",
             "schema check could not be completed",
         ),
