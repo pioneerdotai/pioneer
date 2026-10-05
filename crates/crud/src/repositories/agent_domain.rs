@@ -6297,6 +6297,28 @@ pub async fn cancel_agent_work_graph(
     terminal_reason: &str,
     finished_at: DateTimeWithTimeZone,
 ) -> Result<Vec<AgentWorkGraphCancellationTarget>> {
+    cancel_agent_work_graph_targets(db, root_execution_id, terminal_reason, finished_at, false)
+        .await
+}
+
+/// The await caller must also see already-fenced bindings on retry. This is
+/// collected inside the same bounded native graph write, before its fence.
+pub async fn cancel_agent_work_graph_and_collect_owners(
+    db: &DatabaseTransaction,
+    root_execution_id: &str,
+    terminal_reason: &str,
+    finished_at: DateTimeWithTimeZone,
+) -> Result<Vec<AgentWorkGraphCancellationTarget>> {
+    cancel_agent_work_graph_targets(db, root_execution_id, terminal_reason, finished_at, true).await
+}
+
+async fn cancel_agent_work_graph_targets(
+    db: &DatabaseTransaction,
+    root_execution_id: &str,
+    terminal_reason: &str,
+    finished_at: DateTimeWithTimeZone,
+    collect_owners: bool,
+) -> Result<Vec<AgentWorkGraphCancellationTarget>> {
     let root = agent_execution::Entity::find_by_id(root_execution_id.to_owned())
         .one(db)
         .await
@@ -6350,24 +6372,38 @@ pub async fn cancel_agent_work_graph(
         .iter()
         .map(|execution| execution.id.clone())
         .collect::<Vec<_>>();
-    let response_turns = if active_ids.is_empty() {
+    let target_executions = if collect_owners {
+        executions.iter().collect::<Vec<_>>()
+    } else {
+        active.clone()
+    };
+    let target_ids = target_executions
+        .iter()
+        .map(|execution| execution.id.clone())
+        .collect::<Vec<_>>();
+    let response_turns = if target_ids.is_empty() {
         Vec::new()
     } else {
-        let active_turn_ids = Query::select()
-            .column(turn::Column::Id)
-            .from(turn::Entity)
-            .and_where(turn::Column::Status.eq("in_progress"))
-            .to_owned();
-        agent_turn_response_execution::Entity::find()
-            .filter(agent_turn_response_execution::Column::ExecutionId.is_in(active_ids.clone()))
-            .filter(agent_turn_response_execution::Column::TurnId.in_subquery(active_turn_ids))
+        let query = agent_turn_response_execution::Entity::find()
+            .filter(agent_turn_response_execution::Column::ExecutionId.is_in(target_ids));
+        let query = if collect_owners {
+            query
+        } else {
+            let active_turn_ids = Query::select()
+                .column(turn::Column::Id)
+                .from(turn::Entity)
+                .and_where(turn::Column::Status.eq("in_progress"))
+                .to_owned();
+            query.filter(agent_turn_response_execution::Column::TurnId.in_subquery(active_turn_ids))
+        };
+        query
             .limit(graph_row_limit)
             .all(db)
             .await
-            .context("failed to load active Agent work-graph Turn bindings")?
+            .context("failed to load Agent work-graph Turn bindings")?
     };
-    if response_turns.len() > active_ids.len() {
-        bail!("Agent work graph has too many active Turn bindings");
+    if response_turns.len() > target_executions.len() {
+        bail!("Agent work graph has too many Turn bindings for native completion");
     }
     let mut response_turns_by_execution = BTreeMap::new();
     for response in response_turns {
@@ -6375,10 +6411,10 @@ pub async fn cancel_agent_work_graph(
             .insert(response.execution_id, response.turn_id)
             .is_some()
         {
-            bail!("Agent execution has multiple active response Turns");
+            bail!("Agent execution has multiple response Turns; completion is ambiguous");
         }
     }
-    let targets = active
+    let targets = target_executions
         .iter()
         .map(|execution| AgentWorkGraphCancellationTarget {
             execution_id: execution.id.clone(),
@@ -7482,6 +7518,35 @@ mod tests {
             .unwrap();
         transaction.commit().await.unwrap();
         assert_eq!(targets.len(), 3);
+        // Existing admission cancellation ignores terminal rows on retry.
+        let transaction = db.begin().await.unwrap();
+        assert!(
+            cancel_agent_work_graph(&transaction, root_id, "repeat", now)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        transaction.rollback().await.unwrap();
+        // Completion must retain the exact graph after that same durable fence.
+        let transaction = db.begin().await.unwrap();
+        let owners = cancel_agent_work_graph_and_collect_owners(&transaction, root_id, "wait", now)
+            .await
+            .unwrap();
+        assert_eq!(owners.len(), 3);
+        assert!(
+            owners
+                .iter()
+                .all(|target| target.execution_id != unrelated_id)
+        );
+        assert!(
+            owners
+                .iter()
+                .find(|target| target.execution_id == queued_id)
+                .unwrap()
+                .turn_id
+                .is_none()
+        );
+        transaction.rollback().await.unwrap();
         for id in [root_id, child_id, queued_id] {
             assert_eq!(
                 agent_execution::Entity::find_by_id(id)

@@ -7440,6 +7440,34 @@ impl MessageProcessor {
         turn: &pioneer_protocol::Turn,
         reason: &str,
     ) -> anyhow::Result<bool> {
+        self.cancel_root_agent_work_graph(thread_id, turn, reason, None)
+            .await
+    }
+
+    /// Internal lifecycle prerequisite, with one deadline for graph fencing,
+    /// admission and every native root/descendant cleanup. No public RPC.
+    pub(super) async fn cancel_root_agent_work_graph_for_turn_and_wait(
+        &self,
+        thread_id: &str,
+        turn: &pioneer_protocol::Turn,
+        reason: &str,
+        request_deadline: tokio::time::Instant,
+    ) -> anyhow::Result<bool> {
+        tokio::time::timeout_at(
+            request_deadline,
+            self.cancel_root_agent_work_graph(thread_id, turn, reason, Some(request_deadline)),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("native graph stop deadline expired; cleanup unconfirmed"))?
+    }
+
+    async fn cancel_root_agent_work_graph(
+        &self,
+        thread_id: &str,
+        turn: &pioneer_protocol::Turn,
+        reason: &str,
+        completion_deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<bool> {
         let database = self.crud_store.database_connection();
         let responding_execution_id =
             pioneer_crud::load_agent_turn_response(&database, turn.id.as_str())
@@ -7460,21 +7488,74 @@ impl MessageProcessor {
         let Some(execution) =
             pioneer_crud::load_agent_execution(&database, execution_id.as_str()).await?
         else {
+            if let Some(deadline) = completion_deadline {
+                self.agent_manager
+                    .cancel_turn_and_wait(thread_id, turn.id.as_str(), reason, deadline)
+                    .await?;
+            }
             return Ok(false);
         };
         if execution.id != execution.work_graph_root_execution_id
             || execution.parent_execution_id.is_some()
         {
+            if let Some(deadline) = completion_deadline {
+                self.agent_manager
+                    .cancel_turn_and_wait(thread_id, turn.id.as_str(), reason, deadline)
+                    .await?;
+            }
             return Ok(false);
         }
+
+        let root_owner = if completion_deadline.is_some() {
+            Some(
+                self.agent_manager
+                    .capture_turn_stop_owner(thread_id, turn.id.as_str())
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         // Fence every queued/running descendant before asking provider
         // runtimes to stop. Any concurrent action commit then observes the
         // terminal execution/resource state and fails closed.
-        let targets = self
-            .crud_store
-            .cancel_agent_work_graph(execution.id.as_str(), reason, pioneer_crud::utc_now())
-            .await?;
+        let targets = if completion_deadline.is_some() {
+            self.crud_store
+                .cancel_agent_work_graph_and_collect_owners(
+                    execution.id.as_str(),
+                    reason,
+                    pioneer_crud::utc_now(),
+                )
+                .await?
+        } else {
+            self.crud_store
+                .cancel_agent_work_graph(execution.id.as_str(), reason, pioneer_crud::utc_now())
+                .await?
+        };
+
+        let mut native_owners = std::collections::HashMap::new();
+        if completion_deadline.is_some() {
+            for target in &targets {
+                if target.execution_id == execution.id {
+                    continue;
+                }
+                if let (Some(thread), Some(turn)) = (&target.thread_id, &target.turn_id) {
+                    native_owners.insert(
+                        target.execution_id.clone(),
+                        self.agent_manager
+                            .capture_turn_stop_owner(thread, turn)
+                            .await
+                            .map_err(|error| {
+                                anyhow::anyhow!("descendant native owner unavailable: {error}")
+                            })?,
+                    );
+                } else if target.turn_id.is_some() {
+                    anyhow::bail!("descendant native thread owner is unknown");
+                }
+                // No binding under the serialized graph fence proves no native
+                // Turn was admitted. It needs no invented process join.
+            }
+        }
 
         let mut task_ids = targets
             .iter()
@@ -7514,6 +7595,9 @@ impl MessageProcessor {
                 )
                 .await
             {
+                if completion_deadline.is_some() {
+                    return Err(error.context("descendant Task cleanup failed"));
+                }
                 warn!(
                     root_execution_id = execution.id,
                     task_id,
@@ -7531,18 +7615,31 @@ impl MessageProcessor {
             let (Some(thread_id), Some(turn_id)) =
                 (target.thread_id.as_deref(), target.turn_id.as_deref())
             else {
+                if completion_deadline.is_some() && target.turn_id.is_some() {
+                    anyhow::bail!("descendant native runtime owner is unknown");
+                }
                 continue;
             };
             self.mcp_service.cancel_turn_mcp_invocations(turn_id);
-            let stopped_cli = self
-                .cancel_task_cli_runtime_turn(thread_id, turn_id, reason)
-                .await
-                .unwrap_or(false);
-            if !stopped_cli {
-                let _ = self
-                    .agent_manager
-                    .cancel_turn(thread_id, turn_id, reason)
-                    .await;
+            if let Some(deadline) = completion_deadline {
+                // B's plugin execution paths use AgentManager. Missing native
+                // owner (including a CLI owner) remains unsupported/unknown.
+                let owner = native_owners.get(&target.execution_id).ok_or_else(|| {
+                    anyhow::anyhow!("descendant native completion owner is unknown")
+                })?;
+                self.await_native_graph_owner(owner, reason, deadline)
+                    .await?;
+            } else {
+                let stopped_cli = self
+                    .cancel_task_cli_runtime_turn(thread_id, turn_id, reason)
+                    .await
+                    .unwrap_or(false);
+                if !stopped_cli {
+                    let _ = self
+                        .agent_manager
+                        .cancel_turn(thread_id, turn_id, reason)
+                        .await;
+                }
             }
             self.unregister_agent_action_binding(turn_id).await;
             if target.parent_task_id.is_none() {
@@ -7554,7 +7651,31 @@ impl MessageProcessor {
                 .await;
             }
         }
+        if let Some(deadline) = completion_deadline {
+            self.mcp_service
+                .cancel_turn_mcp_invocations(turn.id.as_str());
+            self.agent_manager
+                .cancel_captured_turn_and_wait(
+                    root_owner.as_ref().expect("captured native root"),
+                    reason,
+                    deadline,
+                )
+                .await?;
+        }
+
         Ok(true)
+    }
+
+    pub(super) async fn await_native_graph_owner(
+        &self,
+        owner: &pioneer_agent::NativeTurnStopOwner,
+        reason: &str,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<()> {
+        self.agent_manager
+            .cancel_captured_turn_and_wait(owner, reason, deadline)
+            .await
+            .map_err(|error| anyhow::anyhow!("descendant native cleanup failed: {error}"))
     }
 
     /// Native provider success with a final response is acknowledged only after

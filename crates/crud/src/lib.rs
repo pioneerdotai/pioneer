@@ -14909,6 +14909,44 @@ impl CrudStore {
         .await
     }
 
+    pub async fn cancel_agent_work_graph_and_collect_owners(
+        &self,
+        root_execution_id: &str,
+        terminal_reason: &str,
+        finished_at: sea_orm::prelude::DateTimeWithTimeZone,
+    ) -> Result<Vec<AgentWorkGraphCancellationTarget>> {
+        self.run_serialized_write(|| {
+            let finished_at = finished_at.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin Agent work-graph cancellation transaction")?;
+                match crate::repositories::agent_domain::cancel_agent_work_graph_and_collect_owners(
+                    &transaction,
+                    root_execution_id,
+                    terminal_reason,
+                    finished_at,
+                )
+                .await
+                {
+                    Ok(targets) => {
+                        transaction.commit().await.context(
+                            "failed to commit Agent work-graph cancellation transaction",
+                        )?;
+                        Ok(targets)
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
+            }
+        })
+        .await
+    }
+
     pub async fn load_execution_for_run(&self, run_id: &str) -> Result<Option<TaskRunExecution>> {
         task_run_execution::find_execution_by_run(&self.connection, run_id)
             .await?

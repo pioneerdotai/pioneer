@@ -66855,6 +66855,10 @@ impl pioneer_mcp::McpRuntimeSession for FakeMcpRuntimeSession {
     }
 
     async fn shutdown(&mut self) {}
+    async fn shutdown_result(&mut self) -> Result<(), pioneer_mcp::McpRuntimeError> {
+        self.shutdown().await;
+        Ok(())
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -77938,3 +77942,69 @@ mod task_delivery_cancellation;
 
 #[path = "tests/memory_post_turn_recovery.rs"]
 mod memory_post_turn_recovery;
+
+#[tokio::test]
+async fn captured_descendant_stop_deadline_is_propagated_and_same_owner_can_retry() {
+    let (tx, mut rx) = mpsc::channel(64);
+    let sessions = Arc::new(SessionManager::new());
+    let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
+    let (workspaces, store, workspace) = setup_workspace_manager().await;
+    let provider = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "delayed",
+        Arc::new(DelayedProvider {
+            delay: Duration::from_secs(60),
+            text: "done".into(),
+        }),
+    ));
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("test-model", "delayed")),
+        provider,
+        sessions,
+        workspaces,
+        store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    );
+    start_thread_and_turn(
+        &processor,
+        connection,
+        &mut rx,
+        &workspace,
+        "thread_stop_descendant",
+        "turn_stop_descendant",
+        "Chat",
+        "delayed",
+    )
+    .await;
+    let owner = processor
+        .agent_manager
+        .capture_turn_stop_owner("thread_stop_descendant", "turn_stop_descendant")
+        .await
+        .unwrap();
+    let error = processor
+        .await_native_graph_owner(
+            &owner,
+            "graph cancellation",
+            tokio::time::Instant::now() - Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("descendant native cleanup failed")
+    );
+    processor
+        .await_native_graph_owner(
+            &owner,
+            "graph retry",
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    processor
+        .agent_manager
+        .remove_thread("thread_stop_descendant")
+        .await;
+}
