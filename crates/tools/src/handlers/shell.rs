@@ -71,6 +71,7 @@ pub struct UnifiedExecHandler {
     one_shots: StdMutex<HashMap<u64, Arc<Mutex<RetainedOneShot>>>>,
     next_session_id: AtomicU64,
     one_shot_limits: OneShotOutputLimits,
+    cleanup_error: StdMutex<Option<String>>,
 }
 
 struct RetainedOneShot {
@@ -85,9 +86,6 @@ async fn drain_shell_readers(
     readers: &mut Vec<tokio::task::JoinHandle<()>>,
     reader_error: &mut Option<String>,
 ) -> Result<(), ToolError> {
-    if let Some(error) = reader_error {
-        return Err(ToolError::internal(error.clone()));
-    }
     while let Some(reader) = readers.last_mut() {
         reader.abort();
         let result = (&mut *reader).await;
@@ -96,11 +94,13 @@ async fn drain_shell_readers(
             if !error.is_cancelled() {
                 let message = format!("shell reader join failed: {error}");
                 *reader_error = Some(message.clone());
-                return Err(ToolError::internal(message));
             }
         }
     }
-    Ok(())
+    match reader_error {
+        Some(error) => Err(ToolError::internal(error.clone())),
+        None => Ok(()),
+    }
 }
 
 struct ExecSession {
@@ -126,6 +126,7 @@ impl Default for UnifiedExecHandler {
             one_shots: StdMutex::new(HashMap::new()),
             next_session_id: AtomicU64::new(0),
             one_shot_limits: OneShotOutputLimits::default(),
+            cleanup_error: StdMutex::new(None),
         }
     }
 }
@@ -253,18 +254,27 @@ impl UnifiedExecHandler {
             .collect::<Vec<_>>();
         for (id, child) in children {
             let mut retained = child.lock().await;
-            terminate_child_process(&mut retained.child).await?;
-            kill_process_tree(retained.process_id.take(), true);
+            let process_result = terminate_child_process(&mut retained.child).await;
+            if let Err(error) = &process_result {
+                self.remember_cleanup_error(error);
+            }
+            if process_result.is_ok() {
+                kill_process_tree(retained.process_id.take(), true);
+            }
             let RetainedOneShot {
                 readers,
                 reader_error,
                 ..
             } = &mut *retained;
-            drain_shell_readers(readers, reader_error).await?;
-            self.one_shots
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&id);
+            if let Err(error) = drain_shell_readers(readers, reader_error).await {
+                self.remember_cleanup_error(&error);
+            }
+            if process_result.is_ok() {
+                self.one_shots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id);
+            }
         }
         let sessions = self
             .sessions
@@ -274,9 +284,43 @@ impl UnifiedExecHandler {
             .copied()
             .collect::<Vec<_>>();
         for id in sessions {
-            self.close_session(id).await?;
+            if let Err(error) = self.close_session(id).await {
+                self.remember_cleanup_error(&error);
+            }
         }
-        Ok(())
+        match self
+            .cleanup_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            Some(error) => Err(ToolError::internal(error)),
+            None => Ok(()),
+        }
+    }
+
+    fn remember_cleanup_error(&self, error: &ToolError) {
+        let mut failure = self
+            .cleanup_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if failure.is_none() {
+            *failure = Some(error.to_string());
+        }
+    }
+
+    /// Used only after native dispatch tasks joined, so no new child can appear.
+    /// An error outcome and ownership of an unconfirmed process are distinct.
+    pub fn cleanup_is_quiescent(&self) -> bool {
+        self.one_shots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+            && self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
     }
 
     async fn close_session(&self, id: u64) -> Result<(), ToolError> {
@@ -288,18 +332,30 @@ impl UnifiedExecHandler {
             .cloned();
         if let Some(session) = session {
             let mut session = session.lock().await;
-            terminate_child_process(&mut session.child).await?;
-            kill_process_tree(session.process_id.take(), true);
+            let process_result = terminate_child_process(&mut session.child).await;
+            if let Err(error) = &process_result {
+                self.remember_cleanup_error(error);
+            }
+            if process_result.is_ok() {
+                kill_process_tree(session.process_id.take(), true);
+            }
             let ExecSession {
                 readers,
                 reader_error,
                 ..
             } = &mut *session;
-            drain_shell_readers(readers, reader_error).await?;
-            self.sessions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&id);
+            let result = drain_shell_readers(readers, reader_error).await;
+            if let Err(error) = &result {
+                self.remember_cleanup_error(error);
+            }
+            // Release only after child wait and all reader joins, even on reader panic.
+            if process_result.is_ok() {
+                self.sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id);
+            }
+            return process_result.and(result);
         }
         Ok(())
     }
@@ -593,7 +649,10 @@ impl UnifiedExecHandler {
                         reader_error,
                         ..
                     } = &mut *retained;
-                    if drain_shell_readers(readers, reader_error).await.is_ok() {
+                    if let Err(error) = drain_shell_readers(readers, reader_error).await {
+                        self.remember_cleanup_error(&error);
+                    }
+                    if readers.is_empty() {
                         self.one_shots
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1662,6 +1721,9 @@ mod tests {
         while !reader.is_finished() {
             tokio::task::yield_now().await;
         }
+        let other = tokio::spawn(std::future::pending::<()>());
+        let other_handle = other.abort_handle();
+        readers.push(other);
         readers.push(reader);
         assert!(
             drain_shell_readers(&mut readers, &mut failure)
@@ -1669,11 +1731,100 @@ mod tests {
                 .is_err()
         );
         assert!(readers.is_empty());
+        assert!(other_handle.is_finished());
+        // Even a previously cached error must not abandon newly retained readers.
+        let another = tokio::spawn(std::future::pending::<()>());
+        let another_handle = another.abort_handle();
+        readers.push(another);
         assert!(
             drain_shell_readers(&mut readers, &mut failure)
                 .await
                 .is_err()
         );
+        assert!(readers.is_empty());
+        assert!(another_handle.is_finished());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_reader_drain_keeps_unconfirmed_join_for_retry() {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (started, start) = tokio::sync::oneshot::channel();
+        // Abort cannot stop a running blocking reader; only its real join can
+        // acknowledge the ownership. No process is needed for this regression.
+        let reader = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _ = released.recv();
+        });
+        start.await.unwrap();
+        let mut readers = vec![reader];
+        let mut failure = None;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                drain_shell_readers(&mut readers, &mut failure)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(readers.len(), 1);
+        release.send(()).unwrap();
+        drain_shell_readers(&mut readers, &mut failure)
+            .await
+            .unwrap();
+        assert!(readers.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reader_panic_does_not_abandon_other_readers_or_other_owned_processes() {
+        let handler = UnifiedExecHandler::default();
+        let mut children = Vec::new();
+        let mut reader_controls = Vec::new();
+        for id in 0..2 {
+            let mut command = tokio::process::Command::new("sh");
+            command
+                .args(["-c", "sleep 60"])
+                .process_group(0)
+                .kill_on_drop(true);
+            let child = command.spawn().unwrap();
+            let process_id = child.id();
+            let pending = tokio::spawn(std::future::pending::<()>());
+            reader_controls.push(pending.abort_handle());
+            let panicked = tokio::spawn(async {
+                panic!("retained reader failure");
+            });
+            while !panicked.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let retained = Arc::new(Mutex::new(RetainedOneShot {
+                child,
+                readers: vec![pending, panicked],
+                reader_error: None,
+                process_id,
+                _runtime_temp_dir: None,
+            }));
+            handler
+                .one_shots
+                .lock()
+                .unwrap()
+                .insert(id, retained.clone());
+            children.push(retained);
+        }
+        assert!(handler.stop_and_wait().await.is_err());
+        assert!(handler.cleanup_is_quiescent());
+        for child in children {
+            let mut child = child.lock().await;
+            assert!(child.child.try_wait().unwrap().is_some());
+            assert!(child.readers.is_empty());
+        }
+        assert!(
+            reader_controls
+                .iter()
+                .all(tokio::task::AbortHandle::is_finished)
+        );
+        // Resolved ownership is released; the handler's failure outcome remains sticky.
+        assert!(handler.stop_and_wait().await.is_err());
+        assert!(handler.cleanup_is_quiescent());
     }
 
     fn invocation(tool_name: &str, payload: ToolPayload) -> ToolInvocation {

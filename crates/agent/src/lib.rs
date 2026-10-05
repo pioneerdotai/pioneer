@@ -2330,6 +2330,7 @@ struct ActiveTurnControl {
 struct AgentThreadControlPlane {
     active: Arc<StdRwLock<Option<ActiveTurnControl>>>,
     last_execution: Arc<StdRwLock<Option<(String, TurnExecutionControl)>>>,
+    retiring_actor: Arc<StdMutex<Option<Arc<NativeTask>>>>,
 }
 
 impl AgentThreadControlPlane {
@@ -2338,8 +2339,8 @@ impl AgentThreadControlPlane {
             .last_execution
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((_, old)) = previous.take() {
-            execution.completion.retain_predecessor(old.completion);
+        if let Some((old_turn, old)) = previous.take() {
+            execution.completion.retain_predecessor(old_turn, old);
         }
         *previous = Some((turn_id.clone(), execution.clone()));
         drop(previous);
@@ -2389,11 +2390,20 @@ impl AgentThreadControlPlane {
     }
 
     fn has_pending_cleanup(&self) -> bool {
+        if self
+            .retiring_actor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|actor| !actor.is_joined())
+        {
+            return true;
+        }
         self.last_execution
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .is_some_and(|(_, control)| control.completion.outcome().is_none())
+            .is_some_and(|(_, control)| !control.completion.is_quiescent())
     }
 
     fn completion_for(&self, turn_id: &str) -> Option<TurnExecutionControl> {
@@ -2455,7 +2465,7 @@ struct AgentThreadHandle {
     control_outcomes: Arc<ControlOperationRegistry>,
     control_plane: AgentThreadControlPlane,
     event_hub: Arc<AgentEventHub>,
-    loop_handle: JoinHandle<()>,
+    loop_handle: Arc<NativeTask>,
 }
 
 #[derive(Default)]
@@ -2737,6 +2747,21 @@ pub struct NativeTurnStopOwner {
         u64,
         Arc<ControlOperationRegistry>,
     )>,
+}
+
+impl NativeTurnStopOwner {
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+    pub fn run_id(&self) -> u64 {
+        self.control.run_id
+    }
+    pub fn is_quiescent(&self) -> bool {
+        self.control.completion.is_quiescent()
+    }
 }
 
 pub struct AgentManager {
@@ -3192,7 +3217,7 @@ impl AgentManager {
                 control_outcomes,
                 control_plane,
                 event_hub,
-                loop_handle,
+                loop_handle: NativeTask::new(loop_handle),
             },
         );
 
@@ -3933,6 +3958,99 @@ impl AgentManager {
         })
     }
 
+    /// Snapshot latest native runs and exact pending predecessors. The latest
+    /// proven outcome also disambiguates an admission row awaiting projection;
+    /// it is already owned by the plane, not retained historical receipts.
+    /// Retirement/replacement is gated through actor join. Every admitted run is
+    /// owned by a live plane or retained retiring plane; activate transfers old
+    /// ownership unless it is proven quiescent. Thus historical bindings need
+    /// no permanent completion receipts. This is not a turn-ID absence lookup.
+    pub async fn capture_native_stop_owners(
+        &self,
+        thread_ids: &[String],
+        max_owners: usize,
+    ) -> Result<Vec<NativeTurnStopOwner>, StopError> {
+        if thread_ids.len() > 65536 || max_owners > 65536 {
+            return Err(StopError::UnknownOwner);
+        }
+        let _retirement_guard = self.thread_creation_lock.lock().await;
+        // A cancelled retirement waiter retains its actor join in the plane.
+        // An unfinished actor could still admit a queued command: fail closed.
+        // Join already-ended actors outside the registry lock before snapshot.
+        let actors = {
+            let state = self.state.read().await;
+            thread_ids
+                .iter()
+                .flat_map(|id| state.retiring_executions.get(id).into_iter().flatten())
+                .filter_map(|plane| {
+                    plane
+                        .retiring_actor
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone()
+                })
+                .take(max_owners.saturating_add(1))
+                .collect::<Vec<_>>()
+        };
+        if actors.len() > max_owners {
+            return Err(StopError::UnknownOwner);
+        }
+        for actor in actors {
+            if actor.is_joined() {
+                continue;
+            }
+            if !actor.is_finished() {
+                return Err(StopError::UnknownOwner);
+            }
+            actor.join().await?;
+        }
+        let state = self.state.read().await;
+        let mut owners = Vec::new();
+        for thread_id in thread_ids {
+            let live = state.threads.get(thread_id);
+            let planes = live.iter().map(|thread| &thread.control_plane).chain(
+                state
+                    .retiring_executions
+                    .get(thread_id)
+                    .into_iter()
+                    .flatten(),
+            );
+            for plane in planes {
+                // Lock activation's publication point while cloning its root.
+                let last = plane
+                    .last_execution
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut pending = last.iter().cloned().collect::<Vec<_>>();
+                while let Some((turn_id, control)) = pending.pop() {
+                    if owners.len() >= max_owners {
+                        return Err(StopError::UnknownOwner);
+                    }
+                    pending.extend(control.completion.predecessors());
+                    let mailbox = live
+                        .filter(|thread| {
+                            Arc::ptr_eq(&thread.control_plane.last_execution, &plane.last_execution)
+                        })
+                        .map(|thread| {
+                            (
+                                thread.command_tx.clone(),
+                                thread.generation,
+                                thread.control_outcomes.clone(),
+                            )
+                        });
+                    owners.push(NativeTurnStopOwner {
+                        thread_id: thread_id.clone(),
+                        turn_id,
+                        control,
+                        retired: Vec::new(),
+                        mailbox,
+                    });
+                }
+            }
+        }
+        Ok(owners)
+    }
+
     pub async fn cancel_captured_turn_and_wait(
         &self,
         owner: &NativeTurnStopOwner,
@@ -3948,7 +4066,7 @@ impl AgentManager {
                 mailbox,
             } = owner;
             control.cancel_all_attempts();
-            if control.completion.outcome().is_none() {
+            if !control.completion.is_quiescent() {
                 if let Some((tx, generation, outcomes)) = mailbox.clone() {
                     let (sender, _receiver) = oneshot::channel();
                     let command = AgentCommand::CancelTurn {
@@ -3969,29 +4087,24 @@ impl AgentManager {
                     let _ = tx.try_send(command);
                 }
             }
-            control.completion.finish(true).await?;
+            let mut result = control.completion.finish(true).await;
             for old in retired {
                 if !Arc::ptr_eq(&old.completion, &control.completion) {
                     old.cancel_all_attempts();
-                    old.completion.finish(true).await?;
+                    if let Err(error) = old.completion.finish(true).await {
+                        result = Err(error);
+                    }
                 }
             }
             // Release only confirmed retired owners, never a timed-out one.
             let mut state = self.state.write().await;
             if let Some(planes) = state.retiring_executions.get_mut(thread_id) {
-                planes.retain(|plane| {
-                    plane
-                        .last_execution
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .as_ref()
-                        .is_some_and(|(_, c)| c.completion.outcome().is_none())
-                });
+                planes.retain(AgentThreadControlPlane::has_pending_cleanup);
                 if planes.is_empty() {
                     state.retiring_executions.remove(thread_id);
                 }
             }
-            Ok(())
+            result
         })
         .await
         .map_err(|_| StopError::Deadline)?
@@ -4312,13 +4425,16 @@ impl AgentManager {
             }
             thread.loop_handle.abort();
             let plane = thread.control_plane.clone();
-            if plane.has_pending_cleanup() {
-                state
-                    .retiring_executions
-                    .entry(thread_id.to_owned())
-                    .or_default()
-                    .push(plane);
-            }
+            *plane
+                .retiring_actor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(thread.loop_handle.clone());
+            state
+                .retiring_executions
+                .entry(thread_id.to_owned())
+                .or_default()
+                .push(plane);
             state.threads.remove(thread_id)
         };
         if let Some(thread) = thread {
@@ -4327,7 +4443,7 @@ impl AgentManager {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .record(thread_id, outcomes.retirement_snapshot());
-            let _ = thread.loop_handle.await;
+            let _ = thread.loop_handle.join().await;
             self.drain_retiring_native_execution(thread_id).await;
             // The actor can finish an already-running command between abort
             // request and cancellation. Refresh the tombstones after join so
@@ -4354,6 +4470,19 @@ impl AgentManager {
         };
         let deadline = tokio::time::Instant::now() + Duration::from_millis(2_500);
         for plane in owners {
+            let actor = plane
+                .retiring_actor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(actor) = actor {
+                if tokio::time::timeout_at(deadline, actor.join())
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+            }
             let control = plane
                 .last_execution
                 .read()
@@ -4396,13 +4525,17 @@ impl AgentManager {
             let mut state = self.state.write().await;
             let thread = state.threads.remove(thread_id);
             if let Some(thread) = &thread {
-                if thread.control_plane.has_pending_cleanup() {
-                    state
-                        .retiring_executions
-                        .entry(thread_id.to_owned())
-                        .or_default()
-                        .push(thread.control_plane.clone());
-                }
+                *thread
+                    .control_plane
+                    .retiring_actor
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(thread.loop_handle.clone());
+                state
+                    .retiring_executions
+                    .entry(thread_id.to_owned())
+                    .or_default()
+                    .push(thread.control_plane.clone());
             }
             thread
         };
@@ -4429,17 +4562,20 @@ impl AgentManager {
             .await,
             Ok(Ok(()))
         );
-        let mut loop_handle = thread.loop_handle;
+        let loop_handle = thread.loop_handle;
         if !shutdown_accepted
-            || tokio::time::timeout(tokio::time::Duration::from_millis(2_500), &mut loop_handle)
-                .await
-                .is_err()
+            || tokio::time::timeout(
+                tokio::time::Duration::from_millis(2_500),
+                loop_handle.join(),
+            )
+            .await
+            .is_err()
         {
             // The actor has had a cooperative cancellation window.  Fence it
             // only after that window, so tool cleanup is not dropped at the
             // same instant as the registry entry.
             loop_handle.abort();
-            let _ = loop_handle.await;
+            let _ = loop_handle.join().await;
         }
 
         self.drain_retiring_native_execution(thread_id).await;
@@ -4519,13 +4655,16 @@ impl AgentManager {
                         // ReconciliationRequired in the retired registry.
                         thread.loop_handle.abort();
                         let plane = thread.control_plane.clone();
-                        if plane.has_pending_cleanup() {
-                            state
-                                .retiring_executions
-                                .entry(thread_id.to_owned())
-                                .or_default()
-                                .push(plane);
-                        }
+                        *plane
+                            .retiring_actor
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(thread.loop_handle.clone());
+                        state
+                            .retiring_executions
+                            .entry(thread_id.to_owned())
+                            .or_default()
+                            .push(plane);
                         (state.threads.remove(thread_id), None)
                     }
                 }
@@ -4545,7 +4684,7 @@ impl AgentManager {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .record(thread_id, outcomes.retirement_snapshot());
-                let _ = thread.loop_handle.await;
+                let _ = thread.loop_handle.join().await;
                 self.drain_retiring_native_execution(thread_id).await;
                 self.retired_control_outcomes
                     .lock()

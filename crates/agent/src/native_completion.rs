@@ -26,6 +26,7 @@ impl std::error::Error for StopError {}
 pub(crate) struct NativeTask {
     state: tokio::sync::Mutex<NativeTaskState>,
     abort: tokio::task::AbortHandle,
+    joined: std::sync::atomic::AtomicBool,
 }
 struct NativeTaskState {
     handle: Option<JoinHandle<()>>,
@@ -35,11 +36,18 @@ impl NativeTask {
     pub(crate) fn new(handle: JoinHandle<()>) -> Arc<Self> {
         Arc::new(Self {
             abort: handle.abort_handle(),
+            joined: std::sync::atomic::AtomicBool::new(false),
             state: tokio::sync::Mutex::new(NativeTaskState {
                 handle: Some(handle),
                 result: None,
             }),
         })
+    }
+    pub(crate) fn is_finished(&self) -> bool {
+        self.abort.is_finished()
+    }
+    pub(crate) fn is_joined(&self) -> bool {
+        self.joined.load(Ordering::Acquire)
     }
     pub(crate) fn abort(&self) {
         self.abort.abort();
@@ -58,6 +66,7 @@ impl NativeTask {
         };
         state.result = Some(result.clone());
         state.handle = None;
+        self.joined.store(true, Ordering::Release);
         result
     }
 }
@@ -65,21 +74,31 @@ impl NativeTask {
 #[derive(Default)]
 pub(crate) struct NativeRunCompletion {
     root: StdMutex<Option<Arc<NativeTask>>>,
-    predecessors: StdMutex<Vec<Arc<NativeRunCompletion>>>,
+    predecessors: StdMutex<Vec<(String, TurnExecutionControl)>>,
     panicked: std::sync::atomic::AtomicBool,
+    quiescent: std::sync::atomic::AtomicBool,
     tools: StdMutex<Vec<Arc<NativeTask>>>,
     shells: StdMutex<Vec<Arc<pioneer_tools::handlers::UnifiedExecHandler>>>,
     cleanup: tokio::sync::Mutex<()>,
     result: StdMutex<Option<Result<(), StopError>>>,
 }
 impl NativeRunCompletion {
-    pub(crate) fn retain_predecessor(&self, prior: Arc<Self>) {
-        if prior.outcome() != Some(Ok(())) {
+    pub(crate) fn retain_predecessor(&self, turn_id: String, prior: TurnExecutionControl) {
+        if !prior.completion.is_quiescent() {
             self.predecessors
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(prior);
+                .push((turn_id, prior));
         }
+    }
+    pub(crate) fn is_quiescent(&self) -> bool {
+        self.quiescent.load(Ordering::Acquire)
+    }
+    pub(crate) fn predecessors(&self) -> Vec<(String, TurnExecutionControl)> {
+        self.predecessors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
     pub(crate) fn mark_panic(&self) {
         self.panicked.store(true, Ordering::Release);
@@ -112,8 +131,8 @@ impl NativeRunCompletion {
         // This is a single native owner's cleanup mutex, never a registry/DB
         // lock. Both the actor and an internal observer use the same drain.
         let _cleanup = self.cleanup.lock().await;
-        if let Some(result) = self.outcome() {
-            return result;
+        if self.is_quiescent() {
+            return self.outcome().ok_or(StopError::UnknownOwner)?;
         }
         let root = self
             .root
@@ -138,7 +157,11 @@ impl NativeRunCompletion {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let mut outcome = root_result;
+        // Keep this run's consumed failure across a cancelled cleanup waiter.
+        let mut outcome = self.outcome().unwrap_or(root_result.clone());
+        if outcome.is_ok() {
+            outcome = root_result;
+        }
         if self.panicked.load(Ordering::Acquire) {
             outcome = Err(StopError::Cleanup("native root panicked".to_owned()));
         }
@@ -152,39 +175,47 @@ impl NativeRunCompletion {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let mut own_quiescent = true;
         for shell in shells {
-            if shell.stop_and_wait().await.is_err() {
-                // Keep native owners available for repair, including when a
-                // waiter was dropped in the middle of process cleanup.
-                return Err(StopError::Cleanup(
-                    "shell process cleanup was not confirmed".to_owned(),
-                ));
+            if let Err(error) = shell.stop_and_wait().await {
+                outcome = Err(StopError::Cleanup(error.to_string()));
             }
+            own_quiescent &= shell.cleanup_is_quiescent();
         }
-        let predecessors = self
-            .predecessors
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        for predecessor in predecessors {
-            Box::pin(predecessor.finish(true)).await?;
-        }
-        self.predecessors
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
         *self
             .result
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome.clone());
-        self.tools
+        // A predecessor's drained panic stays its own stop result. It is not
+        // an error of this successor, nor evidence of outstanding ownership.
+        let mut pending_error = None;
+        for (_, predecessor) in self.predecessors() {
+            let result = Box::pin(predecessor.completion.finish(true)).await;
+            if !predecessor.completion.is_quiescent() {
+                pending_error = Some(result.err().unwrap_or(StopError::UnknownOwner));
+            }
+        }
+        let mut predecessors = self
+            .predecessors
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        self.shells
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        predecessors.retain(|(_, p)| !p.completion.is_quiescent());
+        if own_quiescent && predecessors.is_empty() {
+            self.tools
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            self.shells
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            self.quiescent.store(true, Ordering::Release);
+        }
+        drop(predecessors);
+        if let Some(error) = pending_error {
+            return Err(error);
+        }
+
         outcome
     }
 }
@@ -357,5 +388,262 @@ mod tests {
         );
         release.send(()).unwrap();
         new.completion.finish(false).await.unwrap();
+    }
+    #[tokio::test]
+    async fn drained_root_and_tool_panics_do_not_poison_successors_or_grow_predecessors() {
+        for panic_root in [true, false] {
+            let plane = AgentThreadControlPlane::default();
+            let (tx, _rx) = mpsc::channel(1);
+            let a = TurnExecutionControl::new(tx.clone(), 1);
+            if panic_root {
+                a.completion.set_root(NativeTask::new(tokio::spawn(async {
+                    panic!("A root");
+                })));
+            } else {
+                completed_root(&a.completion);
+                a.completion
+                    .retain_tool(NativeTask::new(tokio::spawn(async {
+                        panic!("A tool");
+                    })));
+            }
+            plane.activate("A".into(), 1, a.clone());
+            assert!(a.completion.finish(false).await.is_err());
+            let captured_error = a.completion.outcome().unwrap();
+            assert!(a.completion.is_quiescent());
+            for run in 2..=4 {
+                let successor = TurnExecutionControl::new(tx.clone(), run);
+                completed_root(&successor.completion);
+                plane.activate(format!("successor-{run}"), run, successor.clone());
+                assert!(successor.completion.predecessors().is_empty());
+                successor.completion.finish(false).await.unwrap();
+                assert_eq!(successor.completion.outcome(), Some(Ok(())));
+                assert!(!plane.has_pending_cleanup());
+            }
+            assert_eq!(a.completion.finish(true).await, captured_error);
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_panicked_predecessor_is_retained_through_cancelled_drain_then_released() {
+        let plane = AgentThreadControlPlane::default();
+        let (tx, _rx) = mpsc::channel(1);
+        let a = TurnExecutionControl::new(tx.clone(), 1);
+        a.completion.set_root(NativeTask::new(tokio::spawn(async {
+            panic!("A root");
+        })));
+        let (release, released) = oneshot::channel();
+        a.completion
+            .retain_tool(NativeTask::new(tokio::spawn(async move {
+                let _ = released.await;
+            })));
+        plane.activate("A".into(), 1, a.clone());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), a.completion.finish(false))
+                .await
+                .is_err()
+        );
+        assert!(!a.completion.is_quiescent());
+        let b = TurnExecutionControl::new(tx.clone(), 2);
+        completed_root(&b.completion);
+        plane.activate("B".into(), 2, b.clone());
+        assert_eq!(b.completion.predecessors().len(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), b.completion.finish(false))
+                .await
+                .is_err()
+        );
+        assert!(!b.completion.is_quiescent());
+        assert!(plane.has_pending_cleanup());
+        release.send(()).unwrap();
+        b.completion.finish(false).await.unwrap();
+        assert!(a.completion.is_quiescent());
+        assert!(a.completion.finish(true).await.is_err());
+        assert!(b.completion.predecessors().is_empty());
+        let c = TurnExecutionControl::new(tx, 3);
+        completed_root(&c.completion);
+        plane.activate("C".into(), 3, c.clone());
+        c.completion.finish(false).await.unwrap();
+        assert!(c.completion.predecessors().is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_keeps_exact_initial_and_revision_owners_and_drops_drained_history() {
+        let manager = AgentManager::new(
+            Arc::new(ProviderRegistry::new(|_| String::new())),
+            crate::manager_tests::test_tool_loop_config(),
+        );
+        let plane = AgentThreadControlPlane::default();
+        let (tx, _rx) = mpsc::channel(1);
+        let initial = TurnExecutionControl::new(tx.clone(), 1);
+        completed_root(&initial.completion);
+        let (release, released) = oneshot::channel();
+        initial
+            .completion
+            .retain_tool(NativeTask::new(tokio::spawn(async move {
+                let _ = released.await;
+            })));
+        plane.activate("initial".into(), 1, initial.clone());
+        let revision = TurnExecutionControl::new(tx, 2);
+        completed_root(&revision.completion);
+        plane.activate("revision".into(), 2, revision.clone());
+        manager
+            .state
+            .write()
+            .await
+            .retiring_executions
+            .insert("thread".into(), vec![plane.clone()]);
+        let threads = vec!["thread".into()];
+        let owners = manager
+            .capture_native_stop_owners(&threads, 8)
+            .await
+            .unwrap();
+        let keys = owners
+            .iter()
+            .map(|owner| (owner.thread_id(), owner.turn_id(), owner.run_id()))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([("thread", "initial", 1), ("thread", "revision", 2)])
+        );
+        assert!(
+            manager
+                .cancel_captured_turn_and_wait(
+                    &owners[0],
+                    "fenced",
+                    tokio::time::Instant::now() + Duration::from_millis(10)
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            manager
+                .capture_native_stop_owners(&threads, 8)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        release.send(()).unwrap();
+        for owner in &owners {
+            manager
+                .cancel_captured_turn_and_wait(
+                    owner,
+                    "retry",
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(
+            manager
+                .capture_native_stop_owners(&threads, 8)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!plane.has_pending_cleanup());
+    }
+
+    #[tokio::test]
+    async fn retirement_snapshot_rejects_unjoined_actor_and_preserves_join_after_waiter_cancel() {
+        let manager = AgentManager::new(
+            Arc::new(ProviderRegistry::new(|_| String::new())),
+            crate::manager_tests::test_tool_loop_config(),
+        );
+        let plane = AgentThreadControlPlane::default();
+        let (release, released) = oneshot::channel();
+        let actor = NativeTask::new(tokio::spawn(async move {
+            let _ = released.await;
+        }));
+        *plane.retiring_actor.lock().unwrap() = Some(actor.clone());
+        manager
+            .state
+            .write()
+            .await
+            .retiring_executions
+            .insert("thread".into(), vec![plane.clone()]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), actor.join())
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            manager
+                .capture_native_stop_owners(&["thread".into()], 8)
+                .await,
+            Err(StopError::UnknownOwner)
+        ));
+        assert!(plane.has_pending_cleanup());
+        release.send(()).unwrap();
+        actor.join().await.unwrap();
+        assert!(
+            manager
+                .capture_native_stop_owners(&["thread".into()], 8)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        manager.drain_retiring_native_execution("thread").await;
+        assert!(
+            !manager
+                .state
+                .read()
+                .await
+                .retiring_executions
+                .contains_key("thread")
+        );
+    }
+    #[tokio::test]
+    async fn captured_drained_failure_is_sticky_but_retirement_releases_its_ownership() {
+        let manager = AgentManager::new(
+            Arc::new(ProviderRegistry::new(|_| String::new())),
+            crate::manager_tests::test_tool_loop_config(),
+        );
+        let (tx, _rx) = mpsc::channel(1);
+        let control = TurnExecutionControl::new(tx, 1);
+        control
+            .completion
+            .set_root(NativeTask::new(tokio::spawn(async {
+                panic!("drained failure");
+            })));
+        let plane = AgentThreadControlPlane::default();
+        plane.activate("failed".into(), 1, control.clone());
+        manager
+            .state
+            .write()
+            .await
+            .retiring_executions
+            .insert("thread".into(), vec![plane]);
+        let captured = manager
+            .capture_turn_stop_owner("thread", "failed")
+            .await
+            .unwrap();
+        let error = manager
+            .cancel_captured_turn_and_wait(
+                &captured,
+                "stop",
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(control.completion.is_quiescent());
+        assert!(
+            !manager
+                .state
+                .read()
+                .await
+                .retiring_executions
+                .contains_key("thread")
+        );
+        assert_eq!(
+            manager
+                .cancel_captured_turn_and_wait(
+                    &captured,
+                    "repeat",
+                    tokio::time::Instant::now() + Duration::from_secs(1)
+                )
+                .await,
+            Err(error)
+        );
     }
 }
