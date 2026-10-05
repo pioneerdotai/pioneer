@@ -2327,3 +2327,7 @@ mod tests {
         assert!(caps.vision);
     }
 }
+
+#[cfg(test)]
+#[path = "wire_tests/compatible.rs"]
+mod wire_contract_tests;

@@ -47,6 +47,7 @@ struct BedrockMessage {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct BedrockContentBlock {
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
@@ -177,9 +178,9 @@ struct BedrockResponseContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BedrockReasoningContent {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     reasoning_text: Option<BedrockReasoningText>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     redacted_content: Option<String>,
 }
 
@@ -879,6 +880,74 @@ impl BedrockProvider {
         format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
     }
 
+    fn parse_response(api_response: BedrockResponse) -> Result<ChatResponse> {
+        let termination = api_response
+            .stop_reason
+            .as_deref()
+            .map(ProviderTermination::from_openai_reason)
+            .unwrap_or_else(|| ProviderTermination::Unknown("missing_stop_reason".to_owned()));
+
+        let usage = api_response.usage.map(|u| u.normalized());
+
+        let mut text_parts = Vec::new();
+        let mut reasoning_parts = Vec::new();
+        let mut tool_calls = Vec::new();
+        let mut replay_blocks = Vec::new();
+
+        for block in api_response.output.message.content {
+            if let Some(t) = block.text {
+                text_parts.push(t);
+            }
+            if let Some(rc) = block.reasoning_content {
+                if let Some(rt) = rc.reasoning_text.as_ref() {
+                    if !rt.text.is_empty() {
+                        reasoning_parts.push(rt.text.clone());
+                    }
+                }
+                replay_blocks.push(rc);
+            }
+            if let Some(tool_use) = block.tool_use {
+                tool_calls.push(ProviderToolCall {
+                    id: tool_use.tool_use_id,
+                    name: tool_use.name,
+                    arguments: serde_json::to_string(&tool_use.input)
+                        .unwrap_or_else(|_| "{}".to_owned()),
+                });
+            }
+        }
+
+        let text = text_parts.join("");
+        let reasoning_content = if reasoning_parts.is_empty() {
+            None
+        } else {
+            Some(reasoning_parts.join(""))
+        };
+        let provider_replay_state = if replay_blocks.is_empty() {
+            None
+        } else {
+            Some(ProviderReplayState::new(
+                "bedrock",
+                serde_json::json!({ "blocks": replay_blocks }),
+            ))
+        };
+
+        if text.is_empty()
+            && tool_calls.is_empty()
+            && reasoning_content.as_deref().unwrap_or_default().is_empty()
+        {
+            return Err(anyhow!("no response from Bedrock"));
+        }
+
+        Ok(ChatResponse {
+            text,
+            usage,
+            termination,
+            reasoning_content,
+            tool_calls,
+            provider_replay_state,
+        })
+    }
+
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
         let status = response.status();
         let body = match crate::http::read_response_text_bounded(
@@ -1024,71 +1093,7 @@ impl crate::traits::Provider for BedrockProvider {
             "provider_response",
         )
         .await?;
-        let termination = api_response
-            .stop_reason
-            .as_deref()
-            .map(ProviderTermination::from_openai_reason)
-            .unwrap_or_else(|| ProviderTermination::Unknown("missing_stop_reason".to_owned()));
-
-        let usage = api_response.usage.map(|u| u.normalized());
-
-        let mut text_parts = Vec::new();
-        let mut reasoning_parts = Vec::new();
-        let mut tool_calls = Vec::new();
-        let mut replay_blocks = Vec::new();
-
-        for block in api_response.output.message.content {
-            if let Some(t) = block.text {
-                text_parts.push(t);
-            }
-            if let Some(rc) = block.reasoning_content {
-                if let Some(rt) = rc.reasoning_text.as_ref() {
-                    if !rt.text.is_empty() {
-                        reasoning_parts.push(rt.text.clone());
-                    }
-                }
-                replay_blocks.push(rc);
-            }
-            if let Some(tool_use) = block.tool_use {
-                tool_calls.push(ProviderToolCall {
-                    id: tool_use.tool_use_id,
-                    name: tool_use.name,
-                    arguments: serde_json::to_string(&tool_use.input)
-                        .unwrap_or_else(|_| "{}".to_owned()),
-                });
-            }
-        }
-
-        let text = text_parts.join("");
-        let reasoning_content = if reasoning_parts.is_empty() {
-            None
-        } else {
-            Some(reasoning_parts.join(""))
-        };
-        let provider_replay_state = if replay_blocks.is_empty() {
-            None
-        } else {
-            Some(ProviderReplayState::new(
-                "bedrock",
-                serde_json::json!({ "blocks": replay_blocks }),
-            ))
-        };
-
-        if text.is_empty()
-            && tool_calls.is_empty()
-            && reasoning_content.as_deref().unwrap_or_default().is_empty()
-        {
-            return Err(anyhow!("no response from Bedrock"));
-        }
-
-        Ok(ChatResponse {
-            text,
-            usage,
-            termination,
-            reasoning_content,
-            tool_calls,
-            provider_replay_state,
-        })
+        Self::parse_response(api_response)
     }
 
     async fn stream_chat(
@@ -2125,3 +2130,7 @@ mod tests {
         assert!(dt.ends_with('Z'));
     }
 }
+
+#[cfg(test)]
+#[path = "wire_tests/bedrock.rs"]
+mod wire_contract_tests;
