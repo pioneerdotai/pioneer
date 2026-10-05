@@ -767,7 +767,10 @@ impl McpService {
                 .oauth
                 .synchronize(&installation_id, &installation)
                 .await?;
-            if !row.enabled {
+            let parent_available = store
+                .plugin_child_available("mcp", &installation_id, workspace_id)
+                .await?;
+            if !row.enabled || !parent_available {
                 self.inner.oauth.suspend(&installation_id).await?;
                 self.stop_task(&installation_id, DomainRuntimeState::Disabled)
                     .await;
@@ -893,9 +896,44 @@ impl McpService {
                 .is_ok()
             {
                 self.inner.tasks.lock().await.remove(&installation_id);
+                // Release admission only after observing the actual successful
+                // join. Absence then means no retained runtime was left behind.
+                self.inner
+                    .runtime_generations
+                    .lock()
+                    .await
+                    .remove(&installation_id);
             }
         }
 
+        Ok(())
+    }
+
+    /// Caller owns the installation lifecycle guard and a revalidated native
+    /// row. A missing task is proof only when this lifecycle has never started
+    /// it (or released it after a confirmed join), not merely an empty task map.
+    pub(crate) async fn stop_admitted_installation(
+        &self,
+        row: &McpServerInstallationRecord,
+    ) -> Result<()> {
+        let id = row
+            .id
+            .as_deref()
+            .context("MCP installation identity missing")?;
+        if self.task_exists(id).await {
+            return self.stop_task_result(id, DomainRuntimeState::Stopped).await;
+        }
+        if self.inner.runtime_generations.lock().await.contains_key(id) {
+            anyhow::bail!("MCP runtime stop owner is unknown");
+        }
+        let current = self
+            .runtime_store()
+            .find_mcp_server_installation(&row.scope_kind, &row.scope_key, &row.name)
+            .await?
+            .context("MCP installation missing during stop")?;
+        if current.id != row.id {
+            anyhow::bail!("MCP installation changed during stop");
+        }
         Ok(())
     }
 
@@ -1035,7 +1073,19 @@ impl McpService {
                     .await?;
             }
         }
-        if row.enabled {
+        let parent_available = if row.scope_kind == "workspace" {
+            match row.id.as_deref() {
+                Some(id) => {
+                    self.runtime_store()
+                        .plugin_child_available("mcp", id, &row.scope_key)
+                        .await?
+                }
+                None => false,
+            }
+        } else {
+            true
+        };
+        if row.enabled && parent_available {
             match self.effective_secret_fingerprint_for_row(&row) {
                 Ok(effective_secret_fingerprint) => {
                     self.start_task(row.clone(), effective_secret_fingerprint)
@@ -5141,6 +5191,35 @@ mod tests {
             .expect("test MCP installation lookup should succeed")
             .and_then(|row| row.id)
             .expect("test MCP installation should have id")
+    }
+
+    // Regression source only: NOT_RUN / NOT_COMPILED.
+    #[tokio::test]
+    async fn admitted_stop_distinguishes_never_started_from_lost_native_owner() {
+        let (service, store, workspace) = test_mcp_service().await;
+        let id = seed_mcp_installation(&store, &workspace, "never-started", false, false).await;
+        let row = store
+            .find_mcp_server_installation("workspace", &workspace, "never-started")
+            .await
+            .unwrap()
+            .unwrap();
+        let _guard = service
+            .installation_lifecycle_guard("workspace", &workspace, "never-started")
+            .await;
+        service.stop_admitted_installation(&row).await.unwrap();
+        // A runtime admission with a lost task is not the same proof as an
+        // installation that was never started by this lifecycle.
+        service
+            .inner
+            .runtime_generations
+            .lock()
+            .await
+            .insert(id.clone(), 1);
+        assert!(service.stop_admitted_installation(&row).await.is_err());
+        service.inner.runtime_generations.lock().await.remove(&id);
+        let mut foreign = row.clone();
+        foreign.id = Some("foreign-native-id".into());
+        assert!(service.stop_admitted_installation(&foreign).await.is_err());
     }
 
     async fn configure_mcp_installation_secret(
