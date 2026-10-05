@@ -753,6 +753,11 @@ async fn lifecycle_late_runner_context_turn_and_source_deletion() {
         .unwrap();
     assert!(apply(&store, "op", NOW).await);
     assert_eq!(scalar(&store, "SELECT count(*) n FROM turn").await, 0);
+    // With foreign keys disabled, restore the cleanup normally performed by
+    // ON DELETE CASCADE before reinserting this Turn with its original id.
+    db.execute_unprepared("DELETE FROM compaction_turn_creation WHERE turn_id='turn'")
+        .await
+        .unwrap();
     db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
     expand_all(&store, NOW).await;
     assert!(apply(&store, "op", NOW).await);
