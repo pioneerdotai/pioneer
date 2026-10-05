@@ -1548,14 +1548,7 @@ async fn project_legacy_auto_accepted_candidate<C: ConnectionTrait>(
     candidate: Option<task_result_candidate::PreparedTaskResultCandidate>,
     review: Option<task_result_review_event::PreparedTaskResultReviewEvent>,
 ) -> Result<bool> {
-    if task_result_candidate::find_candidate_by_run_and_status(
-        db,
-        run_id,
-        TaskResultCandidateStatus::Accepted,
-    )
-    .await?
-    .is_some()
-    {
+    if task_result_candidate::has_accepted_candidate_by_run(db, run_id).await? {
         return Ok(true);
     }
 

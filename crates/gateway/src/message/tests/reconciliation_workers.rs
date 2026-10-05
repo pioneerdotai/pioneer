@@ -14,6 +14,60 @@ async fn native_terminal_effect_kick_uses_background_database_scope() {
     assert_native_kick_database_scope(true).await;
 }
 
+#[tokio::test]
+async fn native_terminal_effect_kick_defers_coalesced_retry_after_storage_failure() {
+    let (processor, _, _, _, _, _) = setup_workspace_message_processor().await;
+    processor
+        .crud_store
+        .database_connection()
+        .close()
+        .await
+        .unwrap();
+    tokio::time::pause();
+    processor.kick_native_terminal_effects();
+    for _ in 0..128 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        processor
+            .native_terminal_effect_kick_running
+            .load(Ordering::Acquire)
+    );
+    processor.kick_native_terminal_effects();
+    tokio::time::advance(Duration::from_secs(4)).await;
+    for _ in 0..128 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        processor
+            .native_terminal_effect_kick_pending
+            .load(Ordering::Acquire)
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    for _ in 0..128 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !processor
+            .native_terminal_effect_kick_pending
+            .load(Ordering::Acquire)
+    );
+    assert!(
+        processor
+            .native_terminal_effect_kick_running
+            .load(Ordering::Acquire)
+    );
+    tokio::time::advance(Duration::from_secs(5)).await;
+    for _ in 0..128 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !processor
+            .native_terminal_effect_kick_running
+            .load(Ordering::Acquire)
+    );
+}
+
 async fn assert_native_kick_database_scope(terminal_effects: bool) {
     use pioneer_sqlite::{
         SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteClass, SqliteWriteEvent,
@@ -171,16 +225,22 @@ async fn assert_native_kick_database_scope(terminal_effects: bool) {
         }
     )));
     let writes = observer.writes.lock().unwrap().clone();
-    assert!(writes.iter().any(|event| matches!(
-        event,
-        SqliteWriteEvent::Acquired {
-            class: SqliteWriteClass::Critical,
-            ..
-        }
-    )));
-    assert!(writes.iter().all(|event| !matches!(event,
-        SqliteWriteEvent::Acquired { class, .. } if *class != SqliteWriteClass::Critical
-    )));
+    if terminal_effects {
+        // No probe/claim input: the removed global exhausted UPDATE must not
+        // acquire a writer merely to perform an empty terminal-effect sweep.
+        assert!(writes.is_empty());
+    } else {
+        assert!(writes.iter().any(|event| matches!(
+            event,
+            SqliteWriteEvent::Acquired {
+                class: SqliteWriteClass::Critical,
+                ..
+            }
+        )));
+        assert!(writes.iter().all(|event| !matches!(event,
+            SqliteWriteEvent::Acquired { class, .. } if *class != SqliteWriteClass::Critical
+        )));
+    }
     if !terminal_effects {
         let row = database
             .query_one_raw(Statement::from_string(

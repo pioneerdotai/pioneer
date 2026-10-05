@@ -13,6 +13,15 @@ use sea_orm::sea_query::{ExprTrait, Query};
 const NOW: i64 = 4_000_000_000;
 const MIGRATION: &str = "m20261002_000001_task_run_occurrence_reconcile";
 
+fn rollback_through_parent_migration() -> u32 {
+    let migrations = Migrator::migrations();
+    let position = migrations
+        .iter()
+        .position(|migration| migration.name() == MIGRATION)
+        .expect("parent tracker migration must remain registered");
+    u32::try_from(migrations.len() - position).unwrap()
+}
+
 async fn row(store: &CrudStore, id: &str) -> Option<pending::Model> {
     pending::Entity::find_by_id(id.to_owned())
         .one(&store.connection)
@@ -654,7 +663,9 @@ async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_obj
     let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     let maintenance = store.with_maintenance_access();
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(1)).await.unwrap();
+    Migrator::down(&*tx, Some(rollback_through_parent_migration()))
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     let tx = maintenance.connection.begin().await.unwrap();
     Migrator::up(&*tx, None).await.unwrap();
@@ -686,7 +697,9 @@ async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_obj
         1
     );
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(1)).await.unwrap();
+    Migrator::down(&*tx, Some(rollback_through_parent_migration()))
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     let objects = store
         .connection
@@ -708,7 +721,11 @@ async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_obj
         .await
         .unwrap();
     assert!(indexes.is_empty());
-    assert_eq!(Migrator::migrations().last().unwrap().name(), MIGRATION);
+    assert!(
+        Migrator::migrations()
+            .iter()
+            .any(|migration| migration.name() == MIGRATION)
+    );
 }
 
 #[tokio::test]
@@ -1513,7 +1530,9 @@ async fn migration_installation_and_completion_marker_rollback_together() {
         .await
         .with_maintenance_access();
     let tx = store.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(1)).await.unwrap();
+    Migrator::down(&*tx, Some(rollback_through_parent_migration()))
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     // Deliberately collide with the second installed trigger, after the new
     // tables/index/seed and first trigger have already been written.
@@ -1646,7 +1665,9 @@ async fn recovery_completed_at_write_tracks_preinstall_run_without_history_disco
         .unwrap();
     let maintenance = store.with_maintenance_access();
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(1)).await.unwrap();
+    Migrator::down(&*tx, Some(rollback_through_parent_migration()))
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     let tx = maintenance.connection.begin().await.unwrap();
     Migrator::up(&*tx, None).await.unwrap();

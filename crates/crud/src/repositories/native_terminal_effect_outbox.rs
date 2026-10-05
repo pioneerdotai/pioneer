@@ -4,11 +4,12 @@ use pioneer_protocol::{
     NativeTerminalEffectGate, NativeTerminalEffectKind, NativeTerminalEffectPayload,
     NativeTerminalEffectPreparation, NativeTerminalEffectSpec,
 };
+use pioneer_sqlite::SqliteDatabase;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, IntoActiveModel,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult,
+    IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -24,6 +25,8 @@ pub const STATUS_DISCARDED: &str = "discarded";
 pub const STATUS_SUPERSEDED: &str = "superseded";
 
 pub const MAX_EFFECTS_PER_TURN: usize = 2;
+pub const EFFECT_INPUT_BUDGET: u64 = 8;
+const MAX_GATE_PROBE_ATTEMPTS: i64 = 16;
 pub const MAX_EFFECT_PAYLOAD_BYTES: usize = 256 * 1024;
 pub const MAX_EFFECT_HANDLER_CHECKPOINT_BYTES: usize = 128 * 1024;
 pub const MAX_EFFECT_ATTEMPTS: u16 = 20;
@@ -37,6 +40,13 @@ const COMPACTED_PAYLOAD_JSON: &str = r#"{"compacted":true}"#;
 pub struct ClaimedNativeTerminalEffect {
     pub row: native_terminal_effect_outbox::Model,
     pub claim_token: String,
+}
+
+/// Independent confirmed claims plus a low-cardinality failure signal.
+#[derive(Debug, Default)]
+pub struct NativeTerminalEffectClaimBatch {
+    pub claimed: Vec<ClaimedNativeTerminalEffect>,
+    pub storage_failed: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -100,6 +110,8 @@ pub(crate) struct PreparedCandidateGateResolution {
     turn_id: String,
     resolved_at: DateTimeWithTimeZone,
     requires_fence: bool,
+    latest: Option<CandidateGateMetadata>,
+    probe_token: Option<String>,
     rows: Vec<PreparedCandidateGateResolutionRow>,
 }
 
@@ -108,6 +120,7 @@ struct PreparedCandidateGateResolutionRow {
     effect_id: String,
     status_before: String,
     updated_at_before: DateTimeWithTimeZone,
+    payload_json_before: String,
     payload_sha256_before: String,
     payload_identity_sha256_before: String,
     terminal_committed_at_before: Option<DateTimeWithTimeZone>,
@@ -148,8 +161,8 @@ pub fn prepare_input(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CandidateGateState {
     Waiting,
-    Accepted(String),
-    Rejected,
+    Accepted(CandidateGateMetadata),
+    Rejected(CandidateGateMetadata),
 }
 
 pub async fn prepare<C: ConnectionTrait>(
@@ -323,6 +336,9 @@ pub async fn prepare_supplemental<C: ConnectionTrait>(
             active.last_error_code = Set(None);
             active.last_error_message = Set(None);
             active.next_run_at = Set(Some(now));
+            active.gate_probe_at = Set(0);
+            active.gate_probe_attempts = Set(0);
+            active.gate_probe_token = Set(None);
             active.claim_token = Set(None);
             active.claim_expires_at = Set(None);
             active.terminal_committed_at = Set(Some(now));
@@ -362,6 +378,7 @@ pub async fn prepare_supplemental<C: ConnectionTrait>(
                 prepared_at: Set(now),
                 created_at: Set(now),
                 updated_at: Set(now),
+                ..Default::default()
             }
             .insert(db)
             .await
@@ -494,8 +511,8 @@ async fn prepare_with_policy<C: ConnectionTrait>(
                     )
                     .await?
                     {
-                        CandidateGateState::Accepted(id) => Some(id),
-                        CandidateGateState::Waiting | CandidateGateState::Rejected => None,
+                        CandidateGateState::Accepted(candidate) => Some(candidate.id),
+                        CandidateGateState::Waiting | CandidateGateState::Rejected(_) => None,
                     }
                 } else {
                     None
@@ -516,6 +533,9 @@ async fn prepare_with_policy<C: ConnectionTrait>(
             active.last_error_code = Set(None);
             active.last_error_message = Set(None);
             active.next_run_at = Set(None);
+            active.gate_probe_at = Set(0);
+            active.gate_probe_attempts = Set(0);
+            active.gate_probe_token = Set(None);
             active.claim_token = Set(None);
             active.claim_expires_at = Set(None);
             active.terminal_committed_at = Set(None);
@@ -542,8 +562,8 @@ async fn prepare_with_policy<C: ConnectionTrait>(
                     )
                     .await?
                     {
-                        CandidateGateState::Accepted(id) => Some(id),
-                        CandidateGateState::Waiting | CandidateGateState::Rejected => None,
+                        CandidateGateState::Accepted(candidate) => Some(candidate.id),
+                        CandidateGateState::Waiting | CandidateGateState::Rejected(_) => None,
                     }
                 } else {
                     None
@@ -576,6 +596,7 @@ async fn prepare_with_policy<C: ConnectionTrait>(
                 prepared_at: Set(now),
                 created_at: Set(now),
                 updated_at: Set(now),
+                ..Default::default()
             }
             .insert(db)
             .await
@@ -655,13 +676,13 @@ pub(crate) async fn prepare_activation_for_terminal<C: ConnectionTrait>(
                             {
                                 CandidateGateState::Accepted(candidate_id) => (
                                     STATUS_UNRESOLVED,
-                                    Some(candidate_id.clone()),
+                                    Some(candidate_id.id.clone()),
                                     false,
                                     true,
                                     Some("terminal_effect_preparation_failed".to_owned()),
                                     Some(format!("post-turn hook preparation failed: {failure:?}")),
                                 ),
-                                CandidateGateState::Rejected => {
+                                CandidateGateState::Rejected(_) => {
                                     (STATUS_DISCARDED, None, false, true, None, None)
                                 }
                                 CandidateGateState::Waiting => {
@@ -876,44 +897,63 @@ fn prepared_activated_state(
     match gate {
         NativeTerminalEffectGate::TerminalCommit => (STATUS_READY, None, true),
         NativeTerminalEffectGate::AcceptedTaskResult => match candidate {
-            CandidateGateState::Accepted(id) => (STATUS_READY, Some(id), true),
-            CandidateGateState::Rejected => (STATUS_DISCARDED, None, false),
+            CandidateGateState::Accepted(candidate) => (STATUS_READY, Some(candidate.id), true),
+            CandidateGateState::Rejected(_) => (STATUS_DISCARDED, None, false),
             CandidateGateState::Waiting => (STATUS_WAITING_ACCEPTANCE, None, false),
         },
     }
 }
 
-/// Loads and validates the bounded acceptance-gate write set before an
-/// authoritative candidate transaction obtains writer admission.
-pub(crate) async fn prepare_gate_resolution_for_candidate<C: ConnectionTrait>(
+/// Immutable payload facts prepared before Task-batch writer admission. The
+/// sequential projector still selects current state inside the transaction.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedGatePayloads {
+    rows: Vec<(String, String, String, String, bool)>,
+    compacted_sha256: String,
+}
+
+pub(crate) async fn prepare_gate_payloads<C: ConnectionTrait>(
     db: &C,
-    candidate_id: &str,
     thread_id: &str,
     turn_id: &str,
-    candidate_status: &str,
-    now: DateTimeWithTimeZone,
-) -> Result<PreparedCandidateGateResolution> {
-    let terminal_status = matches!(
-        candidate_status,
-        "accepted" | "rejected" | "superseded" | "cancelled"
-    );
-    if !terminal_status {
-        return Ok(PreparedCandidateGateResolution {
-            candidate_id: candidate_id.to_owned(),
-            thread_id: thread_id.to_owned(),
-            turn_id: turn_id.to_owned(),
-            resolved_at: now,
-            requires_fence: false,
-            rows: Vec::new(),
-        });
-    }
+) -> Result<PreparedGatePayloads> {
+    let rows = candidate_gated_rows(db, thread_id, turn_id).await?;
+    Ok(PreparedGatePayloads {
+        rows: rows
+            .into_iter()
+            .map(|row| {
+                let failure = row.payload_json.len() <= MAX_EFFECT_PAYLOAD_BYTES
+                    && payload_integrity_matches(
+                        &row.payload_json,
+                        &row.payload_sha256,
+                        &row.payload_identity_sha256,
+                    )
+                    && matches!(
+                        serde_json::from_str::<NativeTerminalEffectPayload>(&row.payload_json),
+                        Ok(NativeTerminalEffectPayload::PostTurnHookPreparationFailed { .. })
+                    );
+                (
+                    row.effect_id,
+                    row.payload_json,
+                    row.payload_sha256,
+                    row.payload_identity_sha256,
+                    failure,
+                )
+            })
+            .collect(),
+        compacted_sha256: payload_sha256_hex(COMPACTED_PAYLOAD_JSON),
+    })
+}
+
+async fn candidate_gated_rows<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Vec<native_terminal_effect_outbox::Model>> {
     let rows = native_terminal_effect_outbox::Entity::find()
         .filter(native_terminal_effect_outbox::Column::ThreadId.eq(thread_id.to_owned()))
         .filter(native_terminal_effect_outbox::Column::TurnId.eq(turn_id.to_owned()))
-        .filter(
-            native_terminal_effect_outbox::Column::GateKind
-                .eq(gate_to_db(NativeTerminalEffectGate::AcceptedTaskResult)),
-        )
+        .filter(native_terminal_effect_outbox::Column::GateKind.eq("accepted_task_result"))
         .filter(
             native_terminal_effect_outbox::Column::Status
                 .is_in([STATUS_PREPARED, STATUS_WAITING_ACCEPTANCE]),
@@ -921,64 +961,137 @@ pub(crate) async fn prepare_gate_resolution_for_candidate<C: ConnectionTrait>(
         .order_by_asc(native_terminal_effect_outbox::Column::EffectId)
         .limit((MAX_EFFECTS_PER_TURN + 1) as u64)
         .all(db)
-        .await
-        .context("failed to load candidate-gated terminal effects")?;
+        .await?;
     if rows.len() > MAX_EFFECTS_PER_TURN {
-        bail!(
-            "Turn `{turn_id}` has more than {MAX_EFFECTS_PER_TURN} candidate-gated native terminal effects"
-        );
+        bail!("Turn exceeds candidate-gated effect bound");
     }
+    Ok(rows)
+}
 
-    let compacted_payload_sha256 = payload_sha256_hex(COMPACTED_PAYLOAD_JSON);
+/// Loads and validates the bounded acceptance-gate write set before an
+/// authoritative candidate transaction obtains writer admission.
+pub(crate) async fn prepare_gate_resolution_for_candidate<C: ConnectionTrait>(
+    db: &C,
+    candidate: Option<CandidateGateMetadata>,
+    thread_id: &str,
+    turn_id: &str,
+    now: DateTimeWithTimeZone,
+    payloads: Option<&PreparedGatePayloads>,
+) -> Result<PreparedCandidateGateResolution> {
+    let terminal = candidate
+        .as_ref()
+        .is_none_or(|candidate| terminal_candidate_statuses().contains(&candidate.status.as_str()));
+    let latest = if terminal {
+        latest_candidate_metadata(db, thread_id, turn_id, candidate.clone()).await?
+    } else {
+        None
+    };
+    if latest.is_none() {
+        return Ok(PreparedCandidateGateResolution {
+            candidate_id: candidate.map(|candidate| candidate.id).unwrap_or_default(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            resolved_at: now,
+            requires_fence: false,
+            latest: None,
+            probe_token: None,
+            rows: Vec::new(),
+        });
+    }
+    let rows = candidate_gated_rows(db, thread_id, turn_id).await?;
+    let candidate_id = latest
+        .as_ref()
+        .expect("terminal metadata was selected")
+        .id
+        .clone();
+    prepare_gate_resolution_rows(
+        &candidate_id,
+        thread_id,
+        turn_id,
+        latest,
+        rows,
+        now,
+        None,
+        payloads,
+    )
+}
+
+fn prepare_gate_resolution_rows(
+    candidate_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    latest: Option<CandidateGateMetadata>,
+    rows: Vec<native_terminal_effect_outbox::Model>,
+    now: DateTimeWithTimeZone,
+    probe_token: Option<String>,
+    payloads: Option<&PreparedGatePayloads>,
+) -> Result<PreparedCandidateGateResolution> {
+    let accepted = latest
+        .as_ref()
+        .is_some_and(|candidate| candidate.status == "accepted");
+    let compacted_payload_sha256 = payloads
+        .map(|facts| facts.compacted_sha256.clone())
+        .unwrap_or_else(|| payload_sha256_hex(COMPACTED_PAYLOAD_JSON));
     let mut prepared_rows = Vec::with_capacity(rows.len());
     for row in rows {
         let committed = row.terminal_committed_at.is_some();
-        let preparation_failure = committed
-            && candidate_status == "accepted"
-            && payload_integrity_matches(
-                row.payload_json.as_str(),
-                row.payload_sha256.as_str(),
-                row.payload_identity_sha256.as_str(),
-            )
-            && matches!(
-                serde_json::from_str::<NativeTerminalEffectPayload>(row.payload_json.as_str()),
-                Ok(NativeTerminalEffectPayload::PostTurnHookPreparationFailed { .. })
-            );
-        let status_after = if committed {
-            if preparation_failure {
-                STATUS_UNRESOLVED
-            } else if candidate_status == "accepted" {
-                STATUS_READY
-            } else {
-                STATUS_DISCARDED
+        let payload_failure = if let Some(payloads) = payloads {
+            let facts = payloads
+                .rows
+                .iter()
+                .find(|facts| facts.0 == row.effect_id)
+                .context("candidate gate payload was not prepared before writer admission")?;
+            if facts.1 != row.payload_json
+                || facts.2 != row.payload_sha256
+                || facts.3 != row.payload_identity_sha256
+            {
+                bail!("candidate gate payload changed after preparation");
             }
+            facts.4
         } else {
-            STATUS_PREPARED
+            row.payload_json.len() <= MAX_EFFECT_PAYLOAD_BYTES
+                && payload_integrity_matches(
+                    &row.payload_json,
+                    &row.payload_sha256,
+                    &row.payload_identity_sha256,
+                )
+                && matches!(
+                    serde_json::from_str::<NativeTerminalEffectPayload>(&row.payload_json),
+                    Ok(NativeTerminalEffectPayload::PostTurnHookPreparationFailed { .. })
+                )
         };
-        let accepted_candidate_id =
-            (candidate_status == "accepted").then(|| candidate_id.to_owned());
-        let next_run_at =
-            (committed && candidate_status == "accepted" && !preparation_failure).then_some(now);
-        let completed_at =
-            (committed && (candidate_status != "accepted" || preparation_failure)).then_some(now);
-        let compact_payload = committed && candidate_status != "accepted";
+        let preparation_failure = committed && accepted && payload_failure;
+        let status_after = if !committed {
+            STATUS_PREPARED
+        } else if preparation_failure {
+            STATUS_UNRESOLVED
+        } else if accepted {
+            STATUS_READY
+        } else {
+            STATUS_DISCARDED
+        };
         prepared_rows.push(PreparedCandidateGateResolutionRow {
             effect_id: row.effect_id,
             status_before: row.status,
             updated_at_before: row.updated_at,
+            payload_json_before: row.payload_json,
             payload_sha256_before: row.payload_sha256,
             payload_identity_sha256_before: row.payload_identity_sha256,
             terminal_committed_at_before: row.terminal_committed_at,
             status_after,
-            accepted_candidate_id,
-            next_run_at,
-            completed_at,
+            accepted_candidate_id: latest
+                .as_ref()
+                .filter(|_| accepted)
+                .map(|candidate| candidate.id.clone()),
+            next_run_at: (committed && accepted && !preparation_failure).then_some(now),
+            completed_at: (committed && (!accepted || preparation_failure)).then_some(now),
             last_error_code: preparation_failure
                 .then_some("terminal_effect_preparation_failed".to_owned()),
             last_error_message: preparation_failure
                 .then_some("post-turn hook preparation failed before durable execution".to_owned()),
-            compact_payload,
-            compacted_payload_sha256: compact_payload.then(|| compacted_payload_sha256.clone()),
+            compact_payload: committed && !accepted,
+            compacted_payload_sha256: (committed && !accepted)
+                .then(|| compacted_payload_sha256.clone()),
         });
     }
     Ok(PreparedCandidateGateResolution {
@@ -987,6 +1100,8 @@ pub(crate) async fn prepare_gate_resolution_for_candidate<C: ConnectionTrait>(
         turn_id: turn_id.to_owned(),
         resolved_at: now,
         requires_fence: true,
+        latest,
+        probe_token,
         rows: prepared_rows,
     })
 }
@@ -1003,41 +1118,54 @@ pub(crate) async fn apply_prepared_gate_resolution<C: ConnectionTrait>(
     if !prepared.requires_fence {
         return Ok(0);
     }
-    let current_effect_ids = native_terminal_effect_outbox::Entity::find()
-        .select_only()
-        .column(native_terminal_effect_outbox::Column::EffectId)
-        .filter(native_terminal_effect_outbox::Column::ThreadId.eq(prepared.thread_id.clone()))
-        .filter(native_terminal_effect_outbox::Column::TurnId.eq(prepared.turn_id.clone()))
-        .filter(
-            native_terminal_effect_outbox::Column::GateKind
-                .eq(gate_to_db(NativeTerminalEffectGate::AcceptedTaskResult)),
-        )
-        .filter(
-            native_terminal_effect_outbox::Column::Status
-                .is_in([STATUS_PREPARED, STATUS_WAITING_ACCEPTANCE]),
-        )
-        .order_by_asc(native_terminal_effect_outbox::Column::EffectId)
-        .limit((MAX_EFFECTS_PER_TURN + 1) as u64)
-        .into_tuple::<String>()
-        .all(db)
-        .await
-        .context("failed to fence candidate-gated terminal effects")?;
-    let prepared_effect_ids = prepared
-        .rows
-        .iter()
-        .map(|row| row.effect_id.clone())
-        .collect::<Vec<_>>();
-    if current_effect_ids.len() > MAX_EFFECTS_PER_TURN || current_effect_ids != prepared_effect_ids
+    // Validate the exact latest id/status/version after the candidate mutation,
+    // using the same four seeks as preparation. Unknown freshness never ACKs.
+    if latest_candidate_metadata(db, &prepared.thread_id, &prepared.turn_id, None).await?
+        != prepared.latest
     {
-        bail!(
-            "candidate-gated native terminal effects changed before resolving candidate `{}`",
-            prepared.candidate_id
-        );
+        bail!("latest terminal candidate changed before gate resolution");
     }
-
+    if prepared.probe_token.is_none() {
+        let current_effect_ids = native_terminal_effect_outbox::Entity::find()
+            .select_only()
+            .column(native_terminal_effect_outbox::Column::EffectId)
+            .filter(native_terminal_effect_outbox::Column::ThreadId.eq(prepared.thread_id.clone()))
+            .filter(native_terminal_effect_outbox::Column::TurnId.eq(prepared.turn_id.clone()))
+            .filter(
+                native_terminal_effect_outbox::Column::GateKind
+                    .eq(gate_to_db(NativeTerminalEffectGate::AcceptedTaskResult)),
+            )
+            .filter(
+                native_terminal_effect_outbox::Column::Status
+                    .is_in([STATUS_PREPARED, STATUS_WAITING_ACCEPTANCE]),
+            )
+            .order_by_asc(native_terminal_effect_outbox::Column::EffectId)
+            .limit((MAX_EFFECTS_PER_TURN + 1) as u64)
+            .into_tuple::<String>()
+            .all(db)
+            .await
+            .context("failed to fence candidate-gated terminal effects")?;
+        let prepared_effect_ids = prepared
+            .rows
+            .iter()
+            .map(|row| row.effect_id.clone())
+            .collect::<Vec<_>>();
+        if current_effect_ids.len() > MAX_EFFECTS_PER_TURN
+            || current_effect_ids != prepared_effect_ids
+        {
+            bail!(
+                "candidate-gated native terminal effects changed before resolving candidate `{}`",
+                prepared.candidate_id
+            );
+        }
+    }
     let mut resolved = 0_u64;
     for row in prepared.rows {
         let mut update = native_terminal_effect_outbox::Entity::update_many()
+            .col_expr(
+                native_terminal_effect_outbox::Column::GateProbeToken,
+                Expr::value(Option::<String>::None),
+            )
             .col_expr(
                 native_terminal_effect_outbox::Column::Status,
                 Expr::value(row.status_after.to_owned()),
@@ -1082,6 +1210,12 @@ pub(crate) async fn apply_prepared_gate_resolution<C: ConnectionTrait>(
                 native_terminal_effect_outbox::Column::PayloadIdentitySha256
                     .eq(row.payload_identity_sha256_before),
             );
+        update = update
+            .filter(native_terminal_effect_outbox::Column::PayloadJson.eq(row.payload_json_before));
+        if let Some(token) = &prepared.probe_token {
+            update = update
+                .filter(native_terminal_effect_outbox::Column::GateProbeToken.eq(token.clone()));
+        }
         update = match row.terminal_committed_at_before {
             Some(committed_at) => update.filter(
                 native_terminal_effect_outbox::Column::TerminalCommittedAt.eq(committed_at),
@@ -1106,7 +1240,7 @@ pub(crate) async fn apply_prepared_gate_resolution<C: ConnectionTrait>(
             .await
             .context("failed to resolve candidate-gated terminal effect")?
             .rows_affected;
-        if updated != 1 {
+        if updated != 1 && prepared.probe_token.is_none() {
             bail!(
                 "candidate-gated native terminal effect changed before resolving candidate `{}`",
                 prepared.candidate_id
@@ -1117,187 +1251,460 @@ pub(crate) async fn apply_prepared_gate_resolution<C: ConnectionTrait>(
     Ok(resolved)
 }
 
-/// Standalone reconciliation wrapper. Transactional candidate paths prepare
-/// on the reader and call `apply_prepared_gate_resolution` directly.
-pub async fn resolve_gate_for_candidate<C: ConnectionTrait>(
-    db: &C,
-    candidate_id: &str,
-    thread_id: &str,
-    turn_id: &str,
-    candidate_status: &str,
-    now: DateTimeWithTimeZone,
-) -> Result<u64> {
-    let prepared = prepare_gate_resolution_for_candidate(
+// A literal predicate is intentional: SQLite must prove the partial-index
+// predicate at prepare time, without a residual status filter on the due range.
+pub(crate) fn gate_due_page(
+    now: i64,
+    limit: u64,
+) -> sea_orm::Select<native_terminal_effect_outbox::Entity> {
+    native_terminal_effect_outbox::Entity::find()
+        .filter(Expr::cust("status = 'waiting_acceptance'"))
+        .filter(native_terminal_effect_outbox::Column::GateProbeAt.lte(now))
+        .order_by_asc(native_terminal_effect_outbox::Column::GateProbeAt)
+        .order_by_asc(native_terminal_effect_outbox::Column::PreparedAt)
+        .order_by_asc(native_terminal_effect_outbox::Column::EffectId)
+        .limit(std::cmp::min(limit, EFFECT_INPUT_BUDGET))
+}
+
+fn probe_delay(attempts: i64) -> i64 {
+    std::cmp::min(
+        5_i64 << (attempts.clamp(1, MAX_GATE_PROBE_ATTEMPTS) - 1),
+        300,
+    )
+}
+
+fn probe_snapshot(row: &native_terminal_effect_outbox::Model) -> Condition {
+    let mut guard = Condition::all()
+        .add(native_terminal_effect_outbox::Column::EffectId.eq(row.effect_id.clone()))
+        .add(native_terminal_effect_outbox::Column::ThreadId.eq(row.thread_id.clone()))
+        .add(native_terminal_effect_outbox::Column::TurnId.eq(row.turn_id.clone()))
+        .add(native_terminal_effect_outbox::Column::GateKind.eq(row.gate_kind.clone()))
+        .add(native_terminal_effect_outbox::Column::Status.eq(STATUS_WAITING_ACCEPTANCE))
+        .add(native_terminal_effect_outbox::Column::UpdatedAt.eq(row.updated_at))
+        .add(native_terminal_effect_outbox::Column::PayloadJson.eq(row.payload_json.clone()))
+        .add(native_terminal_effect_outbox::Column::PayloadSha256.eq(row.payload_sha256.clone()))
+        .add(
+            native_terminal_effect_outbox::Column::PayloadIdentitySha256
+                .eq(row.payload_identity_sha256.clone()),
+        )
+        .add(native_terminal_effect_outbox::Column::GateProbeAt.eq(row.gate_probe_at))
+        .add(native_terminal_effect_outbox::Column::GateProbeAttempts.eq(row.gate_probe_attempts));
+    guard = match &row.gate_probe_token {
+        Some(token) => {
+            guard.add(native_terminal_effect_outbox::Column::GateProbeToken.eq(token.clone()))
+        }
+        None => guard.add(native_terminal_effect_outbox::Column::GateProbeToken.is_null()),
+    };
+    guard = match row.terminal_committed_at {
+        Some(at) => guard.add(native_terminal_effect_outbox::Column::TerminalCommittedAt.eq(at)),
+        None => guard.add(native_terminal_effect_outbox::Column::TerminalCommittedAt.is_null()),
+    };
+    guard
+}
+
+/// Also used after failed reservation/commit: only the original snapshot may
+/// be deferred, including NULL token. A committed reservation won't match it.
+pub(crate) async fn reserve_gate_probe(
+    db: &SqliteDatabase,
+    row: &native_terminal_effect_outbox::Model,
+    token: Option<String>,
+    clock: &(dyn Fn() -> i64 + Send + Sync),
+) -> Result<Option<native_terminal_effect_outbox::Model>> {
+    write_gate_probe(
         db,
-        candidate_id,
-        thread_id,
-        turn_id,
-        candidate_status,
-        now,
+        row,
+        token,
+        row.gate_probe_attempts
+            .saturating_add(1)
+            .clamp(1, MAX_GATE_PROBE_ATTEMPTS),
+        clock,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn defer_gate_probe(
+    db: &SqliteDatabase,
+    row: &native_terminal_effect_outbox::Model,
+    reservation_committed: bool,
+    clock: &(dyn Fn() -> i64 + Send + Sync),
+) -> Result<()> {
+    let attempts = if reservation_committed {
+        row.gate_probe_attempts
+    } else {
+        row.gate_probe_attempts.saturating_add(1)
+    }
+    .clamp(1, MAX_GATE_PROBE_ATTEMPTS);
+    write_gate_probe(
+        db,
+        row,
+        row.gate_probe_token.clone(),
+        attempts,
+        clock,
+        false,
     )
     .await?;
-    apply_prepared_gate_resolution(db, prepared).await
+    Ok(())
 }
 
-pub async fn reconcile_waiting_gates<C: ConnectionTrait>(
-    db: &C,
-    now: DateTimeWithTimeZone,
-    limit: u64,
+async fn write_gate_probe(
+    db: &SqliteDatabase,
+    row: &native_terminal_effect_outbox::Model,
+    token: Option<String>,
+    attempts: i64,
+    clock: &(dyn Fn() -> i64 + Send + Sync),
+    require_due: bool,
+) -> Result<Option<native_terminal_effect_outbox::Model>> {
+    let delay = probe_delay(attempts);
+    let mut guard = probe_snapshot(row);
+    let tx = db.begin().await?;
+    let now = clock();
+    let next = std::cmp::max(row.gate_probe_at, now.saturating_add(delay));
+    if require_due {
+        guard = guard.add(native_terminal_effect_outbox::Column::GateProbeAt.lte(now));
+    }
+    let result = native_terminal_effect_outbox::Entity::update_many()
+        .col_expr(
+            native_terminal_effect_outbox::Column::GateProbeAt,
+            Expr::value(next),
+        )
+        .col_expr(
+            native_terminal_effect_outbox::Column::GateProbeAttempts,
+            Expr::value(attempts),
+        )
+        .col_expr(
+            native_terminal_effect_outbox::Column::GateProbeToken,
+            Expr::value(token.clone()),
+        )
+        // Bookkeeping deliberately does not touch domain updated_at. A probe
+        // must not invalidate a concurrently prepared authoritative resolution.
+        .filter(guard)
+        .exec(&tx)
+        .await;
+    let affected = match result {
+        Ok(result) => result.rows_affected,
+        Err(error) => {
+            let _ = tx.rollback().await;
+            return Err(error.into());
+        }
+    };
+    tx.commit().await?;
+    Ok((affected == 1).then(|| {
+        let mut reserved = row.clone();
+        reserved.gate_probe_at = next;
+        reserved.gate_probe_attempts = attempts;
+        reserved.gate_probe_token = token;
+        reserved
+    }))
+}
+
+pub(crate) async fn probe_waiting_gate(
+    db: &SqliteDatabase,
+    row: &native_terminal_effect_outbox::Model,
+    clock: &(dyn Fn() -> i64 + Send + Sync),
 ) -> Result<u64> {
-    let rows = native_terminal_effect_outbox::Entity::find()
-        .filter(native_terminal_effect_outbox::Column::Status.eq(STATUS_WAITING_ACCEPTANCE))
-        .order_by_asc(native_terminal_effect_outbox::Column::PreparedAt)
-        .limit(limit)
+    if row.gate_kind != "accepted_task_result" {
+        bail!("waiting effect has an invalid gate");
+    }
+    let token = row
+        .gate_probe_token
+        .clone()
+        .context("gate probe has no durable reservation")?;
+    let latest = latest_candidate_metadata(db, &row.thread_id, &row.turn_id, None).await?;
+    if latest.is_none() {
+        return Ok(0);
+    } // Durable reservation already deferred Waiting.
+    let ids = native_terminal_effect_outbox::Entity::find()
+        .select_only()
+        .column(native_terminal_effect_outbox::Column::EffectId)
+        .filter(native_terminal_effect_outbox::Column::TurnId.eq(row.turn_id.clone()))
+        .limit((MAX_EFFECTS_PER_TURN + 1) as u64)
+        .into_tuple::<String>()
         .all(db)
-        .await
-        .context("failed to scan waiting terminal-effect gates")?;
-    let mut resolved = 0_u64;
-    for row in rows {
-        let candidate = task_result_candidate::Entity::find()
-            .filter(task_result_candidate::Column::ThreadId.eq(row.thread_id.clone()))
-            .filter(task_result_candidate::Column::TurnId.eq(row.turn_id.clone()))
-            .filter(task_result_candidate::Column::Status.is_in(terminal_candidate_statuses()))
-            .order_by_desc(task_result_candidate::Column::UpdatedAt)
-            .one(db)
-            .await
-            .context("failed to reconcile terminal-effect candidate gate")?;
-        if let Some(candidate) = candidate {
-            resolved = resolved.saturating_add(
-                resolve_gate_for_candidate(
-                    db,
-                    candidate.id.as_str(),
-                    candidate.thread_id.as_str(),
-                    candidate.turn_id.as_str(),
-                    candidate.status.as_str(),
-                    now,
-                )
-                .await?,
-            );
+        .await?;
+    if ids.len() > MAX_EFFECTS_PER_TURN {
+        bail!("Turn exceeds terminal-effect bound");
+    }
+    let prepared = prepare_gate_resolution_rows(
+        "probe",
+        &row.thread_id,
+        &row.turn_id,
+        latest,
+        vec![row.clone()],
+        crate::util::unix_to_datetime(clock()),
+        Some(token),
+        None,
+    )?;
+    let tx = db.begin().await?;
+    let result = apply_prepared_gate_resolution(&tx, prepared).await;
+    match result {
+        Ok(resolved) => {
+            tx.commit().await?;
+            Ok(resolved)
+        }
+        Err(error) => {
+            let _ = tx.rollback().await;
+            Err(error)
         }
     }
-    Ok(resolved)
 }
 
-pub async fn claim_due<C: ConnectionTrait>(
-    db: &C,
-    now: DateTimeWithTimeZone,
-    claim_expires_at: DateTimeWithTimeZone,
+pub(crate) async fn discover_gate_probes(
+    db: &SqliteDatabase,
+    now: i64,
     limit: u64,
-    claim_token_factory: impl Fn() -> String,
-) -> Result<Vec<ClaimedNativeTerminalEffect>> {
-    let due = Condition::all()
-        .add(native_terminal_effect_outbox::Column::Status.is_in([STATUS_READY, STATUS_RETRY_WAIT]))
-        .add(native_terminal_effect_outbox::Column::NextRunAt.lte(now));
-    let expired = Condition::all()
-        .add(native_terminal_effect_outbox::Column::Status.eq(STATUS_RUNNING))
-        .add(native_terminal_effect_outbox::Column::ClaimExpiresAt.lte(now));
+) -> Result<Vec<native_terminal_effect_outbox::Model>> {
+    Ok(gate_due_page(now, limit).all(db).await?)
+}
 
-    native_terminal_effect_outbox::Entity::update_many()
-        .col_expr(
-            native_terminal_effect_outbox::Column::Status,
-            Expr::value(STATUS_UNRESOLVED.to_owned()),
-        )
-        .col_expr(
-            native_terminal_effect_outbox::Column::LastErrorCode,
-            Expr::value(Some("retry_exhausted".to_owned())),
-        )
-        .col_expr(
-            native_terminal_effect_outbox::Column::LastErrorMessage,
-            Expr::value(Some(
-                "native terminal effect exhausted its retry budget".to_owned(),
-            )),
-        )
-        .col_expr(
-            native_terminal_effect_outbox::Column::CompletedAt,
-            Expr::value(Some(now)),
-        )
-        .col_expr(
-            native_terminal_effect_outbox::Column::NextRunAt,
-            Expr::value(Option::<DateTimeWithTimeZone>::None),
-        )
-        .col_expr(
-            native_terminal_effect_outbox::Column::ClaimToken,
-            Expr::value(Option::<String>::None),
-        )
-        .col_expr(
-            native_terminal_effect_outbox::Column::ClaimExpiresAt,
-            Expr::value(Option::<DateTimeWithTimeZone>::None),
-        )
-        .col_expr(
-            native_terminal_effect_outbox::Column::UpdatedAt,
-            Expr::value(now),
-        )
-        .filter(Condition::any().add(due.clone()).add(expired.clone()))
-        .filter(
-            Expr::col(native_terminal_effect_outbox::Column::AttemptCount).gte(Expr::col(
-                native_terminal_effect_outbox::Column::MaxAttempts,
-            )),
-        )
-        .exec(db)
-        .await
-        .context("failed to terminalize exhausted native terminal effects")?;
-
-    let candidates = native_terminal_effect_outbox::Entity::find()
-        .filter(Condition::any().add(due.clone()).add(expired.clone()))
-        .filter(
-            Expr::col(native_terminal_effect_outbox::Column::AttemptCount).lt(Expr::col(
-                native_terminal_effect_outbox::Column::MaxAttempts,
-            )),
-        )
-        .order_by_asc(native_terminal_effect_outbox::Column::NextRunAt)
+pub(crate) fn claim_page(
+    status: &str,
+    now: DateTimeWithTimeZone,
+    limit: u64,
+) -> sea_orm::Select<native_terminal_effect_outbox::Entity> {
+    let due_column = if status == STATUS_RUNNING {
+        native_terminal_effect_outbox::Column::ClaimExpiresAt
+    } else {
+        native_terminal_effect_outbox::Column::NextRunAt
+    };
+    native_terminal_effect_outbox::Entity::find()
+        .filter(native_terminal_effect_outbox::Column::Status.eq(status.to_owned()))
+        .filter(due_column.lte(now))
+        .order_by_asc(due_column)
         .order_by_asc(native_terminal_effect_outbox::Column::PreparedAt)
+        .order_by_asc(native_terminal_effect_outbox::Column::EffectId)
         .limit(limit)
+}
+
+pub async fn claim_due<F: FnMut() -> String>(
+    db: &SqliteDatabase,
+    discovery_now: DateTimeWithTimeZone,
+    claim_lease_secs: u64,
+    limit: u64,
+    mut claim_token_factory: F,
+    clock: &(dyn Fn() -> i64 + Send + Sync),
+) -> Result<NativeTerminalEffectClaimBatch> {
+    let mut remaining = std::cmp::min(limit, EFFECT_INPUT_BUDGET);
+    let statuses = [STATUS_READY, STATUS_RETRY_WAIT, STATUS_RUNNING];
+    // Three pages share eight INPUT slots, including exhausted rows. Rotate
+    // which status receives the extra slots; empty pages donate unused quota.
+    let rotation = discovery_now.timestamp().div_euclid(2).rem_euclid(3) as usize;
+    let mut candidates = Vec::new();
+    let mut outcome = NativeTerminalEffectClaimBatch::default();
+    for page in 0..3 {
+        if remaining == 0 {
+            break;
+        }
+        let quota = remaining.div_ceil(3 - page);
+        let rows = claim_page(
+            statuses[(rotation + page as usize) % 3],
+            discovery_now,
+            quota,
+        )
         .all(db)
-        .await
-        .context("failed to list due native terminal effects")?;
-    let mut claimed = Vec::new();
+        .await;
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(_error) => {
+                // The failed read may have consumed its whole LIMIT before
+                // decoding failed. Unknown pages cannot donate input slots.
+                remaining -= quota;
+                outcome.storage_failed = true;
+                tracing::warn!("terminal-effect claim page failed");
+                continue;
+            }
+        };
+        remaining -= rows.len() as u64;
+        candidates.extend(rows);
+    }
+    // Discover once. Every selected row, including exhausted/failed rows,
+    // consumes one of these <=8 input slots. No whole-quantum retry.
     for row in candidates {
-        let token = claim_token_factory();
-        let updated = native_terminal_effect_outbox::Entity::update_many()
+        let token = claim_token_factory(); // outside writer admission
+        match claim_one(db, &row, token, claim_lease_secs, clock).await {
+            Ok(Some(claim)) => outcome.claimed.push(claim),
+            Ok(None) => {}
+            Err(_error) => {
+                outcome.storage_failed = true;
+                tracing::warn!("terminal-effect point claim failed");
+                // A commit may have succeeded. The original snapshot then no
+                // longer matches: never dispatch or retry this row here.
+                if let Err(_error) = defer_execution_claim(db, &row, clock).await {
+                    tracing::warn!("terminal-effect claim failure deferral failed");
+                }
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+fn execution_due_column(
+    row: &native_terminal_effect_outbox::Model,
+) -> native_terminal_effect_outbox::Column {
+    if row.status == STATUS_RUNNING {
+        native_terminal_effect_outbox::Column::ClaimExpiresAt
+    } else {
+        native_terminal_effect_outbox::Column::NextRunAt
+    }
+}
+
+// All scheduling/ownership facts used by the point claim and failure deferral.
+// NULLs must match explicitly, particularly a not-yet-claimed ready row.
+fn execution_snapshot(row: &native_terminal_effect_outbox::Model) -> Condition {
+    let mut guard = Condition::all()
+        .add(native_terminal_effect_outbox::Column::EffectId.eq(row.effect_id.clone()))
+        .add(native_terminal_effect_outbox::Column::Status.eq(row.status.clone()))
+        .add(native_terminal_effect_outbox::Column::AttemptCount.eq(row.attempt_count))
+        .add(native_terminal_effect_outbox::Column::MaxAttempts.eq(row.max_attempts))
+        .add(native_terminal_effect_outbox::Column::UpdatedAt.eq(row.updated_at));
+    guard = match &row.claim_token {
+        Some(token) => {
+            guard.add(native_terminal_effect_outbox::Column::ClaimToken.eq(token.clone()))
+        }
+        None => guard.add(native_terminal_effect_outbox::Column::ClaimToken.is_null()),
+    };
+    for (column, value) in [
+        (
+            native_terminal_effect_outbox::Column::NextRunAt,
+            row.next_run_at,
+        ),
+        (
+            native_terminal_effect_outbox::Column::ClaimExpiresAt,
+            row.claim_expires_at,
+        ),
+    ] {
+        guard = match value {
+            Some(value) => guard.add(column.eq(value)),
+            None => guard.add(column.is_null()),
+        };
+    }
+    guard
+}
+
+async fn claim_one(
+    db: &SqliteDatabase,
+    row: &native_terminal_effect_outbox::Model,
+    token: String,
+    claim_lease_secs: u64,
+    clock: &(dyn Fn() -> i64 + Send + Sync),
+) -> Result<Option<ClaimedNativeTerminalEffect>> {
+    // Only this row's mutation, reload and commit are atomic. Independent
+    // effects do not share a domain transition or a claim transaction.
+    let tx = db.begin().await?;
+    let result = async {
+        let now_unix = clock(); // after writer admission, for each input
+        let now = crate::util::unix_to_datetime(now_unix);
+        let expires =
+            crate::util::unix_to_datetime(now_unix.saturating_add(
+                i64::try_from(std::cmp::max(claim_lease_secs, 1)).unwrap_or(i64::MAX),
+            ));
+        let guard = execution_snapshot(row).add(execution_due_column(row).lte(now));
+        let exhausted = row.attempt_count >= row.max_attempts;
+        let mut update = native_terminal_effect_outbox::Entity::update_many()
             .col_expr(
                 native_terminal_effect_outbox::Column::Status,
-                Expr::value(STATUS_RUNNING.to_owned()),
-            )
-            .col_expr(
-                native_terminal_effect_outbox::Column::AttemptCount,
-                Expr::col(native_terminal_effect_outbox::Column::AttemptCount).add(1),
+                Expr::value(if exhausted {
+                    STATUS_UNRESOLVED
+                } else {
+                    STATUS_RUNNING
+                }),
             )
             .col_expr(
                 native_terminal_effect_outbox::Column::ClaimToken,
-                Expr::value(Some(token.clone())),
+                Expr::value((!exhausted).then(|| token.clone())),
             )
             .col_expr(
                 native_terminal_effect_outbox::Column::ClaimExpiresAt,
-                Expr::value(Some(claim_expires_at)),
+                Expr::value((!exhausted).then_some(expires)),
             )
             .col_expr(
                 native_terminal_effect_outbox::Column::UpdatedAt,
                 Expr::value(now),
             )
-            .filter(native_terminal_effect_outbox::Column::EffectId.eq(row.effect_id.clone()))
-            .filter(Condition::any().add(due.clone()).add(expired.clone()))
-            .filter(
-                Expr::col(native_terminal_effect_outbox::Column::AttemptCount).lt(Expr::col(
-                    native_terminal_effect_outbox::Column::MaxAttempts,
-                )),
-            )
-            .exec(db)
-            .await
-            .context("failed to claim native terminal effect")?
-            .rows_affected;
-        if updated == 1
-            && let Some(row) = native_terminal_effect_outbox::Entity::find_by_id(row.effect_id)
-                .one(db)
-                .await
-                .context("failed to reload claimed native terminal effect")?
-        {
-            claimed.push(ClaimedNativeTerminalEffect {
+            .filter(guard);
+        if exhausted {
+            update = update
+                .col_expr(
+                    native_terminal_effect_outbox::Column::CompletedAt,
+                    Expr::value(Some(now)),
+                )
+                .col_expr(
+                    native_terminal_effect_outbox::Column::NextRunAt,
+                    Expr::value(Option::<DateTimeWithTimeZone>::None),
+                )
+                .col_expr(
+                    native_terminal_effect_outbox::Column::LastErrorCode,
+                    Expr::value(Some("retry_exhausted".to_owned())),
+                )
+                .col_expr(
+                    native_terminal_effect_outbox::Column::LastErrorMessage,
+                    Expr::value(Some(
+                        "native terminal effect exhausted its retry budget".to_owned(),
+                    )),
+                );
+        } else {
+            update = update.col_expr(
+                native_terminal_effect_outbox::Column::AttemptCount,
+                Expr::col(native_terminal_effect_outbox::Column::AttemptCount).add(1),
+            );
+        }
+        if update.exec(&tx).await?.rows_affected == 1 && !exhausted {
+            let row = native_terminal_effect_outbox::Entity::find_by_id(row.effect_id.clone())
+                .one(&tx)
+                .await?
+                .context("claimed effect disappeared")?;
+            return Ok(Some(ClaimedNativeTerminalEffect {
                 row,
                 claim_token: token,
-            });
+            }));
+        }
+        Ok(None)
+    }
+    .await;
+    match result {
+        Ok(claim) => {
+            tx.commit().await?;
+            Ok(claim)
+        }
+        Err(error) => {
+            let _ = tx.rollback().await;
+            Err(error)
         }
     }
-    Ok(claimed)
+}
+
+pub(crate) async fn defer_execution_claim(
+    db: &SqliteDatabase,
+    row: &native_terminal_effect_outbox::Model,
+    clock: &(dyn Fn() -> i64 + Send + Sync),
+) -> Result<bool> {
+    let guard = execution_snapshot(row);
+    let column = execution_due_column(row);
+    let old_due = if row.status == STATUS_RUNNING {
+        row.claim_expires_at
+    } else {
+        row.next_run_at
+    };
+    let tx = db.begin().await?;
+    let next = crate::util::unix_to_datetime(clock().saturating_add(5));
+    let next = old_due.map_or(next, |due| std::cmp::max(due, next));
+    // Bookkeeping changes only the due field. Preserve the old owner's token,
+    // attempt_count and domain updated_at; a concurrent claim/completion wins.
+    let result = native_terminal_effect_outbox::Entity::update_many()
+        .col_expr(column, Expr::value(Some(next)))
+        .filter(guard)
+        .exec(&tx)
+        .await;
+    match result {
+        Ok(result) => {
+            tx.commit().await?;
+            Ok(result.rows_affected == 1)
+        }
+        Err(error) => {
+            let _ = tx.rollback().await;
+            Err(error.into())
+        }
+    }
 }
 
 pub async fn mark_succeeded<C: ConnectionTrait>(
@@ -1826,24 +2233,73 @@ fn validate_existing_identity(
     Ok(())
 }
 
+/// The covering index serves four equality seeks, returning no candidate JSON.
+#[derive(Debug, Clone, PartialEq, Eq, FromQueryResult)]
+pub(crate) struct CandidateGateMetadata {
+    pub id: String,
+    pub status: String,
+    pub updated_at: DateTimeWithTimeZone,
+}
+
+pub(crate) fn candidate_metadata_seek(
+    thread_id: &str,
+    turn_id: &str,
+    status: &str,
+) -> sea_orm::Select<task_result_candidate::Entity> {
+    task_result_candidate::Entity::find()
+        .select_only()
+        .columns([
+            task_result_candidate::Column::Id,
+            task_result_candidate::Column::Status,
+            task_result_candidate::Column::UpdatedAt,
+        ])
+        .filter(task_result_candidate::Column::ThreadId.eq(thread_id.to_owned()))
+        .filter(task_result_candidate::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(task_result_candidate::Column::Status.eq(status.to_owned()))
+        .order_by_desc(task_result_candidate::Column::UpdatedAt)
+        .order_by_desc(task_result_candidate::Column::Id)
+        .limit(1)
+}
+
+async fn latest_candidate_metadata<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_id: &str,
+    replacement: Option<CandidateGateMetadata>,
+) -> Result<Option<CandidateGateMetadata>> {
+    let mut latest = replacement.clone();
+    for status in terminal_candidate_statuses() {
+        let mut query = candidate_metadata_seek(thread_id, turn_id, status);
+        // Predict the state after one authoritative candidate write. At most
+        // one index entry can be excluded (id is unique), not a history scan.
+        if let Some(replacement) = &replacement {
+            query = query.filter(task_result_candidate::Column::Id.ne(replacement.id.clone()));
+        }
+        let row = query.into_model::<CandidateGateMetadata>().one(db).await?;
+        if let Some(row) = row {
+            if latest
+                .as_ref()
+                .is_none_or(|current| (row.updated_at, &row.id) > (current.updated_at, &current.id))
+            {
+                latest = Some(row);
+            }
+        }
+    }
+    Ok(latest)
+}
+
 async fn candidate_gate_state<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
     turn_id: &str,
 ) -> Result<CandidateGateState> {
-    let row = task_result_candidate::Entity::find()
-        .filter(task_result_candidate::Column::ThreadId.eq(thread_id.to_owned()))
-        .filter(task_result_candidate::Column::TurnId.eq(turn_id.to_owned()))
-        .filter(task_result_candidate::Column::Status.is_in(terminal_candidate_statuses()))
-        .order_by_desc(task_result_candidate::Column::UpdatedAt)
-        .one(db)
-        .await
-        .context("failed to resolve terminal-effect task-result gate")?;
-    match row {
-        Some(row) if row.status == "accepted" => Ok(CandidateGateState::Accepted(row.id)),
-        Some(_) => Ok(CandidateGateState::Rejected),
-        None => Ok(CandidateGateState::Waiting),
-    }
+    Ok(
+        match latest_candidate_metadata(db, thread_id, turn_id, None).await? {
+            Some(row) if row.status == "accepted" => CandidateGateState::Accepted(row),
+            Some(row) => CandidateGateState::Rejected(row),
+            None => CandidateGateState::Waiting,
+        },
+    )
 }
 
 fn terminal_candidate_statuses() -> [&'static str; 4] {

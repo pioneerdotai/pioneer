@@ -28,6 +28,7 @@ pub struct PreparedTaskEvent {
     payload_json: String,
     payload: TaskEventPayload,
     semantically_matching_existing: Option<SemanticallyMatchingExistingTaskEvent>,
+    pub(crate) gate_payloads: Option<super::native_terminal_effect_outbox::PreparedGatePayloads>,
     candidate_gate_resolution:
         Option<super::native_terminal_effect_outbox::PreparedCandidateGateResolution>,
     candidate_projection: Option<super::task_result_candidate::PreparedTaskResultCandidate>,
@@ -105,6 +106,7 @@ impl PreparedTaskEvent {
             payload_json,
             payload,
             semantically_matching_existing: None,
+            gate_payloads: None,
             candidate_gate_resolution: None,
             candidate_projection,
             review_projection,
@@ -185,6 +187,12 @@ impl PreparedTaskEvent {
         self
     }
 
+    pub(crate) fn candidate_projection(
+        &self,
+    ) -> Option<&super::task_result_candidate::PreparedTaskResultCandidate> {
+        self.candidate_projection.as_ref()
+    }
+
     pub(crate) fn with_candidate_projection(
         mut self,
         prepared: Option<super::task_result_candidate::PreparedTaskResultCandidate>,
@@ -251,6 +259,7 @@ pub async fn append_prepared_event<C: ConnectionTrait>(
         payload_json,
         payload,
         semantically_matching_existing,
+        gate_payloads: _,
         candidate_gate_resolution,
         candidate_projection,
         review_projection,
