@@ -4,9 +4,13 @@ use crate::executor::{TaskExecutionContext, TaskExecutionHandle, TaskExecutorReg
 use crate::projector::TaskProjector;
 use crate::scheduler::{TASK_EXECUTION_LEASE_SECONDS, TaskSchedulerHandle};
 use crate::task_boundary::task_fresh_task;
-use pioneer_crud::{CrudStore, TaskOccurrenceTerminalRepairOutcome};
+use pioneer_crud::{
+    CrudStore, TaskOccurrenceClaimDeferral, TaskOccurrenceClaimFailure,
+    TaskOccurrenceTerminalRepairOutcome,
+};
 use pioneer_protocol::{TaskEventPayload, TaskRun, TaskRunStatus, TaskTriggerStatus, generate_id};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::warn;
 
@@ -14,7 +18,7 @@ const DORMANT_TRIGGER_RECOVERY_MESSAGE: &str =
     "active trigger has no next_fire_at; scheduler will keep it dormant";
 const DISPATCHABLE_RUN_RECOVERY_MESSAGE: &str = "queued run is dispatchable after startup";
 const ID_LEN: usize = 21;
-const TERMINAL_OCCURRENCE_REPAIR_BATCH_LIMIT: u64 = 128;
+const OCCURRENCE_STORAGE_BACKOFF: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReconciliationReport {
@@ -34,7 +38,7 @@ pub struct TaskStartupReconciler {
     event_bus: Arc<TaskEventBus>,
     executors: Arc<TaskExecutorRegistry>,
     scheduler: TaskSchedulerHandle,
-    terminal_occurrence_scan_cursor: Mutex<Option<String>>,
+    terminal_occurrence_retry_at: Mutex<Option<Instant>>,
 }
 
 impl TaskStartupReconciler {
@@ -52,7 +56,7 @@ impl TaskStartupReconciler {
             event_bus,
             executors,
             scheduler,
-            terminal_occurrence_scan_cursor: Mutex::new(None),
+            terminal_occurrence_retry_at: Mutex::new(None),
         }
     }
 
@@ -119,47 +123,8 @@ impl TaskStartupReconciler {
             }
         }
 
-        let terminal_occurrence_page = {
-            let mut cursor = self.terminal_occurrence_scan_cursor.lock().await;
-            let page = self
-                .store
-                .scan_terminal_task_occurrence_mismatches(
-                    cursor.as_deref(),
-                    TERMINAL_OCCURRENCE_REPAIR_BATCH_LIMIT,
-                )
-                .await?;
-            *cursor = page.next_cursor.clone();
-            page
-        };
-        let terminal_occurrence_mismatches = terminal_occurrence_page.mismatches;
-        let terminal_occurrence_mismatch_count = terminal_occurrence_mismatches.len();
-        let mut repaired_terminal_occurrences = 0usize;
-        for mismatch in terminal_occurrence_mismatches {
-            match self
-                .store
-                .compare_and_repair_terminal_task_occurrence(mismatch.run_id.as_str(), now)
-                .await
-            {
-                Ok(TaskOccurrenceTerminalRepairOutcome::Changed) => {
-                    repaired_terminal_occurrences = repaired_terminal_occurrences.saturating_add(1);
-                    warn!(
-                        failure_class = "task_terminal_occurrence_mismatch_repaired",
-                        "repaired terminal Task occurrence projection mismatch"
-                    );
-                }
-                Ok(
-                    TaskOccurrenceTerminalRepairOutcome::AlreadyConsistent
-                    | TaskOccurrenceTerminalRepairOutcome::NotFound
-                    | TaskOccurrenceTerminalRepairOutcome::NotRepairable,
-                ) => {}
-                Err(_error) => {
-                    warn!(
-                        failure_class = "task_terminal_occurrence_repair_failed",
-                        "failed to repair terminal Task occurrence projection mismatch"
-                    );
-                }
-            }
-        }
+        let (terminal_occurrence_mismatch_count, repaired_terminal_occurrences) =
+            self.reconcile_terminal_occurrences(now).await?;
 
         self.scheduler.wake();
         Ok(ReconciliationReport {
@@ -172,6 +137,101 @@ impl TaskStartupReconciler {
             terminal_occurrence_mismatches: terminal_occurrence_mismatch_count,
             repaired_terminal_occurrences,
         })
+    }
+
+    async fn reconcile_terminal_occurrences(&self, now: i64) -> TaskRuntimeResult<(usize, usize)> {
+        // This mutex only serializes quanta/backoff; it retains no DB capacity.
+        // Durable locators, claims and checkpoints survive cancellation/restart.
+        let mut retry_at = self.terminal_occurrence_retry_at.lock().await;
+        if retry_at.is_some_and(|deadline| deadline > Instant::now()) {
+            return Ok((0, 0));
+        }
+        let clock = || chrono::Utc::now().timestamp();
+        // Fixed fair quotas: scope <=16 inputs, seed <=16, due runs <=32.
+        // Bookkeeping failures don't prevent this pass's healthy run checks.
+        let mut storage_error = false;
+        if self
+            .store
+            .expand_task_occurrence_scope(&clock)
+            .await
+            .is_err()
+        {
+            storage_error = true;
+            warn!(
+                failure_class = "task_occurrence_scope_storage_failed",
+                "Task occurrence scope expansion failed"
+            );
+        }
+        if self
+            .store
+            .seed_unfinished_task_occurrences(&clock)
+            .await
+            .is_err()
+        {
+            storage_error = true;
+            warn!(
+                failure_class = "task_occurrence_seed_storage_failed",
+                "Task occurrence seed failed"
+            );
+        }
+        let candidates = match self.store.discover_task_occurrence_reconcile(clock()).await {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                *retry_at = Some(Instant::now() + OCCURRENCE_STORAGE_BACKOFF);
+                return Err(error);
+            }
+        };
+        let mut changed = 0;
+        for candidate in candidates {
+            let store = self.store.clone();
+            // Reuse the owned/abort-on-drop task boundary. A candidate panic or
+            // storage failure cannot abort the rest of the selected quantum.
+            let outcome = task_fresh_task(
+                async move {
+                    let Some(claim) = store
+                        .claim_task_occurrence_reconcile(&candidate, &|| {
+                            chrono::Utc::now().timestamp()
+                        })
+                        .await?
+                    else {
+                        return Ok(TaskOccurrenceTerminalRepairOutcome::StaleClaim);
+                    };
+                    store.reconcile_claimed_task_occurrence(&claim, now).await
+                },
+                "Task occurrence repair task did not finish",
+            )
+            .await;
+            match outcome {
+                Ok(TaskOccurrenceTerminalRepairOutcome::Changed) => {
+                    changed += 1;
+                    warn!(
+                        failure_class = "task_terminal_occurrence_mismatch_repaired",
+                        "repaired terminal Task occurrence projection mismatch"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // Claim errors already attempted an exact-snapshot durable
+                    // deferral. If storage prevented it, also delay the worker.
+                    storage_error |= error
+                        .downcast_ref::<TaskOccurrenceClaimFailure>()
+                        .is_none_or(|failure| {
+                            matches!(
+                                failure.deferral,
+                                TaskOccurrenceClaimDeferral::NoSnapshot
+                                    | TaskOccurrenceClaimDeferral::Failed
+                            )
+                        });
+                    warn!(
+                        failure_class = "task_terminal_occurrence_repair_failed",
+                        "failed to repair terminal Task occurrence projection mismatch"
+                    );
+                }
+            }
+        }
+        *retry_at = storage_error.then(|| Instant::now() + OCCURRENCE_STORAGE_BACKOFF);
+        // Count confirmed mismatches, not dirty candidates (which may agree).
+        Ok((changed, changed))
     }
 
     async fn recover_run(&self, run: &TaskRun, now: i64) -> TaskRuntimeResult<bool> {
