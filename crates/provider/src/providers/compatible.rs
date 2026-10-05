@@ -2053,7 +2053,10 @@ mod tests {
         );
         let request = ChatRequest {
             model: "compatible-model".to_owned(),
-            messages: vec![message],
+            messages: vec![
+                message,
+                ChatMessage::tool_result("call_1", "read_file", "file contents"),
+            ],
             temperature: None,
             max_tokens: None,
             tools: None,
@@ -2069,6 +2072,7 @@ mod tests {
 
         assert_eq!(rendered.messages[0].reasoning_content.as_deref(), Some(""));
         assert_eq!(text_content(&rendered.messages[0].content), Some(""));
+        assert_eq!(rendered.messages[1].tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(
             rendered.messages[0]
                 .tool_calls

@@ -1222,7 +1222,11 @@ mod tests {
         );
         let request = ChatRequest {
             model: "gemini-3-flash-preview".to_owned(),
-            messages: vec![message],
+            messages: vec![
+                message,
+                ChatMessage::tool_result("call_1", "first", "{}"),
+                ChatMessage::tool_result("call_2", "second", "{}"),
+            ],
             temperature: None,
             max_tokens: None,
             tools: None,
@@ -1245,6 +1249,11 @@ mod tests {
             Some("opaque-signature")
         );
         assert!(rendered.contents[0].parts[1].thought_signature.is_none());
+        for (content, id) in rendered.contents[1..].iter().zip(["call_1", "call_2"]) {
+            let result = content.parts[0].function_response.as_ref().unwrap();
+            assert_eq!(result.id.as_deref(), Some(id));
+            assert!(content.parts[0].thought_signature.is_none());
+        }
     }
 
     #[test]
