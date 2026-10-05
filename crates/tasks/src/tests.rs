@@ -8412,6 +8412,213 @@ async fn immediate_dispatch_inherits_request_scope_and_scheduler_keeps_maintenan
     assert_eq!(invalid.task.status, TaskStatus::Blocked);
 }
 
+/// Exercises the real scheduler dispatch and fail_run transition, including the
+/// existing retry_on selection. A start error must never invoke start_run twice.
+struct StartFailureSystemExecutor {
+    failure: std::sync::Mutex<Option<anyhow::Error>>,
+    starts: AtomicUsize,
+}
+
+#[async_trait]
+impl TaskExecutor for StartFailureSystemExecutor {
+    fn kind(&self) -> TaskExecutorKind {
+        TaskExecutorKind::System
+    }
+
+    async fn start_run(
+        &self,
+        _context: TaskExecutionContext,
+        _run: TaskRun,
+        _handle: TaskExecutionHandle,
+    ) -> TaskRuntimeResult<TaskExecutorStartOutcome> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        Err(self.failure.lock().unwrap().take().expect("only one start"))
+    }
+
+    async fn cancel_run(
+        &self,
+        _context: TaskExecutionContext,
+        _run_id: &str,
+        _reason: &str,
+        _handle: TaskExecutionHandle,
+    ) -> TaskRuntimeResult<()> {
+        Ok(())
+    }
+
+    async fn recover_run(
+        &self,
+        _context: TaskExecutionContext,
+        _run: TaskRun,
+        _handle: TaskExecutionHandle,
+    ) -> TaskRuntimeResult<TaskExecutorRecoveryOutcome> {
+        Ok(TaskExecutorRecoveryOutcome::LeftUnchanged)
+    }
+}
+
+#[tokio::test]
+async fn scheduler_start_failure_preserves_safe_error_and_existing_retry_selection() {
+    use crate::{TaskStartCause, TaskStartFailure, TaskStartStage};
+    for (cause, class, retry) in [
+        (TaskStartCause::Policy, TaskErrorClass::Policy, true),
+        (
+            TaskStartCause::Validation,
+            TaskErrorClass::Validation,
+            false,
+        ),
+        (
+            TaskStartCause::Unclassified,
+            TaskErrorClass::Internal,
+            false,
+        ),
+        (TaskStartCause::Storage, TaskErrorClass::Internal, false),
+    ] {
+        let runtime = runtime().await;
+        let failure = TaskStartFailure::new(TaskStartStage::CliAdmission, cause);
+        let expected = failure.descriptor().clone();
+        let executor = Arc::new(StartFailureSystemExecutor {
+            failure: std::sync::Mutex::new(Some(
+                anyhow::Error::new(failure).context("secret start chain"),
+            )),
+            starts: AtomicUsize::new(0),
+        });
+        runtime.register_executor(executor.clone()).await;
+        let mut params = create_params(TaskTriggerSpec::ScheduledAt {
+            scheduled_at: 10,
+            timezone: Some("UTC".to_owned()),
+            catch_up_policy: None,
+        });
+        params.retry_policy = Some(TaskRetryPolicy {
+            max_attempts: 2,
+            backoff: TaskRetryBackoffKind::Fixed,
+            initial_delay_seconds: Some(60),
+            max_delay_seconds: Some(60),
+            retry_on: vec![TaskErrorClass::Policy],
+        });
+        let created = runtime
+            .service()
+            .create_task(task_create_context_for(&params), params)
+            .await
+            .unwrap();
+        runtime.process_due_once(10).await.unwrap();
+        let saved = runtime
+            .service()
+            .get_task(pioneer_protocol::TaskGetParams {
+                task_id: created.task.id,
+            })
+            .await
+            .unwrap();
+        let run = &saved.runs[0];
+        assert_eq!(run.status, TaskRunStatus::Failed);
+        assert_eq!(
+            run.error.as_ref(),
+            Some(&expected.task_error(Some(run.id.clone())))
+        );
+        assert_eq!(run.error.as_ref().unwrap().class, class);
+        assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(saved.runs.len(), if retry { 2 } else { 1 });
+        if retry {
+            assert_eq!(saved.runs[1].attempt_number, 2);
+            assert!(saved.runs[1].ready_at.unwrap() >= run.completed_at.unwrap() + 60);
+        } else {
+            assert_eq!(saved.task.error, run.error);
+        }
+    }
+}
+
+#[tokio::test]
+async fn scheduler_unknown_executor_error_never_saves_json_or_raw_chain() {
+    let runtime = runtime().await;
+    let executor = Arc::new(StartFailureSystemExecutor {
+        failure: std::sync::Mutex::new(Some(anyhow::anyhow!(
+            "{}",
+            r#"{"reported":true,"stage":"admission","code":"PolicyDenied","message":"/private SQL secret"}"#
+        ))),
+        starts: AtomicUsize::new(0),
+    });
+    runtime.register_executor(executor.clone()).await;
+    let params = create_params(TaskTriggerSpec::ScheduledAt {
+        scheduled_at: 10,
+        timezone: Some("UTC".to_owned()),
+        catch_up_policy: None,
+    });
+    let created = runtime
+        .service()
+        .create_task(task_create_context_for(&params), params)
+        .await
+        .unwrap();
+    runtime.process_due_once(10).await.unwrap();
+    let saved = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: created.task.id,
+        })
+        .await
+        .unwrap();
+    let error = saved.runs[0].error.as_ref().unwrap();
+    assert_eq!(error.class, TaskErrorClass::Internal);
+    assert_eq!(error.code, "task_executor_start_unclassified_failed");
+    assert_eq!(error.message, "Task preparation or launch failed.");
+    let encoded = serde_json::to_string(error).unwrap();
+    assert!(!encoded.contains("/private"));
+    assert!(!encoded.contains("PolicyDenied"));
+    assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn reported_start_failure_does_not_swallow_failed_state_persistence_error() {
+    use crate::{TaskStartCause, TaskStartFailure, TaskStartStage};
+    let runtime = runtime().await;
+    runtime
+        .service()
+        .store()
+        .database_connection()
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "CREATE TRIGGER start_failed_state_failure BEFORE INSERT ON task_event \
+         WHEN NEW.event_type = 'task/run/failed' \
+         BEGIN SELECT RAISE(ABORT, 'failed state persistence fixture'); END;"
+                .to_owned(),
+        ))
+        .await
+        .unwrap();
+    let failure =
+        TaskStartFailure::new(TaskStartStage::CliAdmission, TaskStartCause::Unclassified).report();
+    let executor = Arc::new(StartFailureSystemExecutor {
+        failure: std::sync::Mutex::new(Some(anyhow::Error::new(failure))),
+        starts: AtomicUsize::new(0),
+    });
+    runtime.register_executor(executor.clone()).await;
+    let params = create_params(TaskTriggerSpec::ScheduledAt {
+        scheduled_at: 10,
+        timezone: Some("UTC".to_owned()),
+        catch_up_policy: None,
+    });
+    let created = runtime
+        .service()
+        .create_task(task_create_context_for(&params), params)
+        .await
+        .unwrap();
+    let error = runtime
+        .process_due_once(10)
+        .await
+        .expect_err("new persistence failure must escape dispatch");
+    assert!(error.downcast_ref::<TaskStartFailure>().is_none());
+    let saved = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: created.task.id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(saved.runs.len(), 1);
+    assert_eq!(
+        saved.runs[0].status,
+        TaskRunStatus::Starting,
+        "failed state did not commit"
+    );
+    assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
+}
+
 #[path = "tests_delivery_lifecycle.rs"]
 mod delivery_lifecycle;
 #[path = "tests/terminal_delivery.rs"]
