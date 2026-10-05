@@ -64,7 +64,19 @@ use std::sync::Arc;
 const CLI_RUNTIME_FILE_CHANGE_DIFF_PREVIEW_MAX_BYTES: usize = 4 * 1024;
 const CLI_RUNTIME_PENDING_TURN_EVENT_MAX_KEYS: usize = 128;
 const CLI_RUNTIME_PENDING_TURN_EVENT_MAX_PER_TURN: usize = 512;
-const CLI_RUNTIME_STALE_TURN_SCAN_LIMIT: u64 = 128;
+/// Fairness for the current persistent active set only. Restart begins a new
+/// round; this is not a durable checkpoint for auditing terminal history.
+#[derive(Default)]
+pub(super) struct CliRuntimeStaleTurnScan {
+    after: [Option<(chrono::DateTime<chrono::FixedOffset>, String)>; 2],
+}
+
+#[derive(Debug, Default)]
+pub(super) struct CliRuntimeStaleTurnScanSummary {
+    pub selected: usize,
+    /// Successful validator returns, including healthy/no-op results.
+    pub processed: usize,
+}
 const CLI_RUNTIME_SILENT_TURN_STALE_AFTER_MS: i64 = 150_000;
 const CLI_RUNTIME_EVENTED_TURN_STALE_AFTER_MS: i64 = 15 * 60 * 1_000;
 const CLI_RUNTIME_PENDING_UNBOUND_EVENT_TTL_MS: i64 = 30_000;
@@ -6606,44 +6618,98 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn fail_stale_cli_runtime_turns(&self, now_unix_ms: i64) {
-        let bindings = match self
-            .crud_store
-            .list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
-                statuses: vec![
-                    crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
-                    crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
-                ],
-                limit: Some(CLI_RUNTIME_STALE_TURN_SCAN_LIMIT),
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(bindings) => bindings,
-            Err(error) => {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "failed to scan stale CLI runtime turn bindings"
-                );
-                return;
-            }
+    pub(super) async fn fail_stale_cli_runtime_turns(
+        &self,
+        now_unix_ms: i64,
+        scan: &mut CliRuntimeStaleTurnScan,
+    ) -> CliRuntimeStaleTurnScanSummary {
+        use pioneer_crud::CliRuntimeActiveTurnBindingStatus::{Running, Starting};
+        use pioneer_observability::{
+            GatewayOperation, GatewayOperationItemKind, GatewayOperationTrace,
         };
+        let trace = GatewayOperationTrace::start(GatewayOperation::CliRuntimeStaleTurnScan);
+        for kind in [
+            GatewayOperationItemKind::CliRuntimeStaleTurnSelected,
+            GatewayOperationItemKind::CliRuntimeStaleTurnProcessed,
+        ] {
+            trace.record_items(kind, 0);
+        }
+        let mut failed = false;
 
-        for binding in bindings {
-            if let Err(error) = self
-                .fail_stale_cli_runtime_turn_binding(binding, now_unix_ms)
+        // Discovery is always Maintenance; validation/commits inherit the
+        // existing caller scope (Maintenance reads / Critical correctness writes).
+        let discovery = self.crud_store.with_maintenance_access();
+        let mut summary = CliRuntimeStaleTurnScanSummary::default();
+        for (slot, status) in [Starting, Running].into_iter().enumerate() {
+            let bindings = match discovery
+                .list_active_cli_runtime_turn_binding_page(status, scan.after[slot].as_ref())
                 .await
             {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "failed to reconcile stale CLI runtime turn binding"
-                );
+                Ok(bindings) => bindings,
+                Err(error) => {
+                    warn!(
+                        error = %format!("{error:#}"),
+                        status = status.as_str(),
+                        "failed to scan stale CLI runtime turn bindings"
+                    );
+                    failed = true;
+                    continue;
+                }
+            };
+            summary.selected += bindings.len();
+            trace.record_items(
+                GatewayOperationItemKind::CliRuntimeStaleTurnSelected,
+                summary.selected as u64,
+            );
+            // Advance on discovery, including healthy/error candidates and
+            // cancellation during validation. A short/empty page wraps only on
+            // the next quantum; never fetch a second page in this call.
+            scan.after[slot] = if bindings.len()
+                == pioneer_crud::CLI_RUNTIME_ACTIVE_TURN_BINDING_PAGE_MAX as usize
+            {
+                bindings
+                    .last()
+                    .map(|binding| (binding.created_at, binding.turn_id.clone()))
+            } else {
+                None
+            };
+            for binding in bindings {
+                match self
+                    .fail_stale_cli_runtime_turn_binding(binding, now_unix_ms)
+                    .await
+                {
+                    Ok(()) => {
+                        summary.processed += 1;
+                        trace.record_items(
+                            GatewayOperationItemKind::CliRuntimeStaleTurnProcessed,
+                            summary.processed as u64,
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            error = %format!("{error:#}"),
+                            "failed to reconcile stale CLI runtime turn binding"
+                        );
+                        failed = true;
+                    }
+                }
             }
         }
+        debug!(
+            selected = summary.selected,
+            processed = summary.processed,
+            "completed stale CLI runtime active binding quantum"
+        );
         self.prune_stale_cli_runtime_pending_turn_events(now_unix_ms)
             .await;
         self.prune_stale_cli_runtime_pending_turn_server_requests(now_unix_ms)
             .await;
+        if failed {
+            trace.finish_failure();
+        } else {
+            trace.finish_success();
+        }
+        summary
     }
 
     pub(super) async fn reconcile_cli_runtime_human_wait_for_turn(

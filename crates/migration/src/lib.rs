@@ -80,6 +80,8 @@ mod m20260904_000001_recovery_episode_invariant;
 mod m20260905_000001_memory_identity;
 mod m20260906_000003_projection_receipt_cleanup;
 
+mod m20261004_000001_cli_runtime_active_binding_index;
+
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
@@ -158,6 +160,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260930_000001_recovery_diagnostic::Migration),
             Box::new(m20261001_000001_delivery_authority_spec_indexes::Migration),
             Box::new(m20261002_000001_task_run_occurrence_reconcile::Migration),
+            Box::new(m20261004_000001_cli_runtime_active_binding_index::Migration),
         ]
     }
 }

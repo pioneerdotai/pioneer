@@ -881,7 +881,8 @@ pub use crate::repositories::artifact::{
     NewArtifactBlobRecord, UpsertArtifactExternalRefRequest,
 };
 pub use crate::repositories::cli_runtime_binding::{
-    AcceptCliRuntimePendingRequestResponse, CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX,
+    AcceptCliRuntimePendingRequestResponse, CLI_RUNTIME_ACTIVE_TURN_BINDING_PAGE_MAX,
+    CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX, CliRuntimeActiveTurnBindingStatus,
     CliRuntimeExecutionSegmentRecord, CliRuntimeExecutionSegmentStatus,
     CliRuntimeNativeEventListFilter, CliRuntimeNativeEventRecord, CliRuntimeNativeTurnOwner,
     CliRuntimePendingRequestListFilter, CliRuntimePendingRequestRecord,
@@ -5200,6 +5201,15 @@ impl CrudStore {
         let thread_id = thread_id.to_owned();
         cli_runtime_binding::list_turn_bindings_for_thread(&self.connection, thread_id.as_str())
             .await
+    }
+
+    /// Bounded global background discovery. Foreground listing retains its API.
+    pub async fn list_active_cli_runtime_turn_binding_page(
+        &self,
+        status: CliRuntimeActiveTurnBindingStatus,
+        after: Option<&(sea_orm::entity::prelude::DateTimeWithTimeZone, String)>,
+    ) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
+        cli_runtime_binding::list_active_turn_binding_page(&self.connection, status, after).await
     }
 
     pub async fn list_cli_runtime_turn_bindings(
@@ -31258,6 +31268,8 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    #[path = "cli_runtime_active_bindings.rs"]
+    mod cli_runtime_active_bindings;
     #[path = "task_run_occurrence.rs"]
     mod occurrence_tracker;
     use super::{

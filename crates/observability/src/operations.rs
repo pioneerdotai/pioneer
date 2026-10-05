@@ -647,6 +647,7 @@ pub enum GatewayOperation {
     ThreadOpen,
     ThreadGet,
     ThreadTimelinePage,
+    CliRuntimeStaleTurnScan,
 }
 
 impl GatewayOperation {
@@ -663,6 +664,7 @@ impl GatewayOperation {
             Self::ThreadOpen => "thread.open",
             Self::ThreadGet => "thread.get",
             Self::ThreadTimelinePage => "thread_timeline.page",
+            Self::CliRuntimeStaleTurnScan => "cli_runtime.stale_turn_scan",
         }
     }
 
@@ -679,6 +681,7 @@ impl GatewayOperation {
             Self::ThreadOpen => "gateway.thread.open",
             Self::ThreadGet => "gateway.thread.get",
             Self::ThreadTimelinePage => "gateway.thread_timeline.page",
+            Self::CliRuntimeStaleTurnScan => "gateway.cli_runtime.stale_turn_scan",
         }
     }
 }
@@ -894,6 +897,8 @@ pub enum GatewayOperationItemKind {
     ThreadTimelineMaterializedBlocks,
     ThreadTimelineDescendantPendingBlocks,
     ThreadTimelineReturnedBlocks,
+    CliRuntimeStaleTurnSelected,
+    CliRuntimeStaleTurnProcessed,
 }
 
 impl GatewayOperationItemKind {
@@ -917,6 +922,8 @@ impl GatewayOperationItemKind {
                 "thread_timeline.blocks.descendant_pending"
             }
             Self::ThreadTimelineReturnedBlocks => "thread_timeline.blocks.returned",
+            Self::CliRuntimeStaleTurnSelected => "cli_runtime.stale_turn.selected",
+            Self::CliRuntimeStaleTurnProcessed => "cli_runtime.stale_turn.processed",
         }
     }
 
@@ -940,6 +947,8 @@ impl GatewayOperationItemKind {
                 "thread_timeline.blocks.descendant_pending.count"
             }
             Self::ThreadTimelineReturnedBlocks => "thread_timeline.blocks.returned.count",
+            Self::CliRuntimeStaleTurnSelected => "cli_runtime.stale_turn.selected.count",
+            Self::CliRuntimeStaleTurnProcessed => "cli_runtime.stale_turn.processed.count",
         }
     }
 }

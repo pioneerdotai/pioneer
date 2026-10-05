@@ -1,3 +1,6 @@
+#[path = "tests/cli_runtime_active_bindings.rs"]
+mod cli_runtime_active_bindings;
+
 #[path = "tests/task_run_occurrence_tracker.rs"]
 mod task_run_occurrence_tracker;
 
@@ -645,6 +648,7 @@ struct RecordingCliRuntimeSession {
     turn_steer_result: TokioMutex<Option<CLIAgentRuntimeTurnSteerResult>>,
     turn_observation: TokioMutex<Option<CLIAgentRuntimeTurnObservation>>,
     turn_liveness_probe: TokioMutex<Option<CLIAgentRuntimeTurnLivenessProbe>>,
+    turn_liveness_probe_started: tokio::sync::Notify,
     mcp_preparations: TokioMutex<Vec<(String, String)>>,
     projected_mcp_store: TokioMutex<Option<Arc<CrudStore>>>,
     mcp_retargets: TokioMutex<Vec<(String, String, String)>>,
@@ -966,6 +970,7 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         _native_thread_id: &str,
         _native_turn_id: &str,
     ) -> anyhow::Result<CLIAgentRuntimeTurnLivenessProbe> {
+        self.turn_liveness_probe_started.notify_one();
         Ok(self
             .turn_liveness_probe
             .lock()
@@ -44346,6 +44351,7 @@ async fn cli_runtime_stale_silent_running_binding_schedules_recovery_impl() {
                 .fixed_offset()
                 .timestamp_millis()
                 .saturating_add(20 * 60 * 1_000),
+            &mut super::cli_runtime::CliRuntimeStaleTurnScan::default(),
         )
         .await;
 
@@ -44666,7 +44672,12 @@ fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_
             .fixed_offset()
             .timestamp_millis()
             .saturating_add(20 * 60 * 1_000);
-        processor.fail_stale_cli_runtime_turns(first_probe_ms).await;
+        processor
+            .fail_stale_cli_runtime_turns(
+                first_probe_ms,
+                &mut super::cli_runtime::CliRuntimeStaleTurnScan::default(),
+            )
+            .await;
         let (_workspace_id, turn) = crud_store
             .get_turn(thread_id, turn_id)
             .await
@@ -44698,7 +44709,10 @@ fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_
             })],
         });
         processor
-            .fail_stale_cli_runtime_turns(first_probe_ms.saturating_add(20 * 60 * 1_000))
+            .fail_stale_cli_runtime_turns(
+                first_probe_ms.saturating_add(20 * 60 * 1_000),
+                &mut super::cli_runtime::CliRuntimeStaleTurnScan::default(),
+            )
             .await;
 
         let (_workspace_id, turn) = crud_store
@@ -44887,6 +44901,7 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
                 .fixed_offset()
                 .timestamp_millis()
                 .saturating_add(20 * 60 * 1_000),
+            &mut super::cli_runtime::CliRuntimeStaleTurnScan::default(),
         )
         .await;
 
@@ -46601,6 +46616,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
                     .fixed_offset()
                     .timestamp_millis()
                     .saturating_add(20 * 60 * 1_000),
+                &mut super::cli_runtime::CliRuntimeStaleTurnScan::default(),
             )
             .await;
         assert!(
@@ -47277,6 +47293,7 @@ async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
                 .fixed_offset()
                 .timestamp_millis()
                 .saturating_add(20 * 60 * 1_000),
+            &mut super::cli_runtime::CliRuntimeStaleTurnScan::default(),
         )
         .await;
 
@@ -47401,7 +47418,10 @@ async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
         .expect("turn should complete in durable store after opening the request");
 
     processor
-        .fail_stale_cli_runtime_turns(chrono::Utc::now().fixed_offset().timestamp_millis())
+        .fail_stale_cli_runtime_turns(
+            chrono::Utc::now().fixed_offset().timestamp_millis(),
+            &mut super::cli_runtime::CliRuntimeStaleTurnScan::default(),
+        )
         .await;
 
     let pending = crud_store
@@ -51608,7 +51628,12 @@ async fn cli_runtime_human_wait_defers_stale_turn_scan() {
     let scan_now = chrono::Utc::now()
         .timestamp_millis()
         .saturating_add(200_000);
-    processor.fail_stale_cli_runtime_turns(scan_now).await;
+    processor
+        .fail_stale_cli_runtime_turns(
+            scan_now,
+            &mut super::cli_runtime::CliRuntimeStaleTurnScan::default(),
+        )
+        .await;
 
     let (_workspace_id, turn) = crud_store
         .get_turn("thread_cli_command_approval", "codex-turn-command")
@@ -51642,7 +51667,12 @@ async fn cli_runtime_human_wait_expires_without_blocking_the_turn() {
     let scan_now = chrono::Utc::now()
         .timestamp_millis()
         .saturating_add(24 * 60 * 60 * 1_000 + 1);
-    processor.fail_stale_cli_runtime_turns(scan_now).await;
+    processor
+        .fail_stale_cli_runtime_turns(
+            scan_now,
+            &mut super::cli_runtime::CliRuntimeStaleTurnScan::default(),
+        )
+        .await;
 
     let pending = crud_store
         .get_cli_runtime_pending_request(opened.request_id.as_str())
