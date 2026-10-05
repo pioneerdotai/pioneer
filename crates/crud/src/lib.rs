@@ -1228,16 +1228,6 @@ pub struct ClaimedTurnEventDeliveryRecord {
     pub event: AppendedTurnEvent,
 }
 
-/// Persisted native turns that still claim `in_progress` after a process
-/// restart.  CLI-backed turns are excluded by their durable binding; the
-/// recovery coordinator uses this list to reconcile turns that never produced
-/// a running item attempt or recovery job.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InProgressNativeTurnRecord {
-    pub thread_id: String,
-    pub turn_id: String,
-}
-
 /// A terminal task-owned child Turn whose TaskRun aggregate has not yet
 /// consumed the terminal outcome. The row itself is the durable retry token:
 /// reconciliation can be repeated without depending on a process-local
@@ -4515,39 +4505,6 @@ impl CrudStore {
 
     pub async fn delete_expired_turn_llm_context(&self) -> Result<u64> {
         turn_llm_context::delete_expired_turn_llm_context(&self.connection).await
-    }
-
-    pub async fn list_in_progress_native_turns(
-        &self,
-        limit: u64,
-    ) -> Result<Vec<InProgressNativeTurnRecord>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let rows = self
-            .connection
-            .query_all_raw(Statement::from_sql_and_values(
-                self.connection.get_database_backend(),
-                "SELECT t.thread_id, t.id AS turn_id FROM \"turn\" t \
-                 WHERE t.status = 'in_progress' \
-                   AND t.turn_kind = 'conversation' \
-                   AND NOT EXISTS (SELECT 1 FROM turn_execution e WHERE e.turn_id = t.id) \
-                   AND EXISTS (SELECT 1 FROM turn_runtime_snapshot s WHERE s.turn_id = t.id) \
-                   AND NOT EXISTS (SELECT 1 FROM turn_cli_runtime_binding c WHERE c.turn_id = t.id) \
-                 ORDER BY t.updated_at ASC, t.id ASC LIMIT ?"
-                    .to_owned(),
-                [i64::try_from(limit).unwrap_or(i64::MAX).into()],
-            ))
-            .await
-            .context("failed to list in-progress native turns for orphan reconciliation")?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(InProgressNativeTurnRecord {
-                    thread_id: row.try_get("", "thread_id")?,
-                    turn_id: row.try_get("", "turn_id")?,
-                })
-            })
-            .collect()
     }
 
     pub async fn list_unreconciled_terminal_task_child_turns(
@@ -32704,54 +32661,6 @@ mod tests {
             .expect("the current execution owner should append the event");
     }
 
-    #[tokio::test]
-    async fn legacy_orphan_scan_requires_positive_native_runtime_evidence() {
-        let (store, _, _) = test_store_with_started_turn(
-            "ws_legacy_native_evidence",
-            "thr_legacy_native_evidence",
-            "turn_legacy_native_evidence",
-        )
-        .await;
-        assert!(
-            store
-                .list_in_progress_native_turns(10)
-                .await
-                .expect("legacy orphan scan should succeed")
-                .is_empty(),
-            "absence of a CLI binding must not classify an old Turn as native"
-        );
-
-        let timestamp = unix_to_datetime(1_700_000_100);
-        store
-            .upsert_turn_runtime_snapshot(NewTurnRuntimeSnapshot {
-                turn_id: "turn_legacy_native_evidence".to_owned(),
-                thread_id: "thr_legacy_native_evidence".to_owned(),
-                workspace_id: "ws_legacy_native_evidence".to_owned(),
-                mode_json: r#""Agent""#.to_owned(),
-                model: "test-model".to_owned(),
-                provider_name: "test-provider".to_owned(),
-                reasoning_effort: None,
-                agent_skill_versions_json: None,
-                hook_runtime_context_json: "{}".to_owned(),
-                workspace_skill_policies_json: "[]".to_owned(),
-                input_json: "[]".to_owned(),
-                capabilities_json: "[]".to_owned(),
-                resolved_artifacts_json: "[]".to_owned(),
-                runtime_environment_json: "{}".to_owned(),
-                history_json: "[]".to_owned(),
-                created_at: timestamp,
-                updated_at: timestamp,
-            })
-            .await
-            .expect("legacy native runtime evidence should persist");
-        let candidates = store
-            .list_in_progress_native_turns(10)
-            .await
-            .expect("legacy orphan scan should succeed");
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].turn_id, "turn_legacy_native_evidence");
-    }
-
     async fn append_optional_delivery_test_items(
         store: &CrudStore,
         thread: &Thread,
@@ -50899,6 +50808,7 @@ mod tests {
             .all(&connection)
             .await
             .expect("must query turn events");
+        assert!(store.get_turn_execution(&turn.id).await.unwrap().is_none());
         assert_eq!(events.len(), 2);
         assert_eq!(
             events[0].event_type,
@@ -50931,6 +50841,176 @@ mod tests {
             TurnItemEventPayload::TurnPermissionAudit(audit)
                 if audit.event_kind == TurnPermissionAuditEventKind::ProfileSelected
         )));
+    }
+
+    #[tokio::test]
+    async fn authorized_admission_rolls_back_on_owner_failure_and_replay_preserves_receipt() {
+        let store = test_store_with_workspace("ws_owner_admission").await;
+        let timestamp = 1_700_000_000;
+        let thread = sample_thread("ws_owner_admission", "thr_owner_admission", timestamp);
+        let security_snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            "/workspace/owner-admission",
+            timestamp * 1000,
+        );
+        for kind in [
+            crate::TurnExecutorKind::NativeAgent,
+            crate::TurnExecutorKind::ApiProvider,
+            crate::TurnExecutorKind::CliRuntime,
+            crate::TurnExecutorKind::AcpRuntime,
+        ] {
+            let mut turn = sample_turn(&format!("turn_owner_{}", kind.as_str()));
+            turn.mode = ThreadMode::Agent;
+            let audit = pioneer_protocol::TurnPermissionAuditEvent {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn_id: turn.id.clone(),
+                event_kind: TurnPermissionAuditEventKind::ProfileSelected,
+                profile_mode: turn.permission_profile.mode,
+                profile_source: turn.permission_profile.source,
+                security_snapshot_id: None,
+                security_snapshot_version: None,
+                security_reason_code: None,
+                security_capability: None,
+                item_id: None,
+                tool_call_id: None,
+                tool_name: None,
+                action_kind: None,
+                request_key: None,
+                decision: None,
+                reason: None,
+                cached: false,
+            };
+            let admission = crate::NewTurnAdmission {
+                turn_id: turn.id.clone(),
+                thread_id: thread.id.clone(),
+                workspace_id: thread.workspace_id.clone(),
+                request_digest: "a".repeat(64),
+                policy_generation: None,
+                role_key: None,
+                policy_fingerprint: None,
+                execution_lease: None,
+            };
+            let execution = crate::NewTurnExecution {
+                turn_id: turn.id.clone(),
+                thread_id: thread.id.clone(),
+                workspace_id: thread.workspace_id.clone(),
+                executor_kind: kind,
+                executor_key: Some("test-executor".to_owned()),
+                status: crate::TurnExecutionStatus::Starting,
+                owner_id: "admitting-owner".to_owned(),
+                lease_until: unix_to_datetime(timestamp + 45),
+                created_at: unix_to_datetime(timestamp),
+            };
+            // Fail at the ownership write, after Turn events, projections and
+            // admission have already been written inside the transaction.
+            store
+                .connection
+                .execute_unprepared(
+                    "CREATE TRIGGER reject_admission_owner BEFORE INSERT ON turn_execution \
+                 BEGIN SELECT RAISE(ABORT, 'injected ownership failure'); END",
+                )
+                .await
+                .unwrap();
+            for reject_owner in [true, false] {
+                let result = store
+                    .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
+                        &thread,
+                        SandboxMode::FullAccess,
+                        &turn,
+                        &[UserInput::Text {
+                            text: "execute admitted work".to_owned(),
+                            text_elements: Vec::new(),
+                        }],
+                        None,
+                        TurnWorkOwner::Turn,
+                        PersistedActorRef::System,
+                        audit.clone(),
+                        r#"{"kind":"test_explicit_authority"}"#,
+                        None,
+                        Some(admission.clone()),
+                        Some(execution.clone()),
+                        &security_snapshot,
+                        Vec::new(),
+                        None,
+                        None,
+                    )
+                    .await;
+                if reject_owner {
+                    let error = result.expect_err("owner failure must roll back admission");
+                    assert!(format!("{error:#}").contains("injected ownership failure"));
+                    assert!(
+                        store
+                            .get_turn(&thread.id, &turn.id)
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert!(store.get_turn_admission(&turn.id).await.unwrap().is_none());
+                    assert!(store.get_turn_execution(&turn.id).await.unwrap().is_none());
+                    assert!(
+                        pioneer_entity::turn_event::Entity::find()
+                            .filter(pioneer_entity::turn_event::Column::TurnId.eq(&turn.id))
+                            .all(&store.connection)
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                    assert!(
+                        pioneer_entity::turn_event_projection_state::Entity::find()
+                            .filter(
+                                pioneer_entity::turn_event_projection_state::Column::TurnId
+                                    .eq(&turn.id)
+                            )
+                            .all(&store.connection)
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                    store
+                        .connection
+                        .execute_unprepared("DROP TRIGGER reject_admission_owner")
+                        .await
+                        .unwrap();
+                } else {
+                    result.expect("Turn and ownership should commit together");
+                }
+            }
+            assert!(
+                store
+                    .get_turn(&thread.id, &turn.id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(store.get_turn_admission(&turn.id).await.unwrap().is_some());
+            let admitted = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+            assert_eq!(admitted.executor_kind, kind);
+            assert_eq!(admitted.owner_id, "admitting-owner");
+            assert_eq!(admitted.owner_generation, 1);
+            let claimed = store
+                .claim_expired_turn_execution(
+                    &admitted,
+                    "replacement-owner",
+                    timestamp + 46,
+                    timestamp + 91,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(claimed.owner_generation, 2);
+            // Projection-state loss permits replay of sequence 1. It must
+            // neither create an owner nor reset the existing ownership CAS.
+            mark_first_turn_projection_failed(&store, &turn.id, timestamp + 47).await;
+            let replay = store
+                .replay_due_turn_event_projections(timestamp + 47, 1)
+                .await
+                .unwrap();
+            assert_eq!(replay.projected, 1);
+            assert_eq!(
+                store.get_turn_execution(&turn.id).await.unwrap().unwrap(),
+                claimed
+            );
+        }
     }
 
     #[tokio::test]
