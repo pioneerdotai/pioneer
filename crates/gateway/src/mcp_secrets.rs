@@ -24,40 +24,66 @@ pub(crate) async fn garbage_collection_orphan_mcp_secrets(
     dry_run: bool,
 ) -> Result<McpSecretGarbageCollectionReport> {
     let crud_store = crud_store.with_maintenance_access();
-    let rows = crud_store
-        .list_all_mcp_server_installations()
-        .await
-        .context("failed to list active MCP installations for secret GC")?;
-
-    let mut active_refs = BTreeSet::new();
-    for row in rows {
-        let refs = serde_json::from_str::<Vec<McpSecretRef>>(row.secret_refs_json.as_str())
-            .with_context(|| {
-                format!(
-                    "failed to decode MCP secret refs for installation `{}` ({}/{})",
-                    row.name, row.scope_kind, row.scope_key
-                )
-            })?;
-        active_refs.extend(refs.into_iter().map(|secret_ref| secret_ref.ref_id));
-    }
-
-    // OAuth registrations live in their own namespace. Re-read installation IDs
-    // after enumerating secrets, so a concurrently completed install is retained.
+    // Enumerate metadata first. Fresh owned refs/UUIDs created afterwards cannot
+    // be this run's orphan candidates. One DB snapshot retains pending and
+    // committed native owners without a gap between their atomic transitions.
+    let stored_refs = gateway_secrets
+        .list_mcp_secret_refs()
+        .context("failed to list stored MCP secret refs for GC")?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let oauth = gateway_secrets.mcp_oauth_persistence();
     let oauth_ids = oauth
         .ids()
         .await
         .map_err(|_| anyhow::anyhow!("OAuth secret enumeration failed"))?;
+    let retention = crud_store.plugin_credential_retention().await?;
+    let mut active_refs = BTreeSet::new();
+    let mut active_ids = std::collections::HashSet::new();
+    for (kind, owner, payload) in retention {
+        if kind == "native" {
+            active_ids.insert(owner);
+            let refs: Vec<McpSecretRef> = serde_json::from_str(&payload)?;
+            active_refs.extend(refs.into_iter().map(|entry| entry.ref_id));
+        } else {
+            anyhow::ensure!(
+                payload.len() <= 65536,
+                "pending credential retention exceeds bound"
+            );
+            let plan: serde_json::Value = serde_json::from_str(&payload)?;
+            for child in plan
+                .get("children")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if child.get("kind").and_then(serde_json::Value::as_str) == Some("mcp") {
+                    if let Some(id) = child.get("id").and_then(serde_json::Value::as_str) {
+                        active_ids.insert(id.to_owned());
+                    }
+                }
+            }
+            for field in ["cleanup_refs", "retained_refs"] {
+                for entry in plan
+                    .get(field)
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    active_refs.insert(
+                        entry
+                            .as_str()
+                            .ok_or_else(|| anyhow::anyhow!("invalid pending credential reference"))?
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+    }
     let oauth_stored = oauth_ids.len();
     let mut oauth_orphans = 0;
     let mut oauth_deleted = 0;
     if !oauth_ids.is_empty() {
-        let active_ids = crud_store
-            .list_all_mcp_server_installations()
-            .await?
-            .into_iter()
-            .filter_map(|row| row.id)
-            .collect::<std::collections::HashSet<_>>();
         for id in oauth_ids {
             if !active_ids.contains(&id) {
                 oauth_orphans += 1;
@@ -71,12 +97,6 @@ pub(crate) async fn garbage_collection_orphan_mcp_secrets(
             }
         }
     }
-
-    let stored_refs = gateway_secrets
-        .list_mcp_secret_refs()
-        .context("failed to list stored MCP secret refs for GC")?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
 
     let orphan_refs = stored_refs
         .difference(&active_refs)
@@ -110,6 +130,83 @@ mod tests {
     use pioneer_keystore::{MemorySecretStore, SecretId, SecretKind, SecretMeta, SecretStore};
     use sea_orm::Database;
     use std::sync::Arc;
+
+    // NOT_RUN / NOT_COMPILED. In-memory fixture only; no user's keystore.
+    #[tokio::test]
+    async fn interrupted_parent_retains_uncertain_refs_until_explicit_cleanup() {
+        use sea_orm::{EntityTrait, Set};
+        let (store, secrets) = setup_gc().await;
+        let now = chrono::Utc::now().fixed_offset();
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set("ws_gc".into()),
+            name: Set("GC fixture".into()),
+            is_active: Set(true),
+            is_current: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        })
+        .exec(store.database_connection())
+        .await
+        .unwrap();
+        let id = "P".repeat(21);
+        let pending = serde_json::json!({"kind":"native","native_committed":false,
+            "children":[{"kind":"mcp","id":"reserved_native"}],"cleanup_refs":["uncertain"]})
+        .to_string();
+        store
+            .insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+                id: id.clone(),
+                workspace_id: "ws_gc".into(),
+                name: "fixture.tools".into(),
+                version: None,
+                source_upload_id: "fixture".into(),
+                package_path: "/managed/package".into(),
+                data_path: "/managed/data".into(),
+                package_fingerprint: "fixture".into(),
+                enabled: true,
+                state: "interrupted".into(),
+                revision: 1,
+                pending_json: Some(pending.clone()),
+                last_error: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        secrets
+            .put_mcp_secret("uncertain", "fixture value", None)
+            .unwrap();
+        secrets
+            .put_mcp_secret("orphan", "fixture orphan", None)
+            .unwrap();
+        let report = garbage_collection_orphan_mcp_secrets(&store, &secrets, false)
+            .await
+            .unwrap();
+        assert_eq!(report.deleted_refs, 1);
+        assert!(secrets.get_mcp_secret("uncertain").unwrap().is_some());
+        assert!(secrets.get_mcp_secret("orphan").unwrap().is_none());
+        assert_eq!(
+            store
+                .find_plugin_installation(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_json
+                .as_deref(),
+            Some(pending.as_str())
+        );
+        secrets.delete_mcp_secret("uncertain").unwrap();
+        store
+            .finish_plugin_mutation(&id, 1, "installed", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            garbage_collection_orphan_mcp_secrets(&store, &secrets, false)
+                .await
+                .unwrap()
+                .active_refs,
+            0
+        );
+    }
 
     #[tokio::test]
     async fn oauth_gc_keeps_active_registration_and_deletes_only_orphans_after_restart() {

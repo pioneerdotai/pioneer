@@ -1261,6 +1261,7 @@ impl MessageProcessor {
                             p.workspace_id == workspace_id
                                 && p.enabled
                                 && p.state == "installed"
+                                && p.pending_json.is_none()
                                 && p.revision == *expected_revision
                         })
                         .ok_or_else(|| {
@@ -3449,6 +3450,24 @@ impl MessageProcessor {
         prepared: PreparedApiProviderTurnStart,
     ) {
         let outcome = prepared.outcome;
+        let plugin_launch = match self
+            .acquire_plugin_launch_guards(
+                &outcome.started_notification.workspace_id,
+                &outcome.started_notification.turn.id,
+            )
+            .await
+        {
+            Ok(guards) => guards,
+            Err(_) => {
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    "plugin admission changed; refresh the selection".into(),
+                )
+                .await;
+                return;
+            }
+        };
         let start_result = self
             .agent_manager
             .start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
@@ -3470,6 +3489,7 @@ impl MessageProcessor {
                 prepared.execution_security_snapshot,
             )
             .await;
+        drop(plugin_launch);
         if let Err(error) = start_result {
             let reason = format!("failed to dispatch turn to agent runtime: {error}");
             if !self

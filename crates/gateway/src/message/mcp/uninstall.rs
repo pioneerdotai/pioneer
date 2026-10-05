@@ -47,6 +47,109 @@ impl MessageProcessor {
         request_id: RequestId,
         params: McpUninstallParams,
     ) -> std::result::Result<McpUninstallResponse, JsonRpcErrorResponse> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let scope = if params.scope_kind.as_str() == "workspace" {
+            params.workspace_id.as_str()
+        } else {
+            "default"
+        };
+        let row = self
+            .crud_store
+            .find_mcp_server_installation(params.scope_kind.as_str(), scope, params.name.trim())
+            .await
+            .map_err(|_| {
+                mcp_error(
+                    Some(request_id.clone()),
+                    INVALID_REQUEST_CODE,
+                    MCP_ERROR_INTERNAL,
+                    "failed to read MCP installation",
+                    json!({}),
+                )
+            })?;
+        let native = match row.as_ref().and_then(|row| row.id.as_deref()) {
+            Some(id) => self
+                .begin_native_plugin_change(
+                    request_context,
+                    &request_id,
+                    &params.workspace_id,
+                    "mcp",
+                    id,
+                    "remove",
+                    &[],
+                    deadline,
+                )
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        MCP_ERROR_INVALID_REQUEST,
+                        super::super::plugins::native_plugin_error_code(&error),
+                        json!({}),
+                    )
+                })?,
+            None => None,
+        };
+        let owned = native.is_some();
+        let work = self.uninstall_mcp_with_plugin_change(
+            request_context,
+            request_id.clone(),
+            params,
+            native.as_ref().map(|change| &change.write),
+        );
+        let result = if owned {
+            tokio::time::timeout_at(deadline, work)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(mcp_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        MCP_ERROR_INTERNAL,
+                        "plugin change deadline exceeded",
+                        json!({}),
+                    ))
+                })
+        } else {
+            work.await
+        };
+        match (result, native) {
+            (Ok(payload), Some(change)) => {
+                self.finish_native_plugin_change(change)
+                    .await
+                    .map_err(|error| {
+                        mcp_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            MCP_ERROR_INTERNAL,
+                            super::super::plugins::native_plugin_error_code(&error),
+                            json!({}),
+                        )
+                    })?;
+                Ok(payload)
+            }
+            (Err(_), Some(change)) => {
+                let _ = self
+                    .interrupt_native_plugin_change(&change, "plugins.component_remove_failed")
+                    .await;
+                Err(mcp_error(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    MCP_ERROR_INTERNAL,
+                    "plugin component removal requires repair",
+                    json!({}),
+                ))
+            }
+            (result, None) => result,
+        }
+    }
+
+    pub(crate) async fn uninstall_mcp_with_plugin_change(
+        &self,
+        request_context: &RequestContext,
+        request_id: RequestId,
+        params: McpUninstallParams,
+        native: Option<&pioneer_crud::PluginNativeWrite>,
+    ) -> std::result::Result<McpUninstallResponse, JsonRpcErrorResponse> {
         let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_mcp_workspace(
@@ -161,9 +264,47 @@ impl MessageProcessor {
             created_at_unix: now,
         };
 
+        if let Some(write) = native {
+            if row.id.as_deref() != Some(write.child_id.as_str()) {
+                return Err(mcp_error(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    MCP_ERROR_INVALID_REQUEST,
+                    "plugin component identity changed",
+                    json!({}),
+                ));
+            }
+            // The parent remains closed and the native row retains the opaque
+            // references until both real cleanup operations acknowledge success.
+            self.mcp_service
+                .oauth()
+                .disconnect(&server_id)
+                .await
+                .map_err(|_| {
+                    mcp_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        MCP_ERROR_INTERNAL,
+                        "MCP OAuth cleanup requires repair",
+                        json!({}),
+                    )
+                })?;
+            let cleanup = self
+                .gateway_secrets
+                .delete_mcp_secrets(secret_ref_ids.iter().map(String::as_str));
+            if !cleanup.failed.is_empty() {
+                return Err(mcp_error(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    MCP_ERROR_INTERNAL,
+                    "MCP secret cleanup requires repair",
+                    json!({}),
+                ));
+            }
+        }
         if let Err(error) = self
             .crud_store
-            .delete_mcp_server_installation_with_audit(&row, &audit)
+            .delete_mcp_server_installation_with_plugin_change(&row, &audit, native)
             .await
         {
             return Err(mcp_error(
@@ -175,7 +316,9 @@ impl MessageProcessor {
             ));
         }
 
-        if let Err(error) = self.mcp_service.oauth().disconnect(&server_id).await {
+        if native.is_none()
+            && let Err(error) = self.mcp_service.oauth().disconnect(&server_id).await
+        {
             warn!(reason=%error.message,"MCP OAuth cleanup deferred");
         }
         drop(lifecycle);

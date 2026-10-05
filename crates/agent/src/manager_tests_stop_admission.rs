@@ -126,6 +126,26 @@ async fn accepted_start_with_cancelled_expired_ack_waiter_is_unknown_until_actua
     let waiter =
         tokio::spawn(async move { start_at_actor_seam(&native, "admission", "turn").await });
     let registry = enqueued_registry(&manager, "admission", "turn").await;
+    assert_eq!(
+        registry
+            .lock_state()
+            .entries
+            .get(&AgentControlOperationId::StartTurn {
+                turn_id: "turn".into()
+            })
+            .unwrap()
+            .admitted_turn_id
+            .as_deref(),
+        Some("turn")
+    );
+    assert!(
+        manager
+            .native_stop_thread_ids()
+            .await
+            .unwrap()
+            .contains(&"admission".into())
+    );
+
     assert!(matches!(
         manager
             .capture_native_stop_owners(&["admission".into()], 8)
@@ -160,6 +180,14 @@ async fn accepted_start_with_cancelled_expired_ack_waiter_is_unknown_until_actua
     );
     drop(dependencies);
     let owner = published_owner(&manager, "admission", "turn").await;
+    assert!(
+        manager
+            .native_stop_turn_candidates(&["admission".into()])
+            .await
+            .unwrap()
+            .contains(&("admission".into(), "turn".into()))
+    );
+
     manager
         .cancel_captured_turn_and_wait(
             &owner,

@@ -1,4 +1,4 @@
-//! Stage A regressions. NOT_RUN; test targets have not been compiled.
+//! Plugin regressions. NOT_RUN; test targets have not been compiled.
 use super::tests::{pack_skill_record, skill_pack_record, test_store_with_workspace};
 use super::*;
 use pioneer_entity::plugin_installation;
@@ -100,6 +100,323 @@ fn mcp_audit(row: &McpServerInstallationRecord) -> McpAuditEventRecord {
         details_json: "{}".into(),
         created_at_unix: 1,
     }
+}
+
+#[tokio::test]
+async fn package_update_retains_native_identity_policy_overrides_and_successful_sibling() {
+    let store = test_store_with_workspace("ws-update").await;
+    let id = "P".repeat(21);
+    store
+        .insert_plugin_installation(&parent(&id, "ws-update"))
+        .await
+        .unwrap();
+    let first = skill('A', "ws-update");
+    let sibling = skill('B', "ws-update");
+    for (row, key) in [(&first, "one"), (&sibling, "two")] {
+        store
+            .install_skill_lifecycle_with_ownership(
+                row,
+                &policy(row),
+                &[],
+                None,
+                Some(&ownership(&id, row.skill_id.as_str(), key)),
+                1,
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .settle_plugin_installation(&id, 1, "installed", None)
+        .await
+        .unwrap();
+    let native = store
+        .begin_plugin_mutation(
+            "ws-update",
+            &id,
+            1,
+            "updating",
+            true,
+            "{\"kind\":\"native\",\"action\":\"policy\",\"native_committed\":false}",
+        )
+        .await
+        .unwrap();
+    let write = PluginNativeWrite {
+        plugin_id: id.clone(),
+        expected_revision: native.revision,
+        member_key: "one".into(),
+        child_id: first.skill_id.to_string(),
+        override_fields_json: "[\"enabled\",\"allow_implicit_invocation\"]".into(),
+        pending_after: "{\"kind\":\"native\",\"native_committed\":true}".into(),
+    };
+    store
+        .upsert_workspace_skill_policy_with_plugin_change(&policy(&first), Some(&write), 2)
+        .await
+        .unwrap();
+    store
+        .finish_plugin_mutation(&id, native.revision, "installed", None)
+        .await
+        .unwrap();
+    let gate = store
+        .begin_plugin_mutation(
+            "ws-update",
+            &id,
+            native.revision,
+            "updating",
+            true,
+            "{\"kind\":\"update\",\"children\":[]}",
+        )
+        .await
+        .unwrap();
+    let mut owned = ownership(&id, first.skill_id.as_str(), "one");
+    owned.expected_revision = gate.revision;
+    owned.package_fingerprint = "new-assets".into();
+    let patch = SkillInstallationPatch {
+        fingerprint: Some("new-markdown".into()),
+        trust_level: Some(first.trust_level.clone()),
+        ..Default::default()
+    };
+    assert!(
+        store
+            .update_skill_lifecycle_with_plugin_change(
+                &first.skill_id,
+                &patch,
+                &[],
+                None,
+                Some(&owned),
+                None,
+                3
+            )
+            .await
+            .unwrap()
+    );
+    let link = store
+        .find_skill_plugin_owner(&first.skill_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(link.skill_id.as_deref(), Some(first.skill_id.as_str()));
+    assert_eq!(link.package_fingerprint.as_deref(), Some("new-assets"));
+    assert_eq!(link.override_fields_json, write.override_fields_json);
+    let restrictions = store
+        .list_workspace_skill_policies("ws-update")
+        .await
+        .unwrap();
+    assert!(
+        restrictions
+            .iter()
+            .all(|row| row.enabled == Some(false) && row.allow_implicit_invocation == Some(false))
+    );
+    let untouched = store
+        .find_skill_installation(&sibling.skill_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(untouched.fingerprint, sibling.fingerprint);
+    assert_eq!(
+        store
+            .find_skill_plugin_owner(&sibling.skill_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .package_fingerprint
+            .as_deref(),
+        Some("member-tree")
+    );
+    assert!(
+        !store
+            .plugin_child_available("skill", first.skill_id.as_str(), "ws-update")
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn interrupted_package_removal_is_repairable_and_cannot_forget_a_live_native_child() {
+    let store = test_store_with_workspace("ws-package-remove").await;
+    let id = "P".repeat(21);
+    store
+        .insert_plugin_installation(&parent(&id, "ws-package-remove"))
+        .await
+        .unwrap();
+    let child = skill('A', "ws-package-remove");
+    store
+        .install_skill_lifecycle_with_ownership(
+            &child,
+            &policy(&child),
+            &[],
+            None,
+            Some(&ownership(&id, child.skill_id.as_str(), "one")),
+            1,
+        )
+        .await
+        .unwrap();
+    store
+        .settle_plugin_installation(&id, 1, "installed", None)
+        .await
+        .unwrap();
+    let gate = store
+        .begin_plugin_mutation(
+            "ws-package-remove",
+            &id,
+            1,
+            "updating",
+            true,
+            "{\"kind\":\"update\",\"children\":[]}",
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .forget_plugin_component(&id, gate.revision, "skill", "one")
+            .await
+            .is_err()
+    );
+    let write = PluginNativeWrite {
+        plugin_id: id.clone(),
+        expected_revision: gate.revision,
+        member_key: "one".into(),
+        child_id: child.skill_id.to_string(),
+        override_fields_json: "[]".into(),
+        pending_after: gate.pending_json.clone().unwrap(),
+    };
+    assert!(
+        store
+            .uninstall_skill_installation_lifecycle_with_plugin_change(&child, &[], Some(&write), 2)
+            .await
+            .unwrap()
+    );
+    let removed = store
+        .list_plugin_components(&id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(removed.skill_id.is_none());
+    assert_eq!(removed.status, "failed");
+    assert_eq!(
+        removed.diagnostic.as_deref(),
+        Some("component_removed_for_update")
+    );
+    store
+        .finish_plugin_mutation(&id, gate.revision, "interrupted", None)
+        .await
+        .unwrap();
+    let current = store.find_plugin_installation(&id).await.unwrap().unwrap();
+    assert_eq!(current.pending_json, gate.pending_json);
+    let resumed = store
+        .resume_plugin_mutation(
+            "ws-package-remove",
+            &id,
+            current.revision,
+            current.pending_json.as_deref().unwrap(),
+            "{\"kind\":\"update\",\"children\":[]}",
+            "updating",
+        )
+        .await
+        .unwrap();
+    store
+        .forget_plugin_component(&id, resumed.revision, "skill", "one")
+        .await
+        .unwrap();
+    assert!(store.list_plugin_components(&id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn update_upload_consumption_and_repair_gate_share_one_authorized_write() {
+    let store = test_store_with_workspace("ws-upload-update").await;
+    let id = "P".repeat(21);
+    store
+        .insert_plugin_installation(&parent(&id, "ws-upload-update"))
+        .await
+        .unwrap();
+    store
+        .settle_plugin_installation(&id, 1, "installed", None)
+        .await
+        .unwrap();
+    let upload = SkillUploadSessionRecord {
+        purpose: "plugin".into(),
+        upload_id: "U".repeat(21),
+        workspace_id: "ws-upload-update".into(),
+        connection_id: 7,
+        status: "finalized".into(),
+        file_name: "package.tar.gz".into(),
+        archive_format: "tar_gz".into(),
+        compressed_size_bytes: 1,
+        received_bytes: 1,
+        sha256: "a".repeat(64),
+        payload_path: "/managed/upload".into(),
+        created_at_unix: 1,
+        expires_at_unix: 100,
+        finalized_at_unix: Some(2),
+        consumed_at_unix: None,
+        aborted_at_unix: None,
+    };
+    store.insert_skill_upload_session(&upload).await.unwrap();
+    let pending = "{\"kind\":\"update\",\"children\":[]}";
+    for (workspace, connection, now, revision) in [
+        ("foreign", 7, 3, 1),
+        ("ws-upload-update", 8, 3, 1),
+        ("ws-upload-update", 7, 100, 1),
+        ("ws-upload-update", 7, 3, 2),
+    ] {
+        assert!(
+            store
+                .begin_plugin_package_update(
+                    workspace,
+                    &id,
+                    revision,
+                    pending,
+                    &upload.upload_id,
+                    connection,
+                    now,
+                    None
+                )
+                .await
+                .is_err()
+        );
+        let current = store.find_plugin_installation(&id).await.unwrap().unwrap();
+        assert_eq!(current.revision, 1);
+        assert!(current.pending_json.is_none());
+    }
+    let gate = store
+        .begin_plugin_package_update(
+            "ws-upload-update",
+            &id,
+            1,
+            pending,
+            &upload.upload_id,
+            7,
+            3,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(gate.revision, 2);
+    assert_eq!(gate.pending_json.as_deref(), Some(pending));
+    assert!(
+        store
+            .begin_plugin_package_update(
+                "ws-upload-update",
+                &id,
+                2,
+                pending,
+                &upload.upload_id,
+                7,
+                3,
+                Some(pending)
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .find_plugin_installation(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        2
+    );
 }
 
 // B-02: native resolver output is supplied separately from durable bindings.

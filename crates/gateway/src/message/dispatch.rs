@@ -6026,7 +6026,7 @@ impl MessageProcessor {
                         }
                     }
                 }
-                methods::PLUGINS_LIST | methods::PLUGINS_DETAILS | methods::PLUGINS_PREVIEW | methods::PLUGINS_INSTALL => { self.plugins_request(&context, request).await; }
+                methods::PLUGINS_LIST | methods::PLUGINS_DETAILS | methods::PLUGINS_PREVIEW | methods::PLUGINS_INSTALL | methods::PLUGINS_SET_ENABLED | methods::PLUGINS_UPDATE | methods::PLUGINS_REMOVE | methods::PLUGINS_RETRY | methods::PLUGINS_CONTINUE => { self.plugins_request(&context, request).await; }
                 methods::SKILLS_INSTALL => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<SkillsInstallParams>(params_value) {

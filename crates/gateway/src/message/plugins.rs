@@ -1,5 +1,6 @@
-//! Stage B: bounded delivery and sequential calls to the native installers.
+//! Bounded package delivery and sequential calls to the native installers.
 use super::*;
+mod lifecycle;
 use pioneer_crud::PluginOwnershipWrite;
 use pioneer_plugins::{ComponentPlan, Entry, LoadedPluginPlan, Snapshot};
 use pioneer_protocol::constants::methods;
@@ -11,8 +12,11 @@ use std::path::Path;
 #[derive(Serialize, Deserialize)]
 struct PendingInstall {
     children: Vec<ReservedChild>,
+    published_fingerprint: String,
+    target_fingerprint: String,
+    denied: Vec<PluginComponentKey>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct ReservedChild {
     kind: String,
     key: String,
@@ -147,6 +151,7 @@ impl MessageProcessor {
         context: &RequestContext,
         request: JsonRpcRequest,
     ) -> Result<serde_json::Value, JsonRpcErrorResponse> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
         let id = &request.id;
         let params = request.params.unwrap_or_else(|| json!({}));
         let invalid = || plugin_error(id, "plugins.invalid_request");
@@ -156,7 +161,13 @@ impl MessageProcessor {
             .ok_or_else(invalid)?;
         let management = matches!(
             request.method.as_str(),
-            methods::PLUGINS_PREVIEW | methods::PLUGINS_INSTALL
+            methods::PLUGINS_PREVIEW
+                | methods::PLUGINS_INSTALL
+                | methods::PLUGINS_SET_ENABLED
+                | methods::PLUGINS_UPDATE
+                | methods::PLUGINS_REMOVE
+                | methods::PLUGINS_RETRY
+                | methods::PLUGINS_CONTINUE
         );
         self.plugin_admit(context, id, workspace, management)
             .await?;
@@ -200,6 +211,72 @@ impl MessageProcessor {
                         .map_err(|_| invalid())?
                 ))
             }
+            methods::PLUGINS_SET_ENABLED => {
+                let params: PluginsSetEnabledParams =
+                    serde_json::from_value(params).map_err(|_| invalid())?;
+                self.set_plugin_enabled(context, id, params, deadline)
+                    .await
+                    .map(|item| json!(item))
+            }
+            methods::PLUGINS_UPDATE
+            | methods::PLUGINS_REMOVE
+            | methods::PLUGINS_RETRY
+            | methods::PLUGINS_CONTINUE => {
+                let params = match request.method.as_str() {
+                    methods::PLUGINS_UPDATE => {
+                        let p: PluginsUpdateParams =
+                            serde_json::from_value(params).map_err(|_| invalid())?;
+                        PluginsMutateParams {
+                            workspace_id: p.workspace_id,
+                            plugin_id: p.plugin_id,
+                            expected_revision: p.expected_revision,
+                            intent: PluginManagementIntent::Update {
+                                upload_id: p.upload_id,
+                                expected_fingerprint: p.expected_fingerprint,
+                                confirm_changes: p.confirm_changes,
+                            },
+                        }
+                    }
+                    methods::PLUGINS_REMOVE => {
+                        let p: PluginsRemoveParams =
+                            serde_json::from_value(params).map_err(|_| invalid())?;
+                        PluginsMutateParams {
+                            workspace_id: p.workspace_id,
+                            plugin_id: p.plugin_id,
+                            expected_revision: p.expected_revision,
+                            intent: PluginManagementIntent::Remove {
+                                purge_data: p.purge_data,
+                            },
+                        }
+                    }
+                    methods::PLUGINS_RETRY => {
+                        let p: PluginsRetryParams =
+                            serde_json::from_value(params).map_err(|_| invalid())?;
+                        PluginsMutateParams {
+                            workspace_id: p.workspace_id,
+                            plugin_id: p.plugin_id,
+                            expected_revision: p.expected_revision,
+                            intent: PluginManagementIntent::Retry {
+                                components: p.components.unwrap_or_default(),
+                                restore_removed: p.restore_removed,
+                            },
+                        }
+                    }
+                    _ => {
+                        let p: PluginsContinueParams =
+                            serde_json::from_value(params).map_err(|_| invalid())?;
+                        PluginsMutateParams {
+                            workspace_id: p.workspace_id,
+                            plugin_id: p.plugin_id,
+                            expected_revision: p.expected_revision,
+                            intent: PluginManagementIntent::Continue,
+                        }
+                    }
+                };
+                self.mutate_plugin(context, id, params, deadline)
+                    .await
+                    .map(|result| json!(result))
+            }
             methods::PLUGINS_PREVIEW | methods::PLUGINS_INSTALL => {
                 let (upload_id, expected) = if request.method == methods::PLUGINS_INSTALL {
                     let params: PluginsInstallParams =
@@ -208,6 +285,21 @@ impl MessageProcessor {
                 } else {
                     let params: PluginsSourceParams =
                         serde_json::from_value(params).map_err(|_| invalid())?;
+                    if let Some(target) = params.target {
+                        return self
+                            .preview_plugin_update(
+                                context,
+                                id,
+                                PluginsUpdatePreviewParams {
+                                    workspace_id: params.workspace_id,
+                                    upload_id: params.upload_id,
+                                    plugin_id: target.plugin_id,
+                                    expected_revision: target.expected_revision,
+                                },
+                            )
+                            .await
+                            .map(|preview| json!(preview));
+                    }
                     (params.upload_id, None)
                 };
                 if expected.is_some()
@@ -354,6 +446,11 @@ impl MessageProcessor {
                     }
                 })
                 .collect(),
+            published_fingerprint: Snapshot::capture(&package, Default::default(), || false)
+                .map_err(|_| error())?
+                .tree_digest(),
+            target_fingerprint: plan.tree_digest.clone(),
+            denied: lifecycle::denied_keys(&snapshot, &plan),
         };
         let pending_json = serde_json::to_string(&pending).map_err(|_| error())?;
         if pending_json.len() > 65536 {
@@ -361,6 +458,11 @@ impl MessageProcessor {
             return Err(error());
         }
         let now = chrono::Utc::now().fixed_offset();
+        let _parent_guard = self
+            .plugin_mutation_lock(&plugin_id)
+            .await
+            .try_lock_owned()
+            .map_err(|_| error())?;
         let parent = pioneer_entity::plugin_installation::Model {
             id: plugin_id.clone(),
             workspace_id: workspace.into(),
@@ -397,6 +499,10 @@ impl MessageProcessor {
             let _ = std::fs::remove_dir_all(&root);
             return Err(error());
         }
+        let parent_guard = PluginMutationGuard {
+            parent: parent.clone(),
+            _lock: _parent_guard,
+        };
         self.skill_upload_owners
             .lock()
             .await
@@ -477,17 +583,57 @@ impl MessageProcessor {
                     .record_plugin_component_failure(
                         &ownership,
                         &reserved.kind,
-                        "component_install_failed",
+                        if let ComponentPlan::Skill { member_path, .. } = component {
+                            if snapshot.entries().iter().any(|(path, entry)| {
+                                matches!(entry, Entry::Denied)
+                                    && (path == member_path
+                                        || path.starts_with(&format!("{member_path}/")))
+                            }) {
+                                "component_path_denied"
+                            } else {
+                                "component_install_failed"
+                            }
+                        } else {
+                            "component_install_failed"
+                        },
                     )
                     .await
                     .map_err(|_| error())?;
             }
         }
         let diagnostics = serde_json::to_string(&public_diagnostics(&plan)).map_err(|_| error())?;
+        lifecycle::save_package_integrity(
+            &package,
+            &Snapshot::capture(&package, Default::default(), || false)
+                .map_err(|_| error())?
+                .tree_digest(),
+        )
+        .map_err(|_| error())?;
         self.crud_store
-            .settle_plugin_installation(&plugin_id, 1, "installed", Some(diagnostics))
+            .prepare_plugin_reload(&plugin_id, 1)
             .await
             .map_err(|_| error())?;
+        if self
+            .mcp_service
+            .reload_after_plugin_change(&parent_guard)
+            .await
+            .is_err()
+        {
+            self.crud_store
+                .finish_plugin_mutation(
+                    &plugin_id,
+                    1,
+                    "interrupted",
+                    Some("plugins.reload_unconfirmed".into()),
+                )
+                .await
+                .map_err(|_| error())?;
+        } else {
+            self.crud_store
+                .finish_plugin_mutation(&plugin_id, 1, "installed", Some(diagnostics))
+                .await
+                .map_err(|_| error())?;
+        }
         let parent = self
             .crud_store
             .find_plugin_installation(&plugin_id)
@@ -642,7 +788,28 @@ impl MessageProcessor {
             .last_error
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                if parent.state == "interrupted" {
+                    vec![PluginDiagnostic {
+                        code: match parent.last_error.as_deref() {
+                            Some("plugins.reapply_native_change") => "reapply_native_change",
+                            Some(
+                                "plugins.fresh_package_required"
+                                | "plugins.package_unavailable"
+                                | "plugins.package_changed"
+                                | "plugins.package_rejected"
+                                | "plugins.package_repair_required",
+                            ) => "fresh_package_required",
+                            _ => "operation_interrupted",
+                        }
+                        .into(),
+                        path: String::new(),
+                        message: "Operation was interrupted; continue or remove the plugin".into(),
+                    }]
+                } else {
+                    Vec::new()
+                }
+            });
         // Package pointers can name a hidden child even when its ID is removed.
         // Members receive only a neutral parent notice; management retains the
         // complete authored inventory and package diagnostics.
@@ -668,9 +835,15 @@ impl MessageProcessor {
             name: parent.name.clone(),
             version: parent.version.clone(),
             enabled: parent.enabled,
-            state: parent.state.clone(),
+            state: if parent.pending_json.is_some() && parent.state == "installed" {
+                "updating".into()
+            } else {
+                parent.state.clone()
+            },
             revision: parent.revision,
-            status: if parent.state != "installed" {
+            status: if parent.state == "installed" && parent.pending_json.is_some() {
+                "updating".into()
+            } else if parent.state != "installed" {
                 parent.state.clone()
             } else if partial {
                 "partial".into()
@@ -681,4 +854,604 @@ impl MessageProcessor {
             diagnostics,
         })
     }
+}
+
+/// Request-owned parent admission. Internal native calls borrow this typed
+/// context instead of reacquiring the parent before their native lifecycle lock.
+pub(crate) struct PluginMutationGuard {
+    pub(super) parent: pioneer_entity::plugin_installation::Model,
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl PluginMutationGuard {
+    pub(crate) fn parent(&self) -> &pioneer_entity::plugin_installation::Model {
+        &self.parent
+    }
+}
+
+impl MessageProcessor {
+    async fn plugin_mutation_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        plugin_mutex(&self.plugin_mutation_locks, id).await
+    }
+
+    pub(super) async fn acquire_plugin_mutation(
+        &self,
+        workspace: &str,
+        id: &str,
+        revision: i64,
+    ) -> anyhow::Result<PluginMutationGuard> {
+        // Scope is checked before busy disclosure, then revalidated after
+        // acquiring the same parent mutex as native launch/recovery.
+        anyhow::ensure!(
+            self.crud_store
+                .find_plugin_installation(id)
+                .await?
+                .is_some_and(|parent| parent.workspace_id == workspace),
+            "plugins.not_found"
+        );
+        let lock = self
+            .plugin_mutation_lock(id)
+            .await
+            .try_lock_owned()
+            .map_err(|_| anyhow::anyhow!("plugins.busy"))?;
+        let parent = self
+            .crud_store
+            .find_plugin_installation(id)
+            .await?
+            .filter(|parent| parent.workspace_id == workspace)
+            .ok_or_else(|| anyhow::anyhow!("plugins.not_found"))?;
+        anyhow::ensure!(parent.revision == revision, "plugins.stale");
+        Ok(PluginMutationGuard {
+            parent,
+            _lock: lock,
+        })
+    }
+
+    /// Final Gateway start seam shares the mutation mutex. The immutable
+    /// trusted Turn snapshot is revalidated while these guards remain owned
+    /// through native enqueue/publication ACK. Sorted acquisition prevents
+    /// cycles for a request selecting several parents; no launch lease is added.
+    pub(super) async fn acquire_plugin_launch_guards(
+        &self,
+        workspace: &str,
+        turn: &str,
+    ) -> anyhow::Result<Vec<tokio::sync::OwnedMutexGuard<()>>> {
+        acquire_plugin_launch_admission(
+            &self.crud_store,
+            &self.plugin_mutation_locks,
+            workspace,
+            turn,
+        )
+        .await
+    }
+}
+
+impl MessageProcessor {
+    pub(super) async fn stop_plugin_execution(
+        &self,
+        guard: &PluginMutationGuard,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<()> {
+        let parent = &guard.parent;
+        // Actual native inventory supplies candidate IDs. DB status is never
+        // used to infer quiescence, and stale historical rows are not scanned.
+        let ids = self.agent_manager.native_stop_thread_ids().await?;
+        let threads = self
+            .crud_store
+            .plugin_workspace_native_threads(&parent.workspace_id, &ids)
+            .await?;
+        let candidates = self
+            .agent_manager
+            .native_stop_turn_candidates(&threads)
+            .await?;
+        let mut candidates: std::collections::BTreeSet<_> = candidates.into_iter().collect();
+        candidates.extend(
+            self.crud_store
+                .plugin_graph_stop_candidates(&parent.workspace_id, &parent.id)
+                .await?,
+        );
+        for (thread, turn) in candidates {
+            let Some(selection) = self.crud_store.get_plugin_selection(&turn).await? else {
+                continue;
+            };
+            if !selection
+                .parents
+                .iter()
+                .any(|selected| selected.id == parent.id)
+            {
+                continue;
+            }
+            let (_, row) = self
+                .crud_store
+                .get_turn(&thread, &turn)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("plugins.execution_owner_unknown"))?;
+            self.cancel_root_agent_work_graph_for_turn_and_wait(
+                &thread,
+                &row,
+                "plugin configuration changed",
+                deadline,
+            )
+            .await?;
+        }
+        // Graph/fallback stop drains model tool work. The same installation
+        // lifecycle then acknowledges MCP invocation/session/process shutdown.
+        for child in self.crud_store.list_plugin_components(&parent.id).await? {
+            let Some(id) = child.mcp_installation_id else {
+                continue;
+            };
+            let name = mcp::portable::internal_mcp_name(&parent.id, &child.member_key);
+            let _native = self
+                .mcp_service
+                .installation_lifecycle_guard("workspace", &parent.workspace_id, &name)
+                .await;
+            let row = self
+                .crud_store
+                .find_mcp_server_installation("workspace", &parent.workspace_id, &name)
+                .await?
+                .filter(|row| row.id.as_deref() == Some(id.as_str()))
+                .ok_or_else(|| anyhow::anyhow!("plugins.component_owner_changed"))?;
+            let owner = self
+                .crud_store
+                .find_mcp_plugin_owner(&id)
+                .await?
+                .filter(|owner| {
+                    owner.plugin_id == parent.id && owner.member_key == child.member_key
+                })
+                .ok_or_else(|| anyhow::anyhow!("plugins.component_owner_changed"))?;
+            let _ = owner;
+            tokio::time::timeout_at(deadline, self.mcp_service.stop_admitted_installation(&row))
+                .await
+                .map_err(|_| anyhow::anyhow!("plugins.stop_timeout"))??;
+        }
+        Ok(())
+    }
+
+    async fn publish_plugin_changed(&self, parent: &pioneer_entity::plugin_installation::Model) {
+        self.send_gateway_management_notification(
+            methods::PLUGINS_CHANGED,
+            &PluginsChangedNotification {
+                workspace_id: parent.workspace_id.clone(),
+                plugin_id: parent.id.clone(),
+                revision: parent.revision,
+            },
+        )
+        .await;
+    }
+
+    pub(super) async fn set_plugin_enabled(
+        &self,
+        context: &RequestContext,
+        request: &RequestId,
+        params: PluginsSetEnabledParams,
+        deadline: tokio::time::Instant,
+    ) -> Result<PluginItem, JsonRpcErrorResponse> {
+        let mut guard = self
+            .acquire_plugin_mutation(
+                &params.workspace_id,
+                &params.plugin_id,
+                params.expected_revision,
+            )
+            .await
+            .map_err(|error| {
+                plugin_error(
+                    request,
+                    match error.to_string().as_str() {
+                        "plugins.busy" => "plugins.busy",
+                        "plugins.stale" => "plugins.stale",
+                        _ => "plugins.not_found",
+                    },
+                )
+            })?;
+        if guard.parent.state != "installed" || guard.parent.pending_json.is_some() {
+            return Err(plugin_error(request, "plugins.interrupted"));
+        }
+        if guard.parent.enabled == params.enabled {
+            return self
+                .plugin_item(context, &guard.parent)
+                .await
+                .map_err(|_| plugin_error(request, "plugins.inventory_failed"));
+        }
+        let pending = serde_json::to_string(
+            &json!({"kind": "set_enabled", "enabled": params.enabled, "children": []}),
+        )
+        .map_err(|_| plugin_error(request, "plugins.invalid_request"))?;
+        guard.parent = self
+            .crud_store
+            .begin_plugin_mutation(
+                &params.workspace_id,
+                &params.plugin_id,
+                params.expected_revision,
+                "updating",
+                params.enabled,
+                &pending,
+            )
+            .await
+            .map_err(|_| plugin_error(request, "plugins.stale"))?;
+        self.publish_plugin_changed(&guard.parent).await;
+        // One budget spans stop and reload, matching the ordinary RPC budget.
+        // Cancellation leaves this durable closed plan available for Continue.
+        let work = tokio::time::timeout_at(deadline, async {
+            self.stop_plugin_execution(&guard, deadline).await?;
+            self.crud_store
+                .prepare_plugin_reload(&guard.parent.id, guard.parent.revision)
+                .await?;
+            self.mcp_service.reload_after_plugin_change(&guard).await?;
+            self.crud_store
+                .finish_plugin_mutation(&guard.parent.id, guard.parent.revision, "installed", None)
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        if !matches!(work, Ok(Ok(()))) {
+            // A cancelled acknowledgement may follow a committed final writer.
+            // Re-read it instead of reopening a completed action with stale data.
+            if let Some(current) = self
+                .crud_store
+                .find_plugin_installation(&guard.parent.id)
+                .await
+                .map_err(|_| plugin_error(request, "plugins.inventory_failed"))?
+            {
+                if current.pending_json.is_some() {
+                    self.crud_store
+                        .finish_plugin_mutation(
+                            &current.id,
+                            current.revision,
+                            "interrupted",
+                            Some("plugins.stop_or_reload_unconfirmed".into()),
+                        )
+                        .await
+                        .map_err(|_| plugin_error(request, "plugins.interrupted"))?;
+                }
+            }
+        }
+        let parent = self
+            .crud_store
+            .find_plugin_installation(&guard.parent.id)
+            .await
+            .map_err(|_| plugin_error(request, "plugins.inventory_failed"))?
+            .ok_or_else(|| plugin_error(request, "plugins.not_found"))?;
+        self.publish_plugin_changed(&parent).await;
+        self.plugin_item(context, &parent)
+            .await
+            .map_err(|_| plugin_error(request, "plugins.inventory_failed"))
+    }
+}
+
+/// A native controller owns the same parent admission before its native lock.
+/// Internal package operations already own PluginMutationGuard and never call
+/// this acquisition path recursively.
+pub(super) struct NativePluginMutation {
+    pub(super) guard: PluginMutationGuard,
+    pub(super) write: pioneer_crud::PluginNativeWrite,
+    pub(super) deadline: tokio::time::Instant,
+}
+impl MessageProcessor {
+    pub(super) async fn begin_native_plugin_change(
+        &self,
+        context: &RequestContext,
+        request: &RequestId,
+        workspace: &str,
+        kind: &str,
+        child: &str,
+        action: &str,
+        fields: &[&str],
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<Option<NativePluginMutation>> {
+        let link = match kind {
+            "mcp" => self.crud_store.find_mcp_plugin_owner(child).await?,
+            "skill" => {
+                self.crud_store
+                    .find_skill_plugin_owner(&SkillId::new(child)?)
+                    .await?
+            }
+            _ => anyhow::bail!("plugins.invalid_request"),
+        };
+        let Some(link) = link else {
+            return Ok(None);
+        };
+        self.plugin_admit(context, request, workspace, true)
+            .await
+            .map_err(|_| anyhow::anyhow!("plugins.management_denied"))?;
+        let parent = self
+            .crud_store
+            .find_plugin_installation(&link.plugin_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("plugins.not_found"))?;
+        let mut guard = self
+            .acquire_plugin_mutation(workspace, &parent.id, parent.revision)
+            .await?;
+        let interrupted = guard.parent.pending_json.clone();
+        if let Some(pending) = interrupted.as_deref() {
+            let value: serde_json::Value = serde_json::from_str(pending)?;
+            anyhow::ensure!(
+                value.get("kind").and_then(serde_json::Value::as_str) == Some("native")
+                    && value.get("action").and_then(serde_json::Value::as_str) == Some(action)
+                    && value
+                        .get("native_committed")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(false)
+                    && value
+                        .pointer("/children/0/id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(child),
+                "plugins.interrupted"
+            );
+            // Clean the previous uncertain fresh refs before replacing its plan.
+            // A successful native writer would have atomically changed the marker.
+            self.stop_plugin_execution(&guard, deadline).await?;
+            self.cleanup_pending_refs(&guard).await?;
+        } else {
+            anyhow::ensure!(guard.parent.state == "installed", "plugins.interrupted");
+        }
+        // The first ownership read precedes parent admission. Reload under the
+        // mutex so a completed competing edit cannot lose its override fields.
+        let current = match kind {
+            "mcp" => self.crud_store.find_mcp_plugin_owner(child).await?,
+            _ => {
+                self.crud_store
+                    .find_skill_plugin_owner(&SkillId::new(child)?)
+                    .await?
+            }
+        };
+        let link = current
+            .filter(|current| {
+                current.plugin_id == guard.parent.id && current.member_key == link.member_key
+            })
+            .ok_or_else(|| anyhow::anyhow!("plugins.stale"))?;
+        let mut overrides: std::collections::BTreeSet<String> =
+            serde_json::from_str(&link.override_fields_json)?;
+        overrides.extend(fields.iter().map(|field| field.to_string()));
+        let mut pending = json!({"kind":"native", "action":action,
+            "children":[{"kind":kind,"key":link.member_key,"id":child}],
+            "native_committed":false});
+        let before = serde_json::to_string(&pending)?;
+        guard.parent = if let Some(previous) = interrupted.as_deref() {
+            self.crud_store
+                .resume_plugin_mutation(
+                    workspace,
+                    &parent.id,
+                    parent.revision,
+                    previous,
+                    &before,
+                    "updating",
+                )
+                .await?
+        } else {
+            self.crud_store
+                .begin_plugin_mutation(
+                    workspace,
+                    &parent.id,
+                    parent.revision,
+                    "updating",
+                    parent.enabled,
+                    &before,
+                )
+                .await?
+        };
+        self.publish_plugin_changed(&guard.parent).await;
+        if !matches!(
+            tokio::time::timeout_at(deadline, self.stop_plugin_execution(&guard, deadline)).await,
+            Ok(Ok(()))
+        ) {
+            self.crud_store
+                .interrupt_plugin_mutation(
+                    &parent.id,
+                    guard.parent.revision,
+                    &before,
+                    "plugins.stop_unconfirmed",
+                )
+                .await?;
+            self.publish_plugin_changed(&guard.parent).await;
+            anyhow::bail!("plugins.stop_unconfirmed");
+        }
+        pending["native_committed"] = json!(true);
+        let write = pioneer_crud::PluginNativeWrite {
+            plugin_id: guard.parent.id.clone(),
+            expected_revision: guard.parent.revision,
+            member_key: link.member_key,
+            child_id: child.into(),
+            override_fields_json: serde_json::to_string(&overrides)?,
+            pending_after: serde_json::to_string(&pending)?,
+        };
+        Ok(Some(NativePluginMutation {
+            guard,
+            write,
+            deadline,
+        }))
+    }
+    pub(super) async fn finish_native_plugin_change(
+        &self,
+        change: NativePluginMutation,
+    ) -> anyhow::Result<()> {
+        let parent = &change.guard.parent;
+        let result = tokio::time::timeout_at(change.deadline, async {
+            self.cleanup_pending_refs(&change.guard).await?;
+            self.crud_store
+                .prepare_plugin_reload(&parent.id, parent.revision)
+                .await?;
+            self.mcp_service
+                .reload_after_plugin_change(&change.guard)
+                .await?;
+            self.crud_store
+                .finish_plugin_mutation(&parent.id, parent.revision, "installed", None)
+                .await
+        })
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            // Read the current DB outcome, including its atomic native commit
+            // marker. Do not replace it with pre-commit pending after timeout.
+            let current = self
+                .crud_store
+                .find_plugin_installation(&parent.id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("plugins.not_found"))?;
+            if current.revision == parent.revision
+                && current.state == "installed"
+                && current.pending_json.is_none()
+            {
+                // Deadline can expire just after the final DB commit. That
+                // commit only follows confirmed reload under this same guard.
+                self.publish_plugin_changed(&current).await;
+                return Ok(());
+            }
+            let pending = current
+                .pending_json
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("plugins.outcome_unconfirmed"))?;
+            let _ = pending;
+            self.crud_store
+                .finish_plugin_mutation(
+                    &parent.id,
+                    parent.revision,
+                    "interrupted",
+                    Some("plugins.reload_unconfirmed".into()),
+                )
+                .await?;
+            self.publish_plugin_changed(&current).await;
+            anyhow::bail!("plugins.interrupted");
+        }
+        self.publish_plugin_changed(parent).await;
+        Ok(())
+    }
+}
+
+pub(super) fn native_plugin_error_code(error: &anyhow::Error) -> &'static str {
+    match error.to_string().as_str() {
+        "plugins.busy" => "plugins.busy",
+        "plugins.stale" => "plugins.stale",
+        "plugins.not_found" => "plugins.not_found",
+        "plugins.interrupted" => "plugins.interrupted",
+        "plugins.stop_unconfirmed" => "plugins.stop_unconfirmed",
+        _ => "plugins.component_change_failed",
+    }
+}
+impl MessageProcessor {
+    pub(super) async fn interrupt_native_plugin_change(
+        &self,
+        change: &NativePluginMutation,
+        code: &str,
+    ) -> anyhow::Result<()> {
+        let parent = self
+            .crud_store
+            .find_plugin_installation(&change.guard.parent.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("plugins.not_found"))?;
+        if let Some(pending) = &parent.pending_json {
+            let _ = pending;
+            self.crud_store
+                .finish_plugin_mutation(
+                    &parent.id,
+                    change.write.expected_revision,
+                    "interrupted",
+                    Some(code.into()),
+                )
+                .await?;
+            self.publish_plugin_changed(&parent).await;
+        }
+        Ok(())
+    }
+}
+
+impl MessageProcessor {
+    pub(super) async fn acquire_plugin_child_admission(
+        &self,
+        workspace: &str,
+        kind: &str,
+        child: &str,
+    ) -> anyhow::Result<Option<PluginMutationGuard>> {
+        let link = match kind {
+            "mcp" => self.crud_store.find_mcp_plugin_owner(child).await?,
+            "skill" => {
+                self.crud_store
+                    .find_skill_plugin_owner(&SkillId::new(child)?)
+                    .await?
+            }
+            _ => anyhow::bail!("plugins.invalid_request"),
+        };
+        let Some(link) = link else {
+            return Ok(None);
+        };
+        let parent = self
+            .crud_store
+            .find_plugin_installation(&link.plugin_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("plugins.not_found"))?;
+        let guard = self
+            .acquire_plugin_mutation(workspace, &parent.id, parent.revision)
+            .await?;
+        anyhow::ensure!(
+            guard.parent.state == "installed" && guard.parent.pending_json.is_none(),
+            "plugins.interrupted"
+        );
+        let current = match kind {
+            "mcp" => self.crud_store.find_mcp_plugin_owner(child).await?,
+            _ => {
+                self.crud_store
+                    .find_skill_plugin_owner(&SkillId::new(child)?)
+                    .await?
+            }
+        };
+        anyhow::ensure!(
+            current.is_some_and(|current| current.plugin_id == guard.parent.id
+                && current.member_key == link.member_key),
+            "plugins.stale"
+        );
+        Ok(Some(guard))
+    }
+}
+
+pub(crate) type PluginMutationLocks =
+    Arc<Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>>;
+
+async fn plugin_mutex(gates: &PluginMutationLocks, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = gates.lock().await;
+    locks.retain(|_, gate| gate.strong_count() != 0);
+    if let Some(lock) = locks.get(id).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(id.into(), Arc::downgrade(&lock));
+    lock
+}
+
+/// Shared Gateway admission seam for ordinary API starts and native recovery.
+/// Callers retain the returned mutex guards through actual publication ACK.
+/// No database permit is retained; recovery passes its Maintenance store.
+pub(crate) async fn acquire_plugin_launch_admission(
+    store: &pioneer_crud::CrudStore,
+    gates: &PluginMutationLocks,
+    workspace: &str,
+    turn: &str,
+) -> anyhow::Result<Vec<tokio::sync::OwnedMutexGuard<()>>> {
+    let Some(snapshot) = store.get_plugin_selection(turn).await? else {
+        return Ok(Vec::new());
+    };
+    let mut parents = snapshot.parents.clone();
+    parents.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut guards = Vec::with_capacity(parents.len());
+    for selected in parents {
+        let guard = plugin_mutex(gates, &selected.id)
+            .await
+            .try_lock_owned()
+            .map_err(|_| anyhow::anyhow!("plugins.busy"))?;
+        let parent = store
+            .find_plugin_installation(&selected.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("plugins.not_found"))?;
+        anyhow::ensure!(
+            parent.workspace_id == workspace
+                && parent.enabled
+                && parent.state == "installed"
+                && parent.pending_json.is_none()
+                && parent.revision == selected.revision,
+            "plugins.stale_or_disabled"
+        );
+        guards.push(guard);
+    }
+    anyhow::ensure!(
+        store.get_plugin_selection(turn).await?.as_ref() == Some(&snapshot),
+        "plugins.selection_changed"
+    );
+    Ok(guards)
 }

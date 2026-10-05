@@ -7,20 +7,97 @@ impl MessageProcessor {
         request_id: RequestId,
         params: SkillsUpdateParams,
     ) {
-        let source = SkillInstallSource::UploadedSkill(params.source.clone());
-        match self
-            .update_skill_source(
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let native = match self
+            .begin_native_plugin_change(
                 request_context,
-                request_id.clone(),
-                SkillUpdateInput {
-                    workspace_id: params.workspace_id,
-                    skill_id: params.skill_id,
-                    expected_previous_fingerprint: params.expected_previous_fingerprint,
-                },
-                source,
+                &request_id,
+                &params.workspace_id,
+                "skill",
+                params.skill_id.as_str(),
+                "update",
+                &["skill_source"],
+                deadline,
             )
             .await
         {
+            Ok(native) => native,
+            Err(error) => {
+                self.send_error(
+                    request_context.connection_id(),
+                    skills_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_INVALID_REQUEST,
+                        super::super::super::plugins::native_plugin_error_code(&error),
+                        json!({}),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        let source = match &native {
+            Some(change) => {
+                SkillInstallSource::OwnedUpload(params.source.clone(), change.write.clone())
+            }
+            None => SkillInstallSource::UploadedSkill(params.source.clone()),
+        };
+        let owned = native.is_some();
+        let work = self.update_skill_source(
+            request_context,
+            request_id.clone(),
+            SkillUpdateInput {
+                workspace_id: params.workspace_id,
+                skill_id: params.skill_id,
+                expected_previous_fingerprint: params.expected_previous_fingerprint,
+            },
+            source,
+        );
+        let result = if owned {
+            tokio::time::timeout_at(deadline, work)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(skills_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_INTERNAL,
+                        "plugin change deadline exceeded",
+                        json!({}),
+                    ))
+                })
+        } else {
+            work.await
+        };
+        let result = match (result, native) {
+            (Ok(payload), Some(change)) => self
+                .finish_native_plugin_change(change)
+                .await
+                .map(|_| payload)
+                .map_err(|error| {
+                    skills_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_INTERNAL,
+                        super::super::super::plugins::native_plugin_error_code(&error),
+                        json!({}),
+                    )
+                }),
+            (Err(_), Some(change)) => {
+                let _ = self
+                    .interrupt_native_plugin_change(&change, "plugins.component_update_failed")
+                    .await;
+                Err(skills_error(
+                    Some(request_id.clone()),
+                    INVALID_REQUEST_CODE,
+                    SKILLS_ERROR_INTERNAL,
+                    "plugin component update requires repair",
+                    json!({}),
+                ))
+            }
+            (result, None) => result,
+        };
+        match result {
             Ok(payload) => match JsonRpcResponse::from_result(request_id, &payload) {
                 Ok(response) => {
                     if let Err(error) = self
@@ -176,9 +253,10 @@ impl MessageProcessor {
                     json!({}),
                 ));
             };
-            link.package_fingerprint.as_deref() != Some(owner.package_fingerprint.as_str())
+            link.status != "installed"
+                || link.package_fingerprint.as_deref() != Some(owner.package_fingerprint.as_str())
         } else {
-            false
+            materialized.native_write().is_some()
         };
         let prepared = match pioneer_skills::prepare_materialized_skill(
             pioneer_skills::PrepareMaterializedSkillRequest {
@@ -364,27 +442,33 @@ impl MessageProcessor {
             }
         };
         let install_path = update_result.install_path.display().to_string();
+        // The native row is authoritative for trust. A same-key package update
+        // replaces bundled files without relaxing or resetting this restriction.
+        let updated_trust = if materialized.ownership().is_some() {
+            existing.trust_level.clone()
+        } else {
+            trust_level_as_str(&update_result.definition.runtime.trust_level).to_owned()
+        };
         let patch = SkillInstallationPatch {
             owner: Some(update_result.definition.identity.owner.clone()),
             slug: Some(update_result.definition.identity.slug.clone()),
             version: Some(update_result.definition.identity.version_hint.clone()),
             source_ref: Some(source_ref),
             install_path: Some(install_path.clone()),
-            trust_level: Some(
-                trust_level_as_str(&update_result.definition.runtime.trust_level).to_owned(),
-            ),
+            trust_level: Some(updated_trust.clone()),
             fingerprint: Some(update_result.definition.identity.fingerprint.clone()),
             ..SkillInstallationPatch::default()
         };
         let audit_records = skill_audit_records(update_result.audit_events.as_slice());
         let persisted = self
             .crud_store
-            .update_skill_lifecycle_with_ownership(
+            .update_skill_lifecycle_with_plugin_change(
                 &params.skill_id,
                 &patch,
                 audit_records.as_slice(),
                 materialized.upload_id(),
                 materialized.ownership(),
+                materialized.native_write(),
                 now,
             )
             .await;
@@ -425,8 +509,6 @@ impl MessageProcessor {
         let updated_owner = update_result.definition.identity.owner;
         let updated_slug = update_result.definition.identity.slug;
         let updated_fingerprint = update_result.definition.identity.fingerprint;
-        let updated_trust =
-            trust_level_as_str(&update_result.definition.runtime.trust_level).to_owned();
         let payload = SkillsUpdateResponse {
             status: "updated".to_owned(),
             skill: SkillLifecycleResultSkill {

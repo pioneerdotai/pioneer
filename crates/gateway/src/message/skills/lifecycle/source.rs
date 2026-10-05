@@ -12,9 +12,11 @@ pub(crate) struct SkillUpdateInput {
 pub(crate) enum SkillInstallSource {
     UploadedSkill(SkillLifecycleSource),
     PackageMember(PluginOwnershipWrite),
+    OwnedUpload(SkillLifecycleSource, pioneer_crud::PluginNativeWrite),
 }
 pub(super) enum PreparedInstallSource {
     Uploaded(MaterializedSkillSource),
+    OwnedUpload(MaterializedSkillSource, pioneer_crud::PluginNativeWrite),
     Package {
         source_dir: PathBuf,
         cleanup_root: PathBuf,
@@ -24,7 +26,7 @@ pub(super) enum PreparedInstallSource {
 impl PreparedInstallSource {
     pub fn uploaded(&self) -> Option<&MaterializedSkillSource> {
         match self {
-            Self::Uploaded(upload) => Some(upload),
+            Self::Uploaded(upload) | Self::OwnedUpload(upload, _) => Some(upload),
             _ => None,
         }
     }
@@ -34,7 +36,7 @@ impl PreparedInstallSource {
     }
     pub fn source_dir(&self) -> &Path {
         match self {
-            Self::Uploaded(upload) => &upload.source_dir,
+            Self::Uploaded(upload) | Self::OwnedUpload(upload, _) => &upload.source_dir,
             Self::Package { source_dir, .. } => source_dir,
         }
     }
@@ -44,9 +46,17 @@ impl PreparedInstallSource {
             _ => None,
         }
     }
+    pub fn native_write(&self) -> Option<&pioneer_crud::PluginNativeWrite> {
+        match self {
+            Self::OwnedUpload(_, native) => Some(native),
+            _ => None,
+        }
+    }
     pub fn source_ref(&self) -> String {
         match self {
-            Self::Uploaded(upload) => format!("upload:{}", upload.upload.upload_id),
+            Self::Uploaded(upload) | Self::OwnedUpload(upload, _) => {
+                format!("upload:{}", upload.upload.upload_id)
+            }
             Self::Package { ownership, .. } => {
                 format!("plugin:{}:{}", ownership.plugin_id, ownership.member_key)
             }
@@ -54,7 +64,7 @@ impl PreparedInstallSource {
     }
     pub fn cleanup_failure(&self) {
         match self {
-            Self::Uploaded(source) => {
+            Self::Uploaded(source) | Self::OwnedUpload(source, _) => {
                 let _ = std::fs::remove_dir_all(&source.cleanup_root);
             }
             Self::Package { cleanup_root, .. } => {
@@ -102,6 +112,19 @@ impl MessageProcessor {
                 )
                 .await
                 .map(PreparedInstallSource::Uploaded)
+            }
+            SkillInstallSource::OwnedUpload(source, native) => {
+                let upload_id = parse_lifecycle_upload_id(source).map_err(|_| invalid())?;
+                let upload = self
+                    .materialize_uploaded_skill_source(
+                        request_context.connection_id(),
+                        workspace,
+                        &upload_id,
+                        context,
+                        request_id,
+                    )
+                    .await?;
+                Ok(PreparedInstallSource::OwnedUpload(upload, native))
             }
             SkillInstallSource::PackageMember(ownership) => {
                 let parent = self

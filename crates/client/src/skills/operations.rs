@@ -29,9 +29,17 @@ pub enum SkillsIntent {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SkillUploadTarget {
     PluginInstall,
+    PluginUpdatePreview {
+        plugin_id: String,
+        expected_revision: i64,
+    },
     Install,
-    Update { skill_id: SkillId },
-    UpdatePack { pack_id: SkillPackId },
+    Update {
+        skill_id: SkillId,
+    },
+    UpdatePack {
+        pack_id: SkillPackId,
+    },
 }
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -387,7 +395,9 @@ impl ClientCore {
         anyhow::ensure!(epoch.2.is_some(), "gateway_not_connected");
         if !matches!(
             target,
-            SkillUploadTarget::Install | SkillUploadTarget::PluginInstall
+            SkillUploadTarget::Install
+                | SkillUploadTarget::PluginInstall
+                | SkillUploadTarget::PluginUpdatePreview { .. }
         ) {
             let catalog = self
                 .skills_catalog_snapshot(workspace)
@@ -408,7 +418,9 @@ impl ClientCore {
                         .any(|p| &p.pack.id == pack_id),
                     "skill_pack_unavailable"
                 ),
-                SkillUploadTarget::Install | SkillUploadTarget::PluginInstall => {}
+                SkillUploadTarget::Install
+                | SkillUploadTarget::PluginInstall
+                | SkillUploadTarget::PluginUpdatePreview { .. } => {}
             }
         }
         let mut owner = self
@@ -663,12 +675,20 @@ impl ClientCore {
                         let Some(core)=weak.upgrade() else{return;};let effect=core.next_skill_upload_effect(&workspace,operation);let connection=core.provider_runtime_epoch().2;let sender=core.transport_runtime().ws_command_sender();drop(core);let Some((effect,target,kind,effect_generation))=effect else{break;};
                         let bound = connection.map(|id| sender.requests_for_connection(id));
                         let result=match effect {
-                            UploadEffect::Start(mut params)=>{ if target == SkillUploadTarget::PluginInstall { params.purpose = pioneer_protocol::SkillUploadPurpose::Plugin; match &bound { Some(bound) => crate::transport::ws::command_sender::skills_upload_start(bound, params), None => Err(anyhow::anyhow!("gateway_not_connected")) } } else { sender.skills_upload_start(params) } }.map(UploadCompletion::Start),
+                            UploadEffect::Start(mut params)=>{ if matches!(target, SkillUploadTarget::PluginInstall | SkillUploadTarget::PluginUpdatePreview { .. }) { params.purpose = pioneer_protocol::SkillUploadPurpose::Plugin; match &bound { Some(bound) => crate::transport::ws::command_sender::skills_upload_start(bound, params), None => Err(anyhow::anyhow!("gateway_not_connected")) } } else { sender.skills_upload_start(params) } }.map(UploadCompletion::Start),
                             UploadEffect::Chunk{upload_id,offset,bytes}=>sender.send_skill_upload_chunk(workspace.clone(),upload_id,offset,bytes).map(UploadCompletion::Chunk),
-                            UploadEffect::Finish(params)=>{ if target == SkillUploadTarget::PluginInstall { match &bound { Some(bound) => crate::transport::ws::command_sender::skills_upload_finish(bound, params), None => Err(anyhow::anyhow!("gateway_not_connected")) } } else { sender.skills_upload_finish(params) } }.map(UploadCompletion::Finish),
-                            UploadEffect::Apply{upload_id} if target == SkillUploadTarget::PluginInstall => match &bound { Some(bound) => crate::transport::ws::command_sender::plugins_preview(bound, pioneer_protocol::PluginsSourceParams { workspace_id: workspace.clone(), upload_id: upload_id.clone() }).and_then(|preview| crate::transport::ws::command_sender::plugins_install(bound, pioneer_protocol::PluginsInstallParams { workspace_id: workspace.clone(), upload_id, expected_fingerprint: preview.fingerprint })), None => Err(anyhow::anyhow!("gateway_not_connected")) }.map(UploadCompletion::PluginApplied),
+                            UploadEffect::Finish(params)=>{ if matches!(target, SkillUploadTarget::PluginInstall | SkillUploadTarget::PluginUpdatePreview { .. }) { match &bound { Some(bound) => crate::transport::ws::command_sender::skills_upload_finish(bound, params), None => Err(anyhow::anyhow!("gateway_not_connected")) } } else { sender.skills_upload_finish(params) } }.map(UploadCompletion::Finish),
+                            UploadEffect::Apply{upload_id} if matches!(&target, SkillUploadTarget::PluginUpdatePreview {..}) => match &target {
+                                SkillUploadTarget::PluginUpdatePreview {plugin_id,expected_revision} => match &bound {
+                                    Some(bound)=>crate::transport::ws::command_sender::plugins_update_preview(bound,pioneer_protocol::PluginsUpdatePreviewParams {
+                                        workspace_id:workspace.clone(),plugin_id:plugin_id.clone(),expected_revision:*expected_revision,upload_id:upload_id.clone()
+                                    }).map(|preview|UploadCompletion::PluginUpdatePreviewed(upload_id,preview)),
+                                    None=>Err(anyhow::anyhow!("gateway_not_connected")),
+                                },_=>unreachable!(),
+                            },
+                            UploadEffect::Apply{upload_id} if target == SkillUploadTarget::PluginInstall => match &bound { Some(bound) => crate::transport::ws::command_sender::plugins_preview(bound, pioneer_protocol::PluginsSourceParams { workspace_id: workspace.clone(), upload_id: upload_id.clone(), target: None }).and_then(|preview| crate::transport::ws::command_sender::plugins_install(bound, pioneer_protocol::PluginsInstallParams { workspace_id: workspace.clone(), upload_id, expected_fingerprint: preview.fingerprint })), None => Err(anyhow::anyhow!("gateway_not_connected")) }.map(UploadCompletion::PluginApplied),
                             UploadEffect::Apply{upload_id}=>match target {
-                                SkillUploadTarget::PluginInstall=>unreachable!("plugin upload handled above"),
+                                SkillUploadTarget::PluginInstall|SkillUploadTarget::PluginUpdatePreview {..}=>unreachable!("plugin upload handled above"),
                                 SkillUploadTarget::Install=>match kind {SkillUploadSourceKind::Skill=>sender.skills_install(super::actions::skills_install_uploaded_archive_params(&workspace,upload_id)).map(|_|()),SkillUploadSourceKind::Plugin=>unreachable!("plugin source uses plugin target"),SkillUploadSourceKind::Pack=>sender.skills_pack_install(super::actions::skills_pack_install_uploaded_archive_params(&workspace,upload_id)).map(|_|())},
                                 SkillUploadTarget::Update{skill_id}=>sender.skills_update(super::actions::skills_update_uploaded_archive_params(&workspace,skill_id,upload_id,None)).map(|_|()),
                                 SkillUploadTarget::UpdatePack{pack_id}=>sender.skills_pack_update(super::actions::skills_pack_update_uploaded_archive_params(&workspace,pack_id,upload_id)).map(|_|()),
@@ -693,7 +713,9 @@ fn prepare_archive_effect(
     path: PathBuf,
 ) -> anyhow::Result<(SkillUploadSourceKind, SkillUploadArchive)> {
     let kind = match target {
-        SkillUploadTarget::PluginInstall => SkillUploadSourceKind::Plugin,
+        SkillUploadTarget::PluginInstall | SkillUploadTarget::PluginUpdatePreview { .. } => {
+            SkillUploadSourceKind::Plugin
+        }
         SkillUploadTarget::Install => classify_skill_upload_source(&path)?,
         SkillUploadTarget::Update { .. } => SkillUploadSourceKind::Skill,
         SkillUploadTarget::UpdatePack { .. } => SkillUploadSourceKind::Pack,

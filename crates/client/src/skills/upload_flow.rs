@@ -24,6 +24,7 @@ impl SkillUploadState {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SkillUploadPublication {
     pub plugin_result: Option<PluginItem>,
+    pub plugin_update_preview: Option<(String, PluginsUpdatePreviewResponse)>,
     pub operation_id: u64,
     pub generation: u64,
     pub revision: u64,
@@ -51,6 +52,7 @@ pub(crate) enum UploadCompletion {
     Finish(SkillsUploadFinishResponse),
     Applied,
     PluginApplied(PluginItem),
+    PluginUpdatePreviewed(String, PluginsUpdatePreviewResponse),
 }
 pub(crate) struct SkillUploadFlow {
     pub publication: SkillUploadPublication,
@@ -68,6 +70,7 @@ impl SkillUploadFlow {
         Self {
             publication: SkillUploadPublication {
                 plugin_result: None,
+                plugin_update_preview: None,
                 operation_id: operation,
                 generation: operation,
                 revision: 0,
@@ -175,7 +178,9 @@ impl SkillUploadFlow {
                         .is_some_and(|a| a.sha256 == finish.sha256)
             }
             (
-                UploadCompletion::Applied | UploadCompletion::PluginApplied(_),
+                UploadCompletion::Applied
+                | UploadCompletion::PluginApplied(_)
+                | UploadCompletion::PluginUpdatePreviewed(_, _),
                 SkillUploadState::Applying,
             ) => true,
             _ => return false,
@@ -216,6 +221,11 @@ impl SkillUploadFlow {
                 self.publication.plugin_result = Some(item);
                 self.terminate(SkillUploadState::Succeeded);
                 self.cleanup_upload = None;
+            }
+            UploadCompletion::PluginUpdatePreviewed(upload_id, preview) => {
+                self.publication.plugin_update_preview = Some((upload_id, preview));
+                self.terminate(SkillUploadState::Succeeded);
+                self.cleanup_upload = None; // Finalized upload is retained for explicit confirmation/expiry.
             }
             UploadCompletion::Applied => {
                 self.terminate(SkillUploadState::Succeeded);

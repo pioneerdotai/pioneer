@@ -47,6 +47,88 @@ impl MessageProcessor {
         request_id: RequestId,
         params: SkillsUninstallParams,
     ) -> std::result::Result<SkillsUninstallResponse, JsonRpcErrorResponse> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let native = self
+            .begin_native_plugin_change(
+                request_context,
+                &request_id,
+                &params.workspace_id,
+                "skill",
+                params.skill_id.as_str(),
+                "remove",
+                &[],
+                deadline,
+            )
+            .await
+            .map_err(|error| {
+                skills_error(
+                    Some(request_id.clone()),
+                    INVALID_REQUEST_CODE,
+                    SKILLS_ERROR_INVALID_REQUEST,
+                    super::super::super::plugins::native_plugin_error_code(&error),
+                    json!({}),
+                )
+            })?;
+        let owned = native.is_some();
+        let work = self.uninstall_skill_with_plugin_change(
+            request_context,
+            request_id.clone(),
+            params,
+            native.as_ref().map(|change| &change.write),
+        );
+        let result = if owned {
+            tokio::time::timeout_at(deadline, work)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(skills_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_INTERNAL,
+                        "plugin change deadline exceeded",
+                        json!({}),
+                    ))
+                })
+        } else {
+            work.await
+        };
+        match (result, native) {
+            (Ok(payload), Some(change)) => {
+                self.finish_native_plugin_change(change)
+                    .await
+                    .map_err(|error| {
+                        skills_error(
+                            None,
+                            INVALID_REQUEST_CODE,
+                            SKILLS_ERROR_INTERNAL,
+                            super::super::super::plugins::native_plugin_error_code(&error),
+                            json!({}),
+                        )
+                    })?;
+                Ok(payload)
+            }
+            (Err(error), Some(change)) => {
+                let _ = self
+                    .interrupt_native_plugin_change(&change, "plugins.component_remove_failed")
+                    .await;
+                Err(skills_error(
+                    error.id,
+                    INVALID_REQUEST_CODE,
+                    SKILLS_ERROR_INTERNAL,
+                    "plugin component removal requires repair",
+                    json!({}),
+                ))
+            }
+            (result, None) => result,
+        }
+    }
+
+    pub(crate) async fn uninstall_skill_with_plugin_change(
+        &self,
+        request_context: &RequestContext,
+        request_id: RequestId,
+        params: SkillsUninstallParams,
+        native: Option<&pioneer_crud::PluginNativeWrite>,
+    ) -> std::result::Result<SkillsUninstallResponse, JsonRpcErrorResponse> {
         let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_skills_workspace(
@@ -196,9 +278,14 @@ impl MessageProcessor {
 
         let audit_records = skill_audit_records(uninstall_result.audit_events.as_slice());
         let packed_child = parent.is_some();
-        let removed = if packed_child {
+        let removed = if packed_child || native.is_some() {
             self.crud_store
-                .uninstall_skill_installation_lifecycle(&existing, audit_records.as_slice(), now)
+                .uninstall_skill_installation_lifecycle_with_plugin_change(
+                    &existing,
+                    audit_records.as_slice(),
+                    native,
+                    now,
+                )
                 .await
         } else {
             self.crud_store
@@ -221,6 +308,7 @@ impl MessageProcessor {
             }
         }
         if !packed_child
+            && native.is_none()
             && let Err(error) = self
                 .crud_store
                 .insert_skill_audit_event_records(audit_records.as_slice())

@@ -86,6 +86,27 @@ impl crate::core::ClientCore {
         );
         Ok(result)
     }
+    /// A timeout is an uncertain server outcome: callers always refetch details
+    /// after an error instead of reverting the parent optimistically.
+    pub fn set_plugin_enabled(
+        &self,
+        params: pioneer_protocol::PluginsSetEnabledParams,
+    ) -> anyhow::Result<PluginItem> {
+        let epoch = self.provider_runtime_epoch();
+        let connection = epoch
+            .2
+            .ok_or_else(|| anyhow::anyhow!("gateway_not_connected"))?;
+        let transport = self
+            .transport_runtime()
+            .ws_command_sender()
+            .requests_for_connection(connection);
+        let result = crate::transport::ws::command_sender::plugins_set_enabled(&transport, params)?;
+        anyhow::ensure!(
+            self.provider_runtime_epoch() == epoch,
+            "plugin_catalog_stale"
+        );
+        Ok(result)
+    }
     pub fn read_plugin_details(&self, workspace: &str, id: &str) -> anyhow::Result<PluginItem> {
         let epoch = self.provider_runtime_epoch();
         let connection = epoch
@@ -183,5 +204,82 @@ mod tests {
         ];
         assert_eq!(selectable_plugins(&parents, "mixed").len(), 1);
         assert!(plugin_capability(&parents[1]).is_none());
+    }
+}
+
+pub use pioneer_protocol::{
+    PluginComponentKey, PluginManagementIntent, PluginsMutateParams, PluginsUpdatePreviewResponse,
+};
+/// UI-neutral current-action state. An error is an uncertain Gateway outcome;
+/// the caller must refetch before enabling another mutation. No operation polling.
+#[derive(Clone, Debug, Default)]
+pub struct PluginManagementState {
+    pub busy: bool,
+    pub failed: bool,
+    pub refresh_required: bool,
+}
+impl PluginManagementState {
+    pub fn begin(&mut self) -> bool {
+        if self.busy || self.refresh_required {
+            return false;
+        }
+        self.busy = true;
+        self.failed = false;
+        true
+    }
+    pub fn complete(&mut self, success: bool) {
+        self.busy = false;
+        self.failed = !success;
+        self.refresh_required = true;
+    }
+    pub fn refreshed(&mut self) {
+        self.refresh_required = false;
+    }
+}
+impl crate::core::ClientCore {
+    /// Desktop calls this typed adapter directly; mobile can use the same intent
+    /// in D. Bind the action to the selected Gateway and authorization epoch.
+    pub fn mutate_plugin(
+        &self,
+        params: PluginsMutateParams,
+    ) -> anyhow::Result<pioneer_protocol::PluginsMutationResponse> {
+        let epoch = self.provider_runtime_epoch();
+        let connection = epoch
+            .2
+            .ok_or_else(|| anyhow::anyhow!("gateway_not_connected"))?;
+        let sender = self
+            .transport_runtime()
+            .ws_command_sender()
+            .requests_for_connection(connection);
+        let result = crate::transport::ws::command_sender::plugins_mutate(&sender, params)?;
+        anyhow::ensure!(
+            self.provider_runtime_epoch() == epoch,
+            "plugin_catalog_stale"
+        );
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod management_tests {
+    // NOT_RUN / NOT_COMPILED. A failed/uncertain action cannot be retried on a
+    // stale projection; a successful refetch is required in every shell.
+    #[test]
+    fn uncertain_mutation_requires_refetch_and_does_not_stick_in_busy() {
+        let mut state = super::PluginManagementState::default();
+        assert!(state.begin());
+        assert!(!state.begin());
+        state.complete(false);
+        assert!(!state.busy);
+        assert!(state.failed);
+        assert!(!state.begin());
+        state.refreshed();
+        assert!(state.begin());
+        state.complete(true);
+        assert!(!state.busy);
+        assert!(!state.failed);
+        assert!(!state.begin());
+        state.refreshed();
+        assert!(state.begin());
     }
 }

@@ -12,6 +12,14 @@ pub struct PluginOwner {
 pub struct PluginsSourceParams {
     pub workspace_id: String,
     pub upload_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<PluginPreviewTarget>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginPreviewTarget {
+    pub plugin_id: String,
+    pub expected_revision: i64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -110,4 +118,104 @@ mod tests {
             assert!(serde_json::from_value::<super::PluginsInstallParams>(forged).is_err());
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginsSetEnabledParams {
+    pub workspace_id: String,
+    pub plugin_id: String,
+    pub expected_revision: i64,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginComponentKey {
+    pub kind: String,
+    pub member_key: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginsUpdatePreviewParams {
+    pub workspace_id: String,
+    pub plugin_id: String,
+    pub expected_revision: i64,
+    pub upload_id: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct PluginsUpdatePreviewResponse {
+    pub package: PluginsPreviewResponse,
+    pub added: Vec<PluginComponentKey>,
+    pub updated: Vec<PluginComponentKey>,
+    pub identity_resets: Vec<PluginComponentKey>,
+    pub removed: Vec<PluginComponentKey>,
+    /// Conservative disclosure of changed MCP configurations that may need sign-in.
+    pub authorization_changes: Vec<PluginComponentKey>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PluginManagementIntent {
+    Update {
+        upload_id: String,
+        expected_fingerprint: String,
+        confirm_changes: bool,
+    },
+    Retry {
+        components: Vec<PluginComponentKey>,
+        restore_removed: bool,
+    },
+    Continue,
+    Remove {
+        purge_data: bool,
+    },
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginsMutateParams {
+    pub workspace_id: String,
+    pub plugin_id: String,
+    pub expected_revision: i64,
+    pub intent: PluginManagementIntent,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct PluginsMutationResponse {
+    pub plugin: Option<PluginItem>,
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginsUpdateParams {
+    pub workspace_id: String,
+    pub plugin_id: String,
+    pub expected_revision: i64,
+    pub upload_id: String,
+    pub expected_fingerprint: String,
+    pub confirm_changes: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginsRemoveParams {
+    pub workspace_id: String,
+    pub plugin_id: String,
+    pub expected_revision: i64,
+    pub purge_data: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginsRetryParams {
+    pub workspace_id: String,
+    pub plugin_id: String,
+    pub expected_revision: i64,
+    pub components: Option<Vec<PluginComponentKey>>,
+    #[serde(default)]
+    pub restore_removed: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginsContinueParams {
+    pub workspace_id: String,
+    pub plugin_id: String,
+    pub expected_revision: i64,
 }

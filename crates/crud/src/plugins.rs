@@ -595,3 +595,155 @@ impl CrudStore {
         .await
     }
 }
+
+impl CrudStore {
+    pub async fn plugin_credential_retention(&self) -> Result<Vec<(String, String, String)>> {
+        plugins::credential_retention(&self.connection).await
+    }
+}
+
+impl CrudStore {
+    pub async fn resume_plugin_mutation(
+        &self,
+        workspace: &str,
+        id: &str,
+        revision: i64,
+        expected_pending: &str,
+        pending: &str,
+        state: &str,
+    ) -> Result<plugin_installation::Model> {
+        if pending.len() > 65536 || !matches!(state, "updating" | "removing") {
+            bail!("invalid plugin repair");
+        }
+        let _: serde_json::Value = serde_json::from_str(pending)?;
+        self.run_serialized_write(|| async move {
+            plugins::resume_mutation(
+                &self.connection,
+                workspace,
+                id,
+                revision,
+                expected_pending,
+                pending,
+                state,
+            )
+            .await
+        })
+        .await
+    }
+    pub async fn begin_plugin_package_update(
+        &self,
+        workspace: &str,
+        id: &str,
+        revision: i64,
+        pending: &str,
+        upload_id: &str,
+        connection_id: u64,
+        now: i64,
+        previous_pending: Option<&str>,
+    ) -> Result<plugin_installation::Model> {
+        use sea_orm::TransactionTrait;
+        if pending.len() > 65536 {
+            bail!("plugin plan exceeds bound");
+        }
+        let _: serde_json::Value = serde_json::from_str(pending)?;
+        self.run_serialized_write(|| async move {
+            let db = self.connection.begin().await?;
+            let upload = crate::repositories::skill_upload_session::find_skill_upload_session(
+                &db, upload_id,
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("upload missing"))?;
+            if upload.workspace_id != workspace
+                || upload.connection_id != connection_id as i64
+                || upload.purpose != "plugin"
+                || upload.status != "finalized"
+                || upload.expires_at_unix <= now
+            {
+                bail!("upload unavailable");
+            }
+            let parent = plugins::find(&db, id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("plugins.not_found"))?;
+            let row = if let Some(previous) = previous_pending {
+                plugins::resume_mutation(
+                    &db, workspace, id, revision, previous, pending, "updating",
+                )
+                .await?
+            } else {
+                plugins::begin_mutation(
+                    &db,
+                    workspace,
+                    id,
+                    revision,
+                    "updating",
+                    parent.enabled,
+                    pending.into(),
+                )
+                .await?
+            };
+            if !crate::repositories::skill_upload_session::transition_skill_upload_status(
+                &db,
+                upload_id,
+                &["finalized"],
+                "consumed",
+                None,
+                Some(now),
+                None,
+                chrono::Utc::now().fixed_offset(),
+            )
+            .await?
+            {
+                bail!("upload changed");
+            }
+            db.commit().await?;
+            Ok(row)
+        })
+        .await
+    }
+    pub async fn publish_plugin_package(
+        &self,
+        id: &str,
+        revision: i64,
+        name: &str,
+        version: Option<&str>,
+        fingerprint: &str,
+        upload_id: Option<&str>,
+    ) -> Result<()> {
+        self.run_serialized_write(|| async move {
+            plugins::publish_package(
+                &self.connection,
+                id,
+                revision,
+                name,
+                version,
+                fingerprint,
+                upload_id,
+            )
+            .await
+        })
+        .await
+    }
+    pub async fn forget_plugin_component(
+        &self,
+        id: &str,
+        revision: i64,
+        kind: &str,
+        key: &str,
+    ) -> Result<()> {
+        self.run_serialized_write(|| async move {
+            plugins::forget_component(&self.connection, id, revision, kind, key).await
+        })
+        .await
+    }
+}
+
+pub(crate) fn native_package_removal(write: Option<&PluginNativeWrite>) -> Result<bool> {
+    let Some(write) = write else {
+        return Ok(false);
+    };
+    let value: serde_json::Value = serde_json::from_str(&write.pending_after)?;
+    Ok(matches!(
+        value.get("kind").and_then(serde_json::Value::as_str),
+        Some("install" | "update" | "retry" | "remove")
+    ))
+}

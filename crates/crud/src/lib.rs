@@ -18698,6 +18698,28 @@ impl CrudStore {
         ownership: Option<&PluginOwnershipWrite>,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
+        self.update_skill_lifecycle_with_plugin_change(
+            skill_id,
+            patch,
+            audit_records,
+            upload_id,
+            ownership,
+            None,
+            event_timestamp_secs,
+        )
+        .await
+    }
+
+    pub async fn update_skill_lifecycle_with_plugin_change(
+        &self,
+        skill_id: &SkillId,
+        patch: &SkillInstallationPatch,
+        audit_records: &[SkillAuditEventRecord],
+        upload_id: Option<&str>,
+        ownership: Option<&PluginOwnershipWrite>,
+        native: Option<&PluginNativeWrite>,
+        event_timestamp_secs: i64,
+    ) -> Result<bool> {
         if audit_records.is_empty()
             || audit_records
                 .iter()
@@ -18706,6 +18728,10 @@ impl CrudStore {
             bail!("skill update lifecycle requires audit events for the updated SkillId");
         }
         validate_atomic_skill_audit_bound(audit_records)?;
+        if native.is_some() && (ownership.is_some() || upload_id.is_none()) {
+            bail!("native skill edit requires its finalized upload");
+        }
+        plugins::validate_native_write_input(native)?;
 
         if upload_id.is_some() == ownership.is_some() {
             bail!("skill update requires either finalized upload or package ownership");
@@ -18750,15 +18776,27 @@ impl CrudStore {
                     {
                         bail!("plugin child cannot move scope or belong to a pack");
                     }
-                    repositories::plugins::validate_publication(
-                        &transaction,
-                        ownership,
-                        &existing.scope_key,
-                        "skill",
-                        skill_id.as_str(),
-                        Some(skill_id.as_str()),
-                    )
-                    .await?;
+                    if native.is_some() {
+                        repositories::plugins::validate_native_write(
+                            &transaction,
+                            native,
+                            &existing.scope_key,
+                            "skill",
+                            skill_id.as_str(),
+                        )
+                        .await?;
+                    } else {
+                        repositories::plugins::validate_publication(
+                            &transaction,
+                            ownership,
+                            &existing.scope_key,
+                            "skill",
+                            skill_id.as_str(),
+                            Some(skill_id.as_str()),
+                        )
+                        .await?;
+                    }
+
                     if !skill_installation::update_skill_installation(
                         &transaction,
                         &skill_id,
@@ -18776,6 +18814,15 @@ impl CrudStore {
                     .await?;
                     if let Some(link) = prepared_link {
                         repositories::plugins::publish(&transaction, link).await?;
+                    }
+                    if let Some(write) = native {
+                        repositories::plugins::publish_native_write(
+                            &transaction,
+                            write,
+                            "skill",
+                            false,
+                        )
+                        .await?;
                     }
                     if let Some(upload_id) = upload_id {
                         if !skill_upload_session::transition_skill_upload_status(
@@ -19814,6 +19861,7 @@ impl CrudStore {
         event_timestamp_secs: i64,
     ) -> Result<bool> {
         plugins::validate_native_write_input(native)?;
+        let package_removal = plugins::native_package_removal(native)?;
         if audit_records.is_empty()
             || audit_records
                 .iter()
@@ -19944,6 +19992,14 @@ impl CrudStore {
                             true,
                         )
                         .await?;
+                        if package_removal {
+                            repositories::plugins::mark_package_removed(
+                                &transaction,
+                                native,
+                                "skill",
+                            )
+                            .await?;
+                        }
                     }
                     Ok(true)
                 }
@@ -20420,6 +20476,7 @@ impl CrudStore {
         native: Option<&PluginNativeWrite>,
     ) -> Result<()> {
         plugins::validate_native_write_input(native)?;
+        let package_removal = plugins::native_package_removal(native)?;
         let scope_kind = record.scope_kind.clone();
         let scope_key = record.scope_key.clone();
         let name = record.name.clone();
@@ -20505,6 +20562,10 @@ impl CrudStore {
                 if let Some(native) = native {
                     repositories::plugins::publish_native_write(&transaction, native, "mcp", true)
                         .await?;
+                    if package_removal {
+                        repositories::plugins::mark_package_removed(&transaction, native, "mcp")
+                            .await?;
+                    }
                 }
                 transaction
                     .commit()

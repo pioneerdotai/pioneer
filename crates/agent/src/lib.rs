@@ -1435,6 +1435,8 @@ impl StoredControlOutcome {
 #[derive(Debug, Clone)]
 struct StoredControlOperation {
     actor_generation: u64,
+    // Native command identity used only by bounded stop candidate discovery.
+    admitted_turn_id: Option<String>,
     state: StoredControlOperationState,
 }
 
@@ -1616,6 +1618,7 @@ impl ControlOperationRegistry {
             operation_id,
             StoredControlOperation {
                 actor_generation,
+                admitted_turn_id: None,
                 state: StoredControlOperationState::Dispatching {
                     deadline: deadline_after(now, self.enqueue_timeout),
                 },
@@ -1623,6 +1626,31 @@ impl ControlOperationRegistry {
         );
         self.retirement_notify.notify_one();
         ControlOperationAdmission::Fresh
+    }
+
+    fn bind_command_turn(
+        &self,
+        operation: &AgentControlOperationId,
+        generation: u64,
+        command: &AgentCommand,
+    ) {
+        let turn = match command {
+            AgentCommand::StartTurn { turn_id, .. } => Some(turn_id.as_str()),
+            AgentCommand::StartRecoveryAttempt { request, .. } => Some(request.turn_id.as_str()),
+            AgentCommand::StartRestoredRecoveryTurn { turn_request, .. } => {
+                Some(turn_request.turn_id.as_str())
+            }
+            _ => None,
+        };
+        let mut state = self.lock_state();
+        state.revision = state.revision.saturating_add(1);
+        if let Some(entry) = state
+            .entries
+            .get_mut(operation)
+            .filter(|entry| entry.actor_generation == generation)
+        {
+            entry.admitted_turn_id = turn.map(str::to_owned);
+        }
     }
 
     fn mark_enqueued(&self, operation_id: &AgentControlOperationId, actor_generation: u64) {
@@ -2094,6 +2122,7 @@ async fn dispatch_start_command(
     // the reserved slot. Dropping the caller can therefore leave either an
     // unaccepted Dispatching reservation or an accepted Enqueued command,
     // never an ambiguous state between the two.
+    outcomes.bind_command_turn(&operation_id, actor_generation, &command);
     outcomes.mark_enqueued(&operation_id, actor_generation);
     permit.send(command);
 
@@ -2152,6 +2181,7 @@ async fn dispatch_control_command(
         }
         Ok(Ok(permit)) => permit,
     };
+    outcomes.bind_command_turn(&operation_id, actor_generation, &command);
     outcomes.mark_enqueued(&operation_id, actor_generation);
     permit.send(command);
 
@@ -4052,6 +4082,100 @@ impl AgentManager {
             retired,
             mailbox,
         })
+    }
+
+    /// Existing native actor/retirement inventory, bounded for Gateway scope
+    /// filtering before stop. This observation grants no cancellation authority.
+    pub async fn native_stop_thread_ids(&self) -> Result<Vec<String>, StopError> {
+        let state = self.state.read().await;
+        let ids = state
+            .threads
+            .keys()
+            .chain(state.retiring_executions.keys())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if ids.len() > 65536 {
+            return Err(StopError::UnknownOwner);
+        }
+        Ok(ids.into_iter().collect())
+    }
+
+    /// Candidate discovery only: callers still use the accepted snapshot/drain
+    /// entrypoints for actual stop proof. Includes accepted commands before
+    /// native publication, without querying unbounded historical Turn rows.
+    pub async fn native_stop_turn_candidates(
+        &self,
+        threads: &[String],
+    ) -> Result<Vec<(String, String)>, StopError> {
+        if threads.len() > 65536 {
+            return Err(StopError::UnknownOwner);
+        }
+        let state = self.state.read().await;
+        let mut candidates = std::collections::BTreeSet::new();
+        for id in threads {
+            if let Some(thread) = state.threads.get(id) {
+                if thread
+                    .control_plane
+                    .publication_epoch
+                    .load(Ordering::Acquire)
+                    & 1
+                    != 0
+                {
+                    return Err(StopError::UnknownOwner);
+                }
+                let registry = thread.control_outcomes.lock_state();
+                for (operation, entry) in &registry.entries {
+                    if matches!(entry.state, StoredControlOperationState::Completed(_)) {
+                        continue;
+                    }
+                    let turn = match operation {
+                        AgentControlOperationId::StartTurn { turn_id } => Some(turn_id.as_str()),
+                        AgentControlOperationId::StartRecoveryAttempt { .. }
+                        | AgentControlOperationId::StartRestoredRecoveryTurn { .. } => Some(
+                            entry
+                                .admitted_turn_id
+                                .as_deref()
+                                .ok_or(StopError::UnknownOwner)?,
+                        ),
+                        _ => None,
+                    };
+                    if let Some(turn) = turn {
+                        candidates.insert((id.clone(), turn.to_owned()));
+                    }
+                    if candidates.len() > 65536 {
+                        return Err(StopError::UnknownOwner);
+                    }
+                }
+            }
+            let planes = state
+                .threads
+                .get(id)
+                .map(|thread| &thread.control_plane)
+                .into_iter()
+                .chain(state.retiring_executions.get(id).into_iter().flatten());
+            for plane in planes {
+                let mut runs = plane
+                    .last_execution
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut count = 0;
+                while let Some((turn, control)) = runs.pop() {
+                    count += 1;
+                    if count > 65536 {
+                        return Err(StopError::UnknownOwner);
+                    }
+                    runs.extend(control.completion.predecessors());
+                    candidates.insert((id.clone(), turn));
+                    if candidates.len() > 65536 {
+                        return Err(StopError::UnknownOwner);
+                    }
+                }
+            }
+        }
+        Ok(candidates.into_iter().collect())
     }
 
     /// Snapshot latest native runs and exact pending predecessors. The latest

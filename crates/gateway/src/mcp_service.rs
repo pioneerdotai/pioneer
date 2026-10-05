@@ -719,19 +719,68 @@ impl McpService {
     }
 
     pub(crate) async fn reload_workspace(&self, workspace_id: &str) -> Result<()> {
-        self.reload_workspace_with_store(self.inner.crud_store.as_ref(), workspace_id)
+        self.reload_workspace_with_store(self.inner.crud_store.as_ref(), workspace_id, None)
             .await
     }
 
     pub(crate) async fn reload_workspace_for_maintenance(&self, workspace_id: &str) -> Result<()> {
         let store = self.inner.crud_store.with_maintenance_access();
-        self.reload_workspace_with_store(&store, workspace_id).await
+        self.reload_workspace_with_store(&store, workspace_id, None)
+            .await
     }
 
+    /// Only the foreground owner can reload its own prepared parent while the
+    /// pending plan still fences execution. Startup and OAuth launch cannot.
+    pub(crate) async fn reload_after_plugin_change(
+        &self,
+        guard: &crate::message::plugins::PluginMutationGuard,
+    ) -> Result<()> {
+        self.reload_workspace_with_store(
+            self.runtime_store(),
+            &guard.parent().workspace_id,
+            Some(guard),
+        )
+        .await
+    }
+    async fn plugin_start_available(
+        &self,
+        store: &CrudStore,
+        row: &McpServerInstallationRecord,
+        admitted: Option<&crate::message::plugins::PluginMutationGuard>,
+    ) -> Result<bool> {
+        if row.scope_kind != "workspace" {
+            return Ok(true);
+        }
+        let id = row.id.as_deref().context("MCP installation ID missing")?;
+        if let Some(guard) = admitted {
+            if store
+                .find_mcp_plugin_owner(id)
+                .await?
+                .is_some_and(|owner| owner.plugin_id == guard.parent().id)
+            {
+                let current = store
+                    .find_plugin_installation(&guard.parent().id)
+                    .await?
+                    .context("plugin owner missing")?;
+                anyhow::ensure!(
+                    current.workspace_id == row.scope_key
+                        && current.revision == guard.parent().revision,
+                    "plugin reload admission changed"
+                );
+                return store
+                    .plugin_child_runtime_available(id, &row.scope_key)
+                    .await;
+            }
+        }
+        store
+            .plugin_child_available("mcp", id, &row.scope_key)
+            .await
+    }
     async fn reload_workspace_with_store(
         &self,
         store: &CrudStore,
         workspace_id: &str,
+        admitted: Option<&crate::message::plugins::PluginMutationGuard>,
     ) -> Result<()> {
         let rows = store
             .list_mcp_server_installations("workspace", workspace_id)
@@ -767,9 +816,7 @@ impl McpService {
                 .oauth
                 .synchronize(&installation_id, &installation)
                 .await?;
-            let parent_available = store
-                .plugin_child_available("mcp", &installation_id, workspace_id)
-                .await?;
+            let parent_available = self.plugin_start_available(store, &row, admitted).await?;
             if !row.enabled || !parent_available {
                 self.inner.oauth.suspend(&installation_id).await?;
                 self.stop_task(&installation_id, DomainRuntimeState::Disabled)
@@ -862,7 +909,8 @@ impl McpService {
                     self.stop_task_result(&installation_id, DomainRuntimeState::Stopped)
                         .await?;
                 }
-                self.start_task(row, effective_secret_fingerprint).await?;
+                self.start_task(row, effective_secret_fingerprint, store, admitted)
+                    .await?;
             }
         }
 
@@ -994,7 +1042,8 @@ impl McpService {
                 // The admission guard excludes durable resource/UUID replacement.
                 if row.enabled && self.oauth().event_is_current(event, &installation).await {
                     let fingerprint = self.effective_secret_fingerprint_for_row(&row)?;
-                    self.start_task(row, fingerprint).await?;
+                    self.start_task(row, fingerprint, self.runtime_store(), None)
+                        .await?;
                 }
             }
             pioneer_mcp_oauth::OAuthState::Recovered => {
@@ -1068,7 +1117,16 @@ impl McpService {
                 None,
             )
             .await;
-            if self.task_exists(installation_id).await {
+            if self
+                .runtime_store()
+                .find_mcp_plugin_owner(installation_id)
+                .await?
+                .is_some()
+            {
+                // Owned restart cannot reinterpret an absent retained owner as
+                // confirmation. Standalone keeps its prior native branch.
+                self.stop_admitted_installation(row).await?;
+            } else if self.task_exists(installation_id).await {
                 self.stop_task_result(installation_id, DomainRuntimeState::Stopped)
                     .await?;
             }
@@ -1088,8 +1146,13 @@ impl McpService {
         if row.enabled && parent_available {
             match self.effective_secret_fingerprint_for_row(&row) {
                 Ok(effective_secret_fingerprint) => {
-                    self.start_task(row.clone(), effective_secret_fingerprint)
-                        .await?;
+                    self.start_task(
+                        row.clone(),
+                        effective_secret_fingerprint,
+                        self.runtime_store(),
+                        None,
+                    )
+                    .await?;
                 }
                 Err(error) => {
                     self.publish_status(
@@ -1986,12 +2049,30 @@ impl McpService {
         &self,
         row: McpServerInstallationRecord,
         effective_secret_fingerprint: String,
+        store: &CrudStore,
+        admitted: Option<&crate::message::plugins::PluginMutationGuard>,
     ) -> Result<()> {
         let installation = installation_from_record(&row)?;
         let installation_id = row
             .id
             .clone()
             .context("MCP installation row is missing id")?;
+        // All callers retain the existing installation lifecycle admission.
+        // Include OAuth Authorized, which starts directly without reload. A
+        // closed parent cannot recreate a process after lifecycle stop ACK.
+        if !self.plugin_start_available(store, &row, admitted).await? {
+            self.publish_status(
+                &row,
+                DomainRuntimeState::Disabled,
+                Some("Plugin operation is unfinished or disabled".into()),
+                None,
+                0,
+                None,
+                None,
+            )
+            .await;
+            return Ok(());
+        }
         let connector = self
             .inner
             .connector
@@ -8574,6 +8655,114 @@ mod tests {
         assert_eq!(
             materialization.diagnostics[0].code,
             "mcp.resolution.installation_unavailable"
+        );
+    }
+    // C1 regression source only: NOT_RUN / NOT_COMPILED.
+    #[tokio::test]
+    async fn direct_native_start_cannot_bypass_the_closed_parent_during_oauth_recovery() {
+        let (service, store, workspace) = test_mcp_service().await;
+        seed_mcp_installation(&store, &workspace, "template", false, false).await;
+        let mut row = store
+            .find_mcp_server_installation("workspace", &workspace, "template")
+            .await
+            .unwrap()
+            .unwrap();
+        let parent_id = "P".repeat(21);
+        let child_id = "S".repeat(21);
+        let now = chrono::Utc::now().fixed_offset();
+        store
+            .insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+                id: parent_id.clone(),
+                workspace_id: workspace.clone(),
+                name: "mixed".into(),
+                version: None,
+                source_upload_id: "source".into(),
+                package_path: "/unused/package".into(),
+                data_path: "/unused/data".into(),
+                package_fingerprint: "tree".into(),
+                enabled: true,
+                state: "installing".into(),
+                revision: 1,
+                pending_json: Some("{}".into()),
+                last_error: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        row.id = Some(child_id.clone());
+        row.name = "pplugin_closed_parent_fixture".into();
+        row.enabled = true;
+        let write = pioneer_crud::PluginOwnershipWrite {
+            plugin_id: parent_id.clone(),
+            expected_revision: 1,
+            member_key: "one".into(),
+            member_path: None,
+            package_fingerprint: "tree".into(),
+            child_id: child_id.clone(),
+        };
+        let audit = pioneer_crud::McpAuditEventRecord {
+            turn_id: None,
+            server_installation_id: Some(child_id.clone()),
+            server_name: row.name.clone(),
+            raw_tool_name: None,
+            callable_name: None,
+            catalog_version: None,
+            action: "install".into(),
+            decision: "allowed".into(),
+            reason_code: None,
+            details_json: "{}".into(),
+            created_at_unix: 1,
+        };
+        store
+            .upsert_mcp_server_installation_with_audit_and_ownership(&row, &audit, Some(&write), 1)
+            .await
+            .unwrap();
+        store
+            .settle_plugin_installation(&parent_id, 1, "installed", None)
+            .await
+            .unwrap();
+        store
+            .begin_plugin_mutation(
+                &workspace,
+                &parent_id,
+                1,
+                "updating",
+                true,
+                "{\"kind\":\"set_enabled\",\"enabled\":true}",
+            )
+            .await
+            .unwrap();
+        let _native = service
+            .installation_lifecycle_guard("workspace", &workspace, &row.name)
+            .await;
+        // OAuth Authorized and restart converge on this real native start seam.
+        // The connector must never be reached while the parent gate is closed.
+        service
+            .start_task(
+                row.clone(),
+                "fixture-fingerprint".into(),
+                service.runtime_store(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!service.inner.tasks.lock().await.contains_key(&child_id));
+        assert!(
+            !service
+                .inner
+                .runtime_generations
+                .lock()
+                .await
+                .contains_key(&child_id)
+        );
+        assert!(
+            store
+                .find_mcp_server_installation("workspace", &workspace, &row.name)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
         );
     }
 }

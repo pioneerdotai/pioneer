@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail};
 use pioneer_entity::{plugin_component, plugin_installation};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, ModelTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
 pub async fn list<C: ConnectionTrait>(
@@ -590,5 +590,135 @@ pub async fn publish_native_write<C: ConnectionTrait>(
     parent.pending_json = Set(Some(write.pending_after.clone()));
     parent.updated_at = Set(chrono::Utc::now().fixed_offset());
     parent.update(db).await?;
+    Ok(())
+}
+
+/// One bounded read snapshot protects both native and pending credential owners.
+/// Serialization/parsing and keystore work happen after reader capacity is released.
+pub async fn credential_retention<C: ConnectionTrait>(
+    db: &C,
+) -> Result<Vec<(String, String, String)>> {
+    use sea_orm::{DbBackend, Statement};
+    let rows = db.query_all_raw(Statement::from_string(DbBackend::Sqlite,
+        "SELECT 'native' AS kind,id AS owner,secret_refs_json AS payload FROM mcp_server_installation \
+         UNION ALL SELECT 'pending' AS kind,id AS owner,pending_json AS payload \
+         FROM plugin_installation WHERE pending_json IS NOT NULL LIMIT 100001".to_owned())).await?;
+    if rows.len() > 100000 {
+        bail!("credential retention inventory exceeds bound");
+    }
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get("", "kind")?,
+                row.try_get("", "owner")?,
+                row.try_get("", "payload")?,
+            ))
+        })
+        .collect()
+}
+
+pub async fn resume_mutation<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    id: &str,
+    revision: i64,
+    expected_pending: &str,
+    pending: &str,
+    state: &str,
+) -> Result<plugin_installation::Model> {
+    let parent = find(db, id).await?.context("plugins.not_found")?;
+    if parent.workspace_id != workspace
+        || parent.revision != revision
+        || parent.pending_json.as_deref() != Some(expected_pending)
+    {
+        bail!("plugins.stale");
+    }
+    let next = revision
+        .checked_add(1)
+        .context("plugin revision exhausted")?;
+    let mut row: plugin_installation::ActiveModel = parent.into();
+    row.revision = Set(next);
+    row.state = Set(state.to_owned());
+    row.pending_json = Set(Some(pending.to_owned()));
+    row.last_error = Set(None);
+    row.updated_at = Set(chrono::Utc::now().fixed_offset());
+    Ok(row.update(db).await?)
+}
+pub async fn publish_package<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    revision: i64,
+    name: &str,
+    version: Option<&str>,
+    fingerprint: &str,
+    upload_id: Option<&str>,
+) -> Result<()> {
+    let parent = find(db, id).await?.context("plugins.not_found")?;
+    if parent.revision != revision || parent.pending_json.is_none() || parent.state != "updating" {
+        bail!("plugins.stale");
+    }
+    let mut row: plugin_installation::ActiveModel = parent.into();
+    if let Some(upload) = upload_id {
+        row.source_upload_id = Set(upload.into());
+    }
+    row.name = Set(name.into());
+    row.version = Set(version.map(str::to_owned));
+    row.package_fingerprint = Set(fingerprint.into());
+    row.updated_at = Set(chrono::Utc::now().fixed_offset());
+    row.update(db).await?;
+    Ok(())
+}
+pub async fn forget_component<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    revision: i64,
+    kind: &str,
+    key: &str,
+) -> Result<()> {
+    let parent = find(db, id).await?.context("plugins.not_found")?;
+    if parent.revision != revision
+        || parent.pending_json.is_none()
+        || !matches!(
+            parent.state.as_str(),
+            "updating" | "removing" | "interrupted"
+        )
+    {
+        bail!("plugins.stale");
+    }
+    if let Some(row) =
+        plugin_component::Entity::find_by_id((id.to_owned(), kind.to_owned(), key.to_owned()))
+            .one(db)
+            .await?
+    {
+        if row.skill_id.is_some() || row.mcp_installation_id.is_some() {
+            bail!("native component must be removed first");
+        }
+        row.delete(db).await?;
+    }
+    Ok(())
+}
+
+/// A package removal interrupted before forgetting its link is a repairable
+/// failure, not a user restriction. Reuse the existing status/diagnostic fields.
+pub async fn mark_package_removed<C: ConnectionTrait>(
+    db: &C,
+    write: &PluginNativeWrite,
+    kind: &str,
+) -> Result<()> {
+    let link = plugin_component::Entity::find_by_id((
+        write.plugin_id.clone(),
+        kind.to_owned(),
+        write.member_key.clone(),
+    ))
+    .one(db)
+    .await?
+    .context("plugin component missing")?;
+    if link.skill_id.is_some() || link.mcp_installation_id.is_some() {
+        bail!("native removal not published");
+    }
+    let mut row: plugin_component::ActiveModel = link.into();
+    row.status = Set("failed".into());
+    row.diagnostic = Set(Some("component_removed_for_update".into()));
+    row.update(db).await?;
     Ok(())
 }

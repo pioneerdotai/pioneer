@@ -97,6 +97,11 @@ pub mod methods {
     pub const SETTINGS_UPDATE: &str = "settings/update";
     pub const PLUGINS_PREVIEW: &str = "plugins/preview";
     pub const PLUGINS_INSTALL: &str = "plugins/install";
+    pub const PLUGINS_UPDATE: &str = "plugins/update";
+    pub const PLUGINS_REMOVE: &str = "plugins/remove";
+    pub const PLUGINS_RETRY: &str = "plugins/retry";
+    pub const PLUGINS_CONTINUE: &str = "plugins/continue";
+    pub const PLUGINS_SET_ENABLED: &str = "plugins/setEnabled";
     pub const PLUGINS_LIST: &str = "plugins/list";
     pub const PLUGINS_DETAILS: &str = "plugins/details";
     pub const PLUGINS_CHANGED: &str = "plugins/changed";

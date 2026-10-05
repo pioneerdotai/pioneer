@@ -1357,10 +1357,16 @@ fn plugin_turn_normalization_keeps_parent_and_rejects_raw_owned_skill() {
         assert!(matches!(&result.execution[0].kind, pioneer_protocol::TurnCapabilityKind::Skill { skill_id: id, .. } if id == &skill_id));
         assert_eq!(result.plugin_selection.unwrap().children[0].id, skill_id.to_string());
         assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &result.execution).await.is_err());
-        let mut stale = selected.clone(); stale.kind = pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id: parent_id, expected_revision: 2 };
+        let mut stale = selected.clone(); stale.kind = pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id: parent_id.clone(), expected_revision: 2 };
         assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[stale]).await.is_err());
         let mut disabled = policy.clone(); disabled.enabled = Some(false);
-        harness.crud_store.upsert_workspace_skill_policy(&disabled, 2).await.unwrap();
+        let gate=harness.crud_store.begin_plugin_mutation(&harness.workspace_id,&parent_id,1,"updating",true,"{\"kind\":\"native\",\"action\":\"policy\",\"native_committed\":false}").await.unwrap();
+        harness.crud_store.upsert_workspace_skill_policy_with_plugin_change(&disabled,Some(&pioneer_crud::PluginNativeWrite {
+            plugin_id:parent_id.clone(),expected_revision:gate.revision,member_key:"bundled".into(),child_id:skill_id.to_string(),override_fields_json:"[\"enabled\"]".into(),
+            pending_after:"{\"kind\":\"native\",\"action\":\"policy\",\"native_committed\":true}".into()
+        }),2).await.unwrap();
+        harness.crud_store.finish_plugin_mutation(&parent_id,gate.revision,"installed",None).await.unwrap();
+        let mut selected=selected; selected.kind=pioneer_protocol::TurnCapabilityKind::Plugin{plugin_id:parent_id,expected_revision:gate.revision};
         let excluded = harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[selected.clone()]).await.unwrap();
         assert_eq!(excluded.presentation.len(), 1);
         assert!(excluded.execution.is_empty());
@@ -78397,4 +78403,155 @@ async fn native_snapshot_after_publication(
     })
     .await
     .unwrap()
+}
+
+// C1 regression source only: NOT_RUN / NOT_COMPILED.
+#[tokio::test]
+async fn plugin_mutation_and_final_native_start_share_the_parent_admission_barrier() {
+    use sea_orm::ConnectionTrait;
+    let (processor, _, _, _rx, _, workspace) = setup_workspace_message_processor().await;
+    let id = "P".repeat(21);
+    let now = chrono::Utc::now().fixed_offset();
+    let parent = pioneer_entity::plugin_installation::Model {
+        id: id.clone(),
+        workspace_id: workspace.clone(),
+        name: "empty".into(),
+        version: None,
+        source_upload_id: "admission-upload".into(),
+        package_path: "/managed/package".into(),
+        data_path: "/managed/data".into(),
+        package_fingerprint: "empty-tree".into(),
+        enabled: true,
+        state: "installing".into(),
+        revision: 1,
+        pending_json: None,
+        last_error: None,
+        created_at: now,
+        updated_at: now,
+    };
+    processor
+        .crud_store
+        .insert_plugin_installation(&parent)
+        .await
+        .unwrap();
+    processor
+        .crud_store
+        .settle_plugin_installation(&id, 1, "installed", None)
+        .await
+        .unwrap();
+    processor.crud_store.database_connection().execute_unprepared(&format!(
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at)          VALUES('plugin-admission-thread','{workspace}','','chat','test','test','active','user','visible','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);          INSERT INTO turn(id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at)          VALUES('plugin-admission-turn','plugin-admission-thread','in_progress','{{}}','user','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);"
+    )).await.unwrap();
+    processor
+        .crud_store
+        .prepare_plugin_selection(
+            "plugin-admission-turn",
+            &pioneer_protocol::PluginSelectionSnapshot {
+                parents: vec![pioneer_protocol::PluginSelectedParent {
+                    id: id.clone(),
+                    revision: 1,
+                }],
+                children: vec![],
+                phase: "prepared".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let admitted = processor
+        .acquire_plugin_launch_guards(&workspace, "plugin-admission-turn")
+        .await
+        .unwrap();
+    assert_eq!(admitted.len(), 1);
+    assert!(
+        processor
+            .recovery_coordinator
+            .acquire_plugin_recovery_admission(&workspace, "plugin-admission-turn")
+            .await
+            .is_err(),
+        "recovery must contend on the same live parent admission guard"
+    );
+    assert!(
+        processor
+            .acquire_plugin_mutation(&workspace, &id, 1)
+            .await
+            .is_err()
+    );
+    drop(admitted);
+    let recovery = processor
+        .recovery_coordinator
+        .acquire_plugin_recovery_admission(&workspace, "plugin-admission-turn")
+        .await
+        .unwrap();
+    assert_eq!(recovery.len(), 1);
+    assert!(
+        processor
+            .acquire_plugin_mutation(&workspace, &id, 1)
+            .await
+            .is_err()
+    );
+    drop(recovery);
+    let mutation = processor
+        .acquire_plugin_mutation(&workspace, &id, 1)
+        .await
+        .unwrap();
+    assert!(
+        processor
+            .acquire_plugin_launch_guards(&workspace, "plugin-admission-turn")
+            .await
+            .is_err()
+    );
+    let closed = processor
+        .crud_store
+        .begin_plugin_mutation(
+            &workspace,
+            &id,
+            1,
+            "updating",
+            false,
+            "{\"kind\":\"set_enabled\",\"children\":[]}",
+        )
+        .await
+        .unwrap();
+    drop(mutation);
+    assert_eq!(closed.revision, 2);
+    assert!(
+        processor
+            .acquire_plugin_launch_guards(&workspace, "plugin-admission-turn")
+            .await
+            .is_err()
+    );
+    assert!(
+        processor
+            .acquire_plugin_mutation(&workspace, &id, 1)
+            .await
+            .is_err()
+    );
+    assert!(
+        processor
+            .acquire_plugin_mutation("foreign", &id, 2)
+            .await
+            .is_err()
+    );
+    processor
+        .crud_store
+        .finish_plugin_mutation(&id, 2, "installed", None)
+        .await
+        .unwrap();
+    let enabled = processor
+        .crud_store
+        .begin_plugin_mutation(&workspace, &id, 2, "updating", true, "{}")
+        .await
+        .unwrap();
+    processor
+        .crud_store
+        .finish_plugin_mutation(&id, enabled.revision, "installed", None)
+        .await
+        .unwrap();
+    // Re-enabled parent still requires a fresh trusted selection revision.
+    assert!(
+        processor
+            .acquire_plugin_launch_guards(&workspace, "plugin-admission-turn")
+            .await
+            .is_err()
+    );
 }
