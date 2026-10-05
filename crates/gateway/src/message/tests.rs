@@ -67124,6 +67124,42 @@ async fn mcp_list_empty_then_install_stdio_persists_redacts_and_notifies() {
     assert!(!row.enabled);
     assert!(!row.allow_implicit_invocation);
 
+    // The business entrypoint and RPC share the native policy write, audit,
+    // lifecycle guard and runtime publication; there is no internal RPC call.
+    let context =
+        registered_request_context(&processor, connection_id, methods::MCP_POLICY_SET).await;
+    let direct = processor
+        .set_mcp_policy(
+            &context,
+            RequestId::new("mcp_policy_direct001").expect("request id"),
+            McpPolicySetParams {
+                workspace_id: workspace_id.clone(),
+                name: "resend".into(),
+                scope_kind: McpScopeKind::Workspace,
+                enabled: Some(false),
+                allow_implicit_invocation: Some(false),
+            },
+        )
+        .await
+        .expect("native business operation");
+    assert_eq!(direct.policy, policy_payload.policy);
+    assert_eq!(direct.server.policy, policy_payload.server.policy);
+    let after = crud_store_for_assert
+        .find_mcp_server_installation("workspace", &workspace_id, "resend")
+        .await
+        .expect("native row")
+        .expect("same installation");
+    assert_eq!(after.id, row.id);
+    assert!(!after.enabled && !after.allow_implicit_invocation);
+    let audits = crud_store_for_assert
+        .list_recent_mcp_audit_event_records("resend", 32)
+        .await
+        .expect("native policy audits");
+    assert_eq!(
+        audits.iter().filter(|row| row.action == "policy").count(),
+        2
+    );
+
     let _ = std::fs::remove_dir_all(base_dir);
 }
 

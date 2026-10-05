@@ -1,5 +1,11 @@
 use super::*;
 
+pub(crate) struct McpPolicyChange {
+    payload: McpPolicySetResponse,
+    now: i64,
+    lifecycle: tokio::sync::OwnedMutexGuard<()>,
+}
+
 impl MessageProcessor {
     pub(crate) async fn mcp_policy_set(
         &self,
@@ -7,6 +13,67 @@ impl MessageProcessor {
         request_id: RequestId,
         params: McpPolicySetParams,
     ) {
+        match self
+            .prepare_mcp_policy_change(request_context, request_id.clone(), params)
+            .await
+        {
+            Ok(change) => {
+                // Preserve standalone response-before-publication ordering and
+                // the native lifecycle guard through the post-commit effects.
+                let response =
+                    match JsonRpcResponse::from_result(request_id.clone(), &change.payload) {
+                        Ok(response) => response,
+                        Err(error) => {
+                            self.send_error(
+                                request_context.connection_id(),
+                                mcp_error(
+                                    Some(request_id),
+                                    INVALID_REQUEST_CODE,
+                                    MCP_ERROR_INTERNAL,
+                                    "failed to encode mcp/policy/set response",
+                                    json!({"error": format!("{error:#}")}),
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                if let Err(error) = self
+                    .send_json(request_context.connection_id(), &response)
+                    .await
+                {
+                    warn!(error = %error, "failed to send mcp/policy/set response");
+                    return;
+                }
+                self.finish_mcp_policy_change(change).await;
+            }
+            Err(error) => {
+                self.send_error(request_context.connection_id(), error)
+                    .await
+            }
+        }
+    }
+
+    /// Runs the same admitted native mutation and its existing post-commit
+    /// publications/reload without requiring a websocket reply.
+    pub(crate) async fn set_mcp_policy(
+        &self,
+        request_context: &RequestContext,
+        request_id: RequestId,
+        params: McpPolicySetParams,
+    ) -> std::result::Result<McpPolicySetResponse, JsonRpcErrorResponse> {
+        let change = self
+            .prepare_mcp_policy_change(request_context, request_id, params)
+            .await?;
+        Ok(self.finish_mcp_policy_change(change).await)
+    }
+
+    async fn prepare_mcp_policy_change(
+        &self,
+        request_context: &RequestContext,
+        request_id: RequestId,
+        params: McpPolicySetParams,
+    ) -> std::result::Result<McpPolicyChange, JsonRpcErrorResponse> {
         let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_mcp_workspace(
@@ -19,55 +86,39 @@ impl MessageProcessor {
         {
             Ok(workspace_id) => workspace_id,
             Err(error) => {
-                self.send_error(connection_id, error).await;
-                return;
+                return Err(error);
             }
         };
 
         if params.name.trim().is_empty() {
-            self.send_error(
-                connection_id,
-                mcp_error(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    MCP_ERROR_INVALID_REQUEST,
-                    "MCP server name is required",
-                    json!({"name": params.name}),
-                ),
-            )
-            .await;
-            return;
+            return Err(mcp_error(
+                Some(request_id),
+                INVALID_PARAMS_CODE,
+                MCP_ERROR_INVALID_REQUEST,
+                "MCP server name is required",
+                json!({"name": params.name}),
+            ));
         }
         if params.enabled.is_none() && params.allow_implicit_invocation.is_none() {
-            self.send_error(
-                connection_id,
-                mcp_error(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    MCP_ERROR_INVALID_REQUEST,
-                    "enabled or allow_implicit_invocation is required",
-                    json!({"name": params.name}),
-                ),
-            )
-            .await;
-            return;
+            return Err(mcp_error(
+                Some(request_id),
+                INVALID_PARAMS_CODE,
+                MCP_ERROR_INVALID_REQUEST,
+                "enabled or allow_implicit_invocation is required",
+                json!({"name": params.name}),
+            ));
         }
 
         let scope_kind = match McpScopeKind::from_str(params.scope_kind.as_str()) {
             Ok(scope_kind) => scope_kind,
             Err(error) => {
-                self.send_error(
-                    connection_id,
-                    mcp_error(
-                        Some(request_id.clone()),
-                        INVALID_PARAMS_CODE,
-                        MCP_ERROR_INVALID_REQUEST,
-                        "invalid MCP scope kind",
-                        json!({"error": error}),
-                    ),
-                )
-                .await;
-                return;
+                return Err(mcp_error(
+                    Some(request_id.clone()),
+                    INVALID_PARAMS_CODE,
+                    MCP_ERROR_INVALID_REQUEST,
+                    "invalid MCP scope kind",
+                    json!({"error": error}),
+                ));
             }
         };
         let scope_key = match &scope_kind {
@@ -90,36 +141,26 @@ impl MessageProcessor {
         {
             Ok(Some(record)) => record,
             Ok(None) => {
-                self.send_error(
-                    connection_id,
-                    mcp_error(
-                        Some(request_id),
-                        INVALID_PARAMS_CODE,
-                        MCP_ERROR_NOT_FOUND,
-                        "MCP server installation was not found",
-                        json!({
-                            "scope_kind": params.scope_kind,
-                            "scope_key": scope_key,
-                            "name": params.name,
-                        }),
-                    ),
-                )
-                .await;
-                return;
+                return Err(mcp_error(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    MCP_ERROR_NOT_FOUND,
+                    "MCP server installation was not found",
+                    json!({
+                        "scope_kind": params.scope_kind,
+                        "scope_key": scope_key,
+                        "name": params.name,
+                    }),
+                ));
             }
             Err(error) => {
-                self.send_error(
-                    connection_id,
-                    mcp_error(
-                        Some(request_id.clone()),
-                        INVALID_REQUEST_CODE,
-                        MCP_ERROR_INTERNAL,
-                        "failed to query MCP server installation",
-                        json!({"error": format!("{error:#}")}),
-                    ),
-                )
-                .await;
-                return;
+                return Err(mcp_error(
+                    Some(request_id.clone()),
+                    INVALID_REQUEST_CODE,
+                    MCP_ERROR_INTERNAL,
+                    "failed to query MCP server installation",
+                    json!({"error": format!("{error:#}")}),
+                ));
             }
         };
 
@@ -167,18 +208,13 @@ impl MessageProcessor {
         {
             Ok(id) => id,
             Err(error) => {
-                self.send_error(
-                    connection_id,
-                    mcp_error(
-                        Some(request_id.clone()),
-                        INVALID_REQUEST_CODE,
-                        MCP_ERROR_INTERNAL,
-                        "failed to persist MCP server policy",
-                        json!({"error": format!("{error:#}")}),
-                    ),
-                )
-                .await;
-                return;
+                return Err(mcp_error(
+                    Some(request_id.clone()),
+                    INVALID_REQUEST_CODE,
+                    MCP_ERROR_INTERNAL,
+                    "failed to persist MCP server policy",
+                    json!({"error": format!("{error:#}")}),
+                ));
             }
         };
         record.id = Some(installation_id);
@@ -194,37 +230,24 @@ impl MessageProcessor {
             },
             server,
         };
-        let response = match JsonRpcResponse::from_result(request_id.clone(), &payload) {
-            Ok(response) => response,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    mcp_error(
-                        None,
-                        INVALID_REQUEST_CODE,
-                        MCP_ERROR_INTERNAL,
-                        "failed to encode mcp/policy/set response",
-                        json!({"error": format!("{error:#}")}),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
+        Ok(McpPolicyChange {
+            payload,
+            now,
+            lifecycle,
+        })
+    }
 
-        if let Err(error) = self.send_json(connection_id, &response).await {
-            warn!(
-                connection_id,
-                error = %format!("{error:#}"),
-                "failed to send mcp/policy/set response"
-            );
-            return;
-        }
-
+    async fn finish_mcp_policy_change(&self, change: McpPolicyChange) -> McpPolicySetResponse {
+        let McpPolicyChange {
+            payload,
+            now,
+            lifecycle,
+        } = change;
+        let workspace_id = &payload.policy.workspace_id;
         self.notify_mcp_changed(
             workspace_id.as_str(),
             vec![McpChangedItem {
-                name: record.name,
+                name: payload.policy.name.clone(),
                 source_kind: McpSourceKind::Config,
                 action: McpChangedAction::Policy,
             }],
@@ -244,5 +267,6 @@ impl MessageProcessor {
                 "failed to reload MCP runtime after policy change"
             );
         }
+        payload
     }
 }
