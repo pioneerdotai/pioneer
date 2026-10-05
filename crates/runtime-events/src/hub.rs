@@ -97,6 +97,7 @@ struct DurableEventEnvelope {
     committed_tx: Option<oneshot::Sender<Result<(), DurableCommitRejection>>>,
     enqueued_at: Instant,
     turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
 }
 
 /// Receiver for the durable lane. Events published with a commit waiter must
@@ -107,6 +108,7 @@ pub struct DurableEventReceiver {
     pending_commit: Option<oneshot::Sender<Result<(), DurableCommitRejection>>>,
     pending_enqueue_age: Option<Duration>,
     pending_turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    pending_cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
 }
 
 impl DurableEventReceiver {
@@ -118,6 +120,7 @@ impl DurableEventReceiver {
         let envelope = self.lane.receiver.lock().await.recv().await?;
         self.pending_commit = envelope.committed_tx;
         self.pending_turn_transition = envelope.turn_transition;
+        self.pending_cli_blocked_guard = envelope.cli_blocked_guard;
         self.pending_enqueue_age = Some(envelope.enqueued_at.elapsed());
         Some(*envelope.event)
     }
@@ -128,6 +131,10 @@ impl DurableEventReceiver {
         self.pending_enqueue_age
     }
 
+    pub fn cli_blocked_guard(&self) -> Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard> {
+        self.pending_cli_blocked_guard.as_ref()
+    }
+
     pub fn owns_turn_transition(&self) -> bool {
         self.pending_turn_transition.is_some()
     }
@@ -135,6 +142,7 @@ impl DurableEventReceiver {
     pub fn acknowledge_last(&mut self, result: Result<(), DurableCommitRejection>) {
         self.pending_enqueue_age = None;
         self.pending_turn_transition = None;
+        self.pending_cli_blocked_guard = None;
         if let Some(committed_tx) = self.pending_commit.take() {
             let _ = committed_tx.send(result);
         }
@@ -213,7 +221,7 @@ impl ExecutionEventHub {
         &self,
         event: AgentDurableEvent,
     ) -> impl Future<Output = Result<(), ExecutionEventHubError>> + Send + '_ {
-        self.publish_durable_envelope(Box::new(event), None, None)
+        self.publish_durable_envelope(Box::new(event), None, None, None)
     }
 
     pub fn publish_durable_and_wait(
@@ -231,11 +239,26 @@ impl ExecutionEventHub {
         event: AgentDurableEvent,
         turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) -> impl Future<Output = Result<(), ExecutionEventHubError>> + Send + '_ {
+        self.publish_cli_runtime_blocked_and_wait(event, turn_transition, None)
+    }
+
+    /// Targeted source facts for the atomic CLI Blocked lifecycle commit.
+    pub fn publish_cli_runtime_blocked_and_wait(
+        &self,
+        event: AgentDurableEvent,
+        turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+        cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+    ) -> impl Future<Output = Result<(), ExecutionEventHubError>> + Send + '_ {
         let event = Box::new(event);
         async move {
             let (committed_tx, committed_rx) = oneshot::channel();
-            self.publish_durable_envelope(event, Some(committed_tx), turn_transition)
-                .await?;
+            self.publish_durable_envelope(
+                event,
+                Some(committed_tx),
+                turn_transition,
+                cli_blocked_guard,
+            )
+            .await?;
             committed_rx
                 .await
                 .map_err(|_| ExecutionEventHubError::CommitAcknowledgementDropped)?
@@ -248,6 +271,7 @@ impl ExecutionEventHub {
         event: Box<AgentDurableEvent>,
         committed_tx: Option<oneshot::Sender<Result<(), DurableCommitRejection>>>,
         turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+        cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<(), ExecutionEventHubError> {
         self.flush_progress_for_durable(&event).await;
         self.flush_snapshots_for_durable(&event);
@@ -261,6 +285,7 @@ impl ExecutionEventHub {
                 committed_tx,
                 enqueued_at,
                 turn_transition,
+                cli_blocked_guard,
             })
             .await
             .map_err(|_| ExecutionEventHubError::DurableLaneClosed)
@@ -368,6 +393,7 @@ impl ExecutionEventHub {
             pending_commit: None,
             pending_enqueue_age: None,
             pending_turn_transition: None,
+            pending_cli_blocked_guard: None,
         })
     }
 

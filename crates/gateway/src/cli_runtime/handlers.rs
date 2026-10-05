@@ -146,6 +146,7 @@ enum CLIRuntimeSuccessFinalizationPreparation {
 pub(crate) enum CLIRuntimeAuthoritativeTurnState {
     Active(CLIRuntimeActivityEvidence),
     Terminal,
+    Superseded,
     Unavailable,
 }
 
@@ -3508,7 +3509,7 @@ impl MessageProcessor {
                                         .await
                                     {
                                         match AssertUnwindSafe(
-                                            commit_processor.commit_durable_agent_event(event),
+                                            commit_processor.commit_durable_agent_event_with_cli_blocked_guard(event, durable_receiver.cli_blocked_guard().cloned()),
                                         )
                                         .catch_unwind()
                                         .await
@@ -3598,9 +3599,20 @@ impl MessageProcessor {
         event: AgentDurableEvent,
         turn_transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) -> Result<(), pioneer_runtime_events::ExecutionEventHubError> {
+        self.publish_cli_runtime_durable_guarded(instance, event, turn_transition, None)
+            .await
+    }
+
+    async fn publish_cli_runtime_durable_guarded(
+        &self,
+        instance: &CliSessionInstanceId,
+        event: AgentDurableEvent,
+        turn_transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
+        cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+    ) -> Result<(), pioneer_runtime_events::ExecutionEventHubError> {
         for attempt in 0..2 {
             let hub = self.ensure_cli_runtime_execution_event_hub(instance).await;
-            match hub.publish_durable_and_wait_with_turn_transition(event.clone(), turn_transition.cloned()).await {
+            match hub.publish_cli_runtime_blocked_and_wait(event.clone(), turn_transition.cloned(), cli_blocked_guard.clone()).await {
                 Ok(()) => return Ok(()),
                 Err(
                     error @ (pioneer_runtime_events::ExecutionEventHubError::DurableLaneClosed
@@ -6949,9 +6961,10 @@ impl MessageProcessor {
             Ok(CLIRuntimeAuthoritativeTurnState::Terminal) => {
                 Ok(crate::resilience::RuntimeTimeoutObservation::Terminal)
             }
-            Ok(CLIRuntimeAuthoritativeTurnState::Unavailable) => {
-                Ok(crate::resilience::RuntimeTimeoutObservation::Unavailable)
-            }
+            Ok(
+                CLIRuntimeAuthoritativeTurnState::Unavailable
+                | CLIRuntimeAuthoritativeTurnState::Superseded,
+            ) => Ok(crate::resilience::RuntimeTimeoutObservation::Unavailable),
             Err(error) => {
                 warn!(
                     workspace_id = binding.workspace_id.as_str(),
@@ -7002,7 +7015,9 @@ impl MessageProcessor {
                 )
                 .await;
             let transition = self.cli_runtime_session_transition_mutex(&key).await;
-            let _transition = transition.lock().await;
+            let Ok(_transition) = transition.try_lock() else {
+                return Ok(());
+            };
             self.cleanup_cli_runtime_terminal_turn_guard(&expected, "stale CLI runtime turn scan")
                 .await?;
             return Ok(());
@@ -7016,7 +7031,10 @@ impl MessageProcessor {
             binding.continuation_thread_id.clone(),
         )?;
         let transition = self.cli_runtime_session_transition_mutex(&key).await;
-        let turn_transition = Arc::new(transition.lock_owned().await);
+        let Ok(turn_transition) = transition.try_lock_owned() else {
+            return Ok(());
+        };
+        let turn_transition = Arc::new(turn_transition);
         if self
             .crud_store
             .cli_runtime_turn_terminal_guard(&binding)
@@ -7080,7 +7098,8 @@ impl MessageProcessor {
                     .await?;
                 return Ok(());
             }
-            CLIRuntimeAuthoritativeTurnState::Terminal => return Ok(()),
+            CLIRuntimeAuthoritativeTurnState::Terminal
+            | CLIRuntimeAuthoritativeTurnState::Superseded => return Ok(()),
             CLIRuntimeAuthoritativeTurnState::Unavailable => {
                 let reason = format!(
                     "CLI runtime observation is unavailable for stale turn `{}`; authoritative state rehydration is required",
@@ -7323,7 +7342,7 @@ impl MessageProcessor {
                     )
                     .await?
                 else {
-                    return Ok(CLIRuntimeAuthoritativeTurnState::Unavailable);
+                    return Ok(CLIRuntimeAuthoritativeTurnState::Superseded);
                 };
                 if owner.binding.turn_id != binding.turn_id
                     || owner.attempt.native_thread_id != binding.native_thread_id
@@ -7332,7 +7351,7 @@ impl MessageProcessor {
                         segment.status != pioneer_crud::CliRuntimeExecutionSegmentStatus::Running
                     })
                 {
-                    return Ok(CLIRuntimeAuthoritativeTurnState::Unavailable);
+                    return Ok(CLIRuntimeAuthoritativeTurnState::Superseded);
                 }
                 let recovery = match self
                     .cli_runtime_attempt_recovery_state(&owner.attempt)
@@ -7341,24 +7360,32 @@ impl MessageProcessor {
                     CLIRuntimeAttemptRecoveryState::Normal => None,
                     CLIRuntimeAttemptRecoveryState::Active(recovery) => Some(recovery),
                     CLIRuntimeAttemptRecoveryState::Inactive { .. } => {
-                        return Ok(CLIRuntimeAuthoritativeTurnState::Unavailable);
+                        return Ok(CLIRuntimeAuthoritativeTurnState::Superseded);
                     }
                 };
-                if !self
+                let Some(guard) = self
                     .crud_store
-                    .mark_cli_runtime_turn_attempt_terminal(
-                        owner.attempt.id.as_str(),
-                        pioneer_crud::CliRuntimeTurnAttemptStatus::Interrupted,
-                        Some(reason.clone()),
-                        chrono::Utc::now().fixed_offset(),
-                    )
+                    .cli_runtime_blocked_turn_guard(&owner.binding, &native_turn_id)
                     .await?
+                else {
+                    return Ok(CLIRuntimeAuthoritativeTurnState::Superseded);
+                };
+                if guard.attempt_id != owner.attempt.id
+                    || guard.segment.as_ref().map(|(id, _, _)| id.as_str())
+                        != owner.segment.as_ref().map(|segment| segment.id.as_str())
                 {
-                    return Ok(CLIRuntimeAuthoritativeTurnState::Unavailable);
+                    return Ok(CLIRuntimeAuthoritativeTurnState::Superseded);
                 }
+                #[cfg(test)]
+                self.completed_history_preparation_barrier
+                    .wait_if_armed(
+                        "__cli_blocked_before_enqueue__",
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await;
                 self.commit_cli_runtime_final_diff_snapshot(&key, binding, native_turn_id.as_str())
                     .await;
-                self.publish_cli_runtime_durable_and_wait_inner(
+                self.publish_cli_runtime_durable_guarded(
                     handle.instance(),
                     AgentDurableEvent::TurnBlocked {
                         thread_id: binding.thread_id.clone(),
@@ -7367,6 +7394,7 @@ impl MessageProcessor {
                         recovery,
                     },
                     turn_transition,
+                    Some(guard),
                 )
                 .await
                 .map_err(|error| {

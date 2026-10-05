@@ -773,3 +773,286 @@ async fn cli_terminal_guard_accepts_completed_attempt_after_its_own_starting_run
         CliRuntimeTurnAttemptStatus::Completed
     );
 }
+
+async fn blocked_source_fixture() -> (
+    CrudStore,
+    crate::CliRuntimeTurnTerminalGuard,
+    pioneer_protocol::CliRuntimeBlockedTurnGuard,
+) {
+    let (store, old) = terminal_guard_fixture().await;
+    let timestamp = old.binding.created_at;
+    store
+        .update_turn_status(
+            &old.binding.thread_id,
+            &old.binding.turn_id,
+            TurnStatus::InProgress,
+            None,
+            timestamp.timestamp(),
+        )
+        .await
+        .unwrap();
+    store
+        .activate_cli_runtime_turn_attempt(
+            &old.binding.turn_id,
+            &old.attempt.unwrap().id,
+            "blocked-source-A",
+            None,
+            timestamp,
+        )
+        .await
+        .unwrap();
+    store
+        .register_cli_runtime_execution_segment(
+            &old.binding.turn_id,
+            &old.binding.native_thread_id,
+            "blocked-source-A",
+            timestamp,
+        )
+        .await
+        .unwrap();
+    let binding = store
+        .get_cli_runtime_turn_binding(&old.binding.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let snapshot = store
+        .cli_runtime_turn_terminal_guard(&binding)
+        .await
+        .unwrap()
+        .unwrap();
+    let guard = store
+        .cli_runtime_blocked_turn_guard(&binding, "blocked-source-A")
+        .await
+        .unwrap()
+        .unwrap();
+    (store, snapshot, guard)
+}
+
+async fn commit_blocked_source(
+    store: &CrudStore,
+    guard: &pioneer_protocol::CliRuntimeBlockedTurnGuard,
+) -> anyhow::Result<bool> {
+    let (_, turn) = store
+        .get_turn(&guard.thread_id, &guard.turn_id)
+        .await?
+        .unwrap();
+    store
+        .materialize_cli_runtime_blocked_turn_guarded(
+            pioneer_protocol::TurnBlockedNotification {
+                workspace_id: guard.workspace_id.clone(),
+                thread_id: guard.thread_id.clone(),
+                turn: Turn {
+                    status: TurnStatus::Blocked,
+                    error: Some("old blocked source".into()),
+                    ..turn
+                },
+                resume: None,
+            },
+            guard,
+            "owner",
+            1_700_000_000,
+        )
+        .await
+}
+
+#[tokio::test]
+async fn cli_blocked_atomic_source_guard_rejects_new_attempt_and_changed_recovery_authority() {
+    let (store, snapshot, old_guard) = blocked_source_fixture().await;
+    let timestamp = snapshot.binding.created_at;
+    let job = store
+        .enqueue_recovery_job(
+            snapshot.binding.turn_id.clone(),
+            "blocked-source".into(),
+            TurnItemType::SystemEvent,
+            None,
+            RecoveryTrigger::Timeout,
+            RecoveryAction::OpenNextExecutionWindow,
+            Some("recovery".into()),
+            None,
+            None,
+            None,
+            0,
+            2,
+            serde_json::json!({}),
+            serde_json::json!({}),
+            timestamp.timestamp(),
+        )
+        .await
+        .unwrap();
+    let claim = store
+        .claim_due_recovery_jobs(timestamp.timestamp(), 60, 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claim.id, job.id);
+    assert!(matches!(
+        store
+            .mark_claimed_recovery_job_active(
+                &job.id,
+                claim.claim_token.as_deref().unwrap(),
+                "blocked-recovery-owner",
+                timestamp.timestamp()
+            )
+            .await
+            .unwrap(),
+        crate::ClaimedRecoveryActivation::Activated
+    ));
+    let (_, next) = store
+        .prepare_cli_runtime_recovery_turn_attempt(
+            &snapshot.binding.turn_id,
+            "blocked-attempt-B".into(),
+            job.id.clone(),
+            "blocked-recovery-owner".into(),
+            2,
+            "next execution".into(),
+            timestamp,
+        )
+        .await
+        .unwrap();
+    let (binding, next) = store
+        .activate_cli_runtime_turn_attempt(
+            &snapshot.binding.turn_id,
+            &next.id,
+            "blocked-source-B",
+            None,
+            timestamp,
+        )
+        .await
+        .unwrap();
+    let (_, _, segment) = store
+        .register_cli_runtime_execution_segment(
+            &snapshot.binding.turn_id,
+            &snapshot.binding.native_thread_id,
+            "blocked-source-B",
+            timestamp,
+        )
+        .await
+        .unwrap();
+    assert!(!commit_blocked_source(&store, &old_guard).await.unwrap());
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(&binding.turn_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        next
+    );
+    let fresh = store
+        .cli_runtime_blocked_turn_guard(&binding, "blocked-source-B")
+        .await
+        .unwrap()
+        .unwrap();
+    // Same binding/attempt/segment values and timestamps; only the recovery
+    // authority changed between capture and writer validation.
+    store
+        .mark_recovery_job_terminal(
+            &job.id,
+            RecoveryJobStatus::Blocked,
+            Some("authority ended".into()),
+            timestamp.timestamp(),
+        )
+        .await
+        .unwrap();
+    assert!(!commit_blocked_source(&store, &fresh).await.unwrap());
+    let current = store
+        .resolve_cli_runtime_native_turn_owner("codex", "blocked-source-B")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.binding, binding);
+    assert_eq!(current.attempt, next);
+    assert_eq!(current.segment.unwrap(), segment);
+    assert_eq!(
+        store
+            .get_turn(&binding.thread_id, &binding.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+}
+
+#[tokio::test]
+async fn cli_blocked_atomic_source_guard_rejects_execution_generation_aba_at_equal_timestamp() {
+    let (store, snapshot, _) = blocked_source_fixture().await;
+    let binding = &snapshot.binding;
+    let timestamp = binding.created_at;
+    let owner = crate::repositories::turn_execution::insert_immutable(
+        &store.database_connection(),
+        crate::NewTurnExecution {
+            turn_id: binding.turn_id.clone(),
+            thread_id: binding.thread_id.clone(),
+            workspace_id: binding.workspace_id.clone(),
+            executor_kind: crate::TurnExecutorKind::CliRuntime,
+            executor_key: Some("codex".into()),
+            status: crate::TurnExecutionStatus::Starting,
+            owner_id: "owner".into(),
+            lease_until: timestamp + chrono::Duration::seconds(60),
+            created_at: timestamp,
+        },
+    )
+    .await
+    .unwrap();
+    let guard = store
+        .cli_runtime_blocked_turn_guard(binding, "blocked-source-A")
+        .await
+        .unwrap()
+        .unwrap();
+    crate::repositories::turn_execution::mark_terminal(
+        &store.database_connection(),
+        &binding.turn_id,
+        crate::TurnExecutionStatus::Blocked,
+        timestamp,
+    )
+    .await
+    .unwrap();
+    assert!(
+        crate::repositories::turn_execution::reacquire_blocked(
+            &store.database_connection(),
+            &binding.turn_id,
+            &owner.owner_id,
+            timestamp,
+            timestamp
+        )
+        .await
+        .unwrap()
+    );
+    assert!(!commit_blocked_source(&store, &guard).await.unwrap());
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(&binding.turn_id)
+            .await
+            .unwrap(),
+        snapshot.attempt
+    );
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_binding(&binding.turn_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        *binding
+    );
+    assert_eq!(
+        store
+            .get_turn(&binding.thread_id, &binding.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+    assert_eq!(
+        store
+            .get_turn_execution(&binding.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_generation,
+        owner.owner_generation + 1
+    );
+}

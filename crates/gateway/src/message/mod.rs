@@ -3304,7 +3304,10 @@ impl MessageProcessor {
                     self.cli_runtime_command_heartbeats.remove_key(&key).await;
                     continue;
                 }
-                Ok(cli_runtime::CLIRuntimeAuthoritativeTurnState::Unavailable) => {
+                Ok(
+                    cli_runtime::CLIRuntimeAuthoritativeTurnState::Unavailable
+                    | cli_runtime::CLIRuntimeAuthoritativeTurnState::Superseded,
+                ) => {
                     self.cli_runtime_command_heartbeats
                         .mark_attempt_failed(&key, now_unix)
                         .await;

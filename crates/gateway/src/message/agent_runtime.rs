@@ -1272,6 +1272,14 @@ impl MessageProcessor {
         &'a self,
         event: AgentDurableEvent,
     ) -> MessageFuture<'a, Result<(), DurableCommitRejection>> {
+        self.commit_durable_agent_event_with_cli_blocked_guard(event, None)
+    }
+
+    pub(crate) fn commit_durable_agent_event_with_cli_blocked_guard<'a>(
+        &'a self,
+        event: AgentDurableEvent,
+        cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+    ) -> MessageFuture<'a, Result<(), DurableCommitRejection>> {
         let startup_key = durable_event_turn_id(&event).map(str::to_owned);
         let future = match event {
             AgentDurableEvent::TurnSkillsResolved {
@@ -1288,7 +1296,11 @@ impl MessageProcessor {
                     match self.guard_execution_commit(turn_id).await {
                         Ok(_) => false,
                         Err(error) => match classify_durable_commit_guard_error(&event, &error) {
-                            Ok(already_committed) => already_committed,
+                            // Preserve authorization checks; a targeted source
+                            // must still reach writer validation on terminal replay.
+                            Ok(already_committed) => {
+                                already_committed && cli_blocked_guard.is_none()
+                            }
                             Err(rejection) => {
                                 pioneer_observability::record_native_lifecycle_event(
                                     pioneer_observability::NativeLifecycleEventMetric {
@@ -1312,8 +1324,13 @@ impl MessageProcessor {
                     false
                 };
                 let commit_started = Instant::now();
-                let committed =
-                    already_committed || self.persist_durable_agent_event(event.clone()).await;
+                let committed = already_committed
+                    || self
+                        .persist_durable_agent_event_with_cli_blocked_guard(
+                            event.clone(),
+                            cli_blocked_guard,
+                        )
+                        .await;
                 pioneer_observability::record_native_lifecycle_event(
                     pioneer_observability::NativeLifecycleEventMetric {
                         stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
@@ -2697,6 +2714,23 @@ impl MessageProcessor {
         event_timestamp_secs: i64,
         item_started_deadlines: Option<pioneer_crud::TurnItemAttemptDeadlines>,
     ) -> Result<()> {
+        self.materialize_native_agent_turn_event_with_cli_blocked_guard(
+            event,
+            event_timestamp_secs,
+            item_started_deadlines,
+            None,
+        )
+        .await
+    }
+
+    async fn materialize_native_agent_turn_event_with_cli_blocked_guard(
+        &self,
+        event: pioneer_crud::CanonicalTurnEventPayload,
+        event_timestamp_secs: i64,
+        item_started_deadlines: Option<pioneer_crud::TurnItemAttemptDeadlines>,
+        cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+    ) -> Result<()> {
+        let guarded_cli_blocked_commit = cli_blocked_guard.is_some();
         let activates_terminal_effects = matches!(
             &event,
             pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(_)
@@ -2714,6 +2748,27 @@ impl MessageProcessor {
             crate::database::attribution::scope_database_workload_result(
                 pioneer_observability::DatabaseWorkload::TurnEventCommit,
                 async move {
+                    if let Some(guard) = cli_blocked_guard {
+                        let pioneer_crud::CanonicalTurnEventPayload::TurnBlocked(notification) =
+                            event
+                        else {
+                            anyhow::bail!(
+                                "CLI Blocked guard attached to a different lifecycle event"
+                            );
+                        };
+                        anyhow::ensure!(
+                            crud_store
+                                .materialize_cli_runtime_blocked_turn_guarded(
+                                    notification,
+                                    &guard,
+                                    turn_execution_owner_id.as_ref(),
+                                    event_timestamp_secs
+                                )
+                                .await?,
+                            "CLI Blocked observation superseded by its source"
+                        );
+                        return Ok(());
+                    }
                     crud_store
                         .materialize_native_agent_turn_event_owned(
                             event,
@@ -2734,6 +2789,17 @@ impl MessageProcessor {
         };
         match result {
             Ok(()) => {
+                #[cfg(test)]
+                if guarded_cli_blocked_commit {
+                    self.completed_history_preparation_barrier
+                        .wait_if_armed(
+                            "__cli_blocked_after_atomic_commit__",
+                            &tokio_util::sync::CancellationToken::new(),
+                        )
+                        .await;
+                }
+                #[cfg(not(test))]
+                let _ = guarded_cli_blocked_commit;
                 self.kick_native_turn_event_deliveries();
                 if activates_terminal_effects {
                     self.kick_native_terminal_effects();
@@ -3117,9 +3183,10 @@ impl MessageProcessor {
         });
     }
 
-    fn persist_durable_agent_event<'a>(
+    fn persist_durable_agent_event_with_cli_blocked_guard<'a>(
         &'a self,
         event: AgentDurableEvent,
+        cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> MessageFuture<'a, bool> {
         match event {
             AgentDurableEvent::PromptManifestCompiled {
@@ -4065,6 +4132,10 @@ impl MessageProcessor {
                     .finalize_native_patch_projection(thread_id.as_str(), turn_id.as_str())
                     .await
                 {
+                    if cli_blocked_guard.is_some() {
+                        warn!(thread_id, turn_id, error = %error, "deferred guarded CLI Blocked projection preparation");
+                        return false;
+                    }
                     self.report_legacy_turn_failure(
                         thread_id.clone(),
                         turn_id.clone(),
@@ -4073,11 +4144,17 @@ impl MessageProcessor {
                     .await;
                     return false;
                 }
-                pioneer_tools::unregister_native_patch_observers_for_turn(
-                    thread_id.as_str(),
-                    turn_id.as_str(),
-                );
-                if recovery.is_none()
+                let guarded_patch_owner = cli_blocked_guard
+                    .as_ref()
+                    .map(|_| (thread_id.clone(), turn_id.clone()));
+                if cli_blocked_guard.is_none() {
+                    pioneer_tools::unregister_native_patch_observers_for_turn(
+                        thread_id.as_str(),
+                        turn_id.as_str(),
+                    );
+                }
+                if cli_blocked_guard.is_none()
+                    && recovery.is_none()
                     && reason.contains("execution window continuation could not resume")
                 {
                     if !message_future(self.report_turn_failure(
@@ -4090,12 +4167,19 @@ impl MessageProcessor {
                     {
                         return false;
                     }
-                } else if !message_future(
-                    self.mark_turn_blocked_with_recovery(thread_id, turn_id, reason, recovery),
-                )
+                } else if !message_future(self.mark_turn_blocked_with_recovery(
+                    thread_id,
+                    turn_id,
+                    reason,
+                    recovery,
+                    cli_blocked_guard,
+                ))
                 .await
                 {
                     return false;
+                }
+                if let Some((thread_id, turn_id)) = guarded_patch_owner {
+                    pioneer_tools::unregister_native_patch_observers_for_turn(&thread_id, &turn_id);
                 }
                 pioneer_tools::apply_patch::patch_telemetry().record_task_result(false);
                 true
@@ -7775,9 +7859,17 @@ impl MessageProcessor {
         turn_id: String,
         reason: String,
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
+        cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> bool {
-        self.mark_turn_blocked_with_resume_metadata(thread_id, turn_id, reason, recovery, None)
-            .await
+        self.mark_turn_blocked_with_resume_metadata_guarded(
+            thread_id,
+            turn_id,
+            reason,
+            recovery,
+            None,
+            cli_blocked_guard,
+        )
+        .await
     }
 
     pub(super) async fn mark_turn_blocked_with_resume_metadata(
@@ -7787,6 +7879,21 @@ impl MessageProcessor {
         reason: String,
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
         resume: Option<pioneer_protocol::TurnBlockedResumeMetadata>,
+    ) -> bool {
+        self.mark_turn_blocked_with_resume_metadata_guarded(
+            thread_id, turn_id, reason, recovery, resume, None,
+        )
+        .await
+    }
+
+    async fn mark_turn_blocked_with_resume_metadata_guarded(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        reason: String,
+        recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
+        resume: Option<pioneer_protocol::TurnBlockedResumeMetadata>,
+        cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> bool {
         let terminal_actor_generation = self
             .agent_manager
@@ -7809,10 +7916,11 @@ impl MessageProcessor {
                     resume: resume.clone(),
                 };
                 if let Err(error) = self
-                    .materialize_native_agent_turn_event(
+                    .materialize_native_agent_turn_event_with_cli_blocked_guard(
                         pioneer_crud::CanonicalTurnEventPayload::TurnBlocked(notification),
                         now_timestamp_secs(),
                         None,
+                        cli_blocked_guard.clone(),
                     )
                     .await
                 {
@@ -7888,6 +7996,7 @@ impl MessageProcessor {
                     reason,
                     recovery.as_ref(),
                     resume,
+                    cli_blocked_guard,
                 )
                 .await;
         }
@@ -7925,12 +8034,14 @@ impl MessageProcessor {
         let materialize_blocked_result = {
             let processor = self.clone();
             let turn_blocked = turn_blocked.clone();
+            let cli_blocked_guard = cli_blocked_guard.clone();
             message_fresh_task(async move {
                 processor
-                    .materialize_native_agent_turn_event(
+                    .materialize_native_agent_turn_event_with_cli_blocked_guard(
                         pioneer_crud::CanonicalTurnEventPayload::TurnBlocked(turn_blocked),
                         event_timestamp,
                         None,
+                        cli_blocked_guard.clone(),
                     )
                     .await
             })
@@ -8037,6 +8148,7 @@ impl MessageProcessor {
         reason: String,
         recovery: Option<&pioneer_protocol::RecoveryAttemptContext>,
         resume: Option<pioneer_protocol::TurnBlockedResumeMetadata>,
+        cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> bool {
         let (workspace_id, current_turn) = match self
             .crud_store
@@ -8062,6 +8174,9 @@ impl MessageProcessor {
             }
         };
 
+        if cli_blocked_guard.is_some() && current_turn.status != TurnStatus::InProgress {
+            return false;
+        }
         if current_turn.status == TurnStatus::Blocked {
             let block_reason = current_turn
                 .error
@@ -8113,10 +8228,11 @@ impl MessageProcessor {
             let turn_blocked = turn_blocked.clone();
             message_fresh_task(async move {
                 processor
-                    .materialize_native_agent_turn_event(
+                    .materialize_native_agent_turn_event_with_cli_blocked_guard(
                         pioneer_crud::CanonicalTurnEventPayload::TurnBlocked(turn_blocked),
                         event_timestamp,
                         None,
+                        cli_blocked_guard,
                     )
                     .await
             })

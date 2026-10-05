@@ -1206,3 +1206,29 @@ mod tests {
         assert_eq!(decoded, response);
     }
 }
+
+/// Source identity carried only in the existing durable lane for a reconciled
+/// Blocked observation. Not a client event or a persisted checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliRuntimeBlockedTurnGuard {
+    pub turn_id: String,
+    pub thread_id: String,
+    pub workspace_id: String,
+    pub continuation_thread_id: String,
+    pub runtime_id: String,
+    pub runtime_kind: String,
+    pub native_thread_id: String,
+    pub binding_native_turn_id: Option<String>,
+    pub binding_status: String,
+    pub native_goal_status: Option<String>,
+    pub native_goal_turn_id: Option<String>,
+    pub attempt_id: String,
+    pub attempt_status: String,
+    pub attempt_native_turn_id: Option<String>,
+    pub recovery_job_id: Option<String>,
+    pub recovery_attempt_id: Option<String>,
+    pub recovery_confirmed: bool,
+    // (segment id, native turn id, status); latest segment must still be this one.
+    pub segment: Option<(String, String, String)>,
+    pub execution_owner: Option<(String, u64)>,
+}
