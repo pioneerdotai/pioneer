@@ -70,16 +70,32 @@ const FIRST_PARTY_APPLY_PATCH: &str = "apply_patch";
 
 #[derive(Clone)]
 pub(crate) struct McpService {
-    inner: Arc<McpServiceInner>,
+    pub(crate) inner: Arc<McpServiceInner>,
+    pub(crate) runtime_store: Option<Arc<CrudStore>>,
 }
 
-struct McpServiceInner {
-    crud_store: Arc<CrudStore>,
+pub(crate) struct McpServiceInner {
+    pub(crate) crud_store: Arc<CrudStore>,
     authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
     execution_leases: Arc<ExecutionLeaseRegistry>,
     invocation_governor: Arc<crate::turn_mcp::invoker::McpInvocationGovernor>,
-    session_manager: Arc<SessionManager>,
+    pub(crate) session_manager: Arc<SessionManager>,
     auth_service: RwLock<Option<Arc<GatewayAuthService>>>,
+    oauth: pioneer_mcp_oauth::McpOAuthService,
+    oauth_events: std::sync::Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    oauth_recovery_ack_timeout: std::sync::Mutex<Duration>,
+    #[cfg(test)]
+    pub(crate) oauth_rpc_read_barrier:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    #[cfg(test)]
+    pub(crate) oauth_effect_barrier: std::sync::Mutex<
+        Option<(
+            Arc<tokio::sync::Notify>,
+            Arc<tokio::sync::Notify>,
+            Arc<tokio::sync::Notify>,
+        )>,
+    >,
     gateway_secrets: Arc<GatewaySecrets>,
     snapshot_version: Arc<AtomicU64>,
     runtime_generation_counter: AtomicU64,
@@ -91,6 +107,8 @@ struct McpServiceInner {
         tokio::sync::RwLock<Arc<dyn pioneer_tools::PermissionApprovalBroker>>,
     projection_persistence: TurnMcpPersistenceCoordinator,
     connector: RwLock<Arc<dyn McpRuntimeConnector>>,
+    lifecycle_gates:
+        std::sync::Mutex<HashMap<(String, String, String), std::sync::Weak<Mutex<()>>>>,
     tasks: Mutex<HashMap<String, McpServerTaskHandle>>,
     snapshots: Mutex<HashMap<String, McpServerRuntimeSnapshot>>,
     retry_policy: McpRetryPolicy,
@@ -98,15 +116,54 @@ struct McpServiceInner {
 }
 
 struct McpServerTaskHandle {
+    name: String,
     scope_kind: String,
     scope_key: String,
     fingerprint: String,
     effective_secret_fingerprint: String,
-    call_tx: mpsc::Sender<McpServerCallCommand>,
-    shutdown_tx: oneshot::Sender<DomainRuntimeState>,
+    call_tx: mpsc::Sender<McpServerCommand>,
+    oauth_failure_revision: Arc<std::sync::atomic::AtomicU64>,
+    recovery: Arc<OAuthRecoveryMailbox>,
+    shutdown_tx: oneshot::Sender<McpShutdownRequest>,
     join: JoinHandle<()>,
 }
 
+struct McpShutdownRequest {
+    final_state: DomainRuntimeState,
+    crud_store: Arc<CrudStore>,
+}
+enum McpServerCommand {
+    Tool(McpServerCallCommand),
+    OAuthRecovered {
+        store: Arc<CrudStore>,
+        cancellation: tokio_util::sync::CancellationToken,
+        completed: oneshot::Sender<()>,
+        admission: Arc<std::sync::Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>,
+        event: Option<pioneer_mcp_oauth::OAuthEvent>,
+        failure_revision: u64,
+        cause: Option<pioneer_mcp::OAuthFailureCause>,
+    },
+}
+#[derive(Default)]
+struct OAuthRecoveryMailbox {
+    pending: std::sync::Mutex<Option<McpServerCommand>>,
+    wake: tokio::sync::Notify,
+}
+/// A queued recovery must not retain runtime admission after its waiter expires.
+/// An actor that already claimed admission owns it through the actual effect.
+struct OAuthRecoveryWait {
+    cancellation: tokio_util::sync::CancellationToken,
+    admission: Arc<std::sync::Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>,
+}
+impl Drop for OAuthRecoveryWait {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
 struct McpServerCallCommand {
     request: pioneer_tools::McpToolCallRequest,
     cancellation: tokio_util::sync::CancellationToken,
@@ -218,6 +275,78 @@ impl McpSecretResolver for GatewayMcpSecretResolver {
 }
 
 impl McpService {
+    #[cfg(test)]
+    pub(crate) async fn oauth_recovered(&self, installation_id: &str) {
+        self.oauth_recovered_with_admission(installation_id, None, None, None)
+            .await;
+    }
+    async fn oauth_recovered_with_admission(
+        &self,
+        installation_id: &str,
+        guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+        event: Option<pioneer_mcp_oauth::OAuthEvent>,
+        cause: Option<pioneer_mcp::OAuthFailureCause>,
+    ) {
+        let admission = Arc::new(std::sync::Mutex::new(guard));
+        let tx = self
+            .inner
+            .tasks
+            .lock()
+            .await
+            .get(installation_id)
+            .map(|task| {
+                (
+                    task.call_tx.clone(),
+                    task.oauth_failure_revision.load(Ordering::SeqCst),
+                    task.recovery.clone(),
+                )
+            });
+        if let Some((_tx, failure_revision, recovery)) = tx {
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let cleanup = OAuthRecoveryWait {
+                cancellation: cancellation.clone(),
+                admission: admission.clone(),
+            };
+            let (completed, completion) = oneshot::channel();
+            let cause = cause.or_else(|| {
+                event.as_ref().map(|event| pioneer_mcp::OAuthFailureCause {
+                    generation: event.generation.clone(),
+                    revision: event.revision,
+                })
+            });
+            let command = McpServerCommand::OAuthRecovered {
+                store: self
+                    .runtime_store
+                    .clone()
+                    .unwrap_or_else(|| self.inner.crud_store.clone()),
+                cancellation: cancellation.clone(),
+                completed,
+                admission,
+                event,
+                failure_revision,
+                cause,
+            };
+            // One mailbox belongs to the runtime actor. Coalescing drops the old
+            // waiter/envelope; ack expiry releases admission but never loses work.
+            *recovery
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(command);
+            recovery.wake.notify_one();
+            #[cfg(test)]
+            let ack_deadline = *self.inner.oauth_recovery_ack_timeout.lock().unwrap();
+            #[cfg(not(test))]
+            let ack_deadline = Duration::from_secs(30);
+            let _ = tokio::time::timeout(ack_deadline, completion).await;
+            drop(cleanup);
+        }
+    }
+
+    fn runtime_store(&self) -> &CrudStore {
+        self.runtime_store
+            .as_deref()
+            .unwrap_or(self.inner.crud_store.as_ref())
+    }
     pub(crate) fn new(
         crud_store: Arc<CrudStore>,
         session_manager: Arc<SessionManager>,
@@ -226,9 +355,48 @@ impl McpService {
         authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
         execution_leases: Arc<ExecutionLeaseRegistry>,
     ) -> Self {
+        Self::new_with_oauth_options(
+            crud_store,
+            session_manager,
+            gateway_secrets,
+            snapshot_version,
+            authorization_invalidation_hub,
+            execution_leases,
+            pioneer_mcp_oauth::OAuthServiceOptions::default(),
+        )
+    }
+
+    pub(crate) fn new_with_oauth_options(
+        crud_store: Arc<CrudStore>,
+        session_manager: Arc<SessionManager>,
+        gateway_secrets: Arc<GatewaySecrets>,
+        snapshot_version: Arc<AtomicU64>,
+        authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
+        execution_leases: Arc<ExecutionLeaseRegistry>,
+        options: pioneer_mcp_oauth::OAuthServiceOptions,
+    ) -> Self {
         let projection_persistence = TurnMcpPersistenceCoordinator::new(crud_store.clone());
-        Self {
-            inner: Arc::new(McpServiceInner {
+        let (events, event_rx) = mpsc::unbounded_channel();
+        let inner = Arc::new_cyclic(|owner| {
+            let sink = Arc::new(crate::mcp_oauth::GatewayOAuthSink {
+                owner: owner.clone(),
+                events,
+            });
+            let oauth = pioneer_mcp_oauth::McpOAuthService::with_options(
+                gateway_secrets.mcp_oauth_persistence(),
+                sink,
+                options,
+            )
+            .expect("OAuth HTTP client");
+            McpServiceInner {
+                oauth: oauth.clone(),
+                oauth_events: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                oauth_effect_barrier: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                oauth_rpc_read_barrier: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                oauth_recovery_ack_timeout: std::sync::Mutex::new(Duration::from_secs(30)),
                 crud_store,
                 authorization_invalidation_hub,
                 execution_leases,
@@ -248,12 +416,25 @@ impl McpService {
                     pioneer_tools::StaticPermissionApprovalBroker::default(),
                 )),
                 projection_persistence,
-                connector: RwLock::new(Arc::new(RmcpRuntimeConnector::new())),
+                connector: RwLock::new(Arc::new(RmcpRuntimeConnector::with_oauth(Arc::new(oauth)))),
+                lifecycle_gates: std::sync::Mutex::new(HashMap::new()),
                 tasks: Mutex::new(HashMap::new()),
                 snapshots: Mutex::new(HashMap::new()),
                 retry_policy: McpRetryPolicy::default(),
                 projection_limits: RwLock::new(McpProjectionLimits::default()),
-            }),
+            }
+        });
+        let worker = tokio::spawn(crate::mcp_oauth::consume_oauth_events(
+            Arc::downgrade(&inner),
+            event_rx,
+        ));
+        *inner
+            .oauth_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(worker);
+        Self {
+            inner,
+            runtime_store: None,
         }
     }
 
@@ -412,7 +593,62 @@ impl McpService {
         cancellations.len()
     }
 
+    pub(crate) fn oauth(&self) -> &pioneer_mcp_oauth::McpOAuthService {
+        &self.inner.oauth
+    }
+
+    pub(crate) async fn stop_oauth_connection(&self, row: &McpServerInstallationRecord) {
+        if !row.enabled {
+            if let Some(id) = &row.id {
+                self.stop_task(id, DomainRuntimeState::Disabled).await;
+            }
+            self.publish_status(
+                row,
+                DomainRuntimeState::Disabled,
+                Some("server is disabled".into()),
+                None,
+                0,
+                None,
+                None,
+            )
+            .await;
+            return;
+        }
+        if let Some(id) = &row.id {
+            self.stop_task(id, DomainRuntimeState::AuthRequired).await;
+        }
+        self.publish_oauth_required(row, None).await;
+    }
+    pub(crate) async fn publish_oauth_required(
+        &self,
+        row: &McpServerInstallationRecord,
+        diagnostic: Option<String>,
+    ) {
+        if let Some(id) = &row.id {
+            self.stop_task(id, DomainRuntimeState::AuthRequired).await;
+        }
+        self.publish_status(
+            row,
+            DomainRuntimeState::AuthRequired,
+            Some(diagnostic.unwrap_or_else(|| "OAuth sign-in required".into())),
+            None,
+            0,
+            None,
+            None,
+        )
+        .await;
+    }
     pub(crate) async fn shutdown(&self) {
+        self.inner.oauth.shutdown().await;
+        if let Some(worker) = self
+            .inner
+            .oauth_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            worker.abort();
+        }
         self.cancel_all_mcp_invocations();
         let installation_ids = self
             .inner
@@ -449,13 +685,36 @@ impl McpService {
             .context("failed to load MCP workspace installations for reload")?;
 
         let mut desired = HashSet::new();
-        for row in rows {
+        for candidate in rows {
+            let _guard = self
+                .installation_lifecycle_guard(
+                    &candidate.scope_kind,
+                    &candidate.scope_key,
+                    &candidate.name,
+                )
+                .await;
+            let Some(row) = store
+                .find_mcp_server_installation(
+                    &candidate.scope_kind,
+                    &candidate.scope_key,
+                    &candidate.name,
+                )
+                .await?
+            else {
+                continue;
+            };
             let installation_id = row
                 .id
                 .clone()
                 .context("MCP installation row is missing id")?;
 
+            let installation = installation_from_record(&row)?;
+            self.inner
+                .oauth
+                .synchronize(&installation_id, &installation)
+                .await?;
             if !row.enabled {
+                self.inner.oauth.suspend(&installation_id).await?;
                 self.stop_task(&installation_id, DomainRuntimeState::Disabled)
                     .await;
                 self.publish_status(
@@ -563,14 +822,119 @@ impl McpService {
                         && handle.scope_key == workspace_id
                         && !desired.contains(*id)
                 })
-                .map(|(id, _)| id.clone())
+                .map(|(id, task)| (id.clone(), task.name.clone()))
                 .collect::<Vec<_>>()
         };
-        for installation_id in obsolete {
+        for (installation_id, name) in obsolete {
+            let _guard = self
+                .installation_lifecycle_guard("workspace", workspace_id, &name)
+                .await;
+            // A task installed after the original listing is not obsolete.
+            if store
+                .find_mcp_server_installation("workspace", workspace_id, &name)
+                .await?
+                .is_some_and(|row| row.enabled && row.id.as_deref() == Some(&installation_id))
+            {
+                continue;
+            }
             self.stop_task(&installation_id, DomainRuntimeState::Stopped)
                 .await;
         }
 
+        Ok(())
+    }
+
+    /// Serialize installation mutation with runtime effects. This owns no DB
+    /// capacity and may span stop/join; database operations remain individually scoped.
+    pub(crate) async fn installation_lifecycle_guard(
+        &self,
+        scope_kind: &str,
+        scope_key: &str,
+        name: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = {
+            let mut gates = self
+                .inner
+                .lifecycle_gates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            gates.retain(|_, gate| gate.strong_count() != 0);
+            let key = (scope_kind.to_owned(), scope_key.to_owned(), name.to_owned());
+            if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) {
+                gate
+            } else {
+                let gate = Arc::new(Mutex::new(()));
+                gates.insert(key, Arc::downgrade(&gate));
+                gate
+            }
+        };
+        gate.lock_owned().await
+    }
+
+    pub(crate) async fn apply_oauth_runtime_event(
+        &self,
+        event: &pioneer_mcp_oauth::OAuthEvent,
+        name: &str,
+    ) -> Result<()> {
+        let _guard = self
+            .installation_lifecycle_guard(&event.scope_kind, &event.scope_key, name)
+            .await;
+        let Some(row) = self
+            .runtime_store()
+            .find_mcp_server_installation(&event.scope_kind, &event.scope_key, name)
+            .await?
+        else {
+            return Ok(());
+        };
+        if row.id.as_deref() != Some(&event.installation_id) {
+            return Ok(());
+        }
+        let installation = installation_from_record(&row)?;
+        if !self.oauth().event_is_current(event, &installation).await {
+            return Ok(());
+        }
+        match event.state {
+            pioneer_mcp_oauth::OAuthState::Authorized => {
+                self.stop_task(&event.installation_id, DomainRuntimeState::Stopped)
+                    .await;
+                // Recheck operation generation after joining the retired actor.
+                // The admission guard excludes durable resource/UUID replacement.
+                if row.enabled && self.oauth().event_is_current(event, &installation).await {
+                    let fingerprint = self.effective_secret_fingerprint_for_row(&row)?;
+                    self.start_task(row, fingerprint).await?;
+                }
+            }
+            pioneer_mcp_oauth::OAuthState::Recovered => {
+                self.oauth_recovered_with_admission(
+                    &event.installation_id,
+                    Some(_guard),
+                    Some(event.clone()),
+                    None,
+                )
+                .await
+            }
+            pioneer_mcp_oauth::OAuthState::AuthRequired
+            | pioneer_mcp_oauth::OAuthState::InsufficientScope => {
+                self.stop_task(&event.installation_id, DomainRuntimeState::AuthRequired)
+                    .await;
+                if self.oauth().event_is_current(event, &installation).await {
+                    self.publish_status(
+                        &row,
+                        DomainRuntimeState::AuthRequired,
+                        event
+                            .diagnostic
+                            .clone()
+                            .or_else(|| Some("MCP authorization required".into())),
+                        None,
+                        0,
+                        None,
+                        None,
+                    )
+                    .await;
+                }
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -580,15 +944,26 @@ impl McpService {
         scope_key: &str,
         name: &str,
     ) -> Result<Option<McpServerInstallationRecord>> {
+        let _guard = self
+            .installation_lifecycle_guard(scope_kind, scope_key, name)
+            .await;
         let row = self
-            .inner
-            .crud_store
+            .runtime_store()
             .find_mcp_server_installation(scope_kind, scope_key, name)
             .await
             .context("failed to query MCP installation for restart")?;
         let Some(row) = row else {
             return Ok(None);
         };
+        self.restart_admitted_server(&row).await?;
+        Ok(Some(row))
+    }
+
+    /// Caller owns the lifecycle gate and has durably revalidated this exact row.
+    pub(crate) async fn restart_admitted_server(
+        &self,
+        row: &McpServerInstallationRecord,
+    ) -> Result<()> {
         if let Some(installation_id) = row.id.as_deref() {
             self.publish_status(
                 &row,
@@ -634,7 +1009,7 @@ impl McpService {
             )
             .await;
         }
-        Ok(Some(row))
+        Ok(())
     }
 
     pub(crate) async fn runtime_snapshot(
@@ -1334,7 +1709,7 @@ impl McpService {
                     "MCP tool request timed out while waiting for runtime capacity",
                 ));
             }
-            result = call_tx.send(command) => result.map_err(|_| {
+            result = call_tx.send(McpServerCommand::Tool(command)) => result.map_err(|_| {
                 pioneer_tools::ToolError::ExecutionFailed(format!(
                     "MCP server `{}` task is unavailable",
                     row.name
@@ -1420,9 +1795,13 @@ impl McpService {
                 let reason_code = match error.kind {
                     McpRuntimeErrorKind::Cancelled => "cancelled",
                     McpRuntimeErrorKind::TimedOut => "timed_out",
-                    McpRuntimeErrorKind::Failed | McpRuntimeErrorKind::AuthRequired => {
-                        "runtime_error"
-                    }
+                    McpRuntimeErrorKind::Failed
+                    | McpRuntimeErrorKind::AuthRequired
+                    | McpRuntimeErrorKind::RefreshRejected
+                    | McpRuntimeErrorKind::TransientRefresh
+                    | McpRuntimeErrorKind::CredentialStore
+                    | McpRuntimeErrorKind::InsufficientScope
+                    | McpRuntimeErrorKind::Forbidden => "runtime_error",
                 };
                 self.audit_tool_call(
                     &row,
@@ -1442,7 +1821,13 @@ impl McpService {
                     McpRuntimeErrorKind::TimedOut => Err(
                         pioneer_tools::ToolError::execution_failed("MCP tool request timed out"),
                     ),
-                    McpRuntimeErrorKind::Failed | McpRuntimeErrorKind::AuthRequired => {
+                    McpRuntimeErrorKind::Failed
+                    | McpRuntimeErrorKind::AuthRequired
+                    | McpRuntimeErrorKind::RefreshRejected
+                    | McpRuntimeErrorKind::TransientRefresh
+                    | McpRuntimeErrorKind::CredentialStore
+                    | McpRuntimeErrorKind::InsufficientScope
+                    | McpRuntimeErrorKind::Forbidden => {
                         Err(pioneer_tools::ToolError::ExecutionFailed(format!(
                             "MCP tool `{}` failed: {}",
                             request.raw_tool_name, error.message
@@ -1472,6 +1857,7 @@ impl McpService {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (call_tx, call_rx) = mpsc::channel(32);
         let service = self.clone();
+        let name = row.name.clone();
         let fingerprint = row.fingerprint.clone();
         let scope_kind = row.scope_kind.clone();
         let scope_key = row.scope_key.clone();
@@ -1482,6 +1868,10 @@ impl McpService {
             .lock()
             .await
             .insert(installation_id.clone(), runtime_generation);
+        let oauth_failure_revision = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let actor_failure_revision = oauth_failure_revision.clone();
+        let recovery = Arc::new(OAuthRecoveryMailbox::default());
+        let actor_recovery = recovery.clone();
         let join = tokio::spawn(async move {
             service
                 .run_server_task(
@@ -1491,6 +1881,8 @@ impl McpService {
                     connector,
                     shutdown_rx,
                     call_rx,
+                    actor_failure_revision,
+                    actor_recovery,
                 )
                 .await;
         });
@@ -1498,11 +1890,14 @@ impl McpService {
         self.inner.tasks.lock().await.insert(
             installation_id,
             McpServerTaskHandle {
+                name,
                 scope_kind,
                 scope_key,
                 fingerprint,
                 effective_secret_fingerprint,
                 call_tx,
+                oauth_failure_revision,
+                recovery,
                 shutdown_tx,
                 join,
             },
@@ -1532,7 +1927,19 @@ impl McpService {
         self.cancel_installation_mcp_invocations(installation_id);
         let handle = self.inner.tasks.lock().await.remove(installation_id);
         if let Some(handle) = handle {
-            let _ = handle.shutdown_tx.send(final_state);
+            handle
+                .recovery
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            let _ = handle.shutdown_tx.send(McpShutdownRequest {
+                final_state,
+                crud_store: self
+                    .runtime_store
+                    .clone()
+                    .unwrap_or_else(|| self.inner.crud_store.clone()),
+            });
             if let Err(error) = handle.join.await {
                 warn!(
                     installation_id,
@@ -1549,15 +1956,17 @@ impl McpService {
         installation: McpServerInstallation,
         installation_id: String,
         connector: Arc<dyn McpRuntimeConnector>,
-        mut shutdown_rx: oneshot::Receiver<DomainRuntimeState>,
-        mut call_rx: mpsc::Receiver<McpServerCallCommand>,
+        mut shutdown_rx: oneshot::Receiver<McpShutdownRequest>,
+        mut call_rx: mpsc::Receiver<McpServerCommand>,
+        oauth_failure_revision: Arc<std::sync::atomic::AtomicU64>,
+        recovery: Arc<OAuthRecoveryMailbox>,
     ) {
         let resolver = Arc::new(GatewayMcpSecretResolver {
             gateway_secrets: self.inner.gateway_secrets.clone(),
         });
         let mut retry_attempt = 0_u32;
 
-        loop {
+        'connection: loop {
             let now = now_timestamp_secs();
             self.audit(&row, "start", None, json!({"retry_attempt": retry_attempt}))
                 .await;
@@ -1572,14 +1981,13 @@ impl McpService {
             )
             .await;
 
-            let connect = connector
-                .connect(
-                    installation.clone(),
-                    installation_id.clone(),
-                    resolver.clone(),
-                    now,
-                )
-                .await;
+            let connect = tokio::select! {
+                final_state=&mut shutdown_rx => {
+                    if let Ok(final_state)=final_state{self.publish_scoped_shutdown(&row, final_state).await;}
+                    return;
+                }
+                result=connector.connect(installation.clone(),installation_id.clone(),resolver.clone(),now)=>result,
+            };
 
             let mut session = match connect {
                 Ok(session) => session,
@@ -1613,7 +2021,7 @@ impl McpService {
 
                     if error.state == DomainRuntimeState::AuthRequired {
                         if let Ok(final_state) = shutdown_rx.await {
-                            self.publish_shutdown_status(&row, final_state).await;
+                            self.publish_scoped_shutdown(&row, final_state).await;
                         }
                         return;
                     }
@@ -1623,7 +2031,7 @@ impl McpService {
                     tokio::select! {
                         final_state = &mut shutdown_rx => {
                             if let Ok(final_state) = final_state {
-                                self.publish_shutdown_status(&row, final_state).await;
+                                self.publish_scoped_shutdown(&row, final_state).await;
                             }
                             return;
                         }
@@ -1662,10 +2070,15 @@ impl McpService {
             )
             .await;
 
+            let mut oauth_degraded = false;
+            let mut oauth_failure_cause: Option<pioneer_mcp::OAuthFailureCause> = None;
+            let mut before_oauth_degradation: Option<McpServerRuntimeSnapshot> = None;
             loop {
                 tokio::select! {
                     final_state = &mut shutdown_rx => {
-                        self.publish_status(
+                        let shutdown_store = final_state.as_ref().ok().map(|request| request.crud_store.clone());
+                        let shutdown_service = McpService { inner: self.inner.clone(), runtime_store: shutdown_store.or_else(|| self.runtime_store.clone()) };
+                        shutdown_service.publish_status(
                             &row,
                             DomainRuntimeState::Stopping,
                             Some("stopping MCP server".to_owned()),
@@ -1675,12 +2088,12 @@ impl McpService {
                             Some(catalog.catalog_version.clone()),
                         )
                         .await;
-                        self.audit(&row, "stop", Some(catalog.catalog_version.as_str()), json!({})).await;
+                        shutdown_service.audit(&row, "stop", Some(catalog.catalog_version.as_str()), json!({})).await;
                         session.shutdown().await;
                         if let Ok(final_state) = final_state {
-                            self.publish_shutdown_status(&row, final_state).await;
+                            self.publish_scoped_shutdown(&row, final_state).await;
                         }
-                        self.audit(&row, "stopped", Some(catalog.catalog_version.as_str()), json!({})).await;
+                        shutdown_service.audit(&row, "stopped", Some(catalog.catalog_version.as_str()), json!({})).await;
                         return;
                     }
                     event = session.wait_for_event() => {
@@ -1688,6 +2101,10 @@ impl McpService {
                             pioneer_mcp::McpSessionEvent::CatalogChanged => {
                                 match session.refresh_catalog().await {
                                     Ok(catalog) => {
+                                        // A successful catalog reconciliation supersedes the
+                                        // earlier OAuth failure and its saved status snapshot.
+                                        oauth_degraded = false;
+                                        before_oauth_degradation = None;
                                         let degraded_reason = session
                                             .degraded_reason()
                                             .map(ToOwned::to_owned);
@@ -1712,9 +2129,14 @@ impl McpService {
                                         .await;
                                     }
                                     Err(error) => {
+                                        let oauth_error = matches!(error.kind, McpRuntimeErrorKind::TransientRefresh | McpRuntimeErrorKind::CredentialStore);
+                                        if oauth_error { oauth_failure_revision.fetch_add(1, Ordering::SeqCst); oauth_failure_cause = error.oauth_failure.clone(); }
+                                        if oauth_error && !oauth_degraded { before_oauth_degradation = self.inner.snapshots.lock().await.get(&installation_id).cloned(); }
+                                        if !oauth_error { before_oauth_degradation = None; }
+                                        oauth_degraded = oauth_error;
                                         self.publish_status(
                                             &row,
-                                            DomainRuntimeState::Degraded,
+                                            if error.state==DomainRuntimeState::AuthRequired {DomainRuntimeState::AuthRequired}else{DomainRuntimeState::Degraded},
                                             Some(error.message.clone()),
                                             Some(error.message),
                                             0,
@@ -1737,13 +2159,63 @@ impl McpService {
                                     None,
                                 )
                                 .await;
-                                return;
+                                session.shutdown().await;
+                                let delay=self.inner.retry_policy.delay_secs(retry_attempt);
+                                retry_attempt=retry_attempt.saturating_add(1);
+                                tokio::select!{final_state=&mut shutdown_rx=>{if let Ok(state)=final_state{self.publish_scoped_shutdown(&row, state).await;}return;},_=sleep(Duration::from_secs(delay))=>{}}
+                                continue 'connection;
                             }
                         }
                     }
-                    command = call_rx.recv() => {
+                    command = async {
+                        tokio::select! {
+                            command=call_rx.recv()=>command,
+                            _=recovery.wake.notified()=>recovery.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take(),
+                        }
+                    } => {
                         let Some(command) = command else {
                             continue;
+                        };
+                        let command = match command {
+                            McpServerCommand::Tool(command) => command,
+                            McpServerCommand::OAuthRecovered { store, cancellation, completed, admission, event, failure_revision, cause } => {
+                                let _admission = {
+                                    let mut guard = admission.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    if cancellation.is_cancelled() { guard.take(); None } else { guard.take() }
+                                };
+                                // A timed-out waiter released its transferable guard.
+                                // The still-owned mailbox must reacquire admission, while
+                                // shutdown can interrupt acquisition (no stop/join deadlock).
+                                let _retry_admission = if _admission.is_none() {
+                                    tokio::select! {
+                                        state=&mut shutdown_rx=>{ if let Ok(state)=state { self.publish_scoped_shutdown(&row,state).await; } session.shutdown().await; return; },
+                                        guard=self.installation_lifecycle_guard(&row.scope_kind,&row.scope_key,&row.name)=>Some(guard),
+                                    }
+                                } else { None };
+                                let recovery_service = McpService { inner: self.inner.clone(), runtime_store: Some(store) };
+                                let current = match event.as_ref() {
+                                    Some(event) => match recovery_service.runtime_store().find_mcp_server_installation(&row.scope_kind,&row.scope_key,&row.name).await {
+                                        Ok(Some(current)) if current.id == row.id => match installation_from_record(&current) { Ok(installation)=>self.oauth().event_is_current(event,&installation).await, Err(_)=>false },
+                                        _=>false,
+                                    },
+                                    None => true,
+                                };
+                                let same_failure = match (&oauth_failure_cause, &cause) {
+                                    (Some(failure), Some(recovery)) => failure.generation == recovery.generation && failure.revision <= recovery.revision,
+                                    _ => failure_revision == oauth_failure_revision.load(Ordering::SeqCst),
+                                };
+                                if oauth_degraded && current && same_failure {
+                                    oauth_degraded = false;
+                                    let prior = before_oauth_degradation.take().filter(|snapshot| snapshot.state == DomainRuntimeState::Degraded);
+                                    let degraded = session.degraded_reason().map(str::to_owned);
+                                    let state = if prior.is_some() || degraded.is_some() { DomainRuntimeState::Degraded } else { DomainRuntimeState::Ready };
+                                    let reason = prior.as_ref().and_then(|snapshot| snapshot.status_reason.clone()).or(degraded).or_else(|| Some("MCP authorization recovered".into()));
+                                    let last_error = prior.and_then(|snapshot| snapshot.last_error);
+                                    recovery_service.publish_status(&row, state, reason, last_error, 0, None, Some(catalog.catalog_version.clone())).await;
+                                }
+                                let _ = completed.send(());
+                                continue;
+                            }
                         };
                         let raw_tool_name = command.request.raw_tool_name.clone();
                         let arguments = command.request.arguments.clone();
@@ -1761,9 +2233,14 @@ impl McpService {
                         if let Err(error) = &result
                             && error.kind != McpRuntimeErrorKind::Cancelled
                         {
+                            let oauth_error = matches!(error.kind, McpRuntimeErrorKind::TransientRefresh | McpRuntimeErrorKind::CredentialStore);
+                                        if oauth_error { oauth_failure_revision.fetch_add(1, Ordering::SeqCst); oauth_failure_cause = error.oauth_failure.clone(); }
+                                        if oauth_error && !oauth_degraded { before_oauth_degradation = self.inner.snapshots.lock().await.get(&installation_id).cloned(); }
+                                        if !oauth_error { before_oauth_degradation = None; }
+                                        oauth_degraded = oauth_error;
                             self.publish_status(
                                 &row,
-                                DomainRuntimeState::Degraded,
+                                if error.state==DomainRuntimeState::AuthRequired {DomainRuntimeState::AuthRequired}else{DomainRuntimeState::Degraded},
                                 Some(error.message.clone()),
                                 Some(error.message.clone()),
                                 0,
@@ -1777,6 +2254,20 @@ impl McpService {
                 }
             }
         }
+    }
+
+    async fn publish_scoped_shutdown(
+        &self,
+        row: &McpServerInstallationRecord,
+        request: McpShutdownRequest,
+    ) {
+        let service = McpService {
+            inner: self.inner.clone(),
+            runtime_store: Some(request.crud_store),
+        };
+        service
+            .publish_shutdown_status(row, request.final_state)
+            .await;
     }
 
     async fn publish_shutdown_status(
@@ -1887,8 +2378,7 @@ impl McpService {
         catalog: &McpCatalogSnapshot,
     ) {
         let existing = self
-            .inner
-            .crud_store
+            .runtime_store()
             .find_mcp_server_catalog_snapshot(catalog.server_installation_id.as_str())
             .await
             .ok()
@@ -1910,8 +2400,7 @@ impl McpService {
             generated_at_unix: catalog.generated_at_unix,
         };
         if let Err(error) = self
-            .inner
-            .crud_store
+            .runtime_store()
             .upsert_mcp_server_catalog_snapshot(&record, now_timestamp_secs())
             .await
         {
@@ -1975,8 +2464,7 @@ impl McpService {
             created_at_unix: now_timestamp_secs(),
         };
         if let Err(error) = self
-            .inner
-            .crud_store
+            .runtime_store()
             .insert_mcp_audit_event_record(&audit)
             .await
         {
@@ -2040,7 +2528,11 @@ impl McpService {
             .saturating_add(1)
     }
 
-    async fn send_management_notification<T: Serialize>(&self, method: &str, payload: &T) {
+    pub(crate) async fn send_management_notification<T: Serialize>(
+        &self,
+        method: &str,
+        payload: &T,
+    ) {
         let candidate_connection_ids = self.inner.session_manager.connection_ids().await;
         let initially_authorized_connection_ids = self
             .authorized_management_notification_recipients(candidate_connection_ids)
@@ -2088,7 +2580,7 @@ impl McpService {
         }
     }
 
-    async fn authorized_management_notification_recipients(
+    pub(crate) async fn authorized_management_notification_recipients(
         &self,
         candidate_connection_ids: Vec<u64>,
     ) -> Vec<u64> {
@@ -2109,13 +2601,22 @@ impl McpService {
             else {
                 continue;
             };
-            if let Some(auth_service) = auth_service.as_ref()
-                && auth_service
-                    .validate_session_lease(principal.as_ref())
-                    .await
-                    .is_err()
-            {
-                continue;
+            if let Some(auth_service) = auth_service.as_ref() {
+                let valid = if let Some(store) = &self.runtime_store {
+                    auth_service
+                        .validate_session_lease_with_database(
+                            principal.as_ref(),
+                            &store.database_connection(),
+                        )
+                        .await
+                } else {
+                    auth_service
+                        .validate_session_lease(principal.as_ref())
+                        .await
+                };
+                if valid.is_err() {
+                    continue;
+                }
             }
             let action_gate = authorization_service.authorize_action(
                 principal.kind,
@@ -3074,7 +3575,9 @@ impl pioneer_tools::McpToolExecutor for McpService {
     }
 }
 
-fn installation_from_record(row: &McpServerInstallationRecord) -> Result<McpServerInstallation> {
+pub(crate) fn installation_from_record(
+    row: &McpServerInstallationRecord,
+) -> Result<McpServerInstallation> {
     Ok(McpServerInstallation {
         scope_kind: DomainScopeKind::from_str(row.scope_kind.as_str())
             .map_err(anyhow::Error::msg)?,
@@ -3509,7 +4012,7 @@ mod tests {
         async fn execute(
             &self,
             validated: ValidatedTurnMcpInvocation,
-            cancellation: CancellationToken,
+            cancellation: tokio_util::sync::CancellationToken,
         ) -> Result<CanonicalMcpToolResult, TurnMcpInvocationError> {
             assert!(!cancellation.is_cancelled());
             assert_eq!(
@@ -3698,7 +4201,7 @@ mod tests {
             arguments: JsonValue,
             _budget: pioneer_mcp::McpInvocationBudget,
             _timeout: Duration,
-            cancellation: CancellationToken,
+            cancellation: tokio_util::sync::CancellationToken,
         ) -> Result<McpToolCallResult, McpRuntimeError> {
             self.control.calls.fetch_add(1, Ordering::SeqCst);
             self.control.started.notify_one();
@@ -3739,6 +4242,12 @@ mod tests {
 
     async fn test_mcp_service_with_secrets()
     -> (McpService, Arc<CrudStore>, String, Arc<GatewaySecrets>) {
+        test_mcp_service_with_store(Arc::new(MemorySecretStore::new())).await
+    }
+
+    async fn test_mcp_service_with_store(
+        store: Arc<dyn pioneer_keystore::SecretStore>,
+    ) -> (McpService, Arc<CrudStore>, String, Arc<GatewaySecrets>) {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
@@ -3749,7 +4258,7 @@ mod tests {
             .await
             .expect("bootstrap should create default workspace");
         let crud_store = Arc::new(CrudStore::new(connection));
-        let gateway_secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
+        let gateway_secrets = Arc::new(GatewaySecrets::new(store));
         let service = McpService::new(
             crud_store.clone(),
             Arc::new(SessionManager::new()),
@@ -3764,6 +4273,311 @@ mod tests {
             DEFAULT_WORKSPACE_ID.to_owned(),
             gateway_secrets,
         )
+    }
+
+    struct ConnectReadStore {
+        inner: MemorySecretStore,
+        fail_delete: std::sync::Mutex<Option<String>>,
+        armed: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
+        released: std::sync::Mutex<bool>,
+        resumed: std::sync::Condvar,
+    }
+    impl ConnectReadStore {
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.resumed.notify_all();
+        }
+    }
+    impl pioneer_keystore::SecretStore for ConnectReadStore {
+        fn get_string(
+            &self,
+            id: &pioneer_keystore::SecretId,
+        ) -> pioneer_keystore::Result<Option<String>> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.entered.notify_one();
+                let mut released = self.released.lock().unwrap();
+                while !*released {
+                    let next = self
+                        .resumed
+                        .wait_timeout(released, Duration::from_secs(5))
+                        .unwrap();
+                    released = next.0;
+                    assert!(!next.1.timed_out(), "owned connect read must be released");
+                }
+            }
+            self.inner.get_string(id)
+        }
+        fn put_string(
+            &self,
+            id: &pioneer_keystore::SecretId,
+            value: &str,
+            meta: pioneer_keystore::SecretMeta,
+        ) -> pioneer_keystore::Result<()> {
+            self.inner.put_string(id, value, meta)
+        }
+        fn delete(&self, id: &pioneer_keystore::SecretId) -> pioneer_keystore::Result<bool> {
+            if self
+                .fail_delete
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|target| {
+                    id.user() == target || id.user() == format!("{target}::promotion")
+                })
+            {
+                return Err(pioneer_keystore::KeystoreError::DeleteFailed(
+                    "injected cleanup fault".into(),
+                ));
+            }
+            self.inner.delete(id)
+        }
+        fn exists(&self, id: &pioneer_keystore::SecretId) -> pioneer_keystore::Result<bool> {
+            self.inner.exists(id)
+        }
+        fn list(
+            &self,
+            filter: pioneer_keystore::SecretFilter,
+        ) -> pioneer_keystore::Result<Vec<pioneer_keystore::SecretEntryMeta>> {
+            self.inner.list(filter)
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cleanup_holder_does_not_abort_later_enabled_rows_or_disappear_on_disable() {
+        let secrets = Arc::new(ConnectReadStore {
+            inner: MemorySecretStore::new(),
+            fail_delete: Default::default(),
+            armed: Default::default(),
+            entered: Default::default(),
+            released: std::sync::Mutex::new(true),
+            resumed: Default::default(),
+        });
+        let (service, store, workspace, _) = test_mcp_service_with_store(secrets.clone()).await;
+        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+            tools: vec!["send"],
+            fail_auth: false,
+        }));
+        let a = seed_mcp_installation(&store, &workspace, "a-cleanup", true, false).await;
+        let b = seed_mcp_installation(&store, &workspace, "b-enabled", true, false).await;
+        let mut row = store
+            .find_mcp_server_installation("workspace", &workspace, "a-cleanup")
+            .await
+            .unwrap()
+            .unwrap();
+        row.transport_kind = "streamable_http".into();
+        row.transport_json = serde_json::to_string(&McpTransportConfig::StreamableHttp {
+            url: "http://127.0.0.1:9/mcp".into(),
+            headers: Default::default(),
+            startup_timeout_ms: 5000,
+            tool_timeout_ms: 5000,
+        })
+        .unwrap();
+        store
+            .upsert_mcp_server_installation(&row, now_timestamp_secs())
+            .await
+            .unwrap();
+        let installation = installation_from_record(&row).unwrap();
+        *secrets.fail_delete.lock().unwrap() = Some(a.clone());
+        assert!(
+            service
+                .oauth()
+                .disconnect_managed(&a, &installation, 7, &workspace)
+                .await
+                .is_err()
+        );
+        let rows = store
+            .list_mcp_server_installations("workspace", &workspace)
+            .await
+            .unwrap();
+        assert!(
+            rows.iter()
+                .position(|r| r.id.as_deref() == Some(&a))
+                .unwrap()
+                < rows
+                    .iter()
+                    .position(|r| r.id.as_deref() == Some(&b))
+                    .unwrap(),
+            "cleanup must precede B in real repository ordering"
+        );
+        assert!(
+            !service.task_exists(&b).await,
+            "B must not be started by setup"
+        );
+        service.reload_workspace(&workspace).await.unwrap();
+        wait_for_runtime_state(&service, &workspace, &b, DomainRuntimeState::Ready).await;
+        assert!(service.task_exists(&b).await);
+        let before = service.runtime_snapshot("workspace", &workspace).await[&b].runtime_generation;
+        row.enabled = false;
+        store
+            .upsert_mcp_server_installation(&row, now_timestamp_secs())
+            .await
+            .unwrap();
+        service.reload_workspace(&workspace).await.unwrap();
+        wait_for_runtime_state(&service, &workspace, &a, DomainRuntimeState::Disabled).await;
+        assert!(!service.task_exists(&a).await);
+        assert!(
+            service
+                .oauth()
+                .bound_to_installation(&a, &installation)
+                .await
+        );
+        assert_eq!(
+            service.oauth().state(&a).await,
+            Some(pioneer_mcp_oauth::OAuthState::CleanupRequired)
+        );
+        assert!(
+            pioneer_mcp::McpOAuthProvider::client(service.oauth(), &a, &installation)
+                .await
+                .is_err()
+        );
+        assert!(
+            service
+                .oauth()
+                .sign_in(
+                    &a,
+                    &installation,
+                    7,
+                    "http://127.0.0.1:37643/oauth/mcp/callback"
+                )
+                .await
+                .is_err()
+        );
+        *secrets.fail_delete.lock().unwrap() = None;
+        service
+            .oauth()
+            .disconnect_managed(&a, &installation, 7, &workspace)
+            .await
+            .unwrap();
+        // Confirmed management Clear retains a credential-free signed-out
+        // admission. It must not look like an unprobed installation that can
+        // start anonymous OAuth recovery on the next reconciliation.
+        assert_eq!(
+            service
+                .oauth()
+                .management_projection(&a, &installation)
+                .await,
+            (Some(pioneer_mcp_oauth::OAuthState::AuthRequired), false)
+        );
+        for account in [a.clone(), format!("{a}::promotion")] {
+            assert!(
+                !pioneer_keystore::SecretStore::exists(
+                    &secrets.inner,
+                    &pioneer_keystore::SecretId::mcp_oauth(&account).unwrap(),
+                )
+                .unwrap(),
+                "confirmed Clear must remove the account and promotion fence"
+            );
+        }
+        let error = pioneer_mcp::McpOAuthProvider::client(service.oauth(), &a, &installation)
+            .await
+            .err()
+            .expect("signed-out admission must not restore an OAuth client");
+        assert_eq!(error.state, DomainRuntimeState::AuthRequired);
+        assert!(!service.task_exists(&a).await);
+        let snapshot = service.runtime_snapshot("workspace", &workspace).await;
+        assert_eq!(snapshot[&a].state, DomainRuntimeState::Disabled);
+        assert_eq!(snapshot[&b].state, DomainRuntimeState::Ready);
+        assert_eq!(snapshot[&b].runtime_generation, before);
+        service.shutdown().await;
+    }
+    struct OwnedConnectConnector {
+        owner: pioneer_mcp_oauth::McpOAuthService,
+        store: Arc<ConnectReadStore>,
+        completed: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl McpRuntimeConnector for OwnedConnectConnector {
+        async fn connect(
+            &self,
+            installation: McpServerInstallation,
+            id: String,
+            resolver: Arc<dyn McpSecretResolver>,
+            now: i64,
+        ) -> Result<Box<dyn pioneer_mcp::McpRuntimeSession>, McpRuntimeError> {
+            self.store.armed.store(true, Ordering::SeqCst);
+            let result =
+                pioneer_mcp::McpOAuthProvider::client(&self.owner, &id, &installation).await;
+            self.completed.store(true, Ordering::SeqCst);
+            result?;
+            TestMcpRuntimeConnector {
+                tools: vec!["send"],
+                fail_auth: false,
+            }
+            .connect(installation, id, resolver, now)
+            .await
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gateway_shutdown_waits_for_oauth_connect_caller_before_actor_stop_join() {
+        let secrets = Arc::new(ConnectReadStore {
+            inner: MemorySecretStore::new(),
+            fail_delete: Default::default(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::Notify::new(),
+            released: std::sync::Mutex::new(false),
+            resumed: std::sync::Condvar::new(),
+        });
+        struct Release(Arc<ConnectReadStore>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+        let _release = Release(secrets.clone());
+        let (service, store, workspace, _) = test_mcp_service_with_store(secrets.clone()).await;
+        let id = seed_mcp_installation(&store, &workspace, "owned-connect", true, false).await;
+        let mut row = store
+            .find_mcp_server_installation("workspace", &workspace, "owned-connect")
+            .await
+            .unwrap()
+            .unwrap();
+        row.transport_json = serde_json::to_string(&McpTransportConfig::StreamableHttp {
+            url: "http://127.0.0.1:9/mcp".into(),
+            headers: Default::default(),
+            startup_timeout_ms: 30_000,
+            tool_timeout_ms: 120_000,
+        })
+        .unwrap();
+        store
+            .upsert_mcp_server_installation(&row, crate::message::now_timestamp_secs())
+            .await
+            .unwrap();
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        service.set_connector_for_tests(Arc::new(OwnedConnectConnector {
+            owner: service.oauth().clone(),
+            store: secrets.clone(),
+            completed: completed.clone(),
+        }));
+        service
+            .restart_server("workspace", &workspace, "owned-connect")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), secrets.entered.notified())
+            .await
+            .unwrap();
+        let owner = service.clone();
+        let mut shutdown = tokio::spawn(async move { owner.shutdown().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut shutdown)
+                .await
+                .is_err()
+        );
+        assert!(!completed.load(Ordering::SeqCst));
+        assert!(
+            service.task_exists(&id).await,
+            "OAuth shutdown must still own connect before actor removal"
+        );
+        secrets.release();
+        tokio::time::timeout(Duration::from_secs(3), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(completed.load(Ordering::SeqCst));
+        assert!(!service.task_exists(&id).await);
+        assert_eq!(
+            service.runtime_snapshot("workspace", &workspace).await[&id].state,
+            DomainRuntimeState::Stopped
+        );
     }
 
     #[tokio::test]
@@ -5636,6 +6450,1011 @@ mod tests {
         assert_eq!(error.code, TurnMcpInvocationErrorCode::TimedOut);
         assert_eq!(control.calls.load(Ordering::SeqCst), 1);
         assert_turn_mcp_outcome_reason(&fixture, "timed_out").await;
+    }
+
+    struct RefreshFailureConnector {
+        connects: Arc<AtomicUsize>,
+        change: Arc<tokio::sync::Notify>,
+        unrelated_degradation: bool,
+        tool_barrier: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        tool_outcome: Option<Result<(), McpRuntimeError>>,
+        provider: Option<pioneer_mcp_oauth::McpOAuthService>,
+    }
+    struct RefreshFailureSession {
+        inner: Box<dyn pioneer_mcp::McpRuntimeSession>,
+        change: Arc<tokio::sync::Notify>,
+        unrelated_degradation: bool,
+        tool_barrier: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        tool_outcome: Option<Result<(), McpRuntimeError>>,
+        provider: Option<(
+            pioneer_mcp_oauth::McpOAuthService,
+            McpServerInstallation,
+            String,
+            pioneer_mcp::OAuthHttpClient,
+        )>,
+    }
+    #[async_trait::async_trait]
+    impl McpRuntimeConnector for RefreshFailureConnector {
+        async fn connect(
+            &self,
+            installation: McpServerInstallation,
+            id: String,
+            resolver: Arc<dyn McpSecretResolver>,
+            now: i64,
+        ) -> Result<Box<dyn pioneer_mcp::McpRuntimeSession>, McpRuntimeError> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            let provider = if let Some(owner) = &self.provider {
+                pioneer_mcp::McpOAuthProvider::client(owner, &id, &installation)
+                    .await?
+                    .map(|client| (owner.clone(), installation.clone(), id.clone(), client))
+            } else {
+                None
+            };
+            let inner = TestMcpRuntimeConnector {
+                tools: vec!["send"],
+                fail_auth: false,
+            }
+            .connect(installation, id, resolver, now)
+            .await?;
+            Ok(Box::new(RefreshFailureSession {
+                inner,
+                change: self.change.clone(),
+                unrelated_degradation: self.unrelated_degradation,
+                tool_barrier: self.tool_barrier.clone(),
+                tool_outcome: self.tool_outcome.clone(),
+                provider,
+            }))
+        }
+    }
+    #[async_trait::async_trait]
+    impl pioneer_mcp::McpRuntimeSession for RefreshFailureSession {
+        fn initial_catalog(&self) -> &McpCatalogSnapshot {
+            self.inner.initial_catalog()
+        }
+        fn degraded_reason(&self) -> Option<&str> {
+            self.unrelated_degradation
+                .then_some("unrelated stream limitation")
+        }
+        async fn wait_for_event(&mut self) -> pioneer_mcp::McpSessionEvent {
+            self.change.notified().await;
+            pioneer_mcp::McpSessionEvent::CatalogChanged
+        }
+        async fn refresh_catalog(&mut self) -> Result<McpCatalogSnapshot, McpRuntimeError> {
+            Err(McpRuntimeError {
+                oauth_failure: None,
+                kind: McpRuntimeErrorKind::TransientRefresh,
+                state: DomainRuntimeState::Failed,
+                message: "OAuth token refresh temporarily unavailable".into(),
+            })
+        }
+        async fn call_tool(
+            &mut self,
+            name: &str,
+            args: JsonValue,
+            budget: pioneer_mcp::McpInvocationBudget,
+            timeout: Duration,
+            cancellation: tokio_util::sync::CancellationToken,
+        ) -> Result<McpToolCallResult, McpRuntimeError> {
+            if let Some((entered, release)) = &self.tool_barrier {
+                let notified_error = if let Some((owner, installation, id, client)) = &self.provider
+                {
+                    let cause = pioneer_mcp::McpOAuthProvider::transient_failure_from_session(
+                        owner,
+                        id,
+                        installation,
+                        Some(client),
+                    )
+                    .await;
+                    let mut error = McpRuntimeError::failed("notified OAuth failure A");
+                    error.kind = McpRuntimeErrorKind::TransientRefresh;
+                    error.oauth_failure = cause;
+                    Some(error)
+                } else {
+                    None
+                };
+                entered.notify_one();
+                release.notified().await;
+                if let Some(error) = notified_error {
+                    return Err(error);
+                }
+                match &self.tool_outcome {
+                    Some(Ok(())) => {}
+                    Some(Err(error)) => return Err(error.clone()),
+                    None => {
+                        return Err(McpRuntimeError {
+                            oauth_failure: None,
+                            kind: McpRuntimeErrorKind::TransientRefresh,
+                            state: DomainRuntimeState::Failed,
+                            message: "new OAuth failure B".into(),
+                        });
+                    }
+                }
+            }
+            self.inner
+                .call_tool(name, args, budget, timeout, cancellation)
+                .await
+        }
+        async fn shutdown(&mut self) {
+            self.inner.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_oauth_recovery_cannot_clear_a_newer_blocked_tool_failure() {
+        let (service, store, workspace) = test_mcp_service().await;
+        let change = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        struct Release(Arc<tokio::sync::Notify>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.notify_waiters();
+                self.0.notify_one();
+            }
+        }
+        let _release_on_exit = Release(release.clone());
+        let connects = Arc::new(AtomicUsize::new(0));
+        service.set_connector_for_tests(Arc::new(RefreshFailureConnector {
+            connects: connects.clone(),
+            change: change.clone(),
+            unrelated_degradation: false,
+            tool_barrier: Some((entered.clone(), release.clone())),
+            tool_outcome: None,
+            provider: None,
+        }));
+        let id = seed_mcp_installation(&store, &workspace, "queued-recovery", true, false).await;
+        service.reload_workspace(&workspace).await.unwrap();
+        wait_for_runtime_state(&service, &workspace, &id, DomainRuntimeState::Ready).await;
+        let generation =
+            service.runtime_snapshot("workspace", &workspace).await[&id].runtime_generation;
+        change.notify_one();
+        wait_for_runtime_state(&service, &workspace, &id, DomainRuntimeState::Degraded).await;
+        let tx = service.inner.tasks.lock().await[&id].call_tx.clone();
+        let revision = service.inner.tasks.lock().await[&id]
+            .oauth_failure_revision
+            .load(Ordering::SeqCst);
+        assert!(revision > 0);
+        let (response_tx, response_rx) = oneshot::channel();
+        tx.send(McpServerCommand::Tool(McpServerCallCommand {
+            request: pioneer_tools::McpToolCallRequest {
+                workspace_id: workspace.clone(),
+                turn_id: "test-turn".into(),
+                call_id: "tool-B".into(),
+                callable_name: "send".into(),
+                server_id: id.clone(),
+                server_name: "queued-recovery".into(),
+                raw_tool_name: "send".into(),
+                catalog_version: "test".into(),
+                arguments: json!({}),
+                timeout_ms: 5000,
+                max_arguments_bytes: 1024,
+            },
+            cancellation: CancellationToken::new(),
+            response_tx,
+        }))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        let (done, completed) = oneshot::channel();
+        tx.send(McpServerCommand::OAuthRecovered {
+            store: Arc::new(store.with_maintenance_access()),
+            cancellation: CancellationToken::new(),
+            completed: done,
+            admission: Arc::new(std::sync::Mutex::new(None)),
+            event: None,
+            failure_revision: revision,
+            cause: None,
+        })
+        .await
+        .unwrap();
+        release.notify_one();
+        assert_eq!(
+            response_rx.await.unwrap().unwrap_err().message,
+            "new OAuth failure B"
+        );
+        completed.await.unwrap();
+        let after = service.runtime_snapshot("workspace", &workspace).await[&id].clone();
+        assert_eq!(after.state, DomainRuntimeState::Degraded);
+        assert_eq!(after.last_error.as_deref(), Some("new OAuth failure B"));
+        assert_eq!(after.runtime_generation, generation);
+        service.oauth_recovered(&id).await;
+        assert_eq!(
+            service.runtime_snapshot("workspace", &workspace).await[&id].state,
+            DomainRuntimeState::Ready
+        );
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+        service.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn real_oauth_recovery_before_actor_receives_notified_error_restores_projection() {
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+        for unrelated in [false, true] {
+            let (old, store, workspace, secrets) = test_mcp_service_with_secrets().await;
+            old.shutdown().await;
+            let sessions = Arc::new(SessionManager::new());
+            let (recipient_tx, mut recipient) = mpsc::channel(1024);
+            let mut principal = (*authenticated_test_superuser()).clone();
+            principal.access_expires_at_unix = now_timestamp_secs() as u64 + 3600;
+            let client = sessions
+                .register_connection(recipient_tx, Arc::new(principal))
+                .await
+                .unwrap();
+            let service = McpService::new_with_oauth_options(
+                store.clone(),
+                sessions,
+                secrets,
+                Arc::new(AtomicU64::new(1)),
+                Arc::new(AuthorizationInvalidationHub::default()),
+                Arc::new(ExecutionLeaseRegistry::default()),
+                pioneer_mcp_oauth::OAuthServiceOptions {
+                    poll_interval: Duration::from_millis(10),
+                    ..Default::default()
+                },
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let issuer = format!("http://{}", listener.local_addr().unwrap());
+            let metadata = json!({"issuer":issuer,"authorization_endpoint":format!("{issuer}/authorize"),"token_endpoint":format!("{issuer}/token"),"registration_endpoint":format!("{issuer}/register"),"response_types_supported":["code"],"code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true});
+            let router=Router::new().route("/.well-known/oauth-authorization-server",get(move||{let metadata=metadata.clone();async move{Json(metadata)}}))
+                .route("/register",post(|Json(body):Json<JsonValue>|async move{Json(json!({"client_id":"real-recovery-client","redirect_uris":body["redirect_uris"]}))}))
+                .route("/token",post(||async{Json(json!({"access_token":"recovered-token","refresh_token":"rotated-token","token_type":"Bearer","expires_in":3600}))}));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            struct Server(tokio::task::JoinHandle<()>);
+            impl Drop for Server {
+                fn drop(&mut self) {
+                    self.0.abort();
+                }
+            }
+            let _server = Server(server);
+            let id = seed_mcp_installation(&store, &workspace, "real-recovery", true, false).await;
+            let mut row = store
+                .find_mcp_server_installation("workspace", &workspace, "real-recovery")
+                .await
+                .unwrap()
+                .unwrap();
+            row.transport_kind = "streamable_http".into();
+            row.transport_json = serde_json::to_string(&McpTransportConfig::StreamableHttp {
+                url: format!("{issuer}/mcp"),
+                headers: BTreeMap::new(),
+                startup_timeout_ms: 5000,
+                tool_timeout_ms: 120000,
+            })
+            .unwrap();
+            store
+                .upsert_mcp_server_installation(&row, now_timestamp_secs())
+                .await
+                .unwrap();
+            let installation = installation_from_record(&row).unwrap();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            struct Release(Arc<tokio::sync::Notify>);
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    self.0.notify_waiters();
+                    self.0.notify_one();
+                }
+            }
+            let _release = Release(release.clone());
+            let connects = Arc::new(AtomicUsize::new(0));
+            service.set_connector_for_tests(Arc::new(RefreshFailureConnector {
+                connects: connects.clone(),
+                change: Arc::new(tokio::sync::Notify::new()),
+                unrelated_degradation: unrelated,
+                tool_barrier: Some((entered.clone(), release.clone())),
+                tool_outcome: None,
+                provider: Some(service.oauth().clone()),
+            }));
+            service
+                .oauth()
+                .sign_in(
+                    &id,
+                    &installation,
+                    client,
+                    "http://127.0.0.1:37643/oauth/mcp/callback",
+                )
+                .await
+                .unwrap();
+            let browser = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let axum::extract::ws::Message::Text(text) = recipient.recv().await.unwrap()
+                    else {
+                        continue;
+                    };
+                    let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
+                    if value["params"]["state"] == "awaiting_callback" {
+                        break value["params"].clone();
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let url = url::Url::parse(browser["authorization_url"].as_str().unwrap()).unwrap();
+            let state = url
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .unwrap()
+                .1
+                .into_owned();
+            service
+                .oauth()
+                .callback(
+                    &id,
+                    client,
+                    pioneer_mcp_oauth::OAuthCallback {
+                        flow_id: browser["flow_id"].as_str().unwrap().into(),
+                        state,
+                        code: Some("single-code".into()),
+                        issuer: Some(issuer),
+                        error: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let expected = if unrelated {
+                DomainRuntimeState::Degraded
+            } else {
+                DomainRuntimeState::Ready
+            };
+            wait_for_runtime_state(&service, &workspace, &id, expected).await;
+            let generation =
+                service.runtime_snapshot("workspace", &workspace).await[&id].runtime_generation;
+            let (tx, mailbox) = {
+                let tasks = service.inner.tasks.lock().await;
+                (tasks[&id].call_tx.clone(), tasks[&id].recovery.clone())
+            };
+            let (response_tx, response) = oneshot::channel();
+            tx.send(McpServerCommand::Tool(McpServerCallCommand {
+                request: pioneer_tools::McpToolCallRequest {
+                    workspace_id: workspace.clone(),
+                    turn_id: "test-turn".into(),
+                    call_id: "tool-A".into(),
+                    callable_name: "send".into(),
+                    server_id: id.clone(),
+                    server_name: "real-recovery".into(),
+                    raw_tool_name: "send".into(),
+                    catalog_version: "test".into(),
+                    arguments: json!({}),
+                    timeout_ms: 120000,
+                    max_arguments_bytes: 1024,
+                },
+                cancellation: CancellationToken::new(),
+                response_tx,
+            }))
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), entered.notified())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if mailbox.pending.lock().unwrap().is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                service.inner.tasks.lock().await[&id]
+                    .oauth_failure_revision
+                    .load(Ordering::SeqCst),
+                0,
+                "error A has not reached actor yet"
+            );
+            release.notify_one();
+            assert_eq!(
+                response.await.unwrap().unwrap_err().message,
+                "notified OAuth failure A"
+            );
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let snapshot =
+                        service.runtime_snapshot("workspace", &workspace).await[&id].clone();
+                    if mailbox.pending.lock().unwrap().is_none() && snapshot.last_error.is_none() {
+                        assert_eq!(snapshot.state, expected);
+                        assert_eq!(snapshot.runtime_generation, generation);
+                        if unrelated {
+                            assert_eq!(
+                                snapshot.status_reason.as_deref(),
+                                Some("unrelated stream limitation")
+                            );
+                        }
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(connects.load(Ordering::SeqCst), 1);
+            service.shutdown().await;
+        }
+    }
+    #[cfg(feature = "oauth-test-support")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retired_winner_delivers_resolving_and_addressed_reset_through_gateway_consumer() {
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+        for deadline in [false, true] {
+            let (old, store, workspace, secrets) = test_mcp_service_with_secrets().await;
+            old.shutdown().await;
+            let sessions = Arc::new(SessionManager::new());
+            let (recipient_tx, mut recipient) = mpsc::channel(1024);
+            let mut principal = (*authenticated_test_superuser()).clone();
+            principal.access_expires_at_unix = now_timestamp_secs() as u64 + 3600;
+            let client = sessions
+                .register_connection(recipient_tx, Arc::new(principal))
+                .await
+                .unwrap();
+            let hooks = Arc::new(pioneer_mcp_oauth::OAuthTestHooks::default());
+            hooks.pause_after_winner.store(true, Ordering::SeqCst);
+            struct Release(Arc<pioneer_mcp_oauth::OAuthTestHooks>);
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    self.0.publish_resolution.notify_one();
+                }
+            }
+            let _release = Release(hooks.clone());
+            struct Clock(std::sync::Mutex<std::time::SystemTime>);
+            impl pioneer_mcp_oauth::OAuthClock for Clock {
+                fn now(&self) -> std::time::SystemTime {
+                    *self.0.lock().unwrap()
+                }
+            }
+            let clock = Arc::new(Clock(std::sync::Mutex::new(std::time::SystemTime::now())));
+            let service = McpService::new_with_oauth_options(
+                store.clone(),
+                sessions.clone(),
+                secrets,
+                Arc::new(AtomicU64::new(1)),
+                Arc::new(AuthorizationInvalidationHub::default()),
+                Arc::new(ExecutionLeaseRegistry::default()),
+                pioneer_mcp_oauth::OAuthServiceOptions {
+                    test_hooks: Some(hooks.clone()),
+                    clock: clock.clone(),
+                    poll_interval: Duration::from_millis(5),
+                    ..Default::default()
+                },
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let issuer = format!("http://{}", listener.local_addr().unwrap());
+            let metadata = json!({"issuer":issuer,"authorization_endpoint":format!("{issuer}/authorize"),"token_endpoint":format!("{issuer}/token"),"registration_endpoint":format!("{issuer}/register"),"response_types_supported":["code"],"code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true});
+            let router=Router::new().route("/.well-known/oauth-authorization-server",get(move||{let metadata=metadata.clone();async move{Json(metadata)}}))
+                .route("/register",post(|Json(body):Json<JsonValue>|async move{Json(json!({"client_id":"real-recovery-client","redirect_uris":body["redirect_uris"]}))}))
+                .route("/token",post(||async{Json(json!({"access_token":"recovered-token","refresh_token":"rotated-token","token_type":"Bearer","expires_in":3600}))}));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            struct Server(tokio::task::JoinHandle<()>);
+            impl Drop for Server {
+                fn drop(&mut self) {
+                    self.0.abort();
+                }
+            }
+            let _server = Server(server);
+            let id = seed_mcp_installation(&store, &workspace, "real-recovery", false, false).await;
+            let mut row = store
+                .find_mcp_server_installation("workspace", &workspace, "real-recovery")
+                .await
+                .unwrap()
+                .unwrap();
+            row.transport_kind = "streamable_http".into();
+            row.transport_json = serde_json::to_string(&McpTransportConfig::StreamableHttp {
+                url: format!("{issuer}/mcp"),
+                headers: BTreeMap::new(),
+                startup_timeout_ms: 5000,
+                tool_timeout_ms: 120000,
+            })
+            .unwrap();
+            store
+                .upsert_mcp_server_installation(&row, now_timestamp_secs())
+                .await
+                .unwrap();
+            let installation = installation_from_record(&row).unwrap();
+            service
+                .oauth()
+                .sign_in(
+                    &id,
+                    &installation,
+                    client,
+                    "http://127.0.0.1:37643/oauth/mcp/callback",
+                )
+                .await
+                .unwrap();
+            let browser = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let axum::extract::ws::Message::Text(text) = recipient.recv().await.unwrap()
+                    else {
+                        continue;
+                    };
+                    let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
+                    if value["params"]["state"] == "awaiting_callback" {
+                        break value["params"].clone();
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let url = url::Url::parse(browser["authorization_url"].as_str().unwrap()).unwrap();
+            let state = url
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .unwrap()
+                .1
+                .into_owned();
+            service
+                .oauth()
+                .callback(
+                    &id,
+                    client,
+                    pioneer_mcp_oauth::OAuthCallback {
+                        flow_id: browser["flow_id"].as_str().unwrap().into(),
+                        state,
+                        code: Some("single-code".into()),
+                        issuer: Some(issuer),
+                        error: None,
+                    },
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), hooks.winner_reserved.notified())
+                .await
+                .unwrap();
+            assert_eq!(
+                service.oauth().state(&id).await,
+                Some(pioneer_mcp_oauth::OAuthState::Resolving)
+            );
+            if deadline {
+                *clock.0.lock().unwrap() += Duration::from_secs(1200);
+            } else {
+                sessions.unregister_connection(client).await;
+            }
+            tokio::time::timeout(Duration::from_secs(3), hooks.retirement_observed.notified())
+                .await
+                .unwrap();
+            hooks.publish_resolution.notify_one();
+            let flow = browser["flow_id"].as_str().unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !service
+                    .oauth()
+                    .resolution_finished_for_test(&id, flow)
+                    .await
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            if deadline {
+                async fn wire_state(
+                    recipient: &mut mpsc::Receiver<axum::extract::ws::Message>,
+                    state: &str,
+                ) -> JsonValue {
+                    tokio::time::timeout(Duration::from_secs(3), async {
+                        loop {
+                            if let Some(axum::extract::ws::Message::Text(text)) =
+                                recipient.recv().await
+                            {
+                                let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
+                                assert_ne!(value["params"]["state"], "authorized");
+                                if value["params"]["state"] == state {
+                                    break value["params"].clone();
+                                }
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap()
+                }
+                let resolving = wire_state(&mut recipient, "resolving").await;
+                assert_eq!(resolving["flow_id"], browser["flow_id"]);
+                assert!(resolving["authorization_url"].is_null());
+                let (second_tx, mut second_rx) = mpsc::channel(1024);
+                let mut second_principal = (*authenticated_test_superuser()).clone();
+                second_principal.access_expires_at_unix = now_timestamp_secs() as u64 + 3600;
+                let second = sessions
+                    .register_connection(second_tx, Arc::new(second_principal))
+                    .await
+                    .unwrap();
+                let mut replacement = row.clone();
+                let mut config = installation.clone();
+                config.auth.oauth = Some(pioneer_mcp::McpOAuthConfig {
+                    scopes: vec!["additional".into()],
+                    ..Default::default()
+                });
+                replacement.auth_json = serde_json::to_string(&config.auth).unwrap();
+                store
+                    .upsert_mcp_server_installation(&replacement, now_timestamp_secs())
+                    .await
+                    .unwrap();
+                service
+                    .oauth()
+                    .sign_in_in_workspace(
+                        &id,
+                        &config,
+                        second,
+                        "http://127.0.0.1:37643/oauth/mcp/callback",
+                        &workspace,
+                    )
+                    .await
+                    .unwrap();
+                let retired = wire_state(&mut recipient, "retired").await;
+                assert_eq!(retired["flow_id"], browser["flow_id"]);
+                assert!(retired["authorization_url"].is_null());
+                let next = wire_state(&mut second_rx, "awaiting_callback").await;
+                assert_ne!(next["flow_id"], browser["flow_id"]);
+                assert!(next["authorization_url"].is_string());
+                while let Ok(frame) = recipient.try_recv() {
+                    if let axum::extract::ws::Message::Text(text) = frame {
+                        let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
+                        assert!(
+                            value["params"]["authorization_url"].is_null(),
+                            "client A must never receive client B's consent URL"
+                        );
+                    }
+                }
+            } else {
+                assert_eq!(
+                    service.oauth().state(&id).await,
+                    Some(pioneer_mcp_oauth::OAuthState::Resolving)
+                );
+                while let Ok(frame) = recipient.try_recv() {
+                    if let axum::extract::ws::Message::Text(text) = frame {
+                        let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
+                        assert_ne!(
+                            value["params"]["state"], "resolving",
+                            "retirement notification cannot reach a disconnected initiator"
+                        );
+                        assert_ne!(value["params"]["state"], "authorized");
+                    }
+                }
+            }
+            service.shutdown().await;
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_mailbox_accepts_late_delivery_of_the_same_failure_cause() {
+        for unrelated in [false, true] {
+            delayed_recovery_mailbox(true, unrelated, 0).await;
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_mailbox_survives_ack_deadline_and_retires_on_replacement_or_shutdown() {
+        for retire in [0, 1, 2] {
+            delayed_recovery_mailbox(false, false, retire).await;
+        }
+    }
+    async fn delayed_recovery_mailbox(same_cause: bool, unrelated: bool, retire: u8) {
+        let (service, store, workspace) = test_mcp_service().await;
+        let change = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        struct Release(Arc<tokio::sync::Notify>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.notify_waiters();
+                self.0.notify_one();
+            }
+        }
+        let _release = Release(release.clone());
+        let cause = pioneer_mcp::OAuthFailureCause {
+            generation: "manager-A".into(),
+            revision: 7,
+        };
+        let mut error = McpRuntimeError::failed("delayed OAuth failure A");
+        error.kind = McpRuntimeErrorKind::TransientRefresh;
+        error.oauth_failure = Some(cause.clone());
+        let connects = Arc::new(AtomicUsize::new(0));
+        service.set_connector_for_tests(Arc::new(RefreshFailureConnector {
+            connects: connects.clone(),
+            change: change.clone(),
+            unrelated_degradation: unrelated,
+            tool_barrier: Some((entered.clone(), release.clone())),
+            tool_outcome: Some(if same_cause { Err(error) } else { Ok(()) }),
+            provider: None,
+        }));
+        let id = seed_mcp_installation(&store, &workspace, "late-recovery", true, false).await;
+        service.reload_workspace(&workspace).await.unwrap();
+        let expected = if unrelated {
+            DomainRuntimeState::Degraded
+        } else {
+            DomainRuntimeState::Ready
+        };
+        wait_for_runtime_state(&service, &workspace, &id, expected).await;
+        let generation =
+            service.runtime_snapshot("workspace", &workspace).await[&id].runtime_generation;
+        change.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if service.runtime_snapshot("workspace", &workspace).await[&id]
+                    .last_error
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (tx, mailbox) = {
+            let tasks = service.inner.tasks.lock().await;
+            (tasks[&id].call_tx.clone(), tasks[&id].recovery.clone())
+        };
+        let (response_tx, response) = oneshot::channel();
+        tx.send(McpServerCommand::Tool(McpServerCallCommand {
+            request: pioneer_tools::McpToolCallRequest {
+                workspace_id: workspace.clone(),
+                turn_id: "test-turn".into(),
+                call_id: "delayed-tool".into(),
+                callable_name: "send".into(),
+                server_id: id.clone(),
+                server_name: "late-recovery".into(),
+                raw_tool_name: "send".into(),
+                catalog_version: "test".into(),
+                arguments: json!({}),
+                timeout_ms: 120_000,
+                max_arguments_bytes: 1024,
+            },
+            cancellation: CancellationToken::new(),
+            response_tx,
+        }))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        if !same_cause {
+            *service.inner.oauth_recovery_ack_timeout.lock().unwrap() = Duration::from_millis(20);
+        }
+        let scoped = crate::mcp_oauth::maintenance_service(service.inner.clone());
+        let recovery_service = scoped.clone();
+        let recovery_id = id.clone();
+        let mut recovered = Some(tokio::spawn(async move {
+            recovery_service
+                .oauth_recovered_with_admission(
+                    &recovery_id,
+                    None,
+                    None,
+                    if same_cause { Some(cause) } else { None },
+                )
+                .await;
+        }));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if mailbox.pending.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if !same_cause {
+            tokio::time::timeout(Duration::from_secs(1), recovered.take().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                mailbox.pending.lock().unwrap().is_some(),
+                "ack expiry must retain owned recovery"
+            );
+            let admission = tokio::time::timeout(
+                Duration::from_millis(100),
+                service.installation_lifecycle_guard("workspace", &workspace, "late-recovery"),
+            )
+            .await
+            .unwrap();
+            drop(admission);
+        } else {
+            assert!(!recovered.as_ref().unwrap().is_finished());
+        }
+        let stop = if retire != 0 {
+            let service = scoped.clone();
+            let id = id.clone();
+            Some(tokio::spawn(async move {
+                if retire == 2 {
+                    service.shutdown().await;
+                } else {
+                    service.stop_task(&id, DomainRuntimeState::Stopped).await;
+                }
+            }))
+        } else {
+            None
+        };
+        if retire != 0 {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if mailbox.pending.lock().unwrap().is_none() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        release.notify_one();
+        let result = response.await.unwrap();
+        assert_eq!(result.is_err(), same_cause);
+        if let Some(stop) = stop {
+            stop.await.unwrap();
+        } else {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let snapshot =
+                        service.runtime_snapshot("workspace", &workspace).await[&id].clone();
+                    if snapshot.last_error.is_none() {
+                        assert_eq!(snapshot.state, expected);
+                        assert_eq!(snapshot.runtime_generation, generation);
+                        if unrelated {
+                            assert_eq!(
+                                snapshot.status_reason.as_deref(),
+                                Some("unrelated stream limitation")
+                            );
+                        }
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        if let Some(recovered) = recovered {
+            recovered.await.unwrap();
+        }
+        assert!(mailbox.pending.lock().unwrap().is_none());
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+        if retire == 1 {
+            service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+                tools: vec!["send"],
+                fail_auth: false,
+            }));
+            service
+                .restart_server("workspace", &workspace, "late-recovery")
+                .await
+                .unwrap();
+            wait_for_runtime_state(&service, &workspace, &id, DomainRuntimeState::Ready).await;
+            let replacement = service.runtime_snapshot("workspace", &workspace).await[&id].clone();
+            assert!(replacement.runtime_generation > generation);
+            assert!(replacement.last_error.is_none());
+            assert!(mailbox.pending.lock().unwrap().is_none());
+        } else if retire == 2 {
+            assert_eq!(
+                service.runtime_snapshot("workspace", &workspace).await[&id].state,
+                DomainRuntimeState::Stopped
+            );
+        }
+        service.shutdown().await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oauth_recovery_keeps_session_generation_and_unrelated_degraded_reason() {
+        for unrelated in [false, true] {
+            let (service, store, workspace) = test_mcp_service().await;
+            let connects = Arc::new(AtomicUsize::new(0));
+            let change = Arc::new(tokio::sync::Notify::new());
+            service.set_connector_for_tests(Arc::new(RefreshFailureConnector {
+                connects: connects.clone(),
+                change: change.clone(),
+                unrelated_degradation: unrelated,
+                tool_barrier: None,
+                tool_outcome: None,
+                provider: None,
+            }));
+            let id = seed_mcp_installation(&store, &workspace, "oauth-recovery", true, false).await;
+            service.reload_workspace(&workspace).await.unwrap();
+            let original_state = if unrelated {
+                DomainRuntimeState::Degraded
+            } else {
+                DomainRuntimeState::Ready
+            };
+            wait_for_runtime_state(&service, &workspace, &id, original_state).await;
+            let before = service.runtime_snapshot("workspace", &workspace).await[&id].clone();
+            change.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let snapshots = service.runtime_snapshot("workspace", &workspace).await;
+                    if snapshots[&id].last_error.as_deref()
+                        == Some("OAuth token refresh temporarily unavailable")
+                    {
+                        break;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            service.oauth_recovered(&id).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let snapshots = service.runtime_snapshot("workspace", &workspace).await;
+                    let snapshot = &snapshots[&id];
+                    if snapshot.state == original_state && snapshot.last_error.is_none() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let after = service.runtime_snapshot("workspace", &workspace).await[&id].clone();
+            assert_eq!(before.runtime_generation, after.runtime_generation);
+            assert_eq!(connects.load(Ordering::SeqCst), 1);
+            if unrelated {
+                assert_eq!(
+                    after.status_reason.as_deref(),
+                    Some("unrelated stream limitation")
+                );
+            }
+            // Repeated/ordinary successful refresh is a no-op for this actor.
+            service.oauth_recovered(&id).await;
+            assert_eq!(connects.load(Ordering::SeqCst), 1);
+            service.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oauth_loss_event_stops_live_runtime_and_disconnect_preserves_installation() {
+        use pioneer_mcp::McpOAuthProvider;
+        let (service, crud_store, workspace_id) = test_mcp_service().await;
+        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+            tools: vec!["send"],
+            fail_auth: false,
+        }));
+        let id = seed_mcp_installation(&crud_store, &workspace_id, "oauth-test", true, false).await;
+        let mut row = crud_store
+            .find_mcp_server_installation("workspace", &workspace_id, "oauth-test")
+            .await
+            .unwrap()
+            .unwrap();
+        row.transport_kind = "streamable_http".into();
+        row.transport_json = serde_json::to_string(&McpTransportConfig::StreamableHttp {
+            url: "http://127.0.0.1:1/mcp".into(),
+            headers: BTreeMap::new(),
+            startup_timeout_ms: 500,
+            tool_timeout_ms: 500,
+        })
+        .unwrap();
+        crud_store
+            .upsert_mcp_server_installation(&row, 1_700_000_001)
+            .await
+            .unwrap();
+        service.reload_workspace(&workspace_id).await.unwrap();
+        wait_for_runtime_state(&service, &workspace_id, &id, DomainRuntimeState::Ready).await;
+        assert!(service.task_exists(&id).await);
+        // The OAuth service emits through the production Gateway adapter. There
+        // is no browser intent at startup and the fake MCP connector uses no network.
+        service.oauth().authorization_lost(&id).await;
+        wait_for_runtime_state(
+            &service,
+            &workspace_id,
+            &id,
+            DomainRuntimeState::AuthRequired,
+        )
+        .await;
+        assert!(!service.task_exists(&id).await);
+        service.oauth().disconnect(&id).await.unwrap();
+        service.stop_oauth_connection(&row).await;
+        assert!(
+            crud_store
+                .find_mcp_server_installation("workspace", &workspace_id, "oauth-test")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(!service.task_exists(&id).await);
+        service.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

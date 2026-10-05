@@ -828,7 +828,17 @@ mod tests {
         );
         assert!(core.gateway_session().session("endpoint").is_none());
         drop(core);
-        assert!(weak.upgrade().is_none());
+        // Shutdown signals workers to stop; an in-flight Weak upgrade may still
+        // own the core until its worker exits. Observe without acquiring another
+        // strong reference, and keep the wait bounded so leaks still fail.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while weak.strong_count() != 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "process workers retained ClientCore after shutdown"
+        );
     }
 }
 

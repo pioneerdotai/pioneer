@@ -632,6 +632,7 @@ fn hook_tool_names_to_strings(tool_names: &[HookToolName]) -> Vec<&str> {
 #[derive(Default)]
 struct TestMemoryWriteProvider {
     manifest_calls: Arc<Mutex<usize>>,
+    manifest_failures: Mutex<std::collections::VecDeque<crate::MemoryManifestFailure>>,
     write_calls: Arc<Mutex<usize>>,
     write_params: Arc<Mutex<Vec<MemorySemanticWriteParams>>>,
     write_contexts: Arc<Mutex<Vec<MemoryTurnContext>>>,
@@ -672,11 +673,14 @@ impl AgentMemoryWriteProvider for TestMemoryWriteProvider {
         &self,
         _context: MemoryTurnContext,
         _request: MemoryManifestRequest,
-    ) -> Result<MemoryManifest, String> {
+    ) -> Result<MemoryManifest, crate::MemoryManifestFailure> {
         *self
             .manifest_calls
             .lock()
             .expect("manifest call lock poisoned") += 1;
+        if let Some(failure) = self.manifest_failures.lock().unwrap().pop_front() {
+            return Err(failure);
+        }
         Ok(MemoryManifest::default())
     }
 

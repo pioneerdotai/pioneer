@@ -1749,3 +1749,7 @@ reason_updated = "Ein Skill wurde aktualisiert."
 reason_rolled_back = "Eine frühere Skill-Version wurde wiederhergestellt."
 reason_cancelled = "Der Lauf wurde abgebrochen."
 reason_unknown = "Der Vorgang wurde nicht wie erwartet abgeschlossen. Gateway-Protokolle prüfen."
+
+[mcp.oauth]
+callback_received = "Antwort angenommen. Prüfen Sie das Anmeldeergebnis in Pioneer."
+callback_rejected = "Anmeldung abgelehnt. Kehren Sie zu Pioneer zurück und melden Sie sich erneut an."
