@@ -1185,6 +1185,8 @@ async fn cli_native_terminal_source_write_preserves_first_outcome_and_rolls_back
 async fn cli_native_terminal_source_write_rejects_owner_aba_even_with_same_binding_and_timestamp() {
     let (store, _, event) = native_delivery_fixture().await;
     let timestamp = event.created_at;
+    // A live lease makes rejection depend on the generation, not expiration.
+    let lease_until = chrono::Utc::now().fixed_offset() + chrono::Duration::hours(1);
     let db = store.database_connection();
     let owner = crate::repositories::turn_execution::insert_immutable(
         &db,
@@ -1194,9 +1196,9 @@ async fn cli_native_terminal_source_write_rejects_owner_aba_even_with_same_bindi
             workspace_id: event.workspace_id.clone().unwrap(),
             executor_kind: crate::TurnExecutorKind::CliRuntime,
             executor_key: Some("codex".into()),
-            status: crate::TurnExecutionStatus::Blocked,
+            status: crate::TurnExecutionStatus::Starting,
             owner_id: "native-delivery-owner".into(),
-            lease_until: timestamp,
+            lease_until,
             created_at: timestamp,
         },
     )
@@ -1213,15 +1215,32 @@ async fn cli_native_terminal_source_write_rejects_owner_aba_even_with_same_bindi
         .unwrap()
         .unwrap();
     assert!(
+        crate::repositories::turn_execution::mark_terminal(
+            &db,
+            &owner.turn_id,
+            crate::TurnExecutionStatus::Blocked,
+            timestamp,
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
         crate::repositories::turn_execution::reacquire_blocked(
             &db,
             &owner.turn_id,
             &owner.owner_id,
             timestamp,
-            timestamp
+            lease_until
         )
         .await
         .unwrap()
+    );
+    let mut resumed_owner = owner.clone();
+    resumed_owner.owner_generation += 1;
+    assert_eq!(
+        store.get_turn_execution(&owner.turn_id).await.unwrap(),
+        Some(resumed_owner),
+        "only the owner generation changes across the ABA transition"
     );
     assert!(
         !store
@@ -1252,6 +1271,18 @@ async fn cli_native_terminal_source_write_rejects_owner_aba_even_with_same_bindi
             .unwrap()
             .status
             .is_active()
+    );
+    let fresh_source = store
+        .cli_runtime_terminal_event_source(&binding, "native-delivery-A")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .persist_cli_runtime_terminal_event(event, &fresh_source, "native-delivery-owner")
+            .await
+            .unwrap(),
+        "the current generation can still persist its outcome"
     );
 }
 
