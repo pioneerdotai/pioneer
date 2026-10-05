@@ -5495,6 +5495,8 @@ async fn execute_agent_provider_response(
                                 item_id: current_thinking_id.clone(),
                                 item_type: TurnItemType::Reasoning,
                                 failure: ProviderFailureDetails {
+                                    error_reason: None,
+                                    request_id: None,
                                     provider: provider.name().to_owned(),
                                     model: model.clone(),
                                     transport: if provider.capabilities().streaming
@@ -7063,6 +7065,204 @@ mod tests {
             assert!(!lowered.contains("codex"));
             assert!(!lowered.contains("proposal"));
             assert!(!lowered.contains("wire shape"));
+        }
+    }
+
+    #[tokio::test]
+    async fn glm_profiles_preserve_runtime_file_catalog_and_prompt_projection() {
+        use pioneer_provider::{NativePatchWireShape, ProviderRegistry};
+        let registry = ProviderRegistry::new(|_| "dummy-key".to_owned());
+        let model = "glm-5.2";
+        let file_tools = vec!["read_file".to_owned(), "apply_patch".to_owned()];
+        for alias in [
+            "glm",
+            "zhipu",
+            "bigmodel",
+            "glm-cn",
+            "zhipu-cn",
+            "zai",
+            "glm-global",
+            "zhipu-global",
+            "z.ai",
+            "z-ai",
+            "glm-coding",
+            "glm-coding-cn",
+            "zhipu-coding",
+            "zai-coding-cn",
+            "zai-coding",
+            "glm-coding-global",
+            "zai-coding-plan",
+        ] {
+            let provider = registry
+                .get_or_create_for_workspace("fixture", alias)
+                .unwrap();
+            assert!(provider.capabilities().tool_calling);
+            // Obtain the same provider-owned decision as the real turn, rather
+            // than reproducing the capability family's allowlist in the test.
+            let capability = provider.native_file_tool_capability(model);
+            assert_eq!(capability.provider, provider.name());
+            assert_eq!(capability.patch_shape, NativePatchWireShape::JsonFunction);
+            assert!(super::native_file_tool_blocked_names(&capability).is_empty());
+            let snapshot = test_full_access_security_snapshot();
+            let built = pioneer_tools::build_builtin_tools_with_security_snapshot(
+                ".",
+                "turn_glm_file_tools",
+                pioneer_tools::PermissionEvaluationContext::for_turn(
+                    "fixture",
+                    "thread",
+                    "turn_glm_file_tools",
+                    snapshot.permission_profile.clone(),
+                ),
+                test_web_config(),
+                test_computer_use_config(),
+                Some(snapshot.clone()),
+            );
+            built
+                .router
+                .set_blocked_tool_names(super::native_file_tool_blocked_names(&capability));
+            built
+                .router
+                .set_native_patch_wire_shape(capability.patch_shape);
+            let visibility = built
+                .router
+                .compute_final_visible_tools(&file_tools, &[], &[]);
+            for name in &file_tools {
+                assert!(visibility.visible_tools.contains(name), "{alias}/{name}");
+                assert!(
+                    built
+                        .router
+                        .preflight_tool_index()
+                        .core_tools
+                        .contains(name)
+                );
+            }
+            built
+                .router
+                .set_model_visible_tools(&visibility.visible_tools)
+                .await;
+            let visible = built.router.model_visible_specs().await;
+            for name in &file_tools {
+                let spec = visible.iter().find(|spec| spec.name == *name).unwrap();
+                let definition = native_provider_tool_definition(spec.clone(), &capability);
+                assert_eq!(definition.name, *name);
+                if name == "apply_patch" {
+                    assert_eq!(definition.parameters["type"], "object");
+                    assert_eq!(
+                        definition.parameters["required"],
+                        serde_json::json!(["patch"])
+                    );
+                    assert_eq!(
+                        definition.parameters["properties"]["patch"]["type"],
+                        "string"
+                    );
+                }
+            }
+            for (name, arguments) in [
+                ("read_file", serde_json::json!({"path":"fixture.txt"})),
+                (
+                    "apply_patch",
+                    serde_json::json!({"patch":"*** Begin Patch\n*** Add File: fixture.txt\n+dummy\n*** End Patch"}),
+                ),
+            ] {
+                // Parsing/catalog acceptance only: no handler or filesystem
+                // write is invoked, even when this test is eventually run.
+                let call = built
+                    .router
+                    .build_model_tool_call(pioneer_tools::RawToolCall {
+                        call_id: "dummy-call".into(),
+                        tool_name: name.into(),
+                        arguments: arguments.to_string(),
+                    })
+                    .await;
+                let call = call.unwrap_or_else(|error| panic!("{alias}/{name}: {error}"));
+                let invocation = pioneer_tools::ToolInvocation {
+                    call_id: call.call_id,
+                    tool_name: call.tool_name,
+                    source: pioneer_tools::ToolCallSource::Model,
+                    payload: call.payload,
+                    workdir: std::path::PathBuf::from("."),
+                    environment: BTreeMap::new(),
+                    attempt_id: 1,
+                    idempotency_key: call.idempotency_key,
+                    recovery: call.recovery,
+                    permission_metadata: call.permission_metadata,
+                    execution_security_snapshot: Some(snapshot.clone()),
+                    apply_patch_preflight: None,
+                    cancellation: tokio_util::sync::CancellationToken::new(),
+                };
+                // Exercise the existing permission evaluator without executing
+                // a file handler or constructing a second capability decision.
+                let intent = pioneer_tools::PermissionIntent::new(
+                    if name == "read_file" {
+                        pioneer_tools::PermissionActionKind::FileRead
+                    } else {
+                        pioneer_tools::PermissionActionKind::FileWrite
+                    },
+                    pioneer_tools::PermissionRequestScope::empty(),
+                );
+                let mut context = pioneer_tools::PermissionEvaluationContext::for_turn(
+                    "fixture",
+                    "thread",
+                    "turn_glm_file_tools",
+                    snapshot.permission_profile.clone(),
+                );
+                use pioneer_tools::ToolPermissionEvaluator;
+                assert!(matches!(
+                    pioneer_tools::ProfileToolPermissionEvaluator.evaluate(
+                        &context,
+                        &invocation,
+                        &intent
+                    ),
+                    pioneer_tools::PermissionDecision::Allow { .. }
+                ));
+                context.permission_profile.effective_policy.denied_tools = vec![name.to_owned()];
+                assert!(matches!(
+                    pioneer_tools::ProfileToolPermissionEvaluator.evaluate(
+                        &context,
+                        &invocation,
+                        &intent
+                    ),
+                    pioneer_tools::PermissionDecision::Deny { .. }
+                ));
+            }
+            let sections = append_native_filesystem_capability_section(
+                Vec::new(),
+                &capability,
+                Some(&snapshot),
+            )
+            .unwrap();
+            let content = &sections.last().unwrap().content;
+            assert!(content.contains("`read_file`"));
+            assert!(content.contains("`apply_patch`"));
+            assert!(content.contains("exactly one JSON field named `patch`"));
+            assert!(!content.contains("not available"));
+            // Additional policy/catalog blocks still outrank provider support.
+            built
+                .router
+                .set_blocked_tool_names([("apply_patch".to_owned(), "policy denied".to_owned())]);
+            let blocked = built
+                .router
+                .compute_final_visible_tools(&file_tools, &[], &file_tools);
+            assert!(blocked.visible_tools.contains(&"read_file".to_owned()));
+            assert!(!blocked.visible_tools.contains(&"apply_patch".to_owned()));
+            for missing in ["", "unknown", "unsupported"] {
+                let unavailable = provider.native_file_tool_capability(missing);
+                built
+                    .router
+                    .set_blocked_tool_names(super::native_file_tool_blocked_names(&unavailable));
+                let blocked =
+                    built
+                        .router
+                        .compute_final_visible_tools(&file_tools, &[], &file_tools);
+                assert!(blocked.visible_tools.is_empty());
+                let sections = append_native_filesystem_capability_section(
+                    Vec::new(),
+                    &unavailable,
+                    Some(&snapshot),
+                )
+                .unwrap();
+                assert!(sections.last().unwrap().content.contains("not available"));
+            }
         }
     }
 

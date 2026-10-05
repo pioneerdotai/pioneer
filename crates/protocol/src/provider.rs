@@ -27,6 +27,9 @@ pub struct ProviderDefinition {
     pub default_base_url: Option<String>,
     #[serde(default)]
     pub supports_base_url_override: bool,
+    /// Terminal product lifecycle diagnostic; old clients can ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

@@ -25,6 +25,19 @@ const ID_LEN: usize = 21;
 pub const TASK_EXECUTION_LEASE_SECONDS: i64 = 300;
 const TASK_SCHEDULER_MAX_SLEEP_SECONDS: u64 = 60;
 
+/// Only schedule calculation failures can quarantine a Task. Storage and
+/// dispatch failures must retain their existing retry/recovery behavior.
+#[derive(Debug)]
+struct TriggerScheduleError(anyhow::Error);
+
+impl std::fmt::Display for TriggerScheduleError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for TriggerScheduleError {}
+
 #[derive(Clone)]
 pub struct TaskSchedulerHandle {
     notify: Arc<Notify>,
@@ -131,7 +144,19 @@ impl TaskScheduler {
         let due = self.store.list_due_active_task_triggers(now).await?;
         let mut created = 0usize;
         for trigger in due {
-            created = created.saturating_add(self.process_trigger(trigger, now).await?);
+            match self.process_trigger(trigger.clone(), now).await {
+                Ok(count) => created = created.saturating_add(count),
+                Err(error) if error.downcast_ref::<TriggerScheduleError>().is_some() => {
+                    self.block_task_for_trigger_failure(
+                        &trigger,
+                        now,
+                        "task_trigger_schedule_invalid",
+                        &error,
+                    )
+                    .await?;
+                }
+                Err(error) => return Err(error),
+            }
         }
         for run in self.store.list_due_retry_task_runs(now, 1024).await? {
             if self.process_retry_run(run, now).await? {
@@ -181,8 +206,13 @@ impl TaskScheduler {
             Ok(None) => {
                 let error =
                     anyhow::anyhow!("Task `{}` has no durable actor contract", trigger.task_id);
-                self.block_task_for_trigger_failure(trigger, now, &error)
-                    .await?;
+                self.block_task_for_trigger_failure(
+                    trigger,
+                    now,
+                    "task_actor_contract_invalid",
+                    &error,
+                )
+                .await?;
                 Ok(None)
             }
             Err(error) if is_transient_scheduler_storage_error(&error) => Err(error),
@@ -192,8 +222,13 @@ impl TaskScheduler {
                 // immutable row therefore belongs to this Task and can be
                 // isolated without changing the retry semantics of later
                 // storage or dispatch failures.
-                self.block_task_for_trigger_failure(trigger, now, &error)
-                    .await?;
+                self.block_task_for_trigger_failure(
+                    trigger,
+                    now,
+                    "task_actor_contract_invalid",
+                    &error,
+                )
+                .await?;
                 Ok(None)
             }
         }
@@ -203,6 +238,7 @@ impl TaskScheduler {
         &self,
         trigger: &TaskTrigger,
         now: i64,
+        error_code: &str,
         error: &anyhow::Error,
     ) -> TaskRuntimeResult<()> {
         let message = format!("{error:#}");
@@ -211,22 +247,15 @@ impl TaskScheduler {
         };
         let appended = match self
             .store
-            .append_due_trigger_task_events(
-                trigger.id.as_str(),
-                expected_next_fire_at,
+            .block_task_for_due_trigger_failure(
+                trigger,
+                task_error(
+                    error_code,
+                    message.clone(),
+                    TaskErrorClass::Validation,
+                    None,
+                ),
                 now,
-                vec![TaskEventPayload::TaskBlocked {
-                    task_id: trigger.task_id.clone(),
-                    error: Some(task_error(
-                        "task_actor_contract_invalid",
-                        message.clone(),
-                        TaskErrorClass::Validation,
-                        None,
-                    )),
-                    blocked_at: now,
-                }],
-                Vec::new(),
-                Vec::new(),
             )
             .await
         {
@@ -268,9 +297,9 @@ impl TaskScheduler {
         };
         if appended.is_empty() {
             // The same transaction that appends TaskBlocked also verifies the
-            // original due timestamp. If another actor already advanced or
-            // replaced the trigger, that newer state wins and must not be
-            // overwritten by this stale failure.
+            // original due timestamp and schedule. If another actor already
+            // repaired or replaced the trigger, that newer state wins and
+            // must not be overwritten by this stale failure.
             debug!(
                 task_id = %trigger.task_id,
                 trigger_id = %trigger.id,
@@ -419,7 +448,8 @@ impl TaskScheduler {
                 .await;
         }
 
-        let catch_up = TaskTriggerCalculator::catch_up_plan(&trigger, now)?;
+        let catch_up =
+            TaskTriggerCalculator::catch_up_plan(&trigger, now).map_err(TriggerScheduleError)?;
         let available_run_slots = max_parallel_runs.saturating_sub(active_run_count).max(1);
         let planned_fire_count = catch_up.fire_times.len();
         let mut fire_times = catch_up.fire_times;
@@ -431,7 +461,8 @@ impl TaskScheduler {
         updated_trigger.updated_at = now;
         if fire_times.len() < planned_fire_count {
             updated_trigger.next_fire_at = match fire_times.last().copied() {
-                Some(fire_at) => TaskTriggerCalculator::next_after_fire(&trigger, fire_at)?,
+                Some(fire_at) => TaskTriggerCalculator::next_after_fire(&trigger, fire_at)
+                    .map_err(TriggerScheduleError)?,
                 None => catch_up.next_fire_at,
             };
             updated_trigger.status = TaskTriggerStatus::Active;
@@ -574,7 +605,8 @@ impl TaskScheduler {
             // be duplicated.  Still consume this due fire, otherwise every
             // scheduler pass observes the same timestamp forever and the
             // trigger can never move past an occupied serial slot.
-            let catch_up = TaskTriggerCalculator::catch_up_plan(&trigger, now)?;
+            let catch_up = TaskTriggerCalculator::catch_up_plan(&trigger, now)
+                .map_err(TriggerScheduleError)?;
             let mut updated_trigger = trigger.clone();
             updated_trigger.last_fire_at = catch_up.last_fire_at;
             updated_trigger.updated_at = now;
@@ -642,7 +674,8 @@ impl TaskScheduler {
         updated_trigger.updated_at = now;
         if is_recurring(&trigger) {
             updated_trigger.next_fire_at =
-                TaskTriggerCalculator::next_after_fire(&trigger, expected_next_fire_at)?;
+                TaskTriggerCalculator::next_after_fire(&trigger, expected_next_fire_at)
+                    .map_err(TriggerScheduleError)?;
             updated_trigger.status = TaskTriggerStatus::Active;
         } else {
             updated_trigger.next_fire_at = None;
@@ -880,20 +913,10 @@ async fn dispatch_run_to_executor(
             );
             handle.fail_run(Some(error), now).await?;
         }
-        Err(error) => {
-            error!(
-                run_id = run.id,
-                error = %format!("{error:#}"),
-                failure_class = "task_executor_start_failed",
-                "task executor failed to start run"
-            );
+        Err(mut error) => {
+            let descriptor = crate::TaskStartFailure::report_for_scheduler(&mut error);
             let now = now_timestamp_secs();
-            let task_error = task_error(
-                "task_executor_start_failed",
-                format!("{error:#}"),
-                TaskErrorClass::Internal,
-                Some(run.id.clone()),
-            );
+            let task_error = descriptor.task_error(Some(run.id.clone()));
             handle.fail_run(Some(task_error), now).await?;
         }
     }

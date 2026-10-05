@@ -2706,6 +2706,8 @@ pub struct PublicTaskResult {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicTaskFailure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_diagnostic: Option<crate::RecoveryDiagnostic>,
     pub class: TaskErrorClass,
     pub error: crate::PublicError,
 }

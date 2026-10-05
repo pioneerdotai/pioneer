@@ -926,6 +926,17 @@ mod publication_tests {
         crate::ClientFfiRuntime,
         Vec<pioneer_client::core::ClientSubscription>,
     ) {
+        shared_message_fixture_with_thread_model(workers, "model", "provider")
+    }
+    fn shared_message_fixture_with_thread_model(
+        workers: bool,
+        model: &str,
+        provider: &str,
+    ) -> (
+        std::sync::Arc<ClientCore>,
+        crate::ClientFfiRuntime,
+        Vec<pioneer_client::core::ClientSubscription>,
+    ) {
         use pioneer_protocol::*;
         let auth = AuthMeResponse {
             gateway: AuthGatewaySnapshot {
@@ -977,8 +988,8 @@ mod publication_tests {
                 preview: String::new(),
                 preview_author: None,
                 mode: ThreadMode::Chat,
-                model: "model".into(),
-                model_provider: "provider".into(),
+                model: model.into(),
+                model_provider: provider.into(),
                 reasoning_effort: None,
                 created_at: 1,
                 updated_at: 2,
@@ -1054,7 +1065,9 @@ mod publication_tests {
             turns::cancellation::*,
         };
         use pioneer_protocol::*;
-        let (direct, ffi, _leases) = shared_message_fixture();
+        // Keep real workers for cancellation, but no unrelated model default
+        // for the model-display workers to infer at different times.
+        let (direct, ffi, _leases) = shared_message_fixture_with_thread_model(true, "", "");
         let authority = ClientMutationAuthority::for_test();
         let resources = AuthorizationOperationalResourceProjection {
             providers: AuthorizationResourceSelector {
@@ -1123,6 +1136,11 @@ mod publication_tests {
             });
         }
 
+        let composer_before = direct.composer_snapshot("a").unwrap();
+        assert_eq!(
+            Some(composer_before.clone()),
+            ffi.core.composer_snapshot("a")
+        );
         for core in [&direct, &ffi.core] {
             let mut source = core.existing_thread_mutation("a").unwrap();
             source
@@ -1185,6 +1203,7 @@ mod publication_tests {
                 direct.composer_snapshot("a"),
                 ffi.core.composer_snapshot("a")
             );
+            assert_eq!(direct.composer_snapshot("a"), Some(composer_before.clone()));
             assert_eq!(
                 direct
                     .thread_coordinator_snapshot("a")

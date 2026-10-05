@@ -3012,7 +3012,68 @@ impl Default for GatewayAuthConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DesktopConfig {
+    #[serde(default)]
+    pub mcp_oauth: DesktopMcpOAuthConfig,
     pub gateway: GatewayRuntimeConfig,
+}
+
+/// Device-local callback port, independent of the selected Gateway.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DesktopMcpOAuthConfig {
+    #[serde(deserialize_with = "deserialize_mcp_oauth_callback_port")]
+    pub callback_port: std::num::NonZeroU16,
+}
+
+/// Classifies only deserialization errors at the callback-port key. File parse,
+/// I/O and unrelated AppConfig errors remain general configuration failures.
+pub fn is_mcp_oauth_callback_port_error(error: &ConfigError) -> bool {
+    match error {
+        ConfigError::At { key, .. } | ConfigError::Type { key, .. } => {
+            key.as_deref() == Some("desktop.mcp_oauth.callback_port")
+        }
+        _ => false,
+    }
+}
+
+fn deserialize_mcp_oauth_callback_port<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<std::num::NonZeroU16, D::Error> {
+    struct PortVisitor;
+    impl<'de> serde::de::Visitor<'de> for PortVisitor {
+        type Value = std::num::NonZeroU16;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("desktop.mcp_oauth.callback_port: integer from 1 to 65535, excluding HTTP default port 80")
+        }
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+            u16::try_from(value)
+                .ok()
+                .filter(|port| *port != 80)
+                .and_then(std::num::NonZeroU16::new)
+                .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Unsigned(value), &self))
+        }
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+            match u64::try_from(value) {
+                Ok(value) => self.visit_u64(value),
+                Err(_) => Err(E::invalid_value(
+                    serde::de::Unexpected::Signed(value),
+                    &self,
+                )),
+            }
+        }
+    }
+    // deserialize_any avoids config's numeric coercion of booleans/floats/strings.
+    // URL normalization strips :80; the existing redirect contract requires an
+    // explicit non-default port. Reject it instead of producing an unusable URI.
+    deserializer.deserialize_any(PortVisitor)
+}
+
+impl Default for DesktopMcpOAuthConfig {
+    fn default() -> Self {
+        Self {
+            callback_port: std::num::NonZeroU16::new(37643).unwrap(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3312,22 +3373,27 @@ pub fn save_install_state(path: &Path, state: &InstallState) -> Result<()> {
 }
 
 fn config_override_candidates() -> Vec<PathBuf> {
+    ordered_config_overrides(
+        cfg!(debug_assertions),
+        workspace_local_config_path(),
+        user_override_config_path(),
+        std::env::var_os("PIONEER_CONFIG").map(PathBuf::from),
+    )
+}
+
+fn ordered_config_overrides(
+    debug: bool,
+    workspace: PathBuf,
+    user: Option<PathBuf>,
+    explicit: Option<PathBuf>,
+) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-
-    // Workspace-local override is for developer workflow only.
-    // Production builds should not pick up repository-local config/local.toml.
-    if cfg!(debug_assertions) {
-        candidates.push(workspace_local_config_path());
+    // Repository-local configuration is only a developer override.
+    if debug {
+        candidates.push(workspace);
     }
-
-    if let Some(path) = user_override_config_path() {
-        candidates.push(path);
-    }
-
-    if let Some(path) = std::env::var_os("PIONEER_CONFIG").map(PathBuf::from) {
-        candidates.push(path);
-    }
-
+    candidates.extend(user);
+    candidates.extend(explicit);
     candidates
 }
 
@@ -5107,6 +5173,166 @@ token_refresh_leeway_seconds = 300
         config.device_activation_code_ttl_seconds = 600;
         config.jwt_issuer.clear();
         assert!(config.validate_session_security().is_err());
+    }
+
+    #[test]
+    fn mcp_oauth_callback_config_defaults_and_rejects_invalid_ports() {
+        let config = load_config_from_sources(DEFAULT_CONFIG_TOML, vec![]).unwrap();
+        assert_eq!(config.desktop.mcp_oauth.callback_port.get(), 37643);
+        let legacy =
+            DEFAULT_CONFIG_TOML.replace("[desktop.mcp_oauth]\ncallback_port = 37643\n\n", "");
+        assert_eq!(
+            load_config_from_sources(&legacy, vec![])
+                .unwrap()
+                .desktop
+                .mcp_oauth
+                .callback_port
+                .get(),
+            37643
+        );
+        assert_eq!(
+            toml::from_str::<super::DesktopMcpOAuthConfig>("")
+                .unwrap()
+                .callback_port
+                .get(),
+            37643
+        );
+        for value in [
+            "0",
+            "80",
+            "65536",
+            "-1",
+            "1.5",
+            "true",
+            "'invalid'",
+            "'37644'",
+        ] {
+            assert!(
+                toml::from_str::<super::DesktopMcpOAuthConfig>(&format!("callback_port = {value}"))
+                    .is_err(),
+                "accepted {value}"
+            );
+            let path = unique_temp_file_path("invalid-oauth-port");
+            write_file(
+                &path,
+                &format!("[desktop.mcp_oauth]\ncallback_port = {value}\n"),
+            );
+            let error =
+                load_config_from_sources(DEFAULT_CONFIG_TOML, vec![path.clone()]).unwrap_err();
+            assert!(error.to_string().contains("callback_port"));
+            assert!(super::is_mcp_oauth_callback_port_error(&error));
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn mcp_oauth_callback_config_classification_excludes_unrelated_errors() {
+        for content in [
+            "[gateway]\nlisten_addr = []",
+            "[desktop.mcp_oauth",
+            "[desktop]\ngateway = false",
+        ] {
+            let path = unique_temp_file_path("general-config-error");
+            write_file(&path, content);
+            let error =
+                load_config_from_sources(DEFAULT_CONFIG_TOML, vec![path.clone()]).unwrap_err();
+            assert!(!super::is_mcp_oauth_callback_port_error(&error));
+            fs::remove_file(path).unwrap();
+        }
+        let path = unique_temp_file_path("callback-config-repair");
+        write_file(&path, "[desktop.mcp_oauth]\ncallback_port = 0");
+        assert!(super::is_mcp_oauth_callback_port_error(
+            &load_config_from_sources(DEFAULT_CONFIG_TOML, vec![path.clone()]).unwrap_err()
+        ));
+        write_file(&path, "[desktop.mcp_oauth]\ncallback_port = 37644");
+        assert_eq!(
+            load_config_from_sources(DEFAULT_CONFIG_TOML, vec![path.clone()])
+                .unwrap()
+                .desktop
+                .mcp_oauth
+                .callback_port
+                .get(),
+            37644
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mcp_oauth_callback_config_override_priority_and_production_exclusion() {
+        let paths: Vec<_> = (0..3)
+            .map(|_| unique_temp_file_path("oauth-port"))
+            .collect();
+        for (path, port) in paths.iter().zip([37644, 37645, 37646]) {
+            write_file(
+                path,
+                &format!("[desktop.mcp_oauth]\ncallback_port = {port}\n"),
+            );
+        }
+        for (user, explicit, expected) in [
+            (false, false, 37644),
+            (true, false, 37645),
+            (true, true, 37646),
+        ] {
+            let sources = super::ordered_config_overrides(
+                true,
+                paths[0].clone(),
+                user.then(|| paths[1].clone()),
+                explicit.then(|| paths[2].clone()),
+            );
+            assert_eq!(
+                load_config_from_sources(DEFAULT_CONFIG_TOML, sources)
+                    .unwrap()
+                    .desktop
+                    .mcp_oauth
+                    .callback_port
+                    .get(),
+                expected
+            );
+        }
+        let production = super::ordered_config_overrides(false, paths[0].clone(), None, None);
+        assert!(production.is_empty());
+        assert_eq!(
+            load_config_from_sources(DEFAULT_CONFIG_TOML, production)
+                .unwrap()
+                .desktop
+                .mcp_oauth
+                .callback_port
+                .get(),
+            37643
+        );
+        let production = super::ordered_config_overrides(
+            false,
+            paths[0].clone(),
+            Some(paths[1].clone()),
+            Some(paths[2].clone()),
+        );
+        assert_eq!(production, paths[1..].to_vec());
+        assert_eq!(
+            load_config_from_sources(DEFAULT_CONFIG_TOML, production)
+                .unwrap()
+                .desktop
+                .mcp_oauth
+                .callback_port
+                .get(),
+            37646
+        );
+        // An explicit PIONEER_CONFIG selection is still honored in production,
+        // even when it selects the otherwise excluded workspace override.
+        let explicit_workspace =
+            super::ordered_config_overrides(false, paths[0].clone(), None, Some(paths[0].clone()));
+        assert_eq!(explicit_workspace, vec![paths[0].clone()]);
+        assert_eq!(
+            load_config_from_sources(DEFAULT_CONFIG_TOML, explicit_workspace)
+                .unwrap()
+                .desktop
+                .mcp_oauth
+                .callback_port
+                .get(),
+            37644
+        );
+        for path in paths {
+            fs::remove_file(path).unwrap();
+        }
     }
 
     fn write_file(path: &PathBuf, content: &str) {

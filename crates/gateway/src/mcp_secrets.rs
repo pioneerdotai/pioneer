@@ -8,6 +8,9 @@ use crate::secrets::{GatewaySecrets, McpSecretDeleteFailure};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct McpSecretGarbageCollectionReport {
+    pub oauth_stored: usize,
+    pub oauth_orphans: usize,
+    pub oauth_deleted: usize,
     pub active_refs: usize,
     pub stored_refs: usize,
     pub orphan_refs: usize,
@@ -38,6 +41,37 @@ pub(crate) async fn garbage_collection_orphan_mcp_secrets(
         active_refs.extend(refs.into_iter().map(|secret_ref| secret_ref.ref_id));
     }
 
+    // OAuth registrations live in their own namespace. Re-read installation IDs
+    // after enumerating secrets, so a concurrently completed install is retained.
+    let oauth = gateway_secrets.mcp_oauth_persistence();
+    let oauth_ids = oauth
+        .ids()
+        .await
+        .map_err(|_| anyhow::anyhow!("OAuth secret enumeration failed"))?;
+    let oauth_stored = oauth_ids.len();
+    let mut oauth_orphans = 0;
+    let mut oauth_deleted = 0;
+    if !oauth_ids.is_empty() {
+        let active_ids = crud_store
+            .list_all_mcp_server_installations()
+            .await?
+            .into_iter()
+            .filter_map(|row| row.id)
+            .collect::<std::collections::HashSet<_>>();
+        for id in oauth_ids {
+            if !active_ids.contains(&id) {
+                oauth_orphans += 1;
+                if !dry_run {
+                    oauth
+                        .delete(&id)
+                        .await
+                        .map_err(|_| anyhow::anyhow!("OAuth orphan cleanup failed"))?;
+                    oauth_deleted += 1;
+                }
+            }
+        }
+    }
+
     let stored_refs = gateway_secrets
         .list_mcp_secret_refs()
         .context("failed to list stored MCP secret refs for GC")?
@@ -57,6 +91,9 @@ pub(crate) async fn garbage_collection_orphan_mcp_secrets(
     };
 
     Ok(McpSecretGarbageCollectionReport {
+        oauth_stored,
+        oauth_orphans,
+        oauth_deleted,
         active_refs: active_refs.len(),
         stored_refs: stored_refs.len(),
         orphan_refs: orphan_refs.len(),
@@ -73,6 +110,55 @@ mod tests {
     use pioneer_keystore::{MemorySecretStore, SecretId, SecretKind, SecretMeta, SecretStore};
     use sea_orm::Database;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn oauth_gc_keeps_active_registration_and_deletes_only_orphans_after_restart() {
+        let (store, secrets) = setup_gc().await;
+        seed_installation(&store, "native", vec![]).await;
+        let id = store
+            .find_mcp_server_installation("workspace", "ws_gc", "native")
+            .await
+            .unwrap()
+            .unwrap()
+            .id
+            .unwrap();
+        let persistence = secrets.mcp_oauth_persistence();
+        let registration = pioneer_mcp_oauth::Registration {
+            token_endpoint_auth_method: None,
+            client_id: "client".into(),
+            client_secret: Some("secret-canary".into()),
+            redirect_uri: "http://127.0.0.1:37643/oauth/mcp/callback".into(),
+            scopes: vec![],
+            application_type: None,
+            registration_request: None,
+            registration_response: None,
+        };
+        let record = pioneer_mcp_oauth::AuthorizationRecord {
+            identity: "hash".into(),
+            resource: "https://resource.test/mcp".into(),
+            issuer: "https://issuer.test".into(),
+            registration,
+            credentials: None,
+            pending_consent: None,
+        };
+        persistence.write(&id, record.clone()).await.unwrap();
+        persistence.write("orphan", record).await.unwrap();
+        let dry = garbage_collection_orphan_mcp_secrets(&store, &secrets, true)
+            .await
+            .unwrap();
+        assert_eq!(dry.oauth_orphans, 1);
+        assert_eq!(dry.oauth_deleted, 0);
+        let applied = garbage_collection_orphan_mcp_secrets(&store, &secrets, false)
+            .await
+            .unwrap();
+        assert_eq!(applied.oauth_deleted, 1);
+        assert!(persistence.read(&id).await.unwrap().is_some());
+        assert!(persistence.read("orphan").await.unwrap().is_none());
+        let again = garbage_collection_orphan_mcp_secrets(&store, &secrets, false)
+            .await
+            .unwrap();
+        assert_eq!(again.oauth_orphans, 0);
+    }
 
     #[tokio::test]
     async fn gc_dry_run_reports_orphans_without_deleting() {

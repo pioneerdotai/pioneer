@@ -385,7 +385,13 @@ mod tests {
 
     #[test]
     fn entire_pinned_catalog_preserves_pi_contract_and_distinguishes_unknown_pricing() {
-        let generated = generate(&snapshot(), true).unwrap();
+        let mut generated = generate(&snapshot(), true).unwrap();
+        // Pioneer exposes standard CN/global profiles as well as Pi's coding
+        // plans. The supplements are verified against their own source below.
+        for supplement in ["glm", "zai-standard"] {
+            assert!(generated.models.remove(supplement).is_some());
+            assert!(generated.provenance.remove(supplement).is_some());
+        }
         let reference: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/provenance.json"))
                 .unwrap();
@@ -520,6 +526,50 @@ mod behavior_tests {
     use super::*;
     fn snapshot() -> SourceSnapshot {
         serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json")).unwrap()
+    }
+    #[test]
+    fn glm_region_and_product_catalogs_use_their_own_sources() {
+        let mut source = snapshot();
+        let data = &mut source.sources.get_mut(SOURCE_URLS[0]).unwrap().body;
+        for (upstream, context, price) in [("zai", 61001, 1.25), ("zhipuai", 62002, 2.5)] {
+            data[upstream]["models"]["fixture-standard"] = json!({
+                "tool_call":true, "name":"Fixture standard", "limit":{"context":context,"output":1024},
+                "modalities":{"input":["text"]}, "cost":{"input":price}
+            });
+        }
+        let generated = generate(&source, true).unwrap();
+        let reader = ModelCatalog::parse(
+            &serde_json::to_string(&generated.models).unwrap(),
+            &serde_json::to_string(&generated.provenance).unwrap(),
+        )
+        .unwrap();
+        for (runtime, url, context, price) in [
+            ("zai", "https://api.z.ai/api/paas/v4", 61001, 1.25),
+            ("glm", "https://open.bigmodel.cn/api/paas/v4", 62002, 2.5),
+        ] {
+            let model = reader.model(runtime, "fixture-standard").unwrap();
+            assert_eq!(model.base_url, url);
+            assert_eq!(model.api, "openai-completions");
+            assert_eq!(model.cost["input"], price);
+            assert_eq!(
+                reader.limits(runtime, "fixture-standard").context_window,
+                context
+            );
+            assert_eq!(
+                reader.limits(runtime, "fixture-standard").context_origin,
+                OriginKind::Source
+            );
+        }
+        assert!(reader.model("zai-coding", "fixture-standard").is_none());
+        assert!(reader.model("glm-coding", "fixture-standard").is_none());
+        assert_eq!(
+            reader.model("zai-coding", "glm-5.2").unwrap().base_url,
+            "https://api.z.ai/api/coding/paas/v4"
+        );
+        assert_eq!(
+            reader.model("glm-coding", "glm-5.2").unwrap().base_url,
+            "https://open.bigmodel.cn/api/coding/paas/v4"
+        );
     }
     #[test]
     fn new_entries_are_transformed_and_unknown_limits_remain_unknown() {

@@ -1749,3 +1749,7 @@ reason_updated = "एक skill अपडेट हुआ।"
 reason_rolled_back = "Skill का पिछला संस्करण बहाल हुआ।"
 reason_cancelled = "रन रद्द कर दिया गया।"
 reason_unknown = "प्रक्रिया अपेक्षा के अनुसार पूरी नहीं हुई। Gateway लॉग जाँचें."
+
+[mcp.oauth]
+callback_received = "जवाब स्वीकार किया गया। साइन इन का परिणाम देखने के लिए Pioneer पर लौटें।"
+callback_rejected = "साइन इन अस्वीकार हुआ। दोबारा प्रयास करने के लिए Pioneer पर लौटें।"

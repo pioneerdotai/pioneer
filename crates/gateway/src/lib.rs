@@ -26,6 +26,7 @@ mod human_interaction;
 mod identity;
 mod invitation;
 mod keep_awake;
+mod mcp_oauth;
 mod mcp_secrets;
 mod mcp_service;
 mod member;

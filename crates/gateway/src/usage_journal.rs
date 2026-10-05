@@ -157,9 +157,15 @@ impl Provider for JournalProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        Ok(self.stream_chat_with_diagnostics(request).await?.stream)
+    }
+    async fn stream_chat_with_diagnostics(
+        &self,
+        request: ChatRequest,
+    ) -> Result<pioneer_provider::ProviderStream> {
         let (call, mut usage) = self.start(&request.model).await?;
-        let stream = match self.inner.stream_chat(request).await {
-            Ok(stream) => stream,
+        let response = match self.inner.stream_chat_with_diagnostics(request).await {
+            Ok(response) => response,
             Err(error) => {
                 if let Some(snapshot) = pioneer_provider::usage::error_usage(&error) {
                     usage.update(snapshot);
@@ -168,8 +174,9 @@ impl Provider for JournalProvider {
                 return Err(error);
             }
         };
-        Ok(Box::pin(futures_util::stream::unfold(
-            (stream, call, usage, false),
+        let diagnostics = response.diagnostics;
+        let stream = Box::pin(futures_util::stream::unfold(
+            (response.stream, call, usage, false),
             |(mut stream, call, mut usage, mut terminal)| async move {
                 match stream.next().await {
                     Some(result) => {
@@ -213,7 +220,11 @@ impl Provider for JournalProvider {
                     }
                 }
             },
-        )))
+        ));
+        Ok(pioneer_provider::ProviderStream {
+            stream,
+            diagnostics,
+        })
     }
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
         self.inner.list_models().await

@@ -52,7 +52,13 @@ struct ApiGenerateRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ApiContent {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_string",
+        skip_serializing_if = "String::is_empty"
+    )]
     role: String,
+    #[serde(default)]
     parts: Vec<ApiPart>,
 }
 
@@ -62,6 +68,7 @@ struct ApiSystemInstruction {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ApiPart {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<String>,
@@ -81,6 +88,7 @@ struct ApiPart {
         rename = "thoughtSignature",
         skip_serializing_if = "Option::is_none"
     )]
+    // REST bytes fields are base64 strings; retain the opaque representation.
     thought_signature: Option<String>,
 }
 
@@ -94,6 +102,11 @@ struct ApiInlineData {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiFileData {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_string",
+        skip_serializing_if = "String::is_empty"
+    )]
     mime_type: String,
     file_uri: String,
 }
@@ -104,6 +117,10 @@ struct ApiFunctionCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     name: String,
+    #[serde(
+        default = "empty_json_object",
+        deserialize_with = "deserialize_function_arguments"
+    )]
     args: serde_json::Value,
 }
 
@@ -343,11 +360,14 @@ impl GeminiProvider {
 
                     if msg.role == Role::Tool {
                         let name = msg.name.clone().unwrap_or_else(|| "tool".to_owned());
+                        // FunctionResponse.response is a protobuf Struct, not an
+                        // arbitrary JSON value. Preserve scalar/array results inside it.
                         let response_payload =
-                            serde_json::from_str::<serde_json::Value>(msg.content.as_str())
-                                .unwrap_or_else(
-                                    |_| serde_json::json!({ "content": msg.content.clone() }),
-                                );
+                            match serde_json::from_str::<serde_json::Value>(msg.content.as_str()) {
+                                Ok(value) if value.is_object() => value,
+                                Ok(value) => serde_json::json!({ "content": value }),
+                                Err(_) => serde_json::json!({ "content": msg.content }),
+                            };
                         parts.push(ApiPart {
                             text: None,
                             inline_data: None,
@@ -414,7 +434,7 @@ impl GeminiProvider {
                                 function_call: Some(ApiFunctionCall {
                                     id: Some(call.id.clone()),
                                     name: call.name.clone(),
-                                    args: parse_json_or_string(call.arguments.as_str()),
+                                    args: parse_function_arguments(call.arguments.as_str())?,
                                 }),
                                 function_response: None,
                                 thought_signature: function_call_signatures
@@ -669,9 +689,40 @@ impl GeminiProvider {
     }
 }
 
-fn parse_json_or_string(raw: &str) -> serde_json::Value {
-    serde_json::from_str::<serde_json::Value>(raw)
-        .unwrap_or_else(|_| serde_json::Value::String(raw.to_owned()))
+fn deserialize_optional_string<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn empty_json_object() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+fn deserialize_function_arguments<'de, D>(
+    deserializer: D,
+) -> std::result::Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let arguments =
+        Option::<serde_json::Value>::deserialize(deserializer)?.unwrap_or_else(empty_json_object);
+    if !arguments.is_object() {
+        return Err(serde::de::Error::custom(
+            "Gemini functionCall args must be a JSON object",
+        ));
+    }
+    Ok(arguments)
+}
+
+fn parse_function_arguments(raw: &str) -> Result<serde_json::Value> {
+    let arguments: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|_| anyhow!("Gemini functionCall args must be a JSON object"))?;
+    if !arguments.is_object() {
+        return Err(anyhow!("Gemini functionCall args must be a JSON object"));
+    }
+    Ok(arguments)
 }
 
 #[async_trait]
@@ -1647,3 +1698,7 @@ mod tests {
         assert_eq!(api_req.contents[1].role, "model");
     }
 }
+
+#[cfg(test)]
+#[path = "wire_tests/gemini.rs"]
+mod wire_contract_tests;

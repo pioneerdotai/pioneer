@@ -231,6 +231,9 @@ mod tests {
         }
         fn classify_failure(&self, _: &anyhow::Error) -> Option<ProviderFailureClassification> {
             Some(ProviderFailureClassification {
+                is_network_error: false,
+                error_reason: None,
+                request_id: None,
                 class: ProviderFailureClass::RateLimit,
                 http_status: Some(429),
                 provider_code: None,

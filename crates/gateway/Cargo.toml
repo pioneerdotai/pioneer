@@ -6,6 +6,8 @@ license.workspace = true
 authors.workspace = true
 
 [features]
+# Compile only deterministic native OAuth audit fixtures.
+oauth-test-support = ["pioneer-mcp-oauth/test-support"]
 default = []
 computer-use = ["pioneer-tools/computer-use"]
 
@@ -25,6 +27,7 @@ pioneer-hooks.workspace = true
 pioneer-keystore.workspace = true
 pioneer-migration.workspace = true
 pioneer-mcp.workspace = true
+pioneer-mcp-oauth.workspace = true
 pioneer-memory.workspace = true
 pioneer-observability.workspace = true
 pioneer-entity.workspace = true
@@ -78,6 +81,7 @@ serde.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+tokio-tungstenite.workspace = true
 sentry = { workspace = true, features = ["test"] }
 pioneer-sqlite = { workspace = true, features = ["test-support"] }
 pioneer-client.workspace = true

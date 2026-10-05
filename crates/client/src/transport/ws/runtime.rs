@@ -86,12 +86,17 @@ pub struct GatewayWsCommandSender {
     next_connection_id: Arc<AtomicU64>,
     session_access: Arc<Mutex<Option<GatewayHttpAccess>>>,
     connection_generations: Arc<Mutex<GatewayConnectionGenerations>>,
+    #[cfg(test)]
+    pub(crate) test_requests:
+        Arc<Mutex<Option<Arc<dyn crate::rpc::JsonRpcRequestTransport + Send + Sync>>>>,
 }
 
 #[derive(Clone)]
 pub struct GatewayWsClient {
     command_sender: GatewayWsCommandSender,
     event_rx: Arc<Mutex<Receiver<GatewayWsEvent>>>,
+    #[cfg(test)]
+    test_event_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<GatewayWsEvent>>>>,
 }
 
 #[derive(Default)]

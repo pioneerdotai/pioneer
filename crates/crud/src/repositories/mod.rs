@@ -24,6 +24,7 @@ pub(crate) mod compaction_frozen_import;
 mod compaction_frozen_views;
 pub(crate) mod compaction_history;
 pub(crate) mod compaction_lifecycle;
+pub(crate) mod compaction_lifecycle_pending;
 pub(crate) mod compaction_preparation;
 pub(crate) mod compaction_runner;
 pub(crate) mod compaction_source_projection;
@@ -117,3 +118,7 @@ pub(crate) mod tool_output;
 pub(crate) mod compaction_frozen_storage;
 
 mod compaction_check_result;
+
+pub(crate) mod task_run_occurrence_reconcile;
+
+pub(crate) mod task_occurrence_reconcile;

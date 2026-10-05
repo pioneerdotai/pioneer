@@ -95,6 +95,17 @@ pub trait Provider: Send + Sync {
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>>;
 
+    /// Send a stream with request-owned facts for agent-side deadline failures.
+    /// Default adapters retain their existing stream behavior with no known ID.
+    async fn stream_chat_with_diagnostics(
+        &self,
+        request: ChatRequest,
+    ) -> Result<crate::ProviderStream> {
+        self.stream_chat(request)
+            .await
+            .map(crate::ProviderStream::new)
+    }
+
     /// List all models available from this provider.
     /// Default implementation returns an error for providers that don't support listing.
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {

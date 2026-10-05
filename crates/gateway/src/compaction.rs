@@ -138,8 +138,7 @@ pub(crate) struct HubCompactionObserver {
     pub turn: String,
 }
 impl HubCompactionObserver {
-    fn item(
-        &self,
+    pub(crate) fn item(
         operation: &str,
         state: &RunnerState,
         terminal: bool,
@@ -201,7 +200,7 @@ impl CompactionObserver for HubCompactionObserver {
                         workspace_id: self.workspace.clone(),
                         thread_id: self.thread.clone(),
                         turn_id: self.turn.clone(),
-                        item: self.item(operation, state, false),
+                        item: Self::item(operation, state, false),
                     },
                 },
             )
@@ -230,7 +229,7 @@ impl CompactionObserver for HubCompactionObserver {
                         workspace_id: self.workspace.clone(),
                         thread_id: self.thread.clone(),
                         turn_id: self.turn.clone(),
-                        item: self.item(operation, state, true),
+                        item: Self::item(operation, state, true),
                     },
                 },
             )
