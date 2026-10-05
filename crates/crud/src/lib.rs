@@ -9,7 +9,13 @@ mod projector;
 mod repositories;
 mod task_delivery_lifecycle;
 mod task_events;
+mod task_occurrence;
 mod task_run_occurrence;
+pub use repositories::task_occurrence_reconcile::{
+    TASK_OCCURRENCE_RECONCILE_BUDGET, TASK_OCCURRENCE_RUN_QUOTA, TaskOccurrenceClaimDeferral,
+    TaskOccurrenceClaimFailure, TaskOccurrenceClaimFailurePhase, TaskOccurrenceClock,
+    TaskOccurrenceReconcileCandidate, TaskOccurrenceReconcileClaim,
+};
 mod task_terminal;
 pub use repositories::task_run_occurrence_reconcile::{
     OCCURRENCE_RECONCILE_BUDGET, OCCURRENCE_RECONCILE_INITIAL_BACKOFF_SECS,
@@ -1502,66 +1508,6 @@ async fn reserve_execution_for_run_in_connection<C: ConnectionTrait>(
     task_run_execution_from_db_model(execution)
 }
 
-fn exact_terminal_occurrence_status(
-    task: &pioneer_entity::task::Model,
-    run: &pioneer_entity::task_run::Model,
-    execution: &pioneer_entity::task_run_execution::Model,
-    occurrence: &pioneer_entity::task_occurrence_contract::Model,
-    agent_execution: Option<&pioneer_entity::agent_execution::Model>,
-) -> Option<pioneer_protocol::TaskOccurrenceStatus> {
-    if task.id != run.task_id
-        || task.executor_kind != run.executor_kind
-        || occurrence.task_id != run.task_id
-        || occurrence.run_id != run.id
-        || execution.task_id != run.task_id
-        || execution.task_run_id != run.id
-        || execution.executor_kind != run.executor_kind
-        || run.completed_at.is_none()
-        || execution.completed_at.is_none()
-    {
-        return None;
-    }
-
-    let expected = match (run.status.as_str(), execution.status.as_str()) {
-        ("succeeded", "succeeded") => pioneer_protocol::TaskOccurrenceStatus::Delivered,
-        ("failed", "failed") | ("blocked", "blocked") | ("timed_out", "timed_out") => {
-            pioneer_protocol::TaskOccurrenceStatus::Failed
-        }
-        ("cancelled", "cancelled") => pioneer_protocol::TaskOccurrenceStatus::Cancelled,
-        _ => return None,
-    };
-
-    match execution.executor_kind.as_str() {
-        "agent" => {
-            let agent_execution = agent_execution?;
-            if occurrence.agent_execution_id.as_deref() != Some(execution.id.as_str())
-                || agent_execution.id != execution.id
-                || agent_execution.workspace_id != task.workspace_id
-                || agent_execution.parent_task_id.as_deref() != Some(run.task_id.as_str())
-                || occurrence.execution_generation != agent_execution.execution_generation
-                || agent_execution.status != execution.status
-                || agent_execution.finished_at.is_none()
-                || occurrence.work_graph_root_execution_id.as_deref()
-                    != Some(agent_execution.work_graph_root_execution_id.as_str())
-                || occurrence.root_resource_scope_id.as_deref()
-                    != Some(agent_execution.work_graph_root_execution_id.as_str())
-            {
-                return None;
-            }
-        }
-        "system" => {
-            if occurrence.agent_execution_id.is_some()
-                || occurrence.work_graph_root_execution_id.is_some()
-                || occurrence.root_resource_scope_id.is_some()
-            {
-                return None;
-            }
-        }
-        _ => return None,
-    }
-    Some(expected)
-}
-
 /// A single turn's conversation content: user input + assistant reply.
 #[derive(Debug, Clone)]
 pub struct ConversationEntry {
@@ -2630,6 +2576,7 @@ pub enum TaskOccurrenceTerminalRepairOutcome {
     AlreadyConsistent,
     NotFound,
     NotRepairable,
+    StaleClaim,
 }
 
 #[derive(Debug, Clone)]
@@ -14571,102 +14518,6 @@ impl CrudStore {
             limit,
         )
         .await
-    }
-
-    pub async fn compare_and_repair_terminal_task_occurrence(
-        &self,
-        run_id: &str,
-        now: i64,
-    ) -> Result<TaskOccurrenceTerminalRepairOutcome> {
-        let run_id = run_id.to_owned();
-        self.run_serialized_write(|| {
-            self.compare_and_repair_terminal_task_occurrence_once(run_id.clone(), now)
-        })
-        .await
-    }
-
-    async fn compare_and_repair_terminal_task_occurrence_once(
-        &self,
-        run_id: String,
-        now: i64,
-    ) -> Result<TaskOccurrenceTerminalRepairOutcome> {
-        let transaction = self
-            .connection
-            .begin()
-            .await
-            .context("failed to begin terminal Task occurrence repair transaction")?;
-        let result = async {
-            let Some(run) = task_run::find_run_by_id(&transaction, run_id.as_str()).await? else {
-                return Ok(TaskOccurrenceTerminalRepairOutcome::NotFound);
-            };
-            let Some(execution) =
-                task_run_execution::find_execution_by_run(&transaction, run_id.as_str()).await?
-            else {
-                return Ok(TaskOccurrenceTerminalRepairOutcome::NotRepairable);
-            };
-            let Some(occurrence_model) = pioneer_entity::task_occurrence_contract::Entity::find()
-                .filter(pioneer_entity::task_occurrence_contract::Column::RunId.eq(run_id.clone()))
-                .one(&transaction)
-                .await?
-            else {
-                return Ok(TaskOccurrenceTerminalRepairOutcome::NotFound);
-            };
-            let repair_at = now.max(occurrence_model.updated_at.timestamp());
-            let Some(task) =
-                task_repository::find_task_by_id(&transaction, run.task_id.as_str()).await?
-            else {
-                return Ok(TaskOccurrenceTerminalRepairOutcome::NotRepairable);
-            };
-            let agent_execution = if execution.executor_kind == "agent" {
-                pioneer_entity::agent_execution::Entity::find_by_id(execution.id.clone())
-                    .one(&transaction)
-                    .await
-                    .context("failed to revalidate terminal AgentExecution for occurrence repair")?
-            } else {
-                None
-            };
-            let Some(expected_status) = exact_terminal_occurrence_status(
-                &task,
-                &run,
-                &execution,
-                &occurrence_model,
-                agent_execution.as_ref(),
-            ) else {
-                return Ok(TaskOccurrenceTerminalRepairOutcome::NotRepairable);
-            };
-            if occurrence_model.status
-                == repositories::task_actor_contract::task_occurrence_status_to_db(&expected_status)
-            {
-                return Ok(TaskOccurrenceTerminalRepairOutcome::AlreadyConsistent);
-            }
-            let repaired =
-                repositories::task_actor_contract::repair_terminal_task_occurrence_status(
-                    &transaction,
-                    &occurrence_model,
-                    expected_status,
-                    repair_at,
-                )
-                .await?;
-            Ok(if repaired {
-                TaskOccurrenceTerminalRepairOutcome::Changed
-            } else {
-                TaskOccurrenceTerminalRepairOutcome::NotRepairable
-            })
-        }
-        .await;
-        match result {
-            Ok(outcome) => {
-                transaction
-                    .commit()
-                    .await
-                    .context("failed to commit terminal Task occurrence repair transaction")?;
-                Ok(outcome)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
     }
 
     pub async fn reserve_execution_for_run(
@@ -31217,6 +31068,8 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 mod tests {
     #[path = "task_run_occurrence.rs"]
     mod occurrence_tracker;
+    #[path = "task_occurrence_reconcile.rs"]
+    mod task_occurrence_tracker;
     use super::{
         AgentExecutionInput, AgentResourceStateInput, ArtifactBindingTargetRecord,
         AtomicRecoveryJobEnqueueOutcome, BLOCK_KIND_APPROVAL, BLOCK_KIND_USER_MESSAGE,
