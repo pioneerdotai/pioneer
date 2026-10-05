@@ -463,10 +463,82 @@ mod tests {
                     .into();
                     origin.sources[0].version = if hot { "" } else { "revision:1" }.into();
                 }
+                if hot {
+                    // Hot locators have no durable revision yet. Native policy
+                    // cannot make them eligible, even after a final response.
+                    let unresolved =
+                        NativeHistoryLayout::from_messages("ws", "thread", &messages, &[100; 5])
+                            .unwrap();
+                    assert!(
+                        unresolved.units.iter().all(|unit| !unit.complete),
+                        "unresolved sources: {provider}/{model}"
+                    );
+                    let mut final_message = ChatMessage::assistant("final");
+                    origin(&mut final_message, "final", "final", false);
+                    let mut unresolved_closed = messages.clone();
+                    unresolved_closed.push(final_message);
+                    let closed = NativeHistoryLayout::from_messages(
+                        "ws",
+                        "thread",
+                        &unresolved_closed,
+                        &[100; 6],
+                    )
+                    .unwrap();
+                    assert!(
+                        closed.units[..3].iter().all(|unit| !unit.complete),
+                        "final closure does not resolve earlier sources: {provider}/{model}"
+                    );
+                    assert!(closed.units[3].complete);
+                    for mode in [CompactionMode::Normal, CompactionMode::Emergency] {
+                        assert!(
+                            plan_compaction(
+                                &unresolved.units,
+                                &ModelBudget::new(Some(32768), None, None),
+                                256,
+                                0,
+                                512,
+                                mode,
+                                CoverageDomain::WorkingContext,
+                                true,
+                                "fixture",
+                            )
+                            .is_err(),
+                            "unresolved sources must remain pending: {provider}/{model}/{mode:?}"
+                        );
+                        let plan = plan_compaction(
+                            &closed.units,
+                            &ModelBudget::new(Some(32768), None, None),
+                            256,
+                            0,
+                            512,
+                            mode,
+                            CoverageDomain::WorkingContext,
+                            true,
+                            "fixture",
+                        )
+                        .unwrap();
+                        assert_eq!(plan.compact, [3]);
+                    }
+                    // Represent the metadata returned by Gateway's locator
+                    // resolver: versioned input/context sources, not pending IDs.
+                    for message in &mut messages {
+                        let source = &mut message.provenance.as_mut().unwrap().sources[0];
+                        source.scope = if message.role == Role::User {
+                            "input:turn"
+                        } else {
+                            "context:turn"
+                        }
+                        .into();
+                        source.version = "revision:1".into();
+                    }
+                }
                 let layout =
                     NativeHistoryLayout::from_messages("ws", "thread", &messages, &[100; 5])
                         .unwrap();
-                assert_eq!(layout.units[1].complete, !required, "{provider}/{hot}");
+                assert_eq!(
+                    layout.units[1].complete, !required,
+                    "resolved active turn: {provider}/{model}/{hot}"
+                );
                 for mode in [CompactionMode::Normal, CompactionMode::Emergency] {
                     let plan = plan_compaction(
                         &layout.units,
@@ -488,7 +560,10 @@ mod tests {
                 let closed =
                     NativeHistoryLayout::from_messages("ws", "thread", &messages, &[100; 6])
                         .unwrap();
-                assert!(closed.units.iter().all(|unit| unit.complete));
+                assert!(
+                    closed.units.iter().all(|unit| unit.complete),
+                    "resolved final closure: {provider}/{model}/{hot}"
+                );
                 // Final closure restores pair/unit eligibility, but unknown or
                 // binding state still forbids prefix rewriting while retained.
                 let expected_refusal =
