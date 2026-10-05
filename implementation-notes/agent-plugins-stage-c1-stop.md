@@ -226,3 +226,85 @@ Unresolved: coordinator review and all behavioral validation; an unfinished reti
 actor or genuinely unknown admission remains fail-closed with retained ownership.
 No known unresolved non-test compilation error; checks above are not behavior verification.
 No full C1/UI/provider expansion has been started in this correction iteration.
+
+
+## CS-03 admission/publication correction (2026-10-05)
+
+Status: **READY_FOR_C1_STOP_REVIEW**, awaiting coordinator review; this is neither
+acceptance nor behavioral validation. CS-01/CS-02 remain closed by prior source
+review. Earlier sections retain their historical evidence.
+
+- Branch/worktree/cwd: `feature/agent-plugins-simple`,
+  `/Users/alexander/Code/pioneer/pioneer/.worktrees/agent-plugins-simple`.
+- Base HEAD: `c274b16e1f5dfce669f7f21e2f48bb2e6da961ad`, initially clean.
+- Final code HEAD: `9a59de3323a668c2750487030a6b02390608743b`, clean throughout
+  final checks. Code commits: `fb695adb` admission/publication correction,
+  `9a59de33` exact initial-owner fence on the fallback path. Delivery adds only
+  this handoff; its final HEAD and clean-tree status accompany the response.
+
+`agent/src/lib.rs:1766` checks the existing bounded control admission registry
+(max 1,024 entries/thread). Unresolved StartTurn, recovery and restored-recovery
+entries return UnknownOwner regardless of ACK deadline or cancelled waiter.
+The registry revision is checked before owner capture and revalidated on exit
+(`:4066`); no registry lock spans an await. Completed cancel ACK is not startup
+proof. Existing admission, rejection, timeout and retirement semantics remain.
+
+The existing control plane adds a local actor publication counter (`:2379`).
+`agent_loop.rs:311` holds its RAII transition through start/recovery/finish
+commands, including the existing early recovery ACK and durable continuation
+awaits. Odd/changing publication or a quiescent but still-active control returns
+UnknownOwner until actual publication/terminal clear. Retired actor proof continues
+using the accepted actual actor join. This is a publication consistency observer,
+not runtime generation management, a new admission registry or command engine.
+
+Gateway graph await (`message/agent_runtime.rs:7530`, `:7665`, `:9787`) rechecks
+admission/publication after native joins. Every remaining run must be quiescent
+and belong to the initial snapshot, including proven historical runs omitted
+from cancellation selection. A newly published run requires Retry even if it
+has already drained. Identity is exact thread/Turn plus actual completion Arc;
+replacement actor run counters cannot alias it. No replacement is cancelled by
+an old captured handle. The existing no-graph `cancel_turn_and_wait` fallback
+(`agent/src/lib.rs:3981`) applies the same before/after snapshot guard and verifies
+initial ownership before signalling. Fast user-facing cancel and its ACK remain
+unchanged. Pending publication is fail-closed, not partial success; Retry after
+publication captures the actual owner and uses the existing join/deadline path.
+
+No production DB/schema changes, new tables/jobs/leases/workers, second runtime,
+installer/OAuth changes or UI/mobile work. Existing retirement gating is retained;
+no new lock holds registry/DB capacity across provider, task or durable-event awaits.
+The future full-C1 parent gate must separately block new Gateway launches.
+
+Actual checks, cwd above, stable final code HEAD `9a59de33`:
+
+- `CARGO_INCREMENTAL=0 cargo check -p pioneer-gateway --lib`: **exit 0**, 1m58s;
+  `/tmp/pioneer-c1-stop-admission-final-gateway-check.log`. Two existing dead-code
+  warnings: graph-await entrypoint and `set_mcp_policy`.
+- `rustfmt --edition 2024 --config skip_children=true --check` on the six changed
+  Rust sources: **exit 0**; `/tmp/pioneer-c1-stop-admission-final-format.log`.
+- `git diff --check c274b16e..9a59de33`: **exit 0**;
+  `/tmp/pioneer-c1-stop-admission-final-diff.log`.
+- Earlier stable `fb695adb` Gateway library check: **exit 0**, 1m40s;
+  `/tmp/pioneer-c1-stop-admission-fb695adb-gateway-check.log`.
+  Intermediate dirty-base Agent/Gateway library checks: **0 / 0**, 32.25s / 2m37s;
+  `/tmp/pioneer-c1-stop-admission-{agent,gateway}-check-1.log`. These precede final
+  changes and are not final-HEAD evidence. An intermediate rustfmt parse diagnostic
+  from an unfinished source edit was corrected; its individual exit was not captured.
+  Final formatting parsed sources only; it did not compile test targets.
+
+Regression sources: `agent/src/manager_tests_stop_admission.rs` uses real public
+manager admission and existing dependency/durable-ACK/native-join seams for accepted
+start, cancelled/expired ACK waiter, early Applied recovery ACK, restored checkpoint,
+finish/continuation, typed rejection, cleared history and unrelated scope. Gateway
+`message/tests.rs:78221` persists an actual Interrupted Turn before pausing direct
+checkpoint startup, rejects both graph selection and fallback success, then captures
+and drains the published owner on retry. The existing real graph-snapshot regression
+also covers initial historical identities versus outstanding/new identities. Its
+snapshot retries wait for actual actor publication/clear. Six pre-existing fake-actor
+fixtures now wrap handles in the already accepted NativeTask join-owner type.
+
+All own tests **NOT_RUN**; all own test targets **NOT_COMPILED**. No application,
+provider/fixture, functional/smoke/device scenario or migration run. Historical
+external compilation remains **UNKNOWN_EXTERNAL_ACTIVITY**, separately recorded.
+Unresolved: coordinator review and behavioral validation; conservative UnknownOwner
+while admission/publication is unresolved is intentional. No known non-test compile
+failure. Full C1/UI/C2/mobile/testing have not been started in this correction.
