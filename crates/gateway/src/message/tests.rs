@@ -53250,17 +53250,19 @@ async fn agent_skill_audit_event_persists_audit_rows() {
 #[test]
 fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
     run_gateway_message_test("prompt-manifest-hook-sources", || async {
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::channel(256);
         let session_manager = Arc::new(SessionManager::new());
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
         let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        let provider_entered = Arc::new(Notify::new());
+        let provider_release = Arc::new(Notify::new());
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "openai",
-            Arc::new(DelayedProvider {
-                delay: Duration::from_secs(5),
-                text: "delayed manifest response".to_owned(),
+            Arc::new(CancellationBarrierProvider {
+                entered: provider_entered.clone(),
+                release: provider_release,
             }),
         ));
         let processor = MessageProcessor::new(
@@ -53314,26 +53316,26 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
             events::TURN_STARTED,
         )
         .await;
+        // Provider entry follows the actor's real window/manifest/context ACKs.
+        // Keep it gated through the roundtrip so neither a second synthetic
+        // window nor a timer-driven completion races the manifest under test.
+        tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
+            .await
+            .expect("manifest fixture provider should enter after durable startup");
+        let window = crud_store
+            .latest_turn_execution_window(turn_id)
+            .await
+            .expect("manifest fixture execution window should load")
+            .expect("actor should persist its execution window before provider entry");
+        assert_eq!(window.workspace_id, workspace_id);
+        assert_eq!(window.thread_id, thread_id);
+        assert_eq!(window.turn_id, turn_id);
+        assert_eq!(window.window_index, 1);
+        assert_eq!(window.status, ExecutionWindowStatus::Running);
         let _execution_lease = processor
             .register_execution_lease(turn_id)
             .await
             .expect("prompt-manifest fixture execution lease should register");
-        assert!(
-            processor
-                .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowStarted {
-                    notification: pioneer_protocol::TurnExecutionWindowStartedNotification {
-                        workspace_id: workspace_id.clone(),
-                        thread_id: thread_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        window_id: "prompt_manifest_fixture_window".to_owned(),
-                        window_index: 1,
-                        status: ExecutionWindowStatus::Running,
-                        started_at_unix_ms: 1_000,
-                    },
-                })
-                .await,
-            "prompt-manifest fixture execution window should persist"
-        );
 
         let manifest = PromptManifest {
             compiler_version: "0.1.0-test".to_owned(),
@@ -53377,13 +53379,16 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
             }],
         };
 
-        processor
-            .handle_durable_agent_event(AgentDurableEvent::PromptManifestCompiled {
-                thread_id: thread_id.to_owned(),
-                turn_id: turn_id.to_owned(),
-                manifest: manifest.clone(),
-            })
-            .await;
+        assert!(
+            processor
+                .handle_durable_agent_event(AgentDurableEvent::PromptManifestCompiled {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    manifest: manifest.clone(),
+                })
+                .await,
+            "hook-source manifest event should receive its durable ACK"
+        );
 
         let (_, in_memory_turn) = thread_manager
             .turn_get(thread_id, turn_id)
@@ -53415,6 +53420,7 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
             serde_json::from_value(response.result).expect("turn/get result should decode");
 
         assert_eq!(turn_get.turn.prompt_manifest, Some(manifest));
+        processor.agent_manager.remove_thread(thread_id).await;
     });
 }
 
