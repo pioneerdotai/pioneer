@@ -56,6 +56,20 @@ pub(super) fn models_dev(data: &Value, nvidia: &Value, strict: bool) -> Result<V
             "openai-completions",
             "https://api.groq.com/openai/v1",
         ),
+        // Keep standard API metadata separate from the coding subscription
+        // sources below. Source data remains the owner of limits and pricing.
+        (
+            "zai",
+            "zai-standard",
+            "openai-completions",
+            "https://api.z.ai/api/paas/v4",
+        ),
+        (
+            "zhipuai",
+            "glm",
+            "openai-completions",
+            "https://open.bigmodel.cn/api/paas/v4",
+        ),
         (
             "cerebras",
             "cerebras",

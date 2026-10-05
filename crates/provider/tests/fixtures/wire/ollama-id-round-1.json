@@ -1,0 +1,23 @@
+{
+  "message": {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+      {
+        "function": {
+          "name": "forecast",
+          "arguments": {
+            "location": {
+              "city": "Moscow"
+            },
+            "days": 2,
+            "metric": true
+          }
+        },
+        "id": "forecast_native_1"
+      }
+    ]
+  },
+  "done": true,
+  "done_reason": "stop"
+}

@@ -7124,6 +7124,7 @@ impl MessageProcessor {
                 Some(resume),
                 None,
                 transition,
+                None,
             )
             .await
         {
@@ -7783,13 +7784,21 @@ impl MessageProcessor {
         };
         let task_reconciliation_succeeded = match task_reconciliation {
             Ok(Ok(reconciled)) => reconciled,
-            Ok(Err(error)) => {
-                warn!(
-                    thread_id,
-                    turn_id,
-                    error = %format!("{error:#}"),
-                    "completed child task reconciliation is pending durable retry"
-                );
+            Ok(Err(mut error)) => {
+                if let Some(failure) = error.downcast_mut::<pioneer_tasks::TaskStartFailure>() {
+                    failure.report_in_place();
+                    warn!(
+                        descriptor = ?failure.descriptor(),
+                        "completed child task preparation is pending durable retry"
+                    );
+                } else {
+                    warn!(
+                        thread_id,
+                        turn_id,
+                        error = %format!("{error:#}"),
+                        "completed child task reconciliation is pending durable retry"
+                    );
+                }
                 false
             }
             Err(error) => {
@@ -8176,6 +8185,34 @@ impl MessageProcessor {
         reason: String,
         transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) -> bool {
+        self.mark_turn_blocked_with_task_start_failure(thread_id, turn_id, reason, transition, None)
+            .await
+    }
+
+    pub(super) async fn mark_task_turn_blocked_on_start_failure(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        descriptor: &pioneer_tasks::TaskStartFailureDescriptor,
+    ) -> bool {
+        self.mark_turn_blocked_with_task_start_failure(
+            thread_id,
+            turn_id,
+            "task_cli_preparation_failed".to_owned(),
+            None,
+            Some(descriptor),
+        )
+        .await
+    }
+
+    async fn mark_turn_blocked_with_task_start_failure(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        reason: String,
+        transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+        start_failure: Option<&pioneer_tasks::TaskStartFailureDescriptor>,
+    ) -> bool {
         if let Some(user_cancellation_reason) = self
             .user_turn_cancel_intents
             .lock()
@@ -8232,7 +8269,14 @@ impl MessageProcessor {
                 .await;
         }
         self.mark_turn_blocked_with_resume_metadata_guarded(
-            thread_id, turn_id, reason, None, None, None, transition,
+            thread_id,
+            turn_id,
+            reason,
+            None,
+            None,
+            None,
+            transition,
+            start_failure,
         )
         .await
     }
@@ -8345,6 +8389,7 @@ impl MessageProcessor {
             None,
             cli_blocked_guard,
             turn_transition,
+            None,
         )
         .await
     }
@@ -8358,6 +8403,7 @@ impl MessageProcessor {
         resume: Option<pioneer_protocol::TurnBlockedResumeMetadata>,
         cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
         turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+        start_failure: Option<&pioneer_tasks::TaskStartFailureDescriptor>,
     ) -> bool {
         let turn_transition = if turn_transition.is_some() {
             turn_transition
@@ -8501,6 +8547,7 @@ impl MessageProcessor {
                     resume,
                     cli_blocked_guard,
                     turn_transition,
+                    start_failure,
                 )
                 .await;
         }
@@ -8592,11 +8639,12 @@ impl MessageProcessor {
 
         let task_reconciliation_succeeded = match self
             .task_agent_executor
-            .reconcile_child_turn_blocked(
+            .reconcile_child_turn_blocked_with_start_failure(
                 thread_id.as_str(),
                 turn_id.as_str(),
                 turn_blocked.turn.error.as_deref().unwrap_or("turn blocked"),
                 TaskChildReconciliationOrigin::Live,
+                start_failure,
             )
             .await
         {
@@ -8659,6 +8707,7 @@ impl MessageProcessor {
         resume: Option<pioneer_protocol::TurnBlockedResumeMetadata>,
         cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
         turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+        start_failure: Option<&pioneer_tasks::TaskStartFailureDescriptor>,
     ) -> bool {
         let (workspace_id, current_turn) = match self
             .crud_store
@@ -8792,11 +8841,12 @@ impl MessageProcessor {
 
         let task_reconciliation_succeeded = match self
             .task_agent_executor
-            .reconcile_child_turn_blocked(
+            .reconcile_child_turn_blocked_with_start_failure(
                 thread_id.as_str(),
                 turn_id.as_str(),
                 turn_blocked.turn.error.as_deref().unwrap_or("turn blocked"),
                 TaskChildReconciliationOrigin::Live,
+                start_failure,
             )
             .await
         {
