@@ -287,8 +287,8 @@ impl Provider for DeepSeekProvider {
 #[cfg(test)]
 mod tests {
     use crate::types::ReasoningConfig;
-    #[test]
-    fn effective_mode_prepares_completed_canonical_rounds_and_preserves_active_guards() {
+    #[tokio::test]
+    async fn effective_mode_prepares_completed_canonical_rounds_and_preserves_active_guards() {
         let provider = DeepSeekProvider::new("key");
         let mut messages = vec![
             ChatMessage::assistant_tool_calls_with_provider_state(
@@ -319,10 +319,14 @@ mod tests {
                 }]);
                 let prepared = provider.prepare_request(request).unwrap();
                 assert_eq!(prepared.messages[0].tool_calls.is_some(), off);
-                let wire = provider
-                    .transport
-                    .render_chat_request_mode_for_test(prepared, stream)
-                    .unwrap();
+                let wire = crate::attachments::runtime::with_async_authority_scope(
+                    "deepseek-default-mode-fixture".into(),
+                    provider
+                        .transport
+                        .render_chat_request_async_for_test(prepared, stream),
+                )
+                .await
+                .unwrap();
                 assert_eq!(wire["stream"], stream);
                 assert!(wire.to_string().contains("observed result"));
                 assert_eq!(wire["messages"][0].get("tool_calls").is_some(), off);
@@ -364,6 +368,226 @@ mod tests {
             let mut request = request_with(active);
             request.model = "deepseek-v4-flash".into();
             assert!(provider.prepare_request(request).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_historical_thinking_does_not_override_off_at_final_materialization() {
+        use crate::types::{
+            AttachmentDataSource, InputTypeSupport, MessageAttachment, MessageContentPart,
+            ProviderInputCapabilities,
+        };
+        let provider =
+            DeepSeekProvider::new("key").with_input_capabilities(ProviderInputCapabilities {
+                text: true,
+                file: InputTypeSupport::native_inline_only(),
+                image: InputTypeSupport::disabled(),
+                audio: InputTypeSupport::disabled(),
+                video: InputTypeSupport::disabled(),
+            });
+        let mut replay = OpenAiCompatibleProvider::assistant_replay_state(
+            "deepseek",
+            None,
+            Some("historical genuine rationale".into()),
+            &[tool_call()],
+        );
+        replay.model = Some("deepseek-v4-flash".into());
+        let mut messages = vec![
+            ChatMessage::assistant_tool_calls_with_provider_state(
+                None::<String>,
+                Some("historical genuine rationale"),
+                vec![tool_call()],
+                Some(replay),
+            ),
+            ChatMessage::tool_result("call_1", "read_file", "historical result"),
+        ];
+        for id in ["call_2", "call_3"] {
+            let mut call = tool_call();
+            call.id = id.into();
+            messages.push(ChatMessage::assistant_tool_calls_with_provider_state(
+                Some("non-thinking call"),
+                None::<String>,
+                vec![call],
+                None,
+            ));
+            messages.push(ChatMessage::tool_result(
+                id,
+                "read_file",
+                "non-thinking result",
+            ));
+        }
+        complete_round(&mut messages);
+        for (index, message) in messages.iter_mut().enumerate() {
+            message.provenance.as_mut().unwrap().unit_id = format!("round-{}", index / 2);
+        }
+        for media in [false, true] {
+            let mut canonical = messages.clone();
+            if media {
+                canonical[3]
+                    .content_parts
+                    .push(MessageContentPart::file(MessageAttachment {
+                        mime_type: "text/plain".into(),
+                        name: Some("result.txt".into()),
+                        size_bytes: None,
+                        sha256: None,
+                        artifact: None,
+                        source: AttachmentDataSource::Bytes {
+                            base64_data: "bWVkaWEgcmVzdWx0".into(),
+                        },
+                    }));
+            }
+            let canonical_bytes = serde_json::to_vec(&canonical).unwrap();
+            for reasoning in [
+                None,
+                Some(ReasoningConfig::Disabled),
+                Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+            ] {
+                let off = crate::generation::selected_off(reasoning);
+                let mut request = request_with(canonical.clone());
+                request.model = "deepseek-v4-flash".into();
+                request.reasoning = reasoning;
+                request.max_tokens = Some(1024);
+                request.tools = Some(vec![crate::types::ToolDefinition {
+                    name: "read_file".into(),
+                    description: "Read".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }]);
+                // Default Provider budget: first request projection, text-only
+                // early return OR async media materialization with the same mode.
+                let budgeted = crate::attachments::runtime::with_async_authority_scope(
+                    "deepseek-mixed-budget-fixture".into(),
+                    provider.prepare_input_budget(request.clone()),
+                )
+                .await
+                .unwrap();
+                assert_eq!(budgeted.media.len(), usize::from(media));
+                assert_eq!(budgeted.request.messages[2].tool_calls.is_some(), off);
+                assert!(
+                    budgeted
+                        .request
+                        .messages
+                        .iter()
+                        .zip(&canonical)
+                        .all(|(prepared, original)| prepared.provenance == original.provenance)
+                );
+                for stream in [false, true] {
+                    let prepared = provider.prepare_request(budgeted.request.clone()).unwrap();
+                    let wire = crate::attachments::runtime::with_async_authority_scope(
+                        "deepseek-mixed-final-fixture".into(),
+                        provider
+                            .transport
+                            .render_chat_request_async_for_test(prepared, stream),
+                    )
+                    .await
+                    .unwrap();
+                    // Also materialize directly from wrapper projection. Budget
+                    // preparation must not change the final history representation.
+                    let direct = crate::attachments::runtime::with_async_authority_scope(
+                        "deepseek-mixed-direct-fixture".into(),
+                        provider.transport.render_chat_request_async_for_test(
+                            provider.prepare_request(request.clone()).unwrap(),
+                            stream,
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(wire["messages"], direct["messages"]);
+                    assert_eq!(wire["stream"], stream);
+                    assert_eq!(wire["max_tokens"], 1024);
+                    if off {
+                        assert_eq!(wire["thinking"]["type"], "disabled");
+                    }
+                    for id in ["call_2", "call_3"] {
+                        let native_call = wire["messages"].as_array().unwrap().iter().any(|m| {
+                            m["tool_calls"]
+                                .as_array()
+                                .is_some_and(|calls| calls.iter().any(|c| c["id"] == id))
+                        });
+                        let native_result = wire["messages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|m| m["role"] == "tool" && m["tool_call_id"] == id);
+                        assert_eq!(native_call, off);
+                        assert_eq!(native_result, off);
+                    }
+                    assert!(wire.to_string().contains("historical genuine rationale"));
+                    assert!(wire.to_string().contains("non-thinking result"));
+                }
+                for protected in [false, true] {
+                    let mut guarded = request.clone();
+                    for message in &mut guarded.messages[2..] {
+                        if protected {
+                            message.provenance.as_mut().unwrap().protected_input = true;
+                        } else {
+                            message.provenance = None;
+                        }
+                    }
+                    for stream in [false, true] {
+                        let prepared = provider.prepare_request(guarded.clone());
+                        if off {
+                            let wire = crate::attachments::runtime::with_async_authority_scope(
+                                "deepseek-active-off-fixture".into(),
+                                provider
+                                    .transport
+                                    .render_chat_request_async_for_test(prepared.unwrap(), stream),
+                            )
+                            .await
+                            .unwrap();
+                            assert!(wire["messages"].as_array().unwrap().iter().any(|m| {
+                                m["tool_calls"].as_array().is_some_and(|calls| {
+                                    calls.iter().any(|call| call["id"] == "call_2")
+                                })
+                            }));
+                        } else {
+                            let error = prepared.err().unwrap();
+                            assert!(
+                                error
+                                    .downcast_ref::<MissingDeepSeekReasoningReplay>()
+                                    .is_some()
+                            );
+                        }
+                    }
+                }
+                assert_eq!(serde_json::to_vec(&canonical).unwrap(), canonical_bytes);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn final_request_aware_preflight_preserves_incompatible_active_replay_guard() {
+        let provider = DeepSeekProvider::new("key");
+        let mut request =
+            request_with(vec![ChatMessage::assistant_tool_calls_with_provider_state(
+                None::<String>,
+                None::<String>,
+                vec![tool_call()],
+                Some(ProviderReplayState::for_model(
+                    "openrouter",
+                    "foreign",
+                    serde_json::json!({"schema_version":1}),
+                )),
+            )]);
+        request.model = "deepseek-v4-flash".into();
+        for reasoning in [
+            None,
+            Some(ReasoningConfig::Disabled),
+            Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+            Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+        ] {
+            request.reasoning = reasoning;
+            for stream in [false, true] {
+                assert!(provider.prepare_request(request.clone()).is_err());
+                let result = crate::attachments::runtime::with_async_authority_scope(
+                    "deepseek-incompatible-final-fixture".into(),
+                    provider
+                        .transport
+                        .render_chat_request_async_for_test(request.clone(), stream),
+                )
+                .await;
+                assert!(result.is_err());
+            }
         }
     }
 

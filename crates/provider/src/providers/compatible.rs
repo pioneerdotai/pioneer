@@ -1,9 +1,9 @@
 #[cfg(test)]
-use crate::attachments::prepare_messages_for_provider;
+use crate::attachments::prepare_messages_for_request;
 use crate::{
     attachments::{
         PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes, attachment_data_url,
-        ensure_no_unrendered_attachments, prepare_messages_for_provider_async,
+        ensure_no_unrendered_attachments, prepare_messages_for_request_async,
     },
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
     tools::parse::parse_tool_calls,
@@ -993,10 +993,10 @@ impl OpenAiCompatibleProvider {
     ) -> Result<ApiChatRequest> {
         let capabilities =
             <OpenAiCompatibleProvider as crate::traits::Provider>::capabilities(self);
-        let prepared = prepare_messages_for_provider_async(
+        let prepared = prepare_messages_for_request_async(
             self.name.as_str(),
-            request.model.as_str(),
             &capabilities,
+            &request,
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
@@ -1007,9 +1007,10 @@ impl OpenAiCompatibleProvider {
     fn build_chat_request(&self, request: ChatRequest, stream: bool) -> Result<ApiChatRequest> {
         let capabilities =
             <OpenAiCompatibleProvider as crate::traits::Provider>::capabilities(self);
-        let prepared = prepare_messages_for_provider(
+        let prepared = prepare_messages_for_request(
             self.name.as_str(),
             &capabilities,
+            &request,
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )?;
         self.build_chat_request_from_prepared(request, stream, prepared)
@@ -1030,6 +1031,18 @@ impl OpenAiCompatibleProvider {
         stream: bool,
     ) -> Result<serde_json::Value> {
         serde_json::to_value(self.build_chat_request(request, stream)?).map_err(Into::into)
+    }
+
+    /// Uses production's asynchronous model/request-aware materialization and
+    /// shared wire constructor. No HTTP/provider endpoint is involved.
+    #[cfg(test)]
+    pub(super) async fn render_chat_request_async_for_test(
+        &self,
+        request: ChatRequest,
+        stream: bool,
+    ) -> Result<serde_json::Value> {
+        serde_json::to_value(self.build_chat_request_async(request, stream).await?)
+            .map_err(Into::into)
     }
 
     fn build_chat_request_from_prepared(

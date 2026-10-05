@@ -14,7 +14,8 @@ use crate::attachments::errors::AttachmentPipelineError;
 use crate::attachments::normalize::{normalize_attachment_name, reconcile_mime};
 use crate::attachments::resolve::{resolve_attachment_source, resolve_sha256};
 use crate::types::{
-    ChatMessage, InputContentType, MessageAttachment, MessageContentPart, ProviderCapabilities,
+    ChatMessage, ChatRequest, InputContentType, MessageAttachment, MessageContentPart,
+    ProviderCapabilities,
 };
 use anyhow::Result;
 use base64::Engine;
@@ -118,6 +119,7 @@ pub fn prepare_messages_for_provider_model(
     prepare_messages_for_provider_target(
         provider_name,
         Some(model),
+        None,
         capabilities,
         messages,
         &config,
@@ -131,6 +133,52 @@ pub fn prepare_messages_for_provider_model(
 pub async fn prepare_messages_for_provider_async(
     provider_name: &str,
     model: &str,
+    capabilities: &ProviderCapabilities,
+    messages: &[ChatMessage],
+) -> Result<PreparedProviderMessages> {
+    prepare_messages_async(provider_name, model, None, capabilities, messages).await
+}
+
+/// Request-aware replay projection for generation consumers. Message-only
+/// callers retain their legacy policy; requests supply their current mode.
+/// `messages` can be rendered prompt messages or the budget's canonical copy.
+pub(crate) async fn prepare_messages_for_request_async(
+    provider_name: &str,
+    capabilities: &ProviderCapabilities,
+    request: &ChatRequest,
+    messages: &[ChatMessage],
+) -> Result<PreparedProviderMessages> {
+    prepare_messages_async(
+        provider_name,
+        &request.model,
+        crate::history::request_thinking_override(provider_name, request),
+        capabilities,
+        messages,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_messages_for_request(
+    provider_name: &str,
+    capabilities: &ProviderCapabilities,
+    request: &ChatRequest,
+    messages: &[ChatMessage],
+) -> Result<PreparedProviderMessages> {
+    prepare_messages_for_provider_target(
+        provider_name,
+        Some(&request.model),
+        crate::history::request_thinking_override(provider_name, request),
+        capabilities,
+        messages,
+        &default_attachment_pipeline_config(),
+    )
+}
+
+async fn prepare_messages_async(
+    provider_name: &str,
+    model: &str,
+    thinking_override: Option<bool>,
     capabilities: &ProviderCapabilities,
     messages: &[ChatMessage],
 ) -> Result<PreparedProviderMessages> {
@@ -153,6 +201,7 @@ pub async fn prepare_messages_for_provider_async(
             prepare_messages_for_provider_target(
                 provider_name.as_str(),
                 Some(model.as_str()),
+                thinking_override,
                 &capabilities,
                 messages.as_slice(),
                 &config,
@@ -169,12 +218,13 @@ pub fn prepare_messages_for_provider_with_config(
     messages: &[ChatMessage],
     config: &AttachmentPipelineConfig,
 ) -> Result<PreparedProviderMessages> {
-    prepare_messages_for_provider_target(provider_name, None, capabilities, messages, config)
+    prepare_messages_for_provider_target(provider_name, None, None, capabilities, messages, config)
 }
 
 fn prepare_messages_for_provider_target(
     provider_name: &str,
     model: Option<&str>,
+    thinking_override: Option<bool>,
     capabilities: &ProviderCapabilities,
     messages: &[ChatMessage],
     config: &AttachmentPipelineConfig,
@@ -185,7 +235,14 @@ fn prepare_messages_for_provider_target(
         .sum::<usize>();
     observability::emit_preflight_start(provider_name, messages.len(), attachment_count_hint);
 
-    let result = prepare_messages_impl(provider_name, model, capabilities, messages, config);
+    let result = prepare_messages_impl(
+        provider_name,
+        model,
+        thinking_override,
+        capabilities,
+        messages,
+        config,
+    );
     match &result {
         Ok(prepared) => {
             observability::emit_preflight_ok(provider_name, prepared.budget_report);
@@ -207,12 +264,15 @@ fn prepare_messages_for_provider_target(
 fn prepare_messages_impl(
     provider_name: &str,
     model: Option<&str>,
+    thinking_override: Option<bool>,
     capabilities: &ProviderCapabilities,
     messages: &[ChatMessage],
     config: &AttachmentPipelineConfig,
 ) -> Result<PreparedProviderMessages> {
     let projected_messages = model
-        .map(|model| crate::history::project_messages_for_provider(provider_name, model, messages))
+        .map(|model| {
+            crate::history::project_messages(provider_name, model, thinking_override, messages)
+        })
         .transpose()?;
     let messages = projected_messages.as_deref().unwrap_or(messages);
     let attachment_count = messages

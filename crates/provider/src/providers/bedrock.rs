@@ -1112,6 +1112,156 @@ fn provider_model_from_bedrock_model_summary(m: BedrockModelSummary) -> Provider
 
 #[cfg(test)]
 mod tests {
+    /// A documented AWS platform vocabulary update, represented both as a
+    /// saved catalog profile and as a fresh models.dev source update. Limits
+    /// remain those of the pinned source; no second limits catalog is created.
+    fn aws_46_catalog(fresh: bool) -> crate::catalog::ModelCatalog {
+        use crate::catalog::generator::{SOURCE_URLS, SourceSnapshot, generate};
+        let ids = [
+            "anthropic.claude-opus-4-6-v1",
+            "us.anthropic.claude-opus-4-6-v1",
+            "eu.anthropic.claude-opus-4-6-v1",
+            "au.anthropic.claude-opus-4-6-v1",
+            "global.anthropic.claude-opus-4-6-v1",
+        ];
+        if fresh {
+            let mut source: SourceSnapshot =
+                serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                    .unwrap();
+            for id in ids {
+                source.sources.get_mut(SOURCE_URLS[0]).unwrap().body["amazon-bedrock"]["models"]
+                    [id]["reasoning_options"][0]["values"] =
+                    serde_json::json!(["low", "medium", "high", "xhigh", "max"]);
+            }
+            let generated = generate(&source, true).unwrap();
+            crate::catalog::ModelCatalog::parse(
+                &serde_json::to_string(&generated.models).unwrap(),
+                &serde_json::to_string(&generated.provenance).unwrap(),
+            )
+            .unwrap()
+        } else {
+            let mut models: serde_json::Value =
+                serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json"))
+                    .unwrap();
+            for id in ids {
+                models["amazon-bedrock"][id]["thinkingLevelMap"]["xhigh"] =
+                    serde_json::json!("xhigh");
+                models["amazon-bedrock"][id]["sourceGeneration"]["reasoningOptions"] = serde_json::json!([{"type":"effort","values":["low","medium","high","xhigh","max"]}]);
+            }
+            crate::catalog::ModelCatalog::parse(
+                &models.to_string(),
+                include_str!("../../tests/fixtures/catalog/provenance.json"),
+            )
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn aws_opus_46_xhigh_survives_discovery_and_native_converse_materialization() {
+        let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
+        for fresh in [false, true] {
+            let updated = aws_46_catalog(fresh);
+            let original = crate::generation::test_catalog(fresh);
+            for id in [
+                "anthropic.claude-opus-4-6-v1",
+                "us.anthropic.claude-opus-4-6-v1",
+                "eu.anthropic.claude-opus-4-6-v1",
+                "au.anthropic.claude-opus-4-6-v1",
+                "global.anthropic.claude-opus-4-6-v1",
+            ] {
+                let discovered = crate::generation::test_discovery(&updated, "bedrock", id);
+                assert!(
+                    discovered
+                        .capabilities
+                        .reasoning
+                        .as_ref()
+                        .unwrap()
+                        .effort_options
+                        .contains(&"xhigh".into())
+                );
+                let mut request = crate::generation::test_request(id);
+                request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::XHigh));
+                let prepared = prepare_messages_for_provider_model(
+                    "bedrock",
+                    id,
+                    &provider.capabilities(),
+                    &request.messages,
+                )
+                .unwrap();
+                for catalog in [None, Some(&original), Some(&updated)] {
+                    // Existing stream_chat delegates to chat and uses this same constructor.
+                    let body = serde_json::to_value(
+                        BedrockProvider::build_request_with_catalog(&request, &prepared, catalog)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        body["additionalModelRequestFields"]["output_config"]["effort"],
+                        "xhigh"
+                    );
+                    assert_eq!(
+                        body["additionalModelRequestFields"]["thinking"]["type"],
+                        "adaptive"
+                    );
+                    assert_eq!(body["inferenceConfig"]["maxTokens"], 1024);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aws_46_platform_exception_cannot_widen_other_profiles_or_override_denials() {
+        let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
+        let id = "anthropic.claude-opus-4-6-v1";
+        for metadata in [
+            serde_json::json!({"compat":{"supportsReasoningEffort":false},"thinkingLevelMap":{"xhigh":"xhigh"}}),
+            serde_json::json!({"thinkingLevelMap":{"xhigh":"invented"}}),
+        ] {
+            let catalog = crate::generation::test_catalog_model("amazon-bedrock", id, id, metadata);
+            let mut request = crate::generation::test_request(id);
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::XHigh));
+            let prepared = prepare_messages_for_provider_model(
+                "bedrock",
+                id,
+                &provider.capabilities(),
+                &request.messages,
+            )
+            .unwrap();
+            assert!(
+                BedrockProvider::build_request_with_catalog(&request, &prepared, Some(&catalog))
+                    .is_err()
+            );
+            let discovered = crate::generation::test_discovery(&catalog, "bedrock", id);
+            assert!(
+                discovered
+                    .capabilities
+                    .reasoning
+                    .as_ref()
+                    .is_none_or(|r| !r.effort_options.contains(&"xhigh".into()))
+            );
+        }
+        for id in [
+            "anthropic.claude-opus-4-5-20251101-v1:0",
+            "anthropic.claude-sonnet-4-6",
+            "anthropic.claude-opus-4-8",
+            "anthropic.claude-opus-4-6-opaque",
+            "arn:aws:bedrock:region:account:application-inference-profile/opaque",
+        ] {
+            let mut request = crate::generation::test_request(id);
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::XHigh));
+            let prepared = prepare_messages_for_provider_model(
+                "bedrock",
+                id,
+                &provider.capabilities(),
+                &request.messages,
+            )
+            .unwrap();
+            assert!(
+                BedrockProvider::build_request_with_catalog(&request, &prepared, None).is_err()
+            );
+        }
+    }
+
     #[test]
     fn converse_mandatory_and_source_denials_override_stale_metadata() {
         let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");

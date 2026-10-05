@@ -330,7 +330,7 @@ pub fn project_messages_for_provider(
     project_messages(provider, model, None, messages)
 }
 
-fn project_messages(
+pub(crate) fn project_messages(
     provider: &str,
     model: &str,
     thinking_override: Option<bool>,
@@ -473,12 +473,17 @@ fn project_messages(
         .collect()
 }
 
+/// Keep the current request's mode authoritative through budget and attachment
+/// materialization. Historical reasoning must never override explicit off.
+pub(crate) fn request_thinking_override(provider: &str, request: &ChatRequest) -> Option<bool> {
+    (provider == "deepseek").then(|| crate::generation::deepseek_effective_thinking(request))
+}
+
 pub fn project_request_for_provider(
     provider: &str,
     mut request: ChatRequest,
 ) -> Result<ChatRequest> {
-    let thinking =
-        (provider == "deepseek").then(|| crate::generation::deepseek_effective_thinking(&request));
+    let thinking = request_thinking_override(provider, &request);
     request.messages = project_messages(
         provider,
         request.model.as_str(),

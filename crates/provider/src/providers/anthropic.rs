@@ -1077,6 +1077,37 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
 #[cfg(test)]
 mod tests {
     #[test]
+    fn direct_opus_46_vocabulary_is_not_expanded_by_aws_platform_rules() {
+        for effort in [ReasoningEffort::XHigh, ReasoningEffort::Max] {
+            let mut request = crate::generation::test_request("claude-opus-4-6");
+            request.reasoning = Some(ReasoningConfig::Effort(effort));
+            let mapped = crate::generation::test_catalog_model(
+                "anthropic",
+                "claude-opus-4-6",
+                "claude-opus-4-6",
+                serde_json::json!({"thinkingLevelMap":{"xhigh":"xhigh","max":"max"}}),
+            );
+            for catalog in [None, Some(&mapped)] {
+                for stream in [false, true] {
+                    let result = AnthropicProvider::build_chat_request_with_catalog(
+                        &request,
+                        None,
+                        vec![],
+                        stream,
+                        catalog,
+                    );
+                    assert_eq!(result.is_ok(), effort == ReasoningEffort::Max);
+                    if let Ok(body) = result {
+                        let json = serde_json::to_value(body).unwrap();
+                        assert_eq!(json["output_config"]["effort"], "max");
+                        assert_eq!(json["thinking"]["type"], "adaptive");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn stale_adaptive_hint_cannot_change_opus_45_effort_only_contract() {
         let catalog = crate::generation::test_catalog_model(
             "anthropic",

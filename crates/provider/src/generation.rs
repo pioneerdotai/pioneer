@@ -928,7 +928,14 @@ fn anthropic_fields_with_model(
     ]
     .iter()
     .any(|family| claude_family(id, family));
-    let known_effort = registry.is_some_and(|r| r.effort_options.contains(&wire)) || modern;
+    // AWS Converse documents xhigh for the exact Opus 4.6-v1 platform
+    // profile, whereas direct Messages does not. claude_id has already bounded
+    // exact/regional identity; a map cannot grant this to another model.
+    // https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-adaptive-thinking.html
+    let aws_opus_46 = provider == "bedrock" && id == "claude-opus-4-6-v1";
+    let known_effort = registry.is_some_and(|r| r.effort_options.contains(&wire))
+        || modern
+        || aws_opus_46 && wire == "xhigh";
     ensure!(
         known_effort,
         "Claude model does not document selected qualitative effort (legacy thinking needs numeric budget)"
