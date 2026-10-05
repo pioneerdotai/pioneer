@@ -28334,6 +28334,48 @@ impl CrudStore {
         claim_expires_at: DateTimeWithTimeZone,
         enqueue_optional_deliveries: bool,
     ) -> Result<()> {
+        self.append_and_project_turn_event_with_replay_in_transaction(
+            transaction,
+            prepared,
+            created_at,
+            claim_expires_at,
+            enqueue_optional_deliveries,
+            false,
+        )
+        .await
+    }
+
+    async fn append_and_project_compaction_event_in_transaction(
+        &self,
+        transaction: &DatabaseTransaction,
+        prepared: PreparedProjectedTurnEvent,
+        created_at: DateTimeWithTimeZone,
+        claim_expires_at: DateTimeWithTimeZone,
+    ) -> Result<()> {
+        // Replaying ItemStarted would allocate another running attempt. Only
+        // the terminal service item may restore an already projected event.
+        let repair_terminal_projection =
+            matches!(prepared.event.payload(), TurnEventPayload::ItemCompleted(_));
+        self.append_and_project_turn_event_with_replay_in_transaction(
+            transaction,
+            prepared,
+            created_at,
+            claim_expires_at,
+            true,
+            repair_terminal_projection,
+        )
+        .await
+    }
+
+    async fn append_and_project_turn_event_with_replay_in_transaction(
+        &self,
+        transaction: &DatabaseTransaction,
+        prepared: PreparedProjectedTurnEvent,
+        created_at: DateTimeWithTimeZone,
+        claim_expires_at: DateTimeWithTimeZone,
+        enqueue_optional_deliveries: bool,
+        repair_compaction_projection: bool,
+    ) -> Result<()> {
         let PreparedProjectedTurnEvent {
             event,
             projection,
@@ -28354,6 +28396,16 @@ impl CrudStore {
             )
             .await?
             {
+                if repair_compaction_projection {
+                    // A projected service event is idempotent, but its exact
+                    // item may have been deleted/replayed. Restore projections
+                    // atomically without appending or delivering it twice.
+                    self.projector
+                        .project_prepared(transaction, &appended_event, projection)
+                        .await?;
+                    self.project_semantic_timeline_live_turn_event(transaction, &appended_event)
+                        .await?;
+                }
                 return Ok(());
             }
             anyhow::bail!(

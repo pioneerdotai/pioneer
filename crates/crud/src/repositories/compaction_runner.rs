@@ -1084,6 +1084,32 @@ pub(crate) async fn compaction_resume_deadline(
     }).await
 }
 
+/// Shared preparation for foreground reconciliation and pending repair. Decode
+/// and encode happen outside the writer; the caller fences every source value.
+pub(super) fn reconciled_terminal_runner(
+    state: &RunnerState,
+    status: &str,
+    outcome: Option<&str>,
+) -> Result<RunnerState> {
+    if status == "running"
+        || status == "completed"
+        || matches!(
+            state.phase,
+            RunnerPhase::Failed { .. } | RunnerPhase::Applied { .. }
+        )
+    {
+        return Ok(state.clone());
+    }
+    let kind = if status == "cancelled" {
+        FailureKind::Cancelled
+    } else if outcome == Some("deadline") {
+        FailureKind::Deadline
+    } else {
+        FailureKind::Permanent
+    };
+    state.terminate(kind)
+}
+
 /// Complete the state record after a control-plane terminal fence. No
 /// attempt can advance past that fence. Preparation reads one bounded row;
 /// the write revalidates its generation and durable terminal classification.
@@ -1117,23 +1143,10 @@ pub(crate) async fn compaction_reconcile_runner_state(
         return Ok(None);
     };
     let state: RunnerState = serde_json::from_str(&state)?;
-    if status == "running"
-        || status == "completed"
-        || matches!(
-            state.phase,
-            RunnerPhase::Failed { .. } | RunnerPhase::Applied { .. }
-        )
-    {
+    let terminal = reconciled_terminal_runner(&state, &status, outcome.as_deref())?;
+    if terminal == state {
         return Ok(Some(state));
     }
-    let kind = if status == "cancelled" {
-        FailureKind::Cancelled
-    } else if outcome.as_deref() == Some("deadline") {
-        FailureKind::Deadline
-    } else {
-        FailureKind::Permanent
-    };
-    let terminal = state.terminate(kind)?;
     let encoded = serde_json::to_string(&terminal)?;
     ensure!(
         encoded.len() <= SOURCE_PAGE_BYTES,
