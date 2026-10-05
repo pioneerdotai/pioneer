@@ -78038,11 +78038,11 @@ async fn graph_snapshot_matches_revision_runs_and_rejects_foreign_or_unknown() {
         )
         .await;
     }
-    let owners = processor
-        .agent_manager
-        .capture_native_stop_owners(&["graph-initial".into(), "graph-revision".into()], 8)
-        .await
-        .unwrap();
+    let owners = native_snapshot_after_publication(
+        &processor.agent_manager,
+        &["graph-initial".into(), "graph-revision".into()],
+    )
+    .await;
     assert_eq!(owners.len(), 2);
     let binding =
         |thread: &str, turn: &str, pending| pioneer_crud::AgentWorkGraphCancellationTarget {
@@ -78123,11 +78123,22 @@ async fn graph_snapshot_matches_revision_runs_and_rejects_foreign_or_unknown() {
         .unwrap();
     let mut partial_targets = targets.clone();
     partial_targets[0].turn_pending = false;
-    let partial_snapshot = processor
-        .agent_manager
-        .capture_native_stop_owners(&["graph-initial".into(), "graph-revision".into()], 8)
-        .await
-        .unwrap();
+    let partial_snapshot = native_snapshot_after_publication(
+        &processor.agent_manager,
+        &["graph-initial".into(), "graph-revision".into()],
+    )
+    .await;
+    let captured_runs = partial_snapshot
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        super::agent_runtime::validate_native_graph_stop_snapshot(
+            &captured_runs,
+            &partial_snapshot
+        )
+        .is_err()
+    );
     let active_sibling = super::agent_runtime::select_native_graph_owners(
         &partial_targets,
         partial_snapshot,
@@ -78140,11 +78151,11 @@ async fn graph_snapshot_matches_revision_runs_and_rejects_foreign_or_unknown() {
     assert_eq!(active_sibling[0].turn_id(), "revision");
     // A still-pending DB row can reuse the latest actual joined outcome on retry,
     // while completed initial/revision history needs no retained old owner.
-    let joined_snapshot = processor
-        .agent_manager
-        .capture_native_stop_owners(&["graph-initial".into(), "graph-revision".into()], 8)
-        .await
-        .unwrap();
+    let joined_snapshot = native_snapshot_after_publication(
+        &processor.agent_manager,
+        &["graph-initial".into(), "graph-revision".into()],
+    )
+    .await;
     assert_eq!(
         super::agent_runtime::select_native_graph_owners(
             &targets,
@@ -78165,11 +78176,21 @@ async fn graph_snapshot_matches_revision_runs_and_rejects_foreign_or_unknown() {
         )
         .await
         .unwrap();
-    let remaining = processor
-        .agent_manager
-        .capture_native_stop_owners(&["graph-initial".into(), "graph-revision".into()], 8)
-        .await
-        .unwrap();
+    let remaining = native_snapshot_after_publication(
+        &processor.agent_manager,
+        &["graph-initial".into(), "graph-revision".into()],
+    )
+    .await;
+    // The initial snapshot also contained the already drained historical sibling.
+    super::agent_runtime::validate_native_graph_stop_snapshot(&captured_runs, &remaining).unwrap();
+    let selected_only = active_sibling
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        super::agent_runtime::validate_native_graph_stop_snapshot(&selected_only, &remaining)
+            .is_err()
+    );
     let terminal_targets = targets
         .iter()
         .cloned()
@@ -78194,4 +78215,186 @@ async fn graph_snapshot_matches_revision_runs_and_rejects_foreign_or_unknown() {
         .agent_manager
         .remove_thread("graph-revision")
         .await;
+}
+
+#[tokio::test]
+async fn persisted_interrupted_turn_cannot_hide_accepted_direct_checkpoint_startup() {
+    let (tx, mut rx) = mpsc::channel(64);
+    let sessions = Arc::new(SessionManager::new());
+    let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
+    let (workspaces, store, workspace) = setup_workspace_manager().await;
+    let provider = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "delayed",
+        Arc::new(DelayedProvider {
+            delay: Duration::from_secs(60),
+            text: "done".into(),
+        }),
+    ));
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("test-model", "delayed")),
+        provider,
+        sessions,
+        workspaces,
+        store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    );
+    let thread = "checkpoint-admission";
+    let turn = "checkpoint-turn";
+    start_thread_and_turn(
+        &processor, connection, &mut rx, &workspace, thread, turn, "Chat", "delayed",
+    )
+    .await;
+    assert!(
+        processor
+            .mark_turn_interrupted(thread.into(), turn.into(), "user stop committed".into())
+            .await
+    );
+    processor.agent_manager.remove_thread(thread).await;
+    processor
+        .agent_manager
+        .ensure_thread(thread, &workspace)
+        .await
+        .unwrap();
+    // Pause the actual actor before activate using its existing checkpoint
+    // durable-publication ACK, not a manually constructed completed control.
+    let mut durable = processor
+        .agent_manager
+        .take_durable_receiver(thread)
+        .await
+        .unwrap();
+    let payload = serde_json::from_value(json!({
+        "schema_version": pioneer_protocol::EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
+        "workspace_id": workspace, "thread_id": thread, "turn_id": turn,
+        "original_request": {"input_count": 1, "text_truncated": false, "attachment_count": 0},
+        "window": {"window_index": 1, "agent_round_count": 1, "tool_call_count": 0},
+        "provider_budget": {"agent_round_count": 1, "tool_call_count": 0, "provider_usage_available": false},
+        "tools": {"requested_count": 0, "executed_count": 0, "unexecuted_count": 0,
+            "total_count": 0, "succeeded_count": 0, "failed_count": 0, "in_progress_count": 0,
+            "detail_limit": 1, "details_truncated": false}
+    })).unwrap();
+    let checkpoint = pioneer_agent::ExecutionCheckpointContext {
+        window_id: format!("{turn}:window:1"),
+        window_index: 1,
+        checkpoint_id: "checkpoint".into(),
+        checkpoint_kind: "window_exhausted".into(),
+        payload,
+        usage: pioneer_agent::ExecutionWindowUsageSnapshot::default(),
+    };
+    let native = processor.agent_manager.clone();
+    let start = tokio::spawn(async move {
+        let cwd = std::env::current_dir().unwrap();
+        native.start_turn_with_hook_context_and_execution_checkpoint_permission_profile_and_security_snapshot(
+            thread, turn, ThreadMode::Chat, pioneer_agent::AgentTurnHookRuntimeContext::default(), "test-model", "delayed",
+            HashMap::new(), pioneer_skills::SkillCatalogSnapshot { version: 1, generated_at_unix: 0, skills: Vec::new() },
+            vec![UserInput::Text { text: "checkpoint startup".into(), text_elements: Vec::new() }],
+            Vec::new(), Vec::new(), HashMap::new(), Vec::new(), Some(checkpoint),
+            pioneer_protocol::default_turn_permission_profile_snapshot(),
+            pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(cwd.to_string_lossy(), 1),
+        ).await
+    });
+    let event = tokio::time::timeout(Duration::from_secs(2), durable.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        event,
+        pioneer_protocol::AgentDurableEvent::TurnExecutionWindowContinued { .. }
+    ));
+    assert!(
+        processor
+            .agent_manager
+            .active_turn_id(thread)
+            .await
+            .is_none()
+    );
+    let (_, persisted) = processor
+        .crud_store
+        .get_turn(thread, turn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.status, TurnStatus::Interrupted);
+    let target = pioneer_crud::AgentWorkGraphCancellationTarget {
+        execution_id: "checkpoint-execution".into(),
+        thread_id: Some(thread.into()),
+        turn_id: Some(turn.into()),
+        parent_task_id: None,
+        turn_pending: false,
+        has_cli_binding: false,
+    };
+    let stopped = processor
+        .agent_manager
+        .capture_native_stop_owners(&[thread.into()], 8)
+        .await
+        .map_err(anyhow::Error::new)
+        .and_then(|owners| {
+            super::agent_runtime::select_native_graph_owners(&[target], owners, thread, turn, false)
+        });
+    assert!(
+        stopped.is_err(),
+        "persisted Interrupted cannot acknowledge accepted unpublished startup"
+    );
+    assert!(matches!(
+        processor
+            .agent_manager
+            .cancel_turn_and_wait(
+                thread,
+                turn,
+                "fallback before publication",
+                tokio::time::Instant::now() + Duration::from_secs(1)
+            )
+            .await,
+        Err(pioneer_agent::StopError::UnknownOwner)
+    ));
+    durable.acknowledge_last(Ok(()));
+    start.await.unwrap().unwrap();
+    let owner = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(owners) = processor
+                .agent_manager
+                .capture_native_stop_owners(&[thread.into()], 8)
+                .await
+            {
+                if let Some(owner) = owners
+                    .into_iter()
+                    .find(|owner| owner.turn_id() == turn && !owner.is_quiescent())
+                {
+                    break owner;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    processor
+        .await_native_graph_owner(
+            &owner,
+            "retry after publication",
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert!(owner.is_quiescent());
+    drop(durable);
+    processor.agent_manager.remove_thread(thread).await;
+}
+
+async fn native_snapshot_after_publication(
+    manager: &pioneer_agent::AgentManager,
+    threads: &[String],
+) -> Vec<pioneer_agent::NativeTurnStopOwner> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match manager.capture_native_stop_owners(threads, 8).await {
+                Ok(owners) => return owners,
+                Err(pioneer_agent::StopError::UnknownOwner) => tokio::task::yield_now().await,
+                Err(error) => panic!("unexpected native snapshot error: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap()
 }

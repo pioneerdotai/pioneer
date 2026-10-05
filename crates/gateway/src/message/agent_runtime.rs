@@ -7523,7 +7523,7 @@ impl MessageProcessor {
                 .await?
         };
 
-        let native_owners = if completion_deadline.is_some() {
+        let (native_owners, native_threads, captured_runs) = if completion_deadline.is_some() {
             let mut threads = targets
                 .iter()
                 .filter_map(|target| target.turn_id.as_ref().and(target.thread_id.clone()))
@@ -7532,19 +7532,26 @@ impl MessageProcessor {
             // Capture before Task/native cancellation, after the durable admission
             // fence. Snapshot also covers predecessor and retirement ownership;
             // historical terminal rows alone are never cleanup proof.
+            let threads = threads.into_iter().collect::<Vec<_>>();
             let owners = self
                 .agent_manager
-                .capture_native_stop_owners(&threads.into_iter().collect::<Vec<_>>(), 65_536)
+                .capture_native_stop_owners(&threads, 65_536)
                 .await?;
-            select_native_graph_owners(
+            // Include proven historical runs omitted from cancellation selection.
+            let captured_runs = owners
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>();
+            let owners = select_native_graph_owners(
                 &targets,
                 owners,
                 thread_id,
                 turn.id.as_str(),
                 matches!(turn.status, pioneer_protocol::TurnStatus::InProgress),
-            )?
+            )?;
+            (owners, threads, captured_runs)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new(), std::collections::HashSet::new())
         };
 
         let mut task_ids = targets
@@ -7655,6 +7662,16 @@ impl MessageProcessor {
             }
         }
 
+        if completion_deadline.is_some() {
+            // Completion of captured tasks can unblock a previously accepted
+            // recovery/continuation. Revalidate actor admission/publication at
+            // the success boundary; do not cancel a replacement by old run ID.
+            let remaining = self
+                .agent_manager
+                .capture_native_stop_owners(&native_threads, 65_536)
+                .await?;
+            validate_native_graph_stop_snapshot(&captured_runs, &remaining)?;
+        }
         Ok(true)
     }
 
@@ -9763,4 +9780,19 @@ pub(super) fn select_native_graph_owners(
                     && (owner.thread_id(), owner.turn_id()) == (root_thread, root_turn))
         })
         .collect())
+}
+
+/// The success boundary permits only proven-quiescent identities already in
+/// the initial snapshot, including history omitted from cancellation selection.
+pub(super) fn validate_native_graph_stop_snapshot(
+    captured: &std::collections::HashSet<pioneer_agent::NativeTurnStopOwner>,
+    remaining: &[pioneer_agent::NativeTurnStopOwner],
+) -> anyhow::Result<()> {
+    if remaining
+        .iter()
+        .any(|owner| !owner.is_quiescent() || !captured.contains(owner))
+    {
+        anyhow::bail!("native graph publication changed during stop; retry required");
+    }
+    Ok(())
 }

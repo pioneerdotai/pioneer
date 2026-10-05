@@ -310,6 +310,17 @@ pub(super) async fn run_agent_loop(
     }
 
     while let Some(command) = command_rx.recv().await {
+        // Start/recovery may ACK before replacement publication, and finish
+        // may continue a drained root into a new execution window. Keep this
+        // actor seam visible to stop snapshots through all intervening awaits.
+        let _publication = matches!(
+            &command,
+            AgentCommand::StartTurn { .. }
+                | AgentCommand::StartRecoveryAttempt { .. }
+                | AgentCommand::StartRestoredRecoveryTurn { .. }
+                | AgentCommand::TurnTaskFinished { .. }
+        )
+        .then(|| control_plane.publication_transition());
         // Retain the completed turn's Stop fence without owning background
         // preparation. Durable registration already happened before provider
         // execution and the Gateway worker owns all later work.

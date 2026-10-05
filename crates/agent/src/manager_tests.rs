@@ -6492,7 +6492,7 @@ async fn thread_removal_fences_a_full_mailbox_without_unbounded_wait() {
             control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
             control_plane: AgentThreadControlPlane::default(),
             event_hub: Arc::new(AgentEventHub::new()),
-            loop_handle,
+            loop_handle: crate::NativeTask::new(loop_handle),
         },
     );
 
@@ -6529,7 +6529,7 @@ async fn thread_removal_does_not_expose_replacement_until_old_actor_has_stopped(
             control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
             control_plane: AgentThreadControlPlane::default(),
             event_hub: Arc::new(AgentEventHub::new()),
-            loop_handle,
+            loop_handle: crate::NativeTask::new(loop_handle),
         },
     );
 
@@ -6600,7 +6600,7 @@ async fn control_timeout_fences_only_the_unresponsive_actor_generation() {
             control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
             control_plane: AgentThreadControlPlane::default(),
             event_hub: Arc::new(AgentEventHub::new()),
-            loop_handle,
+            loop_handle: crate::NativeTask::new(loop_handle),
         },
     );
 
@@ -6686,7 +6686,7 @@ async fn abandoned_enqueued_control_is_generation_fenced_on_reconciliation() {
             control_outcomes: outcomes,
             control_plane: AgentThreadControlPlane::default(),
             event_hub: Arc::new(AgentEventHub::new()),
-            loop_handle,
+            loop_handle: crate::NativeTask::new(loop_handle),
         },
     );
 
@@ -6747,7 +6747,7 @@ async fn terminal_retirement_fences_generation_before_registry_release() {
             control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
             control_plane: AgentThreadControlPlane::default(),
             event_hub: Arc::new(AgentEventHub::new()),
-            loop_handle,
+            loop_handle: crate::NativeTask::new(loop_handle),
         },
     );
 
@@ -6804,7 +6804,7 @@ async fn terminal_retirement_does_not_publish_replacement_before_old_actor_stops
             control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
             control_plane: AgentThreadControlPlane::default(),
             event_hub: Arc::new(AgentEventHub::new()),
-            loop_handle,
+            loop_handle: crate::NativeTask::new(loop_handle),
         },
     );
 
@@ -16226,3 +16226,6 @@ async fn compaction_boundary_prepares_each_follow_up_before_provider() {
         "new input reached the provider once"
     );
 }
+
+#[path = "manager_tests_stop_admission.rs"]
+mod stop_admission;
