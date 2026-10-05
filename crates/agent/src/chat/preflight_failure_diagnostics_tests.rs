@@ -81,9 +81,9 @@ fn preflight_events<'a>(
 }
 
 // sentry-tracing 0.49 stores event fields in a context, not event.extra.
-fn preflight_tracing_fields(
-    event: &sentry::protocol::Event<'static>,
-) -> &BTreeMap<String, JsonValue> {
+fn preflight_tracing_fields<'a>(
+    event: &'a sentry::protocol::Event<'static>,
+) -> &'a BTreeMap<String, JsonValue> {
     match event.contexts.get("Rust Tracing Fields") {
         Some(sentry::protocol::Context::Other(fields)) => fields,
         _ => panic!("preflight event must retain its Rust Tracing Fields context"),
