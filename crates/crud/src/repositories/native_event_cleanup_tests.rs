@@ -10,7 +10,9 @@ use pioneer_sqlite::{
     SqliteWriteExecutor, SqliteWriteObserver, sqlite_read_only_connection_url,
 };
 use sea_orm::sea_query::SqliteQueryBuilder;
-use sea_orm::{ConnectOptions, Database, DatabaseBackend, Statement};
+use sea_orm::{
+    ActiveModelTrait, ConnectOptions, Database, DatabaseBackend, EntityTrait, Set, Statement,
+};
 use std::{
     path::PathBuf,
     sync::{
@@ -246,6 +248,43 @@ impl Fixture {
         self.bind(id, "codex", if completed { "completed" } else { "running" })
             .await
     }
+    async fn historical_completed_turn(&self, id: &str) -> Result<()> {
+        // Seed the release-boundary schema without invoking today's projector,
+        // which requires outbox columns added by later migrations.
+        let at = chrono::DateTime::from_timestamp(NOW, 0)
+            .unwrap()
+            .fixed_offset();
+        pioneer_entity::thread::Entity::insert(pioneer_entity::thread::ActiveModel {
+            id: Set("thread-cleanup".into()),
+            workspace_id: Set("ws-cleanup".into()),
+            preview: Set(String::new()),
+            mode: Set("agent".into()),
+            model: Set("gpt-5.4".into()),
+            model_provider: Set("openai".into()),
+            status: Set("active".into()),
+            created_at: Set(at),
+            updated_at: Set(at),
+            ..Default::default()
+        })
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(pioneer_entity::thread::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(&self.db)
+        .await?;
+        pioneer_entity::turn::ActiveModel {
+            id: Set(id.into()),
+            thread_id: Set("thread-cleanup".into()),
+            status: Set("completed".into()),
+            created_at: Set(at),
+            updated_at: Set(at),
+            ..Default::default()
+        }
+        .insert(&self.db)
+        .await?;
+        self.bind(id, "codex", "completed").await
+    }
     async fn bind(&self, id: &str, runtime: &str, status: &str) -> Result<()> {
         let at = chrono::DateTime::from_timestamp(NOW, 0)
             .unwrap()
@@ -480,7 +519,7 @@ async fn byte_budget_runtime_ownership_and_empty_preparation_races() -> Result<(
 #[tokio::test]
 async fn migration_bootstrap_restart_vacuum_and_live_events_before_cursor() -> Result<()> {
     let f = Fixture::open_version(false).await?;
-    f.turn("legacy", true).await?;
+    f.historical_completed_turn("legacy").await?;
     for i in 0..130 {
         f.event(
             &format!("m-{i:03}"),
@@ -506,7 +545,7 @@ async fn migration_bootstrap_restart_vacuum_and_live_events_before_cursor() -> R
     assert!(!first.complete);
     let f = f.restart().await?;
     f.sql("VACUUM").await?;
-    f.turn("live", true).await?;
+    f.historical_completed_turn("live").await?;
     f.event("a-live", Some("live"), "codex", "item/completed", 1)
         .await?;
     assert_eq!(
@@ -947,7 +986,7 @@ async fn moved_event_wakes_destination_and_queued_deletes_do_not_update_job() ->
 #[tokio::test]
 async fn bootstrap_cursor_rolls_back_with_job_registration_failure() -> Result<()> {
     let f = Fixture::open_version(false).await?;
-    f.turn("legacy", true).await?;
+    f.historical_completed_turn("legacy").await?;
     f.event("legacy", Some("legacy"), "codex", "item/completed", 8)
         .await?;
     let f = f.migrate(false).await?;

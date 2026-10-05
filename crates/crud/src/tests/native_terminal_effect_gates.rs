@@ -1001,13 +1001,19 @@ async fn planner_uses_four_covering_seeks_gate_partial_range_and_three_claim_ran
         )
         .await;
     }
-    assert_plan(
-        &db,
-        outbox::gate_due_page(NOW, 8).build(DatabaseBackend::Sqlite),
-        "idx_native_terminal_effect_gate_due",
-        &["gate_probe_at<?"],
-    )
-    .await;
+    let gate_statement = outbox::gate_due_page(NOW, 8);
+    for analyzed in [false, true] {
+        if analyzed {
+            db.execute_unprepared("ANALYZE").await.unwrap();
+        }
+        assert_plan(
+            &db,
+            gate_statement.clone(),
+            "idx_native_terminal_effect_gate_due",
+            &["gate_probe_at<?"],
+        )
+        .await;
+    }
     for status in ["ready", "retry_wait", "running"] {
         let statement =
             outbox::claim_page(status, unix_to_datetime(NOW), 3).build(DatabaseBackend::Sqlite);

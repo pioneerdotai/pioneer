@@ -8,8 +8,9 @@ use pioneer_sqlite::SqliteDatabase;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult,
-    IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait,
+    FromQueryResult, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    Statement, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -1251,19 +1252,21 @@ pub(crate) async fn apply_prepared_gate_resolution<C: ConnectionTrait>(
     Ok(resolved)
 }
 
-// A literal predicate is intentional: SQLite must prove the partial-index
-// predicate at prepare time, without a residual status filter on the due range.
-pub(crate) fn gate_due_page(
-    now: i64,
-    limit: u64,
-) -> sea_orm::Select<native_terminal_effect_outbox::Entity> {
-    native_terminal_effect_outbox::Entity::find()
-        .filter(Expr::cust("status = 'waiting_acceptance'"))
-        .filter(native_terminal_effect_outbox::Column::GateProbeAt.lte(now))
-        .order_by_asc(native_terminal_effect_outbox::Column::GateProbeAt)
-        .order_by_asc(native_terminal_effect_outbox::Column::PreparedAt)
-        .order_by_asc(native_terminal_effect_outbox::Column::EffectId)
-        .limit(std::cmp::min(limit, EFFECT_INPUT_BUDGET))
+// SeaQuery has no SQLite INDEXED BY support. The literal predicate makes the
+// partial index usable; INDEXED BY prevents a competing status index and sort
+// from visiting the entire waiting set before LIMIT.
+pub(crate) fn gate_due_page(now: i64, limit: u64) -> Statement {
+    Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "SELECT native_terminal_effect_outbox.* FROM native_terminal_effect_outbox \
+         INDEXED BY idx_native_terminal_effect_gate_due \
+         WHERE status = 'waiting_acceptance' AND gate_probe_at <= ? \
+         ORDER BY gate_probe_at, prepared_at, effect_id LIMIT ?",
+        [
+            now.into(),
+            (std::cmp::min(limit, EFFECT_INPUT_BUDGET) as i64).into(),
+        ],
+    )
 }
 
 fn probe_delay(attempts: i64) -> i64 {
@@ -1454,7 +1457,10 @@ pub(crate) async fn discover_gate_probes(
     now: i64,
     limit: u64,
 ) -> Result<Vec<native_terminal_effect_outbox::Model>> {
-    Ok(gate_due_page(now, limit).all(db).await?)
+    Ok(native_terminal_effect_outbox::Entity::find()
+        .from_raw_sql(gate_due_page(now, limit))
+        .all(db)
+        .await?)
 }
 
 pub(crate) fn claim_page(
