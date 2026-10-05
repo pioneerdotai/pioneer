@@ -7506,16 +7506,6 @@ impl MessageProcessor {
             return Ok(false);
         }
 
-        let root_owner = if completion_deadline.is_some() {
-            Some(
-                self.agent_manager
-                    .capture_turn_stop_owner(thread_id, turn.id.as_str())
-                    .await?,
-            )
-        } else {
-            None
-        };
-
         // Fence every queued/running descendant before asking provider
         // runtimes to stop. Any concurrent action commit then observes the
         // terminal execution/resource state and fails closed.
@@ -7533,29 +7523,29 @@ impl MessageProcessor {
                 .await?
         };
 
-        let mut native_owners = std::collections::HashMap::new();
-        if completion_deadline.is_some() {
-            for target in &targets {
-                if target.execution_id == execution.id {
-                    continue;
-                }
-                if let (Some(thread), Some(turn)) = (&target.thread_id, &target.turn_id) {
-                    native_owners.insert(
-                        target.execution_id.clone(),
-                        self.agent_manager
-                            .capture_turn_stop_owner(thread, turn)
-                            .await
-                            .map_err(|error| {
-                                anyhow::anyhow!("descendant native owner unavailable: {error}")
-                            })?,
-                    );
-                } else if target.turn_id.is_some() {
-                    anyhow::bail!("descendant native thread owner is unknown");
-                }
-                // No binding under the serialized graph fence proves no native
-                // Turn was admitted. It needs no invented process join.
-            }
-        }
+        let native_owners = if completion_deadline.is_some() {
+            let mut threads = targets
+                .iter()
+                .filter_map(|target| target.turn_id.as_ref().and(target.thread_id.clone()))
+                .collect::<std::collections::BTreeSet<_>>();
+            threads.insert(thread_id.to_owned());
+            // Capture before Task/native cancellation, after the durable admission
+            // fence. Snapshot also covers predecessor and retirement ownership;
+            // historical terminal rows alone are never cleanup proof.
+            let owners = self
+                .agent_manager
+                .capture_native_stop_owners(&threads.into_iter().collect::<Vec<_>>(), 65_536)
+                .await?;
+            select_native_graph_owners(
+                &targets,
+                owners,
+                thread_id,
+                turn.id.as_str(),
+                matches!(turn.status, pioneer_protocol::TurnStatus::InProgress),
+            )?
+        } else {
+            Vec::new()
+        };
 
         let mut task_ids = targets
             .iter()
@@ -7608,6 +7598,21 @@ impl MessageProcessor {
             }
         }
 
+        if let Some(deadline) = completion_deadline {
+            // Every captured run is awaited; execution IDs cannot overwrite
+            // multiple revisions, recovery runs or outstanding predecessors.
+            for owner in &native_owners {
+                self.mcp_service
+                    .cancel_turn_mcp_invocations(owner.turn_id());
+                self.await_native_graph_owner(owner, reason, deadline)
+                    .await?;
+            }
+        }
+
+        let selected_turns = native_owners
+            .iter()
+            .map(|owner| (owner.thread_id(), owner.turn_id()))
+            .collect::<std::collections::BTreeSet<_>>();
         for target in targets {
             if target.execution_id == execution.id {
                 continue;
@@ -7621,14 +7626,12 @@ impl MessageProcessor {
                 continue;
             };
             self.mcp_service.cancel_turn_mcp_invocations(turn_id);
-            if let Some(deadline) = completion_deadline {
-                // B's plugin execution paths use AgentManager. Missing native
-                // owner (including a CLI owner) remains unsupported/unknown.
-                let owner = native_owners.get(&target.execution_id).ok_or_else(|| {
-                    anyhow::anyhow!("descendant native completion owner is unknown")
-                })?;
-                self.await_native_graph_owner(owner, reason, deadline)
-                    .await?;
+            if completion_deadline.is_some() {
+                if !selected_turns.contains(&(thread_id, turn_id)) {
+                    // The snapshot's full native lifetime invariant proves no
+                    // outstanding owner; do not mutate historical completed Turns.
+                    continue;
+                }
             } else {
                 let stopped_cli = self
                     .cancel_task_cli_runtime_turn(thread_id, turn_id, reason)
@@ -7650,17 +7653,6 @@ impl MessageProcessor {
                 )
                 .await;
             }
-        }
-        if let Some(deadline) = completion_deadline {
-            self.mcp_service
-                .cancel_turn_mcp_invocations(turn.id.as_str());
-            self.agent_manager
-                .cancel_captured_turn_and_wait(
-                    root_owner.as_ref().expect("captured native root"),
-                    reason,
-                    deadline,
-                )
-                .await?;
         }
 
         Ok(true)
@@ -9707,4 +9699,68 @@ mod user_message_attachment_tests {
                 if capability.pack_id == pack_id && capability.label == "Authoritative Pack"
         ));
     }
+}
+
+/// Match bounded durable one-to-many bindings to captured actual native runs.
+/// A missing pending binding is an admission/ownership gap, not a terminal-state
+/// cleanup claim. Historical bindings can disappear only through the manager's
+/// proven-quiescent release/actor-join invariant used by its snapshot.
+pub(super) fn select_native_graph_owners(
+    targets: &[pioneer_crud::AgentWorkGraphCancellationTarget],
+    owners: Vec<pioneer_agent::NativeTurnStopOwner>,
+    root_thread: &str,
+    root_turn: &str,
+    root_pending: bool,
+) -> anyhow::Result<Vec<pioneer_agent::NativeTurnStopOwner>> {
+    if targets.iter().any(|target| target.has_cli_binding) {
+        anyhow::bail!("graph stop contains an unsupported CLI runtime binding");
+    }
+    let mut bindings = std::collections::BTreeSet::new();
+    for target in targets {
+        match (&target.thread_id, &target.turn_id) {
+            (Some(thread), Some(turn)) => {
+                bindings.insert((thread.as_str(), turn.as_str()));
+            }
+            (None, Some(_)) => anyhow::bail!("graph response thread owner is unknown"),
+            (_, None) => {} // Serialized fence closes queued/unadmitted work.
+        }
+    }
+    let known_turns = owners
+        .iter()
+        .map(|owner| (owner.thread_id(), owner.turn_id()))
+        .collect::<std::collections::BTreeSet<_>>();
+    for owner in &owners {
+        if !owner.is_quiescent()
+            && !bindings.contains(&(owner.thread_id(), owner.turn_id()))
+            && (owner.thread_id(), owner.turn_id()) != (root_thread, root_turn)
+        {
+            anyhow::bail!("outstanding native run has no exact graph response binding");
+        }
+    }
+    for target in targets.iter().filter(|target| target.turn_pending) {
+        if let (Some(thread), Some(turn)) = (&target.thread_id, &target.turn_id) {
+            if !known_turns.contains(&(thread.as_str(), turn.as_str())) {
+                anyhow::bail!("pending graph response native owner is unknown");
+            }
+        }
+    }
+    if root_pending && !known_turns.contains(&(root_thread, root_turn)) {
+        anyhow::bail!("pending root native owner is unknown");
+    }
+    let pending_turns = targets
+        .iter()
+        .filter(|target| target.turn_pending)
+        .filter_map(|target| Some((target.thread_id.as_deref()?, target.turn_id.as_deref()?)))
+        .collect::<std::collections::BTreeSet<_>>();
+    // Retain every outstanding exact run, plus already proven latest outcomes
+    // requested by still-pending admission rows. Never replay historical errors.
+    Ok(owners
+        .into_iter()
+        .filter(|owner| {
+            !owner.is_quiescent()
+                || pending_turns.contains(&(owner.thread_id(), owner.turn_id()))
+                || (root_pending
+                    && (owner.thread_id(), owner.turn_id()) == (root_thread, root_turn))
+        })
+        .collect())
 }

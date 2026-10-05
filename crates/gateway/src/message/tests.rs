@@ -78008,3 +78008,190 @@ async fn captured_descendant_stop_deadline_is_propagated_and_same_owner_can_retr
         .remove_thread("thread_stop_descendant")
         .await;
 }
+
+#[tokio::test]
+async fn graph_snapshot_matches_revision_runs_and_rejects_foreign_or_unknown() {
+    let (tx, mut rx) = mpsc::channel(64);
+    let sessions = Arc::new(SessionManager::new());
+    let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
+    let (workspaces, store, workspace) = setup_workspace_manager().await;
+    let provider = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "delayed",
+        Arc::new(DelayedProvider {
+            delay: Duration::from_secs(60),
+            text: "done".into(),
+        }),
+    ));
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("test-model", "delayed")),
+        provider,
+        sessions,
+        workspaces,
+        store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    );
+    for (thread, turn) in [("graph-initial", "initial"), ("graph-revision", "revision")] {
+        start_thread_and_turn(
+            &processor, connection, &mut rx, &workspace, thread, turn, "Chat", "delayed",
+        )
+        .await;
+    }
+    let owners = processor
+        .agent_manager
+        .capture_native_stop_owners(&["graph-initial".into(), "graph-revision".into()], 8)
+        .await
+        .unwrap();
+    assert_eq!(owners.len(), 2);
+    let binding =
+        |thread: &str, turn: &str, pending| pioneer_crud::AgentWorkGraphCancellationTarget {
+            execution_id: "one-task-execution".into(),
+            thread_id: Some(thread.into()),
+            turn_id: Some(turn.into()),
+            parent_task_id: Some("task".into()),
+            turn_pending: pending,
+            has_cli_binding: false,
+        };
+    let targets = vec![
+        binding("graph-initial", "initial", true),
+        binding("graph-revision", "revision", true),
+        binding("historical-sibling", "completed-revision", false),
+        pioneer_crud::AgentWorkGraphCancellationTarget {
+            execution_id: "queued".into(),
+            thread_id: None,
+            turn_id: None,
+            parent_task_id: Some("task".into()),
+            turn_pending: false,
+            has_cli_binding: false,
+        },
+    ];
+    let selected = super::agent_runtime::select_native_graph_owners(
+        &targets,
+        owners.clone(),
+        "root",
+        "root-turn",
+        false,
+    )
+    .unwrap();
+    assert_eq!(selected.len(), 2);
+    let mut foreign = targets.clone();
+    foreign[0].thread_id = Some("foreign-thread".into());
+    assert!(
+        super::agent_runtime::select_native_graph_owners(
+            &foreign,
+            owners.clone(),
+            "root",
+            "root-turn",
+            false
+        )
+        .is_err()
+    );
+    let mut unknown = targets.clone();
+    unknown.push(binding("unknown", "pending-revision", true));
+    assert!(
+        super::agent_runtime::select_native_graph_owners(
+            &unknown,
+            owners.clone(),
+            "root",
+            "root-turn",
+            false
+        )
+        .is_err()
+    );
+    assert!(
+        super::agent_runtime::select_native_graph_owners(
+            &targets,
+            owners.clone(),
+            "root",
+            "unknown-root",
+            true
+        )
+        .is_err()
+    );
+    let first = selected
+        .iter()
+        .find(|owner| owner.turn_id() == "initial")
+        .unwrap();
+    processor
+        .await_native_graph_owner(
+            first,
+            "stop initial",
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    let mut partial_targets = targets.clone();
+    partial_targets[0].turn_pending = false;
+    let partial_snapshot = processor
+        .agent_manager
+        .capture_native_stop_owners(&["graph-initial".into(), "graph-revision".into()], 8)
+        .await
+        .unwrap();
+    let active_sibling = super::agent_runtime::select_native_graph_owners(
+        &partial_targets,
+        partial_snapshot,
+        "root",
+        "root-turn",
+        false,
+    )
+    .unwrap();
+    assert_eq!(active_sibling.len(), 1);
+    assert_eq!(active_sibling[0].turn_id(), "revision");
+    // A still-pending DB row can reuse the latest actual joined outcome on retry,
+    // while completed initial/revision history needs no retained old owner.
+    let joined_snapshot = processor
+        .agent_manager
+        .capture_native_stop_owners(&["graph-initial".into(), "graph-revision".into()], 8)
+        .await
+        .unwrap();
+    assert_eq!(
+        super::agent_runtime::select_native_graph_owners(
+            &targets,
+            joined_snapshot,
+            "root",
+            "root-turn",
+            false
+        )
+        .unwrap()
+        .len(),
+        2
+    );
+    processor
+        .await_native_graph_owner(
+            &active_sibling[0],
+            "stop revision",
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    let remaining = processor
+        .agent_manager
+        .capture_native_stop_owners(&["graph-initial".into(), "graph-revision".into()], 8)
+        .await
+        .unwrap();
+    let terminal_targets = targets
+        .iter()
+        .cloned()
+        .map(|mut target| {
+            target.turn_pending = false;
+            target
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        super::agent_runtime::select_native_graph_owners(
+            &terminal_targets,
+            remaining,
+            "root",
+            "root-turn",
+            false
+        )
+        .unwrap()
+        .is_empty()
+    );
+    processor.agent_manager.remove_thread("graph-initial").await;
+    processor
+        .agent_manager
+        .remove_thread("graph-revision")
+        .await;
+}
