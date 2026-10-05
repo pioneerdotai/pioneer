@@ -22,7 +22,7 @@ const UPLOAD_STATUS_CONSUMED: &str = "consumed";
 const UPLOAD_STATUS_ABORTED: &str = "aborted";
 const UPLOAD_STATUS_EXPIRED: &str = "expired";
 
-pub(super) struct MaterializedSkillSource {
+pub(crate) struct MaterializedSkillSource {
     pub source_dir: PathBuf,
     pub cleanup_root: PathBuf,
     pub upload: SkillUploadSessionRecord,
@@ -197,6 +197,7 @@ impl MessageProcessor {
         }
 
         let record = SkillUploadSessionRecord {
+            purpose: params.purpose.as_str().to_owned(),
             upload_id: upload_id.clone(),
             workspace_id: workspace_id.clone(),
             connection_id,
@@ -763,6 +764,13 @@ impl MessageProcessor {
                 request_id,
             )
             .await?;
+        if materialized.upload.purpose != "skill" {
+            let _ = fs::remove_dir_all(&materialized.cleanup_root);
+            return Err(invalid_materialized_archive_error(
+                request_id,
+                anyhow!("upload purpose mismatch"),
+            ));
+        }
         match validate_single_skill_root(materialized.source_dir.clone()).and_then(|source_dir| {
             normalize_materialized_skill_frontmatter(source_dir.as_path())?;
             Ok(source_dir)
@@ -795,6 +803,13 @@ impl MessageProcessor {
                 request_id,
             )
             .await?;
+        if materialized.upload.purpose != "skill" {
+            let _ = fs::remove_dir_all(&materialized.cleanup_root);
+            return Err(invalid_materialized_archive_error(
+                request_id,
+                anyhow!("upload purpose mismatch"),
+            ));
+        }
         match validate_skill_pack_root(materialized.source_dir.clone()).and_then(|validated| {
             for member in &validated.members {
                 normalize_materialized_skill_frontmatter(member.source_dir.as_path())?;
@@ -809,7 +824,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn materialize_uploaded_archive_source(
+    pub(crate) async fn materialize_uploaded_archive_source(
         &self,
         connection_id: ConnectionId,
         workspace_id: &str,
@@ -856,13 +871,27 @@ impl MessageProcessor {
             )
         })?;
 
-        let source_dir = match extract_archive_secure(
-            PathBuf::from(upload.payload_path.as_str()).as_path(),
-            cleanup_root.as_path(),
-            context.max_upload_uncompressed_bytes,
-            context.max_upload_archive_entries,
-            context.security_policy.max_install_file_bytes,
-        ) {
+        let archive = PathBuf::from(upload.payload_path.as_str());
+        let extracted = if upload.purpose == "plugin" {
+            extract_archive_with_purpose(
+                &archive,
+                &cleanup_root,
+                context.max_upload_uncompressed_bytes,
+                context.max_upload_archive_entries,
+                context.security_policy.max_install_file_bytes,
+                true,
+            )
+        } else {
+            // Keep standalone extraction on its original security branch.
+            extract_archive_secure(
+                &archive,
+                &cleanup_root,
+                context.max_upload_uncompressed_bytes,
+                context.max_upload_archive_entries,
+                context.security_policy.max_install_file_bytes,
+            )
+        };
+        let source_dir = match extracted {
             Ok(source_dir) => source_dir,
             Err(error) => {
                 let materialized = MaterializedSkillSource {
@@ -985,7 +1014,7 @@ impl MessageProcessor {
         Ok(())
     }
 
-    pub(super) fn cleanup_upload_artifacts(
+    pub(crate) fn cleanup_upload_artifacts(
         &self,
         upload: &SkillUploadSessionRecord,
         materialized_cleanup_root: &std::path::Path,
@@ -1530,6 +1559,26 @@ pub(super) fn extract_archive_secure(
     max_entries: usize,
     max_file_bytes: usize,
 ) -> Result<PathBuf> {
+    extract_archive_with_purpose(
+        archive_path,
+        cleanup_root,
+        max_uncompressed_bytes,
+        max_entries,
+        max_file_bytes,
+        false,
+    )
+}
+
+fn extract_archive_with_purpose(
+    archive_path: &Path,
+    cleanup_root: &Path,
+    max_uncompressed_bytes: usize,
+    max_entries: usize,
+    max_file_bytes: usize,
+    plugin: bool,
+) -> Result<PathBuf> {
+    let mut links = Vec::new();
+    let mut directory_modes = Vec::new();
     let file = fs::File::open(archive_path)
         .with_context(|| format!("failed to open skill archive `{}`", archive_path.display()))?;
     let decoder = GzDecoder::new(file);
@@ -1580,6 +1629,12 @@ pub(super) fn extract_archive_secure(
         }
 
         if entry_type.is_dir() {
+            if plugin {
+                directory_modes.push((
+                    target_path.clone(),
+                    entry.header().mode().unwrap_or(0o755) & 0o777,
+                ));
+            }
             fs::create_dir_all(target_path.as_path()).with_context(|| {
                 format!(
                     "failed to create archive directory `{}`",
@@ -1590,6 +1645,14 @@ pub(super) fn extract_archive_secure(
             continue;
         }
 
+        if plugin && entry_type.is_symlink() {
+            let target = entry
+                .link_name()?
+                .ok_or_else(|| anyhow!("missing link target"))?
+                .into_owned();
+            links.push((target_path, target));
+            continue;
+        }
         if !entry_type.is_file() {
             bail!(
                 "archive contains unsupported entry `{}`",
@@ -1623,7 +1686,13 @@ pub(super) fn extract_archive_secure(
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = entry.header().mode().unwrap_or(0o644);
-            let permissions = if mode & 0o111 != 0 { 0o755 } else { 0o644 };
+            let permissions = if plugin {
+                mode & 0o777
+            } else if mode & 0o111 != 0 {
+                0o755
+            } else {
+                0o644
+            };
             let _ = fs::set_permissions(
                 target_path.as_path(),
                 fs::Permissions::from_mode(permissions),
@@ -1632,6 +1701,31 @@ pub(super) fn extract_archive_secure(
         ensure_materialized_path_contained(cleanup_root.as_path(), target_path.as_path())?;
     }
 
+    // Links are created only after all writes, so archive links can never
+    // redirect extraction. Snapshot capture follows only contained links and
+    // normalizes them into regular files for the genuine native installer.
+    for (path, target) in links {
+        if path.exists() {
+            bail!("link overlaps materialized entry");
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &path)?;
+        #[cfg(not(unix))]
+        {
+            let _ = (path, target);
+            bail!("plugin archive links unsupported on this host");
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for (path, mode) in directory_modes.into_iter().rev() {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        }
+    }
     let root = root_name.ok_or_else(|| anyhow!("archive is empty"))?;
     let source_dir = cleanup_root.join(root);
     ensure_materialized_path_contained(cleanup_root.as_path(), source_dir.as_path())?;
@@ -1794,6 +1888,54 @@ mod tests {
 
         assert!(gap.contains("does not match chunk offset"));
         assert_eq!(contents, b"hellworld");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_archive_normalizes_contained_links_without_weakening_legacy_extraction() {
+        let case = TempCase::new("plugin-links");
+        let archive = case.path.join("plugin.tar.gz");
+        write_archive(
+            &archive,
+            &[
+                TestEntry::dir("plugin"),
+                TestEntry::file("plugin/plugin.json", br#"{"name":"mixed"}"#),
+                TestEntry::file("plugin/bin/helper", b"data"),
+                TestEntry::symlink("plugin/bin/contained", "helper"),
+                TestEntry::symlink("plugin/outside", "../../outside"),
+            ],
+        );
+        let root = extract_archive_with_purpose(&archive, &case.materialized, 4096, 16, 1024, true)
+            .unwrap();
+        let snapshot =
+            pioneer_plugins::Snapshot::capture(&root, Default::default(), || false).unwrap();
+        assert_eq!(snapshot.file("bin/contained"), Some(b"data".as_slice()));
+        assert!(matches!(
+            snapshot.entries().get("outside"),
+            Some(pioneer_plugins::Entry::Denied)
+        ));
+        let legacy = TempCase::new("legacy-links");
+        assert!(extract_archive_secure(&archive, &legacy.materialized, 4096, 16, 1024).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_symlink_cannot_redirect_later_archive_writes() {
+        let case = TempCase::new("plugin-link-write");
+        let archive = case.path.join("plugin.tar.gz");
+        write_archive(
+            &archive,
+            &[
+                TestEntry::dir("plugin"),
+                TestEntry::symlink("plugin/assets", "../../escape"),
+                TestEntry::file("plugin/assets/body", b"contained"),
+            ],
+        );
+        assert!(
+            extract_archive_with_purpose(&archive, &case.materialized, 4096, 16, 1024, true)
+                .is_err()
+        );
+        assert!(!case.path.join("escape/body").exists());
     }
 
     #[test]

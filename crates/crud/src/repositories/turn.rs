@@ -631,6 +631,7 @@ async fn prepare_turn_upsert_with_actor_columns<C: ConnectionTrait>(
     };
 
     let row = turn::ActiveModel {
+        plugin_selection_json: Set(None),
         id: Set(turn_id.to_owned()),
         thread_id: Set(thread_id.to_owned()),
         initiated_by_actor_id: Set(initiated_by_actor_id),

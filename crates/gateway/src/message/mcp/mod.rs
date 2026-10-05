@@ -278,6 +278,7 @@ fn list_item_from_record_with_catalog_and_runtime(
             }
         });
     Ok(McpListItem {
+        plugin_owner: None,
         id: record.id.clone().unwrap_or_default(),
         name: record.name.clone(),
         display_name: record.display_name.clone(),

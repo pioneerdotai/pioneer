@@ -1548,6 +1548,15 @@ impl<'de> Deserialize<'de> for TurnCapability {
         let wire = TurnCapabilityWire::deserialize(deserializer)?;
         let expected = match &wire.kind {
             TurnCapabilityKind::Skill { skill_id, .. } => Some(skill_capability_key(skill_id)),
+            TurnCapabilityKind::Plugin {
+                plugin_id,
+                expected_revision,
+            } => {
+                if plugin_id.len() != 21 || *expected_revision < 1 {
+                    return Err(serde::de::Error::custom("invalid plugin selection"));
+                }
+                Some(plugin_capability_key(plugin_id))
+            }
             TurnCapabilityKind::SkillPack { pack_id } => Some(skill_pack_capability_key(pack_id)),
             TurnCapabilityKind::McpServer { name, scope_kind } => {
                 Some(mcp_server_capability_key(*scope_kind, name))
@@ -1583,6 +1592,10 @@ pub fn skill_capability_key(skill_id: &SkillId) -> String {
 }
 
 /// Builds the canonical internal key for a selected skill pack capability.
+pub fn plugin_capability_key(plugin_id: &str) -> String {
+    format!("plugin:{plugin_id}")
+}
+
 pub fn skill_pack_capability_key(pack_id: &SkillPackId) -> String {
     format!("skill_pack:{pack_id}")
 }
@@ -1607,6 +1620,12 @@ pub fn mcp_tool_capability_key(
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum TurnCapabilityKind {
+    Plugin {
+        #[serde(rename = "pluginId")]
+        plugin_id: String,
+        #[serde(rename = "expectedRevision")]
+        expected_revision: i64,
+    },
     Skill {
         #[serde(rename = "skillId")]
         skill_id: SkillId,
@@ -4939,6 +4958,9 @@ pub enum UserMessageAttachment {
     Skill {
         capability: TurnSkillCapabilitySummary,
     },
+    Plugin {
+        capability: TurnPluginCapabilitySummary,
+    },
     SkillPack {
         capability: TurnSkillPackCapabilitySummary,
     },
@@ -4948,6 +4970,14 @@ pub enum UserMessageAttachment {
     McpTool {
         capability: TurnMcpToolCapabilitySummary,
     },
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnPluginCapabilitySummary {
+    pub plugin_id: String,
+    pub expected_revision: i64,
+    pub label: String,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]

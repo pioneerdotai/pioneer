@@ -1298,7 +1298,8 @@ fn resolve_turn_capability_input(
             TurnCapabilityKind::Skill {
                 pack_id: Some(_), ..
             }
-            | TurnCapabilityKind::SkillPack { .. } => {
+            | TurnCapabilityKind::SkillPack { .. }
+            | TurnCapabilityKind::Plugin { .. } => {
                 normalized.rejected.push(rejected_capability(
                     capability,
                     TurnCapabilityRejectedReason::InvalidInput,
@@ -1368,7 +1369,8 @@ fn resolve_turn_capability_input(
             TurnCapabilityKind::Skill {
                 pack_id: Some(_), ..
             }
-            | TurnCapabilityKind::SkillPack { .. } => {
+            | TurnCapabilityKind::SkillPack { .. }
+            | TurnCapabilityKind::Plugin { .. } => {
                 unreachable!("pack metadata was rejected before runtime normalization")
             }
             TurnCapabilityKind::McpServer { name, scope_kind } => {
@@ -1607,6 +1609,7 @@ fn capability_display_label(rejected: &TurnRejectedCapability) -> String {
     match &rejected.kind {
         TurnCapabilityKind::Skill { skill_id, .. } => skill_id.to_string(),
         TurnCapabilityKind::SkillPack { pack_id } => pack_id.to_string(),
+        TurnCapabilityKind::Plugin { plugin_id, .. } => plugin_id.clone(),
         TurnCapabilityKind::McpServer { name, .. } => name.clone(),
         TurnCapabilityKind::McpTool {
             server_name,
@@ -4050,11 +4053,23 @@ async fn execute_agent_provider_response(
         }
     }
 
-    let skill_tool_materialization = skill_tools::materialize_skill_tooling(
+    let mut skill_tool_materialization = skill_tools::materialize_skill_tooling(
         &skills_resolution.runtime_plan,
         &tool_loop_config.skills,
     );
 
+    if let Some(provider) = &turn_tool_provider {
+        skill_tools::guard_skill_tooling(
+            &mut skill_tool_materialization,
+            &skills_resolution.runtime_plan,
+            provider.clone(),
+            TurnToolContext {
+                workspace_id: workspace_id.into(),
+                thread_id: thread_id.into(),
+                turn_id: turn_id.into(),
+            },
+        );
+    }
     for excluded in &skill_tool_materialization.excluded_tools {
         warn!(
             thread_id,
@@ -4310,7 +4325,7 @@ async fn execute_agent_provider_response(
             skills_resolution.result.active.as_slice(),
             exposed_agent_overlay,
         ),
-        !agent_skill_overlay.is_empty(),
+        !agent_skill_overlay.is_empty() || turn_tool_provider.is_some(),
     )
     .await?;
 

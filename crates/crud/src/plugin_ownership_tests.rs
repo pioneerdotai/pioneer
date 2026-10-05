@@ -578,3 +578,158 @@ async fn legacy_reserved_standalone_updates_but_new_names_and_owned_adoption_are
         "plugin-a"
     );
 }
+
+// Stage B sources: NOT_RUN / NOT_COMPILED.
+#[tokio::test]
+async fn plugin_reservation_consumes_only_its_finalized_owned_upload_atomically() {
+    let store = test_store_with_workspace("ws").await;
+    let mut parent = parent("P".repeat(21).as_str(), "ws");
+    parent.pending_json = Some("{\"children\":[]}".into());
+    let upload = SkillUploadSessionRecord {
+        purpose: "plugin".into(),
+        upload_id: parent.source_upload_id.clone(),
+        workspace_id: "ws".into(),
+        connection_id: 7,
+        status: "finalized".into(),
+        file_name: "plugin.tar.gz".into(),
+        archive_format: "tar_gz".into(),
+        compressed_size_bytes: 1,
+        received_bytes: 1,
+        sha256: "a".repeat(64),
+        payload_path: "/managed/upload.tar.gz".into(),
+        created_at_unix: 1,
+        expires_at_unix: 100,
+        finalized_at_unix: Some(2),
+        consumed_at_unix: None,
+        aborted_at_unix: None,
+    };
+    store.insert_skill_upload_session(&upload).await.unwrap();
+    assert!(
+        store
+            .reserve_plugin_installation(&parent, 8, 3)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .find_plugin_by_upload(&upload.upload_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .find_skill_upload_session(&upload.upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "finalized"
+    );
+    let maintenance = store.with_maintenance_access();
+    let (a, b) = tokio::join!(
+        store.reserve_plugin_installation(&parent, 7, 3),
+        maintenance.reserve_plugin_installation(&parent, 7, 3)
+    );
+    assert_ne!(a.is_ok(), b.is_ok());
+    assert_eq!(
+        store.list_plugin_installations("ws").await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        store
+            .find_skill_upload_session(&upload.upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "consumed"
+    );
+    assert!(
+        store
+            .reserve_plugin_installation(&parent, 7, 3)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn install_failure_preserves_native_sibling_and_closes_failed_child() {
+    let store = test_store_with_workspace("ws").await;
+    store
+        .insert_plugin_installation(&parent("plugin-a", "ws"))
+        .await
+        .unwrap();
+    let good = skill('G', "ws");
+    let good_owner = ownership("plugin-a", good.skill_id.as_str(), "good");
+    store
+        .install_skill_lifecycle_with_ownership(
+            &good,
+            &policy(&good),
+            &[skill_audit(&good)],
+            None,
+            Some(&good_owner),
+            1,
+        )
+        .await
+        .unwrap();
+    let failed = ownership("plugin-a", &"F".repeat(21), "failed");
+    store
+        .record_plugin_component_failure(&failed, "skill", "component_install_failed")
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .plugin_child_available("skill", good.skill_id.as_str(), "ws")
+            .await
+            .unwrap()
+    );
+    store
+        .settle_plugin_installation("plugin-a", 1, "installed", None)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .plugin_child_available("skill", good.skill_id.as_str(), "ws")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .plugin_child_available("skill", good.skill_id.as_str(), "foreign")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .plugin_turn_child_available("no-ready-turn", "skill", good.skill_id.as_str(), "ws")
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .find_skill_installation(&good.skill_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let links = store.list_plugin_components("plugin-a").await.unwrap();
+    assert_eq!(links.len(), 2);
+    assert!(
+        links
+            .iter()
+            .any(|c| c.member_key == "failed" && c.status == "failed" && c.skill_id.is_none())
+    );
+    // The original child restriction was not relaxed by parent settlement.
+    assert_eq!(
+        store
+            .list_workspace_skill_policies("ws")
+            .await
+            .unwrap()
+            .iter()
+            .find(|p| p.skill_id == good.skill_id)
+            .unwrap()
+            .enabled,
+        Some(false)
+    );
+}

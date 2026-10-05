@@ -319,6 +319,21 @@ macro_rules! schema_doc {
 
 pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
     vec![
+        schema_doc!("plugins_source_params.json", crate::PluginsSourceParams),
+        schema_doc!("plugins_install_params.json", crate::PluginsInstallParams),
+        schema_doc!("plugins_list_params.json", crate::PluginsListParams),
+        schema_doc!("plugins_details_params.json", crate::PluginsDetailsParams),
+        schema_doc!("plugins_list_response.json", crate::PluginsListResponse),
+        schema_doc!(
+            "plugins_preview_response.json",
+            crate::PluginsPreviewResponse
+        ),
+        schema_doc!(
+            "plugins_changed_notification.json",
+            crate::PluginsChangedNotification
+        ),
+        schema_doc!("plugin_item.json", crate::PluginItem),
+        schema_doc!("plugin_owner.json", crate::PluginOwner),
         schema_doc!("access_change_kind.json", AccessChangeKind),
         schema_doc!(
             "access_changed_notification.json",

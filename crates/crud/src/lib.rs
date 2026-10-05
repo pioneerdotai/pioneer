@@ -2488,6 +2488,7 @@ fn skill_dependency_snapshot_record_from_model(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillUploadSessionRecord {
+    pub purpose: String,
     pub upload_id: String,
     pub workspace_id: String,
     pub connection_id: u64,
@@ -3219,6 +3220,7 @@ fn skill_upload_session_record_from_model(
     model: pioneer_entity::skill_upload_session::Model,
 ) -> SkillUploadSessionRecord {
     SkillUploadSessionRecord {
+        purpose: model.purpose,
         upload_id: model.upload_id,
         workspace_id: model.workspace_id,
         connection_id: u64::try_from(model.connection_id).unwrap_or_default(),
@@ -48822,6 +48824,7 @@ mod tests {
     async fn skill_upload_terminal_transitions_cannot_overwrite_consumed_or_aborted_state() {
         let store = test_store_with_workspace("workspace-one").await;
         let finalized = |upload_id: &str| crate::SkillUploadSessionRecord {
+            purpose: "skill".to_owned(),
             upload_id: upload_id.to_owned(),
             workspace_id: "workspace-one".to_owned(),
             connection_id: 7,
@@ -48948,6 +48951,7 @@ mod tests {
     async fn ordinary_skill_lifecycle_transactions_include_upload_consumption() {
         let store = test_store_with_workspace("workspace-one").await;
         let upload = |upload_id: &str| crate::SkillUploadSessionRecord {
+            purpose: "skill".to_owned(),
             upload_id: upload_id.to_owned(),
             workspace_id: "workspace-one".to_owned(),
             connection_id: 7,

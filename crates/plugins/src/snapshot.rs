@@ -88,6 +88,9 @@ impl Snapshot {
             root_mode: 0o755,
         })
     }
+    pub fn root_mode(&self) -> u32 {
+        self.root_mode
+    }
     pub fn entries(&self) -> &BTreeMap<String, Entry> {
         &self.entries
     }

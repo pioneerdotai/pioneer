@@ -25,9 +25,13 @@
     },
     "turnId": {
       "type": "string"
+    },
+    "view": {
+      "$ref": "#/$defs/PatchHistoryViewKind"
     }
   },
   "required": [
+    "view",
     "threadId",
     "turnId",
     "items",
@@ -40,13 +44,40 @@
         "coverage": {
           "$ref": "#/$defs/PatchHistoryQueryCoverage"
         },
+        "execution": {
+          "$ref": "#/$defs/PatchHistoryExecutionContext"
+        },
         "record": {
           "$ref": "#/$defs/PatchHistoryRecord"
+        },
+        "view": {
+          "$ref": "#/$defs/PatchHistoryViewKind"
         }
       },
       "required": [
+        "view",
+        "execution",
         "record",
         "coverage"
+      ]
+    },
+    "PatchFilesystemMutationSourceView": {
+      "type": "object",
+      "properties": {
+        "itemId": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "toolName": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "itemId",
+        "toolName",
+        "reason"
       ]
     },
     "PatchHistoryAuthorityView": {
@@ -87,6 +118,16 @@
           "maximum": 65535,
           "minimum": 0
         },
+        "destinationLocation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PatchHistoryPathView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "destinationPath": {
           "type": [
             "string",
@@ -119,6 +160,9 @@
         "sideEffects": {
           "$ref": "#/$defs/PatchHistorySideEffects"
         },
+        "sourceLocation": {
+          "$ref": "#/$defs/PatchHistoryPathView"
+        },
         "sourcePath": {
           "type": "string"
         }
@@ -129,6 +173,7 @@
         "sequence",
         "kind",
         "sourcePath",
+        "sourceLocation",
         "sideEffects"
       ]
     },
@@ -272,6 +317,37 @@
         "history_capacity"
       ]
     },
+    "PatchHistoryExecutionContext": {
+      "type": "object",
+      "properties": {
+        "executionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "presentedThreadId": {
+          "type": "string"
+        },
+        "runId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sourceThreadId": {
+          "type": "string"
+        },
+        "sourceTurnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sourceThreadId",
+        "sourceTurnId",
+        "presentedThreadId"
+      ]
+    },
     "PatchHistoryLineEnding": {
       "type": "string",
       "enum": [
@@ -300,6 +376,25 @@
         "finalNewline"
       ]
     },
+    "PatchHistoryPathView": {
+      "type": "object",
+      "properties": {
+        "absolutePath": {
+          "type": "string"
+        },
+        "relativePath": {
+          "type": "string"
+        },
+        "workspaceRoot": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "relativePath",
+        "workspaceRoot",
+        "absolutePath"
+      ]
+    },
     "PatchHistoryProvenanceView": {
       "type": "string",
       "enum": [
@@ -322,6 +417,15 @@
         },
         "exactness": {
           "$ref": "#/$defs/TurnDiffExactnessView"
+        },
+        "filesystem": {
+          "description": "Completeness across every filesystem-capable tool in the turn. This is\ndeliberately independent from exactness of the Apply Patch records.",
+          "$ref": "#/$defs/TurnFilesystemCoverageView",
+          "default": {
+            "kind": "incomplete",
+            "reason": "turn-wide filesystem coverage was not recorded",
+            "sources": []
+          }
         },
         "firstMissingOrdinal": {
           "type": [
@@ -562,6 +666,14 @@
         "utf8_bom"
       ]
     },
+    "PatchHistoryViewKind": {
+      "type": "string",
+      "enum": [
+        "timeline",
+        "turn_aggregate",
+        "record_diff"
+      ]
+    },
     "PatchRecordExactnessView": {
       "type": "string",
       "enum": [
@@ -618,6 +730,57 @@
           "required": [
             "kind",
             "reason"
+          ]
+        }
+      ]
+    },
+    "TurnFilesystemCoverageView": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "pending"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "complete"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "incomplete"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "sources": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/PatchFilesystemMutationSourceView"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "reason",
+            "sources"
           ]
         }
       ]

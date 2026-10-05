@@ -1470,6 +1470,15 @@ impl MessageProcessor {
                     "gateway could not persist the turn skill projection",
                 ));
             }
+            self.crud_store
+                .ready_plugin_selection(&turn_id)
+                .await
+                .map_err(|_| {
+                    DurableCommitRejection::retryable(
+                        "plugin_selection_unavailable",
+                        "plugin selection could not become ready",
+                    )
+                })?;
             pioneer_observability::record_native_lifecycle_event(
                 pioneer_observability::NativeLifecycleEventMetric {
                     stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
@@ -9242,6 +9251,7 @@ fn user_message_attachments_from_capabilities_with_lookup<'a>(
                         },
                     }
                 }
+                pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id, expected_revision } => pioneer_protocol::UserMessageAttachment::Plugin { capability: pioneer_protocol::TurnPluginCapabilitySummary { plugin_id: plugin_id.clone(), expected_revision: *expected_revision, label: capability.label.clone().ok_or_else(|| anyhow::anyhow!("plugin presentation missing"))? } },
                 pioneer_protocol::TurnCapabilityKind::SkillPack { pack_id } => {
                     let name = pack_names.get(pack_id).ok_or_else(|| {
                         anyhow::anyhow!(

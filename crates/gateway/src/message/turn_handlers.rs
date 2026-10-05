@@ -414,6 +414,45 @@ pub(super) fn validate_root_agent_launch_capabilities(
     Ok(())
 }
 
+/// Extend only the server-derived plugin portion of an explicit root launch.
+/// Validate the client's standalone grants first, so fabricated child grants
+/// cannot be adopted as a trusted expansion. The common admission still checks
+/// permissions for the complete existing Skill/MCP leaves afterward.
+fn project_plugin_root_launch(
+    params: &mut TurnStartParams,
+    plugin_keys: &HashSet<String>,
+) -> Result<(), TurnStartFailure> {
+    if params.agent_launch.is_none() || plugin_keys.is_empty() {
+        return Ok(());
+    }
+    let mut standalone = params.clone();
+    standalone
+        .capabilities
+        .retain(|c| !plugin_keys.contains(&c.id));
+    validate_root_agent_launch_capabilities(&standalone)?;
+    let launch = params.agent_launch.as_mut().expect("launch checked");
+    for capability in params
+        .capabilities
+        .iter()
+        .filter(|c| plugin_keys.contains(&c.id))
+    {
+        match &capability.kind {
+            pioneer_protocol::TurnCapabilityKind::Skill { skill_id, .. } => {
+                launch.execution.skill_ids.push(skill_id.clone())
+            }
+            pioneer_protocol::TurnCapabilityKind::McpServer { .. } => {
+                launch.execution.mcp_server_ids.push(capability.id.clone())
+            }
+            _ => {
+                return Err(TurnStartFailure::invalid_input(
+                    "invalid plugin launch expansion",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn persist_admitted_turn_start(
     crud_store: &pioneer_crud::CrudStore,
     provider_registry: &pioneer_provider::ProviderRegistry,
@@ -600,6 +639,8 @@ pub(super) fn new_turn_execution(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NormalizedTurnCapabilities {
+    pub(super) plugin_selection: Option<pioneer_protocol::PluginSelectionSnapshot>,
+    plugin_capability_ids: HashSet<String>,
     pub(super) presentation: Vec<pioneer_protocol::TurnCapability>,
     pub(crate) execution: Vec<pioneer_protocol::TurnCapability>,
     pub(super) pack_names: HashMap<pioneer_protocol::SkillPackId, String>,
@@ -1086,7 +1127,8 @@ impl MessageProcessor {
                     }
                     Some((capability, skill_id))
                 }
-                pioneer_protocol::TurnCapabilityKind::SkillPack { .. }
+                pioneer_protocol::TurnCapabilityKind::Plugin { .. }
+                | pioneer_protocol::TurnCapabilityKind::SkillPack { .. }
                 | pioneer_protocol::TurnCapabilityKind::McpServer { .. }
                 | pioneer_protocol::TurnCapabilityKind::McpTool { .. } => None,
             })
@@ -1154,10 +1196,156 @@ impl MessageProcessor {
         let mut full_pack_ids = HashSet::new();
         let mut pack_children = HashMap::new();
         let mut pack_names = HashMap::new();
+        let mut plugin_leaves = HashMap::new();
+        let mut plugin_capability_ids = HashSet::new();
+        let mut plugin_selection = pioneer_protocol::PluginSelectionSnapshot {
+            phase: "prepared".into(),
+            ..Default::default()
+        };
 
         for capability in capabilities {
             match &capability.kind {
+                TurnCapabilityKind::Plugin {
+                    plugin_id,
+                    expected_revision,
+                } => {
+                    if plugin_selection.parents.iter().any(|p| &p.id == plugin_id) {
+                        return Err(TurnStartFailure::invalid_input(
+                            "duplicate plugin selection",
+                        ));
+                    }
+                    let parent = self
+                        .crud_store
+                        .find_plugin_installation(plugin_id)
+                        .await
+                        .map_err(|_| TurnStartFailure::unavailable("plugin inventory unavailable"))?
+                        .filter(|p| {
+                            p.workspace_id == workspace_id
+                                && p.enabled
+                                && p.state == "installed"
+                                && p.revision == *expected_revision
+                        })
+                        .ok_or_else(|| {
+                            TurnStartFailure::invalid_input(
+                                "plugin unavailable or revision changed",
+                            )
+                        })?;
+                    let components = self
+                        .crud_store
+                        .list_plugin_components(plugin_id)
+                        .await
+                        .map_err(|_| {
+                            TurnStartFailure::unavailable("plugin components unavailable")
+                        })?;
+                    let mut leaves = Vec::new();
+                    for component in components.iter().filter(|c| c.status == "installed") {
+                        let (id, leaf) = match component.kind.as_str() {
+                            "skill" => {
+                                let skill_id = pioneer_protocol::SkillId::new(
+                                    component.skill_id.clone().ok_or_else(|| {
+                                        TurnStartFailure::invalid_input("plugin child missing")
+                                    })?,
+                                )
+                                .map_err(|_| {
+                                    TurnStartFailure::invalid_input("plugin child invalid")
+                                })?;
+                                if self
+                                    .crud_store
+                                    .find_skill_installation(&skill_id)
+                                    .await
+                                    .map_err(|_| {
+                                        TurnStartFailure::unavailable("skill inventory unavailable")
+                                    })?
+                                    .is_none_or(|c| c.scope_key != workspace_id)
+                                {
+                                    return Err(TurnStartFailure::invalid_input(
+                                        "plugin skill missing",
+                                    ));
+                                }
+                                (
+                                    skill_id.to_string(),
+                                    TurnCapability {
+                                        id: pioneer_protocol::skill_capability_key(&skill_id),
+                                        label: None,
+                                        kind: TurnCapabilityKind::Skill {
+                                            skill_id,
+                                            pack_id: None,
+                                        },
+                                    },
+                                )
+                            }
+                            "mcp" => {
+                                let rows = self
+                                    .crud_store
+                                    .list_mcp_server_installations("workspace", workspace_id)
+                                    .await
+                                    .map_err(|_| {
+                                        TurnStartFailure::unavailable("MCP inventory unavailable")
+                                    })?;
+                                let row = rows
+                                    .into_iter()
+                                    .find(|r| r.id == component.mcp_installation_id)
+                                    .ok_or_else(|| {
+                                        TurnStartFailure::invalid_input("plugin MCP missing")
+                                    })?;
+                                (
+                                    row.id.clone().unwrap(),
+                                    TurnCapability {
+                                        id: pioneer_protocol::mcp_server_capability_key(
+                                            pioneer_protocol::McpScopeKind::Workspace,
+                                            &row.name,
+                                        ),
+                                        label: None,
+                                        kind: TurnCapabilityKind::McpServer {
+                                            name: row.name,
+                                            scope_kind: pioneer_protocol::McpScopeKind::Workspace,
+                                        },
+                                    },
+                                )
+                            }
+                            _ => {
+                                return Err(TurnStartFailure::invalid_input(
+                                    "plugin component invalid",
+                                ));
+                            }
+                        };
+                        plugin_selection
+                            .children
+                            .push(pioneer_protocol::PluginSelectedChild {
+                                kind: component.kind.clone(),
+                                id,
+                                parent_id: plugin_id.clone(),
+                            });
+                        if plugin_selection.children.len() > 256 {
+                            return Err(TurnStartFailure::invalid_input(
+                                "plugin expansion limit exceeded",
+                            ));
+                        }
+                        plugin_capability_ids.insert(leaf.id.clone());
+                        leaves.push(leaf);
+                    }
+                    plugin_selection
+                        .parents
+                        .push(pioneer_protocol::PluginSelectedParent {
+                            id: plugin_id.clone(),
+                            revision: *expected_revision,
+                        });
+                    plugin_leaves.insert(plugin_id.clone(), leaves);
+                    presentation.push(TurnCapability {
+                        label: Some(parent.name),
+                        ..capability.clone()
+                    });
+                }
                 TurnCapabilityKind::Skill { skill_id, pack_id } => {
+                    if self
+                        .crud_store
+                        .find_skill_plugin_owner(skill_id)
+                        .await
+                        .map_err(|_| TurnStartFailure::unavailable("skill ownership unavailable"))?
+                        .is_some()
+                    {
+                        return Err(TurnStartFailure::invalid_input("select the parent plugin"));
+                    }
                     let installation = self
                         .crud_store
                         .find_skill_installation(skill_id)
@@ -1279,6 +1467,36 @@ impl MessageProcessor {
                     presentation.push(capability.clone());
                 }
                 TurnCapabilityKind::McpServer { .. } | TurnCapabilityKind::McpTool { .. } => {
+                    let (name, scope) = match &capability.kind {
+                        TurnCapabilityKind::McpServer { name, scope_kind } => (name, scope_kind),
+                        TurnCapabilityKind::McpTool {
+                            server_name,
+                            scope_kind,
+                            ..
+                        } => (server_name, scope_kind),
+                        _ => unreachable!(),
+                    };
+                    if let Some(row) = self
+                        .crud_store
+                        .find_mcp_server_installation(scope.as_str(), workspace_id, name)
+                        .await
+                        .map_err(|_| TurnStartFailure::unavailable("MCP inventory unavailable"))?
+                    {
+                        if let Some(id) = row.id
+                            && self
+                                .crud_store
+                                .find_mcp_plugin_owner(&id)
+                                .await
+                                .map_err(|_| {
+                                    TurnStartFailure::unavailable("MCP ownership unavailable")
+                                })?
+                                .is_some()
+                        {
+                            return Err(TurnStartFailure::invalid_input(
+                                "select the parent plugin",
+                            ));
+                        }
+                    }
                     presentation.push(capability.clone());
                 }
             }
@@ -1288,6 +1506,9 @@ impl MessageProcessor {
         let mut seen_skill_ids = HashSet::new();
         for capability in &presentation {
             match &capability.kind {
+                TurnCapabilityKind::Plugin { plugin_id, .. } => {
+                    execution.extend(plugin_leaves.remove(plugin_id).expect("validated plugin"));
+                }
                 TurnCapabilityKind::Skill { skill_id, pack_id } => {
                     if pack_id
                         .as_ref()
@@ -1342,7 +1563,14 @@ impl MessageProcessor {
             }
         }
 
+        if !plugin_selection.parents.is_empty() && execution.len() > 256 {
+            return Err(TurnStartFailure::invalid_input(
+                "Expanded plugin selection exceeds the internal capability limit",
+            ));
+        }
         Ok(NormalizedTurnCapabilities {
+            plugin_capability_ids,
+            plugin_selection: (!plugin_selection.parents.is_empty()).then_some(plugin_selection),
             presentation,
             execution,
             pack_names,
@@ -1645,6 +1873,24 @@ impl MessageProcessor {
             // on top of the database projector and can exhaust a standard Tokio
             // worker stack.
             let started_phase = message_future(async {
+                if params
+                    .capabilities
+                    .iter()
+                    .any(|c| matches!(c.kind, pioneer_protocol::TurnCapabilityKind::Plugin { .. }))
+                {
+                    self.send_turn_start_failure(
+                        connection_id,
+                        request_id.clone(),
+                        &success_response,
+                        &thread.id,
+                        &turn_id,
+                        TurnStartFailure::invalid_input(
+                            "Plugins are not supported for detached task execution yet",
+                        ),
+                    )
+                    .await;
+                    return None;
+                }
                 let normalized_capabilities = match self
                     .normalize_turn_skill_capabilities(
                         thread.workspace_id.as_str(),
@@ -2421,6 +2667,24 @@ impl MessageProcessor {
                     params.thread_id.trim()
                 ))
             })?;
+        pioneer_protocol::validate_turn_execution_envelope(&params)
+            .map_err(TurnStartFailure::invalid_input)?;
+        if params
+            .capabilities
+            .iter()
+            .any(|c| matches!(c.kind, pioneer_protocol::TurnCapabilityKind::Plugin { .. }))
+            && !self.native_api_provider_supports_agent_skill_overlay(
+                &thread.workspace_id,
+                params
+                    .model_provider
+                    .as_deref()
+                    .unwrap_or(&thread.model_provider),
+            )
+        {
+            return Err(TurnStartFailure::invalid_input(
+                "Plugins require a native provider with tool calling",
+            ));
+        }
         let normalized_capabilities = {
             let _startup_part = pioneer_observability::turn_startup::stage(
                 &params.turn_id,
@@ -2440,11 +2704,14 @@ impl MessageProcessor {
             .await?;
         }
         params.capabilities = normalized_capabilities.execution.clone();
+        project_plugin_root_launch(&mut params, &normalized_capabilities.plugin_capability_ids)?;
         validate_root_agent_launch_capabilities(&params)?;
         super::message_turn::normalize_turn_collaboration_params(&mut params).map_err(|error| {
             TurnStartFailure::invalid_input(format!("invalid Turn collaboration metadata: {error}"))
         })?;
-        let request_digest = native_turn_admission_digest(&request_actor, &params)
+        let mut digest_params = params.clone();
+        digest_params.capabilities = normalized_capabilities.presentation.clone();
+        let request_digest = native_turn_admission_digest(&request_actor, &digest_params)
             .map_err(TurnStartFailure::invalid_input)?;
         let existing_admission = self
             .crud_store
@@ -2540,28 +2807,57 @@ impl MessageProcessor {
         let startup_persist = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::Persist,
         );
-        let outcome_result = match resolved_permission_profile {
-            Some(profile) => {
-                self.thread_manager
-                    .turn_start_with_user_metadata_and_permission_profile(
-                        connection_id,
-                        params,
-                        profile,
-                        author,
-                        mentions,
-                    )
-                    .await
-            }
-            None => {
-                self.thread_manager
-                    .turn_start_with_user_metadata(connection_id, params, author, mentions)
-                    .await
+        let outcome_result = if normalized_capabilities.plugin_selection.is_some() {
+            let mut public_envelope = params.clone();
+            public_envelope.capabilities = normalized_capabilities.presentation.clone();
+            self.thread_manager
+                .turn_start_with_plugin_capabilities(
+                    connection_id,
+                    public_envelope,
+                    normalized_capabilities.execution.clone(),
+                    resolved_permission_profile,
+                    author,
+                    mentions,
+                )
+                .await
+        } else {
+            match resolved_permission_profile {
+                Some(profile) => {
+                    self.thread_manager
+                        .turn_start_with_user_metadata_and_permission_profile(
+                            connection_id,
+                            params,
+                            profile,
+                            author,
+                            mentions,
+                        )
+                        .await
+                }
+                None => {
+                    self.thread_manager
+                        .turn_start_with_user_metadata(connection_id, params, author, mentions)
+                        .await
+                }
             }
         };
         drop(startup_persist);
         let outcome = outcome_result.map_err(|error| {
             TurnStartFailure::internal(format!("failed to start turn: {error:#}"))
         })?;
+        if let Some(selection) = &normalized_capabilities.plugin_selection {
+            if let Err(_) = self
+                .crud_store
+                .prepare_plugin_selection(&outcome.materialization.turn.id, selection)
+                .await
+            {
+                self.thread_manager
+                    .rollback_turn_start(outcome.rollback_context.clone())
+                    .await;
+                return Err(TurnStartFailure::unavailable(
+                    "plugin selection snapshot unavailable",
+                ));
+            }
+        }
         let effective_reasoning_effort = match self
             .resolve_turn_reasoning_effort(
                 outcome.started_notification.workspace_id.as_str(),
@@ -4039,6 +4335,10 @@ impl MessageProcessor {
                 ));
                 return None;
             };
+            if params.capabilities.iter().any(|c| matches!(c.kind, pioneer_protocol::TurnCapabilityKind::Plugin { .. })) {
+                send_turn_start_failure!("Plugins are not supported by this CLI runtime yet".to_owned());
+                return None;
+            }
             let normalized_capabilities = match self
                 .normalize_turn_skill_capabilities(
                     thread.workspace_id.as_str(),
@@ -11224,6 +11524,31 @@ mod tests {
             .execution
             .mcp_server_ids = vec![server_id.clone(), server_id];
         assert!(validate_root_agent_launch_capabilities(&params).is_err());
+    }
+
+    #[test]
+    fn plugin_root_launch_accepts_only_server_derived_grants_and_preserves_public_limit() {
+        let skill_id = pioneer_protocol::SkillId::new("S".repeat(21)).unwrap();
+        let leaf = pioneer_protocol::TurnCapability {
+            id: pioneer_protocol::skill_capability_key(&skill_id),
+            label: None,
+            kind: pioneer_protocol::TurnCapabilityKind::Skill {
+                skill_id: skill_id.clone(),
+                pack_id: None,
+            },
+        };
+        let keys = HashSet::from([leaf.id.clone()]);
+        let mut params = root_agent_launch_params(vec![leaf.clone()], vec![], vec![]);
+        project_plugin_root_launch(&mut params, &keys).unwrap();
+        validate_root_agent_launch_capabilities(&params).unwrap();
+        assert_eq!(
+            params.agent_launch.as_ref().unwrap().execution.skill_ids,
+            vec![skill_id.clone()]
+        );
+        let mut forged = root_agent_launch_params(vec![leaf.clone()], vec![skill_id], vec![]);
+        assert!(project_plugin_root_launch(&mut forged, &keys).is_err());
+        let raw = root_agent_launch_params(vec![leaf; 65], vec![], vec![]);
+        assert!(pioneer_protocol::validate_turn_execution_envelope(&raw).is_err());
     }
 
     fn root_agent_launch_params(

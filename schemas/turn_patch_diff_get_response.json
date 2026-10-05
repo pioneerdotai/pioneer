@@ -17,6 +17,14 @@
     "exactness": {
       "$ref": "#/$defs/TurnDiffExactnessView"
     },
+    "filesystem": {
+      "$ref": "#/$defs/TurnFilesystemCoverageView",
+      "default": {
+        "kind": "incomplete",
+        "reason": "turn-wide filesystem coverage was not recorded",
+        "sources": []
+      }
+    },
     "recordsRendered": {
       "type": "integer",
       "format": "uint32",
@@ -38,9 +46,13 @@
     },
     "unifiedPatch": {
       "type": "string"
+    },
+    "view": {
+      "$ref": "#/$defs/PatchHistoryViewKind"
     }
   },
   "required": [
+    "view",
     "threadId",
     "turnId",
     "exactness",
@@ -49,6 +61,25 @@
     "recordsRendered"
   ],
   "$defs": {
+    "PatchFilesystemMutationSourceView": {
+      "type": "object",
+      "properties": {
+        "itemId": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "toolName": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "itemId",
+        "toolName",
+        "reason"
+      ]
+    },
     "PatchHistoryCoverageView": {
       "oneOf": [
         {
@@ -137,6 +168,14 @@
         }
       ]
     },
+    "PatchHistoryViewKind": {
+      "type": "string",
+      "enum": [
+        "timeline",
+        "turn_aggregate",
+        "record_diff"
+      ]
+    },
     "TurnDiffExactnessView": {
       "oneOf": [
         {
@@ -185,6 +224,57 @@
           "required": [
             "kind",
             "reason"
+          ]
+        }
+      ]
+    },
+    "TurnFilesystemCoverageView": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "pending"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "complete"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "incomplete"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "sources": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/PatchFilesystemMutationSourceView"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "reason",
+            "sources"
           ]
         }
       ]

@@ -888,7 +888,7 @@ pub(crate) fn pin_launch_selection_capabilities(
                 }
                 skill_ids.push(skill_id.clone());
             }
-            TurnCapabilityKind::SkillPack { .. } => {
+            TurnCapabilityKind::SkillPack { .. } | TurnCapabilityKind::Plugin { .. } => {
                 anyhow::bail!("normalized Task launch contains an unexpanded Skill pack");
             }
             TurnCapabilityKind::McpServer { name, scope_kind } => {

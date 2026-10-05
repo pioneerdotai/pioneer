@@ -663,6 +663,22 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         Forbidden,
         Management,
     ),
+    method_entry(PLUGINS_LIST, SkillDiscover, Workspace, NotFound, Read),
+    method_entry(PLUGINS_DETAILS, SkillDiscover, Workspace, NotFound, Read),
+    method_entry(
+        PLUGINS_PREVIEW,
+        SkillManage,
+        Capability,
+        Forbidden,
+        Management,
+    ),
+    method_entry(
+        PLUGINS_INSTALL,
+        SkillManage,
+        Capability,
+        Forbidden,
+        Management,
+    ),
     method_entry(SKILLS_LIST, SkillDiscover, Workspace, NotFound, Read),
     method_entry(
         SKILLS_INSTALL,

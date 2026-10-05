@@ -25,6 +25,7 @@ mod native_health;
 mod notifications;
 mod patch_history_handlers;
 mod permission_handlers;
+mod plugins;
 mod provider_handlers;
 mod provider_readiness;
 mod reconciliation_diagnostics;

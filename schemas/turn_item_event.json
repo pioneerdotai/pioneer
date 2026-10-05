@@ -3974,6 +3974,8 @@
         "dynamic_skill_tool",
         "computer_use",
         "task_subagent",
+        "memory_write",
+        "agent_action",
         "internal",
         "unknown"
       ]
@@ -4172,6 +4174,26 @@
         "inherited_from_parent_turn",
         "task_permission_cap",
         "system"
+      ]
+    },
+    "TurnPluginCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "expectedRevision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "label": {
+          "type": "string"
+        },
+        "pluginId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pluginId",
+        "expectedRevision",
+        "label"
       ]
     },
     "TurnSecurityCapabilityKind": {
@@ -4408,6 +4430,22 @@
             "type": {
               "type": "string",
               "const": "skill"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnPluginCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "plugin"
             }
           },
           "required": [

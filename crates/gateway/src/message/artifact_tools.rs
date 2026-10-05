@@ -52,6 +52,27 @@ impl GatewayArtifactFinalizationProvider {
 
 #[async_trait]
 impl TurnToolProvider for GatewayArtifactToolProvider {
+    async fn authorize_skill_invocation(
+        &self,
+        context: TurnToolContext,
+        skill_id: pioneer_protocol::SkillId,
+    ) -> Result<(), String> {
+        let processor = self.processor()?;
+        if !processor
+            .crud_store
+            .plugin_turn_child_available(
+                &context.turn_id,
+                "skill",
+                skill_id.as_str(),
+                &context.workspace_id,
+            )
+            .await
+            .map_err(|_| "skill ownership unavailable".to_owned())?
+        {
+            return Err("plugin selection is unavailable for this turn".into());
+        }
+        Ok(())
+    }
     async fn materialize_turn_tools(
         &self,
         context: TurnToolContext,

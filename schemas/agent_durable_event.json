@@ -516,6 +516,23 @@
       ]
     },
     {
+      "description": "Immutable terminal side-effect preparation. Gateway persists this\nbounded batch before acknowledging it; the subsequent canonical Turn\nterminal projection atomically makes the current batch runnable.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "native_terminal_effects_prepared"
+        },
+        "preparation": {
+          "$ref": "#/$defs/NativeTerminalEffectPreparation"
+        }
+      },
+      "required": [
+        "kind",
+        "preparation"
+      ]
+    },
+    {
       "type": "object",
       "properties": {
         "kind": {
@@ -2505,6 +2522,157 @@
         "selection_reason"
       ]
     },
+    "NativeTerminalEffectGate": {
+      "type": "string",
+      "enum": [
+        "terminal_commit",
+        "accepted_task_result"
+      ]
+    },
+    "NativeTerminalEffectKind": {
+      "type": "string",
+      "enum": [
+        "post_turn_hook",
+        "attached_task_cleanup"
+      ]
+    },
+    "NativeTerminalEffectPayload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "post_turn_hook"
+            },
+            "request": true,
+            "runtime_snapshot": {
+              "description": "Versioned immutable subscriptions and handler descriptors captured\nby the Turn. The outbox schema is new, so there is no valid legacy\nrow whose execution may fall back to mutable process configuration."
+            }
+          },
+          "required": [
+            "kind",
+            "request",
+            "runtime_snapshot"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "failure": {
+              "$ref": "#/$defs/NativeTerminalEffectPreparationFailure"
+            },
+            "kind": {
+              "type": "string",
+              "const": "post_turn_hook_preparation_failed"
+            }
+          },
+          "required": [
+            "kind",
+            "failure"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "attached_task_cleanup"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "runtime_contract": {
+              "description": "Immutable semantic contract of the cleanup adapter captured by the\noriginating Turn. A worker may rebind the durable obligation to a\ncurrent provider after restart only when this value matches.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "reason",
+            "runtime_contract"
+          ]
+        }
+      ]
+    },
+    "NativeTerminalEffectPreparation": {
+      "type": "object",
+      "properties": {
+        "batchId": {
+          "type": "string"
+        },
+        "effects": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/NativeTerminalEffectSpec"
+          }
+        },
+        "runtimeGeneration": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "batchId",
+        "workspaceId",
+        "threadId",
+        "turnId",
+        "runtimeGeneration"
+      ]
+    },
+    "NativeTerminalEffectPreparationFailure": {
+      "type": "string",
+      "enum": [
+        "invalid_hook_request",
+        "hook_runtime_unavailable",
+        "subscription_snapshot_unavailable",
+        "handler_snapshot_unavailable",
+        "snapshot_serialization_failed",
+        "payload_serialization_failed",
+        "payload_too_large"
+      ]
+    },
+    "NativeTerminalEffectSpec": {
+      "type": "object",
+      "properties": {
+        "effectId": {
+          "type": "string"
+        },
+        "effectKind": {
+          "$ref": "#/$defs/NativeTerminalEffectKind"
+        },
+        "gate": {
+          "$ref": "#/$defs/NativeTerminalEffectGate"
+        },
+        "maxAttempts": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "payload": {
+          "$ref": "#/$defs/NativeTerminalEffectPayload"
+        }
+      },
+      "required": [
+        "effectId",
+        "effectKind",
+        "gate",
+        "payload",
+        "maxAttempts"
+      ]
+    },
     "PermissionBehavior": {
       "type": "string",
       "enum": [
@@ -3735,6 +3903,17 @@
           "items": {
             "$ref": "#/$defs/TurnFilesystemSandboxEntry"
           }
+        },
+        "maxFilesystemKind": {
+          "description": "Distinguishes a restricted cap with zero roots from an unrestricted\ncap, whose bounded-root list is also empty. Legacy records omit this\nfield and are interpreted conservatively by the Gateway.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnFilesystemSandboxKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "maxNetworkPolicy": {
           "$ref": "#/$defs/TurnNetworkPolicySnapshot"
@@ -8325,17 +8504,28 @@
     "ToolPermissionPolicySnapshot": {
       "type": "object",
       "properties": {
+        "agent_action": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
         "allowed_paths": {
           "type": "array",
           "items": {
             "type": "string"
           }
         },
+        "allowed_paths_restricted": {
+          "description": "See `allowed_tools_restricted`.  A restricted empty path set is a\ndurable deny-all result, while an unrestricted empty set is the legacy\nwildcard.",
+          "type": "boolean"
+        },
         "allowed_tools": {
           "type": "array",
           "items": {
             "type": "string"
           }
+        },
+        "allowed_tools_restricted": {
+          "description": "`allowed_tools = []` historically means \"no allow-list\".  This bit\npreserves the distinct result of intersecting two disjoint allow-lists:\na restricted empty set must deny every tool rather than reopen all of\nthem.",
+          "type": "boolean"
         },
         "computer_use": {
           "$ref": "#/$defs/PermissionBehavior"
@@ -8364,6 +8554,9 @@
         "mcp_write_or_unknown": {
           "$ref": "#/$defs/PermissionBehavior"
         },
+        "memory_write": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
         "network": {
           "$ref": "#/$defs/PermissionBehavior"
         },
@@ -8384,7 +8577,9 @@
         "mcp_write_or_unknown",
         "dynamic_skill_tool",
         "computer_use",
-        "task_subagent"
+        "task_subagent",
+        "memory_write",
+        "agent_action"
       ]
     },
     "ToolRecoveryIdempotencyMode": {
@@ -8813,6 +9008,27 @@
     },
     "TurnCapabilityKind": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "expectedRevision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "pluginId": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "plugin"
+            }
+          },
+          "required": [
+            "type",
+            "pluginId",
+            "expectedRevision"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -9284,6 +9500,13 @@
         "path",
         "access",
         "provenance"
+      ]
+    },
+    "TurnFilesystemSandboxKind": {
+      "type": "string",
+      "enum": [
+        "restricted",
+        "unrestricted"
       ]
     },
     "TurnFilesystemSandboxPath": {
@@ -10521,6 +10744,8 @@
         "dynamic_skill_tool",
         "computer_use",
         "task_subagent",
+        "memory_write",
+        "agent_action",
         "internal",
         "unknown"
       ]
@@ -10745,6 +10970,26 @@
         "inherited_from_parent_turn",
         "task_permission_cap",
         "system"
+      ]
+    },
+    "TurnPluginCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "expectedRevision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "label": {
+          "type": "string"
+        },
+        "pluginId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pluginId",
+        "expectedRevision",
+        "label"
       ]
     },
     "TurnProcessPolicySnapshot": {
@@ -11505,6 +11750,22 @@
             "type": {
               "type": "string",
               "const": "skill"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnPluginCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "plugin"
             }
           },
           "required": [

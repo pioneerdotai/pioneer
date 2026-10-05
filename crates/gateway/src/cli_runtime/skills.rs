@@ -330,6 +330,9 @@ pub(crate) fn partition_cli_runtime_capabilities(
     let mut partition = CliRuntimeCapabilityPartition::default();
     for capability in capabilities {
         match &capability.kind {
+            pioneer_protocol::TurnCapabilityKind::Plugin { .. } => {
+                return Err("plugin parent must be expanded before CLI projection".into());
+            }
             TurnCapabilityKind::Skill {
                 skill_id,
                 pack_id: None,

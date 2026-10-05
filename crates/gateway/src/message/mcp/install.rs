@@ -441,6 +441,11 @@ impl MessageProcessor {
                 action: changed_action,
             });
 
+            let mut published_server = list_item_from_record(&record);
+            published_server.plugin_owner = ownership.map(|owner| pioneer_protocol::PluginOwner {
+                plugin_id: owner.plugin_id.clone(),
+                member_key: owner.member_key.clone(),
+            });
             response_items.push(McpInstallResult {
                 name: record.name.clone(),
                 status: if changed_action == McpChangedAction::Update {
@@ -449,7 +454,7 @@ impl MessageProcessor {
                     McpInstallResultStatus::Installed
                 },
                 diagnostics,
-                server: Some(list_item_from_record(&record)),
+                server: Some(published_server),
             });
         }
 

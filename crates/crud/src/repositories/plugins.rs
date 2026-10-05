@@ -1,6 +1,93 @@
 use anyhow::{Context, Result, bail};
 use pioneer_entity::{plugin_component, plugin_installation};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
+};
+
+pub async fn list<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+) -> Result<Vec<plugin_installation::Model>> {
+    let rows = plugin_installation::Entity::find()
+        .filter(plugin_installation::Column::WorkspaceId.eq(workspace))
+        .order_by_asc(plugin_installation::Column::CreatedAt)
+        .limit(1001)
+        .all(db)
+        .await?;
+    if rows.len() > 1000 {
+        bail!("plugin inventory limit exceeded");
+    }
+    Ok(rows)
+}
+
+/// Only immediate DB validation/writes run under the caller's writer. The
+/// package and bounded pending plan have already been prepared outside it.
+pub async fn settle<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    revision: i64,
+    state: &str,
+    error: Option<String>,
+) -> Result<()> {
+    let parent = find(db, id).await?.context("plugin missing")?;
+    if parent.revision != revision || parent.state != "installing" {
+        bail!("plugin operation changed");
+    }
+    let pending = parent.pending_json.clone();
+    let mut row: plugin_installation::ActiveModel = parent.into();
+    row.state = Set(state.to_owned());
+    row.pending_json = Set(if state == "installed" { None } else { pending });
+    row.last_error = Set(error);
+    row.updated_at = Set(chrono::Utc::now().fixed_offset());
+    row.update(db).await?;
+    Ok(())
+}
+
+pub async fn record_failure<C: ConnectionTrait>(
+    db: &C,
+    write: &PluginOwnershipWrite,
+    kind: &str,
+    diagnostic: &str,
+) -> Result<()> {
+    let existing = plugin_component::Entity::find_by_id((
+        write.plugin_id.clone(),
+        kind.to_owned(),
+        write.member_key.clone(),
+    ))
+    .one(db)
+    .await?;
+    let native_id = existing.as_ref().and_then(|c| {
+        if kind == "skill" {
+            c.skill_id.as_deref()
+        } else {
+            c.mcp_installation_id.as_deref()
+        }
+    });
+    validate_publication(
+        db,
+        Some(write),
+        &find(db, &write.plugin_id)
+            .await?
+            .context("plugin missing")?
+            .workspace_id,
+        kind,
+        &write.child_id,
+        native_id,
+    )
+    .await?;
+    let mut link = prepare_link(write, kind);
+    if let Some(existing) = existing {
+        link.skill_id = Set(existing.skill_id);
+        link.mcp_installation_id = Set(existing.mcp_installation_id);
+    } else {
+        link.skill_id = Set(None);
+        link.mcp_installation_id = Set(None);
+    }
+    link.status = Set("failed".into());
+    link.diagnostic = Set(Some(diagnostic.into()));
+    publish(db, link).await
+}
 
 /// Host-derived ownership accompanying the native child write. The reserved ID
 /// is also recorded in the parent's pending plan by the caller before I/O.
@@ -168,4 +255,36 @@ pub async fn insert_parent<C: ConnectionTrait>(
 ) -> Result<()> {
     plugin_installation::Entity::insert(row).exec(db).await?;
     Ok(())
+}
+
+pub async fn selection<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<Option<String>> {
+    Ok(pioneer_entity::turn::Entity::find_by_id(turn_id)
+        .one(db)
+        .await?
+        .and_then(|t| t.plugin_selection_json))
+}
+pub async fn set_selection<C: ConnectionTrait>(db: &C, turn_id: &str, value: String) -> Result<()> {
+    let row = pioneer_entity::turn::Entity::find_by_id(turn_id)
+        .one(db)
+        .await?
+        .context("turn missing")?;
+    let mut row: pioneer_entity::turn::ActiveModel = row.into();
+    row.plugin_selection_json = Set(Some(value));
+    row.update(db).await?;
+    Ok(())
+}
+
+/// Bounded native binding existence check for the ready publication transaction.
+pub async fn has_skill_binding<C: ConnectionTrait>(
+    db: &C,
+    turn: &str,
+    skill: &str,
+) -> Result<bool> {
+    use pioneer_entity::turn_skill_binding as binding;
+    Ok(binding::Entity::find()
+        .filter(binding::Column::TurnId.eq(turn))
+        .filter(binding::Column::SkillId.eq(skill))
+        .one(db)
+        .await?
+        .is_some())
 }

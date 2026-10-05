@@ -505,6 +505,16 @@ pub trait TurnToolProvider: Send + Sync {
         context: TurnToolContext,
     ) -> Result<TurnToolMaterialization, String>;
 
+    /// Late gate for native read_skill and dynamic skill handlers. The Gateway
+    /// checks existing ownership and the server-derived selection snapshot.
+    async fn authorize_skill_invocation(
+        &self,
+        _context: TurnToolContext,
+        _skill_id: SkillId,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn authorize_skill_continuation(
         &self,
         _context: SkillContinuationAuthorizationContext,

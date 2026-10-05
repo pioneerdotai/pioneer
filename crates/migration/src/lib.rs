@@ -81,6 +81,7 @@ mod m20260905_000001_memory_identity;
 mod m20260906_000003_projection_receipt_cleanup;
 
 mod m20261005_000001_plugin_ownership;
+mod m20261005_000002_plugin_turn_selection;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -161,6 +162,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261001_000001_delivery_authority_spec_indexes::Migration),
             Box::new(m20261002_000001_task_run_occurrence_reconcile::Migration),
             Box::new(m20261005_000001_plugin_ownership::Migration),
+            Box::new(m20261005_000002_plugin_turn_selection::Migration),
         ]
     }
 }

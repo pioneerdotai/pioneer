@@ -81,7 +81,7 @@ impl MessageProcessor {
                 None => None,
             };
             let runtime = row.id.as_deref().and_then(|id| runtime_snapshots.get(id));
-            let item = match list_item_from_record_with_catalog_and_runtime(
+            let mut item = match list_item_from_record_with_catalog_and_runtime(
                 row,
                 catalog.as_ref(),
                 runtime,
@@ -114,6 +114,26 @@ impl MessageProcessor {
                 item.id.as_str(),
             ) {
                 continue;
+            }
+            match self.crud_store.find_mcp_plugin_owner(&item.id).await {
+                Ok(owner) => {
+                    item.plugin_owner = owner.map(|o| pioneer_protocol::PluginOwner {
+                        plugin_id: o.plugin_id,
+                        member_key: o.member_key,
+                    })
+                }
+                Err(_) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id.clone()),
+                            INVALID_REQUEST_CODE,
+                            "MCP ownership unavailable",
+                        ),
+                    )
+                    .await;
+                    return;
+                }
             }
             servers.push(item);
         }

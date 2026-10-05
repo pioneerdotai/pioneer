@@ -1327,6 +1327,37 @@ async fn setup_cli_runtime_security_harness_for_principal(
     }
 }
 
+// Stage B regression source; NOT_RUN / NOT_COMPILED.
+#[test]
+fn plugin_turn_normalization_keeps_parent_and_rejects_raw_owned_skill() {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let harness = setup_cli_runtime_security_harness(None).await;
+        let parent_id = "P".repeat(21);
+        let now = chrono::Utc::now().fixed_offset();
+        harness.crud_store.insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+            id: parent_id.clone(), workspace_id: harness.workspace_id.clone(), name: "authoritative-name".into(), version: None, source_upload_id: "upload-plugin".into(), package_path: "/managed/package".into(), data_path: "/managed/data".into(), package_fingerprint: "tree".into(), enabled: true, state: "installing".into(), revision: 1, pending_json: None, last_error: None, created_at: now, updated_at: now,
+        }).await.unwrap();
+        let selected = pioneer_protocol::TurnCapability { id: pioneer_protocol::plugin_capability_key(&parent_id), label: Some("untrusted-label".into()), kind: pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id: parent_id.clone(), expected_revision: 1 } };
+        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[selected.clone()]).await.is_err());
+        let skill_id = pioneer_protocol::SkillId::new("S".repeat(21)).unwrap();
+        let child = pioneer_crud::SkillInstallationRecord { skill_id: skill_id.clone(), owner: None, slug: "bundled".into(), version: None, source_kind: "user".into(), scope_key: harness.workspace_id.clone(), source_ref: "plugin".into(), install_path: "/managed/skills/bundled".into(), trust_level: "community".into(), fingerprint: "member".into(), updated_at_unix: 1, pack_id: None, pack_member_key: None };
+        let policy = pioneer_crud::WorkspaceSkillPolicyRecord { id: "policy-plugin".into(), workspace_id: harness.workspace_id.clone(), skill_id: skill_id.clone(), enabled: Some(true), allow_implicit_invocation: Some(false) };
+        harness.crud_store.install_skill_lifecycle_with_ownership(&child, &policy, &[], None, Some(&pioneer_crud::PluginOwnershipWrite { plugin_id: parent_id.clone(), expected_revision: 1, member_key: "bundled".into(), member_path: Some("skills/bundled".into()), package_fingerprint: "member".into(), child_id: skill_id.to_string() }), 1).await.unwrap();
+        harness.crud_store.settle_plugin_installation(&parent_id, 1, "installed", None).await.unwrap();
+        let result = harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[selected.clone()]).await.unwrap();
+        assert_eq!(result.presentation.len(), 1);
+        assert_eq!(result.presentation[0].label.as_deref(), Some("authoritative-name"));
+        assert!(matches!(result.presentation[0].kind, pioneer_protocol::TurnCapabilityKind::Plugin { .. }));
+        assert_eq!(result.execution.len(), 1);
+        assert!(matches!(&result.execution[0].kind, pioneer_protocol::TurnCapabilityKind::Skill { skill_id: id, .. } if id == &skill_id));
+        assert_eq!(result.plugin_selection.unwrap().children[0].id, skill_id.to_string());
+        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &result.execution).await.is_err());
+        let mut stale = selected.clone(); stale.kind = pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id: parent_id, expected_revision: 2 };
+        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[stale]).await.is_err());
+        assert!(harness.processor.normalize_turn_skill_capabilities("foreign", &[selected]).await.is_err());
+    });
+}
+
 #[test]
 fn skill_pack_turn_normalization_is_authoritative_ordered_and_fail_closed() {
     tokio::runtime::Builder::new_current_thread()
@@ -63815,6 +63846,7 @@ async fn upload_expiry_waits_for_the_shared_lifecycle_guard() {
     let upload_id = "expiryguardupload0001";
     crud_store_for_assert
         .insert_skill_upload_session(&pioneer_crud::SkillUploadSessionRecord {
+            purpose: "skill".to_owned(),
             upload_id: upload_id.to_owned(),
             workspace_id,
             connection_id,

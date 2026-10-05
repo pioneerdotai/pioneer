@@ -840,6 +840,30 @@ impl ThreadManager {
             .await
     }
 
+    /// Only the Gateway normalizer supplies this internal expansion. Validate
+    /// the public parent envelope before replacing it with bounded native leaves.
+    pub(crate) async fn turn_start_with_plugin_capabilities(
+        &self,
+        connection_id: ConnectionId,
+        params: TurnStartParams,
+        capabilities: Vec<pioneer_protocol::TurnCapability>,
+        permission_profile: Option<pioneer_protocol::TurnPermissionProfileSnapshot>,
+        author: Option<pioneer_protocol::TurnAuthorSnapshot>,
+        mentions: Vec<pioneer_protocol::TurnMention>,
+    ) -> Result<TurnStartOutcome> {
+        self.turn_start_for_actor_with_permission_profile_concurrency(
+            Some(connection_id),
+            params,
+            permission_profile,
+            author,
+            mentions,
+            TurnOrigin::User,
+            false,
+            Some(capabilities),
+        )
+        .await
+    }
+
     pub async fn turn_start_with_user_metadata_and_permission_profile(
         &self,
         connection_id: ConnectionId,
@@ -949,6 +973,7 @@ impl ThreadManager {
             Vec::new(),
             TurnOrigin::User,
             true,
+            None,
         )
         .await
     }
@@ -1052,6 +1077,7 @@ impl ThreadManager {
             mentions,
             origin,
             false,
+            None,
         )
         .await
     }
@@ -1065,9 +1091,15 @@ impl ThreadManager {
         mentions: Vec<pioneer_protocol::TurnMention>,
         origin: TurnOrigin,
         allow_concurrent_agent_child: bool,
+        plugin_capabilities: Option<Vec<pioneer_protocol::TurnCapability>>,
     ) -> Result<TurnStartOutcome> {
         pioneer_protocol::validate_turn_execution_envelope(&params)
             .map_err(|message| anyhow!(message))?;
+        let mut params = params;
+        if let Some(capabilities) = plugin_capabilities {
+            validate_plugin_expansion(&params, &capabilities)?;
+            params.capabilities = capabilities;
+        }
         let thread_id = params.thread_id.trim();
         if thread_id.is_empty() {
             bail!("`thread_id` is required for `turn/start`");
@@ -3341,5 +3373,86 @@ mod tests {
 
         let removed = manager.connection_closed(10).await;
         assert_eq!(removed, vec!["thr_000000000000000011".to_owned()]);
+    }
+}
+
+/// Private preparation boundary; no RPC can supply the expanded argument.
+fn validate_plugin_expansion(
+    params: &TurnStartParams,
+    capabilities: &[pioneer_protocol::TurnCapability],
+) -> Result<()> {
+    pioneer_protocol::validate_turn_execution_envelope(params)
+        .map_err(|message| anyhow!(message))?;
+    if !params
+        .capabilities
+        .iter()
+        .any(|c| matches!(c.kind, pioneer_protocol::TurnCapabilityKind::Plugin { .. }))
+        || capabilities.len() > 256
+        || capabilities.iter().any(|c| {
+            !matches!(
+                c.kind,
+                pioneer_protocol::TurnCapabilityKind::Skill { pack_id: None, .. }
+                    | pioneer_protocol::TurnCapabilityKind::McpServer { .. }
+                    | pioneer_protocol::TurnCapabilityKind::McpTool { .. }
+            )
+        })
+    {
+        bail!("invalid prepared plugin capabilities");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod plugin_expansion_tests {
+    use super::*;
+    // Sources only: NOT_RUN / NOT_COMPILED. Exercises the actual boundary.
+    #[test]
+    fn public_and_internal_capability_limits_have_separate_trust_boundaries() {
+        let plugin_id = "P".repeat(21);
+        let parent = pioneer_protocol::TurnCapability {
+            id: pioneer_protocol::plugin_capability_key(&plugin_id),
+            label: None,
+            kind: pioneer_protocol::TurnCapabilityKind::Plugin {
+                plugin_id,
+                expected_revision: 1,
+            },
+        };
+        let mut params = TurnStartParams {
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            input: vec![],
+            capabilities: vec![parent.clone()],
+            model: None,
+            model_provider: None,
+            sandbox_policy: None,
+            mode: Some(ThreadMode::Agent),
+            agent_launch: None,
+            reply_to_turn_id: None,
+            mentioned_principal_ids: vec![],
+            execution_backend: None,
+            reasoning: None,
+            permission_profile: None,
+            cli_runtime_options: None,
+            agent_delegation_routes: vec![],
+        };
+        let leaves: Vec<_> = (0..257)
+            .map(|index| {
+                let skill_id = pioneer_protocol::SkillId::new(format!("{index:021}")).unwrap();
+                pioneer_protocol::TurnCapability {
+                    id: pioneer_protocol::skill_capability_key(&skill_id),
+                    label: None,
+                    kind: pioneer_protocol::TurnCapabilityKind::Skill {
+                        skill_id,
+                        pack_id: None,
+                    },
+                }
+            })
+            .collect();
+        assert!(validate_plugin_expansion(&params, &leaves[..256]).is_ok());
+        assert!(validate_plugin_expansion(&params, &leaves).is_err());
+        params.capabilities = leaves[..65].to_vec();
+        assert!(validate_plugin_expansion(&params, &leaves[..256]).is_err());
+        params.capabilities = vec![parent.clone()];
+        assert!(validate_plugin_expansion(&params, &[parent]).is_err());
     }
 }

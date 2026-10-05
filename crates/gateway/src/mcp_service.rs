@@ -1037,12 +1037,30 @@ impl McpService {
         explicit_tools: &[AgentMcpToolRef],
     ) -> Result<WorkspaceMcpToolState> {
         self.reload_workspace(workspace_id).await?;
-        let rows = self
+        let mut rows = self
             .inner
             .crud_store
             .list_mcp_server_installations("workspace", workspace_id)
             .await
             .context("failed to load MCP workspace installations for tool materialization")?;
+        for row in &mut rows {
+            if let Some(id) = &row.id {
+                if self
+                    .inner
+                    .crud_store
+                    .find_mcp_plugin_owner(id)
+                    .await?
+                    .is_some()
+                {
+                    row.allow_implicit_invocation = false;
+                    row.enabled &= self
+                        .inner
+                        .crud_store
+                        .plugin_child_available("mcp", id, workspace_id)
+                        .await?;
+                }
+            }
+        }
         let runtime = self.runtime_snapshot("workspace", workspace_id).await;
         let mut state = WorkspaceMcpToolState::default();
         let mut explicit_servers_by_name = HashMap::<String, Vec<&AgentMcpServerRef>>::new();
@@ -1564,6 +1582,24 @@ impl McpService {
                 ))
             })?;
 
+        if !self
+            .inner
+            .crud_store
+            .plugin_turn_child_available(
+                &request.turn_id,
+                "mcp",
+                &request.server_id,
+                &request.workspace_id,
+            )
+            .await
+            .map_err(|_| {
+                pioneer_tools::ToolError::Rejected("plugin ownership unavailable".into())
+            })?
+        {
+            return Err(pioneer_tools::ToolError::Rejected(
+                "plugin selection is unavailable for this turn".into(),
+            ));
+        }
         if !row.enabled {
             self.audit_tool_call(
                 &row,

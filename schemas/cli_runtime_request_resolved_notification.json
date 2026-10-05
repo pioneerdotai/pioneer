@@ -30,6 +30,13 @@
         "null"
       ]
     },
+    "visible_thread_ids": {
+      "description": "Mirrors the opened notification so clients can remove an ancestor-\nprojected request without waiting for a separate timeline refresh.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "workspace_id": {
       "type": "string"
     }
@@ -49,6 +56,18 @@
             "status": {
               "type": "string",
               "const": "approved"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "approved_for_session"
             }
           },
           "required": [

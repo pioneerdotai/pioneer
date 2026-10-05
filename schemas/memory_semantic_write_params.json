@@ -76,6 +76,13 @@
         }
       ]
     },
+    "target_memory_id": {
+      "description": "Explicit correction target; preserves its stored namespace/key. Never\ninferred from similarity. The server validates scope and visibility.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "value": {
       "type": [
         "string",
