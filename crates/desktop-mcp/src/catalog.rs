@@ -308,7 +308,12 @@ impl McpCatalogView {
             });
             let catalog = self.client.mcp_catalog_snapshot(&workspace);
             if let Some(catalog) = catalog {
-                next.mcp_servers = catalog.servers().iter().map(|s| (**s).clone()).collect();
+                next.mcp_servers = catalog
+                    .servers()
+                    .iter()
+                    .filter(|s| pioneer_client::mcp::list::mcp_is_standalone(s))
+                    .map(|s| (**s).clone())
+                    .collect();
                 next.mcp_loading = catalog.request() == McpLoadState::Loading;
                 next.mcp_error = (catalog.request() == McpLoadState::Failed)
                     .then(|| t!("mcp.error.load_servers_failed", error = "").to_string());

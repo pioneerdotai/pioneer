@@ -9347,6 +9347,7 @@ dependencies = [
  "libc",
  "mime_guess",
  "pioneer-observability",
+ "pioneer-plugins",
  "pioneer-protocol",
  "pioneer-skills",
  "qrcode",
@@ -9450,6 +9451,7 @@ dependencies = [
  "pioneer-desktop-foundation",
  "pioneer-desktop-mcp",
  "pioneer-desktop-onboarding",
+ "pioneer-desktop-plugins",
  "pioneer-desktop-providers",
  "pioneer-desktop-settings",
  "pioneer-desktop-skills",
@@ -9540,6 +9542,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pioneer-desktop-plugins"
+version = "0.56.0"
+dependencies = [
+ "gpui-kit",
+ "pioneer-client",
+ "pioneer-desktop-foundation",
+ "rust-i18n",
+ "tokio",
+]
+
+[[package]]
 name = "pioneer-desktop-providers"
 version = "0.56.0"
 dependencies = [
@@ -9600,6 +9613,7 @@ dependencies = [
  "image",
  "pioneer-client",
  "pioneer-desktop-foundation",
+ "pioneer-desktop-plugins",
  "pioneer-observability",
  "rust-i18n",
  "serde",

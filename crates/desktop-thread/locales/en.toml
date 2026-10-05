@@ -331,3 +331,5 @@
 "timeline.web_search.results_count" = "%{count} results"
 "timeline.web_search.running" = "Searching the web"
 "timeline.work_group.completed" = "Worked"
+
+"chat.composer.add_menu.plugins" = "Plugins"

@@ -331,3 +331,5 @@
 "timeline.web_search.results_count" = "%{count} результатов"
 "timeline.web_search.running" = "Ищу в интернете"
 "timeline.work_group.completed" = "Работал"
+
+"chat.composer.add_menu.plugins" = "Плагины"

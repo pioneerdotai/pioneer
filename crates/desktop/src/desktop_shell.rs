@@ -60,6 +60,7 @@ pub(crate) struct DesktopShellView {
     providers: Option<Entity<pioneer_desktop_providers::ProviderCatalogView>>,
     mcp: Option<Entity<pioneer_desktop_mcp::McpCatalogView>>,
     skills: Option<Entity<pioneer_desktop_skills::SkillsCatalogView>>,
+    plugins: Option<Entity<pioneer_desktop_plugins::PluginsView>>,
     agents_document: Option<Entity<pioneer_desktop_agents_doc::AgentsDocumentEditor>>,
     desktop_update: Option<Entity<pioneer_desktop_update::DesktopUpdateView>>,
     task_notifications: Option<Entity<pioneer_desktop_task_notifications::TaskNotificationView>>,
@@ -80,6 +81,7 @@ impl DesktopShellView {
             self.onboarding.as_ref().map(|root| root.clone().into())
         } else {
             match route.route() {
+                MainRoute::Plugins => self.plugins.as_ref().map(|root| root.clone().into()),
                 MainRoute::Threads => self.thread.as_ref().map(|(_, root)| root.clone().into()),
                 MainRoute::AgentsDoc => self
                     .agents_document
@@ -129,6 +131,16 @@ impl DesktopShellView {
         }
         if let Some(view) = &self.skills {
             view.update(cx, |view, cx| view.set_window_active(active, cx));
+        }
+        if let Some(view) = &self.plugins {
+            let route = self.navigation.snapshot();
+            view.update(cx, |view, cx| {
+                view.set_context(
+                    route.navigation().workspace_id().map(str::to_owned),
+                    active && route.route() == MainRoute::Plugins,
+                    cx,
+                )
+            });
         }
         if let Some(view) = &self.settings {
             view.update(cx, |view, cx| {
@@ -370,6 +382,8 @@ impl DesktopShellView {
             window,
             cx,
         );
+        let plugins =
+            pioneer_desktop_plugins::PluginsView::new(client.clone(), registrar.clone(), cx);
         let identity = crate::gateway::IdentityAuthorizationBinding::new(registrar.as_ref());
         let mut identity_changes = identity.watch();
         let identity_task = cx.spawn(async move |view, cx| {
@@ -566,6 +580,7 @@ impl DesktopShellView {
             administration: Some(administration),
             mcp: Some(mcp),
             skills: Some(skills),
+            plugins: Some(plugins),
             agents_document: None,
             desktop_update,
             task_notifications: Some(task_notifications),
@@ -698,6 +713,7 @@ impl DesktopShellView {
                 route: SettingsRoute::Account,
             },
             MainRoute::Mcp if self.can_manage => SemanticDestination::Mcp { server_id: None },
+            MainRoute::Plugins if self.can_manage => SemanticDestination::Plugins,
             MainRoute::Skills if self.can_manage => SemanticDestination::Skills { skill_id: None },
             _ => return,
         };
@@ -849,6 +865,9 @@ impl Render for DesktopShellView {
                     view.activate_navigation(MainRoute::Mcp, cx)
                 }),
             )
+            .on_action(cx.listener(|view, _: &OpenPlugins, _, cx| {
+                view.activate_navigation(MainRoute::Plugins, cx)
+            }))
             .on_action(cx.listener(|view, _: &OpenSkills, _, cx| {
                 view.activate_navigation(MainRoute::Skills, cx)
             }))
@@ -911,7 +930,10 @@ struct SidebarHostView {
 impl Render for SidebarHostView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let route = self.navigation.snapshot();
-        if matches!(route.route(), MainRoute::Threads | MainRoute::AgentsDoc) {
+        if matches!(
+            route.route(),
+            MainRoute::Threads | MainRoute::AgentsDoc | MainRoute::Plugins
+        ) {
             return v_flex()
                 .size_full()
                 .bg(cx.theme().sidebar)
@@ -933,7 +955,7 @@ impl Render for SidebarHostView {
             MainRoute::Administration => &self.administration,
             MainRoute::Mcp | MainRoute::McpDetails => &self.mcp,
             MainRoute::Skills | MainRoute::SkillDetails => &self.skills,
-            MainRoute::Threads | MainRoute::AgentsDoc => unreachable!(),
+            MainRoute::Threads | MainRoute::AgentsDoc | MainRoute::Plugins => unreachable!(),
         }
         .clone();
         v_flex()

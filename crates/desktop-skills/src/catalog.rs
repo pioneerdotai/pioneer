@@ -305,7 +305,12 @@ impl SkillsCatalogView {
                 workspace_id: Some(workspace.clone()),
             });
             if let Some(catalog) = self.client.skills_catalog_snapshot(&workspace) {
-                next.skills_catalog = catalog.catalog.iter().map(|s| (**s).clone()).collect();
+                next.skills_catalog = catalog
+                    .catalog
+                    .iter()
+                    .filter(|s| pioneer_client::skills::catalog::skill_is_user_selectable(s))
+                    .map(|s| (**s).clone())
+                    .collect();
                 next.installed_skills = catalog.installed.iter().map(|s| (**s).clone()).collect();
                 next.skills_management = (*catalog.management).clone();
                 next.skills_loading = catalog.request == SkillsLoadState::Loading;

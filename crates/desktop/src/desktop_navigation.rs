@@ -13,6 +13,7 @@ use std::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MainRoute {
+    Plugins,
     Threads,
     AgentsDoc,
     Providers,
@@ -26,6 +27,7 @@ pub(crate) enum MainRoute {
 impl MainRoute {
     fn from_destination(destination: &SemanticDestination) -> Self {
         match destination {
+            SemanticDestination::Plugins => Self::Plugins,
             SemanticDestination::Threads => Self::Threads,
             SemanticDestination::AgentsDocument => Self::AgentsDoc,
             SemanticDestination::Providers { .. } => Self::Providers,
@@ -188,6 +190,7 @@ gpui_kit::actions!(
         OpenProviders,
         OpenMcp,
         OpenSkills,
+        OpenPlugins,
         OpenAdministration,
         OpenSettings
     ]

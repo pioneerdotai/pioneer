@@ -27,7 +27,9 @@ impl UploadView {
             SkillUploadTarget::Install if p.pack => {
                 t!("skills.error.install_pack_failed").to_string()
             }
-            SkillUploadTarget::Install => t!("skills.error.install_failed").to_string(),
+            SkillUploadTarget::PluginInstall | SkillUploadTarget::Install => {
+                t!("skills.error.install_failed").to_string()
+            }
             SkillUploadTarget::Update { .. } => t!("skills.error.update_failed").to_string(),
             SkillUploadTarget::UpdatePack { .. } => {
                 t!("skills.error.update_pack_failed").to_string()
