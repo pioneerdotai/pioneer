@@ -5,7 +5,6 @@ use anyhow::{Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-// Sources and profile-by-profile evidence: docs/provider-tools.md.
 pub(crate) fn native_parallel_control(provider: &str) -> bool {
     let provider = policy_id(provider);
     matches!(
