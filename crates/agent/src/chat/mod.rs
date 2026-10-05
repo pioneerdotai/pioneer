@@ -278,36 +278,41 @@ fn unknown_tool_task_result(
 }
 
 struct AbortOnDropJoinHandle<T> {
-    handle: Option<tokio::task::JoinHandle<T>>,
+    owner: Arc<crate::NativeTask>,
+    result: Option<tokio::sync::oneshot::Receiver<T>>,
 }
-
-impl<T> AbortOnDropJoinHandle<T> {
-    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+impl<T: Send + 'static> AbortOnDropJoinHandle<T> {
+    fn spawn(
+        future: impl std::future::Future<Output = T> + Send + 'static,
+        control: &TurnExecutionControl,
+    ) -> Self {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = crate::NativeTask::new(tokio::spawn(async move {
+            let _ = tx.send(future.await);
+        }));
+        // Synchronous publication before the root reaches its next await.
+        control.completion.retain_tool(task.clone());
         Self {
-            handle: Some(handle),
+            owner: task,
+            result: Some(rx),
         }
     }
-
-    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
-        // Keep ownership of the JoinHandle while awaiting it.  Taking it out
-        // before the await makes Drop unable to abort a task when the join
-        // future is cancelled (for example when the parent Turn is fenced).
-        // Tokio then detaches the child and any external side effect can outlive
-        // the Turn owner.
+    async fn join(mut self) -> Result<T, String> {
         let result = self
-            .handle
+            .result
             .as_mut()
-            .expect("join handle should be present")
-            .await;
-        self.handle.take();
-        result
+            .expect("tool result receiver")
+            .await
+            .map_err(|_| "native tool task ended without its result".to_owned())?;
+        self.owner.join().await.map_err(|error| error.to_string())?;
+        self.result.take();
+        Ok(result)
     }
 }
-
 impl<T> Drop for AbortOnDropJoinHandle<T> {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
+        if self.result.is_some() {
+            self.owner.abort();
         }
     }
 }
@@ -4185,6 +4190,8 @@ async fn execute_agent_provider_response(
     }
     .with_permission_approval_broker(permission_approval_broker);
 
+    turn_control.completion.retain_shell(tools.shell.clone());
+
     // One trusted provider capability decision owns native filesystem-tool
     // visibility for this turn.  Apply it before preflight so the core index,
     // request_tools catalog and final provider schema cannot diverge.
@@ -5795,7 +5802,8 @@ async fn execute_agent_provider_response(
                     // Tool handlers can execute nested tools. Running each model tool call in its
                     // own task keeps nested dispatch from being polled under the full chat-loop
                     // future, whose execution-window state is intentionally large.
-                    let handle = tokio::spawn(async move {
+                    let completion_control = turn_control.clone();
+                    let handle = AbortOnDropJoinHandle::spawn(async move {
                         let provider_call_id = model_tool_call.id.clone();
                         let arguments = model_tool_call.arguments.clone();
                         let tool_name = model_tool_call.name.clone();
@@ -6299,7 +6307,7 @@ async fn execute_agent_provider_response(
                             full_source_in_item,
                             message,
                         })
-                    });
+                    }, &completion_control);
 
                     SpawnedToolTask {
                         item_id: task_item_id,
@@ -6307,7 +6315,7 @@ async fn execute_agent_provider_response(
                         ordinal,
                         tool_name: task_tool_name,
                         arguments: task_arguments,
-                        handle: AbortOnDropJoinHandle::new(handle),
+                        handle,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -6981,6 +6989,33 @@ fn estimated_attachment_part_bytes(part: &MessageContentPart) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn retained_tool_tasks_keep_existing_parallel_dispatch() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let control = crate::TurnExecutionControl::new(tx, 1);
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let a = barrier.clone();
+        let first = super::AbortOnDropJoinHandle::spawn(
+            async move {
+                a.wait().await;
+                1
+            },
+            &control,
+        );
+        let b = barrier.clone();
+        let second = super::AbortOnDropJoinHandle::spawn(
+            async move {
+                b.wait().await;
+                2
+            },
+            &control,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), barrier.wait())
+            .await
+            .unwrap();
+        assert_eq!(first.join().await.unwrap(), 1);
+        assert_eq!(second.join().await.unwrap(), 2);
+    }
     use super::{
         ChatExecutionWindowStats, ExecutedToolResult, TURN_ITEM_ID_LEN,
         TaskMutationFinalizationGuard, agent_skill_cards_have_read_path,

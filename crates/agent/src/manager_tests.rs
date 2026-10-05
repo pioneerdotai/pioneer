@@ -76,7 +76,7 @@ use tokio::task::yield_now;
 use tokio::time::{Duration, Instant, advance, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
-fn test_tool_loop_config() -> ToolLoopConfig {
+pub(crate) fn test_tool_loop_config() -> ToolLoopConfig {
     ToolLoopConfig {
         provider: pioneer_provider::ProviderTimeoutPolicy::default(),
         preflight: super::PreflightLoopConfig::default(),
@@ -13607,6 +13607,18 @@ async fn cancel_turn_returns_without_waiting_for_actor_terminal_event() {
         .await
         .expect("turn should start");
 
+    let owner = manager
+        .capture_turn_stop_owner(thread_id, turn_id)
+        .await
+        .unwrap();
+    let (release, released) = tokio::sync::oneshot::channel();
+    owner
+        .control
+        .completion
+        .retain_tool(super::NativeTask::new(tokio::spawn(async move {
+            let _ = released.await;
+        })));
+
     // Gateway commits the durable Interrupted lifecycle before invoking this
     // process control. The runtime must therefore stop independently without
     // waiting for the actor to publish a second terminal event.
@@ -13617,6 +13629,29 @@ async fn cancel_turn_returns_without_waiting_for_actor_terminal_event() {
     .await
     .expect("turn cancellation must not wait for the actor mailbox")
     .expect("turn cancellation should succeed");
+    assert!(
+        timeout(
+            Duration::from_millis(10),
+            manager.cancel_captured_turn_and_wait(
+                &owner,
+                "wait",
+                tokio::time::Instant::now() + Duration::from_secs(1)
+            )
+        )
+        .await
+        .is_err()
+    );
+    assert!(owner.control.completion.outcome().is_none());
+    release.send(()).unwrap();
+    manager
+        .cancel_captured_turn_and_wait(
+            &owner,
+            "retry",
+            tokio::time::Instant::now() + Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+    manager.remove_thread(thread_id).await;
 }
 
 #[tokio::test]
