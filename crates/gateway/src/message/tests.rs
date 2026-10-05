@@ -78008,8 +78008,14 @@ async fn failed_codex_summary_journal_retains_decoder_numeric_evidence_without_c
     assert_eq!(retained.cache_write_input_tokens, None);
     assert_eq!(retained.physical_attempt_id, None);
     assert_eq!(retained.generation_id, None);
-    assert!(retained.accounting.as_ref().unwrap()["reported_cost"].is_null());
-    assert!(retained.accounting.as_ref().unwrap()["estimated_cost"].is_null());
+    assert_eq!(
+        retained.accounting.as_ref().unwrap()["reported_cost"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        retained.accounting.as_ref().unwrap()["estimated_cost"],
+        serde_json::Value::Null
+    );
     assert!(!rows[0].usage_json.contains("SECRET"));
     assert!(!rows[0].usage_json.contains("no final answer"));
 }
@@ -78247,9 +78253,9 @@ async fn cli_exit_and_reasoning_evidence_reaches_summary_consumer_and_failed_jou
         assert_eq!(retained.request_id, None);
         assert_eq!(retained.generation_id, None);
         if let Some(accounting) = &retained.accounting {
-            assert!(accounting["reported_cost"].is_null());
-            assert!(accounting["estimated_cost"].is_null());
-            assert!(accounting["sdk_estimated_cost"].is_null());
+            assert_eq!(accounting["reported_cost"], serde_json::Value::Null);
+            assert_eq!(accounting["estimated_cost"], serde_json::Value::Null);
+            assert_eq!(accounting["sdk_estimated_cost"], serde_json::Value::Null);
             if native.as_u64().is_some() {
                 assert_eq!(
                     accounting["reasoning_source"],
@@ -78341,9 +78347,12 @@ async fn cli_exit_and_reasoning_evidence_reaches_summary_consumer_and_failed_jou
                 accounting["sdk_estimated_cost"]["provenance"],
                 "cli_sdk_price_table_estimate"
             );
-            assert!(accounting["sdk_estimated_cost"]["sdk_version"].is_null());
-            assert!(accounting["reported_cost"].is_null());
-            assert!(accounting["estimated_cost"].is_null());
+            assert_eq!(
+                accounting["sdk_estimated_cost"]["sdk_version"],
+                serde_json::Value::Null
+            );
+            assert_eq!(accounting["reported_cost"], serde_json::Value::Null);
+            assert_eq!(accounting["estimated_cost"], serde_json::Value::Null);
         }
         assert!(!rows[0].usage_json.contains("SECRET"));
         assert!(!rows[0].usage_json.contains("overloaded_error"));
