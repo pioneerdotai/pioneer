@@ -50,8 +50,26 @@ impl CrudStore {
         at: i64,
     ) -> Result<TaskDeliveryTransitionOutcome<AppendedTaskEvent>> {
         self.run_serialized_write(|| {
-            self.transition_task_delivery_once(event.clone(), transition, at)
+            self.transition_task_delivery_once(event.clone(), transition, at, None)
         })
+        .await
+    }
+
+    /// Recovery preparation reads a selected delivery, exact attempt and retry.
+    /// Revalidate these raw facts in the same transaction as the domain event.
+    pub async fn recover_task_delivery(
+        &self,
+        event: TaskEventPayload,
+        snapshot: &crate::DeliveryRecoverySnapshot,
+        cutoff: i64,
+        at: i64,
+    ) -> Result<TaskDeliveryTransitionOutcome<AppendedTaskEvent>> {
+        self.transition_task_delivery_once(
+            event,
+            TaskDeliveryTransition::Recover { cutoff },
+            at,
+            Some(snapshot),
+        )
         .await
     }
 
@@ -60,6 +78,7 @@ impl CrudStore {
         event: TaskEventPayload,
         transition: TaskDeliveryTransition,
         at: i64,
+        recovery_snapshot: Option<&crate::DeliveryRecoverySnapshot>,
     ) -> Result<TaskDeliveryTransitionOutcome<AppendedTaskEvent>> {
         let prepared = self
             .prepare_task_events_for_write(vec![event])
@@ -155,6 +174,14 @@ impl CrudStore {
                 "pending" | "delivering" | "delivered" | "failed" | "cancelled"
             ) {
                 bail!("delivery has an unknown durable status");
+            }
+            if let Some(snapshot) = recovery_snapshot {
+                if snapshot.delivery.id != row.id {
+                    bail!("recovery snapshot belongs to another delivery");
+                }
+                if !crate::repositories::task_delivery_recovery::matches(&tx, snapshot).await? {
+                    return Ok(TaskDeliveryTransitionOutcome::Superseded);
+                }
             }
             let attempt_row = match transition {
                 TaskDeliveryTransition::Start => {
@@ -528,6 +555,8 @@ pub enum TaskDeliveryCommitTestKind {
     Start,
     Finish,
     Recovery,
+    RecoveryRetry,
+    RecoveryPanic,
     Cancellation,
 }
 
@@ -558,13 +587,17 @@ impl CrudStore {
         });
     }
 
-    async fn pause_delivery_commit_for_test(&self, kind: TaskDeliveryCommitTestKind) {
+    pub(crate) async fn pause_delivery_commit_for_test(&self, kind: TaskDeliveryCommitTestKind) {
         let gate = {
             let mut guard = self
                 .delivery_commit_test_gate
                 .lock()
                 .expect("delivery test gate poisoned");
-            if guard.as_ref().is_some_and(|gate| gate.kind == kind) {
+            if guard.as_ref().is_some_and(|gate| {
+                gate.kind == kind
+                    || (kind == TaskDeliveryCommitTestKind::Recovery
+                        && gate.kind == TaskDeliveryCommitTestKind::RecoveryPanic)
+            }) {
                 guard.take()
             } else {
                 None
@@ -573,6 +606,9 @@ impl CrudStore {
         if let Some(gate) = gate {
             gate.entered.notify_one();
             gate.release.notified().await;
+            if gate.kind == TaskDeliveryCommitTestKind::RecoveryPanic {
+                panic!("injected recovery preparation panic");
+            }
         }
     }
 }

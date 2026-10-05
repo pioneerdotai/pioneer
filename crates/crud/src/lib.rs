@@ -8,6 +8,10 @@ mod model_history;
 mod projector;
 mod repositories;
 mod task_delivery_lifecycle;
+mod task_delivery_recovery;
+pub use repositories::task_delivery_recovery::{
+    DELIVERY_RECOVERY_BUDGET, DeliveryRecoveryCursor, DeliveryRecoverySnapshot,
+};
 mod task_events;
 mod task_run_occurrence;
 mod task_terminal;
@@ -16140,18 +16144,6 @@ impl CrudStore {
         limit: u64,
     ) -> Result<Vec<TaskDelivery>> {
         task_delivery::list_due_deliveries(&self.connection, unix_to_datetime(now), limit)
-            .await?
-            .into_iter()
-            .map(task_delivery_from_db_model)
-            .collect()
-    }
-
-    pub async fn list_stuck_task_deliveries(
-        &self,
-        before: i64,
-        limit: u64,
-    ) -> Result<Vec<TaskDelivery>> {
-        task_delivery::list_stuck_deliveries(&self.connection, unix_to_datetime(before), limit)
             .await?
             .into_iter()
             .map(task_delivery_from_db_model)

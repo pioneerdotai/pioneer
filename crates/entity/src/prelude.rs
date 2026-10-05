@@ -118,6 +118,7 @@ pub use super::task_agent_spec::Entity as TaskAgentSpec;
 pub use super::task_delivery::Entity as TaskDelivery;
 pub use super::task_delivery_attempt::Entity as TaskDeliveryAttempt;
 pub use super::task_delivery_authority::Entity as TaskDeliveryAuthority;
+pub use super::task_delivery_recovery_retry::Entity as TaskDeliveryRecoveryRetry;
 pub use super::task_dependency::Entity as TaskDependency;
 pub use super::task_event::Entity as TaskEvent;
 pub use super::task_event_fanout_cursor::Entity as TaskEventFanoutCursor;
