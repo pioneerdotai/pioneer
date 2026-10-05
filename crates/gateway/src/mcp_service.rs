@@ -124,8 +124,18 @@ struct McpServerTaskHandle {
     call_tx: mpsc::Sender<McpServerCommand>,
     oauth_failure_revision: Arc<std::sync::atomic::AtomicU64>,
     recovery: Arc<OAuthRecoveryMailbox>,
-    shutdown_tx: oneshot::Sender<McpShutdownRequest>,
+    shutdown_tx: Option<oneshot::Sender<McpShutdownRequest>>,
+    completed: Arc<tokio_util::sync::CancellationToken>,
     join: JoinHandle<()>,
+}
+
+// Completion is distinct from the shutdown request. It remains in the native
+// task map until observed, even when the stop caller is cancelled.
+struct McpTaskCompletion(Arc<tokio_util::sync::CancellationToken>);
+impl Drop for McpTaskCompletion {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 struct McpShutdownRequest {
@@ -1908,7 +1918,10 @@ impl McpService {
         let actor_failure_revision = oauth_failure_revision.clone();
         let recovery = Arc::new(OAuthRecoveryMailbox::default());
         let actor_recovery = recovery.clone();
+        let completed = Arc::new(tokio_util::sync::CancellationToken::new());
+        let completion = McpTaskCompletion(completed.clone());
         let join = tokio::spawn(async move {
+            let _completion = completion;
             service
                 .run_server_task(
                     row,
@@ -1934,7 +1947,8 @@ impl McpService {
                 call_tx,
                 oauth_failure_revision,
                 recovery,
-                shutdown_tx,
+                shutdown_tx: Some(shutdown_tx),
+                completed,
                 join,
             },
         );
@@ -1960,30 +1974,56 @@ impl McpService {
     }
 
     async fn stop_task(&self, installation_id: &str, final_state: DomainRuntimeState) {
+        if let Err(error) = self.stop_task_result(installation_id, final_state).await {
+            warn!(error = %error, "MCP server task join failed");
+        }
+    }
+
+    async fn stop_task_result(
+        &self,
+        installation_id: &str,
+        final_state: DomainRuntimeState,
+    ) -> Result<()> {
         self.cancel_installation_mcp_invocations(installation_id);
-        let handle = self.inner.tasks.lock().await.remove(installation_id);
-        if let Some(handle) = handle {
+        let completion = {
+            let mut tasks = self.inner.tasks.lock().await;
+            let Some(handle) = tasks.get_mut(installation_id) else {
+                return Ok(());
+            };
             handle
                 .recovery
                 .pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
-            let _ = handle.shutdown_tx.send(McpShutdownRequest {
-                final_state,
-                crud_store: self
-                    .runtime_store
-                    .clone()
-                    .unwrap_or_else(|| self.inner.crud_store.clone()),
-            });
-            if let Err(error) = handle.join.await {
-                warn!(
-                    installation_id,
-                    error = %format!("{error:#}"),
-                    "MCP server task join failed"
-                );
+            if let Some(shutdown) = handle.shutdown_tx.take() {
+                let _ = shutdown.send(McpShutdownRequest {
+                    final_state,
+                    crud_store: self
+                        .runtime_store
+                        .clone()
+                        .unwrap_or_else(|| self.inner.crud_store.clone()),
+                });
             }
+            handle.completed.clone()
+        };
+        completion.cancelled().await;
+        // The native task future ended. Inspect its join outcome before claiming
+        // success, and never remove a replacement task with the same row ID.
+        let handle = {
+            let mut tasks = self.inner.tasks.lock().await;
+            if tasks
+                .get(installation_id)
+                .is_some_and(|handle| !Arc::ptr_eq(&handle.completed, &completion))
+            {
+                anyhow::bail!("MCP runtime changed during shutdown");
+            }
+            tasks.remove(installation_id)
+        };
+        if let Some(handle) = handle {
+            handle.join.await.context("MCP runtime shutdown failed")?;
         }
+        Ok(())
     }
 
     async fn run_server_task(
@@ -4268,6 +4308,158 @@ mod tests {
         }
 
         async fn shutdown(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn cancelled_stop_retains_native_handle_until_a_retry_observes_completion() {
+        let (service, _, workspace) = test_mcp_service().await;
+        let id = "stopping-native-installation";
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (call_tx, _call_rx) = mpsc::channel(1);
+        let completed = Arc::new(CancellationToken::new());
+        let completion = McpTaskCompletion(completed.clone());
+        let (entered, stopping) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let join = tokio::spawn(async move {
+            let _completion = completion;
+            shutdown_rx.await.expect("native shutdown request");
+            entered.send(()).expect("shutdown observer");
+            released.await.expect("shutdown completion release");
+        });
+        service.inner.tasks.lock().await.insert(
+            id.into(),
+            McpServerTaskHandle {
+                name: "stopping-native".into(),
+                scope_kind: "workspace".into(),
+                scope_key: workspace,
+                fingerprint: "configuration".into(),
+                effective_secret_fingerprint: "material".into(),
+                call_tx,
+                oauth_failure_revision: Arc::new(AtomicU64::new(0)),
+                recovery: Arc::new(OAuthRecoveryMailbox::default()),
+                shutdown_tx: Some(shutdown_tx),
+                completed,
+                join,
+            },
+        );
+        let native = service.clone();
+        let first = tokio::spawn(async move {
+            native
+                .stop_task_result(id, DomainRuntimeState::Stopped)
+                .await
+        });
+        stopping.await.expect("native stop was requested");
+        first.abort();
+        assert!(
+            first
+                .await
+                .expect_err("caller was cancelled")
+                .is_cancelled()
+        );
+        assert!(
+            service.task_exists(id).await,
+            "unacknowledged native owner remains reachable"
+        );
+        let native = service.clone();
+        let retry = tokio::spawn(async move {
+            native
+                .stop_task_result(id, DomainRuntimeState::Stopped)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !retry.is_finished(),
+            "a cancellation signal is not a shutdown acknowledgement"
+        );
+        release.send(()).expect("allow native completion");
+        retry
+            .await
+            .expect("retry join")
+            .expect("native shutdown acknowledged");
+        assert!(!service.task_exists(id).await);
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delayed_stop_does_not_remove_a_replacement_runtime_with_the_same_installation_id() {
+        let (service, _, workspace) = test_mcp_service().await;
+        let id = "replacement-native-installation";
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (call_tx, _call_rx) = mpsc::channel(1);
+        let completed = Arc::new(CancellationToken::new());
+        let completion = McpTaskCompletion(completed.clone());
+        let (entered, stopping) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let join = tokio::spawn(async move {
+            let _completion = completion;
+            shutdown_rx.await.expect("original shutdown");
+            entered.send(()).expect("original stop observer");
+            released.await.expect("original completion release");
+        });
+        service.inner.tasks.lock().await.insert(
+            id.into(),
+            McpServerTaskHandle {
+                name: "replacement-native".into(),
+                scope_kind: "workspace".into(),
+                scope_key: workspace.clone(),
+                fingerprint: "original".into(),
+                effective_secret_fingerprint: "material".into(),
+                call_tx,
+                oauth_failure_revision: Arc::new(AtomicU64::new(0)),
+                recovery: Arc::new(OAuthRecoveryMailbox::default()),
+                shutdown_tx: Some(shutdown_tx),
+                completed,
+                join,
+            },
+        );
+        let native = service.clone();
+        let old_stop = tokio::spawn(async move {
+            native
+                .stop_task_result(id, DomainRuntimeState::Stopped)
+                .await
+        });
+        stopping.await.expect("original stop admitted");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (call_tx, _call_rx) = mpsc::channel(1);
+        let completed = Arc::new(CancellationToken::new());
+        let completion = McpTaskCompletion(completed.clone());
+        let join = tokio::spawn(async move {
+            let _completion = completion;
+            shutdown_rx
+                .await
+                .expect("replacement retains its own shutdown sender");
+        });
+        service.inner.tasks.lock().await.insert(
+            id.into(),
+            McpServerTaskHandle {
+                name: "replacement-native".into(),
+                scope_kind: "workspace".into(),
+                scope_key: workspace,
+                fingerprint: "replacement".into(),
+                effective_secret_fingerprint: "material".into(),
+                call_tx,
+                oauth_failure_revision: Arc::new(AtomicU64::new(0)),
+                recovery: Arc::new(OAuthRecoveryMailbox::default()),
+                shutdown_tx: Some(shutdown_tx),
+                completed,
+                join,
+            },
+        );
+        release.send(()).expect("finish original runtime");
+        old_stop
+            .await
+            .expect("original stop caller")
+            .expect_err("replacement is not the original owner");
+        assert_eq!(
+            service.inner.tasks.lock().await[id].fingerprint,
+            "replacement"
+        );
+        service
+            .stop_task_result(id, DomainRuntimeState::Stopped)
+            .await
+            .expect("stop exact replacement");
+        assert!(!service.task_exists(id).await);
+        service.shutdown().await;
     }
 
     async fn test_mcp_service() -> (McpService, Arc<CrudStore>, String) {

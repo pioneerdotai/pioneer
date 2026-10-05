@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) struct McpPolicyChange {
+struct McpPolicyChange {
     payload: McpPolicySetResponse,
     now: i64,
     lifecycle: tokio::sync::OwnedMutexGuard<()>,
@@ -27,7 +27,7 @@ impl MessageProcessor {
                             self.send_error(
                                 request_context.connection_id(),
                                 mcp_error(
-                                    Some(request_id),
+                                    None,
                                     INVALID_REQUEST_CODE,
                                     MCP_ERROR_INTERNAL,
                                     "failed to encode mcp/policy/set response",
