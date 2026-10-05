@@ -1,0 +1,16 @@
+{
+  "message": {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+      {
+        "function": {
+          "name": "clock",
+          "arguments": {}
+        }
+      }
+    ]
+  },
+  "done": true,
+  "done_reason": "stop"
+}
