@@ -4706,6 +4706,7 @@ impl MessageProcessor {
         recovery: pioneer_protocol::RecoveryAttemptContext,
         failure_message: String,
         transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+        accepted_cli_outcome: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> bool {
         let now_unix = now_timestamp_secs();
         match self
@@ -4715,10 +4716,18 @@ impl MessageProcessor {
                 recovery.attempt_id.as_str(),
                 failure_message,
                 now_unix,
+                accepted_cli_outcome.as_ref(),
             )
             .await
         {
             Ok(events) => {
+                if events.is_empty() {
+                    return self
+                        .replay_applied_recovery_provider_failure(
+                            &turn_id, &recovery, now_unix, transition,
+                        )
+                        .await;
+                }
                 let mut committed = true;
                 for event in events {
                     committed &= self
@@ -4917,7 +4926,7 @@ impl MessageProcessor {
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
     ) -> bool {
         self.handle_provider_failure_detected_with_transition(
-            thread_id, turn_id, item_id, item_type, failure, recovery, None,
+            thread_id, turn_id, item_id, item_type, failure, recovery, None, None,
         )
         .await
     }
@@ -4931,6 +4940,7 @@ impl MessageProcessor {
         failure: pioneer_protocol::ProviderFailureDetails,
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
         transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+        accepted_cli_outcome: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> bool {
         let now_unix = now_timestamp_secs();
 
@@ -4942,6 +4952,7 @@ impl MessageProcessor {
                     recovery.attempt_id.as_str(),
                     failure,
                     now_unix,
+                    accepted_cli_outcome.as_ref(),
                 )
                 .await
             {
@@ -5129,12 +5140,7 @@ impl MessageProcessor {
             }
         };
 
-        if (job.diagnostic.is_some() && job.last_failure_attempt_id.is_none())
-            || job
-                .last_failure_attempt_id
-                .as_deref()
-                .is_some_and(|attempt| attempt != recovery.attempt_id)
-        {
+        if job.last_failure_attempt_id.as_deref() != Some(recovery.attempt_id.as_str()) {
             return false;
         }
 

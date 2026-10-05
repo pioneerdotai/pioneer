@@ -76893,7 +76893,13 @@ async fn blocked_provider_task_consumers_impl(scenario: &str, path: &str) {
         .unwrap();
     let events = processor
         .recovery_coordinator
-        .record_recovery_provider_failure(&job.id, "first_attempt", failure.clone(), first_due + 1)
+        .record_recovery_provider_failure(
+            &job.id,
+            "first_attempt",
+            failure.clone(),
+            first_due + 1,
+            None,
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -77308,7 +77314,7 @@ async fn recovery_failure_task_consumers_impl(
             } else {
                 processor
                     .recovery_coordinator
-                    .record_recovery_provider_failure(&job.id, attempt, last.clone(), due + 1)
+                    .record_recovery_provider_failure(&job.id, attempt, last.clone(), due + 1, None)
                     .await
                     .unwrap()
             };
@@ -77627,7 +77633,13 @@ fn provider_replay_is_fenced_after_retryable_recovery_start_error() {
             if attempt == "provider_attempt_A" {
                 let events = processor
                     .recovery_coordinator
-                    .record_recovery_provider_failure(&job.id, attempt, failure.clone(), due + 1)
+                    .record_recovery_provider_failure(
+                        &job.id,
+                        attempt,
+                        failure.clone(),
+                        due + 1,
+                        None,
+                    )
                     .await
                     .unwrap();
                 assert!(matches!(

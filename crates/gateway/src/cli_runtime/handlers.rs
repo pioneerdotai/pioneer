@@ -5340,6 +5340,17 @@ impl MessageProcessor {
         turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
         event: RuntimeEvent,
     ) -> bool {
+        self.process_bound_cli_runtime_event_with_transition(instance, turn_binding, event, None)
+            .await
+    }
+
+    async fn process_bound_cli_runtime_event_with_transition(
+        &self,
+        instance: &CliSessionInstanceId,
+        turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
+        event: RuntimeEvent,
+        retained: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    ) -> bool {
         if cli_runtime_turn_status_for_terminal_event(&event).is_none() {
             return self
                 .process_bound_cli_runtime_event_inner(instance, turn_binding, event, None, None)
@@ -5393,12 +5404,15 @@ impl MessageProcessor {
                 .await;
             // Wait only on the producer, before enqueue. The ordered consumer
             // remains free to ACK admission windows while this event waits.
-            let transition = Arc::new(
-                self.cli_runtime_session_transition_mutex(instance.key())
-                    .await
-                    .lock_owned()
-                    .await,
-            );
+            let transition = match retained {
+                Some(transition) => transition.clone(),
+                None => Arc::new(
+                    self.cli_runtime_session_transition_mutex(instance.key())
+                        .await
+                        .lock_owned()
+                        .await,
+                ),
+            };
             let current = self
                 .crud_store
                 .get_cli_runtime_turn_binding(&source.turn_id)
@@ -5527,9 +5541,10 @@ impl MessageProcessor {
         };
         let (selected, event): (pioneer_protocol::CliRuntimeBlockedTurnGuard, RuntimeEvent) =
             serde_json::from_str(&saved.payload_redacted_json)?;
-        if !selected.same_native_execution(&source) {
-            return Ok(false);
-        }
+        anyhow::ensure!(
+            selected.same_native_execution(&source),
+            "accepted CLI terminal outcome source is superseded; observational fallback deferred"
+        );
         let goal_completion = matches!(event, RuntimeEvent::TurnCompleted(_))
             && selected.segment_ack_needs_goal_completion(
                 expected.binding.native_goal_observed_at.is_some(),
@@ -5803,12 +5818,18 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "refused to publish CLI TurnCompleted without durable finalization"
                 );
+                // A saved completion remains owed; preparation failure must
+                // not consume it as a synthetic recovery failure.
+                if terminal_delivery.is_some() {
+                    return false;
+                }
                 if let Some(recovery) = recovery.as_ref() {
                     self.handle_cli_runtime_recovery_native_failure(
                         turn_binding.turn_id.clone(),
                         recovery.clone(),
                         failure,
                         turn_transition.cloned(),
+                        terminal_delivery.cloned(),
                     )
                     .await;
                 } else {
@@ -5856,6 +5877,7 @@ impl MessageProcessor {
                     },
                     recovery.clone(),
                     turn_transition.cloned(),
+                    terminal_delivery.cloned(),
                 )
                 .await;
             if !committed {
@@ -5925,6 +5947,7 @@ impl MessageProcessor {
                     recovery.clone(),
                     failure_message.clone(),
                     turn_transition.cloned(),
+                    terminal_delivery.cloned(),
                 )
                 .await
             {
@@ -7562,6 +7585,22 @@ impl MessageProcessor {
         turn: &Turn,
         turn_transition: &Arc<tokio::sync::OwnedMutexGuard<()>>,
     ) -> anyhow::Result<CLIRuntimeAuthoritativeTurnState> {
+        let Some(expected) = self
+            .crud_store
+            .cli_runtime_turn_terminal_guard(binding)
+            .await?
+        else {
+            return Ok(CLIRuntimeAuthoritativeTurnState::Superseded);
+        };
+        if expected.turn_status != turn.status {
+            return Ok(CLIRuntimeAuthoritativeTurnState::Superseded);
+        }
+        if self
+            .replay_cli_runtime_terminal_event(&expected, turn_transition)
+            .await?
+        {
+            return Ok(CLIRuntimeAuthoritativeTurnState::Terminal);
+        }
         if let Some(attempt) = self
             .crud_store
             .latest_cli_runtime_turn_attempt(binding.turn_id.as_str())
@@ -7832,12 +7871,11 @@ impl MessageProcessor {
             CLIAgentRuntimeObservedTurnStatus::InProgress => unreachable!(),
         };
         if !self
-            .process_bound_cli_runtime_event_inner(
+            .process_bound_cli_runtime_event_with_transition(
                 handle.instance(),
                 binding.clone(),
                 terminal_event,
                 Some(turn_transition),
-                None,
             )
             .await
         {
