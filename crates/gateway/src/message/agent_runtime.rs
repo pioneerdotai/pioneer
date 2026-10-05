@@ -1281,6 +1281,12 @@ impl MessageProcessor {
         cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
         mut turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) -> MessageFuture<'a, Result<(), DurableCommitRejection>> {
+        let terminal_delivery = cli_blocked_guard
+            .as_ref()
+            .filter(|guard| guard.terminal_delivery_id.is_some())
+            .cloned();
+        let cli_blocked_guard =
+            cli_blocked_guard.filter(|guard| guard.terminal_delivery_id.is_none());
         let startup_key = durable_event_turn_id(&event).map(str::to_owned);
         let future = match event {
             AgentDurableEvent::TurnSkillsResolved {
@@ -1293,6 +1299,63 @@ impl MessageProcessor {
                 let turn_id = durable_event_turn_id(&event).map(str::to_owned);
                 let terminal_turn_id = terminal_durable_event_turn_id(&event).map(str::to_owned);
                 let lifecycle_event = native_lifecycle_event_metric(&event);
+                if let Some(source) = terminal_delivery.as_ref() {
+                    if turn_transition.is_none() {
+                        return Err(DurableCommitRejection::permanent(
+                            "missing_cli_ownership",
+                            "native terminal delivery has no retained ownership",
+                        ));
+                    }
+                    if source.terminal_delivery_id.as_deref()
+                        != Some(
+                            super::cli_runtime::cli_runtime_terminal_event_record(
+                                source,
+                                String::new(),
+                            )
+                            .id
+                            .as_str(),
+                        )
+                    {
+                        return Err(DurableCommitRejection::permanent(
+                            "invalid_terminal_delivery",
+                            "native terminal delivery identity mismatch",
+                        ));
+                    }
+                    let native = source
+                        .segment
+                        .as_ref()
+                        .map(|(_, native, _)| native.as_str())
+                        .or(source.attempt_native_turn_id.as_deref());
+                    let actual = match (
+                        self.crud_store
+                            .get_cli_runtime_turn_binding(&source.turn_id)
+                            .await,
+                        native,
+                    ) {
+                        (Ok(Some(binding)), Some(native)) => {
+                            self.crud_store
+                                .cli_runtime_terminal_event_source(&binding, native)
+                                .await
+                        }
+                        (Err(error), _) => Err(error),
+                        _ => Ok(None),
+                    }
+                    .map_err(|_| {
+                        DurableCommitRejection::retryable(
+                            "source_unavailable",
+                            "native terminal source storage lookup failed",
+                        )
+                    })?;
+                    if !actual
+                        .as_ref()
+                        .is_some_and(|actual| actual.same_execution(source))
+                    {
+                        return Err(DurableCommitRejection::permanent(
+                            "source_superseded",
+                            "native terminal producer execution changed",
+                        ));
+                    }
+                }
                 // Normal CLI terminal events enter through this consumer too.
                 // Retained publishers already own the gate; never reacquire it.
                 if turn_transition.is_none()
@@ -1408,6 +1471,29 @@ impl MessageProcessor {
                         elapsed: Some(commit_started.elapsed()),
                     },
                 );
+                if committed && terminal_turn_id.is_some() {
+                    if let Some(source) = terminal_delivery.as_ref() {
+                        let record = super::cli_runtime::cli_runtime_terminal_event_record(
+                            source,
+                            String::new(),
+                        );
+                        self.ack_cli_runtime_terminal_event(&record)
+                            .await
+                            .map_err(|_| {
+                                DurableCommitRejection::retryable(
+                                    "terminal_ack_storage_failure",
+                                    "native terminal delivery ACK storage failure",
+                                )
+                            })?;
+                        #[cfg(test)]
+                        self.completed_history_preparation_barrier
+                            .wait_if_armed(
+                                "__cli_native_terminal_consumer_committed__",
+                                &tokio_util::sync::CancellationToken::new(),
+                            )
+                            .await;
+                    }
+                }
                 if committed {
                     if let Some((stage, outcome)) = lifecycle_event {
                         pioneer_observability::record_native_lifecycle_event(
@@ -4602,7 +4688,8 @@ impl MessageProcessor {
         turn_id: String,
         recovery: pioneer_protocol::RecoveryAttemptContext,
         failure_message: String,
-    ) {
+        transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    ) -> bool {
         let now_unix = now_timestamp_secs();
         match self
             .recovery_coordinator
@@ -4615,9 +4702,13 @@ impl MessageProcessor {
             .await
         {
             Ok(events) => {
+                let mut committed = true;
                 for event in events {
-                    self.handle_recovery_event(event, now_unix).await;
+                    committed &= self
+                        .handle_recovery_event_with_transition(event, now_unix, transition.clone())
+                        .await;
                 }
+                committed
             }
             Err(error) => {
                 warn!(
@@ -4627,6 +4718,7 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to record native CLI recovery attempt failure"
                 );
+                false
             }
         }
     }
@@ -4807,6 +4899,22 @@ impl MessageProcessor {
         failure: pioneer_protocol::ProviderFailureDetails,
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
     ) -> bool {
+        self.handle_provider_failure_detected_with_transition(
+            thread_id, turn_id, item_id, item_type, failure, recovery, None,
+        )
+        .await
+    }
+
+    pub(super) async fn handle_provider_failure_detected_with_transition(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        item_type: TurnItemType,
+        failure: pioneer_protocol::ProviderFailureDetails,
+        recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
+        transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    ) -> bool {
         let now_unix = now_timestamp_secs();
 
         if let Some(recovery) = recovery {
@@ -4827,12 +4935,19 @@ impl MessageProcessor {
                                 turn_id.as_str(),
                                 &recovery,
                                 now_unix,
+                                transition.clone(),
                             )
                             .await;
                     }
                     let mut committed = true;
                     for event in events {
-                        committed &= self.handle_recovery_event(event, now_unix).await;
+                        committed &= self
+                            .handle_recovery_event_with_transition(
+                                event,
+                                now_unix,
+                                transition.clone(),
+                            )
+                            .await;
                     }
                     committed
                 }
@@ -4937,7 +5052,13 @@ impl MessageProcessor {
                         Ok(events) => {
                             let mut committed = !events.is_empty();
                             for event in events {
-                                committed &= self.handle_recovery_event(event, now_unix).await;
+                                committed &= self
+                                    .handle_recovery_event_with_transition(
+                                        event,
+                                        now_unix,
+                                        transition.clone(),
+                                    )
+                                    .await;
                             }
                             committed
                         }
@@ -4971,6 +5092,7 @@ impl MessageProcessor {
         turn_id: &str,
         recovery: &pioneer_protocol::RecoveryAttemptContext,
         event_timestamp: i64,
+        transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) -> bool {
         let job = match self
             .crud_store
@@ -5047,7 +5169,8 @@ impl MessageProcessor {
             }
             _ => return false,
         };
-        self.handle_recovery_event(event, event_timestamp).await
+        self.handle_recovery_event_with_transition(event, event_timestamp, transition)
+            .await
     }
 
     pub(super) async fn handle_timeout_candidate(
@@ -6069,6 +6192,15 @@ impl MessageProcessor {
         event: crate::resilience::RecoveryCoordinatorEvent,
         event_timestamp: i64,
     ) -> MessageFuture<'a, bool> {
+        self.handle_recovery_event_with_transition(event, event_timestamp, None)
+    }
+
+    pub(super) fn handle_recovery_event_with_transition<'a>(
+        &'a self,
+        event: crate::resilience::RecoveryCoordinatorEvent,
+        event_timestamp: i64,
+        transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    ) -> MessageFuture<'a, bool> {
         message_future(async move {
             use pioneer_observability::NativeLifecycleOutcome as Outcome;
 
@@ -6218,7 +6350,7 @@ impl MessageProcessor {
                     turn_id,
                     reason,
                 } => {
-                    message_future(self.handle_recovery_blocked_event(job_id, turn_id, reason, event_timestamp))
+                    message_future(self.handle_recovery_blocked_event(job_id, turn_id, reason, event_timestamp, transition))
                         .await
                 }
                 crate::resilience::RecoveryCoordinatorEvent::RecoveryExhausted(outcome) => {
@@ -6310,35 +6442,61 @@ impl MessageProcessor {
             job_id: request.job_id.clone(),
             attempt_id: request.recovery_attempt_id.clone(),
         };
-        let expected = self
-            .crud_store
-            .cli_runtime_turn_terminal_guard(&request.binding)
+        let Some(expected) = self
+            .cli_recovery_source_or_defer(
+                &request.binding,
+                &request.job_id,
+                &request.recovery_attempt_id,
+                event_timestamp,
+            )
             .await
-            .ok()
-            .flatten();
+        else {
+            return;
+        };
         let transition = match self.try_cli_runtime_turn_transition(&request.binding).await {
             Ok(Some(transition)) => transition,
-            _ => {
+            result => {
+                if let Err(error) = result {
+                    warn!(error = %error, "CLI recovery transition lookup failed");
+                }
                 self.defer_cli_runtime_recovery_attempt(
                     &request.job_id,
                     &request.recovery_attempt_id,
                     &request.turn_id,
-                    "CLI session transition is owned; defer existing reconciliation".into(),
+                    "CLI session transition is owned or unavailable".into(),
                     event_timestamp,
                 )
                 .await;
                 return;
             }
         };
-        if expected.is_none()
-            || self
-                .crud_store
-                .cli_runtime_turn_terminal_guard(&request.binding)
-                .await
-                .ok()
-                .flatten()
-                != expected
-        {
+        #[cfg(test)]
+        self.completed_history_preparation_barrier
+            .wait_if_armed(
+                "__cli_recovery_after_source__",
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        let Some(current) = self
+            .cli_recovery_source_or_defer(
+                &request.binding,
+                &request.job_id,
+                &request.recovery_attempt_id,
+                event_timestamp,
+            )
+            .await
+        else {
+            return;
+        };
+        if current != expected {
+            self.defer_cli_runtime_recovery_attempt(
+                &request.job_id,
+                &request.recovery_attempt_id,
+                &request.turn_id,
+                "CLI reconciliation snapshot changed".into(),
+                event_timestamp,
+            )
+            .await;
             return;
         }
         match self
@@ -6451,6 +6609,74 @@ impl MessageProcessor {
         }
     }
 
+    async fn cli_recovery_source_or_defer(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        job_id: &str,
+        attempt_id: &str,
+        now: i64,
+    ) -> Option<pioneer_crud::CliRuntimeTurnTerminalGuard> {
+        let context = pioneer_protocol::RecoveryAttemptContext {
+            job_id: job_id.into(),
+            attempt_id: attempt_id.into(),
+        };
+        match self
+            .recovery_coordinator
+            .is_active_recovery_attempt(&binding.turn_id, &context)
+            .await
+        {
+            Ok(false) => return None,
+            Ok(true) => {}
+            Err(error) => {
+                warn!(error = %error, "CLI recovery authority lookup failed");
+                self.defer_cli_runtime_recovery_attempt(
+                    job_id,
+                    attempt_id,
+                    &binding.turn_id,
+                    format!("CLI recovery authority storage failure: {error:#}"),
+                    now,
+                )
+                .await;
+                return None;
+            }
+        }
+        #[cfg(test)]
+        self.completed_history_preparation_barrier
+            .wait_if_armed(
+                "__cli_recovery_before_source__",
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        let result = self
+            .crud_store
+            .cli_runtime_turn_terminal_guard(binding)
+            .await;
+        let diagnostic = match result {
+            Ok(Some(snapshot)) => return Some(snapshot),
+            Ok(None) => "CLI recovery source disappeared or snapshot changed".to_owned(),
+            Err(error) => {
+                warn!(error = %error, "CLI recovery source storage lookup failed");
+                format!("CLI recovery source storage failure: {error:#}")
+            }
+        };
+        #[cfg(test)]
+        self.completed_history_preparation_barrier
+            .wait_if_armed(
+                "__cli_recovery_before_defer__",
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        self.defer_cli_runtime_recovery_attempt(
+            job_id,
+            attempt_id,
+            &binding.turn_id,
+            diagnostic,
+            now,
+        )
+        .await;
+        None
+    }
+
     async fn defer_cli_runtime_recovery_attempt(
         &self,
         recovery_job_id: &str,
@@ -6495,58 +6721,91 @@ impl MessageProcessor {
         event_timestamp: i64,
         transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) {
+        let Some(expected) = self
+            .cli_recovery_source_or_defer(
+                binding,
+                recovery_job_id,
+                recovery_attempt_id,
+                event_timestamp,
+            )
+            .await
+        else {
+            return;
+        };
         let acquired = if transition.is_none() {
-            let expected = self
-                .crud_store
-                .cli_runtime_turn_terminal_guard(binding)
-                .await
-                .ok()
-                .flatten();
-            let Some(acquired) = self
-                .try_cli_runtime_turn_transition(binding)
-                .await
-                .ok()
-                .flatten()
-            else {
-                return;
-            };
-            if expected.is_none()
-                || self
-                    .crud_store
-                    .cli_runtime_turn_terminal_guard(binding)
-                    .await
-                    .ok()
-                    .flatten()
-                    != expected
-            {
-                return;
+            match self.try_cli_runtime_turn_transition(binding).await {
+                Ok(Some(acquired)) => Some(acquired),
+                result => {
+                    if let Err(error) = result {
+                        warn!(error = %error, "CLI blocked recovery gate lookup failed");
+                    }
+                    self.defer_cli_runtime_recovery_attempt(
+                        recovery_job_id,
+                        recovery_attempt_id,
+                        &binding.turn_id,
+                        "CLI blocked recovery transition unavailable".into(),
+                        event_timestamp,
+                    )
+                    .await;
+                    return;
+                }
             }
-            Some(acquired)
         } else {
             None
         };
+        let Some(current) = self
+            .cli_recovery_source_or_defer(
+                binding,
+                recovery_job_id,
+                recovery_attempt_id,
+                event_timestamp,
+            )
+            .await
+        else {
+            return;
+        };
+        if current != expected {
+            self.defer_cli_runtime_recovery_attempt(
+                recovery_job_id,
+                recovery_attempt_id,
+                &binding.turn_id,
+                "CLI blocked recovery snapshot changed".into(),
+                event_timestamp,
+            )
+            .await;
+            return;
+        }
         let transition = transition.or(acquired.as_ref());
         let recovery = pioneer_protocol::RecoveryAttemptContext {
             job_id: recovery_job_id.to_owned(),
             attempt_id: recovery_attempt_id.to_owned(),
         };
-        if let Err(error) = self
+        let blocked = match self
             .recovery_coordinator
-            .block_active_recoveries_for_turn(
-                binding.turn_id.as_str(),
+            .block_active_recoveries_for_turn_if_owned(
+                &binding.turn_id,
                 Some(&recovery),
-                diagnostic.as_str(),
+                &diagnostic,
                 event_timestamp,
             )
             .await
         {
-            warn!(
-                turn_id = binding.turn_id,
-                recovery_job_id,
-                recovery_attempt_id,
-                error = %format!("{error:#}"),
-                "failed to persist invalid CLI runtime recovery binding"
-            );
+            Ok(blocked) => blocked,
+            Err(error) => {
+                warn!(turn_id = binding.turn_id, recovery_job_id, recovery_attempt_id, error = %error,
+                    "failed to persist invalid CLI runtime recovery binding");
+                self.defer_cli_runtime_recovery_attempt(
+                    recovery_job_id,
+                    recovery_attempt_id,
+                    &binding.turn_id,
+                    "CLI blocked recovery storage unavailable".into(),
+                    event_timestamp,
+                )
+                .await;
+                return;
+            }
+        };
+        if !blocked {
             return;
         }
         self.mark_turn_blocked_with_transition(
@@ -6757,6 +7016,7 @@ impl MessageProcessor {
         turn_id: String,
         reason: String,
         event_timestamp: i64,
+        transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) -> bool {
         // Use the durable outbox for typed no-progress stops in both live delivery
         // and restart replay. Its claim and commit fences own the terminal event.
@@ -6833,12 +7093,14 @@ impl MessageProcessor {
             }
         };
         if !self
-            .mark_turn_blocked_with_resume_metadata(
+            .mark_turn_blocked_with_resume_metadata_guarded(
                 thread_id,
                 turn_id,
                 format!("{display_reason} (recovery job {job_id})"),
                 None,
                 Some(resume),
+                None,
+                transition,
             )
             .await
         {
@@ -8060,20 +8322,6 @@ impl MessageProcessor {
             None,
             cli_blocked_guard,
             turn_transition,
-        )
-        .await
-    }
-
-    pub(super) async fn mark_turn_blocked_with_resume_metadata(
-        &self,
-        thread_id: String,
-        turn_id: String,
-        reason: String,
-        recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
-        resume: Option<pioneer_protocol::TurnBlockedResumeMetadata>,
-    ) -> bool {
-        self.mark_turn_blocked_with_resume_metadata_guarded(
-            thread_id, turn_id, reason, recovery, resume, None, None,
         )
         .await
     }

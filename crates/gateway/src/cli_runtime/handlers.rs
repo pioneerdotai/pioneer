@@ -3497,9 +3497,8 @@ impl MessageProcessor {
                         durable = durable_receiver.recv(), if durable_open => {
                             match durable {
                                 Some(event) => {
-                                    // A retained transition originates at the background
-                                    // reconciliation boundary, even when this hub was
-                                    // originally opened by an interactive provider pump.
+                                    // Retained CLI ownership scopes the narrow correctness
+                                    // commit independently of how this hub was opened.
                                     let commit_processor = if durable_receiver.owns_turn_transition() {
                                         listener_processor.scoped_for_background_reconciliation()
                                     } else {
@@ -4469,6 +4468,33 @@ impl MessageProcessor {
                 return None;
             }
         };
+        // Early turn/started is buffered until activation. Do not wait for the
+        // admission-owned gate while that admission still awaits start_turn.
+        if binding.status != crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING {
+            return None;
+        }
+        let selected = self
+            .crud_store
+            .cli_runtime_turn_terminal_guard(&binding)
+            .await
+            .ok()
+            .flatten()?;
+        let _transition = self
+            .cli_runtime_session_transition_mutex(key)
+            .await
+            .lock_owned()
+            .await;
+        if self
+            .crud_store
+            .cli_runtime_turn_terminal_guard(&binding)
+            .await
+            .ok()
+            .flatten()
+            .as_ref()
+            != Some(&selected)
+        {
+            return None;
+        }
         if binding.status != crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING {
             return None;
         }
@@ -4593,6 +4619,28 @@ impl MessageProcessor {
         else {
             return;
         };
+        let selected = self
+            .crud_store
+            .cli_runtime_turn_terminal_guard(&binding)
+            .await
+            .ok()
+            .flatten();
+        let transition = self
+            .cli_runtime_session_transition_mutex(instance.key())
+            .await
+            .lock_owned()
+            .await;
+        if selected.is_none()
+            || self
+                .crud_store
+                .cli_runtime_turn_terminal_guard(&binding)
+                .await
+                .ok()
+                .flatten()
+                != selected
+        {
+            return;
+        }
         let binding = match self
             .crud_store
             .set_cli_runtime_turn_native_goal_state(
@@ -4614,6 +4662,7 @@ impl MessageProcessor {
                 return;
             }
         };
+        drop(transition);
         self.reconcile_codex_goal_terminal(instance, binding).await;
     }
 
@@ -5256,8 +5305,231 @@ impl MessageProcessor {
         turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
         event: RuntimeEvent,
     ) -> bool {
-        self.process_bound_cli_runtime_event_inner(instance, turn_binding, event, None)
+        if cli_runtime_turn_status_for_terminal_event(&event).is_none() {
+            return self
+                .process_bound_cli_runtime_event_inner(instance, turn_binding, event, None, None)
+                .await;
+        }
+        let result = async {
+            let native_turn_id = match cli_runtime_native_turn_id_for_event(&event) {
+                Some(native) => native.to_owned(),
+                None => match self
+                    .cli_runtime_running_native_turn_id(&turn_binding)
+                    .await?
+                {
+                    Some(native) => native,
+                    None => return Ok(false),
+                },
+            };
+            let Some(source) = self
+                .crud_store
+                .cli_runtime_terminal_event_source(&turn_binding, &native_turn_id)
+                .await?
+            else {
+                return Ok(false);
+            };
+            #[cfg(test)]
+            self.completed_history_preparation_barrier
+                .wait_if_armed(
+                    "__cli_native_terminal_before_gate__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            let payload = serde_json::to_string(&(source.clone(), event.clone()))?;
+            let record = cli_runtime_terminal_event_record(&source, payload);
+            if !self
+                .crud_store
+                .with_maintenance_access()
+                .persist_cli_runtime_terminal_event(record.clone(), &source)
+                .await?
+            {
+                return Ok(false);
+            }
+            #[cfg(test)]
+            self.completed_history_preparation_barrier
+                .wait_if_armed(
+                    "__cli_native_terminal_saved__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            // Wait only on the producer, before enqueue. The ordered consumer
+            // remains free to ACK admission windows while this event waits.
+            let transition = Arc::new(
+                self.cli_runtime_session_transition_mutex(instance.key())
+                    .await
+                    .lock_owned()
+                    .await,
+            );
+            let current = self
+                .crud_store
+                .get_cli_runtime_turn_binding(&source.turn_id)
+                .await?;
+            let Some(binding) = current else {
+                return Ok(false);
+            };
+            if !self
+                .crud_store
+                .cli_runtime_terminal_event_source(&binding, &native_turn_id)
+                .await?
+                .as_ref()
+                .is_some_and(|current| current.same_execution(&source))
+            {
+                return Ok(false);
+            }
+            let saved = self
+                .crud_store
+                .get_cli_runtime_native_event(&record.id)
+                .await?
+                .context("saved CLI terminal outcome disappeared")?;
+            let (selected, event): (pioneer_protocol::CliRuntimeBlockedTurnGuard, RuntimeEvent) =
+                serde_json::from_str(&saved.payload_redacted_json)?;
+            if !selected.same_execution(&source) {
+                return Ok(false);
+            }
+            let goal_completion = matches!(event, RuntimeEvent::TurnCompleted(_))
+                && selected
+                    .native_goal_status
+                    .as_deref()
+                    .is_some_and(|status| status != "complete")
+                && binding.native_goal_status.as_deref() == Some("complete");
+            // A segment ACK is not the canonical completion of its Goal.
+            if !goal_completion
+                && self
+                    .crud_store
+                    .get_cli_runtime_native_event(&format!("{}:ack", record.id))
+                    .await?
+                    .is_some()
+            {
+                return Ok(true);
+            }
+            let mut delivery = selected;
+            delivery.terminal_delivery_id = Some(record.id.clone());
+            let applied = self
+                .process_bound_cli_runtime_event_inner(
+                    instance,
+                    binding,
+                    event,
+                    Some(&transition),
+                    Some(&delivery),
+                )
+                .await;
+            if applied {
+                self.ack_cli_runtime_terminal_event(&record).await?;
+            }
+            Ok::<_, anyhow::Error>(applied)
+        }
+        .await;
+        match result {
+            Ok(applied) => applied,
+            Err(error) => {
+                warn!(turn_id = turn_binding.turn_id, error = %error, "CLI terminal delivery remains durable and retryable");
+                false
+            }
+        }
+    }
+
+    pub(super) async fn ack_cli_runtime_terminal_event(
+        &self,
+        record: &pioneer_crud::NewCliRuntimeNativeEvent,
+    ) -> anyhow::Result<()> {
+        let mut ack = record.clone();
+        ack.id.push_str(":ack");
+        ack.native_method = "gateway/terminal_ack".into();
+        ack.payload_redacted_json = "{}".into();
+        self.crud_store
+            .with_maintenance_access()
+            .append_cli_runtime_native_event_if_absent(ack)
+            .await?;
+        Ok(())
+    }
+
+    // One saved outcome per selected execution, sought by primary key. This
+    // runs before activity/human-wait/stale eligibility, including after reopen.
+    async fn replay_cli_runtime_terminal_event(
+        &self,
+        expected: &pioneer_crud::CliRuntimeTurnTerminalGuard,
+        transition: &Arc<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> anyhow::Result<bool> {
+        let Some(attempt) = expected.attempt.as_ref() else {
+            return Ok(false);
+        };
+        let native = expected
+            .segment
+            .as_ref()
+            .map(|segment| segment.native_turn_id.as_str())
+            .or(attempt.native_turn_id.as_deref());
+        let Some(native) = native else {
+            return Ok(false);
+        };
+        let Some(source) = self
+            .crud_store
+            .cli_runtime_terminal_event_source(&expected.binding, native)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let record = cli_runtime_terminal_event_record(&source, String::new());
+        let Some(saved) = self
+            .crud_store
+            .get_cli_runtime_native_event(&record.id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let (selected, event): (pioneer_protocol::CliRuntimeBlockedTurnGuard, RuntimeEvent) =
+            serde_json::from_str(&saved.payload_redacted_json)?;
+        if !selected.same_execution(&source) {
+            return Ok(false);
+        }
+        let goal_completion = matches!(event, RuntimeEvent::TurnCompleted(_))
+            && selected
+                .native_goal_status
+                .as_deref()
+                .is_some_and(|status| status != "complete")
+            && source.native_goal_status.as_deref() == Some("complete");
+        if !goal_completion
+            && self
+                .crud_store
+                .get_cli_runtime_native_event(&format!("{}:ack", record.id))
+                .await?
+                .is_some()
+        {
+            return Ok(false);
+        }
+        let manager = self
+            .cli_runtime_manager
+            .as_ref()
+            .context("CLI manager unavailable for saved terminal delivery")?;
+        let restored = match self
+            .restore_cli_runtime_launch_spec(&expected.binding)
             .await
+        {
+            CliRuntimeLaunchSpecRestore::Ready(restored) => restored,
+            CliRuntimeLaunchSpecRestore::Unavailable { diagnostic }
+            | CliRuntimeLaunchSpecRestore::InvalidBinding { diagnostic } => {
+                anyhow::bail!("{diagnostic}")
+            }
+        };
+        let handle = manager
+            .get_or_start_with_launch_spec(restored.session_key, restored.launch_spec)
+            .await?;
+        // Event and Claude transcript UUID are on disk; no old process snapshot
+        // is consulted. Retained ownership covers the real lane through ACK.
+        let mut delivery = selected;
+        delivery.terminal_delivery_id = Some(record.id.clone());
+        anyhow::ensure!(
+            self.process_bound_cli_runtime_event_inner(
+                handle.instance(),
+                expected.binding.clone(),
+                event,
+                Some(transition),
+                Some(&delivery)
+            )
+            .await,
+            "saved CLI terminal outcome could not be delivered in this quantum"
+        );
+        self.ack_cli_runtime_terminal_event(&record).await?;
+        Ok(true)
     }
 
     async fn process_bound_cli_runtime_event_inner(
@@ -5266,6 +5538,7 @@ impl MessageProcessor {
         mut turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
         event: RuntimeEvent,
         turn_transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
+        terminal_delivery: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> bool {
         if !self.cli_runtime_instance_is_current(instance).await {
             self.audit_stale_cli_runtime_process_activity(instance, "bound_event");
@@ -5476,6 +5749,7 @@ impl MessageProcessor {
                         turn_binding.turn_id.clone(),
                         recovery.clone(),
                         failure,
+                        turn_transition.cloned(),
                     )
                     .await;
                 } else {
@@ -5495,13 +5769,46 @@ impl MessageProcessor {
             && let Some(provider_failure) =
                 classify_runtime_provider_failure(&event, chrono::Local::now().fixed_offset())
         {
+            let failure_message = provider_failure.message.clone();
+            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
+                .await;
+            let committed = self
+                .handle_provider_failure_detected_with_transition(
+                    turn_binding.thread_id.clone(),
+                    turn_binding.turn_id.clone(),
+                    "runtime:provider_failure".to_owned(),
+                    pioneer_protocol::TurnItemType::SystemEvent,
+                    pioneer_protocol::ProviderFailureDetails {
+                        error_reason: None,
+                        request_id: None,
+                        provider: turn_binding.runtime_kind.clone(),
+                        model: turn_binding
+                            .model
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        transport: pioneer_protocol::ProviderTransportKind::NonStream,
+                        class: provider_failure.class,
+                        stage: pioneer_protocol::ProviderFailureStage::FirstChunk,
+                        http_status: None,
+                        provider_code: provider_failure.provider_code,
+                        retry_after_ms: provider_failure.retry_after_ms,
+                        is_recoverable_hint: true,
+                        message: Some(provider_failure.message),
+                    },
+                    recovery.clone(),
+                    turn_transition.cloned(),
+                )
+                .await;
+            if !committed {
+                return false;
+            }
             if let Some(attempt) = turn_attempt {
                 match self
                     .crud_store
                     .mark_cli_runtime_turn_attempt_terminal(
                         attempt.id.as_str(),
                         pioneer_crud::CliRuntimeTurnAttemptStatus::Failed,
-                        Some(provider_failure.message.clone()),
+                        Some(failure_message.clone()),
                         chrono::Utc::now().fixed_offset(),
                     )
                     .await
@@ -5525,34 +5832,7 @@ impl MessageProcessor {
                     }
                 }
             }
-            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
-                .await;
-            return self
-                .handle_provider_failure_detected(
-                    turn_binding.thread_id.clone(),
-                    turn_binding.turn_id.clone(),
-                    "runtime:provider_failure".to_owned(),
-                    pioneer_protocol::TurnItemType::SystemEvent,
-                    pioneer_protocol::ProviderFailureDetails {
-                        error_reason: None,
-                        request_id: None,
-                        provider: turn_binding.runtime_kind.clone(),
-                        model: turn_binding
-                            .model
-                            .clone()
-                            .unwrap_or_else(|| "unknown".to_owned()),
-                        transport: pioneer_protocol::ProviderTransportKind::NonStream,
-                        class: provider_failure.class,
-                        stage: pioneer_protocol::ProviderFailureStage::FirstChunk,
-                        http_status: None,
-                        provider_code: provider_failure.provider_code,
-                        retry_after_ms: provider_failure.retry_after_ms,
-                        is_recoverable_hint: true,
-                        message: Some(provider_failure.message),
-                    },
-                    recovery.clone(),
-                )
-                .await;
+            return true;
         }
         if terminal_status.is_some()
             && let Some(recovery) = recovery.as_ref()
@@ -5578,6 +5858,19 @@ impl MessageProcessor {
                 ),
                 _ => unreachable!(),
             };
+            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
+                .await;
+            if !self
+                .handle_cli_runtime_recovery_native_failure(
+                    turn_binding.turn_id.clone(),
+                    recovery.clone(),
+                    failure_message.clone(),
+                    turn_transition.cloned(),
+                )
+                .await
+            {
+                return false;
+            }
             if let Some(attempt) = turn_attempt {
                 match self
                     .crud_store
@@ -5596,7 +5889,6 @@ impl MessageProcessor {
                             native_turn_id = native_turn_id_label,
                             "ignored duplicate terminal event for CLI recovery attempt"
                         );
-                        return false;
                     }
                     Err(error) => {
                         warn!(
@@ -5609,14 +5901,6 @@ impl MessageProcessor {
                     }
                 }
             }
-            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
-                .await;
-            self.handle_cli_runtime_recovery_native_failure(
-                turn_binding.turn_id.clone(),
-                recovery.clone(),
-                failure_message,
-            )
-            .await;
             return true;
         }
         if recovery.is_none() && matches!(&event, RuntimeEvent::TurnInterrupted(_)) {
@@ -5624,6 +5908,19 @@ impl MessageProcessor {
                 RuntimeEvent::TurnInterrupted(interrupted) => interrupted.reason.clone(),
                 _ => unreachable!(),
             };
+            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
+                .await;
+            let committed = self
+                .report_turn_failure(
+                    turn_binding.thread_id.clone(),
+                    turn_binding.turn_id.clone(),
+                    TurnFailureRecoveryKind::RuntimeFailure,
+                    failure_message.clone(),
+                )
+                .await;
+            if !committed {
+                return false;
+            }
             if let Some(attempt) = turn_attempt {
                 match self
                     .crud_store
@@ -5642,7 +5939,6 @@ impl MessageProcessor {
                             native_turn_id = native_turn_id_label,
                             "ignored duplicate interruption for CLI runtime attempt"
                         );
-                        return false;
                     }
                     Err(error) => {
                         warn!(
@@ -5655,16 +5951,7 @@ impl MessageProcessor {
                     }
                 }
             }
-            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
-                .await;
-            return self
-                .report_turn_failure(
-                    turn_binding.thread_id.clone(),
-                    turn_binding.turn_id.clone(),
-                    TurnFailureRecoveryKind::RuntimeFailure,
-                    failure_message,
-                )
-                .await;
+            return true;
         }
         // Persist the provider's transcript record before canonical completion.
         // A failed write keeps the completion retryable; a process exit after
@@ -5762,7 +6049,12 @@ impl MessageProcessor {
         let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
         for durable in projected.durable {
             if let Err(error) = self
-                .publish_cli_runtime_durable_and_wait_inner(instance, durable, turn_transition)
+                .publish_cli_runtime_durable_guarded(
+                    instance,
+                    durable,
+                    turn_transition,
+                    terminal_delivery.cloned(),
+                )
                 .await
             {
                 warn!(
@@ -7093,6 +7385,13 @@ impl MessageProcessor {
         }
 
         if self
+            .replay_cli_runtime_terminal_event(&expected, &turn_transition)
+            .await?
+        {
+            return Ok(());
+        }
+
+        if self
             .reconcile_cli_runtime_human_wait_for_turn_inner(
                 binding.turn_id.as_str(),
                 now_unix_ms,
@@ -7479,6 +7778,7 @@ impl MessageProcessor {
                 binding.clone(),
                 terminal_event,
                 Some(turn_transition),
+                None,
             )
             .await
         {
@@ -12783,6 +13083,43 @@ fn cli_runtime_turn_binding_matches_native_activity(
     native_thread_id.is_some_and(|native_thread_id| binding.native_thread_id == native_thread_id)
         && native_turn_id
             .is_some_and(|native_turn_id| binding.native_turn_id.as_deref() == Some(native_turn_id))
+}
+
+pub(super) fn cli_runtime_terminal_event_record(
+    source: &pioneer_protocol::CliRuntimeBlockedTurnGuard,
+    payload_redacted_json: String,
+) -> pioneer_crud::NewCliRuntimeNativeEvent {
+    use sha2::Digest;
+    let identity = serde_json::to_vec(&(
+        &source.turn_id,
+        &source.attempt_id,
+        source.segment.as_ref().map(|(id, _, _)| id),
+        &source.execution_owner,
+    ))
+    .expect("native source identity serializes");
+    let id = format!(
+        "cli-terminal:{}",
+        hex::encode(sha2::Sha256::digest(identity))
+    );
+    let now = chrono::Utc::now().fixed_offset();
+    pioneer_crud::NewCliRuntimeNativeEvent {
+        id,
+        runtime_id: source.runtime_id.clone(),
+        runtime_kind: source.runtime_kind.clone(),
+        workspace_id: Some(source.workspace_id.clone()),
+        thread_id: Some(source.thread_id.clone()),
+        turn_id: Some(source.turn_id.clone()),
+        native_thread_id: Some(source.native_thread_id.clone()),
+        native_turn_id: source
+            .segment
+            .as_ref()
+            .map(|(_, native, _)| native.clone())
+            .or(source.attempt_native_turn_id.clone()),
+        native_method: "gateway/terminal_delivery".into(),
+        payload_redacted_json,
+        sequence: now.timestamp_millis(),
+        created_at: now,
+    }
 }
 
 fn cli_runtime_turn_status_from_binding(

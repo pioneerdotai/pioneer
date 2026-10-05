@@ -1394,6 +1394,18 @@ impl RecoveryCoordinator {
         error_message: &str,
         now_unix: i64,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        self.block_active_recoveries_for_turn_if_owned(turn_id, recovery, error_message, now_unix)
+            .await?;
+        Ok(Vec::new())
+    }
+
+    pub async fn block_active_recoveries_for_turn_if_owned(
+        &self,
+        turn_id: &str,
+        recovery: Option<&RecoveryAttemptContext>,
+        error_message: &str,
+        now_unix: i64,
+    ) -> Result<bool> {
         let jobs = if let Some(recovery) = recovery {
             self.crud_store
                 .get_recovery_job(recovery.job_id.as_str())
@@ -1449,7 +1461,7 @@ impl RecoveryCoordinator {
                 .await?;
         }
 
-        Ok(Vec::new())
+        Ok(blocked_any)
     }
 
     async fn fail_active_recoveries_for_turn_with_cancel_reason(

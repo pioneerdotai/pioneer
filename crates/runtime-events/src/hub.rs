@@ -246,7 +246,7 @@ impl ExecutionEventHub {
         self.publish_cli_runtime_blocked_and_wait(event, turn_transition, None)
     }
 
-    /// Targeted source facts for the atomic CLI Blocked lifecycle commit.
+    /// CLI source facts for the atomic Blocked commit or native terminal delivery.
     pub fn publish_cli_runtime_blocked_and_wait(
         &self,
         event: AgentDurableEvent,

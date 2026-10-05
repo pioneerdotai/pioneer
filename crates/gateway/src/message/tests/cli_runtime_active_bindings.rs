@@ -1,5 +1,6 @@
 use super::*;
 use crate::message::cli_runtime::CliRuntimeStaleTurnScan;
+use crate::message::turn_handlers::CliRuntimeLaunchSpecRestore;
 use pioneer_entity::{turn, turn_cli_runtime_binding as binding, turn_liveness};
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
@@ -866,7 +867,8 @@ async fn cli_active_scan_defers_busy_session_without_waiting_or_refetching_pages
 
 const BLOCKED_THREAD: &str = "blocked-observation-thread";
 const BLOCKED_TURN: &str = "blocked-observation-turn";
-const BLOCKED_NATIVE_THREAD: &str = "blocked-native-thread";
+// Claude's durable launch contract requires a real provider session UUID.
+const BLOCKED_NATIVE_THREAD: &str = "01900000-0000-7000-8000-000000000071";
 
 // Uses the project's persisted admission and recording provider. Reopening
 // builds a new processor, store and session from the same isolated disk schema.
@@ -897,6 +899,16 @@ async fn blocked_observation_fixture(
             "blocked observation",
         )
         .await;
+        persist_test_cli_instruction_projection(
+            &store,
+            BLOCKED_TURN,
+            match kind {
+                "codex" => CLIAgentRuntimeKind::Codex,
+                "claude" => CLIAgentRuntimeKind::Claude,
+                _ => panic!("unsupported fixture runtime"),
+            },
+        )
+        .await;
     }
     let session = Arc::new(RecordingCliRuntimeSession::default());
     *session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
@@ -905,10 +917,6 @@ async fn blocked_observation_fixture(
         reconciliation_events: Vec::new(),
     });
     let manager = test_cli_runtime_manager(session.clone());
-    manager
-        .get_or_start(CLIAgentRuntimeSessionKey::new(&workspace, kind, BLOCKED_THREAD).unwrap())
-        .await
-        .unwrap();
     let processor = with_enabled_test_cli_runtime_catalog(
         MessageProcessor::new(
             Arc::new(ThreadManager::new("test", "openai")),
@@ -920,9 +928,23 @@ async fn blocked_observation_fixture(
             test_summary_config(),
             test_tool_loop_config(),
         )
-        .with_cli_runtime_manager_for_tests(manager),
+        .with_cli_runtime_manager_for_tests(manager.clone()),
     )
     .scoped_for_background_reconciliation();
+    let binding = store
+        .get_cli_runtime_turn_binding(BLOCKED_TURN)
+        .await
+        .unwrap()
+        .unwrap();
+    let CliRuntimeLaunchSpecRestore::Ready(restored) =
+        processor.restore_cli_runtime_launch_spec(&binding).await
+    else {
+        panic!("the fixture must persist the real CLI launch contract");
+    };
+    manager
+        .get_or_start_with_launch_spec(restored.session_key, restored.launch_spec)
+        .await
+        .unwrap();
     (processor, store, session, workspace)
 }
 
@@ -1728,4 +1750,912 @@ async fn cli_normal_terminal_consumer_rejects_busy_without_blocking_lane_and_fen
         )]
     );
     drop(resumed);
+}
+
+fn ordinary_native_failure(native_thread: &str, native_turn: &str) -> RuntimeEvent {
+    RuntimeEvent::TurnFailed(RuntimeTurnFailed {
+        native_thread_id: Some(native_thread.into()),
+        native_turn_id: Some(native_turn.into()),
+        message: "ordinary native outcome saved before admission ACK".into(),
+        code: None,
+        native: None,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_native_terminal_waits_outside_lane_and_active_scan_replays_cancelled_producer() {
+    let temp = tempfile::tempdir().unwrap();
+    let (processor, store, session, workspace) =
+        blocked_observation_fixture(&temp.path().join("native-delivery.sqlite"), "codex", true)
+            .await;
+    let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
+    let handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .existing_session(&key)
+        .await
+        .unwrap();
+    let gate = processor.cli_runtime_session_transition_mutex(&key).await;
+    let owned = gate.clone().lock_owned().await;
+    processor.arm_completed_history_preparation_barrier("__cli_native_terminal_saved__");
+    let mut producer = Box::pin(processor.handle_cli_runtime_timeline_event(
+        handle.instance(),
+        ordinary_native_failure(BLOCKED_NATIVE_THREAD, BLOCKED_TURN),
+    ));
+    tokio::select! {
+        _ = processor.wait_for_completed_history_preparation_barrier() => {},
+        _ = &mut producer => panic!("producer must save its execution outcome before waiting"),
+    }
+    processor.release_completed_history_preparation_barrier();
+    assert!(futures_util::poll!(&mut producer).is_pending());
+    assert_blocked_observation_active(&store).await;
+    assert!(!has_recovery(&store, BLOCKED_TURN).await);
+    // Admission's actual window event must pass the same ordered durable lane,
+    // while the terminal producer still waits for the admission-owned gate.
+    processor
+        .publish_cli_runtime_durable_and_wait(
+            handle.instance(),
+            AgentDurableEvent::TurnExecutionWindowStarted {
+                notification: pioneer_protocol::TurnExecutionWindowStartedNotification {
+                    workspace_id: workspace.clone(),
+                    thread_id: BLOCKED_THREAD.into(),
+                    turn_id: BLOCKED_TURN.into(),
+                    window_id: "terminal_delivery_window".into(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    started_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(gate.try_lock().is_err());
+    drop(producer); // The provider may exit or its event pump may be cancelled.
+    drop(owned);
+    *session.turn_observation.lock().await = None;
+    // The real worker entry processes a fresh active row immediately. No
+    // stale age, old process snapshot or manual event resubmission is needed.
+    let result = processor
+        .fail_stale_cli_runtime_turns(
+            chrono::Utc::now().timestamp_millis(),
+            &mut CliRuntimeStaleTurnScan::default(),
+        )
+        .await;
+    assert_eq!((result.selected, result.processed), (1, 1));
+    let job = store
+        .find_unresolved_recovery_job_for_turn(BLOCKED_TURN)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        job.trigger,
+        pioneer_protocol::RecoveryTrigger::RuntimeFailure
+    );
+    assert!(
+        job.last_error
+            .as_deref()
+            .unwrap()
+            .contains("ordinary native outcome")
+    );
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        pioneer_crud::CliRuntimeTurnAttemptStatus::Failed
+    );
+    assert!(gate.try_lock().is_ok());
+    assert!(session.interrupts.lock().await.is_empty());
+    let before = pioneer_entity::turn_event::Entity::find()
+        .filter(pioneer_entity::turn_event::Column::TurnId.eq(BLOCKED_TURN))
+        .count(&store.database_connection())
+        .await
+        .unwrap();
+    processor
+        .fail_stale_cli_runtime_turns(
+            chrono::Utc::now().timestamp_millis(),
+            &mut CliRuntimeStaleTurnScan::default(),
+        )
+        .await;
+    assert_eq!(
+        pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(BLOCKED_TURN))
+            .count(&store.database_connection())
+            .await
+            .unwrap(),
+        before
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_saved_native_outcome_reopens_for_codex_and_claude_without_provider_snapshot() {
+    for (kind, completed) in [
+        ("codex", false),
+        ("claude", false),
+        ("codex", true),
+        ("claude", true),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp
+            .path()
+            .join(format!("{kind}-{completed}-native-delivery.sqlite"));
+        let (processor, store, session, workspace) =
+            blocked_observation_fixture(&path, kind, true).await;
+        let key = CLIAgentRuntimeSessionKey::new(&workspace, kind, BLOCKED_THREAD).unwrap();
+        let handle = processor
+            .cli_runtime_manager
+            .as_ref()
+            .unwrap()
+            .existing_session(&key)
+            .await
+            .unwrap();
+        let owned = processor
+            .cli_runtime_session_transition_mutex(&key)
+            .await
+            .lock_owned()
+            .await;
+        processor.arm_completed_history_preparation_barrier("__cli_native_terminal_saved__");
+        let record_uuid = uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000072").unwrap();
+        let event = if completed {
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some(BLOCKED_NATIVE_THREAD.into()),
+                native_turn_id: BLOCKED_TURN.into(),
+                status: "completed".into(),
+                native: Some(pioneer_cli_agent_runtime::event::RuntimeNativeEvent {
+                    method: "turn/completed".into(),
+                    payload_redacted: Some(json!({"assistantRecordUuid": record_uuid.to_string()})),
+                    raw_redacted: None,
+                }),
+            })
+        } else {
+            ordinary_native_failure(BLOCKED_NATIVE_THREAD, BLOCKED_TURN)
+        };
+        let mut producer =
+            Box::pin(processor.handle_cli_runtime_timeline_event(handle.instance(), event));
+        tokio::select! {
+            _ = processor.wait_for_completed_history_preparation_barrier() => {},
+            _ = &mut producer => panic!("native outcome must be durable before cancellation"),
+        }
+        drop(producer);
+        drop(owned);
+        assert!(!has_recovery(&store, BLOCKED_TURN).await);
+        assert!(session.interrupts.lock().await.is_empty());
+        drop(handle);
+        drop(store);
+        drop(processor);
+        // A different manager/session has no Claude in-memory turn outcome.
+        let (reopened, store, session, _) = blocked_observation_fixture(&path, kind, false).await;
+        *session.turn_observation.lock().await = None;
+        let repaired = reopened
+            .fail_stale_cli_runtime_turns(
+                chrono::Utc::now().timestamp_millis(),
+                &mut CliRuntimeStaleTurnScan::default(),
+            )
+            .await;
+        assert_eq!((repaired.selected, repaired.processed), (1, 1));
+        if completed {
+            assert_eq!(
+                store
+                    .get_turn(BLOCKED_THREAD, BLOCKED_TURN)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .status,
+                TurnStatus::Completed
+            );
+            assert_eq!(
+                store
+                    .latest_cli_runtime_turn_attempt(BLOCKED_TURN)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                pioneer_crud::CliRuntimeTurnAttemptStatus::Completed
+            );
+            let binding = store
+                .get_cli_runtime_turn_binding(BLOCKED_TURN)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(binding.status, "completed");
+            assert!(!has_recovery(&store, BLOCKED_TURN).await);
+            if kind == "claude" {
+                assert_eq!(
+                    crate::cli_runtime::thread_binding::claude_assistant_record_boundary(
+                        store.as_ref(),
+                        &binding
+                    )
+                    .await
+                    .unwrap(),
+                    Some(record_uuid)
+                );
+            }
+            let before = pioneer_entity::turn_event::Entity::find()
+                .filter(pioneer_entity::turn_event::Column::TurnId.eq(BLOCKED_TURN))
+                .count(&store.database_connection())
+                .await
+                .unwrap();
+            reopened
+                .fail_stale_cli_runtime_turns(
+                    chrono::Utc::now().timestamp_millis(),
+                    &mut CliRuntimeStaleTurnScan::default(),
+                )
+                .await;
+            assert_eq!(
+                pioneer_entity::turn_event::Entity::find()
+                    .filter(pioneer_entity::turn_event::Column::TurnId.eq(BLOCKED_TURN))
+                    .count(&store.database_connection())
+                    .await
+                    .unwrap(),
+                before
+            );
+            continue;
+        }
+        let job = store
+            .find_unresolved_recovery_job_for_turn(BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            job.trigger,
+            pioneer_protocol::RecoveryTrigger::RuntimeFailure
+        );
+        assert!(
+            job.last_error
+                .as_deref()
+                .unwrap()
+                .contains("ordinary native outcome")
+        );
+        assert!(session.interrupts.lock().await.is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_old_native_failed_producer_cannot_open_recovery_or_cleanup_resumed_attempt() {
+    let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
+    drop(rx);
+    let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", GUARDED_THREAD).unwrap();
+    let handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .existing_session(&key)
+        .await
+        .unwrap();
+    processor.arm_completed_history_preparation_barrier("__cli_native_terminal_before_gate__");
+    let mut producer = Box::pin(processor.handle_cli_runtime_timeline_event(
+        handle.instance(),
+        ordinary_native_failure("codex-thread-command", GUARDED_TURN),
+    ));
+    tokio::select! {
+        _ = processor.wait_for_completed_history_preparation_barrier() => {},
+        _ = &mut producer => panic!("old native owner must be selected before admission"),
+    }
+    let job = block_guarded_fixture(&store).await;
+    let transition = processor
+        .cli_runtime_turn_resume_transition(GUARDED_TURN)
+        .await
+        .unwrap();
+    let next = resume_guarded_fixture(&store, &job).await;
+    pending_for_new_execution(&store, &workspace).await;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let _invocation = processor
+        .mcp_service
+        .hold_test_turn_mcp_invocation(GUARDED_TURN, cancel.clone());
+    let lease = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+    processor
+        .cli_runtime_session_turn_leases
+        .lock()
+        .await
+        .insert(GUARDED_TURN.into(), lease);
+    let before = store
+        .cli_runtime_turn_terminal_guard(
+            &store
+                .get_cli_runtime_turn_binding(GUARDED_TURN)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    drop(transition);
+    processor.release_completed_history_preparation_barrier();
+    producer.await;
+    assert_eq!(
+        store
+            .cli_runtime_turn_terminal_guard(
+                &store
+                    .get_cli_runtime_turn_binding(GUARDED_TURN)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .await
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(GUARDED_TURN)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        next.id
+    );
+    assert!(
+        store
+            .find_recovery_jobs_by_turn_and_status(
+                GUARDED_TURN,
+                pioneer_protocol::RecoveryJobStatus::Pending
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!cancel.is_cancelled());
+    assert!(
+        processor
+            .cli_runtime_session_turn_leases
+            .lock()
+            .await
+            .contains_key(GUARDED_TURN)
+    );
+    assert_eq!(
+        store
+            .get_cli_runtime_pending_request("guard-new-human")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Pending
+    );
+    assert!(session.interrupts.lock().await.is_empty());
+    assert!(session.mcp_terminals.lock().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_old_native_failed_producer_rejects_same_attempt_new_segment_with_equal_timestamp() {
+    let temp = tempfile::tempdir().unwrap();
+    let (processor, store, session, workspace) = blocked_observation_fixture(
+        &temp.path().join("native-source-segment.sqlite"),
+        "codex",
+        true,
+    )
+    .await;
+    let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
+    let handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .existing_session(&key)
+        .await
+        .unwrap();
+    let owner = store
+        .resolve_cli_runtime_native_turn_owner("codex", BLOCKED_TURN)
+        .await
+        .unwrap()
+        .unwrap();
+    processor.arm_completed_history_preparation_barrier("__cli_native_terminal_before_gate__");
+    let mut producer = Box::pin(processor.handle_cli_runtime_timeline_event(
+        handle.instance(),
+        ordinary_native_failure(BLOCKED_NATIVE_THREAD, BLOCKED_TURN),
+    ));
+    tokio::select! {
+        _ = processor.wait_for_completed_history_preparation_barrier() => {},
+        _ = &mut producer => panic!("must select segment A"),
+    }
+    let timestamp = owner.segment.unwrap().updated_at;
+    store
+        .terminalize_cli_runtime_execution_segment(
+            "codex",
+            BLOCKED_TURN,
+            pioneer_crud::CliRuntimeExecutionSegmentStatus::Completed,
+            None,
+            timestamp,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, attempt, segment) = store
+        .register_cli_runtime_execution_segment(
+            BLOCKED_TURN,
+            BLOCKED_NATIVE_THREAD,
+            "native-segment-B",
+            timestamp,
+        )
+        .await
+        .unwrap();
+    assert_eq!(attempt.id, owner.attempt.id);
+    processor.release_completed_history_preparation_barrier();
+    producer.await;
+    assert_blocked_observation_active(&store).await;
+    assert_eq!(
+        store
+            .get_cli_runtime_execution_segment_by_native_turn("codex", "native-segment-B")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        segment.id
+    );
+    assert!(!has_recovery(&store, BLOCKED_TURN).await);
+    assert!(session.interrupts.lock().await.is_empty());
+}
+
+async fn activate_observation_request(
+    processor: &MessageProcessor,
+    store: &CrudStore,
+) -> (
+    crate::resilience::RecoveryCoordinatorEvent,
+    pioneer_crud::RecoveryJobRecord,
+    i64,
+) {
+    assert!(
+        processor
+            .report_turn_failure(
+                BLOCKED_THREAD.into(),
+                BLOCKED_TURN.into(),
+                super::super::agent_runtime::TurnFailureRecoveryKind::ObservationGap,
+                "missing observation".into()
+            )
+            .await
+    );
+    let job = store
+        .find_unresolved_recovery_job_for_turn(BLOCKED_TURN)
+        .await
+        .unwrap()
+        .unwrap();
+    let now = job.next_run_at_unix;
+    let request = processor.recovery_coordinator.run_ready_jobs(now, 16).await.unwrap().into_iter()
+        .find(|event| matches!(event, crate::resilience::RecoveryCoordinatorEvent::CliRuntimeTerminalReconciliationRequested(_)))
+        .expect("the coordinator must activate and dispatch the real reconciliation request");
+    let job = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+    assert_eq!(job.status, pioneer_protocol::RecoveryJobStatus::Active);
+    (request, job, now)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_reconciliation_stale_and_storage_sources_defer_durably_without_recovery_budget() {
+    for phase in ["before_handler", "after_source", "lookup_failure"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(format!("recovery-{phase}.sqlite"));
+        let (processor, store, _, _) = blocked_observation_fixture(&path, "codex", true).await;
+        let (request, active, now) = activate_observation_request(&processor, &store).await;
+        if phase == "before_handler" {
+            binding::Entity::update_many()
+                .col_expr(binding::Column::Model, Expr::value("changed model"))
+                .filter(binding::Column::TurnId.eq(BLOCKED_TURN))
+                .exec(&store.database_connection())
+                .await
+                .unwrap();
+            assert!(processor.handle_recovery_event(request, now).await);
+        } else {
+            processor.arm_completed_history_preparation_barrier(if phase == "after_source" {
+                "__cli_recovery_after_source__"
+            } else {
+                "__cli_recovery_before_source__"
+            });
+            let mut handler = Box::pin(processor.handle_recovery_event(request, now));
+            tokio::select! {
+                _ = processor.wait_for_completed_history_preparation_barrier() => {},
+                _ = &mut handler => panic!("request must reach the selected reader boundary"),
+            }
+            if phase == "after_source" {
+                binding::Entity::update_many()
+                    .col_expr(binding::Column::Model, Expr::value("changed model"))
+                    .filter(binding::Column::TurnId.eq(BLOCKED_TURN))
+                    .exec(&store.database_connection())
+                    .await
+                    .unwrap();
+            } else {
+                // The real reader reports an invalid persisted source; this
+                // must remain a storage error, not an absent/superseded request.
+                turn::Entity::update_many()
+                    .col_expr(
+                        turn::Column::Status,
+                        Expr::value("invalid persisted status"),
+                    )
+                    .filter(turn::Column::Id.eq(BLOCKED_TURN))
+                    .exec(&store.database_connection())
+                    .await
+                    .unwrap();
+            }
+            processor.release_completed_history_preparation_barrier();
+            assert!(handler.await);
+        }
+        let deferred = store.get_recovery_job(&active.id).await.unwrap().unwrap();
+        assert_eq!(
+            deferred.status,
+            pioneer_protocol::RecoveryJobStatus::Pending
+        );
+        assert!(deferred.active_attempt_id.is_none());
+        assert_eq!(deferred.next_run_at_unix, now + 5);
+        assert_eq!(deferred.run_count, active.run_count);
+        assert_eq!(
+            deferred.provider_attempt_number,
+            active.provider_attempt_number
+        );
+        assert_eq!(deferred.policy_json, active.policy_json);
+        assert_eq!(deferred.policy_snapshot, active.policy_snapshot);
+        if phase == "lookup_failure" {
+            assert!(
+                deferred
+                    .last_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("storage failure")
+            );
+            turn::Entity::update_many()
+                .col_expr(turn::Column::Status, Expr::value("in_progress"))
+                .filter(turn::Column::Id.eq(BLOCKED_TURN))
+                .exec(&store.database_connection())
+                .await
+                .unwrap();
+        }
+        drop(store);
+        drop(processor);
+        let (reopened, store, session, _) =
+            blocked_observation_fixture(&path, "codex", false).await;
+        *session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
+            status: CLIAgentRuntimeObservedTurnStatus::InProgress,
+            message: None,
+            reconciliation_events: Vec::new(),
+        });
+        let events = reopened
+            .recovery_coordinator
+            .run_ready_jobs(deferred.next_run_at_unix, 16)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::resilience::RecoveryCoordinatorEvent::CliRuntimeTerminalReconciliationRequested(
+                _
+            )
+        )));
+        for event in events {
+            assert!(
+                reopened
+                    .handle_recovery_event(event, deferred.next_run_at_unix)
+                    .await
+            );
+        }
+        let finished = store.get_recovery_job(&active.id).await.unwrap().unwrap();
+        assert_eq!(
+            finished.status,
+            pioneer_protocol::RecoveryJobStatus::Succeeded,
+            "the scheduled retry must progress without watchdog activation"
+        );
+        assert!(
+            store
+                .latest_cli_runtime_turn_attempt(BLOCKED_TURN)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                .is_active()
+        );
+        assert!(session.interrupts.lock().await.is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_reconciliation_late_deferral_cannot_change_replacement_recovery_attempt() {
+    let temp = tempfile::tempdir().unwrap();
+    let (processor, store, session, _) =
+        blocked_observation_fixture(&temp.path().join("recovery-replaced.sqlite"), "codex", true)
+            .await;
+    let (request, active, now) = activate_observation_request(&processor, &store).await;
+    binding::Entity::update_many()
+        .col_expr(binding::Column::Model, Expr::value("metadata refresh"))
+        .filter(binding::Column::TurnId.eq(BLOCKED_TURN))
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+    processor.arm_completed_history_preparation_barrier("__cli_recovery_before_defer__");
+    let mut handler = Box::pin(processor.handle_recovery_event(request, now));
+    tokio::select! {
+        _ = processor.wait_for_completed_history_preparation_barrier() => {},
+        _ = &mut handler => panic!("the old request must pause before fenced deferral"),
+    }
+    assert!(
+        store
+            .defer_active_recovery_job(
+                &active.id,
+                active.active_attempt_id.as_deref().unwrap(),
+                now,
+                Some("replacement owns the work".into()),
+                now
+            )
+            .await
+            .unwrap()
+    );
+    let claimed = store
+        .claim_due_recovery_jobs(now, 60, 16)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|job| job.id == active.id)
+        .unwrap();
+    assert!(matches!(
+        store
+            .mark_claimed_recovery_job_active(
+                &active.id,
+                claimed.claim_token.as_deref().unwrap(),
+                "replacement-recovery-attempt",
+                now
+            )
+            .await
+            .unwrap(),
+        pioneer_crud::ClaimedRecoveryActivation::Activated
+    ));
+    let replacement = store.get_recovery_job(&active.id).await.unwrap().unwrap();
+    processor.release_completed_history_preparation_barrier();
+    assert!(handler.await);
+    let after = store.get_recovery_job(&active.id).await.unwrap().unwrap();
+    assert_eq!(after.status, replacement.status);
+    assert_eq!(after.active_attempt_id, replacement.active_attempt_id);
+    assert_eq!(after.next_run_at_unix, replacement.next_run_at_unix);
+    assert_eq!(after.updated_at_unix, replacement.updated_at_unix);
+    assert_eq!(after.last_error, replacement.last_error);
+    assert_eq!(after.run_count, replacement.run_count);
+    assert!(session.interrupts.lock().await.is_empty());
+    assert_blocked_observation_active(&store).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_native_terminal_consumer_acks_delivery_and_retains_ownership_after_publisher_cancel() {
+    let temp = tempfile::tempdir().unwrap();
+    let (processor, store, _, workspace) = blocked_observation_fixture(
+        &temp.path().join("native-lane-cancel.sqlite"),
+        "codex",
+        true,
+    )
+    .await;
+    let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
+    let handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .existing_session(&key)
+        .await
+        .unwrap();
+    let gate = processor.cli_runtime_session_transition_mutex(&key).await;
+    processor
+        .arm_completed_history_preparation_barrier("__cli_native_terminal_consumer_committed__");
+    let mut producer = Box::pin(processor.handle_cli_runtime_timeline_event(
+        handle.instance(),
+        ordinary_native_failure(BLOCKED_NATIVE_THREAD, BLOCKED_TURN),
+    ));
+    tokio::select! {
+        _ = processor.wait_for_completed_history_preparation_barrier() => {},
+        _ = &mut producer => panic!("real native event must reach its durable consumer"),
+    }
+    let job = store
+        .find_unresolved_recovery_job_for_turn(BLOCKED_TURN)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        job.trigger,
+        pioneer_protocol::RecoveryTrigger::RuntimeFailure
+    );
+    drop(producer);
+    assert!(
+        gate.try_lock().is_err(),
+        "consumer retains ownership independently of its publisher"
+    );
+    let mut admission = Box::pin(processor.cli_runtime_turn_resume_transition(BLOCKED_TURN));
+    assert!(futures_util::poll!(&mut admission).is_pending());
+    let before = pioneer_entity::turn_event::Entity::find()
+        .filter(pioneer_entity::turn_event::Column::TurnId.eq(BLOCKED_TURN))
+        .count(&store.database_connection())
+        .await
+        .unwrap();
+    processor.release_completed_history_preparation_barrier();
+    let admission = admission.await.unwrap().unwrap();
+    drop(admission);
+    processor
+        .fail_stale_cli_runtime_turns(
+            chrono::Utc::now().timestamp_millis(),
+            &mut CliRuntimeStaleTurnScan::default(),
+        )
+        .await;
+    assert_eq!(
+        pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(BLOCKED_TURN))
+            .count(&store.database_connection())
+            .await
+            .unwrap(),
+        before,
+        "consumer ACK prevents a replay from adding recovery notifications"
+    );
+    assert_eq!(
+        store
+            .find_unresolved_recovery_job_for_turn(BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        job.id
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_old_native_failed_producer_rejects_owner_generation_aba_at_equal_timestamp() {
+    let temp = tempfile::tempdir().unwrap();
+    let (processor, store, session, workspace) =
+        blocked_observation_fixture(&temp.path().join("native-owner-aba.sqlite"), "codex", true)
+            .await;
+    let now = chrono::Utc::now().fixed_offset();
+    let db = store.database_connection();
+    use pioneer_entity::turn_execution as execution;
+    use sea_orm::Set;
+    execution::Entity::insert(execution::ActiveModel {
+        turn_id: Set(BLOCKED_TURN.into()),
+        thread_id: Set(BLOCKED_THREAD.into()),
+        workspace_id: Set(workspace.clone()),
+        executor_kind: Set("cli_runtime".into()),
+        executor_key: Set(Some("codex".into())),
+        status: Set("starting".into()),
+        owner_id: Set(processor.turn_execution_owner_id.to_string()),
+        owner_generation: Set(1),
+        lease_until: Set(now + chrono::Duration::seconds(60)),
+        heartbeat_at: Set(now),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    })
+    .exec(&db)
+    .await
+    .unwrap();
+    let owner = store
+        .get_turn_execution(BLOCKED_TURN)
+        .await
+        .unwrap()
+        .unwrap();
+    let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
+    let handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .existing_session(&key)
+        .await
+        .unwrap();
+    processor.arm_completed_history_preparation_barrier("__cli_native_terminal_before_gate__");
+    let mut producer = Box::pin(processor.handle_cli_runtime_timeline_event(
+        handle.instance(),
+        ordinary_native_failure(BLOCKED_NATIVE_THREAD, BLOCKED_TURN),
+    ));
+    tokio::select! {
+        _ = processor.wait_for_completed_history_preparation_barrier() => {},
+        _ = &mut producer => panic!("producer must capture the old owner epoch"),
+    }
+    execution::Entity::update_many()
+        .col_expr(execution::Column::Status, Expr::value("blocked"))
+        .filter(execution::Column::TurnId.eq(BLOCKED_TURN))
+        .exec(&db)
+        .await
+        .unwrap();
+    execution::Entity::update_many()
+        .col_expr(execution::Column::Status, Expr::value("starting"))
+        .col_expr(execution::Column::OwnerGeneration, Expr::value(2_i64))
+        .filter(execution::Column::TurnId.eq(BLOCKED_TURN))
+        .exec(&db)
+        .await
+        .unwrap();
+    let after = store
+        .get_turn_execution(BLOCKED_TURN)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.owner_id, owner.owner_id);
+    assert_eq!(after.status, owner.status);
+    assert_eq!(after.updated_at, owner.updated_at);
+    assert_eq!(after.owner_generation, owner.owner_generation + 1);
+    processor.release_completed_history_preparation_barrier();
+    producer.await;
+    assert_blocked_observation_active(&store).await;
+    assert!(!has_recovery(&store, BLOCKED_TURN).await);
+    assert!(session.interrupts.lock().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_native_goal_segment_ack_does_not_suppress_canonical_goal_completion() {
+    let temp = tempfile::tempdir().unwrap();
+    let (processor, store, _, workspace) =
+        blocked_observation_fixture(&temp.path().join("native-goal-ack.sqlite"), "codex", true)
+            .await;
+    let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
+    let handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .existing_session(&key)
+        .await
+        .unwrap();
+    processor
+        .handle_cli_runtime_timeline_event(
+            handle.instance(),
+            RuntimeEvent::ThreadGoalUpdated(RuntimeThreadGoalUpdated {
+                native_thread_id: BLOCKED_NATIVE_THREAD.into(),
+                native_turn_id: Some(BLOCKED_TURN.into()),
+                status: RuntimeThreadGoalStatus::Active,
+                native: None,
+            }),
+        )
+        .await;
+    processor
+        .handle_cli_runtime_timeline_event(
+            handle.instance(),
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some(BLOCKED_NATIVE_THREAD.into()),
+                native_turn_id: BLOCKED_TURN.into(),
+                status: "completed".into(),
+                native: None,
+            }),
+        )
+        .await;
+    assert!(
+        store
+            .latest_cli_runtime_turn_attempt(BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .is_active()
+    );
+    assert_eq!(
+        store
+            .get_turn(BLOCKED_THREAD, BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+    processor
+        .handle_cli_runtime_timeline_event(
+            handle.instance(),
+            RuntimeEvent::ThreadGoalUpdated(RuntimeThreadGoalUpdated {
+                native_thread_id: BLOCKED_NATIVE_THREAD.into(),
+                native_turn_id: Some(BLOCKED_TURN.into()),
+                status: RuntimeThreadGoalStatus::Complete,
+                native: None,
+            }),
+        )
+        .await;
+    assert_eq!(
+        store
+            .get_turn(BLOCKED_THREAD, BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::Completed
+    );
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        pioneer_crud::CliRuntimeTurnAttemptStatus::Completed
+    );
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_binding(BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "completed"
+    );
 }

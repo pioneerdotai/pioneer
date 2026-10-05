@@ -1056,3 +1056,199 @@ async fn cli_blocked_atomic_source_guard_rejects_execution_generation_aba_at_equ
         owner.owner_generation + 1
     );
 }
+
+async fn native_delivery_fixture() -> (
+    CrudStore,
+    pioneer_protocol::CliRuntimeBlockedTurnGuard,
+    crate::NewCliRuntimeNativeEvent,
+) {
+    let (store, guard) = terminal_guard_fixture().await;
+    store
+        .update_turn_status(
+            &guard.binding.thread_id,
+            &guard.binding.turn_id,
+            TurnStatus::InProgress,
+            None,
+            1_700_000_000,
+        )
+        .await
+        .unwrap();
+    let (binding, _) = store
+        .activate_cli_runtime_turn_attempt(
+            &guard.binding.turn_id,
+            &guard.attempt.unwrap().id,
+            "native-delivery-A",
+            None,
+            guard.binding.updated_at,
+        )
+        .await
+        .unwrap();
+    let source = store
+        .cli_runtime_terminal_event_source(&binding, "native-delivery-A")
+        .await
+        .unwrap()
+        .unwrap();
+    let event = crate::NewCliRuntimeNativeEvent {
+        id: "native-terminal-delivery-fixture".into(),
+        runtime_id: source.runtime_id.clone(),
+        runtime_kind: source.runtime_kind.clone(),
+        turn_id: Some(source.turn_id.clone()),
+        thread_id: Some(source.thread_id.clone()),
+        workspace_id: Some(source.workspace_id.clone()),
+        native_thread_id: Some(source.native_thread_id.clone()),
+        native_turn_id: Some("native-delivery-A".into()),
+        native_method: "gateway/terminal_delivery".into(),
+        payload_redacted_json: "{\"outcome\":\"failed\"}".into(),
+        sequence: 1,
+        created_at: binding.updated_at,
+    };
+    (store.with_maintenance_access(), source, event)
+}
+
+#[tokio::test]
+async fn cli_native_terminal_source_write_preserves_first_outcome_and_rolls_back_on_storage_failure()
+ {
+    let (store, source, event) = native_delivery_fixture().await;
+    let binding = store
+        .get_cli_runtime_turn_binding(&source.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let before = store
+        .cli_runtime_turn_terminal_guard(&binding)
+        .await
+        .unwrap();
+    store.database_connection().execute_unprepared(
+        "CREATE TRIGGER reject_native_terminal_delivery BEFORE INSERT ON cli_runtime_native_event WHEN NEW.native_method = 'gateway/terminal_delivery' BEGIN SELECT RAISE(ABORT, 'injected delivery failure'); END"
+    ).await.unwrap();
+    assert!(
+        store
+            .persist_cli_runtime_terminal_event(event.clone(), &source)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .get_cli_runtime_native_event(&event.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .cli_runtime_turn_terminal_guard(&binding)
+            .await
+            .unwrap(),
+        before
+    );
+    store
+        .database_connection()
+        .execute_unprepared("DROP TRIGGER reject_native_terminal_delivery")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .persist_cli_runtime_terminal_event(event.clone(), &source)
+            .await
+            .unwrap()
+    );
+    let mut later = event.clone();
+    later.payload_redacted_json = "{\"outcome\":\"different\"}".into();
+    assert!(
+        store
+            .persist_cli_runtime_terminal_event(later, &source)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .get_cli_runtime_native_event(&event.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .payload_redacted_json,
+        event.payload_redacted_json,
+        "a retransmission cannot replace the accepted native outcome"
+    );
+    assert_eq!(
+        store
+            .cli_runtime_turn_terminal_guard(&binding)
+            .await
+            .unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn cli_native_terminal_source_write_rejects_owner_aba_even_with_same_binding_and_timestamp() {
+    let (store, _, event) = native_delivery_fixture().await;
+    let timestamp = event.created_at;
+    let db = store.database_connection();
+    let owner = crate::repositories::turn_execution::insert_immutable(
+        &db,
+        crate::NewTurnExecution {
+            turn_id: event.turn_id.clone().unwrap(),
+            thread_id: event.thread_id.clone().unwrap(),
+            workspace_id: event.workspace_id.clone().unwrap(),
+            executor_kind: crate::TurnExecutorKind::CliRuntime,
+            executor_key: Some("codex".into()),
+            status: crate::TurnExecutionStatus::Blocked,
+            owner_id: "native-delivery-owner".into(),
+            lease_until: timestamp,
+            created_at: timestamp,
+        },
+    )
+    .await
+    .unwrap();
+    let binding = store
+        .get_cli_runtime_turn_binding(&owner.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let source = store
+        .cli_runtime_terminal_event_source(&binding, "native-delivery-A")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        crate::repositories::turn_execution::reacquire_blocked(
+            &db,
+            &owner.turn_id,
+            &owner.owner_id,
+            timestamp,
+            timestamp
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        !store
+            .persist_cli_runtime_terminal_event(event.clone(), &source)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .get_cli_runtime_native_event(&event.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_binding(&owner.turn_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        binding
+    );
+    assert!(
+        store
+            .latest_cli_runtime_turn_attempt(&owner.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .is_active()
+    );
+}

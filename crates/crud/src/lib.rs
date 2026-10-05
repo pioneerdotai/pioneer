@@ -911,21 +911,32 @@ pub struct CliRuntimeTurnTerminalGuard {
 fn cli_runtime_blocked_guard_from_snapshot(
     snapshot: &CliRuntimeTurnTerminalGuard,
 ) -> Option<pioneer_protocol::CliRuntimeBlockedTurnGuard> {
+    if snapshot
+        .segment
+        .as_ref()
+        .is_some_and(|segment| segment.status != CliRuntimeExecutionSegmentStatus::Running)
+    {
+        return None;
+    }
+    cli_runtime_event_guard_from_snapshot(snapshot)
+}
+
+fn cli_runtime_event_guard_from_snapshot(
+    snapshot: &CliRuntimeTurnTerminalGuard,
+) -> Option<pioneer_protocol::CliRuntimeBlockedTurnGuard> {
     let binding = &snapshot.binding;
     let attempt = snapshot.attempt.as_ref()?;
     if snapshot.turn_status != TurnStatus::InProgress
         || !attempt.status.is_active()
         || attempt.turn_id != binding.turn_id
         || attempt.runtime_id != binding.runtime_id
+        || attempt.runtime_kind != binding.runtime_kind
         || attempt.native_thread_id != binding.native_thread_id
-        || snapshot
-            .segment
-            .as_ref()
-            .is_some_and(|segment| segment.status != CliRuntimeExecutionSegmentStatus::Running)
     {
         return None;
     }
     Some(pioneer_protocol::CliRuntimeBlockedTurnGuard {
+        terminal_delivery_id: None,
         turn_id: binding.turn_id.clone(),
         thread_id: binding.thread_id.clone(),
         workspace_id: binding.workspace_id.clone(),
@@ -6161,6 +6172,120 @@ impl CrudStore {
             turn_status: turn_status_from_db(&turn.status)
                 .context("unknown canonical Turn status")?,
         }))
+    }
+
+    /// Coherent provenance of an ordinary native terminal event. Unlike a
+    /// destructive Blocked observation, a Goal completion may already have
+    /// completed its segment while its owning attempt remains active.
+    pub async fn cli_runtime_terminal_event_source(
+        &self,
+        binding: &CliRuntimeTurnBindingRecord,
+        native_turn_id: &str,
+    ) -> Result<Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>> {
+        Ok(self
+            .cli_runtime_turn_terminal_guard(binding)
+            .await?
+            .as_ref()
+            .and_then(cli_runtime_event_guard_from_snapshot)
+            .filter(|source| {
+                source
+                    .segment
+                    .as_ref()
+                    .map(|(_, native, _)| native.as_str())
+                    .or(source.attempt_native_turn_id.as_deref())
+                    == Some(native_turn_id)
+            }))
+    }
+
+    pub async fn get_cli_runtime_native_event(
+        &self,
+        id: &str,
+    ) -> Result<Option<CliRuntimeNativeEventRecord>> {
+        cli_runtime_binding::find_native_event(&self.connection, id).await
+    }
+
+    /// Persist the accepted native outcome before waiting for transition
+    /// ownership. Payload preparation is outside capacity; the source CAS and
+    /// insert share this writer commit. First outcome of an execution wins.
+    pub async fn persist_cli_runtime_terminal_event(
+        &self,
+        event: NewCliRuntimeNativeEvent,
+        expected: &pioneer_protocol::CliRuntimeBlockedTurnGuard,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            event.runtime_id == expected.runtime_id
+                && event.runtime_kind == expected.runtime_kind
+                && event.turn_id.as_deref() == Some(expected.turn_id.as_str())
+                && event.thread_id.as_deref() == Some(expected.thread_id.as_str())
+                && event.workspace_id.as_deref() == Some(expected.workspace_id.as_str())
+                && event.native_thread_id.as_deref() == Some(expected.native_thread_id.as_str())
+                && event.native_turn_id.as_deref()
+                    == expected
+                        .segment
+                        .as_ref()
+                        .map(|(_, native, _)| native.as_str())
+                        .or(expected.attempt_native_turn_id.as_deref())
+                && event.native_method == "gateway/terminal_delivery",
+            "native terminal delivery does not match its selected source"
+        );
+        self.run_serialized_write(|| async {
+            let transaction = self.connection.begin().await?;
+            let Some(binding) =
+                cli_runtime_binding::find_turn_binding(&transaction, &expected.turn_id).await?
+            else {
+                transaction.rollback().await?;
+                return Ok(false);
+            };
+            let turn = turn::find_turn_by_thread_and_id(
+                &transaction,
+                &expected.thread_id,
+                &expected.turn_id,
+            )
+            .await?;
+            let attempt =
+                cli_runtime_binding::latest_turn_attempt(&transaction, &expected.turn_id).await?;
+            let segment = if let Some(attempt) = attempt.as_ref() {
+                cli_runtime_binding::latest_execution_segment_for_attempt(&transaction, &attempt.id)
+                    .await?
+            } else {
+                None
+            };
+            let execution_owner = turn_execution::find(&transaction, &expected.turn_id)
+                .await?
+                .map(|owner| (owner.owner_id, owner.owner_generation));
+            let actual = if let Some(turn) = turn {
+                Some(CliRuntimeTurnTerminalGuard {
+                    binding,
+                    attempt,
+                    segment,
+                    execution_owner,
+                    turn_status: turn_status_from_db(&turn.status)
+                        .context("unknown canonical Turn status")?,
+                })
+            } else {
+                None
+            };
+            let actual = actual
+                .as_ref()
+                .and_then(cli_runtime_event_guard_from_snapshot);
+            if !actual
+                .as_ref()
+                .is_some_and(|actual| actual.same_execution(expected))
+            {
+                transaction.rollback().await?;
+                return Ok(false);
+            }
+            if cli_runtime_binding::find_native_event(&transaction, &event.id)
+                .await?
+                .is_none()
+            {
+                cli_runtime_binding::append_native_event_if_absent(&transaction, event.clone())
+                    .await?;
+            }
+            transaction.commit().await?;
+            Ok(true)
+        })
+        .await
     }
 
     /// Capture the exact native owner selected by a Blocked runtime observation.

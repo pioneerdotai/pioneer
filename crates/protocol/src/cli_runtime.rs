@@ -1207,10 +1207,14 @@ mod tests {
     }
 }
 
-/// Source identity carried only in the existing durable lane for a reconciled
-/// Blocked observation. Not a client event or a persisted checkpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Internal source identity for the durable lane and saved native outcomes.
+/// This does not change client or canonical domain event payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CliRuntimeBlockedTurnGuard {
+    /// Existing native-journal outcome being delivered; None is a guarded
+    /// Blocked observation with the atomic attempt/canonical transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_delivery_id: Option<String>,
     pub turn_id: String,
     pub thread_id: String,
     pub workspace_id: String,
@@ -1231,4 +1235,26 @@ pub struct CliRuntimeBlockedTurnGuard {
     // (segment id, native turn id, status); latest segment must still be this one.
     pub segment: Option<(String, String, String)>,
     pub execution_owner: Option<(String, u64)>,
+}
+
+impl CliRuntimeBlockedTurnGuard {
+    /// Native event provenance survives legitimate activity/status/Goal changes
+    /// of this execution, but never a different attempt, segment or owner epoch.
+    pub fn same_execution(&self, other: &Self) -> bool {
+        self.turn_id == other.turn_id
+            && self.thread_id == other.thread_id
+            && self.workspace_id == other.workspace_id
+            && self.continuation_thread_id == other.continuation_thread_id
+            && self.runtime_id == other.runtime_id
+            && self.runtime_kind == other.runtime_kind
+            && self.native_thread_id == other.native_thread_id
+            && self.binding_native_turn_id == other.binding_native_turn_id
+            && self.attempt_id == other.attempt_id
+            && self.attempt_native_turn_id == other.attempt_native_turn_id
+            && self.recovery_job_id == other.recovery_job_id
+            && self.recovery_attempt_id == other.recovery_attempt_id
+            && self.segment.as_ref().map(|(id, native, _)| (id, native))
+                == other.segment.as_ref().map(|(id, native, _)| (id, native))
+            && self.execution_owner == other.execution_owner
+    }
 }
