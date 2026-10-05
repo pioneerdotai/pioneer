@@ -5426,6 +5426,90 @@ async fn compaction_terminal_fence_reconciliation_persists_once_and_rejects_late
 }
 
 #[tokio::test]
+async fn compaction_successful_apply_fences_prepared_lifecycle_timeout() {
+    use pioneer_entity::compaction_lifecycle_pending as pending;
+    use sea_orm::EntityTrait;
+    let store = store().await;
+    source(&store, "apply-race-source", 1, "original source").await;
+    let reference = store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    let op = admit_import_operation(&store, "apply-race", "thread", "turn").await;
+    let ready = ready_import_operation(&store, &op, "thread", &reference).await;
+    let candidate = pending::Entity::find_by_id(&op.id)
+        .one(&store.database_connection())
+        .await
+        .unwrap()
+        .unwrap();
+    let now = i64::try_from(op.admission.deadline_ms).unwrap();
+    let claim = store
+        .compaction_claim_lifecycle(&candidate, &|| now)
+        .await
+        .unwrap()
+        .unwrap();
+    let timeout = store
+        .compaction_prepare_lifecycle(&claim, now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!timeout.needs_publication());
+    // Interleave the real atomic apply after timeout preparation, before its
+    // writer admission. The old timeout must neither finish nor ACK this apply.
+    assert_eq!(
+        store
+            .compaction_apply_runner(&op.id, &ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    let after_apply = pending::Entity::find_by_id(&op.id)
+        .one(&store.database_connection())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !store
+            .compaction_repair_lifecycle(timeout, None, now / 1000)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .compaction_operation(&op.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "completed"
+    );
+    assert_eq!(
+        store.compaction_head(&op.owner).await.unwrap().as_deref(),
+        Some("checkpoint-apply-race")
+    );
+    assert_eq!(
+        pending::Entity::find_by_id(&op.id)
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap(),
+        after_apply
+    );
+    assert!(matches!(
+        store
+            .compaction_runner_state(&op.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        pioneer_compaction::runner::RunnerPhase::Applied { .. }
+    ));
+}
+
+#[tokio::test]
 async fn compaction_post_terminal_stop_survives_worker_loss_and_fences_new_admission() {
     let store = store().await;
     source(&store, "stop-source", 1, "original source").await;
@@ -5724,59 +5808,6 @@ async fn completed_cli_check_is_atomic_bounded_and_captures_settings_once() {
             .await
             .unwrap()
             .is_none()
-    );
-}
-
-#[tokio::test]
-async fn compaction_recovery_metadata_pages_do_not_starve_later_operations() {
-    let store = store().await;
-    let assertion = source(&store, "recovery-source", 1, "canonical source").await;
-    for index in 0..17 {
-        let id = format!("recovery-{index:02}");
-        candidate(&store, &id, None, &assertion).await;
-        store
-            .compaction_bind_execution_turn(&id, "turn")
-            .await
-            .unwrap();
-    }
-    assert!(
-        store
-            .compaction_lifecycle_recovery(11, "")
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let after_deadline = 10 + OPERATION_MILLIS;
-    let first = store
-        .compaction_lifecycle_recovery(after_deadline, "")
-        .await
-        .unwrap();
-    assert_eq!(first.len(), 16);
-    let last = first.last().unwrap().id.clone();
-    let second = store
-        .compaction_lifecycle_recovery(after_deadline, &last)
-        .await
-        .unwrap();
-    assert_eq!(second.len(), 1);
-    assert_eq!(second[0].id, "recovery-16");
-    assert!(
-        store
-            .compaction_lifecycle_recovery(after_deadline, &second[0].id)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    store
-        .compaction_stop_execution("ws", "thread", "owner", "turn")
-        .await
-        .unwrap();
-    assert!(
-        store
-            .compaction_lifecycle_recovery(11, "")
-            .await
-            .unwrap()
-            .iter()
-            .all(|row| row.cancelled)
     );
 }
 

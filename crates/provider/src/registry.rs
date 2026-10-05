@@ -267,6 +267,13 @@ impl AuthorityBoundProvider {
         if self.revoked.load(Ordering::Acquire) {
             return Err(ProviderAuthorityRevoked.into());
         }
+        // Check before catalog loading, budgeting and endpoint redaction so
+        // retirement remains a local, non-secret diagnostic in every operation.
+        if let Some(reason) = crate::definition::provider_definition(self.inner.name())
+            .and_then(|definition| definition.retirement_reason())
+        {
+            anyhow::bail!(reason);
+        }
         Ok(())
     }
 
@@ -856,6 +863,7 @@ impl ProviderRegistry {
         digest.update(proxy_url.unwrap_or("<direct>").as_bytes());
         digest.update([0]);
         digest.update(base_url.unwrap_or("<default>").as_bytes());
+        crate::factory::hash_connection_environment(&mut digest, provider_name);
         ProviderAuthorityFingerprint(hex::encode(digest.finalize()))
     }
 
@@ -1148,10 +1156,135 @@ mod tests {
     }
 
     #[test]
+    fn glm_profiles_and_aliases_keep_native_file_tools_after_factory_and_registry() {
+        let registry = ProviderRegistry::new(|_| "dummy-key".to_owned());
+        for alias in [
+            "glm",
+            "zhipu",
+            "bigmodel",
+            "glm-cn",
+            "zhipu-cn",
+            "zai",
+            "glm-global",
+            "zhipu-global",
+            "z.ai",
+            "z-ai",
+            "glm-coding",
+            "glm-coding-cn",
+            "zhipu-coding",
+            "zai-coding-cn",
+            "zai-coding",
+            "glm-coding-global",
+            "zai-coding-plan",
+        ] {
+            let canonical = crate::definition::provider_definition(alias).unwrap().name;
+            let direct = crate::factory::create_provider(alias, "dummy-key").unwrap();
+            let scoped = registry
+                .get_or_create_for_workspace("fixture", alias)
+                .unwrap();
+            for provider in [direct.as_ref(), scoped.as_ref()] {
+                assert_eq!(provider.name(), canonical, "{alias}");
+                assert!(provider.capabilities().tool_calling, "{alias}");
+                let capability = provider.native_file_tool_capability("glm-5.2");
+                assert_eq!(capability.provider, canonical, "{alias}");
+                assert_eq!(capability.model, "glm-5.2");
+                assert_eq!(
+                    capability.patch_shape,
+                    crate::NativePatchWireShape::JsonFunction
+                );
+                assert!(capability.read_file && capability.apply_patch, "{alias}");
+                assert!(capability.is_supported());
+                let schema = crate::apply_patch_tool_schema(capability.patch_shape);
+                assert_eq!(schema["type"], "object");
+                assert_eq!(schema["required"], serde_json::json!(["patch"]));
+                assert_eq!(schema["properties"]["patch"]["type"], "string");
+                assert_eq!(schema["additionalProperties"], false);
+                for missing in ["", " ", "unknown", "unsupported"] {
+                    let unavailable = provider.native_file_tool_capability(missing);
+                    assert_eq!(unavailable.provider, canonical);
+                    assert_eq!(
+                        unavailable.patch_shape,
+                        crate::NativePatchWireShape::Unavailable
+                    );
+                    assert!(!unavailable.read_file && !unavailable.apply_patch);
+                }
+            }
+            assert!(scoped.authority_fingerprint().is_some());
+        }
+        assert!(crate::factory::create_provider("unknown-glm-profile", "dummy-key").is_err());
+        let unknown = crate::select_native_file_tool_capability("unknown-glm-profile", "glm-5.2");
+        assert!(!unknown.read_file && !unknown.apply_patch);
+    }
+
+    #[test]
+    fn glm_global_and_coding_profiles_resolve_separate_credential_authorities() {
+        let names = Arc::new(Mutex::new(Vec::new()));
+        let captured = names.clone();
+        let registry = ProviderRegistry::new_scoped(move |_, provider| {
+            captured.lock().unwrap().push(provider.to_owned());
+            format!("dummy-{provider}-key")
+        });
+        let cn = registry
+            .get_or_create_for_workspace("fixture", "bigmodel")
+            .unwrap();
+        let global = registry
+            .get_or_create_for_workspace("fixture", "glm-global")
+            .unwrap();
+        let cn_coding = registry
+            .get_or_create_for_workspace("fixture", "zai-coding-cn")
+            .unwrap();
+        let global_coding = registry
+            .get_or_create_for_workspace("fixture", "zai-coding-plan")
+            .unwrap();
+        assert_eq!(
+            *names.lock().unwrap(),
+            ["glm", "zai", "glm-coding", "zai-coding"]
+        );
+        for (provider, name) in [
+            (cn, "glm"),
+            (global, "zai"),
+            (cn_coding, "glm-coding"),
+            (global_coding, "zai-coding"),
+        ] {
+            assert_eq!(provider.name(), name);
+        }
+    }
+
+    #[test]
     fn get_or_create_unknown_provider_errors() {
         let registry = ProviderRegistry::new(|_| String::new());
         let result = registry.get_or_create("nonexistent_provider_xyz");
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn retired_profiles_never_discover_warmup_or_chat_even_with_override() {
+        let registry = ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+            |_, _| Ok("dummy-key".to_owned()),
+            |_, _| Ok(None),
+            |_, _| Ok(Some("https://example.test/retired/v1".to_owned())),
+            ProviderTimeoutPolicy::default(),
+        );
+        for alias in ["yi", "01ai", "lingyiwanwu", "hyperbolic"] {
+            let provider = registry
+                .get_or_create_for_workspace("fixture-workspace", alias)
+                .unwrap();
+            assert!(!provider.capabilities().streaming);
+            for error in [
+                provider.list_models().await.unwrap_err(),
+                provider.warmup().await.unwrap_err(),
+                provider.chat(chat_request()).await.unwrap_err(),
+            ] {
+                assert!(error.to_string().contains("retired"));
+                assert!(!error.to_string().contains("example.test"));
+                assert!(!error.to_string().contains("dummy-key"));
+            }
+            let error = match provider.stream_chat(chat_request()).await {
+                Err(error) => error,
+                Ok(_) => panic!("retired stream must fail"),
+            };
+            assert!(error.to_string().contains("retired"));
+        }
     }
 
     #[test]

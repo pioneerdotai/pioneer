@@ -110,6 +110,7 @@ pub fn select_native_file_tool_capability(provider: &str, model: &str) -> Native
         "friendli",
         "friendliai",
         "glm",
+        "glm-coding",
         "glm-cn",
         "glm-global",
         "google",
@@ -154,6 +155,10 @@ pub fn select_native_file_tool_capability(provider: &str, model: &str) -> Native
         "volcengine",
         "xai",
         "yi",
+        // Region/product routing changes identity, not GLM's JSON function
+        // contract. Subscription entitlement is a separate vendor condition.
+        "zai",
+        "zai-coding",
         "zhipu",
         "zhipu-cn",
         "zhipu-global",
