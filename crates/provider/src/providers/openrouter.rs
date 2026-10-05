@@ -11,7 +11,7 @@ use crate::{
         ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, InputContentType,
         InputTypeSupport, ProviderCapabilities, ProviderInputCapabilities, ProviderReplayState,
         ProviderTermination, ProviderTimeoutPolicy, ReasoningConfig, ReasoningEffort, Role,
-        StreamChunk, ToolChoice, ToolDefinition,
+        StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
