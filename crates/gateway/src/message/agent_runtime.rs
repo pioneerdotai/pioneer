@@ -2400,7 +2400,7 @@ impl MessageProcessor {
         {
             return;
         }
-        let this = self.scoped_with_database_class(SqliteWriteClass::Critical);
+        let this = self.scoped_for_background_reconciliation();
         tokio::spawn(async move {
             struct KickGuard(Arc<AtomicBool>);
 
@@ -2446,7 +2446,7 @@ impl MessageProcessor {
         {
             return;
         }
-        let this = self.scoped_with_database_class(SqliteWriteClass::Critical);
+        let this = self.scoped_for_background_reconciliation();
         tokio::spawn(async move {
             loop {
                 this.native_terminal_effect_kick_pending

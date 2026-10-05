@@ -1749,3 +1749,7 @@ reason_updated = "スキルを 1 件更新しました。"
 reason_rolled_back = "スキルを以前のバージョンに戻しました。"
 reason_cancelled = "実行がキャンセルされました。"
 reason_unknown = "処理が正常に完了しませんでした。Gateway のログを確認してください。"
+
+[mcp.oauth]
+callback_received = "応答を受け付けました。Pioneerでログイン結果を確認してください。"
+callback_rejected = "ログインを受け付けられませんでした。Pioneerに戻って再試行してください。"

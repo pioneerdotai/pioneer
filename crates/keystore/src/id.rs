@@ -7,6 +7,7 @@ pub const PROVIDER_PROXY_SERVICE: &str = "pioneer.gateway.provider_proxy";
 pub const PROVIDER_BASE_URL_SERVICE: &str = "pioneer.gateway.provider_base_url";
 pub const CLI_RUNTIME_PROXY_SERVICE: &str = "pioneer.gateway.cli_runtime_proxy";
 pub const MODEL_CATALOG_PROXY_SERVICE: &str = "pioneer.gateway.model_catalog_proxy";
+pub const MCP_OAUTH_SERVICE: &str = "pioneer.gateway.mcp_oauth";
 pub const MCP_SECRET_SERVICE: &str = "pioneer.gateway.mcp_secret";
 pub const USER_JWT_TOKEN_SERVICE: &str = "pioneer.gateway.user_jwt_token";
 pub const GATEWAY_ACCESS_JWT_SIGNING_KEY_SERVICE: &str = "pioneer.gateway.access_jwt_signing_key";
@@ -92,6 +93,13 @@ impl SecretId {
         }
     }
 
+    pub fn mcp_oauth(connection_id: &str) -> Result<Self> {
+        Self::from_service_user(
+            MCP_OAUTH_SERVICE,
+            validate_user("OAuth connection", connection_id)?,
+        )
+    }
+
     pub fn mcp_secret(ref_id: &str) -> Result<Self> {
         let ref_id = validate_user("mcp ref_id", ref_id)?;
         Self::from_service_user(MCP_SECRET_SERVICE, ref_id)
@@ -134,6 +142,7 @@ pub enum SecretKind {
     CliRuntimeProxy,
     ModelCatalogProxy,
     McpSecret,
+    McpOAuth,
     UserJwtToken,
     GatewayAccessJwtSigningKey,
     GatewayAuthCredentialHmacKey,
@@ -149,6 +158,7 @@ impl SecretKind {
             SecretKind::ProviderBaseUrl => PROVIDER_BASE_URL_SERVICE,
             SecretKind::CliRuntimeProxy => CLI_RUNTIME_PROXY_SERVICE,
             SecretKind::ModelCatalogProxy => MODEL_CATALOG_PROXY_SERVICE,
+            SecretKind::McpOAuth => MCP_OAUTH_SERVICE,
             SecretKind::McpSecret => MCP_SECRET_SERVICE,
             SecretKind::UserJwtToken => USER_JWT_TOKEN_SERVICE,
             SecretKind::GatewayAccessJwtSigningKey => GATEWAY_ACCESS_JWT_SIGNING_KEY_SERVICE,
@@ -165,6 +175,7 @@ impl SecretKind {
             PROVIDER_BASE_URL_SERVICE => Some(SecretKind::ProviderBaseUrl),
             CLI_RUNTIME_PROXY_SERVICE => Some(SecretKind::CliRuntimeProxy),
             MODEL_CATALOG_PROXY_SERVICE => Some(SecretKind::ModelCatalogProxy),
+            MCP_OAUTH_SERVICE => Some(SecretKind::McpOAuth),
             MCP_SECRET_SERVICE => Some(SecretKind::McpSecret),
             USER_JWT_TOKEN_SERVICE => Some(SecretKind::UserJwtToken),
             GATEWAY_ACCESS_JWT_SIGNING_KEY_SERVICE => Some(SecretKind::GatewayAccessJwtSigningKey),

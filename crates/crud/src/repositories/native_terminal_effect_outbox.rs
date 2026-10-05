@@ -76,6 +76,9 @@ struct PreparedNativeTerminalEffectActivationRow {
     thread_id: String,
     effect_kind: String,
     gate_kind: String,
+    // Terminal repair preparation decoded these exact bytes. Hash columns
+    // and updated_at alone cannot fence a same-timestamp physical SQL edit.
+    expected_payload_json: String,
     payload_sha256: String,
     payload_identity_sha256: String,
     updated_at: DateTimeWithTimeZone,
@@ -730,6 +733,7 @@ pub(crate) async fn prepare_activation_for_terminal<C: ConnectionTrait>(
             thread_id: row.thread_id,
             effect_kind: row.effect_kind,
             gate_kind: row.gate_kind,
+            expected_payload_json: row.payload_json,
             payload_sha256: row.payload_sha256,
             payload_identity_sha256: row.payload_identity_sha256,
             updated_at: row.updated_at,
@@ -847,6 +851,9 @@ pub(crate) async fn activate_prepared_for_terminal<C: ConnectionTrait>(
             .filter(native_terminal_effect_outbox::Column::ThreadId.eq(row.thread_id))
             .filter(native_terminal_effect_outbox::Column::EffectKind.eq(row.effect_kind))
             .filter(native_terminal_effect_outbox::Column::GateKind.eq(row.gate_kind))
+            .filter(
+                native_terminal_effect_outbox::Column::PayloadJson.eq(row.expected_payload_json),
+            )
             .filter(native_terminal_effect_outbox::Column::PayloadSha256.eq(row.payload_sha256))
             .filter(
                 native_terminal_effect_outbox::Column::PayloadIdentitySha256

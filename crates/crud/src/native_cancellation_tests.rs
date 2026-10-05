@@ -1162,6 +1162,27 @@ async fn native_cancellation_owner_change_and_health_restore_cannot_clear_fence(
     );
 }
 
+// Isolate the cancellation migration's up/down boundary while keeping the
+// full registered schema. Later unrelated migrations must not become the
+// target of these guards merely because they were appended to the registry.
+// This ordering is fixture-only; the production migrator keeps chronological order.
+struct CancellationFixtureMigrator;
+
+impl MigratorTrait for CancellationFixtureMigrator {
+    fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+        let mut migrations = Migrator::migrations();
+        let index = migrations
+            .iter()
+            .position(|migration| {
+                migration.name() == "m20261001_000001_native_cancellation_context"
+            })
+            .expect("native cancellation migration must remain registered");
+        let cancellation = migrations.remove(index);
+        migrations.push(cancellation);
+        migrations
+    }
+}
+
 // Use the scoped writer transaction's SeaORM executor without exposing a pool.
 // Both successful migration writes and failed down guards release the reservation
 // before the caller inspects durable state.
@@ -1172,9 +1193,9 @@ async fn migrate_fixture(
 ) -> std::result::Result<(), sea_orm::DbErr> {
     let transaction = db.begin().await?;
     let result = if down {
-        Migrator::down(&*transaction, steps).await
+        CancellationFixtureMigrator::down(&*transaction, steps).await
     } else {
-        Migrator::up(&*transaction, steps).await
+        CancellationFixtureMigrator::up(&*transaction, steps).await
     };
     match result {
         Ok(()) => transaction.commit().await,
@@ -1197,9 +1218,13 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
         );
         // Apply the pre-change schema, optionally install the real logical view,
         // then traverse the new migration. No migration runs in this work session.
-        migrate_fixture(&db, Some((Migrator::migrations().len() - 1) as u32), false)
-            .await
-            .unwrap();
+        migrate_fixture(
+            &db,
+            Some((CancellationFixtureMigrator::migrations().len() - 1) as u32),
+            false,
+        )
+        .await
+        .unwrap();
         let transaction = db.begin().await.unwrap();
         assert!(
             SchemaManager::new(&*transaction)

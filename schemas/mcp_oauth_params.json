@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "McpOAuthParams",
+  "description": "Shell loopback preparation is complete before this request is sent.",
+  "type": "object",
+  "properties": {
+    "action": {
+      "$ref": "#/$defs/McpOAuthAction"
+    },
+    "name": {
+      "type": "string"
+    },
+    "scope_kind": {
+      "$ref": "#/$defs/McpScopeKind",
+      "default": "workspace"
+    },
+    "server_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "server_id",
+    "name",
+    "action"
+  ],
+  "$defs": {
+    "McpOAuthAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "sign_in"
+            },
+            "redirect_uri": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "redirect_uri"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "disconnect"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "flow_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "cancel"
+            }
+          },
+          "required": [
+            "kind",
+            "flow_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "flow_id": {
+              "type": "string"
+            },
+            "issuer": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "callback"
+            },
+            "state": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "flow_id",
+            "state"
+          ]
+        }
+      ]
+    },
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    }
+  }
+}
