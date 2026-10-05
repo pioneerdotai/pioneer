@@ -10,3 +10,6 @@ pioneer-client.workspace = true
 rust-i18n.workspace = true
 pioneer-desktop-foundation.workspace = true
 tokio.workspace = true
+pioneer-protocol.workspace = true
+pioneer-desktop-mcp.workspace = true
+pioneer-desktop-skills.workspace = true

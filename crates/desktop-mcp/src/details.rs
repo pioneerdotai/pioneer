@@ -88,6 +88,25 @@ impl McpCatalogView {
                             h_flex()
                                 .items_center()
                                 .gap_2()
+                                .when(self.plugin_component.is_some(), |row| {
+                                    row.child(
+                                        Button::new(self.ui_id(&server.id, "configuration"))
+                                            .outline()
+                                            .xsmall()
+                                            .label(t!("mcp.details.configure").to_string())
+                                            .disabled(is_pending)
+                                            .on_click({
+                                                let entity = desktop_entity.clone();
+                                                move |_, window, cx| {
+                                                    let _ = entity.update(cx, |view, cx| {
+                                                        view.open_mcp_config_dialog(
+                                                            None, window, cx,
+                                                        )
+                                                    });
+                                                }
+                                            }),
+                                    )
+                                })
                                 .child(
                                     Button::new(self.ui_id(&server.id, "enabled"))
                                         .xsmall()

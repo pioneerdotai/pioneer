@@ -2,10 +2,12 @@
 #[macro_use]
 extern crate rust_i18n;
 rust_i18n::i18n!("locales", fallback = "en");
+mod management;
 mod picker;
 use gpui_kit::component::{button::*, scroll::ScrollableElement, theme::ActiveTheme, *};
 use gpui_kit::{prelude::*, *};
 pub use picker::open_plugin_picker;
+use pioneer_client::plugins::PluginManagementState;
 use pioneer_client::{
     core::ClientCore,
     plugins::PluginCatalogState,
@@ -16,6 +18,10 @@ use pioneer_client::{
 };
 use pioneer_desktop_foundation::{
     ClientBindingRegistrar, ClientBindingRegistration, ClientPublicationSink,
+};
+use pioneer_protocol::{
+    PluginComponentItem, PluginComponentKey, PluginItem, PluginsSetEnabledParams,
+    PluginsUpdatePreviewResponse,
 };
 use std::sync::Arc;
 struct UploadChanges(tokio::sync::watch::Sender<u64>);
@@ -30,7 +36,9 @@ pub(crate) fn status_label(status: &str) -> String {
         "installed" => t!("plugins.installed"),
         "partial" => t!("plugins.partial"),
         "installing" | "starting" => t!("plugins.installing"),
-        "interrupted" | "updating" | "removing" => t!("plugins.interrupted"),
+        "interrupted" => t!("plugins.interrupted"),
+        "updating" => t!("plugins.updating"),
+        "removing" => t!("plugins.removing"),
         "failed" => t!("plugins.failed"),
         "disabled" => t!("plugins.disabled"),
         "authrequired" | "auth_required" => t!("plugins.auth_required"),
@@ -38,6 +46,19 @@ pub(crate) fn status_label(status: &str) -> String {
         "notstarted" | "not_started" => t!("plugins.pending"),
         "error" | "stopped" | "offline" => t!("plugins.offline"),
         _ => t!("plugins.unavailable"),
+    }
+    .to_string()
+}
+
+fn diagnostic_label(code: &str) -> String {
+    match code {
+        "component_path_denied" => t!("plugins.path_denied"),
+        "component_install_failed" => t!("plugins.component_failed"),
+        "fresh_package_required" => t!("plugins.fresh_package_required"),
+        "reapply_native_change" => t!("plugins.reapply_native_change"),
+        "operation_interrupted" => t!("plugins.repair_notice"),
+        "components_unavailable" => t!("plugins.components_unavailable"),
+        _ => t!("plugins.package_attention"),
     }
     .to_string()
 }
@@ -58,6 +79,13 @@ pub struct PluginsView {
     upload: Option<SkillUploadOperation>,
     upload_task: Option<Task<()>>,
     install_failed: bool,
+    management: PluginManagementState,
+    mutation: Option<Task<()>>,
+    update_target: Option<(String, i64)>,
+    update_preview: Option<(String, PluginsUpdatePreviewResponse)>,
+    remove_confirmation: bool,
+    purge_data: bool,
+    child_details: Option<management::ChildDetails>,
 }
 impl PluginsView {
     pub fn new(
@@ -97,6 +125,13 @@ impl PluginsView {
                 upload: None,
                 upload_task: None,
                 install_failed: false,
+                management: Default::default(),
+                mutation: None,
+                update_target: None,
+                update_preview: None,
+                remove_confirmation: false,
+                purge_data: false,
+                child_details: None,
             }
         })
     }
@@ -105,6 +140,13 @@ impl PluginsView {
         let changed = self.workspace != workspace || self.connection != connection;
         let opening = active && !self.active;
         if changed {
+            self.mutation = None;
+            self.management = Default::default();
+            self.update_target = None;
+            self.update_preview = None;
+            self.remove_confirmation = false;
+            self.purge_data = false;
+            self.child_details = None;
             self.request = None;
             self.source_picker = None;
             self.upload_task = None;
@@ -143,7 +185,10 @@ impl PluginsView {
                     return;
                 }
                 match result {
-                    Ok(response) => view.catalog.accept(response),
+                    Ok(response) => {
+                        view.catalog.accept(response);
+                        view.management.refreshed();
+                    }
                     Err(_) => view.catalog.fail(),
                 }
                 if view
@@ -187,7 +232,15 @@ impl PluginsView {
                 };
                 match view.client.start_skill_upload(
                     workspace,
-                    SkillUploadTarget::PluginInstall,
+                    view.update_target
+                        .as_ref()
+                        .map(|(plugin_id, expected_revision)| {
+                            SkillUploadTarget::PluginUpdatePreview {
+                                plugin_id: plugin_id.clone(),
+                                expected_revision: *expected_revision,
+                            }
+                        })
+                        .unwrap_or(SkillUploadTarget::PluginInstall),
                     path,
                 ) {
                     Ok(operation) => {
@@ -231,6 +284,9 @@ impl PluginsView {
                         && done
                     {
                         view.install_failed = publication.state == SkillUploadState::Failed;
+                        if let Some(preview) = &publication.plugin_update_preview {
+                            view.update_preview = Some(preview.clone());
+                        }
                         if let Some(item) = &publication.plugin_result {
                             view.selected = Some(item.id.clone());
                         }
@@ -260,8 +316,25 @@ impl PluginsView {
     }
 }
 impl Render for PluginsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let busy = self.upload_active();
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(child) = self.child_details.clone() {
+            return v_flex()
+                .size_full()
+                .min_h_0()
+                .child(
+                    Button::new("plugin-component-back")
+                        .ghost()
+                        .label(t!("plugins.back_to_plugin").to_string())
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.child_details = None;
+                            view.refresh(cx);
+                            cx.notify();
+                        })),
+                )
+                .child(child.element())
+                .into_any_element();
+        }
+        let busy = self.upload_active() || self.management.busy || self.management.refresh_required;
         let manage = self
             .workspace
             .as_deref()
@@ -302,16 +375,22 @@ impl Render for PluginsView {
                                 .outline()
                                 .label(t!("plugins.add_folder").to_string())
                                 .disabled(busy)
-                                .on_click(cx.listener(|view, _, _, cx| view.pick_source(true, cx))),
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.update_target = None;
+                                    view.update_preview = None;
+                                    view.pick_source(true, cx);
+                                })),
                         )
                         .child(
                             Button::new("plugins-archive")
                                 .outline()
                                 .label(t!("plugins.add_archive").to_string())
                                 .disabled(busy)
-                                .on_click(
-                                    cx.listener(|view, _, _, cx| view.pick_source(false, cx)),
-                                ),
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.update_target = None;
+                                    view.update_preview = None;
+                                    view.pick_source(false, cx);
+                                })),
                         )
                     }),
             )
@@ -340,6 +419,13 @@ impl Render for PluginsView {
                         .child(t!("plugins.install_error").to_string()),
                 )
             })
+            .when(self.management.failed, |view| {
+                view.child(
+                    div()
+                        .text_color(cx.theme().danger)
+                        .child(t!("plugins.change_failed").to_string()),
+                )
+            })
             .child(
                 v_flex()
                     .flex_1()
@@ -364,11 +450,16 @@ impl Render for PluginsView {
                                 .label(t!("plugins.back").to_string())
                                 .on_click(cx.listener(|view, _, _, cx| {
                                     view.selected = None;
+                                    view.update_target = None;
+                                    view.update_preview = None;
+                                    view.remove_confirmation = false;
+                                    view.purge_data = false;
                                     cx.notify();
                                 })),
                         )
                         .child(div().text_lg().font_semibold().child(plugin.name.clone()))
                         .child(status_label(&plugin.status))
+                        .child(self.management_controls(&plugin, manage, busy, window, cx))
                         .child(
                             div()
                                 .text_sm()
@@ -388,6 +479,17 @@ impl Render for PluginsView {
                                 .border_color(cx.theme().border)
                                 .child(div().flex_1().child(component.member_key.clone()))
                                 .child(status_label(&component.status))
+                                .when_some(component.diagnostic.as_deref(), |row, code| {
+                                    row.child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(diagnostic_label(code)),
+                                    )
+                                })
+                                .child(
+                                    self.component_controls(&plugin, component, manage, busy, cx),
+                                )
                                 .when_some(component.runtime_status.clone(), |row, status| {
                                     row.child(status_label(&status))
                                 })
@@ -403,10 +505,11 @@ impl Render for PluginsView {
                                 div()
                                     .text_sm()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(
-                                        t!("plugins.diagnostic", path = d.path.as_str())
-                                            .to_string(),
-                                    )
+                                    .child(if d.path.is_empty() {
+                                        diagnostic_label(&d.code)
+                                    } else {
+                                        format!("{} ({})", diagnostic_label(&d.code), d.path)
+                                    })
                             }))
                         })
                     })
@@ -432,5 +535,6 @@ impl Render for PluginsView {
                         }))
                     }),
             )
+            .into_any_element()
     }
 }
