@@ -1010,11 +1010,34 @@ fn commit_staged_skill(
     Ok(result)
 }
 
+#[derive(Debug)]
+pub struct StagedSkillFolder {
+    pub source_dir: PathBuf,
+    pub cleanup_root: PathBuf,
+}
+
 fn stage_source(request: &InstallSkillRequest) -> Result<PathBuf> {
-    let source_root = fs::canonicalize(request.source_path.as_path()).with_context(|| {
+    stage_skill_folder(
+        &request.source_path,
+        &request.install_root,
+        &request.policy,
+        false,
+    )
+    .map(|staged| staged.source_dir)
+}
+
+/// The native folder staging operation, also used by host-managed package
+/// members before the same prepare/security/commit path. Never moves the source.
+pub fn stage_skill_folder(
+    source_path: &Path,
+    install_root: &Path,
+    policy: &SkillInstallerPolicy,
+    preserve_directory_modes: bool,
+) -> Result<StagedSkillFolder> {
+    let source_root = fs::canonicalize(source_path).with_context(|| {
         format!(
             "failed to canonicalize source path `{}`",
-            request.source_path.display()
+            source_path.display()
         )
     })?;
     if !source_root.is_dir() {
@@ -1024,7 +1047,7 @@ fn stage_source(request: &InstallSkillRequest) -> Result<PathBuf> {
         );
     }
 
-    let staging_root = request.install_root.join(".staging");
+    let staging_root = install_root.join(".staging");
     fs::create_dir_all(staging_root.as_path())
         .with_context(|| format!("failed to create staging root `{}`", staging_root.display()))?;
     let staging_session_dir = staging_root.join(unique_suffix());
@@ -1047,14 +1070,31 @@ fn stage_source(request: &InstallSkillRequest) -> Result<PathBuf> {
         )
     })?;
 
-    copy_tree_secure(
+    if let Err(error) = copy_tree_secure(
         source_root.as_path(),
         staged_skill_dir.as_path(),
-        request.policy.security.max_install_file_bytes.max(1),
-        request.policy.security.max_install_archive_bytes.max(1),
-    )?;
+        policy.security.max_install_file_bytes.max(1),
+        policy.security.max_install_archive_bytes.max(1),
+        preserve_directory_modes,
+    ) {
+        let _ = fs::remove_dir_all(&staging_session_dir);
+        return Err(error);
+    }
 
-    Ok(staged_skill_dir)
+    let root_mode_result = if preserve_directory_modes {
+        fs::metadata(&source_root)
+            .and_then(|metadata| fs::set_permissions(&staged_skill_dir, metadata.permissions()))
+    } else {
+        Ok(())
+    };
+    if let Err(error) = root_mode_result {
+        let _ = fs::remove_dir_all(&staging_session_dir);
+        return Err(error.into());
+    }
+    Ok(StagedSkillFolder {
+        source_dir: staged_skill_dir,
+        cleanup_root: staging_session_dir,
+    })
 }
 
 fn copy_tree_secure(
@@ -1062,10 +1102,12 @@ fn copy_tree_secure(
     target_root: &Path,
     max_file_bytes: usize,
     max_total_bytes: usize,
+    preserve_directory_modes: bool,
 ) -> Result<()> {
     let mut queue = VecDeque::new();
     queue.push_back(PathBuf::new());
     let mut total_copied = 0usize;
+    let mut directory_modes = Vec::new();
 
     while let Some(relative) = queue.pop_front() {
         let source_dir = source_root.join(relative.as_path());
@@ -1097,6 +1139,9 @@ fn copy_tree_secure(
                         target_path.display()
                     )
                 })?;
+                if preserve_directory_modes {
+                    directory_modes.push((target_path, metadata.permissions()));
+                }
                 queue.push_back(rel_path);
                 continue;
             }
@@ -1136,6 +1181,11 @@ fn copy_tree_secure(
         }
     }
 
+    // Apply modes after copy so read-only source directories do not prevent
+    // copying their contents. Legacy standalone staging retains its old modes.
+    for (path, mode) in directory_modes.into_iter().rev() {
+        fs::set_permissions(path, mode)?;
+    }
     Ok(())
 }
 
@@ -1203,6 +1253,92 @@ mod tests {
     use pioneer_protocol::SkillId;
     use std::fs;
     use std::path::PathBuf;
+
+    // Stage A coverage. NOT_RUN; no test compilation has been authorized.
+    #[test]
+    fn package_folder_staging_and_assets_only_commit_preserve_source_and_identity() {
+        let root = temp_case("package-assets-only");
+        let source = root.join("source");
+        write_skill(&source, "Asset Skill", "assets update");
+        fs::create_dir_all(source.join("assets")).unwrap();
+        fs::write(source.join("assets/data"), "before").unwrap();
+        let skill_id = SkillId::new("A".repeat(21)).unwrap();
+        let install_root = root.join("installed");
+        let lock_path = install_root.join("skills-lock.toml");
+        let installed = super::install_skill(super::InstallSkillRequest {
+            skill_id: skill_id.clone(),
+            source_kind: SkillSourceKind::User,
+            source_ref: "original".into(),
+            source_path: source.clone(),
+            install_root: install_root.clone(),
+            lock_path: lock_path.clone(),
+            now_unix: 1,
+            policy: Default::default(),
+        })
+        .unwrap();
+        fs::write(source.join("assets/data"), "after").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                source.join("assets/data"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let staged =
+            super::stage_skill_folder(&source, &install_root, &Default::default(), true).unwrap();
+        let prepared = super::prepare_materialized_skill(super::PrepareMaterializedSkillRequest {
+            skill_id: skill_id.clone(),
+            source_kind: SkillSourceKind::User,
+            source_ref: "plugin:parent:member".into(),
+            materialized_source_path: staged.source_dir,
+            policy: Default::default(),
+        })
+        .unwrap();
+        assert_eq!(
+            prepared.definition.identity.fingerprint,
+            installed.definition.identity.fingerprint
+        );
+        let updated = super::commit_prepared_skill(super::CommitPreparedSkillRequest {
+            operation: super::InstallOperation::Update,
+            prepared,
+            install_root,
+            lock_path,
+            previous: Some(super::PreviousSkillInstallation {
+                managed_install_path: Some(installed.install_path),
+                fingerprint: installed.definition.identity.fingerprint,
+            }),
+            expected_previous_fingerprint: None,
+            now_unix: 2,
+            policy: Default::default(),
+        })
+        .unwrap();
+        assert_eq!(updated.definition.identity.skill_id, skill_id);
+        assert_eq!(
+            fs::read_to_string(updated.install_path.join("assets/data")).unwrap(),
+            "after"
+        );
+        assert!(source.join("SKILL.md").is_file());
+        assert_eq!(
+            fs::read_to_string(source.join("assets/data")).unwrap(),
+            "after"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(updated.install_path.join("assets/data"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+        }
+        super::finalize_prepared_skill_commit(&updated);
+        let _ = fs::remove_dir_all(root);
+    }
 
     fn temp_case(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()

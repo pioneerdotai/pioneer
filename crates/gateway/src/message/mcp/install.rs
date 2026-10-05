@@ -72,11 +72,77 @@ impl MessageProcessor {
             }
         };
 
+        match self
+            .install_mcp_plan(
+                request_context,
+                request_id.clone(),
+                &workspace_id,
+                plan,
+                None,
+                params.oauth_redirect_uri.as_deref(),
+                params.oauth_callback_unavailable,
+            )
+            .await
+        {
+            Ok(payload) => match JsonRpcResponse::from_result(request_id, &payload) {
+                Ok(response) => {
+                    if let Err(error) = self.send_json(connection_id, &response).await {
+                        warn!(connection_id, error = %error, "failed to send mcp/install response");
+                    }
+                }
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        mcp_error(
+                            None,
+                            INVALID_REQUEST_CODE,
+                            MCP_ERROR_INTERNAL,
+                            "failed to encode mcp/install response",
+                            json!({"error": format!("{error:#}")}),
+                        ),
+                    )
+                    .await
+                }
+            },
+            Err(error) => self.send_error(connection_id, error).await,
+        }
+    }
+
+    /// The genuine native installer, shared by the legacy parser and portable
+    /// package adapter. Ownership is committed with the native row and audit.
+    pub(crate) async fn install_mcp_plan(
+        &self,
+        request_context: &RequestContext,
+        request_id: RequestId,
+        workspace_id: &str,
+        plan: pioneer_mcp::McpInstallPlan,
+        ownership: Option<&pioneer_crud::PluginOwnershipWrite>,
+        oauth_redirect_uri: Option<&str>,
+        oauth_callback_unavailable: bool,
+    ) -> std::result::Result<McpInstallResponse, JsonRpcErrorResponse> {
+        let connection_id = request_context.connection_id();
+        let workspace_id = self
+            .validate_mcp_workspace(
+                connection_id,
+                request_id.clone(),
+                workspace_id.to_owned(),
+                methods::MCP_INSTALL,
+            )
+            .await?;
         let now = now_timestamp_secs();
         let mut response_items = Vec::new();
         let mut changed = Vec::new();
         let mut events_written = 0usize;
 
+        if ownership.is_some() && plan.items.len() != 1 {
+            return Err(mcp_error(
+                Some(request_id),
+                INVALID_PARAMS_CODE,
+                MCP_ERROR_INVALID_REQUEST,
+                "owned MCP install must contain exactly one server",
+                json!({}),
+            ));
+        }
         for item in plan.items {
             let diagnostics = item
                 .diagnostics
@@ -113,38 +179,83 @@ impl MessageProcessor {
             {
                 Ok(existing) => existing,
                 Err(error) => {
-                    self.send_error(
-                        connection_id,
-                        mcp_error(
-                            Some(request_id.clone()),
-                            INVALID_REQUEST_CODE,
-                            MCP_ERROR_INTERNAL,
-                            "failed to query existing MCP server installation",
-                            json!({"error": format!("{error:#}")}),
-                        ),
-                    )
-                    .await;
-                    return;
+                    return Err(mcp_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        MCP_ERROR_INTERNAL,
+                        "failed to query existing MCP server installation",
+                        json!({"error": format!("{error:#}")}),
+                    ));
                 }
             };
 
+            if let Some(owner) = ownership {
+                if installation.scope_kind != McpScopeKind::Workspace
+                    || installation.scope_key != workspace_id
+                    || installation.name
+                        != super::portable::internal_mcp_name(&owner.plugin_id, &owner.member_key)
+                    || existing
+                        .as_ref()
+                        .is_some_and(|row| row.id.as_deref() != Some(owner.child_id.as_str()))
+                {
+                    return Err(mcp_error(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        MCP_ERROR_INVALID_REQUEST,
+                        "plugin MCP identity or scope conflict",
+                        json!({}),
+                    ));
+                }
+                if let Some(row) = &existing {
+                    let linked = self
+                        .crud_store
+                        .find_mcp_plugin_owner(row.id.as_deref().unwrap_or(""))
+                        .await
+                        .map_err(|_| {
+                            mcp_error(
+                                Some(request_id.clone()),
+                                INVALID_REQUEST_CODE,
+                                MCP_ERROR_INTERNAL,
+                                "failed to check MCP ownership",
+                                json!({}),
+                            )
+                        })?;
+                    if !linked.is_some_and(|link| {
+                        link.plugin_id == owner.plugin_id && link.member_key == owner.member_key
+                    }) {
+                        return Err(mcp_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            MCP_ERROR_INVALID_REQUEST,
+                            "MCP installation belongs to another source",
+                            json!({}),
+                        ));
+                    }
+                }
+            } else if installation
+                .name
+                .starts_with(super::portable::PLUGIN_MCP_PREFIX)
+            {
+                return Err(mcp_error(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    MCP_ERROR_INVALID_REQUEST,
+                    "reserved plugin MCP name",
+                    json!({}),
+                ));
+            }
             let old_secret_ref_ids = match existing.as_ref() {
                 Some(existing) => {
                     match parse_mcp_secret_ref_ids(existing.secret_refs_json.as_str()) {
                         Ok(ref_ids) => ref_ids,
                         Err(error) => {
-                            self.send_error(
-                                connection_id,
-                                mcp_error(
-                                    Some(request_id.clone()),
-                                    INVALID_REQUEST_CODE,
-                                    MCP_ERROR_INTERNAL,
-                                    "failed to decode existing MCP secret refs",
-                                    json!({"error": format!("{error:#}")}),
-                                ),
-                            )
-                            .await;
-                            return;
+                            return Err(mcp_error(
+                                Some(request_id.clone()),
+                                INVALID_REQUEST_CODE,
+                                MCP_ERROR_INTERNAL,
+                                "failed to decode existing MCP secret refs",
+                                json!({"error": format!("{error:#}")}),
+                            ));
                         }
                     }
                 }
@@ -171,18 +282,13 @@ impl MessageProcessor {
                         "mcp_install_keystore_write_failure",
                         &cleanup_report,
                     );
-                    self.send_error(
-                        connection_id,
-                        mcp_error(
-                            Some(request_id.clone()),
-                            INVALID_REQUEST_CODE,
-                            MCP_ERROR_INTERNAL,
-                            "failed to save MCP secrets",
-                            json!({"error": format!("{error:#}")}),
-                        ),
-                    )
-                    .await;
-                    return;
+                    return Err(mcp_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        MCP_ERROR_INTERNAL,
+                        "failed to save MCP secrets",
+                        json!({"error": format!("{error:#}")}),
+                    ));
                 }
                 written_secret_ref_ids.insert(secret.ref_id.clone());
             }
@@ -190,21 +296,19 @@ impl MessageProcessor {
             let mut record = match installation_record_from_domain(&installation) {
                 Ok(record) => record,
                 Err(error) => {
-                    self.send_error(
-                        connection_id,
-                        mcp_error(
-                            Some(request_id.clone()),
-                            INVALID_REQUEST_CODE,
-                            MCP_ERROR_INTERNAL,
-                            "failed to encode MCP server installation",
-                            json!({"error": format!("{error:#}")}),
-                        ),
-                    )
-                    .await;
-                    return;
+                    return Err(mcp_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        MCP_ERROR_INTERNAL,
+                        "failed to encode MCP server installation",
+                        json!({"error": format!("{error:#}")}),
+                    ));
                 }
             };
 
+            if let Some(owner) = ownership {
+                record.id = Some(owner.child_id.clone());
+            }
             if let Some(existing) = existing.as_ref() {
                 record.id = existing.id.clone();
                 record.enabled = existing.enabled;
@@ -240,7 +344,9 @@ impl MessageProcessor {
 
             let installation_id = match self
                 .crud_store
-                .upsert_mcp_server_installation_with_audit(&record, &audit, now)
+                .upsert_mcp_server_installation_with_audit_and_ownership(
+                    &record, &audit, ownership, now,
+                )
                 .await
             {
                 Ok(id) => id,
@@ -250,18 +356,13 @@ impl MessageProcessor {
                         .map(String::as_str);
                     let cleanup_report = self.gateway_secrets.delete_mcp_secrets(cleanup_refs);
                     warn_mcp_secret_delete_report("mcp_install_db_failure", &cleanup_report);
-                    self.send_error(
-                        connection_id,
-                        mcp_error(
-                            Some(request_id.clone()),
-                            INVALID_REQUEST_CODE,
-                            MCP_ERROR_INTERNAL,
-                            "failed to persist MCP server installation",
-                            json!({"error": format!("{error:#}")}),
-                        ),
-                    )
-                    .await;
-                    return;
+                    return Err(mcp_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        MCP_ERROR_INTERNAL,
+                        "failed to persist MCP server installation",
+                        json!({"error": format!("{error:#}")}),
+                    ));
                 }
             };
             record.id = Some(installation_id.clone());
@@ -272,7 +373,7 @@ impl MessageProcessor {
                 let oauth = self.mcp_service.oauth();
                 let outcome = oauth.synchronize(&installation_id, &installation).await;
                 if outcome.is_ok() {
-                    if params.oauth_callback_unavailable {
+                    if oauth_callback_unavailable {
                         let _ = oauth
                             .begin_install_without_callback(
                                 &installation_id,
@@ -281,7 +382,7 @@ impl MessageProcessor {
                                 &workspace_id,
                             )
                             .await;
-                    } else if let Some(redirect) = params.oauth_redirect_uri.as_deref() {
+                    } else if let Some(redirect) = oauth_redirect_uri {
                         if let Err(error) = oauth
                             .begin_install_in_workspace(
                                 &installation_id,
@@ -354,33 +455,6 @@ impl MessageProcessor {
             audit: McpLifecycleAuditSummary { events_written },
         };
 
-        let response = match JsonRpcResponse::from_result(request_id.clone(), &response_payload) {
-            Ok(response) => response,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    mcp_error(
-                        None,
-                        INVALID_REQUEST_CODE,
-                        MCP_ERROR_INTERNAL,
-                        "failed to encode mcp/install response",
-                        json!({"error": format!("{error:#}")}),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-
-        if let Err(error) = self.send_json(connection_id, &response).await {
-            warn!(
-                connection_id,
-                error = %format!("{error:#}"),
-                "failed to send mcp/install response"
-            );
-            return;
-        }
-
         if !changed.is_empty() {
             let snapshot_version = self.next_mcp_snapshot_version();
             let notification = McpChangedNotification {
@@ -403,5 +477,6 @@ impl MessageProcessor {
                 "failed to reload MCP runtime after install"
             );
         }
+        Ok(response_payload)
     }
 }

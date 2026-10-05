@@ -120,9 +120,18 @@ impl McpRuntimeConnector for RmcpRuntimeConnector {
                 };
                 let had_authorization = authorized.is_some();
                 let http = crate::oauth::ManagedHttpClient {
-                    plain: reqwest_0_13::Client::builder().build().map_err(|_| {
-                        McpRuntimeError::failed("HTTP client initialization failed")
-                    })?,
+                    // Portable configured headers cannot follow a redirect to
+                    // another origin. The OAuth client already disables redirects.
+                    plain: {
+                        let builder = reqwest_0_13::Client::builder();
+                        let builder = if installation.source_ref.get("plugin_id").is_some() {
+                            builder.redirect(reqwest_0_13::redirect::Policy::none())
+                        } else {
+                            builder
+                        };
+                        builder.build()
+                    }
+                    .map_err(|_| McpRuntimeError::failed("HTTP client initialization failed"))?,
                     authorized,
                     owner: if installation.transport.has_authorization_header() {
                         None

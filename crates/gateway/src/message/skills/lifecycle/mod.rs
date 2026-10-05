@@ -7,3 +7,5 @@ mod pack_uninstall;
 mod pack_update;
 mod uninstall;
 mod update;
+
+pub(crate) mod source;

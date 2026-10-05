@@ -23,6 +23,7 @@ mod install;
 mod list;
 mod oauth;
 mod policy;
+pub(crate) mod portable;
 mod restart;
 mod uninstall;
 

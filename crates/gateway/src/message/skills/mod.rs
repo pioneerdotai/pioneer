@@ -526,3 +526,5 @@ fn hash_skill_root(root: &Path, hasher: &mut DefaultHasher) {
         }
     }
 }
+
+pub(crate) use lifecycle::source::{SkillInstallSource, SkillUpdateInput};

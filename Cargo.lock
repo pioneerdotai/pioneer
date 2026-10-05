@@ -9691,6 +9691,7 @@ dependencies = [
  "pioneer-memory",
  "pioneer-migration",
  "pioneer-observability",
+ "pioneer-plugins",
  "pioneer-promt",
  "pioneer-protocol",
  "pioneer-provider",
@@ -9858,6 +9859,22 @@ dependencies = [
  "serde_json",
  "tracing",
  "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "pioneer-plugins"
+version = "0.56.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "http",
+ "pioneer-skills",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.11.0",
+ "tempfile",
  "url",
 ]
 
