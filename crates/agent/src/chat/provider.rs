@@ -2947,6 +2947,8 @@ mod native_decoder_gate_tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(AtomicUsize::new(0));
+            let received_requests = requests.clone();
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
@@ -2965,6 +2967,7 @@ mod native_decoder_gate_tests {
                         if request.len() >= end + 4 + length { break; }
                     }
                 }
+                received_requests.fetch_add(1, Ordering::SeqCst);
                 let content_type = if ollama { "application/json" } else { "text/event-stream" };
                 let headers = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
                 socket.write_all(headers.as_bytes()).await.unwrap();
@@ -2981,7 +2984,15 @@ mod native_decoder_gate_tests {
                 Arc::new(pioneer_provider::providers::AnthropicProvider::with_base_url("test-only", base))
             };
             let attempts = Arc::new(AtomicUsize::new(0));
-            let provider: Arc<dyn Provider> = Arc::new(CountingTransport { inner, attempts: attempts.clone() });
+            let name = if ollama { "ollama" } else { "anthropic" };
+            // Input preparation requires the authority scope supplied by the
+            // registry, including for text-only requests to the local transport.
+            let registry = pioneer_provider::ProviderRegistry::with_provider(
+                name,
+                Arc::new(CountingTransport { inner, attempts: attempts.clone() }),
+            );
+            let provider = registry.get_or_create_for_workspace("ws", name).unwrap();
+            assert!(provider.authority_fingerprint().is_some());
             let hub = AgentEventHub::new();
             let mut receiver = hub.take_durable_receiver().await.unwrap();
             let observations = Arc::new(AtomicUsize::new(0));
@@ -3010,6 +3021,7 @@ mod native_decoder_gate_tests {
                 for _call in &round.tool_calls { executions.fetch_add(1, Ordering::SeqCst); }
             }
             assert_eq!(attempts.load(Ordering::SeqCst), 1, "no automatic retry/fallback");
+            assert_eq!(requests.load(Ordering::SeqCst), 1, "must reach the native decoder through HTTP");
             if success {
                 assert!(result.is_ok());
                 assert_eq!(executions.load(Ordering::SeqCst), 1);
