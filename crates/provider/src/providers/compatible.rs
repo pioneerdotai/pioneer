@@ -2317,12 +2317,13 @@ mod tests {
             name: "read_file".to_owned(),
             arguments: "{\"path\":\"README.md\"}".to_owned(),
         }];
-        let replay_state = OpenAiCompatibleProvider::assistant_replay_state(
+        let mut replay_state = OpenAiCompatibleProvider::assistant_replay_state(
             provider.name(),
             Some(String::new()),
             Some(String::new()),
             tool_calls.as_slice(),
         );
+        replay_state.model = Some("compatible-model".to_owned());
         let message = ChatMessage::assistant_tool_calls_with_provider_state(
             None::<String>,
             None::<String>,
@@ -2341,21 +2342,81 @@ mod tests {
             compiled_prompt: None,
         };
 
-        let rendered = provider
-            .build_chat_request(request, false)
-            .expect("an explicitly present empty replay field must remain replayable");
+        assert!(request.messages[0].provenance.is_none());
+        for stream in [false, true] {
+            let rendered = provider
+                .build_chat_request(request.clone(), stream)
+                .expect("an explicitly present empty replay field must remain replayable");
 
-        assert_eq!(rendered.messages[0].reasoning_content.as_deref(), Some(""));
-        assert_eq!(text_content(&rendered.messages[0].content), Some(""));
-        assert_eq!(
-            rendered.messages[0]
-                .tool_calls
-                .as_ref()
-                .expect("tool calls must be replayed")[0]
-                .function
-                .arguments,
-            "{\"path\":\"README.md\"}"
+            assert_eq!(rendered.messages[0].reasoning_content.as_deref(), Some(""));
+            assert_eq!(text_content(&rendered.messages[0].content), Some(""));
+            assert_eq!(
+                rendered.messages[0]
+                    .tool_calls
+                    .as_ref()
+                    .expect("tool calls must be replayed")[0]
+                    .function
+                    .arguments,
+                "{\"path\":\"README.md\"}"
+            );
+            let wire = serde_json::to_value(rendered).unwrap();
+            assert_eq!(wire["stream"], stream);
+            assert_eq!(
+                wire["messages"][0].get("reasoning_content"),
+                Some(&serde_json::json!(""))
+            );
+            assert_eq!(wire["messages"][0]["content"], "");
+            assert_eq!(
+                wire["messages"][0]["tool_calls"][0]["function"]["arguments"],
+                "{\"path\":\"README.md\"}"
+            );
+        }
+    }
+
+    #[test]
+    fn compatible_model_unbound_active_empty_replay_is_rejected_by_request_projection() {
+        let provider = test_provider();
+        let calls = vec![ProviderToolCall {
+            id: "call_1".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: "{\"path\":\"README.md\"}".to_owned(),
+        }];
+        let replay = OpenAiCompatibleProvider::assistant_replay_state(
+            provider.name(),
+            Some(String::new()),
+            Some(String::new()),
+            &calls,
         );
+        assert!(replay.model.is_none());
+        let request = ChatRequest {
+            model: "compatible-model".to_owned(),
+            messages: vec![ChatMessage::assistant_tool_calls_with_provider_state(
+                None::<String>,
+                None::<String>,
+                calls,
+                Some(replay),
+            )],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        assert!(request.messages[0].provenance.is_none());
+        for stream in [false, true] {
+            let error = provider
+                .build_chat_request(request.clone(), stream)
+                .expect_err("model-unbound active replay must fail at the request-aware projector");
+            assert!(
+                error
+                    .downcast_ref::<crate::history::IncompatibleProviderReplayContinuation>()
+                    .is_some()
+            );
+            assert!(error.to_string().contains("test-provider/unknown-model"));
+            assert!(error.to_string().contains("test-provider/compatible-model"));
+        }
     }
 
     #[test]
