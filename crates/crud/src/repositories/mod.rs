@@ -119,3 +119,5 @@ pub(crate) mod compaction_frozen_storage;
 mod compaction_check_result;
 
 pub(crate) mod task_run_occurrence_reconcile;
+
+pub(crate) mod task_occurrence_reconcile;

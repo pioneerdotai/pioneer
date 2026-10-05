@@ -922,6 +922,16 @@ async fn finalization_failure_rolls_back_the_already_projected_terminal_batch() 
     let store = runtime.service().store();
     let db = store.database_connection();
     let before = events(&runtime, &run).await;
+    let pending_before =
+        pioneer_entity::task_occurrence_reconcile_pending::Entity::find_by_id(run.id.clone())
+            .one(&db)
+            .await
+            .unwrap();
+    let generation_before =
+        pioneer_entity::task_occurrence_reconcile_sequence::Entity::find_by_id(1)
+            .one(&db)
+            .await
+            .unwrap();
     db.execute_unprepared("CREATE TRIGGER reject_terminal_occurrence BEFORE UPDATE ON task_occurrence_contract WHEN NEW.status='delivered' BEGIN SELECT RAISE(ABORT, 'injected finalization failure'); END").await.unwrap();
     assert!(
         handle
@@ -930,6 +940,20 @@ async fn finalization_failure_rolls_back_the_already_projected_terminal_batch() 
             .is_err()
     );
     assert_eq!(events(&runtime, &run).await, before);
+    assert_eq!(
+        pioneer_entity::task_occurrence_reconcile_pending::Entity::find_by_id(run.id.clone())
+            .one(&db)
+            .await
+            .unwrap(),
+        pending_before
+    );
+    assert_eq!(
+        pioneer_entity::task_occurrence_reconcile_sequence::Entity::find_by_id(1)
+            .one(&db)
+            .await
+            .unwrap(),
+        generation_before
+    );
     assert!(deliveries(&runtime, &run).await.is_empty());
     assert!(
         !store

@@ -3769,7 +3769,7 @@ async fn reconciliation_repairs_only_an_exact_terminal_occurrence_mismatch() {
 }
 
 #[tokio::test]
-async fn terminal_occurrence_scan_cursor_advances_past_unrepairable_rows() {
+async fn diagnostic_terminal_occurrence_pages_advance_past_unrepairable_rows() {
     let runtime = runtime().await;
     let store = runtime.service().store();
     store
