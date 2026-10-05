@@ -1250,7 +1250,9 @@ fn memory_provider_request_error(
 ) -> HookError {
     let classification = provider.classify_failure(error).unwrap_or_else(|| {
         ProviderFailureClassification::new(pioneer_agent::classify_provider_failure_message(
-            error.to_string().as_str(),
+            pioneer_provider::usage::classification_source(error)
+                .to_string()
+                .as_str(),
             stage,
         ))
     });

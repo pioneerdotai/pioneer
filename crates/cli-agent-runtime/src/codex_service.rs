@@ -103,10 +103,7 @@ impl CodexService {
         );
         let run = async {
             let (output, success) = self.invoke(&request, deadline, MAX_SERVICE_BYTES).await?;
-            let completion =
-                decode_exec_completion(&output).context(ServiceStage("cli_exec_decode"))?;
-            ensure!(success, "Codex service process failed");
-            Ok(completion)
+            decode_exec_outcome(&output, success)
         };
         let result = match tokio::time::timeout_at(deadline, run).await {
             Ok(result) => result,
@@ -240,6 +237,20 @@ fn process_config(
     Ok(process)
 }
 
+/// Production process-exit boundary, shared by summarize and pure regressions.
+/// Decode first so a valid terminal's numeric evidence survives nonzero exit;
+/// neither a bad transcript nor a failed process becomes a successful summary.
+pub fn decode_exec_outcome(output: &[u8], success: bool) -> Result<CodexServiceCompletion> {
+    let completion = decode_exec_completion(output).context(ServiceStage("cli_exec_decode"))?;
+    if !success {
+        return Err(crate::service::with_observed_usage(
+            anyhow::anyhow!("Codex service process failed"),
+            completion.observed_usage,
+        ));
+    }
+    Ok(completion)
+}
+
 /// Decode the pinned exec JSONL contract without invoking an external process.
 /// Rejected transcripts retain only sanitized terminal numeric usage context.
 pub fn decode_exec_completion(output: &[u8]) -> Result<CodexServiceCompletion> {
@@ -298,13 +309,13 @@ pub fn decode_exec_completion(output: &[u8]) -> Result<CodexServiceCompletion> {
                     .into())
                     .map_err(|error: anyhow::Error| {
                         error.context(crate::service::ObservedServiceUsage(
-                            crate::service::bounded_usage(&event),
+                            crate::service::bounded_codex_usage(&event),
                         ))
                     });
                 }
                 Some("turn.completed") => {
                     // Terminal numeric evidence survives application/order rejection.
-                    completion.observed_usage = crate::service::bounded_usage(&event);
+                    completion.observed_usage = crate::service::bounded_codex_usage(&event);
                     ensure!(
                         started && !completion.text.trim().is_empty(),
                         "Codex service returned no final answer"
@@ -403,6 +414,61 @@ fn terminal_failure(event: &CodexJsonlRpcNotificationEvent) -> ServiceFailure {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn process_exit_boundary_retains_profile_specific_usage_and_stays_failed() {
+        let prefix = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"SECRET_SESSION\"}\n",
+            "{\"type\":\"turn.started\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"SECRET_SUMMARY\"}}\n"
+        );
+        for counter in [
+            serde_json::json!(9),
+            serde_json::json!(0),
+            serde_json::json!(null),
+            serde_json::json!(-1),
+            serde_json::json!("9"),
+            serde_json::json!(true),
+            serde_json::json!(1.5),
+            serde_json::json!([9]),
+            serde_json::json!({"secret":"SECRET"}),
+        ] {
+            let terminal = serde_json::json!({"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":13,"reasoning_output_tokens":counter,"secret":"SECRET"},"total_cost_usd":999});
+            let transcript = format!("{prefix}{terminal}\n");
+            let success = decode_exec_outcome(transcript.as_bytes(), true).unwrap();
+            let error = decode_exec_outcome(transcript.as_bytes(), false)
+                .err()
+                .unwrap();
+            assert!(format!("{error:#}").contains("Codex service process failed"));
+            let observed = &error
+                .downcast_ref::<crate::service::ObservedServiceUsage>()
+                .unwrap()
+                .0;
+            assert_eq!(observed, &success.observed_usage);
+            assert_eq!(
+                observed["reasoning_output_tokens"].as_u64(),
+                counter.as_u64()
+            );
+            assert_eq!(success.output_tokens, Some(13));
+            assert!(!observed.to_string().contains("SECRET"));
+            assert!(observed["total_cost_usd"].is_null());
+        }
+        let missing = format!("{prefix}{{\"type\":\"turn.completed\"}}\n");
+        let error = decode_exec_outcome(missing.as_bytes(), false)
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .downcast_ref::<crate::service::ObservedServiceUsage>()
+                .is_none()
+        );
+        assert_eq!(
+            decode_exec_outcome(missing.as_bytes(), true)
+                .unwrap()
+                .output_tokens,
+            None
+        );
+    }
+
     #[test]
     fn rejected_terminal_transcripts_keep_only_available_numeric_evidence() {
         let start = concat!(

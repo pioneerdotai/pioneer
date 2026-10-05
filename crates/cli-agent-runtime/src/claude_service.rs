@@ -151,14 +151,7 @@ impl ClaudeService {
                 let (_, output) =
                     tokio::try_join!(async { write.await.map_err(anyhow::Error::from) }, read)?;
                 let status = owner.as_mut().unwrap().process.wait().await?;
-                if !status.success() {
-                    // Decode a structured terminal error when the CLI provided one,
-                    // otherwise do not expose stderr or malformed provider bodies.
-                    if let Ok(value) = serde_json::from_slice::<Value>(&output) {
-                        return Err(failure(terminal_value(&value)).into());
-                    }
-                    anyhow::bail!("Claude service process failed");
-                }
+                ensure_process_outcome(&output, status.success())?;
                 Ok(output)
             };
             exchange.await
@@ -234,6 +227,25 @@ fn process_config(
     }
     spawn
 }
+/// Production nonzero-exit rejection boundary. Only a parsed native terminal
+/// result contributes metrics; malformed/incomplete transcripts are not mined.
+/// Preserve the original typed failure and never persist raw result/error text.
+pub fn ensure_process_outcome(output: &[u8], success: bool) -> Result<()> {
+    if success {
+        return Ok(());
+    }
+    if let Ok(value) = serde_json::from_slice::<Value>(output) {
+        let terminal = terminal_value(&value);
+        let error: anyhow::Error = failure(terminal).into();
+        return Err(if terminal["type"] == "result" {
+            crate::service::with_observed_usage(error, crate::service::bounded_usage(terminal))
+        } else {
+            error
+        });
+    }
+    anyhow::bail!("Claude service process failed")
+}
+
 // In the pinned release, verbose JSON includes the init frame carrying the
 // model resolved by the CLI itself. This preserves native alias/environment
 // resolution without guessing a model or accepting a fallback during generation.
@@ -375,6 +387,52 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::{collections::HashSet, os::unix::fs::PermissionsExt, sync::Arc};
+    #[test]
+    fn process_exit_boundary_keeps_terminal_metrics_and_typed_failure_without_secrets() {
+        for count in [Some(12_u64), Some(0), None] {
+            let mut terminal = json!({"type":"result","subtype":"error_during_execution","error":{"type":"rate_limit_error"},"retry_after_ms":3000,"result":"SECRET_TRANSCRIPT","session_id":"SECRET_SESSION","usage":{"prompt":"SECRET","reasoning_output_tokens":42}});
+            if let Some(count) = count {
+                terminal["usage"]["input_tokens"] = count.into();
+                terminal["usage"]["output_tokens"] = count.into();
+                terminal["usage"]["cache_read_input_tokens"] = count.into();
+                terminal["usage"]["cache_creation_input_tokens"] = 0.into();
+                terminal["total_cost_usd"] = json!(0.2);
+            }
+            let output = json!([{"type":"system","subtype":"init"}, terminal]).to_string();
+            let error = ensure_process_outcome(output.as_bytes(), false)
+                .err()
+                .unwrap();
+            let typed = error.downcast_ref::<ServiceFailure>().unwrap();
+            assert_eq!(typed.class, ProviderFailureClass::RateLimit);
+            assert_eq!(typed.retry_after_ms, Some(3000));
+            let metadata = error.downcast_ref::<crate::service::ObservedServiceUsage>();
+            assert_eq!(metadata.is_some(), count.is_some());
+            if let Some(metadata) = metadata {
+                assert_eq!(metadata.0["input_tokens"].as_u64(), count);
+                assert_eq!(metadata.0["output_tokens"].as_u64(), count);
+                assert_eq!(metadata.0["cache_read_input_tokens"].as_u64(), count);
+                assert_eq!(metadata.0["cache_creation_input_tokens"], 0);
+                assert_eq!(metadata.0["total_cost_usd"], 0.2);
+                assert!(metadata.0["reasoning_output_tokens"].is_null());
+                assert!(!metadata.0.to_string().contains("SECRET"));
+            }
+            assert!(!format!("{error:#?}").contains("SECRET"));
+            assert!(ensure_process_outcome(output.as_bytes(), true).is_ok());
+        }
+        for output in [
+            b"invalid SECRET".as_slice(),
+            br#"{"type":"system","usage":{"input_tokens":999},"result":"SECRET"}"#.as_slice(),
+        ] {
+            let error = ensure_process_outcome(output, false).err().unwrap();
+            assert!(
+                error
+                    .downcast_ref::<crate::service::ObservedServiceUsage>()
+                    .is_none()
+            );
+            assert!(!format!("{error:#}").contains("SECRET"));
+        }
+    }
+
     fn request() -> ClaudeServiceRequest {
         ClaudeServiceRequest {
             model: "claude-sonnet-4-6".into(),

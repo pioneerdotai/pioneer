@@ -406,7 +406,14 @@ fn pricing_eligibility(
 
 /// Explicit adapter evidence on failures, without raw headers/payloads/errors.
 #[derive(Clone)]
-pub struct ObservedProviderUsage(pub(crate) TokenUsage);
+pub struct ObservedProviderUsage {
+    usage: TokenUsage,
+    // Identify the original top-level cause without copying its text/payload.
+    // Anyhow contexts prepend causes; additional metadata/stage contexts may
+    // therefore be skipped for classification only. Never format the full chain
+    // as a persisted diagnostic to recover classification hints.
+    classification_chain_len: usize,
+}
 impl std::fmt::Debug for ObservedProviderUsage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ObservedProviderUsage")
@@ -419,10 +426,36 @@ impl std::fmt::Display for ObservedProviderUsage {
 }
 impl std::error::Error for ObservedProviderUsage {}
 pub fn error_usage(error: &anyhow::Error) -> Option<&TokenUsage> {
-    error.downcast_ref::<ObservedProviderUsage>().map(|e| &e.0)
+    error
+        .downcast_ref::<ObservedProviderUsage>()
+        .map(|e| &e.usage)
 }
 pub(crate) fn with_error_usage(error: anyhow::Error, usage: &TokenUsage) -> anyhow::Error {
-    error.context(ObservedProviderUsage(usage.clone()))
+    let classification_chain_len = error
+        .downcast_ref::<ObservedProviderUsage>()
+        .map(|e| e.classification_chain_len)
+        .unwrap_or_else(|| error.chain().count());
+    error.context(ObservedProviderUsage {
+        usage: usage.clone(),
+        classification_chain_len,
+    })
+}
+
+/// Original cause for private fallback classification, transparent to usage
+/// enrichment and subsequent context. This is not a diagnostic/telemetry API:
+/// callers must keep the safe outer Display for persisted error messages.
+/// Typed adapter errors remain reachable through anyhow downcast_ref.
+pub fn classification_source(error: &anyhow::Error) -> &(dyn std::error::Error + 'static) {
+    let skip = error
+        .downcast_ref::<ObservedProviderUsage>()
+        .map(|e| {
+            error
+                .chain()
+                .count()
+                .saturating_sub(e.classification_chain_len)
+        })
+        .unwrap_or(0);
+    error.chain().nth(skip).unwrap_or_else(|| error.as_ref())
 }
 
 fn estimate(

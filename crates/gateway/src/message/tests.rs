@@ -77553,3 +77553,271 @@ async fn auxiliary_metadata_only_header_survives_failure_without_inventing_count
     assert_eq!(retained.output_tokens, None);
     assert!(!rows[0].usage_json.contains("SECRET"));
 }
+
+#[tokio::test]
+async fn cli_exit_and_reasoning_evidence_reaches_summary_consumer_and_failed_journal_once() {
+    use pioneer_cli_agent_runtime::{
+        claude::service::ensure_process_outcome,
+        codex::service::decode_exec_outcome,
+        service::{ObservedServiceUsage, ServiceFailure},
+    };
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_cli_exit_reasoning", "turn_cli_exit_reasoning")
+            .await;
+    let prefix = concat!(
+        "{\"type\":\"thread.started\",\"thread_id\":\"SECRET_SESSION\"}\n",
+        "{\"type\":\"turn.started\"}\n",
+    );
+    let answer = "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"SECRET_SUMMARY\"}}\n";
+    for (index, (native, legacy, count, reject)) in [
+        (
+            serde_json::json!(7),
+            serde_json::json!(null),
+            Some(100_u64),
+            "success",
+        ),
+        (
+            serde_json::json!(7),
+            serde_json::json!(null),
+            Some(100),
+            "nonzero",
+        ),
+        (
+            serde_json::json!(0),
+            serde_json::json!(null),
+            Some(0),
+            "nonzero",
+        ),
+        (
+            serde_json::json!(null),
+            serde_json::json!(null),
+            None,
+            "nonzero",
+        ),
+        (
+            serde_json::json!("7"),
+            serde_json::json!(null),
+            Some(100),
+            "nonzero",
+        ),
+        (
+            serde_json::json!(-7),
+            serde_json::json!(null),
+            Some(100),
+            "no_answer",
+        ),
+        (
+            serde_json::json!(7),
+            serde_json::json!(null),
+            Some(100),
+            "no_answer",
+        ),
+        (
+            serde_json::json!(7),
+            serde_json::json!(null),
+            Some(100),
+            "trailing",
+        ),
+        (
+            serde_json::json!(7),
+            serde_json::json!(null),
+            Some(100),
+            "malformed",
+        ),
+        (
+            serde_json::json!(0),
+            serde_json::json!(9),
+            Some(100),
+            "nonzero",
+        ),
+        (
+            serde_json::json!(null),
+            serde_json::json!(9),
+            Some(100),
+            "success",
+        ),
+        (
+            serde_json::json!("invalid"),
+            serde_json::json!(9),
+            Some(100),
+            "nonzero",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut usage = serde_json::json!({"reasoning_output_tokens":native,"reasoning_tokens":legacy,"secret":"SECRET_PROMPT","arbitrary_id":"SECRET_ID"});
+        if let Some(count) = count {
+            usage["input_tokens"] = count.into();
+            usage["output_tokens"] = if count == 0 { 0 } else { 13 }.into();
+            usage["cached_input_tokens"] = if count == 0 { 0 } else { 80 }.into();
+        }
+        let terminal = serde_json::json!({"type":"turn.completed","usage":usage});
+        let transcript = format!(
+            "{prefix}{}{terminal}\n{}",
+            if reject == "no_answer" { "" } else { answer },
+            match reject {
+                "trailing" => "{\"type\":\"turn.started\"}\n",
+                "malformed" => "invalid SECRET\n",
+                _ => "",
+            },
+        );
+        let result = decode_exec_outcome(transcript.as_bytes(), reject != "nonzero");
+        let failed = reject != "success";
+        assert_eq!(result.is_err(), failed);
+        let owner = format!("codex-exit-reasoning-{index}");
+        let mut observed = pioneer_provider::TokenUsage {
+            provider: Some("codex-cli".into()),
+            ..Default::default()
+        };
+        let call = crate::usage_journal::Call::start(
+            store.as_ref(),
+            &workspace,
+            "summary",
+            &owner,
+            &observed,
+        )
+        .await
+        .unwrap();
+        // Actual CLI summary consumer, fed by the production exit/decoder path.
+        match result {
+            Ok(completion) => {
+                crate::compaction::apply_cli_usage(&mut observed, &completion.observed_usage)
+            }
+            Err(error) => {
+                assert!(!format!("{error:#?}").contains("SECRET"));
+                if let Some(metadata) = error.downcast_ref::<ObservedServiceUsage>() {
+                    crate::compaction::apply_cli_usage(&mut observed, &metadata.0);
+                }
+            }
+        }
+        let status = if failed { "failed" } else { "completed" };
+        call.record(status, &observed).await.unwrap();
+        call.record(status, &observed).await.unwrap();
+        let rows = store
+            .provider_usage_page(&workspace, &owner, "", 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, status);
+        let retained: pioneer_provider::TokenUsage =
+            serde_json::from_str(&rows[0].usage_json).unwrap();
+        assert_eq!(retained.input_tokens, count);
+        assert_eq!(
+            retained.output_tokens,
+            count.map(|count| if count == 0 { 0 } else { 13 })
+        );
+        assert_eq!(
+            retained.cache_read_input_tokens,
+            count.map(|count| if count == 0 { 0 } else { 80 })
+        );
+        assert_eq!(
+            retained.reasoning_tokens,
+            native.as_u64().or_else(|| legacy.as_u64())
+        );
+        assert_eq!(retained.cache_write_input_tokens, None);
+        assert_eq!(retained.request_id, None);
+        assert_eq!(retained.generation_id, None);
+        if let Some(accounting) = &retained.accounting {
+            assert!(accounting["reported_cost"].is_null());
+            assert!(accounting["estimated_cost"].is_null());
+            assert!(accounting["sdk_estimated_cost"].is_null());
+            if native.as_u64().is_some() {
+                assert_eq!(
+                    accounting["reasoning_source"],
+                    "codex_exec.usage.reasoning_output_tokens"
+                );
+            }
+            if native.as_u64().is_some() && legacy.as_u64().is_some() {
+                assert_eq!(accounting["reasoning_alias_conflict"], native != legacy);
+            }
+        }
+        assert!(!rows[0].usage_json.contains("SECRET"));
+        assert!(!rows[0].usage_json.contains("process failed"));
+    }
+    for (index, (input, output, read, write, cost)) in [
+        (
+            Some(20_u64),
+            Some(11_u64),
+            Some(7_u64),
+            Some(3_u64),
+            Some(0.2),
+        ),
+        (Some(0), Some(0), Some(0), Some(0), Some(0.0)),
+        (None, None, None, None, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut terminal = serde_json::json!({"type":"result","subtype":"error_during_execution","error":{"type":"overloaded_error","message":"SECRET_ERROR"},"session_id":"SECRET_SESSION","usage":{"reasoning_output_tokens":99,"prompt":"SECRET_PROMPT"}});
+        for (key, value) in [
+            ("input_tokens", input),
+            ("output_tokens", output),
+            ("cache_read_input_tokens", read),
+            ("cache_creation_input_tokens", write),
+        ] {
+            if let Some(value) = value {
+                terminal["usage"][key] = value.into();
+            }
+        }
+        if let Some(cost) = cost {
+            terminal["total_cost_usd"] = serde_json::json!(cost);
+        }
+        let error = ensure_process_outcome(terminal.to_string().as_bytes(), false)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.downcast_ref::<ServiceFailure>().unwrap().class,
+            pioneer_protocol::ProviderFailureClass::Provider5xx
+        );
+        let owner = format!("claude-exit-{index}");
+        let mut observed = pioneer_provider::TokenUsage {
+            provider: Some("claude-cli".into()),
+            ..Default::default()
+        };
+        let call = crate::usage_journal::Call::start(
+            store.as_ref(),
+            &workspace,
+            "summary",
+            &owner,
+            &observed,
+        )
+        .await
+        .unwrap();
+        if let Some(metadata) = error.downcast_ref::<ObservedServiceUsage>() {
+            crate::compaction::apply_cli_usage(&mut observed, &metadata.0);
+        }
+        call.record("failed", &observed).await.unwrap();
+        call.record("failed", &observed).await.unwrap();
+        let rows = store
+            .provider_usage_page(&workspace, &owner, "", 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "failed");
+        let retained: pioneer_provider::TokenUsage =
+            serde_json::from_str(&rows[0].usage_json).unwrap();
+        assert_eq!(
+            retained.input_tokens,
+            input.map(|input| input + read.unwrap_or(0) + write.unwrap_or(0))
+        );
+        assert_eq!(retained.output_tokens, output);
+        assert_eq!(retained.cache_read_input_tokens, read);
+        assert_eq!(retained.cache_write_input_tokens, write);
+        assert_eq!(retained.reasoning_tokens, None);
+        assert_eq!(retained.generation_id, None);
+        if let Some(accounting) = &retained.accounting {
+            assert_eq!(accounting["sdk_estimated_cost"]["amount"].as_f64(), cost);
+            assert_eq!(accounting["sdk_estimated_cost"]["currency"], "USD");
+            assert_eq!(
+                accounting["sdk_estimated_cost"]["provenance"],
+                "cli_sdk_price_table_estimate"
+            );
+            assert!(accounting["sdk_estimated_cost"]["sdk_version"].is_null());
+            assert!(accounting["reported_cost"].is_null());
+            assert!(accounting["estimated_cost"].is_null());
+        }
+        assert!(!rows[0].usage_json.contains("SECRET"));
+        assert!(!rows[0].usage_json.contains("overloaded_error"));
+    }
+}

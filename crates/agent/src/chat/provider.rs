@@ -979,6 +979,15 @@ fn adapter_error_for_target(
     } else {
         provider.classify_failure(error)
     };
+    // Usage context has a safe fixed Display. Classify the original cause
+    // privately, then persist only the safe outer diagnostic and typed hints.
+    let inferred = infer_failure_classification(
+        &format!(
+            "{prefix}: {}",
+            pioneer_provider::usage::classification_source(error)
+        ),
+        stage,
+    );
     provider_failure_error_with_classification(
         target.item_id,
         target.item_type,
@@ -987,7 +996,7 @@ fn adapter_error_for_target(
         transport,
         stage,
         format!("{prefix}: {error}"),
-        classification,
+        Some(merge_failure_classification(classification, inferred)),
     )
 }
 
@@ -1288,25 +1297,16 @@ fn provider_failure_error_with_classification(
     error_message: String,
     classification: Option<ProviderFailureClassification>,
 ) -> ChatTurnError {
-    let lower = error_message.to_ascii_lowercase();
-    let inferred_http_status = extract_http_status(error_message.as_str());
-    let inferred_retry_after_ms = extract_retry_after_ms(lower.as_str());
-    let inferred_provider_code = extract_provider_code(error_message.as_str());
-    let inferred_class = classify_provider_failure_message(error_message.as_str(), stage);
-    let (class, http_status, provider_code, retry_after_ms) = match classification {
-        Some(classification) => (
-            classification.class,
-            classification.http_status.or(inferred_http_status),
-            classification.provider_code.or(inferred_provider_code),
-            classification.retry_after_ms.or(inferred_retry_after_ms),
-        ),
-        None => (
-            inferred_class,
-            inferred_http_status,
-            inferred_provider_code,
-            inferred_retry_after_ms,
-        ),
-    };
+    let classification = merge_failure_classification(
+        classification,
+        infer_failure_classification(&error_message, stage),
+    );
+    let ProviderFailureClassification {
+        class,
+        http_status,
+        provider_code,
+        retry_after_ms,
+    } = classification;
     let is_recoverable_hint = provider_failure_class_is_recoverable(class);
 
     ChatTurnError::ProviderFailure {
@@ -1324,6 +1324,33 @@ fn provider_failure_error_with_classification(
             is_recoverable_hint,
             message: Some(error_message),
         },
+    }
+}
+
+fn infer_failure_classification(
+    message: &str,
+    stage: ProviderFailureStage,
+) -> ProviderFailureClassification {
+    ProviderFailureClassification {
+        class: classify_provider_failure_message(message, stage),
+        http_status: extract_http_status(message),
+        provider_code: extract_provider_code(message),
+        retry_after_ms: extract_retry_after_ms(&message.to_ascii_lowercase()),
+    }
+}
+
+fn merge_failure_classification(
+    classification: Option<ProviderFailureClassification>,
+    inferred: ProviderFailureClassification,
+) -> ProviderFailureClassification {
+    match classification {
+        Some(classification) => ProviderFailureClassification {
+            class: classification.class,
+            http_status: classification.http_status.or(inferred.http_status),
+            provider_code: classification.provider_code.or(inferred.provider_code),
+            retry_after_ms: classification.retry_after_ms.or(inferred.retry_after_ms),
+        },
+        None => inferred,
     }
 }
 
@@ -1376,6 +1403,246 @@ fn extract_http_status(message: &str) -> Option<u16> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn registry_usage_metadata_is_transparent_to_production_failure_translation() {
+        struct Failing {
+            message: &'static str,
+            classification: Option<ProviderFailureClassification>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Failing {
+            fn name(&self) -> &str {
+                "openrouter"
+            }
+            fn classify_failure(&self, _: &anyhow::Error) -> Option<ProviderFailureClassification> {
+                self.classification.clone()
+            }
+            async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+                Err(anyhow::anyhow!(self.message))
+            }
+            async fn stream_chat(
+                &self,
+                _: ChatRequest,
+            ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+            {
+                let snapshot = TokenUsage {
+                    generation_id: Some("gen-header".into()),
+                    input_tokens: None,
+                    output_tokens: Some(0),
+                    cache_read_input_tokens: Some(8),
+                    ..Default::default()
+                };
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamChunk::usage(snapshot.clone())),
+                    Ok(StreamChunk::usage(snapshot)),
+                    Err(anyhow::anyhow!(self.message)),
+                ])))
+            }
+        }
+        let request = || ChatRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        for (message, stage, class, typed) in [
+            (
+                "OpenRouter API error 429: {\"code\":\"rate_limit_exceeded\"} retry-after: 2",
+                ProviderFailureStage::Connect,
+                ProviderFailureClass::RateLimit,
+                false,
+            ),
+            (
+                "OpenRouter API error 503: unavailable",
+                ProviderFailureStage::Connect,
+                ProviderFailureClass::Provider5xx,
+                false,
+            ),
+            (
+                "connection reset by peer",
+                ProviderFailureStage::MidStream,
+                ProviderFailureClass::NetworkTransient,
+                false,
+            ),
+            (
+                "provider API error 400: invalid request",
+                ProviderFailureStage::MidStream,
+                ProviderFailureClass::ProviderRejected,
+                false,
+            ),
+            (
+                "provider returned empty response",
+                ProviderFailureStage::Finalize,
+                ProviderFailureClass::EmptyResponse,
+                true,
+            ),
+            (
+                "opaque adapter failure",
+                ProviderFailureStage::FirstChunk,
+                ProviderFailureClass::RateLimit,
+                true,
+            ),
+        ] {
+            let inner = Arc::new(Failing {
+                message,
+                classification: typed.then(|| ProviderFailureClassification {
+                    class,
+                    http_status: (class == ProviderFailureClass::RateLimit).then_some(429),
+                    provider_code: (class == ProviderFailureClass::RateLimit)
+                        .then(|| "native_rate_limit".into()),
+                    retry_after_ms: (class == ProviderFailureClass::RateLimit).then_some(7000),
+                }),
+            });
+            let plain = inner.chat(request()).await.err().unwrap();
+            let registry = pioneer_provider::ProviderRegistry::new(|_| String::new());
+            registry.insert("openrouter", inner.clone()).unwrap();
+            let wrapped = registry.get_or_create("openrouter").unwrap();
+            let mut stream = wrapped.stream_chat(request()).await.unwrap();
+            let observation = ProviderAttemptObservation::new(wrapped.as_ref(), "fixture");
+            for _ in 0..2 {
+                observation.observe(&stream.next().await.unwrap().unwrap().usage.unwrap());
+            }
+            let enriched = stream.next().await.unwrap().err().unwrap();
+            observation.observe_error(&enriched);
+            observation.observe_error(&enriched);
+            let translate = |provider: &dyn Provider, error: &anyhow::Error| {
+                let ChatTurnError::ProviderFailure { failure, .. } = adapter_error_for_target(
+                    FailureTarget::new("item", TurnItemType::Reasoning),
+                    provider,
+                    "fixture",
+                    ProviderTransportKind::Stream,
+                    stage,
+                    "provider error",
+                    error,
+                ) else {
+                    panic!("expected failure")
+                };
+                failure
+            };
+            let before = translate(inner.as_ref(), &plain);
+            let after = translate(wrapped.as_ref(), &enriched);
+            assert_eq!(after.class, class);
+            assert_eq!(after.class, before.class);
+            assert_eq!(after.http_status, before.http_status);
+            assert_eq!(after.provider_code, before.provider_code);
+            assert_eq!(after.retry_after_ms, before.retry_after_ms);
+            if message.starts_with("OpenRouter API error 429") {
+                assert_eq!(after.http_status, Some(429));
+                assert_eq!(after.provider_code.as_deref(), Some("rate_limit_exceeded"));
+                assert_eq!(after.retry_after_ms, Some(2000));
+            }
+            if message.starts_with("OpenRouter API error 503") {
+                assert_eq!(after.http_status, Some(503));
+            }
+            assert_eq!(after.is_recoverable_hint, before.is_recoverable_hint);
+            assert_eq!(after.stage, before.stage);
+            assert_eq!(after.transport, before.transport);
+            assert!(!after.message.unwrap().contains(message));
+            let observed = observation.usage.lock().unwrap();
+            assert_eq!(observed.generation_id.as_deref(), Some("gen-header"));
+            assert_eq!(observed.input_tokens, None);
+            assert_eq!(observed.output_tokens, Some(0));
+            assert_eq!(observed.cache_read_input_tokens, Some(8));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_openrouter_header_errors_keep_http_and_retry_hints_without_redaction_override()
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        for (status, class) in [
+            (429, ProviderFailureClass::RateLimit),
+            (503, ProviderFailureClass::Provider5xx),
+        ] {
+            for streaming in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = [0_u8; 8192];
+                    socket.read(&mut request).await.unwrap();
+                    let body = r#"{"error":{"code":"native_rejection","message":"SECRET_BODY retry-after: 2"}}"#;
+                    socket.write_all(format!("HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nX-Generation-Id: gen-native-header\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                });
+                // Native adapter + normal registry wrapper; no endpoint override
+                // resolver, so the default non-redacting error path is exercised.
+                let registry = pioneer_provider::ProviderRegistry::new(|_| String::new());
+                registry
+                    .insert(
+                        "openrouter",
+                        Arc::new(
+                            pioneer_provider::providers::OpenRouterProvider::with_base_url(
+                                "key", url,
+                            ),
+                        ),
+                    )
+                    .unwrap();
+                let provider = registry.get_or_create("openrouter").unwrap();
+                let request = ChatRequest {
+                    model: "fixture".into(),
+                    messages: vec![],
+                    temperature: None,
+                    max_tokens: None,
+                    tools: None,
+                    tool_choice: None,
+                    parallel_tool_calls: None,
+                    reasoning: None,
+                    compiled_prompt: None,
+                };
+                let error = if streaming {
+                    provider.stream_chat(request).await.err().unwrap()
+                } else {
+                    provider.chat(request).await.err().unwrap()
+                };
+                server.await.unwrap();
+                assert!(provider.classify_failure(&error).is_none());
+                let transport = if streaming {
+                    ProviderTransportKind::Stream
+                } else {
+                    ProviderTransportKind::NonStream
+                };
+                let translate = |error: &anyhow::Error| {
+                    let ChatTurnError::ProviderFailure { failure, .. } = adapter_error_for_target(
+                        FailureTarget::new("item", TurnItemType::Reasoning),
+                        provider.as_ref(),
+                        "fixture",
+                        transport,
+                        ProviderFailureStage::Connect,
+                        "provider error",
+                        error,
+                    ) else {
+                        panic!("expected provider failure")
+                    };
+                    failure
+                };
+                let before = translate(&anyhow::anyhow!(
+                    pioneer_provider::usage::classification_source(&error).to_string()
+                ));
+                let after = translate(&error);
+                assert_eq!(after.class, class);
+                assert_eq!(after.http_status, Some(status));
+                assert_eq!(after.provider_code.as_deref(), Some("native_rejection"));
+                assert_eq!(after.retry_after_ms, Some(2000));
+                assert_eq!(after.class, before.class);
+                assert_eq!(after.http_status, before.http_status);
+                assert_eq!(after.provider_code, before.provider_code);
+                assert_eq!(after.retry_after_ms, before.retry_after_ms);
+                assert_eq!(after.is_recoverable_hint, before.is_recoverable_hint);
+                assert!(!after.message.unwrap().contains("SECRET_BODY"));
+                let usage = pioneer_provider::usage::error_usage(&error).unwrap();
+                assert_eq!(usage.generation_id.as_deref(), Some("gen-native-header"));
+                assert_eq!(usage.input_tokens, None);
+                assert_eq!(usage.output_tokens, None);
+            }
+        }
+    }
+
     async fn failure_from_overridden_endpoint(
         provider_name: &'static str,
         status: u16,
@@ -1398,7 +1665,7 @@ mod tests {
             })
             .to_string();
             stream.write_all(format!(
-                "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nX-Generation-Id: gen-private-header\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             ).as_bytes()).await.unwrap();
         });
@@ -1426,6 +1693,11 @@ mod tests {
             provider.chat(request).await.err().unwrap()
         };
         server.await.unwrap();
+        if provider_name == "openrouter" {
+            let usage = pioneer_provider::usage::error_usage(&error).unwrap();
+            assert_eq!(usage.generation_id.as_deref(), Some("gen-private-header"));
+            assert_eq!(usage.input_tokens, None);
+        }
         assert!(!format!("{error:#?}").contains(secret));
         assert!(
             !error
@@ -1485,6 +1757,22 @@ mod tests {
                 false,
                 ProviderFailureClass::ProviderRejected,
                 false,
+            ),
+            (
+                "openrouter",
+                503,
+                "temporary upstream failure",
+                false,
+                ProviderFailureClass::Provider5xx,
+                true,
+            ),
+            (
+                "openrouter",
+                429,
+                "rate limit; retry-after: 3",
+                true,
+                ProviderFailureClass::RateLimit,
+                true,
             ),
             (
                 "openai",

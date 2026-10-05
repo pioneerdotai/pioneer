@@ -48,6 +48,28 @@ pub(crate) fn bounded_usage(value: &serde_json::Value) -> serde_json::Value {
     }
     serde_json::Value::Object(result)
 }
+/// Codex exec's documented reasoning field is profile-specific, not a Claude
+/// field. Keep both recognized native names as evidence; normalization prefers
+/// valid reasoning_output_tokens over legacy reasoning_tokens, never sums them.
+/// Invalid counters are discarded rather than converted to zero.
+pub(crate) fn bounded_codex_usage(value: &serde_json::Value) -> serde_json::Value {
+    let mut result = bounded_usage(value);
+    // Codex exec does not report Claude SDK cost estimates.
+    result.as_object_mut().unwrap().remove("total_cost_usd");
+    if let Some(count) = value["usage"]["reasoning_output_tokens"].as_u64() {
+        result["reasoning_output_tokens"] = count.into();
+    }
+    result
+}
+
+pub(crate) fn with_observed_usage(error: anyhow::Error, usage: serde_json::Value) -> anyhow::Error {
+    if usage.as_object().is_some_and(|m| !m.is_empty()) {
+        error.context(ObservedServiceUsage(usage))
+    } else {
+        error
+    }
+}
+
 #[cfg(test)]
 mod usage_tests {
     #[test]

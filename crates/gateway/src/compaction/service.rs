@@ -424,7 +424,13 @@ pub(crate) fn apply_cli_usage(
         observed.uncached_input_tokens = None;
     }
     observed.output_tokens = raw["output_tokens"].as_u64();
-    observed.reasoning_tokens = raw["reasoning_tokens"].as_u64();
+    // Native Codex reasoning is already included in output. Prefer the valid
+    // documented name, including zero; retain a valid legacy alias separately.
+    // Claude/other profiles do not acquire Codex field semantics.
+    let codex_reasoning = (observed.provider.as_deref() == Some("codex-cli"))
+        .then(|| raw["reasoning_output_tokens"].as_u64())
+        .flatten();
+    observed.reasoning_tokens = codex_reasoning.or_else(|| raw["reasoning_tokens"].as_u64());
     observed.semantics = Some(
         if claude {
             "exclusive_cache"
@@ -436,11 +442,112 @@ pub(crate) fn apply_cli_usage(
     observed.accounting = Some(
         serde_json::json!({"reported_cost":null,"sdk_estimated_cost":raw["total_cost_usd"].as_f64().filter(|_|claude).map(|amount|serde_json::json!({"amount":amount,"currency":"USD","provenance":"cli_sdk_price_table_estimate","source":"https://code.claude.com/docs/en/agent-sdk/cost-tracking","scope":"isolated_cli_summary_result","sdk_version":null})),"estimated_cost":null,"price_status":"external_cli_route_not_attested"}),
     );
+    if observed.provider.as_deref() == Some("codex-cli") {
+        let accounting = observed.accounting.as_mut().unwrap();
+        accounting["reasoning_source"] = if codex_reasoning.is_some() {
+            serde_json::json!("codex_exec.usage.reasoning_output_tokens")
+        } else if observed.reasoning_tokens.is_some() {
+            serde_json::json!("codex_exec.usage.reasoning_tokens")
+        } else {
+            serde_json::Value::Null
+        };
+        accounting["reasoning_alias_conflict"] =
+            match (codex_reasoning, raw["reasoning_tokens"].as_u64()) {
+                (Some(native), Some(legacy)) => serde_json::json!(native != legacy),
+                _ => serde_json::Value::Null,
+            };
+    }
     observed.raw_usage = Some(raw.clone());
 }
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn nonzero_terminal_usage_preserves_gateway_failure_contract() {
+        use pioneer_cli_agent_runtime::{
+            claude::service::ensure_process_outcome, codex::service::decode_exec_outcome,
+        };
+        let transcript = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"SECRET_SESSION\"}\n",
+            "{\"type\":\"turn.started\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"SECRET_SUMMARY\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":13,\"reasoning_output_tokens\":7}}\n"
+        );
+        let error = decode_exec_outcome(transcript.as_bytes(), false)
+            .err()
+            .unwrap();
+        let mut observed = pioneer_provider::TokenUsage {
+            provider: Some("codex-cli".into()),
+            ..Default::default()
+        };
+        super::apply_cli_usage(
+            &mut observed,
+            &error
+                .downcast_ref::<pioneer_cli_agent_runtime::service::ObservedServiceUsage>()
+                .unwrap()
+                .0,
+        );
+        let after = super::failure(error);
+        let before = super::failure(anyhow::anyhow!("Codex service process failed"));
+        assert_eq!(after.kind, before.kind);
+        assert_eq!(after.code, before.code);
+        assert_eq!(after.retry_after_ms, before.retry_after_ms);
+        let diagnostic = after.diagnostic.unwrap();
+        assert_eq!(diagnostic.stage, before.diagnostic.as_ref().unwrap().stage);
+        assert_eq!(diagnostic.code, "cli_process_failed");
+        assert!(
+            !serde_json::to_string(&diagnostic)
+                .unwrap()
+                .contains("SECRET")
+        );
+        assert_eq!(observed.output_tokens, Some(13));
+        assert_eq!(observed.reasoning_tokens, Some(7));
+        let terminal = serde_json::json!({"type":"result","error":{"type":"rate_limit_error","message":"SECRET"},"retry_after_ms":3000,"usage":{"input_tokens":10,"output_tokens":0},"total_cost_usd":0.2});
+        let error = ensure_process_outcome(terminal.to_string().as_bytes(), false)
+            .err()
+            .unwrap();
+        let mut observed = pioneer_provider::TokenUsage {
+            provider: Some("claude-cli".into()),
+            ..Default::default()
+        };
+        super::apply_cli_usage(
+            &mut observed,
+            &error
+                .downcast_ref::<pioneer_cli_agent_runtime::service::ObservedServiceUsage>()
+                .unwrap()
+                .0,
+        );
+        let after = super::failure(error);
+        let before = super::failure(
+            pioneer_cli_agent_runtime::service::ServiceFailure {
+                class: pioneer_protocol::ProviderFailureClass::RateLimit,
+                retry_after_ms: Some(3000),
+            }
+            .into(),
+        );
+        assert_eq!(after.kind, before.kind);
+        assert_eq!(after.code, before.code);
+        assert_eq!(after.retry_after_ms, Some(3000));
+        assert_eq!(
+            after.diagnostic.as_ref().unwrap().stage,
+            before.diagnostic.as_ref().unwrap().stage
+        );
+        assert_eq!(
+            after.diagnostic.as_ref().unwrap().code,
+            before.diagnostic.as_ref().unwrap().code
+        );
+        assert!(
+            !serde_json::to_string(&after.diagnostic.unwrap())
+                .unwrap()
+                .contains("SECRET")
+        );
+        assert_eq!(observed.output_tokens, Some(0));
+        assert_eq!(
+            observed.accounting.unwrap()["sdk_estimated_cost"]["amount"],
+            0.2
+        );
+    }
+
     #[test]
     fn cli_sdk_estimate_and_partial_error_counts_are_not_provider_billing() {
         let mut usage = pioneer_provider::TokenUsage {

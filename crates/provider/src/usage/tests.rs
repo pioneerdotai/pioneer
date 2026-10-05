@@ -546,3 +546,47 @@ fn unresolved_router_and_catalog_conditions_remain_unknown_through_context() {
         assert!(usage.accounting.unwrap()["estimated_cost"].is_null());
     }
 }
+
+#[test]
+fn usage_error_context_preserves_original_classification_source_and_typed_causes() {
+    let native = crate::ProviderHttpErrorBodyTooLarge {
+        status: 429,
+        limit: crate::ProviderResponseTooLarge::new("http_error_body", 1024, 1025),
+    };
+    let before = native.to_string();
+    let usage = crate::TokenUsage {
+        generation_id: Some("gen-header".into()),
+        ..Default::default()
+    };
+    let error = super::with_error_usage(native.into(), &usage);
+    let error = super::with_error_usage(error, &usage).context("safe service stage");
+    assert_eq!(super::classification_source(&error).to_string(), before);
+    assert_eq!(
+        error
+            .downcast_ref::<crate::ProviderHttpErrorBodyTooLarge>()
+            .unwrap()
+            .status,
+        429
+    );
+    assert_eq!(
+        super::error_usage(&error).unwrap().generation_id.as_deref(),
+        Some("gen-header")
+    );
+    assert_eq!(super::error_usage(&error).unwrap().input_tokens, None);
+    assert_eq!(error.to_string(), "safe service stage");
+    assert!(
+        !format!(
+            "{:?}",
+            error
+                .downcast_ref::<super::ObservedProviderUsage>()
+                .unwrap()
+        )
+        .contains("gen-header")
+    );
+    // Redaction creates a new source and does not revive the discarded original.
+    let redacted = super::with_error_usage(anyhow::anyhow!("safe endpoint failure"), &usage);
+    assert_eq!(
+        super::classification_source(&redacted).to_string(),
+        "safe endpoint failure"
+    );
+}
