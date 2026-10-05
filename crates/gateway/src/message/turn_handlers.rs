@@ -1202,6 +1202,44 @@ impl MessageProcessor {
             phase: "prepared".into(),
             ..Default::default()
         };
+        // This is the native operational projection, not a second resolver.
+        // Disabled/unavailable installed members are omitted from input leaves;
+        // trust/security/dependencies are resolved with the real MCP projection
+        // later, and only that resolver's bindings become the ready snapshot.
+        let plugin_skill_projection = if capabilities
+            .iter()
+            .any(|c| matches!(c.kind, TurnCapabilityKind::Plugin { .. }))
+        {
+            let context = self
+                .skills_runtime_context(workspace_id)
+                .map_err(|_| TurnStartFailure::unavailable("skill projection unavailable"))?;
+            let catalog = self
+                .load_skills_catalog(workspace_id, &context)
+                .await
+                .map_err(|_| TurnStartFailure::unavailable("skill projection unavailable"))?;
+            let policies = self
+                .crud_store
+                .list_workspace_skill_policies(workspace_id)
+                .await
+                .map_err(|_| TurnStartFailure::unavailable("skill projection unavailable"))?;
+            let policy_set = self.build_policy_set(&catalog.skills, &policies, &context);
+            catalog
+                .skills
+                .iter()
+                .map(|s| {
+                    (
+                        s.identity.skill_id.clone(),
+                        super::skills::member_skill_is_operationally_visible(
+                            s,
+                            &pioneer_skills::effective_policy_for_skill(s, &policy_set),
+                            true,
+                        ),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
 
         for capability in capabilities {
             match &capability.kind {
@@ -1321,8 +1359,17 @@ impl MessageProcessor {
                                 "plugin expansion limit exceeded",
                             ));
                         }
-                        plugin_capability_ids.insert(leaf.id.clone());
-                        leaves.push(leaf);
+                        let eligible = match &leaf.kind {
+                            TurnCapabilityKind::Skill { skill_id, .. } => plugin_skill_projection
+                                .get(skill_id)
+                                .copied()
+                                .unwrap_or(false),
+                            _ => true,
+                        };
+                        if eligible {
+                            plugin_capability_ids.insert(leaf.id.clone());
+                            leaves.push(leaf);
+                        }
                     }
                     plugin_selection
                         .parents

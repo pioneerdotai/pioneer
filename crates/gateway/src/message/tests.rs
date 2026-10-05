@@ -1333,14 +1333,19 @@ fn plugin_turn_normalization_keeps_parent_and_rejects_raw_owned_skill() {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let harness = setup_cli_runtime_security_harness(None).await;
         let parent_id = "P".repeat(21);
+        let fixture = unique_temp_dir("plugin-normalization");
+        let package = fixture.join("package");
+        let member = package.join("skills/bundled");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("SKILL.md"), "---\nname: bundled\ndescription: Bundled regression skill\n---\nInstructions\n").unwrap();
         let now = chrono::Utc::now().fixed_offset();
         harness.crud_store.insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
-            id: parent_id.clone(), workspace_id: harness.workspace_id.clone(), name: "authoritative-name".into(), version: None, source_upload_id: "upload-plugin".into(), package_path: "/managed/package".into(), data_path: "/managed/data".into(), package_fingerprint: "tree".into(), enabled: true, state: "installing".into(), revision: 1, pending_json: None, last_error: None, created_at: now, updated_at: now,
+            id: parent_id.clone(), workspace_id: harness.workspace_id.clone(), name: "authoritative-name".into(), version: None, source_upload_id: "upload-plugin".into(), package_path: package.to_string_lossy().into(), data_path: fixture.join("data").to_string_lossy().into(), package_fingerprint: "tree".into(), enabled: true, state: "installing".into(), revision: 1, pending_json: None, last_error: None, created_at: now, updated_at: now,
         }).await.unwrap();
         let selected = pioneer_protocol::TurnCapability { id: pioneer_protocol::plugin_capability_key(&parent_id), label: Some("untrusted-label".into()), kind: pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id: parent_id.clone(), expected_revision: 1 } };
         assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[selected.clone()]).await.is_err());
         let skill_id = pioneer_protocol::SkillId::new("S".repeat(21)).unwrap();
-        let child = pioneer_crud::SkillInstallationRecord { skill_id: skill_id.clone(), owner: None, slug: "bundled".into(), version: None, source_kind: "user".into(), scope_key: harness.workspace_id.clone(), source_ref: "plugin".into(), install_path: "/managed/skills/bundled".into(), trust_level: "community".into(), fingerprint: "member".into(), updated_at_unix: 1, pack_id: None, pack_member_key: None };
+        let child = pioneer_crud::SkillInstallationRecord { skill_id: skill_id.clone(), owner: None, slug: "bundled".into(), version: None, source_kind: "user".into(), scope_key: harness.workspace_id.clone(), source_ref: "plugin".into(), install_path: member.to_string_lossy().into(), trust_level: "community".into(), fingerprint: "member".into(), updated_at_unix: 1, pack_id: None, pack_member_key: None };
         let policy = pioneer_crud::WorkspaceSkillPolicyRecord { id: "policy-plugin".into(), workspace_id: harness.workspace_id.clone(), skill_id: skill_id.clone(), enabled: Some(true), allow_implicit_invocation: Some(false) };
         harness.crud_store.install_skill_lifecycle_with_ownership(&child, &policy, &[], None, Some(&pioneer_crud::PluginOwnershipWrite { plugin_id: parent_id.clone(), expected_revision: 1, member_key: "bundled".into(), member_path: Some("skills/bundled".into()), package_fingerprint: "member".into(), child_id: skill_id.to_string() }), 1).await.unwrap();
         harness.crud_store.settle_plugin_installation(&parent_id, 1, "installed", None).await.unwrap();
@@ -1354,8 +1359,321 @@ fn plugin_turn_normalization_keeps_parent_and_rejects_raw_owned_skill() {
         assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &result.execution).await.is_err());
         let mut stale = selected.clone(); stale.kind = pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id: parent_id, expected_revision: 2 };
         assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[stale]).await.is_err());
+        let mut disabled = policy.clone(); disabled.enabled = Some(false);
+        harness.crud_store.upsert_workspace_skill_policy(&disabled, 2).await.unwrap();
+        let excluded = harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[selected.clone()]).await.unwrap();
+        assert_eq!(excluded.presentation.len(), 1);
+        assert!(excluded.execution.is_empty());
+        assert_eq!(excluded.plugin_selection.unwrap().children.len(), 1, "structural candidate identity is retained until native preparation commits");
         assert!(harness.processor.normalize_turn_skill_capabilities("foreign", &[selected]).await.is_err());
+        std::fs::remove_dir_all(fixture).unwrap();
     });
+}
+
+// B-03 regression source: real native list projections and both plugin RPCs.
+// NOT_RUN / NOT_COMPILED. Installation records are fixtures, no MCP is started.
+#[tokio::test]
+async fn plugins_list_and_details_preserve_native_member_disclosure() {
+    use sea_orm::ConnectionTrait;
+    let mut harness = setup_cli_runtime_security_harness(None).await;
+    let fixture = unique_temp_dir("plugin-disclosure");
+    let package = fixture.join("package");
+    let parent_id = "P".repeat(21);
+    let now = chrono::Utc::now().fixed_offset();
+    let parent = pioneer_entity::plugin_installation::Model {
+        id: parent_id.clone(),
+        workspace_id: harness.workspace_id.clone(),
+        name: "fixture".into(),
+        version: None,
+        source_upload_id: "disclosure-upload".into(),
+        package_path: package.to_string_lossy().into(),
+        data_path: fixture.join("data").to_string_lossy().into(),
+        package_fingerprint: "tree".into(),
+        enabled: true,
+        state: "installing".into(),
+        revision: 1,
+        pending_json: None,
+        last_error: None,
+        created_at: now,
+        updated_at: now,
+    };
+    harness
+        .crud_store
+        .insert_plugin_installation(&parent)
+        .await
+        .unwrap();
+    let allowed_skill = pioneer_protocol::SkillId::new("A".repeat(21)).unwrap();
+    let hidden_skill = pioneer_protocol::SkillId::new("D".repeat(21)).unwrap();
+    for (id, key, enabled) in [
+        (&allowed_skill, "allowed-skill", true),
+        (&hidden_skill, "secret-disabled-skill", false),
+    ] {
+        let dir = package.join("skills").join(key);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {key}\ndescription: {key} description\n---\nInstructions\n"),
+        )
+        .unwrap();
+        let row = pioneer_crud::SkillInstallationRecord {
+            skill_id: id.clone(),
+            owner: None,
+            slug: key.into(),
+            version: None,
+            source_kind: "user".into(),
+            scope_key: harness.workspace_id.clone(),
+            source_ref: "plugin".into(),
+            install_path: dir.to_string_lossy().into(),
+            trust_level: "community".into(),
+            fingerprint: "member".into(),
+            updated_at_unix: 1,
+            pack_id: None,
+            pack_member_key: None,
+        };
+        harness
+            .crud_store
+            .install_skill_lifecycle_with_ownership(
+                &row,
+                &pioneer_crud::WorkspaceSkillPolicyRecord {
+                    id: format!("policy-{id}"),
+                    workspace_id: harness.workspace_id.clone(),
+                    skill_id: id.clone(),
+                    enabled: Some(enabled),
+                    allow_implicit_invocation: Some(false),
+                },
+                &[],
+                None,
+                Some(&pioneer_crud::PluginOwnershipWrite {
+                    plugin_id: parent_id.clone(),
+                    expected_revision: 1,
+                    member_key: key.into(),
+                    member_path: Some(format!("skills/{key}")),
+                    package_fingerprint: "member".into(),
+                    child_id: id.to_string(),
+                }),
+                1,
+            )
+            .await
+            .unwrap();
+    }
+    let allowed_mcp = "M".repeat(21);
+    let hidden_mcp = "N".repeat(21);
+    for (id, key, enabled) in [
+        (&allowed_mcp, "allowed-mcp", true),
+        (&hidden_mcp, "secret-disabled-mcp", false),
+    ] {
+        let row = pioneer_crud::McpServerInstallationRecord {
+            id: Some(id.clone()),
+            scope_kind: "workspace".into(),
+            scope_key: harness.workspace_id.clone(),
+            name: format!(
+                "pplugin_fixture_{}",
+                if enabled { "allowed" } else { "disabled" }
+            ),
+            display_name: None,
+            source_kind: "config".into(),
+            source_ref: "{}".into(),
+            transport_kind: "stdio".into(),
+            transport_json: serde_json::to_string(&pioneer_mcp::McpTransportConfig::Stdio {
+                command: "unused-fixture-command".into(),
+                args: vec![],
+                cwd: None,
+                env: Default::default(),
+                startup_timeout_ms: 5000,
+                tool_timeout_ms: 5000,
+            })
+            .unwrap(),
+            auth_json: serde_json::to_string(&pioneer_mcp::McpAuthConfig::default()).unwrap(),
+            secret_refs_json: "[]".into(),
+            enabled,
+            allow_implicit_invocation: false,
+            required: false,
+            fingerprint: "native".into(),
+            updated_at_unix: 1,
+        };
+        harness
+            .crud_store
+            .upsert_mcp_server_installation_with_audit_and_ownership(
+                &row,
+                &pioneer_crud::McpAuditEventRecord {
+                    turn_id: None,
+                    server_installation_id: None,
+                    server_name: row.name.clone(),
+                    raw_tool_name: None,
+                    callable_name: None,
+                    catalog_version: None,
+                    action: "install".into(),
+                    decision: "allowed".into(),
+                    reason_code: None,
+                    details_json: "{}".into(),
+                    created_at_unix: 1,
+                },
+                Some(&pioneer_crud::PluginOwnershipWrite {
+                    plugin_id: parent_id.clone(),
+                    expected_revision: 1,
+                    member_key: key.into(),
+                    member_path: Some("mcp.json".into()),
+                    package_fingerprint: "member".into(),
+                    child_id: id.clone(),
+                }),
+                1,
+            )
+            .await
+            .unwrap();
+    }
+    harness
+        .crud_store
+        .record_plugin_component_failure(
+            &pioneer_crud::PluginOwnershipWrite {
+                plugin_id: parent_id.clone(),
+                expected_revision: 1,
+                member_key: "secret-failed-skill".into(),
+                member_path: Some("skills/secret-failed-skill".into()),
+                package_fingerprint: "member".into(),
+                child_id: "F".repeat(21),
+            },
+            "skill",
+            "component_install_failed",
+        )
+        .await
+        .unwrap();
+    harness.crud_store.settle_plugin_installation(&parent_id, 1, "installed", Some(json!([
+        {"code":"denied_path","path":"skills/secret-disabled-skill/assets","message":"secret-disabled-skill needs attention"},
+        {"code":"invalid_mcp","path":"mcp.json#/mcpServers/secret-disabled-mcp","message":"secret-disabled-mcp needs attention"},
+    ]).to_string())).await.unwrap();
+    harness.crud_store.database_connection().execute_unprepared(&format!(
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at) \
+         VALUES('plugin-disclosure-thread','{}','','chat','test','test','active','user','visible','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", harness.workspace_id
+    )).await.unwrap();
+    materialize_test_member_collaborator(
+        &harness.crud_store,
+        &harness.workspace_id,
+        "plugin-disclosure-thread",
+    )
+    .await;
+    let (tx, mut member_rx) = mpsc::channel(32);
+    let member_connection = harness
+        .processor
+        .session_manager
+        .register_connection(tx, authenticated_test_member_collaborator())
+        .await
+        .unwrap();
+    harness
+        .processor
+        .session_manager
+        .set_connection_workspace(member_connection, Some(harness.workspace_id.clone()))
+        .await;
+    for (connection, rx, administrator) in [
+        (harness.connection_id, &mut harness.rx, true),
+        (member_connection, &mut member_rx, false),
+    ] {
+        let skills_id = generate_test_request_id("plugdisc", "skills");
+        let context =
+            registered_request_context(&harness.processor, connection, "skills/list").await;
+        harness
+            .processor
+            .skills_list(
+                &context,
+                serde_json::from_value(json!(skills_id)).unwrap(),
+                pioneer_protocol::SkillListParams {
+                    workspace_id: harness.workspace_id.clone(),
+                    include_health: true,
+                    include_policy: true,
+                },
+            )
+            .await;
+        let skills: pioneer_protocol::SkillListResponse =
+            serde_json::from_value(recv_response_by_id(rx, &skills_id).await.result).unwrap();
+        assert!(skills.skills.iter().any(|s| s.skill_id == allowed_skill));
+        assert_eq!(
+            skills.skills.iter().any(|s| s.skill_id == hidden_skill),
+            administrator
+        );
+        let mcp_id = generate_test_request_id("plugdisc", "mcp");
+        let context = registered_request_context(&harness.processor, connection, "mcp/list").await;
+        harness
+            .processor
+            .mcp_list(
+                &context,
+                serde_json::from_value(json!(mcp_id)).unwrap(),
+                pioneer_protocol::McpListParams {
+                    workspace_id: harness.workspace_id.clone(),
+                },
+            )
+            .await;
+        let mcp: pioneer_protocol::McpListResponse =
+            serde_json::from_value(recv_response_by_id(rx, &mcp_id).await.result).unwrap();
+        assert!(mcp.servers.iter().any(|s| s.id == allowed_mcp));
+        assert_eq!(
+            mcp.servers.iter().any(|s| s.id == hidden_mcp),
+            administrator
+        );
+        for method in ["plugins/list", "plugins/details"] {
+            let id = generate_test_request_id("plugdisc", method);
+            let context = registered_request_context(&harness.processor, connection, method).await;
+            let params = if method == "plugins/details" {
+                json!({"workspace_id":harness.workspace_id,"plugin_id":parent_id})
+            } else {
+                json!({"workspace_id":harness.workspace_id})
+            };
+            harness
+                .processor
+                .plugins_request(
+                    &context,
+                    serde_json::from_value(
+                        json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+                    )
+                    .unwrap(),
+                )
+                .await;
+            let value = recv_response_by_id(rx, &id).await.result;
+            let item: pioneer_protocol::PluginItem = if method == "plugins/list" {
+                serde_json::from_value::<pioneer_protocol::PluginsListResponse>(value)
+                    .unwrap()
+                    .plugins
+                    .into_iter()
+                    .find(|p| p.id == parent_id)
+                    .unwrap()
+            } else {
+                serde_json::from_value(value).unwrap()
+            };
+            assert_eq!(item.components.len(), if administrator { 5 } else { 2 });
+            assert!(
+                item.components
+                    .iter()
+                    .any(|c| c.skill_id.as_ref() == Some(&allowed_skill))
+            );
+            assert!(
+                item.components
+                    .iter()
+                    .any(|c| c.mcp_installation_id.as_ref() == Some(&allowed_mcp))
+            );
+            let encoded = serde_json::to_string(&item).unwrap();
+            if administrator {
+                assert!(encoded.contains("secret-disabled-skill"));
+                assert!(encoded.contains("secret-failed-skill"));
+                assert!(encoded.contains("secret-disabled-mcp"));
+            } else {
+                for hidden in [
+                    hidden_skill.as_str(),
+                    hidden_mcp.as_str(),
+                    "secret-disabled-skill",
+                    "secret-disabled-mcp",
+                    "secret-failed-skill",
+                    "mcp.json",
+                    "skills/",
+                ] {
+                    assert!(
+                        !encoded.contains(hidden),
+                        "hidden child must not leak through any response field: {hidden}"
+                    );
+                }
+                assert_eq!(item.diagnostics.len(), 1);
+                assert!(item.diagnostics[0].path.is_empty());
+            }
+        }
+    }
+    std::fs::remove_dir_all(fixture).unwrap();
 }
 
 #[test]

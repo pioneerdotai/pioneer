@@ -101,6 +101,174 @@ fn mcp_audit(row: &McpServerInstallationRecord) -> McpAuditEventRecord {
         created_at_unix: 1,
     }
 }
+
+// B-02: native resolver output is supplied separately from durable bindings.
+// Missing bindings for selected leaves remain a commit failure; exclusions do
+// not turn installed siblings into an all-or-nothing dependency.
+#[tokio::test]
+async fn plugin_ready_keeps_resolved_siblings_and_rejects_real_missing_bindings() {
+    use pioneer_protocol::{PluginSelectedChild, PluginSelectedParent, PluginSelectionSnapshot};
+    let store = test_store_with_workspace("ws").await;
+    let parent_id = "P".repeat(21);
+    store
+        .insert_plugin_installation(&parent(&parent_id, "ws"))
+        .await
+        .unwrap();
+    let allowed = skill('A', "ws");
+    let disabled = skill('D', "ws");
+    for (row, enabled) in [(&allowed, true), (&disabled, false)] {
+        let mut restriction = policy(row);
+        restriction.enabled = Some(enabled);
+        store
+            .install_skill_lifecycle_with_ownership(
+                row,
+                &restriction,
+                &[],
+                None,
+                Some(&ownership(
+                    &parent_id,
+                    row.skill_id.as_str(),
+                    &row.skill_id.to_string(),
+                )),
+                1,
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .settle_plugin_installation(&parent_id, 1, "installed", None)
+        .await
+        .unwrap();
+    store.database_connection().execute_unprepared(
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at) \
+         VALUES('thread','ws','','chat','test','test','active','user','visible','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP); \
+         INSERT INTO turn(id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at) \
+         VALUES('turn','thread','in_progress','{}','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);"
+    ).await.unwrap();
+    let prepared = PluginSelectionSnapshot {
+        parents: vec![PluginSelectedParent {
+            id: parent_id.clone(),
+            revision: 1,
+        }],
+        children: [&allowed, &disabled]
+            .iter()
+            .map(|row| PluginSelectedChild {
+                kind: "skill".into(),
+                id: row.skill_id.to_string(),
+                parent_id: parent_id.clone(),
+            })
+            .collect(),
+        phase: "prepared".into(),
+    };
+    store
+        .prepare_plugin_selection("turn", &prepared)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .ready_plugin_selection("turn", &[allowed.skill_id.clone()])
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.get_plugin_selection("turn").await.unwrap().unwrap(),
+        prepared
+    );
+    store
+        .replace_turn_skill_bindings(
+            "turn",
+            &[TurnSkillBindingRecord {
+                skill_id: allowed.skill_id.clone(),
+                skill_owner: allowed.owner.clone(),
+                skill_slug: allowed.slug.clone(),
+                skill_version: None,
+                fingerprint: allowed.fingerprint.clone(),
+                source_kind: allowed.source_kind.clone(),
+                resolved_reason: "explicit_capability".into(),
+            }],
+            1,
+        )
+        .await
+        .unwrap();
+    store
+        .database_connection()
+        .execute_unprepared(
+            "CREATE TRIGGER fail_plugin_ready BEFORE UPDATE OF plugin_selection_json ON turn \
+         BEGIN SELECT RAISE(ABORT,'fixture ready write failure'); END;",
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .ready_plugin_selection("turn", &[allowed.skill_id.clone()])
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.get_plugin_selection("turn").await.unwrap().unwrap(),
+        prepared
+    );
+    store
+        .database_connection()
+        .execute_unprepared("DROP TRIGGER fail_plugin_ready")
+        .await
+        .unwrap();
+    store
+        .ready_plugin_selection("turn", &[allowed.skill_id.clone()])
+        .await
+        .unwrap();
+    let ready = store.get_plugin_selection("turn").await.unwrap().unwrap();
+    assert_eq!(ready.phase, "ready");
+    assert_eq!(ready.children, vec![prepared.children[0].clone()]);
+    assert!(
+        store
+            .plugin_turn_child_available("turn", "skill", allowed.skill_id.as_str(), "ws")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .plugin_turn_child_available("turn", "skill", disabled.skill_id.as_str(), "ws")
+            .await
+            .unwrap()
+    );
+    // All-excluded is a valid parent selection, with no execution permission.
+    store
+        .prepare_plugin_selection("turn", &prepared)
+        .await
+        .unwrap();
+    store
+        .replace_turn_skill_bindings("turn", &[], 2)
+        .await
+        .unwrap();
+    store.ready_plugin_selection("turn", &[]).await.unwrap();
+    assert!(
+        store
+            .get_plugin_selection("turn")
+            .await
+            .unwrap()
+            .unwrap()
+            .children
+            .is_empty()
+    );
+    // A foreign identity is never excused by being absent from resolver output.
+    let mut foreign = prepared.clone();
+    foreign.children[1].id = "F".repeat(21);
+    store
+        .prepare_plugin_selection("turn", &foreign)
+        .await
+        .unwrap();
+    assert!(store.ready_plugin_selection("turn", &[]).await.is_err());
+    assert_eq!(
+        store
+            .get_plugin_selection("turn")
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        "prepared"
+    );
+}
 #[tokio::test]
 async fn native_skill_policy_audit_and_ownership_commit_together_without_upload() {
     let store = test_store_with_workspace("ws").await;

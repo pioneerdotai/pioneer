@@ -1,5 +1,17 @@
 use super::*;
 
+pub(in crate::message) fn mcp_installation_is_disclosed(
+    principal: &crate::auth::AuthenticatedSessionPrincipal,
+    id: &str,
+    enabled: bool,
+) -> bool {
+    let authorization = crate::authorization::AuthorizationService::new();
+    (authorization.role_disclosure_policy(principal.kind, principal.role_key.as_ref())
+        != Some(crate::authorization::RoleDisclosurePolicy::Collaborator)
+        || enabled)
+        && authorization.mcp_server_allowed(principal.kind, principal.role_key.as_ref(), id)
+}
+
 impl MessageProcessor {
     pub(crate) async fn mcp_list(
         &self,
@@ -50,10 +62,6 @@ impl MessageProcessor {
             .mcp_service
             .runtime_snapshot("workspace", workspace_id.as_str())
             .await;
-        let member = crate::authorization::AuthorizationService::new().role_disclosure_policy(
-            request_context.principal().kind,
-            request_context.principal().role_key.as_ref(),
-        ) == Some(crate::authorization::RoleDisclosurePolicy::Collaborator);
         let mut servers = Vec::with_capacity(rows.len());
         for row in &rows {
             let catalog = match row.id.as_deref() {
@@ -105,13 +113,10 @@ impl MessageProcessor {
             // Discovery for an ordinary workspace member is a catalog of
             // usable capabilities, not a management inventory. Disabled
             // installations remain visible only to Gateway administrators.
-            if member && !item.policy.enabled {
-                continue;
-            }
-            if !crate::authorization::AuthorizationService::new().mcp_server_allowed(
-                request_context.principal().kind,
-                request_context.principal().role_key.as_ref(),
+            if !mcp_installation_is_disclosed(
+                request_context.principal(),
                 item.id.as_str(),
+                item.policy.enabled,
             ) {
                 continue;
             }

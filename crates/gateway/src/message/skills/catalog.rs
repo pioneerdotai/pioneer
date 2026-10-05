@@ -65,7 +65,7 @@ fn projected_skill_policy_state(
     }
 }
 
-fn member_skill_is_operationally_visible(
+pub(in crate::message) fn member_skill_is_operationally_visible(
     skill: &pioneer_skills::SkillDefinition,
     effective_policy: &pioneer_skills::EffectiveSkillPolicy,
     installed_in_workspace: bool,
@@ -73,6 +73,22 @@ fn member_skill_is_operationally_visible(
     skill.is_available()
         && effective_policy.enabled
         && (matches!(skill.identity.source_kind, SkillSourceKind::System) || installed_in_workspace)
+}
+
+pub(in crate::message) fn skill_is_disclosed(
+    principal: &crate::auth::AuthenticatedSessionPrincipal,
+    skill: &pioneer_skills::SkillDefinition,
+    effective_policy: &pioneer_skills::EffectiveSkillPolicy,
+    installed_in_workspace: bool,
+) -> bool {
+    let authorization = crate::authorization::AuthorizationService::new();
+    authorization.skill_allowed(
+        principal.kind,
+        principal.role_key.as_ref(),
+        skill.identity.skill_id.as_str(),
+    ) && (authorization.role_disclosure_policy(principal.kind, principal.role_key.as_ref())
+        != Some(crate::authorization::RoleDisclosurePolicy::Collaborator)
+        || member_skill_is_operationally_visible(skill, effective_policy, installed_in_workspace))
 }
 
 #[cfg(test)]
@@ -718,16 +734,12 @@ impl MessageProcessor {
             .skills
             .iter()
             .filter(|skill| {
-                crate::authorization::AuthorizationService::new().skill_allowed(
-                    request_context.principal().kind,
-                    request_context.principal().role_key.as_ref(),
-                    skill.identity.skill_id.as_str(),
-                ) && (!member
-                    || member_skill_is_operationally_visible(
-                        skill,
-                        &effective_policy_for_skill(skill, &policy_set),
-                        installation_by_id.contains_key(&skill.identity.skill_id),
-                    ))
+                skill_is_disclosed(
+                    request_context.principal(),
+                    skill,
+                    &effective_policy_for_skill(skill, &policy_set),
+                    installation_by_id.contains_key(&skill.identity.skill_id),
+                )
             })
             .map(|skill| {
                 let installation = installation_by_id.get(&skill.identity.skill_id);

@@ -177,7 +177,7 @@ impl MessageProcessor {
                 let mut plugins = Vec::with_capacity(parents.len());
                 for parent in parents {
                     plugins.push(
-                        self.plugin_item(&parent)
+                        self.plugin_item(context, &parent)
                             .await
                             .map_err(|_| plugin_error(id, "plugins.inventory_failed"))?,
                     );
@@ -195,7 +195,9 @@ impl MessageProcessor {
                     .filter(|p| p.workspace_id == workspace)
                     .ok_or_else(invalid)?;
                 Ok(json!(
-                    self.plugin_item(&parent).await.map_err(|_| invalid())?
+                    self.plugin_item(context, &parent)
+                        .await
+                        .map_err(|_| invalid())?
                 ))
             }
             methods::PLUGINS_PREVIEW | methods::PLUGINS_INSTALL => {
@@ -221,7 +223,9 @@ impl MessageProcessor {
                         return Err(invalid());
                     }
                     return Ok(json!(
-                        self.plugin_item(&parent).await.map_err(|_| invalid())?
+                        self.plugin_item(context, &parent)
+                            .await
+                            .map_err(|_| invalid())?
                     ));
                 }
                 let runtime = self
@@ -273,7 +277,9 @@ impl MessageProcessor {
                         {
                             Err(invalid())
                         } else {
-                            self.plugin_item(&parent).await.map_err(|_| invalid())
+                            self.plugin_item(context, &parent)
+                                .await
+                                .map_err(|_| invalid())
                         }
                     } else {
                         self.install_plugin(
@@ -488,7 +494,10 @@ impl MessageProcessor {
             .await
             .map_err(|_| error())?
             .ok_or_else(error)?;
-        let item = self.plugin_item(&parent).await.map_err(|_| error())?;
+        let item = self
+            .plugin_item(context, &parent)
+            .await
+            .map_err(|_| error())?;
         self.send_gateway_management_notification(
             methods::PLUGINS_CHANGED,
             &PluginsChangedNotification {
@@ -503,37 +512,151 @@ impl MessageProcessor {
 
     async fn plugin_item(
         &self,
+        context: &RequestContext,
         parent: &pioneer_entity::plugin_installation::Model,
     ) -> anyhow::Result<PluginItem> {
         let links = self.crud_store.list_plugin_components(&parent.id).await?;
+        let member = crate::authorization::AuthorizationService::new().role_disclosure_policy(
+            context.principal().kind,
+            context.principal().role_key.as_ref(),
+        ) != Some(crate::authorization::RoleDisclosurePolicy::Administrative);
+        let mut skills = std::collections::HashMap::new();
+        if links.iter().any(|l| l.kind == "skill") {
+            let runtime = self.skills_runtime_context(&parent.workspace_id)?;
+            let catalog = self
+                .load_skills_catalog(&parent.workspace_id, &runtime)
+                .await?;
+            let policies = self
+                .crud_store
+                .list_workspace_skill_policies(&parent.workspace_id)
+                .await?;
+            let policies = self.build_policy_set(&catalog.skills, &policies, &runtime);
+            let installations = self.crud_store.list_skill_installations().await?;
+            let refs = catalog
+                .skills
+                .iter()
+                .map(|s| pioneer_skills::SkillExplicitRef {
+                    skill_id: s.identity.skill_id.clone(),
+                    label: None,
+                })
+                .collect::<Vec<_>>();
+            let resolution = pioneer_skills::resolve_skills(pioneer_skills::SkillResolutionInput {
+                explicit_refs: &refs,
+                touched_paths: &[],
+                catalog: &catalog,
+                policy_set: &policies,
+                validation_policy: runtime.validation_policy,
+                dependency_input: &pioneer_skills::DependencyCheckInput::baseline(),
+            });
+            for skill in &catalog.skills {
+                let policy = pioneer_skills::effective_policy_for_skill(skill, &policies);
+                let installed = installations.iter().any(|i| {
+                    i.scope_key == parent.workspace_id && i.skill_id == skill.identity.skill_id
+                });
+                let visible = super::skills::skill_is_disclosed(
+                    context.principal(),
+                    skill,
+                    &policy,
+                    installed,
+                );
+                let status = if !skill.is_available() {
+                    "unavailable"
+                } else if !policy.enabled {
+                    "disabled"
+                } else if resolution
+                    .active
+                    .iter()
+                    .any(|a| a.skill_id == skill.identity.skill_id)
+                {
+                    "active"
+                } else {
+                    "blocked"
+                };
+                skills.insert(
+                    skill.identity.skill_id.to_string(),
+                    (visible, status.to_owned()),
+                );
+            }
+        }
+        let mcp = self
+            .crud_store
+            .list_mcp_server_installations("workspace", &parent.workspace_id)
+            .await?;
         let runtime = self
             .mcp_service
             .runtime_snapshot("workspace", &parent.workspace_id)
             .await;
         let mut components = Vec::with_capacity(links.len());
+        let mut hidden = false;
         for link in links {
+            let visible = match link.kind.as_str() {
+                "skill" => link
+                    .skill_id
+                    .as_ref()
+                    .and_then(|id| skills.get(id))
+                    .map(|s| s.0)
+                    .unwrap_or(!member),
+                "mcp" => link
+                    .mcp_installation_id
+                    .as_ref()
+                    .and_then(|id| mcp.iter().find(|r| r.id.as_ref() == Some(id)))
+                    .map(|row| {
+                        super::mcp::mcp_installation_is_disclosed(
+                            context.principal(),
+                            row.id.as_deref().unwrap(),
+                            row.enabled,
+                        )
+                    })
+                    .unwrap_or(!member),
+                _ => !member,
+            };
+            if !visible {
+                hidden = true;
+                continue;
+            }
             let runtime_status = if let Some(id) = &link.mcp_installation_id {
-                runtime
-                    .get(id)
-                    .map(|state| format!("{:?}", state.state).to_ascii_lowercase())
+                if mcp.iter().any(|r| r.id.as_ref() == Some(id) && !r.enabled) {
+                    Some("disabled".into())
+                } else {
+                    runtime
+                        .get(id)
+                        .map(|state| format!("{:?}", state.state).to_ascii_lowercase())
+                }
             } else {
-                None
+                link.skill_id
+                    .as_ref()
+                    .and_then(|id| skills.get(id))
+                    .map(|s| s.1.clone())
             };
             components.push(PluginComponentItem {
                 kind: link.kind,
                 member_key: link.member_key,
                 status: link.status,
-                diagnostic: link.diagnostic,
+                diagnostic: if member { None } else { link.diagnostic },
                 skill_id: link.skill_id.map(SkillId::new).transpose()?,
                 mcp_installation_id: link.mcp_installation_id,
                 runtime_status,
             });
         }
-        let diagnostics: Vec<PluginDiagnostic> = parent
+        let mut diagnostics: Vec<PluginDiagnostic> = parent
             .last_error
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default();
+        // Package pointers can name a hidden child even when its ID is removed.
+        // Members receive only a neutral parent notice; management retains the
+        // complete authored inventory and package diagnostics.
+        if member {
+            let unavailable = hidden || !diagnostics.is_empty();
+            diagnostics.clear();
+            if unavailable {
+                diagnostics.push(PluginDiagnostic {
+                    code: "components_unavailable".into(),
+                    path: String::new(),
+                    message: "Some components are unavailable".into(),
+                });
+            }
+        }
         let partial = diagnostics.iter().any(|d| {
             !matches!(
                 d.code.as_str(),

@@ -55,7 +55,7 @@ const SKILLS_WATCH_DEBOUNCE_MS: u64 = 1_500;
 #[derive(Clone)]
 pub(crate) struct SkillsRuntimeContext {
     catalog_params: SkillCatalogLoadParams,
-    validation_policy: SkillValidationPolicy,
+    pub(in crate::message) validation_policy: SkillValidationPolicy,
     security_policy: SkillSecurityPolicy,
     global_policy_defaults: SkillPolicy,
     user_root: PathBuf,
@@ -73,6 +73,7 @@ pub(crate) struct SkillsRuntimeContext {
 }
 
 mod catalog;
+pub(in crate::message) use catalog::{member_skill_is_operationally_visible, skill_is_disclosed};
 mod lifecycle;
 mod policy;
 mod storage_relocation;

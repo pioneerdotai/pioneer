@@ -288,3 +288,13 @@ pub async fn has_skill_binding<C: ConnectionTrait>(
         .await?
         .is_some())
 }
+
+pub async fn has_mcp_binding<C: ConnectionTrait>(db: &C, turn: &str, server: &str) -> Result<bool> {
+    use pioneer_entity::turn_mcp_binding as binding;
+    Ok(binding::Entity::find()
+        .filter(binding::Column::TurnId.eq(turn))
+        .filter(binding::Column::ServerInstallationId.eq(server))
+        .one(db)
+        .await?
+        .is_some())
+}

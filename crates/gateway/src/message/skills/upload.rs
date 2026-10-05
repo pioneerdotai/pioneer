@@ -1701,11 +1701,23 @@ fn extract_archive_with_purpose(
         ensure_materialized_path_contained(cleanup_root.as_path(), target_path.as_path())?;
     }
 
-    // Links are created only after all writes, so archive links can never
-    // redirect extraction. Snapshot capture follows only contained links and
-    // normalizes them into regular files for the genuine native installer.
+    // Reject the entire link topology before the first link write. Deferring
+    // links protects regular writes, but a link must not become an ancestor
+    // of a later link (or of an implicit parent directory).
+    let link_paths: HashSet<_> = links.iter().map(|(path, _)| path.as_path()).collect();
+    for relative in &seen_paths {
+        let path = cleanup_root.join(relative);
+        for ancestor in path.ancestors().skip(1) {
+            if link_paths.contains(ancestor) {
+                bail!("archive symlink overlaps descendant entry");
+            }
+        }
+    }
+    // Snapshot capture follows only contained links and normalizes them into
+    // regular files for the genuine native installer. External leaf links are
+    // retained as denied assets; they are never traversed during extraction.
     for (path, target) in links {
-        if path.exists() {
+        if fs::symlink_metadata(&path).is_ok() {
             bail!("link overlaps materialized entry");
         }
         if let Some(parent) = path.parent() {
@@ -1936,6 +1948,61 @@ mod tests {
                 .is_err()
         );
         assert!(!case.path.join("escape/body").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_nested_links_never_write_through_an_external_ancestor() {
+        for nested in ["plugin/a/new-link", "plugin/a/new-dir/link"] {
+            for ancestor_first in [true, false] {
+                let case = TempCase::new("plugin-nested-link-write");
+                let external = case.path.join("external");
+                fs::create_dir(&external).unwrap();
+                fs::write(external.join("sentinel"), b"unchanged").unwrap();
+                let archive = case.path.join("plugin.tar.gz");
+                let external_target = external.to_str().unwrap();
+                let (first, second) = if ancestor_first {
+                    (
+                        TestEntry::symlink("plugin/a", external_target),
+                        TestEntry::symlink(nested, "missing-target"),
+                    )
+                } else {
+                    (
+                        TestEntry::symlink(nested, "missing-target"),
+                        TestEntry::symlink("plugin/a", external_target),
+                    )
+                };
+                write_archive(
+                    &archive,
+                    &[
+                        TestEntry::file("plugin/plugin.json", br#"{"name":"mixed"}"#),
+                        first,
+                        second,
+                    ],
+                );
+                assert!(
+                    extract_archive_with_purpose(
+                        &archive,
+                        &case.materialized,
+                        4096,
+                        16,
+                        1024,
+                        true
+                    )
+                    .is_err()
+                );
+                assert_eq!(fs::read(external.join("sentinel")).unwrap(), b"unchanged");
+                assert_eq!(
+                    fs::read_dir(&external).unwrap().count(),
+                    1,
+                    "no external directory or dangling link may be created"
+                );
+                assert!(
+                    fs::symlink_metadata(case.materialized.join("plugin/a")).is_err(),
+                    "reject the topology before creating even its first link"
+                );
+            }
+        }
     }
 
     #[test]

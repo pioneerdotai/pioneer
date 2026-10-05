@@ -1470,8 +1470,12 @@ impl MessageProcessor {
                     "gateway could not persist the turn skill projection",
                 ));
             }
+            let resolved_skills = bindings
+                .iter()
+                .map(|b| b.skill_id.clone())
+                .collect::<Vec<_>>();
             self.crud_store
-                .ready_plugin_selection(&turn_id)
+                .ready_plugin_selection(&turn_id, &resolved_skills)
                 .await
                 .map_err(|_| {
                     DurableCommitRejection::retryable(

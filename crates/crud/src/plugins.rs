@@ -29,13 +29,32 @@ impl CrudStore {
         })
         .await
     }
-    pub async fn ready_plugin_selection(&self, turn: &str) -> Result<()> {
+    /// `resolved_skills` comes from the native resolver's committed event, not
+    /// from the client or inferred from missing DB bindings.
+    pub async fn ready_plugin_selection(
+        &self,
+        turn: &str,
+        resolved_skills: &[pioneer_protocol::SkillId],
+    ) -> Result<()> {
         use sea_orm::TransactionTrait;
         let Some(mut snapshot) = self.get_plugin_selection(turn).await? else {
             return Ok(());
         };
         validate_selection(&snapshot)?;
         let expected = serde_json::to_string(&snapshot)?;
+        let candidates = snapshot.children.clone();
+        let mut prepared = Vec::with_capacity(candidates.len());
+        for child in &candidates {
+            let selected = if child.kind == "skill" {
+                resolved_skills.iter().any(|id| id.as_str() == child.id)
+            } else {
+                plugins::has_mcp_binding(&self.connection, turn, &child.id).await?
+            };
+            if selected {
+                prepared.push(child.clone());
+            }
+        }
+        snapshot.children = prepared;
         snapshot.phase = "ready".into();
         let value = serde_json::to_string(&snapshot)?;
         // The prepared selection and its native bindings may change after the
@@ -45,6 +64,7 @@ impl CrudStore {
             let value = value.clone();
             let expected = expected.clone();
             let snapshot = snapshot.clone();
+            let candidates = candidates.clone();
             async move {
                 let db = self.connection.begin().await?;
                 if plugins::selection(&db, turn).await?.as_deref() != Some(expected.as_str()) {
@@ -61,26 +81,34 @@ impl CrudStore {
                         bail!("plugin changed during preparation");
                     }
                 }
-                for child in &snapshot.children {
+                // Exclusion by the resolver never excuses structural identity
+                // changes. Check all original candidates, including excluded
+                // ones, before publishing the smaller execution snapshot.
+                for child in &candidates {
                     let owner = plugins::owner(&db, &child.kind, &child.id)
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("plugin ownership missing"))?;
                     if owner.plugin_id != child.parent_id || owner.status != "installed" {
                         bail!("plugin child changed during preparation");
                     }
+                }
+                if candidates.iter().any(|c| c.kind == "mcp")
+                    && crate::repositories::turn_mcp_binding::find_turn_mcp_projection(&db, turn)
+                        .await?
+                        .is_none()
+                {
+                    bail!("plugin MCP projection missing");
+                }
+                for child in &snapshot.children {
                     if child.kind == "skill"
                         && !plugins::has_skill_binding(&db, turn, &child.id).await?
                     {
                         bail!("plugin skill binding missing");
                     }
                     if child.kind == "mcp"
-                        && crate::repositories::turn_mcp_binding::find_turn_mcp_projection(
-                            &db, turn,
-                        )
-                        .await?
-                        .is_none()
+                        && !plugins::has_mcp_binding(&db, turn, &child.id).await?
                     {
-                        bail!("plugin MCP projection missing");
+                        bail!("plugin MCP binding missing");
                     }
                 }
                 plugins::set_selection(&db, turn, value).await?;
