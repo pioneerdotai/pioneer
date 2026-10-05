@@ -1621,6 +1621,9 @@ impl pioneer_mcp::McpRuntimeSession for ScopeRefreshSession {
     async fn shutdown(&mut self) {
         self.inner.shutdown().await;
     }
+    async fn shutdown_result(&mut self) -> Result<(), pioneer_mcp::McpRuntimeError> {
+        self.inner.shutdown_result().await
+    }
 }
 
 struct QueueFixtureRelease {
