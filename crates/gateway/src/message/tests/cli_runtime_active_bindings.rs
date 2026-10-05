@@ -2,7 +2,7 @@ use super::*;
 use crate::message::cli_runtime::CliRuntimeStaleTurnScan;
 use pioneer_entity::{turn, turn_cli_runtime_binding as binding, turn_liveness};
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
 
 // Real persisted Turns make the healthy prefix exercise the validator rather
 // than its missing-Turn shortcut. Equal timestamps exercise the turn_id tie.
@@ -350,4 +350,411 @@ async fn cli_active_scan_preserves_maintenance_reads_and_critical_correctness_wr
     drop(writes);
     assert!(database.reader_query_only_enabled().await.unwrap());
     assert!(has_recovery(&store, "route_stale").await);
+}
+
+const GUARDED_TURN: &str = "codex-turn-command";
+const GUARDED_THREAD: &str = "thread_cli_command_approval";
+
+async fn block_guarded_fixture(store: &CrudStore) -> String {
+    let now = chrono::Utc::now().timestamp();
+    store
+        .update_turn_status(
+            GUARDED_THREAD,
+            GUARDED_TURN,
+            TurnStatus::Blocked,
+            Some("blocked"),
+            now,
+        )
+        .await
+        .unwrap();
+    let job = store
+        .enqueue_recovery_job(
+            GUARDED_TURN.into(),
+            "guard-fixture".into(),
+            pioneer_protocol::TurnItemType::SystemEvent,
+            None,
+            pioneer_protocol::RecoveryTrigger::Timeout,
+            pioneer_protocol::RecoveryAction::BlockResumable,
+            Some("blocked".into()),
+            None,
+            None,
+            None,
+            0,
+            0,
+            json!({}),
+            json!({}),
+            now,
+        )
+        .await
+        .unwrap();
+    store
+        .mark_recovery_job_terminal(
+            &job.id,
+            pioneer_protocol::RecoveryJobStatus::Blocked,
+            Some("blocked".into()),
+            now,
+        )
+        .await
+        .unwrap();
+    job.id
+}
+
+async fn resume_guarded_fixture(
+    store: &CrudStore,
+    job: &str,
+) -> pioneer_crud::CliRuntimeTurnAttemptRecord {
+    let now = chrono::Utc::now();
+    assert!(matches!(
+        store
+            .resume_blocked_turn_recovery(
+                GUARDED_THREAD,
+                GUARDED_TURN,
+                Some(job),
+                now.timestamp(),
+                "guard-owner",
+                now.timestamp() + 60,
+            )
+            .await
+            .unwrap(),
+        pioneer_crud::BlockedTurnRecoveryResumeOutcome::Resumed(_)
+    ));
+    let claimed = store
+        .claim_due_recovery_jobs(now.timestamp(), 60, 16)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|claim| claim.id == job)
+        .expect("resumed job must be due");
+    let recovery_attempt_id = pioneer_protocol::generate_id(21);
+    assert!(matches!(
+        store
+            .mark_claimed_recovery_job_active(
+                job,
+                claimed.claim_token.as_deref().unwrap(),
+                &recovery_attempt_id,
+                now.timestamp(),
+            )
+            .await
+            .unwrap(),
+        pioneer_crud::ClaimedRecoveryActivation::Activated
+    ));
+    let (_, attempt) = store
+        .prepare_cli_runtime_recovery_turn_attempt(
+            GUARDED_TURN,
+            pioneer_protocol::generate_id(21),
+            job.to_owned(),
+            recovery_attempt_id,
+            2,
+            "explicit resume".into(),
+            now.fixed_offset(),
+        )
+        .await
+        .unwrap();
+    let (_, attempt) = store
+        .activate_cli_runtime_turn_attempt(
+            GUARDED_TURN,
+            &attempt.id,
+            "native_guard_new",
+            None,
+            now.fixed_offset(),
+        )
+        .await
+        .unwrap();
+    store
+        .register_cli_runtime_execution_segment(
+            GUARDED_TURN,
+            "codex-thread-command",
+            "native_guard_new",
+            now.fixed_offset(),
+        )
+        .await
+        .unwrap();
+    attempt
+}
+
+async fn pending_for_new_execution(store: &CrudStore, workspace: &str) {
+    let now = chrono::Utc::now().fixed_offset();
+    store
+        .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+            request_id: "guard-new-human".into(),
+            runtime_id: "codex".into(),
+            runtime_kind: "codex".into(),
+            workspace_id: workspace.into(),
+            thread_id: GUARDED_THREAD.into(),
+            turn_id: Some(GUARDED_TURN.into()),
+            native_thread_id: Some("codex-thread-command".into()),
+            native_turn_id: Some("native_guard_new".into()),
+            native_item_id: None,
+            request_kind: "user_input".into(),
+            payload_json: "{}".into(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_active_terminal_snapshot_resume_wins_without_new_execution_effects_and_scan_continues()
+{
+    let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
+    drop(rx);
+    let job = block_guarded_fixture(&store).await;
+    let processor = processor.scoped_for_background_reconciliation();
+    processor.arm_completed_history_preparation_barrier("__cli_terminal_before_commit__");
+    let mut scan = CliRuntimeStaleTurnScan::default();
+    let quantum =
+        processor.fail_stale_cli_runtime_turns(chrono::Utc::now().timestamp_millis(), &mut scan);
+    tokio::pin!(quantum);
+    tokio::select! {
+        _ = processor.wait_for_completed_history_preparation_barrier() => {}
+        _ = &mut quantum => panic!("snapshot must pause before guarded commit"),
+    }
+    let transition = processor
+        .cli_runtime_turn_resume_transition(GUARDED_TURN)
+        .await
+        .unwrap();
+    let next = resume_guarded_fixture(&store, &job).await;
+    pending_for_new_execution(&store, &workspace).await;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let _invocation = processor
+        .mcp_service
+        .hold_test_turn_mcp_invocation(GUARDED_TURN, cancel.clone());
+    let lease = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+    processor
+        .cli_runtime_session_turn_leases
+        .lock()
+        .await
+        .insert(GUARDED_TURN.into(), lease);
+    let events = pioneer_entity::turn_event::Entity::find()
+        .filter(pioneer_entity::turn_event::Column::TurnId.eq(GUARDED_TURN))
+        .count(&store.database_connection())
+        .await
+        .unwrap();
+    drop(transition);
+    processor.release_completed_history_preparation_barrier();
+    let summary = quantum.await;
+    assert_eq!((summary.selected, summary.processed), (4, 4));
+    assert_eq!(
+        store
+            .get_turn(GUARDED_THREAD, GUARDED_TURN)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(GUARDED_TURN)
+            .await
+            .unwrap()
+            .unwrap(),
+        next
+    );
+    let owner = store
+        .resolve_cli_runtime_native_turn_owner("codex", "native_guard_new")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.attempt.id, next.id);
+    assert_eq!(owner.binding.status, "running");
+    assert!(!cancel.is_cancelled());
+    assert_eq!(
+        store
+            .get_cli_runtime_pending_request("guard-new-human")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Pending
+    );
+    assert!(
+        processor
+            .cli_runtime_session_turn_leases
+            .lock()
+            .await
+            .contains_key(GUARDED_TURN)
+    );
+    assert!(session.interrupts.lock().await.is_empty());
+    assert!(session.goal_clears.lock().await.is_empty());
+    assert!(session.mcp_terminals.lock().await.is_empty());
+    assert_eq!(session.closes.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(GUARDED_TURN))
+            .count(&store.database_connection())
+            .await
+            .unwrap(),
+        events
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_active_terminal_commit_serializes_new_admission_until_old_effects_finish() {
+    let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
+    drop(rx);
+    let job = block_guarded_fixture(&store).await;
+    let processor = processor.scoped_for_background_reconciliation();
+    processor.arm_completed_history_preparation_barrier("__cli_terminal_after_commit__");
+    let mut scan = CliRuntimeStaleTurnScan::default();
+    let quantum =
+        processor.fail_stale_cli_runtime_turns(chrono::Utc::now().timestamp_millis(), &mut scan);
+    tokio::pin!(quantum);
+    tokio::select! {
+        _ = processor.wait_for_completed_history_preparation_barrier() => {}
+        _ = &mut quantum => panic!("commit must pause before external effects"),
+    }
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_binding(GUARDED_TURN)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "blocked"
+    );
+    let key = CLIAgentRuntimeSessionKey::new(workspace.clone(), "codex", GUARDED_THREAD).unwrap();
+    let gate = processor.cli_runtime_session_transition_mutex(&key).await;
+    assert!(
+        gate.try_lock().is_err(),
+        "admission uses this same session gate"
+    );
+    let manager = processor.cli_runtime_manager.as_ref().unwrap();
+    let old_instance = manager
+        .existing_session(&key)
+        .await
+        .unwrap()
+        .instance()
+        .clone();
+    let admission = async {
+        let _transition = processor
+            .cli_runtime_turn_resume_transition(GUARDED_TURN)
+            .await
+            .unwrap();
+        let replacement = manager.get_or_start(key.clone()).await.unwrap();
+        assert!(replacement.instance().generation() > old_instance.generation());
+        let next = resume_guarded_fixture(&store, &job).await;
+        pending_for_new_execution(&store, &workspace).await;
+        next
+    };
+    tokio::pin!(admission);
+    assert!(futures_util::poll!(&mut admission).is_pending());
+    processor.release_completed_history_preparation_barrier();
+    let (summary, next) = tokio::join!(quantum, admission);
+    assert_eq!((summary.selected, summary.processed), (4, 4));
+    assert_eq!(
+        session.interrupts.lock().await.as_slice(),
+        &[(
+            Some("codex-thread-command".into()),
+            Some(GUARDED_TURN.into())
+        )]
+    );
+    assert!(manager.existing_session(&key).await.is_some());
+    assert_eq!(session.goal_clears.lock().await.len(), 1);
+    assert_eq!(session.closes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(GUARDED_TURN)
+            .await
+            .unwrap()
+            .unwrap(),
+        next
+    );
+    assert_eq!(
+        store
+            .get_cli_runtime_pending_request("guard-new-human")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Pending
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_active_terminal_cancellation_leaves_no_queued_terminal_effect_for_resumed_turn() {
+    let (processor, _, rx, _, store, session) = cli_runtime_approval_processor().await;
+    drop(rx);
+    let job = block_guarded_fixture(&store).await;
+    let processor = processor.scoped_for_background_reconciliation();
+    processor.arm_completed_history_preparation_barrier("__cli_terminal_after_commit__");
+    let mut scan = CliRuntimeStaleTurnScan::default();
+    {
+        let quantum = processor
+            .fail_stale_cli_runtime_turns(chrono::Utc::now().timestamp_millis(), &mut scan);
+        tokio::pin!(quantum);
+        tokio::select! {
+            _ = processor.wait_for_completed_history_preparation_barrier() => {}
+            _ = &mut quantum => panic!("commit must pause before external effects"),
+        }
+        // Dropping this owning future cancels the old cleanup and its session gate.
+    }
+    let transition = processor
+        .cli_runtime_turn_resume_transition(GUARDED_TURN)
+        .await
+        .unwrap();
+    let next = resume_guarded_fixture(&store, &job).await;
+    drop(transition);
+    let summary = processor
+        .fail_stale_cli_runtime_turns(chrono::Utc::now().timestamp_millis(), &mut scan)
+        .await;
+    assert!(summary.selected <= 128);
+    assert_eq!(summary.processed, summary.selected);
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(GUARDED_TURN)
+            .await
+            .unwrap()
+            .unwrap(),
+        next
+    );
+    assert!(session.interrupts.lock().await.is_empty());
+    assert!(session.goal_clears.lock().await.is_empty());
+    assert!(session.mcp_terminals.lock().await.is_empty());
+    assert_eq!(session.closes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cli_terminal_queued_event_keeps_transition_through_cancelled_waiter_and_preserves_order() {
+    let hub = pioneer_runtime_events::ExecutionEventHub::new();
+    let mut receiver = hub.take_durable_receiver().await.unwrap();
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let transition = Arc::new(gate.clone().lock_owned().await);
+    hub.publish_durable(AgentDurableEvent::TurnBlocked {
+        thread_id: "ordered-thread".into(),
+        turn_id: "earlier".into(),
+        reason: "earlier durable event".into(),
+        recovery: None,
+    })
+    .await
+    .unwrap();
+    {
+        let publish = hub.publish_durable_and_wait_with_turn_transition(
+            AgentDurableEvent::TurnBlocked {
+                thread_id: "ordered-thread".into(),
+                turn_id: "terminal".into(),
+                reason: "terminal observation".into(),
+                recovery: None,
+            },
+            Some(transition),
+        );
+        tokio::pin!(publish);
+        assert!(futures_util::poll!(&mut publish).is_pending());
+        assert!(
+            matches!(receiver.recv().await, Some(AgentDurableEvent::TurnBlocked { turn_id, .. }) if turn_id == "earlier")
+        );
+        assert!(!receiver.owns_turn_transition());
+        receiver.acknowledge_last(Ok(()));
+        assert!(
+            matches!(receiver.recv().await, Some(AgentDurableEvent::TurnBlocked { turn_id, .. }) if turn_id == "terminal")
+        );
+        assert!(receiver.owns_turn_transition());
+        // Cancel only the waiter. The existing durable consumer still owns the
+        // old execution's terminal handler and must keep admission fenced.
+    }
+    assert!(gate.try_lock().is_err());
+    receiver.acknowledge_last(Ok(()));
+    assert!(gate.try_lock().is_ok());
 }

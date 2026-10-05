@@ -906,6 +906,15 @@ fn execution_backend_allows_agent_skill_overlay(
     )
 }
 
+// Recovery resumes the same Turn without taking its retained lease again.
+// A separate, short-lived transition mutex in the same session ownership map
+// therefore fences resume/native admission against background terminal effects.
+#[derive(Default)]
+pub(super) struct CliRuntimeSessionTurnLocks {
+    lease: Arc<tokio::sync::Mutex<()>>,
+    transition: Arc<tokio::sync::Mutex<()>>,
+}
+
 impl MessageProcessor {
     #[allow(clippy::too_many_arguments)]
     async fn admit_composite_execution_request(
@@ -4277,6 +4286,8 @@ impl MessageProcessor {
                     }
                 }
             }
+            let transition_mutex = self.cli_runtime_session_transition_mutex(&session_key).await;
+            let _transition = transition_mutex.lock().await;
             // Session ownership serializes both provider use and continuity
             // decisions. Re-read the durable binding and persisted thread head
             // after waiting: an in-memory Thread snapshot can be empty after a
@@ -6549,6 +6560,10 @@ impl MessageProcessor {
             continuation_head,
         } = prepared;
         let pioneer_turn_id = outcome.started_notification.turn.id.clone();
+        let transition_mutex = self
+            .cli_runtime_session_transition_mutex(session_instance.key())
+            .await;
+        let _transition = transition_mutex.lock().await;
         self.interrupt_completed_history_for_new_input(
             &outcome.started_notification.workspace_id,
             &outcome.started_notification.thread_id,
@@ -7639,6 +7654,10 @@ impl MessageProcessor {
                 return Err(CliRuntimeRecoveryStartFailure::InvalidBinding { diagnostic });
             }
         };
+        let transition_mutex = self
+            .cli_runtime_session_transition_mutex(&restored.session_key)
+            .await;
+        let _transition = transition_mutex.lock().await;
         let binding = restored.binding.clone();
         let Some((_workspace_id, turn)) = self
             .crud_store
@@ -8065,10 +8084,41 @@ impl MessageProcessor {
         key: &crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
     ) -> Arc<tokio::sync::Mutex<()>> {
         let mut mutexes = self.cli_runtime_session_turn_mutexes.lock().await;
-        mutexes
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        mutexes.entry(key.clone()).or_default().lease.clone()
+    }
+
+    // Unlike the retained Turn lease, this gate covers one transition, including
+    // its external terminal effects. Recovery of the same Turn uses it too.
+    pub(super) async fn cli_runtime_session_transition_mutex(
+        &self,
+        key: &crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let mut mutexes = self.cli_runtime_session_turn_mutexes.lock().await;
+        mutexes.entry(key.clone()).or_default().transition.clone()
+    }
+
+    pub(super) async fn cli_runtime_turn_resume_transition(
+        &self,
+        turn_id: &str,
+    ) -> anyhow::Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
+        let Some(binding) = self
+            .crud_store
+            .get_cli_runtime_turn_binding(turn_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let key = crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
+            binding.workspace_id,
+            binding.runtime_id,
+            binding.continuation_thread_id,
+        )?;
+        Ok(Some(
+            self.cli_runtime_session_transition_mutex(&key)
+                .await
+                .lock_owned()
+                .await,
+        ))
     }
 
     async fn keep_task_cli_runtime_queue_alive(
@@ -9964,6 +10014,21 @@ impl MessageProcessor {
                 return;
             }
             None => {
+                let transition = match self.cli_runtime_turn_resume_transition(&turn_id).await {
+                    Ok(transition) => transition,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request_id),
+                                INVALID_REQUEST_CODE,
+                                format!("failed to acquire CLI resume ownership: {error:#}"),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
                 let resumed_job = match self
                     .recovery_coordinator
                     .resume_blocked_turn(
@@ -10001,6 +10066,7 @@ impl MessageProcessor {
                     }
                 };
 
+                drop(transition);
                 match self.recovery_coordinator.run_ready_jobs(now_unix, 16).await {
                     Ok(events) => {
                         for event in events {

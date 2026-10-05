@@ -4407,6 +4407,9 @@ impl TaskAgentExecutor {
             return Ok(None);
         };
 
+        let transition = processor
+            .cli_runtime_turn_resume_transition(turn_id)
+            .await?;
         let outcome = processor
             .crud_store
             .resume_task_owned_turn(
@@ -4418,6 +4421,7 @@ impl TaskAgentExecutor {
                 now_unix.saturating_add(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
             )
             .await?;
+        drop(transition);
         let Some(outcome) = outcome else {
             return Ok(Some(TaskChildResumeOutcome::Conflict {
                 reason: "task-owned child lineage disappeared while resuming".to_owned(),

@@ -596,7 +596,7 @@ pub struct MessageProcessor {
         Mutex<
             HashMap<
                 crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
-                Arc<tokio::sync::Mutex<()>>,
+                turn_handlers::CliRuntimeSessionTurnLocks,
             >,
         >,
     >,

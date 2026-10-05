@@ -652,6 +652,7 @@ struct RecordingCliRuntimeSession {
     mcp_preparations: TokioMutex<Vec<(String, String)>>,
     projected_mcp_store: TokioMutex<Option<Arc<CrudStore>>>,
     mcp_retargets: TokioMutex<Vec<(String, String, String)>>,
+    mcp_terminals: TokioMutex<Vec<String>>,
     goal_resets: TokioMutex<Vec<String>>,
     fail_next_goal_reset: TokioMutex<bool>,
     goal_clears: TokioMutex<Vec<String>>,
@@ -884,6 +885,11 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
             session_generation: 1,
             projection_activation_generation: 1,
         }))
+    }
+
+    async fn terminal_mcp_turn(&self, turn_id: &str) -> anyhow::Result<()> {
+        self.mcp_terminals.lock().await.push(turn_id.to_owned());
+        Ok(())
     }
 
     async fn retarget_mcp_turn(

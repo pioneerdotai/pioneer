@@ -403,3 +403,373 @@ async fn cli_active_binding_index_retry_down_and_up_preserve_domain_and_workspac
         .collect::<Vec<_>>();
     assert_eq!(columns_after_rollback, columns);
 }
+
+async fn terminal_guard_fixture() -> (CrudStore, crate::CliRuntimeTurnTerminalGuard) {
+    let (store, thread, turn) =
+        test_store_with_started_turn("ws_cli_guard", "thr_cli_guard", "turn_cli_guard").await;
+    let timestamp = unix_to_datetime(1_700_000_000);
+    store
+        .prepare_cli_runtime_initial_turn_attempt(
+            crate::NewCliRuntimeTurnBinding {
+                turn_id: turn.id.clone(),
+                thread_id: thread.id.clone(),
+                continuation_thread_id: thread.id.clone(),
+                workspace_id: thread.workspace_id.clone(),
+                runtime_id: "codex".into(),
+                runtime_kind: "codex".into(),
+                native_thread_id: "native_thread".into(),
+                native_turn_id: None,
+                request_id: None,
+                status: "starting".into(),
+                model: None,
+                cwd: None,
+                sandbox_json: None,
+                approval_policy: None,
+                input_mapping_json: "{}".into(),
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+            "attempt_guard_1".into(),
+            1,
+        )
+        .await
+        .unwrap();
+    store
+        .update_turn_status(
+            &thread.id,
+            &turn.id,
+            TurnStatus::Blocked,
+            Some("blocked"),
+            1_700_000_000,
+        )
+        .await
+        .unwrap();
+    let binding = store
+        .get_cli_runtime_turn_binding(&turn.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let guard = store
+        .cli_runtime_turn_terminal_guard(&binding)
+        .await
+        .unwrap()
+        .unwrap();
+    (store, guard)
+}
+
+async fn commit_guard(
+    store: &CrudStore,
+    guard: &crate::CliRuntimeTurnTerminalGuard,
+) -> anyhow::Result<Option<crate::CliRuntimeTurnBindingRecord>> {
+    store
+        .terminalize_cli_runtime_turn_binding_guarded(
+            &guard.binding.turn_id,
+            "blocked",
+            CliRuntimeTurnAttemptStatus::Interrupted,
+            Some("old decision".into()),
+            unix_to_datetime(1_700_000_000),
+            Some(guard),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn cli_terminal_guard_rejects_starting_activation_terminal_and_canonical_resume() {
+    for change in ["running", "terminal", "resume"] {
+        let (store, guard) = terminal_guard_fixture().await;
+        match change {
+            "running" => {
+                store
+                    .activate_cli_runtime_turn_attempt(
+                        &guard.binding.turn_id,
+                        &guard.attempt.as_ref().unwrap().id,
+                        "native_running",
+                        None,
+                        guard.binding.updated_at,
+                    )
+                    .await
+                    .unwrap();
+            }
+            "terminal" => {
+                store
+                    .terminalize_cli_runtime_turn_binding(
+                        &guard.binding.turn_id,
+                        "completed",
+                        CliRuntimeTurnAttemptStatus::Completed,
+                        None,
+                        guard.binding.updated_at,
+                    )
+                    .await
+                    .unwrap();
+            }
+            "resume" => {
+                store
+                    .update_turn_status(
+                        &guard.binding.thread_id,
+                        &guard.binding.turn_id,
+                        TurnStatus::InProgress,
+                        None,
+                        1_700_000_000,
+                    )
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let current = store
+            .get_cli_runtime_turn_binding(&guard.binding.turn_id)
+            .await
+            .unwrap();
+        let attempt = store
+            .latest_cli_runtime_turn_attempt(&guard.binding.turn_id)
+            .await
+            .unwrap();
+        assert!(commit_guard(&store, &guard).await.unwrap().is_none());
+        assert_eq!(
+            store
+                .get_cli_runtime_turn_binding(&guard.binding.turn_id)
+                .await
+                .unwrap(),
+            current
+        );
+        assert_eq!(
+            store
+                .latest_cli_runtime_turn_attempt(&guard.binding.turn_id)
+                .await
+                .unwrap(),
+            attempt
+        );
+    }
+}
+
+#[tokio::test]
+async fn cli_terminal_guard_rejects_same_timestamp_status_aba_with_new_recovery_attempt() {
+    let (store, guard) = terminal_guard_fixture().await;
+    let (_, next) = store
+        .prepare_cli_runtime_recovery_turn_attempt(
+            &guard.binding.turn_id,
+            "attempt_guard_2".into(),
+            "recovery_job_2".into(),
+            "recovery_attempt_2".into(),
+            2,
+            "resume".into(),
+            guard.binding.updated_at,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_binding(&guard.binding.turn_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        guard.binding
+    );
+    assert!(commit_guard(&store, &guard).await.unwrap().is_none());
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(&guard.binding.turn_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        next
+    );
+    assert_eq!(next.status, CliRuntimeTurnAttemptStatus::Starting);
+}
+
+#[tokio::test]
+async fn cli_terminal_guard_repairs_active_projection_atomically_and_rolls_back_on_projection_error()
+ {
+    let (store, guard) = terminal_guard_fixture().await;
+    // The same project fixture uses a failing projection write to prove that
+    // binding and attempt mutations do not survive an error later in the txn.
+    let before = pioneer_entity::turn_work_projection::Entity::find_by_id(&guard.binding.turn_id)
+        .one(&store.database_connection())
+        .await
+        .unwrap();
+    assert!(
+        before.is_some(),
+        "rollback fixture requires an existing projection"
+    );
+    store.database_connection().execute_unprepared(
+        "CREATE TRIGGER reject_cli_guard_projection BEFORE UPDATE ON turn_work_projection BEGIN SELECT RAISE(ABORT, 'guard projection failure'); END",
+    ).await.unwrap();
+    assert!(commit_guard(&store, &guard).await.is_err());
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_binding(&guard.binding.turn_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        guard.binding
+    );
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(&guard.binding.turn_id)
+            .await
+            .unwrap(),
+        guard.attempt
+    );
+    assert_eq!(
+        pioneer_entity::turn_work_projection::Entity::find_by_id(&guard.binding.turn_id)
+            .one(&store.database_connection())
+            .await
+            .unwrap(),
+        before
+    );
+    store
+        .database_connection()
+        .execute_unprepared("DROP TRIGGER reject_cli_guard_projection")
+        .await
+        .unwrap();
+    let result = commit_guard(&store, &guard).await.unwrap().unwrap();
+    assert_eq!(result.status, "blocked");
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(&guard.binding.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        CliRuntimeTurnAttemptStatus::Interrupted
+    );
+    assert!(commit_guard(&store, &guard).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn cli_terminal_guard_rejects_reacquired_execution_owner_at_equal_timestamp() {
+    let (store, guard) = terminal_guard_fixture().await;
+    let db = store.database_connection();
+    let owner = crate::repositories::turn_execution::insert_immutable(
+        &db,
+        crate::NewTurnExecution {
+            turn_id: guard.binding.turn_id.clone(),
+            thread_id: guard.binding.thread_id.clone(),
+            workspace_id: guard.binding.workspace_id.clone(),
+            executor_kind: crate::TurnExecutorKind::CliRuntime,
+            executor_key: Some("codex".into()),
+            status: crate::TurnExecutionStatus::Starting,
+            owner_id: "owner".into(),
+            lease_until: guard.binding.updated_at + chrono::Duration::seconds(60),
+            created_at: guard.binding.created_at,
+        },
+    )
+    .await
+    .unwrap();
+    store
+        .update_turn_status(
+            &guard.binding.thread_id,
+            &guard.binding.turn_id,
+            TurnStatus::Blocked,
+            Some("blocked"),
+            1_700_000_000,
+        )
+        .await
+        .unwrap();
+    let guard = store
+        .cli_runtime_turn_terminal_guard(&guard.binding)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        crate::repositories::turn_execution::reacquire_blocked(
+            &db,
+            &owner.turn_id,
+            &owner.owner_id,
+            guard.binding.updated_at,
+            guard.binding.updated_at,
+        )
+        .await
+        .unwrap()
+    );
+    // The canonical status and binding are unchanged; the existing ownership
+    // generation alone fences this otherwise identical terminal decision.
+    assert!(commit_guard(&store, &guard).await.unwrap().is_none());
+    let new_owner = store
+        .get_turn_execution(&owner.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(new_owner.owner_id, owner.owner_id);
+    assert_eq!(new_owner.owner_generation, owner.owner_generation + 1);
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(&owner.turn_id)
+            .await
+            .unwrap(),
+        guard.attempt
+    );
+}
+
+#[tokio::test]
+async fn cli_terminal_guard_accepts_completed_attempt_after_its_own_starting_running_transitions() {
+    let (store, guard) = terminal_guard_fixture().await;
+    store
+        .update_turn_status(
+            &guard.binding.thread_id,
+            &guard.binding.turn_id,
+            TurnStatus::InProgress,
+            None,
+            1_700_000_000,
+        )
+        .await
+        .unwrap();
+    let (running, attempt) = store
+        .activate_cli_runtime_turn_attempt(
+            &guard.binding.turn_id,
+            &guard.attempt.as_ref().unwrap().id,
+            "valid-native",
+            None,
+            guard.binding.updated_at,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .mark_cli_runtime_turn_attempt_terminal(
+                &attempt.id,
+                CliRuntimeTurnAttemptStatus::Completed,
+                None,
+                guard.binding.updated_at,
+            )
+            .await
+            .unwrap()
+    );
+    store
+        .update_turn_status(
+            &running.thread_id,
+            &running.turn_id,
+            TurnStatus::Completed,
+            None,
+            1_700_000_000,
+        )
+        .await
+        .unwrap();
+    let completed_guard = store
+        .cli_runtime_turn_terminal_guard(&running)
+        .await
+        .unwrap()
+        .unwrap();
+    let binding = store
+        .terminalize_cli_runtime_turn_binding_guarded(
+            &running.turn_id,
+            "completed",
+            CliRuntimeTurnAttemptStatus::Completed,
+            None,
+            guard.binding.updated_at,
+            Some(&completed_guard),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.status, "completed");
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(&binding.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        CliRuntimeTurnAttemptStatus::Completed
+    );
+}

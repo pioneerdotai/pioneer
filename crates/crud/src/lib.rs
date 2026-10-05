@@ -897,6 +897,17 @@ pub use crate::repositories::cli_runtime_binding::{
     TransitionCliRuntimePendingRequestDelivery, deserialize_cli_runtime_json,
     serialize_cli_runtime_json,
 };
+/// Facts used by terminal projection repair. Captured in one reader snapshot;
+/// validated again in the binding/attempt/projection writer transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliRuntimeTurnTerminalGuard {
+    pub binding: CliRuntimeTurnBindingRecord,
+    pub attempt: Option<CliRuntimeTurnAttemptRecord>,
+    pub segment: Option<CliRuntimeExecutionSegmentRecord>,
+    pub execution_owner: Option<(String, u64)>,
+    pub turn_status: TurnStatus,
+}
+
 pub use crate::repositories::thread_agents_doc::{
     ResolvedThreadAgentsDocRecord, ThreadAgentsDocError, ThreadAgentsDocRecord,
     ThreadAgentsDocRevisionRecord, ThreadAgentsDocSaveReason, ThreadAgentsDocScope,
@@ -6064,6 +6075,48 @@ impl CrudStore {
         .await
     }
 
+    pub async fn cli_runtime_turn_terminal_guard(
+        &self,
+        expected_binding: &CliRuntimeTurnBindingRecord,
+    ) -> Result<Option<CliRuntimeTurnTerminalGuard>> {
+        let snapshot = self.connection.begin_read().await?;
+        let binding =
+            cli_runtime_binding::find_turn_binding(&snapshot, expected_binding.turn_id.as_str())
+                .await?;
+        if binding.as_ref() != Some(expected_binding) {
+            return Ok(None);
+        }
+        let Some(turn) = turn::find_turn_by_thread_and_id(
+            &snapshot,
+            expected_binding.thread_id.as_str(),
+            expected_binding.turn_id.as_str(),
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let attempt =
+            cli_runtime_binding::latest_turn_attempt(&snapshot, expected_binding.turn_id.as_str())
+                .await?;
+        let segment = if let Some(attempt) = attempt.as_ref() {
+            cli_runtime_binding::latest_execution_segment_for_attempt(&snapshot, &attempt.id)
+                .await?
+        } else {
+            None
+        };
+        let execution_owner = turn_execution::find(&snapshot, &expected_binding.turn_id)
+            .await?
+            .map(|execution| (execution.owner_id, execution.owner_generation));
+        Ok(Some(CliRuntimeTurnTerminalGuard {
+            binding: expected_binding.clone(),
+            attempt,
+            segment,
+            execution_owner,
+            turn_status: turn_status_from_db(&turn.status)
+                .context("unknown canonical Turn status")?,
+        }))
+    }
+
     pub async fn terminalize_cli_runtime_turn_binding(
         &self,
         turn_id: &str,
@@ -6072,11 +6125,37 @@ impl CrudStore {
         failure_reason: Option<String>,
         completed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
     ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
+        self.terminalize_cli_runtime_turn_binding_guarded(
+            turn_id,
+            binding_status,
+            attempt_status,
+            failure_reason,
+            completed_at,
+            None,
+        )
+        .await
+    }
+
+    /// None means superseded (or missing), and must not authorize terminal effects.
+    pub async fn terminalize_cli_runtime_turn_binding_guarded(
+        &self,
+        turn_id: &str,
+        binding_status: &str,
+        attempt_status: CliRuntimeTurnAttemptStatus,
+        failure_reason: Option<String>,
+        completed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+        expected: Option<&CliRuntimeTurnTerminalGuard>,
+    ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
         if attempt_status.is_active() {
             bail!(
                 "CLI runtime terminal binding cannot use active attempt status `{}`",
                 attempt_status.as_str()
             );
+        }
+        if let Some(expected) = expected
+            && binding_status != turn_status_to_db(expected.turn_status)
+        {
+            bail!("terminal binding projection does not match its canonical Turn decision");
         }
         let turn_id = turn_id.to_owned();
         let binding_status = binding_status.to_owned();
@@ -6092,8 +6171,42 @@ impl CrudStore {
                 transaction.rollback().await.ok();
                 return Ok(None);
             };
-            if let Some(attempt) =
-                cli_runtime_binding::latest_turn_attempt(&transaction, turn_id.as_str()).await?
+            let attempt =
+                cli_runtime_binding::latest_turn_attempt(&transaction, turn_id.as_str()).await?;
+            if let Some(expected) = expected {
+                let turn = turn::find_turn_by_thread_and_id(
+                    &transaction,
+                    expected.binding.thread_id.as_str(),
+                    turn_id.as_str(),
+                )
+                .await?;
+                let segment = if let Some(attempt) = attempt.as_ref() {
+                    cli_runtime_binding::latest_execution_segment_for_attempt(
+                        &transaction,
+                        &attempt.id,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+                let execution_owner = turn_execution::find(&transaction, turn_id.as_str())
+                    .await?
+                    .map(|execution| (execution.owner_id, execution.owner_generation));
+                if expected.turn_status == TurnStatus::InProgress
+                    || binding != expected.binding
+                    || attempt != expected.attempt
+                    || segment != expected.segment
+                    || execution_owner != expected.execution_owner
+                    || turn
+                        .as_ref()
+                        .and_then(|turn| turn_status_from_db(&turn.status))
+                        != Some(expected.turn_status)
+                {
+                    transaction.rollback().await?;
+                    return Ok(None);
+                }
+            }
+            if let Some(attempt) = attempt
                 && attempt.status.is_active()
                 && !cli_runtime_binding::mark_turn_attempt_terminal(
                     &transaction,
