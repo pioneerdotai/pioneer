@@ -994,3 +994,53 @@ async fn webm_unknown_track_and_mime_only_constraint_fail_before_projection() {
         }
     }
 }
+
+#[tokio::test]
+async fn native_gemini_aggregate_keeps_exact_thirds_at_the_audio_boundary() {
+    let mut parts = vec![part(
+        InputContentType::Audio,
+        "audio/wav",
+        &wav_frames(34199, 1),
+    )];
+    for _ in 0..3 {
+        parts.push(part(
+            InputContentType::Audio,
+            "audio/wav",
+            &wav_frames(1, 3),
+        ));
+    }
+    // 34199 seconds + 3*(1/3 second) = exactly 34200 seconds, independently.
+    let req = request("media", parts.clone());
+    assert!(
+        scoped(
+            Arc::new(state("gemini", "media", json!({}))),
+            super::prepare_messages_for_provider_async(
+                "gemini",
+                "media",
+                &capabilities(),
+                &req.messages
+            )
+        )
+        .await
+        .is_ok()
+    );
+    parts.push(part(
+        InputContentType::Audio,
+        "audio/wav",
+        &wav_frames(1, 3),
+    ));
+    let req = request("media", parts);
+    assert!(
+        scoped(
+            Arc::new(state("gemini", "media", json!({}))),
+            super::prepare_messages_for_provider_async(
+                "gemini",
+                "media",
+                &capabilities(),
+                &req.messages
+            )
+        )
+        .await
+        .is_err()
+    );
+}

@@ -241,18 +241,90 @@ pub fn image_tokens(provider: &str, model: &str, width: u32, height: u32) -> Res
         .div_ceil(100))
 }
 
-pub(super) fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
-    Ok(duration_nanos(bytes, mime)?.div_ceil(1_000_000))
+/// Exact rational seconds for native limits; rounding is only for estimates.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct NativeDuration {
+    numer: u128,
+    denom: u128,
 }
-/// Native span, rounded up only at nanosecond resolution; no additional sample.
+impl NativeDuration {
+    pub(super) const ZERO: Self = Self { numer: 0, denom: 1 };
+    fn new(numer: u128, denom: u128) -> Self {
+        let g = gcd(numer, denom);
+        Self {
+            numer: numer / g,
+            denom: denom / g,
+        }
+    }
+    pub(super) fn add(self, other: Self) -> Result<Self> {
+        let g = gcd(self.denom, other.denom);
+        let a = other.denom / g;
+        let b = self.denom / g;
+        let numer = self
+            .numer
+            .checked_mul(a)
+            .and_then(|n| other.numer.checked_mul(b).and_then(|m| n.checked_add(m)))
+            .context("native duration rational overflow")?;
+        let denom = self
+            .denom
+            .checked_mul(a)
+            .context("native duration denominator overflow")?;
+        Ok(Self::new(numer, denom))
+    }
+    fn max(self, other: Self) -> Result<Self> {
+        let a = self
+            .numer
+            .checked_mul(other.denom)
+            .context("native duration comparison overflow")?;
+        let b = other
+            .numer
+            .checked_mul(self.denom)
+            .context("native duration comparison overflow")?;
+        Ok(if a >= b { self } else { other })
+    }
+    pub(super) fn within_millis(self, limit: u64) -> Result<bool> {
+        let left = self
+            .numer
+            .checked_mul(1000)
+            .context("native duration limit overflow")?;
+        let right = u128::from(limit)
+            .checked_mul(self.denom)
+            .context("native duration limit overflow")?;
+        Ok(left <= right)
+    }
+    fn ceil(self, units: u128) -> Result<u64> {
+        u64::try_from(
+            self.numer
+                .checked_mul(units)
+                .context("duration resolution overflow")?
+                .div_ceil(self.denom),
+        )
+        .context("duration resolution exceeds bounded representation")
+    }
+}
+fn gcd(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+pub(super) fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
+    native_duration(bytes, mime)?.ceil(1000)
+}
+#[cfg(test)]
 pub(super) fn duration_nanos(bytes: &[u8], mime: &str) -> Result<u64> {
+    native_duration(bytes, mime)?.ceil(1_000_000_000)
+}
+pub(super) fn native_duration(bytes: &[u8], mime: &str) -> Result<NativeDuration> {
     if matches!(
         mime,
         "video/mp4" | "audio/mp4" | "video/quicktime" | "audio/x-m4a"
     ) {
         let context =
             mp4parse::read_mp4(&mut Cursor::new(bytes)).context("MP4 timing is unavailable")?;
-        let mut duration = 0;
+        let mut duration = NativeDuration::ZERO;
         for track in &context.tracks {
             let ticks = track
                 .duration
@@ -261,12 +333,12 @@ pub(super) fn duration_nanos(bytes: &[u8], mime: &str) -> Result<u64> {
                 .timescale
                 .context("MP4 track time base is unavailable")?;
             ensure!(scale.0 > 0, "MP4 track time base is zero");
-            duration = duration.max(
-                ((u128::from(ticks.0) * 1_000_000_000).div_ceil(u128::from(scale.0)))
-                    .min(u128::from(u64::MAX)) as u64,
-            );
+            duration = duration.max(NativeDuration::new(
+                u128::from(ticks.0),
+                u128::from(scale.0),
+            ))?;
         }
-        ensure!(duration > 0, "MP4 duration is unavailable");
+        ensure!(duration.numer > 0, "MP4 duration is unavailable");
         return Ok(duration);
     }
     use symphonia::core::{
@@ -287,7 +359,7 @@ pub(super) fn duration_nanos(bytes: &[u8], mime: &str) -> Result<u64> {
         MetadataOptions::default(),
     )?;
     let mut bases = BTreeMap::new();
-    let mut duration = 0_u64;
+    let mut duration = NativeDuration::ZERO;
     let mut unknown = std::collections::BTreeSet::new();
     let mut all_known = !format.tracks().is_empty();
     for track in format.tracks() {
@@ -313,7 +385,7 @@ pub(super) fn duration_nanos(bytes: &[u8], mime: &str) -> Result<u64> {
                         .flatten()
                 })
             {
-                duration = duration.max(ticks_nanos(ticks, base));
+                duration = duration.max(ticks_span(ticks, base))?;
             } else {
                 all_known = false;
                 unknown.insert(track.id);
@@ -374,18 +446,21 @@ pub(super) fn duration_nanos(bytes: &[u8], mime: &str) -> Result<u64> {
                 .and_then(|v| u64::try_from(v).ok())
                 .context("invalid media span")?;
             ensure!(ticks > 0, "media track duration is unavailable");
-            duration = duration.max(ticks_nanos(ticks, bases[&id]));
+            duration = duration.max(ticks_span(ticks, bases[&id]))?;
         }
     }
-    ensure!(duration > 0, "media duration is unavailable");
+    ensure!(duration.numer > 0, "media duration is unavailable");
     Ok(duration)
 }
+fn ticks_span(ticks: u64, base: symphonia::core::units::TimeBase) -> NativeDuration {
+    NativeDuration::new(
+        u128::from(ticks) * u128::from(base.numer.get()),
+        u128::from(base.denom.get()),
+    )
+}
+#[cfg(test)]
 fn ticks_nanos(ticks: u64, base: symphonia::core::units::TimeBase) -> u64 {
-    (u128::from(ticks)
-        .saturating_mul(u128::from(base.numer.get()))
-        .saturating_mul(1_000_000_000)
-        .div_ceil(u128::from(base.denom.get())))
-    .min(u128::from(u64::MAX)) as u64
+    ticks_span(ticks, base).ceil(1_000_000_000).unwrap()
 }
 
 #[cfg(test)]
@@ -652,5 +727,13 @@ mod native_span_rounding_tests {
         );
         assert_eq!(ticks_nanos(1, thirds), 333_333_334);
         assert_eq!(ticks_nanos(3, thirds), 1_000_000_000);
+        let exact = ticks_span(1, thirds)
+            .add(ticks_span(1, thirds))
+            .unwrap()
+            .add(ticks_span(1, thirds))
+            .unwrap();
+        assert!(exact.within_millis(1000).unwrap());
+        assert!(!exact.within_millis(999).unwrap());
+        assert_eq!(exact.ceil(1000).unwrap(), 1000);
     }
 }

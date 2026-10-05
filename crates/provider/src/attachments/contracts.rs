@@ -357,12 +357,12 @@ pub(super) fn validate_materialized_constraints(
             ),
             "duration constraint requires audio/video input"
         );
-        let duration = super::input_estimate::duration_millis(
+        let duration = super::input_estimate::native_duration(
             super::attachment_bytes(attachment)?,
             &attachment.mime_type,
         )?;
         ensure!(
-            duration <= limit,
+            duration.within_millis(limit)?,
             "media duration exceeds model maxDurationMillis"
         );
     }
@@ -544,18 +544,18 @@ pub(super) fn validate_model_media_limits(
             "Gemini PDF input exceeds 1000 pages per request"
         );
         // https://ai.google.dev/gemini-api/docs/audio: maximum per prompt.
-        let mut duration = 0u64;
+        let mut duration = super::input_estimate::NativeDuration::ZERO;
         for audio in attachments
             .iter()
             .filter(|a| a.kind == InputContentType::Audio)
         {
-            duration = duration.saturating_add(super::input_estimate::duration_nanos(
+            duration = duration.add(super::input_estimate::native_duration(
                 super::attachment_bytes(audio)?,
                 &audio.mime_type,
-            )?);
+            )?)?;
         }
         ensure!(
-            duration <= 34_200_000_000_000,
+            duration.within_millis(34_200_000)?,
             "Gemini audio exceeds 9.5 hours per prompt"
         );
     }
