@@ -3995,6 +3995,9 @@ impl AgentManager {
                 .into_iter()
                 .collect::<std::collections::HashSet<_>>();
             let owner = self.capture_turn_stop_owner(thread_id, turn_id).await?;
+            if !captured.contains(&owner) {
+                return Err(StopError::UnknownOwner);
+            }
             self.cancel_captured_turn_and_wait(&owner, reason, request_deadline)
                 .await?;
             let remaining = self.capture_native_stop_owners(&threads, 65_536).await?;
