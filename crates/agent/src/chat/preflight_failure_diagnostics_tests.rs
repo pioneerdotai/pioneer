@@ -80,6 +80,16 @@ fn preflight_events<'a>(
         .collect()
 }
 
+// sentry-tracing 0.49 stores event fields in a context, not event.extra.
+fn preflight_tracing_fields(
+    event: &sentry::protocol::Event<'static>,
+) -> &BTreeMap<String, JsonValue> {
+    match event.contexts.get("Rust Tracing Fields") {
+        Some(sentry::protocol::Context::Other(fields)) => fields,
+        _ => panic!("preflight event must retain its Rust Tracing Fields context"),
+    }
+}
+
 fn assert_safe_fallback(result: TurnPreflightProviderCallResult) -> String {
     let failure = match &result {
         TurnPreflightProviderCallResult::Failure(failure) => failure,
@@ -478,11 +488,11 @@ async fn preflight_diagnostics_unwrapped_local_failure_reports_one_safe_error() 
     assert_eq!(errors.len(), 1, "inner setup must not double-report");
     assert_eq!(errors[0].level, sentry::Level::Error);
     assert_eq!(
-        errors[0].extra.get("stage"),
+        preflight_tracing_fields(errors[0]).get("stage"),
         Some(&json!("input_capacity_validation"))
     );
     assert_eq!(
-        errors[0].extra.get("cause_code"),
+        preflight_tracing_fields(errors[0]).get("cause_code"),
         Some(&json!("input_capacity_exceeded"))
     );
     assert_eq!(errors[0].message.as_deref(), Some(message.as_str()));
@@ -578,8 +588,14 @@ async fn preflight_diagnostics_preparation_error_conversions_drop_source_and_con
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].level, sentry::Level::Error);
         assert_eq!(errors[0].message.as_deref(), Some(message.as_str()));
-        assert_eq!(errors[0].extra.get("stage"), Some(&json!(stage)));
-        assert_eq!(errors[0].extra.get("cause_code"), Some(&json!(cause)));
+        assert_eq!(
+            preflight_tracing_fields(errors[0]).get("stage"),
+            Some(&json!(stage))
+        );
+        assert_eq!(
+            preflight_tracing_fields(errors[0]).get("cause_code"),
+            Some(&json!(cause))
+        );
         assert!(
             !serde_json::to_string(&events)
                 .unwrap()
@@ -754,11 +770,14 @@ async fn preflight_diagnostics_orchestrator_resolution_failure_has_no_request_at
         ("thread_provider", "thread-provider"),
         ("thread_model", "thread-model"),
     ] {
-        assert_eq!(errors[0].extra.get(field), Some(&json!(value)));
+        assert_eq!(
+            preflight_tracing_fields(errors[0]).get(field),
+            Some(&json!(value))
+        );
     }
     for field in ["attempt", "input_chars", "elapsed_ms"] {
         assert!(
-            !errors[0].extra.contains_key(field),
+            !preflight_tracing_fields(errors[0]).contains_key(field),
             "resolution must not invent request metadata"
         );
     }
