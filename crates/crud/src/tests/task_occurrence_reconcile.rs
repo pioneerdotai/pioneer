@@ -294,7 +294,7 @@ async fn literal_agent_identity_and_null_matrix() {
         "execution_generation=2",
         "status='failed'",
         "finished_at=NULL",
-        "work_graph_root_execution_id='other'",
+        "work_graph_root_execution_id='z00000000000000000000'",
     ] {
         sql(
             &store,
@@ -619,7 +619,7 @@ async fn agent_late_insert_uses_execution_pk_and_does_not_invent_bindings() {
         .unwrap();
     // Resource/grant FKs intentionally restrict deletion; use a second shared
     // execution id to represent a missing, later inserted authority.
-    let late = "late_agent_execution";
+    let late = "l00000000000000000000";
     sql(
         &store,
         "UPDATE task_run_execution SET id=? WHERE task_run_id=?",
@@ -1627,8 +1627,8 @@ async fn agent_old_new_keys_use_execution_pk_even_without_occurrence_rows() {
     let task = task(&store, TaskExecutorKind::Agent).await;
     let a = source_run(&store, &task, 1, TaskRunStatus::Succeeded).await;
     let b = source_run(&store, &task, 2, TaskRunStatus::Succeeded).await;
-    let a_id = "bare_agent_a";
-    let b_id = "bare_agent_b";
+    let a_id = "a00000000000000000000";
+    let b_id = "b00000000000000000000";
     for (run, id) in [(&a, a_id), (&b, b_id)] {
         crate::repositories::task_run_execution::insert_execution_if_absent(
             &store.connection,
