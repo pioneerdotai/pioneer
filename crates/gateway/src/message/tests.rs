@@ -199,6 +199,30 @@ fn default_test_permission_profile() -> pioneer_protocol::TurnPermissionProfileS
     pioneer_protocol::default_turn_permission_profile_snapshot()
 }
 
+async fn assert_admitted_turn_owner(processor: &MessageProcessor, thread_id: &str, turn_id: &str) {
+    let receipt = processor
+        .crud_store
+        .get_turn_execution(turn_id)
+        .await
+        .expect("ownership lookup should succeed")
+        .expect("an admitted executable Turn must have an ownership receipt");
+    assert_eq!(receipt.thread_id, thread_id);
+    assert_eq!(receipt.turn_id, turn_id);
+    assert_eq!(
+        receipt.owner_id.as_str(),
+        processor.turn_execution_owner_id.as_ref()
+    );
+    assert_eq!(receipt.owner_generation, 1);
+    assert!(
+        processor
+            .crud_store
+            .get_turn_admission(turn_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
 async fn registered_request_context(
     processor: &MessageProcessor,
     connection_id: ConnectionId,
@@ -19053,6 +19077,7 @@ async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_
         !wait_response.completed.is_empty(),
         "child echo turn should complete the task"
     );
+    assert_admitted_turn_owner(&processor, &lineage.child_thread_id, &lineage.child_turn_id).await;
     let completed = &wait_response.completed[0];
     assert_eq!(
         completed.child_turn_id.as_deref(),
@@ -19299,11 +19324,35 @@ async fn review_enabled_child_completion_creates_pending_candidate_without_final
         include_result: true,
         format: TaskDeliveryFormat::Summary,
     });
+    let (_, reviewer_launch) = super::agent_action_tools::resolve_workspace_task_launch(
+        &processor,
+        &workspace_id,
+        "openai",
+        "test-model",
+        None,
+        None,
+        "turn_parent_review_success",
+    )
+    .await
+    .expect("reviewer must use an available exact workspace identity");
+    let reviewer_identity = reviewer_launch
+        .expect("native reviewer launch must be exact")
+        .0;
+    let mut review_policy = TaskAgentReviewPolicy::parent_agent_default(2);
+    review_policy
+        .reviewers
+        .push(pioneer_protocol::TaskResultReviewerSpec {
+            reviewer_kind: TaskResultReviewerKind::ReviewAgent,
+            agent_nickname: Some(reviewer_identity.nickname),
+            agent_role: None,
+            required: false,
+            weight: None,
+        });
     params
         .agent_spec
         .as_mut()
         .expect("agent spec should exist")
-        .review_policy = Some(TaskAgentReviewPolicy::parent_agent_default(2));
+        .review_policy = Some(review_policy);
 
     let response = create_task_for_test(&processor, params)
         .await
@@ -19319,6 +19368,28 @@ async fn review_enabled_child_completion_creates_pending_candidate_without_final
         TaskResultCandidateStatus::PendingReview,
     )
     .await;
+
+    // A reviewer context may become visible before its executable admission.
+    // Wait for that admission, then verify the same receipt as every child.
+    let mut reviewer = None;
+    for _ in 0..100 {
+        let turns = crud_store.list_task_run_turns(&run.id).await.unwrap();
+        if let Some(turn) = turns
+            .into_iter()
+            .find(|turn| turn.kind == TaskRunTurnKind::Review)
+            && crud_store
+                .get_turn_execution(&turn.turn_id)
+                .await
+                .unwrap()
+                .is_some()
+        {
+            reviewer = Some(turn);
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    let reviewer = reviewer.expect("reviewer must reach executable admission");
+    assert_admitted_turn_owner(&processor, &reviewer.thread_id, &reviewer.turn_id).await;
 
     assert_eq!(candidate.thread_id, lineage.child_thread_id);
     assert_eq!(candidate.turn_id, lineage.child_turn_id);
@@ -20252,6 +20323,7 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_i
         TaskResultCandidateStatus::PendingReview,
     )
     .await;
+    assert_admitted_turn_owner(&processor, &revised.child_thread_id, &revised.child_turn_id).await;
     assert_eq!(next_candidate.round, 1);
     assert_eq!(next_candidate.thread_id, revised.child_thread_id);
     assert_eq!(next_candidate.turn_id, revised.child_turn_id);
@@ -30986,6 +31058,15 @@ async fn assert_detached_native_child_turn_cancellation() {
         .created_by_turn_id
         .as_deref()
         .expect("detached child lineage should point at its parent occurrence turn");
+    assert!(
+        crud_store
+            .get_turn_execution(parent_occurrence_turn_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "parent TaskRun occurrences are execution-free projections"
+    );
+
     let parent_anchor = wait_for_task_anchor_item_status(
         crud_store.clone(),
         parent_occurrence_turn_id,
@@ -33111,6 +33192,7 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         .as_str()
         .expect("direct Agent child turn id should be present")
         .to_owned();
+    assert_admitted_turn_owner(&processor, thread_id, &child_turn_id).await;
     assert_ne!(child_turn_id, root_turn_id);
     let permission_request_id = opened_request["request_id"]
         .as_str()
@@ -41093,6 +41175,7 @@ async fn turn_start_without_execution_backend_uses_api_provider_path() {
     )
     .await;
 
+    assert_admitted_turn_owner(&processor, "thr_turn_start_api_old", "turn_start_api_old").await;
     for _ in 0..20 {
         if capture_provider.snapshot_requests().iter().any(|request| {
             request
@@ -41189,6 +41272,7 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
         .await
         .expect("native turn/start preparation should succeed");
 
+    assert_admitted_turn_owner(&processor, "thread_security_native", "turn_security_native").await;
     let author = crud_store
         .get_turn("thread_security_native", "turn_security_native")
         .await
