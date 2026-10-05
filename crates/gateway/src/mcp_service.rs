@@ -304,6 +304,7 @@ impl McpService {
             .lock()
             .await
             .get(installation_id)
+            .filter(|task| task.shutdown_tx.is_some())
             .map(|task| {
                 (
                     task.call_tx.clone(),
@@ -785,7 +786,8 @@ impl McpService {
                 }
                 match tasks.get(&installation_id) {
                     Some(handle)
-                        if handle.fingerprint == row.fingerprint
+                        if handle.shutdown_tx.is_some()
+                            && handle.fingerprint == row.fingerprint
                             && handle.effective_secret_fingerprint
                                 == effective_secret_fingerprint =>
                     {
@@ -1703,6 +1705,7 @@ impl McpService {
             .lock()
             .await
             .get(request.server_id.as_str())
+            .filter(|handle| handle.shutdown_tx.is_some())
             .map(|handle| handle.call_tx.clone())
             .ok_or_else(|| {
                 pioneer_tools::ToolError::NotFound(format!(
@@ -4359,6 +4362,17 @@ mod tests {
         assert!(
             service.task_exists(id).await,
             "unacknowledged native owner remains reachable"
+        );
+        tokio::time::timeout(Duration::from_secs(1), service.oauth_recovered(id))
+            .await
+            .expect("stopping actors must not receive OAuth recovery commands");
+        assert!(
+            service.inner.tasks.lock().await[id]
+                .recovery
+                .pending
+                .lock()
+                .unwrap()
+                .is_none()
         );
         let native = service.clone();
         let retry = tokio::spawn(async move {
