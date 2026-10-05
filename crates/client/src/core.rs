@@ -966,6 +966,7 @@ pub struct ClientCore {
     pub(crate) skills_controller: Mutex<crate::skills::operations::SkillsController>,
     pub(crate) skills_store: Mutex<crate::skills::store::SkillsStore>,
     pub(crate) mcp_controller: Mutex<crate::mcp::operations::McpController>,
+    pub(crate) mcp_oauth: Mutex<crate::mcp::oauth::OAuthController>,
     pub(crate) mcp_store: Mutex<crate::mcp::store::McpStore>,
     pub(crate) administration_operations:
         Mutex<crate::administration::operations::AdministrationOperationController>,
@@ -1189,6 +1190,7 @@ impl ClientCore {
             device_activation: Mutex::new(Default::default()),
             skills_store: Mutex::new(crate::skills::store::SkillsStore::default()),
             mcp_controller: Mutex::new(crate::mcp::operations::McpController::default()),
+            mcp_oauth: Mutex::new(crate::mcp::oauth::OAuthController::default()),
             mcp_store: Mutex::default(),
             administration_operations: Mutex::default(),
             administration_store: Mutex::default(),
@@ -1336,6 +1338,14 @@ impl ClientCore {
                 .gateway_state_event_is_current(event)
         {
             return;
+        }
+        if matches!(
+            event,
+            crate::transport::ws::GatewayWsEvent::Disconnected { .. }
+                | crate::transport::ws::GatewayWsEvent::Reconnecting { .. }
+                | crate::transport::ws::GatewayWsEvent::ConnectFailed { .. }
+        ) {
+            self.fence_mcp_oauth();
         }
         self.observe_session_connection(event);
         let mut owner = self
@@ -1692,7 +1702,10 @@ impl ClientCore {
                 .clear();
         }
         subscribers.clear();
+        self.stop_mcp_oauth();
         let _ = self.transport_runtime.ws_command_sender().shutdown();
+        #[cfg(test)]
+        self.transport_runtime.close_test_ingress();
     }
 
     pub(crate) fn current_scope_demand(&self, scope: &ClientScope) -> Option<ClientDemand> {
@@ -1722,6 +1735,9 @@ impl ClientCore {
         if let crate::transport::ws::GatewayWsEvent::Notification { notification, .. } = event {
             self.observe_administration_notification(notification);
             self.observe_provider_runtime_notification(notification);
+            if self.observe_mcp_oauth_notification(notification) {
+                return None;
+            }
             if self.observe_mcp_notification(notification) {
                 return None;
             }
@@ -1925,8 +1941,13 @@ impl ClientCore {
                 })
                 .expect("Client thread request task could not start"),
         );
-        let runtime = core.transport_runtime.clone();
-        let weak = Arc::downgrade(&core);
+        core.start_gateway_event_dispatcher();
+        core
+    }
+
+    pub(crate) fn start_gateway_event_dispatcher(self: &Arc<Self>) {
+        let runtime = self.transport_runtime.clone();
+        let weak = Arc::downgrade(self);
         let task = std::thread::Builder::new()
             .name("client-gateway-events".into())
             .spawn(move || {
@@ -1940,11 +1961,10 @@ impl ClientCore {
                 }
             })
             .expect("Client Gateway event task could not start");
-        *core
+        *self
             .gateway_task
             .lock()
             .expect("Gateway task owner poisoned") = Some(task);
-        core
     }
 
     /// Process-local Gateway transport handle; no domain state or event delivery to shells.
@@ -2701,6 +2721,7 @@ impl ClientCore {
             self.invalidate_provider_collections();
             self.invalidate_mcp();
             self.invalidate_mcp_operations();
+            self.fence_mcp_oauth();
             self.invalidate_skills();
             self.invalidate_skills_operations();
             self.invalidate_provider_operations();

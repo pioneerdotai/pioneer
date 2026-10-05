@@ -24,8 +24,12 @@ use serde::{Deserialize, Serialize};
 use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
+pub(crate) const GLOBAL_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
+pub(crate) const CN_CODING_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
+pub(crate) const GLOBAL_CODING_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 
 pub struct GlmProvider {
+    profile: &'static str,
     api_key: String,
     base_url: String,
     timeout_policy: ProviderTimeoutPolicy,
@@ -331,11 +335,17 @@ impl GlmProvider {
         timeout_policy: ProviderTimeoutPolicy,
     ) -> Self {
         Self {
+            profile: "glm",
             api_key: api_key.into(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
         }
+    }
+
+    pub(crate) fn with_profile(mut self, profile: &'static str) -> Self {
+        self.profile = profile;
+        self
     }
 
     fn audio_format_from_mime(mime: &str) -> String {
@@ -547,7 +557,7 @@ impl GlmProvider {
 #[async_trait]
 impl crate::traits::Provider for GlmProvider {
     fn name(&self) -> &str {
-        "glm"
+        self.profile
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -899,8 +909,8 @@ impl crate::traits::Provider for GlmProvider {
                 name: None,
                 description: None,
                 created: m.created,
-                provider: "glm".to_owned(),
-                owned_by: m.owned_by.or(Some("zhipu".to_owned())),
+                provider: self.name().to_owned(),
+                owned_by: m.owned_by,
                 limits: ProviderModelLimits::default(),
                 capabilities: ProviderModelCapabilities::default(),
                 transcription: None,
@@ -924,6 +934,33 @@ mod tests {
     use crate::attachments::prepare_messages_for_provider;
     use crate::traits::Provider;
     use crate::types::ChatMessage;
+
+    #[test]
+    fn region_product_defaults_and_override_keep_profile_identity() {
+        for (name, base) in [
+            ("glm", DEFAULT_BASE_URL),
+            ("zai", GLOBAL_BASE_URL),
+            ("glm-coding", CN_CODING_BASE_URL),
+            ("zai-coding", GLOBAL_CODING_BASE_URL),
+        ] {
+            let provider =
+                GlmProvider::with_base_url("dummy-key", format!("{base}/")).with_profile(name);
+            assert_eq!(provider.name(), name);
+            assert_eq!(
+                provider.chat_completions_url(),
+                format!("{base}/chat/completions")
+            );
+            assert_eq!(provider.models_url(), format!("{base}/models"));
+            let custom =
+                GlmProvider::with_base_url("dummy-key", "https://example.test/team/coding/")
+                    .with_profile(name);
+            assert_eq!(custom.name(), name);
+            assert_eq!(
+                custom.chat_completions_url(),
+                "https://example.test/team/coding/chat/completions"
+            );
+        }
+    }
 
     #[test]
     fn creates_with_api_key() {

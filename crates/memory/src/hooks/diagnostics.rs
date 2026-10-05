@@ -85,3 +85,37 @@ pub(super) fn memory_retryable_safe_hook_error(
         .with_retryable(true)
         .with_safe_for_user(true)
 }
+
+/// Fixed fields only; the message also preserves them in outbox APIs that store text.
+pub(super) fn memory_manifest_hook_error(failure: crate::MemoryManifestFailure) -> HookError {
+    let mut error = memory_hook_error(
+        failure.code(),
+        format!(
+            "memory manifest loading failed: failure_class={} failure_stage={} sqlite_primary_code={:?} sqlite_extended_code={:?}",
+            failure.class_name(), failure.stage.as_str(),
+            failure.sqlite_primary_code, failure.sqlite_extended_code,
+        ),
+    )
+    .with_retryable(failure.retryable())
+    .with_safe_for_user(true);
+    for (key, value) in [
+        ("failure_class", Some(failure.class_name().to_owned())),
+        ("failure_stage", Some(failure.stage.as_str().to_owned())),
+        (
+            "sqlite_primary_code",
+            failure.sqlite_primary_code.map(|code| code.to_string()),
+        ),
+        (
+            "sqlite_extended_code",
+            failure.sqlite_extended_code.map(|code| code.to_string()),
+        ),
+    ] {
+        if let Some(value) = value {
+            error.metadata.insert(
+                HookMetadataKey::new(key).expect("static metadata key"),
+                value,
+            );
+        }
+    }
+    error
+}

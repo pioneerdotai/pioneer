@@ -9,7 +9,21 @@ mod projector;
 mod repositories;
 mod task_delivery_lifecycle;
 mod task_events;
+mod task_occurrence;
+mod task_run_occurrence;
+pub use repositories::task_occurrence_reconcile::{
+    TASK_OCCURRENCE_RECONCILE_BUDGET, TASK_OCCURRENCE_RUN_QUOTA, TaskOccurrenceClaimDeferral,
+    TaskOccurrenceClaimFailure, TaskOccurrenceClaimFailurePhase, TaskOccurrenceClock,
+    TaskOccurrenceReconcileCandidate, TaskOccurrenceReconcileClaim,
+};
 mod task_terminal;
+pub use repositories::task_run_occurrence_reconcile::{
+    OCCURRENCE_RECONCILE_BUDGET, OCCURRENCE_RECONCILE_INITIAL_BACKOFF_SECS,
+    OCCURRENCE_RECONCILE_MAX_ATTEMPT_COUNT, OCCURRENCE_RECONCILE_MAX_BACKOFF_SECS,
+    TaskRunOccurrenceClaimDeferral, TaskRunOccurrenceClaimFailure,
+    TaskRunOccurrenceClaimFailurePhase, TaskRunOccurrenceClock,
+    TaskRunOccurrenceReconcileCandidate, TaskRunOccurrenceReconcileClaim,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub use task_delivery_lifecycle::TaskDeliveryCommitTestKind;
 pub use task_delivery_lifecycle::{TaskDeliveryTransition, TaskDeliveryTransitionOutcome};
@@ -1023,6 +1037,8 @@ pub struct ClaimedNativeTerminalEffectRecord {
     pub attempt_count: u16,
     pub max_attempts: u16,
     pub claim_token: String,
+    /// Captured from the durable marker for this fenced attempt.
+    pub legacy_manifest_revalidation: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1216,16 +1232,6 @@ pub struct ClaimedTurnEventDeliveryRecord {
     pub attempt_count: i64,
     pub claim_token: String,
     pub event: AppendedTurnEvent,
-}
-
-/// Persisted native turns that still claim `in_progress` after a process
-/// restart.  CLI-backed turns are excluded by their durable binding; the
-/// recovery coordinator uses this list to reconcile turns that never produced
-/// a running item attempt or recovery job.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InProgressNativeTurnRecord {
-    pub thread_id: String,
-    pub turn_id: String,
 }
 
 /// A terminal task-owned child Turn whose TaskRun aggregate has not yet
@@ -1500,66 +1506,6 @@ async fn reserve_execution_for_run_in_connection<C: ConnectionTrait>(
         .await?
         .context("task run execution missing after reservation")?;
     task_run_execution_from_db_model(execution)
-}
-
-fn exact_terminal_occurrence_status(
-    task: &pioneer_entity::task::Model,
-    run: &pioneer_entity::task_run::Model,
-    execution: &pioneer_entity::task_run_execution::Model,
-    occurrence: &pioneer_entity::task_occurrence_contract::Model,
-    agent_execution: Option<&pioneer_entity::agent_execution::Model>,
-) -> Option<pioneer_protocol::TaskOccurrenceStatus> {
-    if task.id != run.task_id
-        || task.executor_kind != run.executor_kind
-        || occurrence.task_id != run.task_id
-        || occurrence.run_id != run.id
-        || execution.task_id != run.task_id
-        || execution.task_run_id != run.id
-        || execution.executor_kind != run.executor_kind
-        || run.completed_at.is_none()
-        || execution.completed_at.is_none()
-    {
-        return None;
-    }
-
-    let expected = match (run.status.as_str(), execution.status.as_str()) {
-        ("succeeded", "succeeded") => pioneer_protocol::TaskOccurrenceStatus::Delivered,
-        ("failed", "failed") | ("blocked", "blocked") | ("timed_out", "timed_out") => {
-            pioneer_protocol::TaskOccurrenceStatus::Failed
-        }
-        ("cancelled", "cancelled") => pioneer_protocol::TaskOccurrenceStatus::Cancelled,
-        _ => return None,
-    };
-
-    match execution.executor_kind.as_str() {
-        "agent" => {
-            let agent_execution = agent_execution?;
-            if occurrence.agent_execution_id.as_deref() != Some(execution.id.as_str())
-                || agent_execution.id != execution.id
-                || agent_execution.workspace_id != task.workspace_id
-                || agent_execution.parent_task_id.as_deref() != Some(run.task_id.as_str())
-                || occurrence.execution_generation != agent_execution.execution_generation
-                || agent_execution.status != execution.status
-                || agent_execution.finished_at.is_none()
-                || occurrence.work_graph_root_execution_id.as_deref()
-                    != Some(agent_execution.work_graph_root_execution_id.as_str())
-                || occurrence.root_resource_scope_id.as_deref()
-                    != Some(agent_execution.work_graph_root_execution_id.as_str())
-            {
-                return None;
-            }
-        }
-        "system" => {
-            if occurrence.agent_execution_id.is_some()
-                || occurrence.work_graph_root_execution_id.is_some()
-                || occurrence.root_resource_scope_id.is_some()
-            {
-                return None;
-            }
-        }
-        _ => return None,
-    }
-    Some(expected)
 }
 
 /// A single turn's conversation content: user input + assistant reply.
@@ -2614,6 +2560,8 @@ pub struct DueTaskTriggerReconciliation {
 /// authoritative TaskRun aggregate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskRunOccurrenceTerminalizationOutcome {
+    /// The preparation or durable generation/token was superseded. Normal deferral.
+    StaleClaim,
     Changed,
     AlreadyConsistent,
     NotFound,
@@ -2628,6 +2576,7 @@ pub enum TaskOccurrenceTerminalRepairOutcome {
     AlreadyConsistent,
     NotFound,
     NotRepairable,
+    StaleClaim,
 }
 
 #[derive(Debug, Clone)]
@@ -4503,39 +4452,6 @@ impl CrudStore {
 
     pub async fn delete_expired_turn_llm_context(&self) -> Result<u64> {
         turn_llm_context::delete_expired_turn_llm_context(&self.connection).await
-    }
-
-    pub async fn list_in_progress_native_turns(
-        &self,
-        limit: u64,
-    ) -> Result<Vec<InProgressNativeTurnRecord>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let rows = self
-            .connection
-            .query_all_raw(Statement::from_sql_and_values(
-                self.connection.get_database_backend(),
-                "SELECT t.thread_id, t.id AS turn_id FROM \"turn\" t \
-                 WHERE t.status = 'in_progress' \
-                   AND t.turn_kind = 'conversation' \
-                   AND NOT EXISTS (SELECT 1 FROM turn_execution e WHERE e.turn_id = t.id) \
-                   AND EXISTS (SELECT 1 FROM turn_runtime_snapshot s WHERE s.turn_id = t.id) \
-                   AND NOT EXISTS (SELECT 1 FROM turn_cli_runtime_binding c WHERE c.turn_id = t.id) \
-                 ORDER BY t.updated_at ASC, t.id ASC LIMIT ?"
-                    .to_owned(),
-                [i64::try_from(limit).unwrap_or(i64::MAX).into()],
-            ))
-            .await
-            .context("failed to list in-progress native turns for orphan reconciliation")?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(InProgressNativeTurnRecord {
-                    thread_id: row.try_get("", "thread_id")?,
-                    turn_id: row.try_get("", "turn_id")?,
-                })
-            })
-            .collect()
     }
 
     pub async fn list_unreconciled_terminal_task_child_turns(
@@ -13646,10 +13562,48 @@ impl CrudStore {
             self.append_due_trigger_task_events_once(
                 trigger_id.to_owned(),
                 expected_next_fire_at,
+                None,
                 now,
                 events.clone(),
                 occurrence_contracts.clone(),
                 reserve_executions.clone(),
+            )
+        })
+        .await
+    }
+
+    /// Quarantine a Task only if the failed schedule is still current. The
+    /// caller calculates outside database capacity; a user can repair the
+    /// spec without changing its next fire time before this commit. Prepare
+    /// the repository's canonical spec JSON here, then revalidate it and the
+    /// Task identity inside the existing atomic due-trigger transaction.
+    pub async fn block_task_for_due_trigger_failure(
+        &self,
+        trigger: &TaskTrigger,
+        error: TaskError,
+        now: i64,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        let Some(expected_next_fire_at) = trigger.next_fire_at else {
+            return Ok(Vec::new());
+        };
+        let expected_snapshot = (
+            trigger.task_id.clone(),
+            serde_json::to_string(&trigger.spec)?,
+        );
+        let events = vec![TaskEventPayload::TaskBlocked {
+            task_id: trigger.task_id.clone(),
+            error: Some(error),
+            blocked_at: now,
+        }];
+        self.run_serialized_write(|| {
+            self.append_due_trigger_task_events_once(
+                trigger.id.clone(),
+                expected_next_fire_at,
+                Some(expected_snapshot.clone()),
+                now,
+                events.clone(),
+                Vec::new(),
+                Vec::new(),
             )
         })
         .await
@@ -14301,227 +14255,6 @@ impl CrudStore {
             .transpose()
     }
 
-    /// Find TaskRun occurrence Turns that disagree with their authoritative
-    /// terminal TaskRun. This includes false terminalization by generic Turn
-    /// recovery, not only occurrences left `in_progress`.
-    pub async fn list_mismatched_terminal_task_run_occurrence_ids(
-        &self,
-        limit: u64,
-    ) -> Result<Vec<String>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let rows = self
-            .connection
-            .query_all_raw(Statement::from_sql_and_values(
-                self.connection.get_database_backend(),
-                "SELECT occurrence.id AS run_id \
-                 FROM \"turn\" occurrence \
-                 INNER JOIN task_run run ON run.id = occurrence.id \
-                 WHERE occurrence.turn_kind = 'task_run' \
-                   AND ((run.status = 'succeeded' AND occurrence.status <> 'completed') \
-                     OR (run.status IN ('failed', 'timed_out') AND occurrence.status <> 'failed') \
-                     OR (run.status = 'blocked' AND occurrence.status <> 'blocked') \
-                     OR (run.status = 'cancelled' AND occurrence.status <> 'interrupted')) \
-                 ORDER BY occurrence.updated_at ASC, occurrence.id ASC LIMIT ?"
-                    .to_owned(),
-                [i64::try_from(limit).unwrap_or(i64::MAX).into()],
-            ))
-            .await
-            .context("failed to list TaskRun occurrence Turns with mismatched terminal state")?;
-        rows.into_iter()
-            .map(|row| row.try_get("", "run_id").map_err(Into::into))
-            .collect()
-    }
-
-    /// Atomically compare the canonical occurrence Turn (`Turn.id == TaskRun.id`)
-    /// with its authoritative terminal TaskRun and materialize the terminal Turn
-    /// event only when their statuses differ.
-    pub async fn compare_and_materialize_task_run_occurrence_terminal(
-        &self,
-        run_id: &str,
-        fallback_completed_at: i64,
-    ) -> Result<TaskRunOccurrenceTerminalizationOutcome> {
-        let run_id = run_id.to_owned();
-        self.run_serialized_write(|| {
-            self.compare_and_materialize_task_run_occurrence_terminal_once(
-                run_id.clone(),
-                fallback_completed_at,
-            )
-        })
-        .await
-    }
-
-    async fn compare_and_materialize_task_run_occurrence_terminal_once(
-        &self,
-        run_id: String,
-        fallback_completed_at: i64,
-    ) -> Result<TaskRunOccurrenceTerminalizationOutcome> {
-        let Some(prepared_run_model) =
-            task_run::find_run_by_id(&self.connection, run_id.as_str()).await?
-        else {
-            return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-        };
-        let run = task_run_from_db_model(prepared_run_model.clone())?;
-        let (desired_status, desired_error) = match run.status {
-            TaskRunStatus::Succeeded => (TurnStatus::Completed, None),
-            TaskRunStatus::Failed | TaskRunStatus::TimedOut => (
-                TurnStatus::Failed,
-                run.error.as_ref().map(|error| error.message.clone()),
-            ),
-            TaskRunStatus::Blocked => (
-                TurnStatus::Blocked,
-                run.error.as_ref().map(|error| error.message.clone()),
-            ),
-            TaskRunStatus::Cancelled => (
-                TurnStatus::Interrupted,
-                run.error.as_ref().map(|error| error.message.clone()),
-            ),
-            TaskRunStatus::Queued
-            | TaskRunStatus::Starting
-            | TaskRunStatus::Running
-            | TaskRunStatus::Waiting
-            | TaskRunStatus::WaitingReview => {
-                bail!(
-                    "TaskRun `{}` is not terminal and cannot terminalize its occurrence Turn",
-                    run.id
-                );
-            }
-        };
-        let Some(prepared_turn_model) =
-            turn::find_turn_by_id(&self.connection, run.id.as_str()).await?
-        else {
-            return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-        };
-        if turn_kind_from_db(prepared_turn_model.turn_kind.as_str()) != Some(TurnKind::TaskRun) {
-            return Ok(TaskRunOccurrenceTerminalizationOutcome::InvalidBinding);
-        }
-        let current_status = turn_status_from_db(prepared_turn_model.status.as_str())
-            .with_context(|| format!("occurrence Turn `{}` has an unknown status", run.id))?;
-        if current_status == desired_status {
-            return Ok(TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent);
-        }
-        let Some(prepared_thread_model) =
-            thread::find_thread_by_id(&self.connection, prepared_turn_model.thread_id.as_str())
-                .await?
-        else {
-            return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-        };
-        let Some(mut terminal_turn) = turn_from_db_model(prepared_turn_model.clone())? else {
-            bail!("occurrence Turn `{}` has an unknown status", run.id);
-        };
-        terminal_turn.status = desired_status;
-        terminal_turn.error = desired_error;
-        let terminal_event = match desired_status {
-            TurnStatus::Completed => {
-                TurnEventPayload::TurnCompleted(pioneer_protocol::TurnCompletedNotification {
-                    workspace_id: prepared_thread_model.workspace_id.clone(),
-                    thread_id: prepared_thread_model.id.clone(),
-                    turn: terminal_turn,
-                })
-            }
-            TurnStatus::Failed | TurnStatus::Interrupted => {
-                TurnEventPayload::TurnFailed(pioneer_protocol::TurnFailedNotification {
-                    workspace_id: prepared_thread_model.workspace_id.clone(),
-                    thread_id: prepared_thread_model.id.clone(),
-                    turn: terminal_turn,
-                })
-            }
-            TurnStatus::Blocked => {
-                TurnEventPayload::TurnBlocked(pioneer_protocol::TurnBlockedNotification {
-                    workspace_id: prepared_thread_model.workspace_id.clone(),
-                    thread_id: prepared_thread_model.id.clone(),
-                    turn: terminal_turn,
-                    resume: None,
-                })
-            }
-            TurnStatus::InProgress => unreachable!("TaskRun terminal status mapping"),
-        };
-        let completed_at = run.completed_at.unwrap_or(fallback_completed_at);
-        let created_at = unix_to_datetime(completed_at);
-        let claim_expires_at =
-            unix_to_datetime(completed_at.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
-        let terminal_event = prepare_projected_turn_event_for_permanent_storage(
-            &self.connection,
-            terminal_event,
-            created_at,
-        )
-        .await?;
-
-        let transaction = self
-            .connection
-            .begin()
-            .await
-            .context("failed to begin TaskRun occurrence terminalization transaction")?;
-
-        let result = async {
-            let Some(run_model) = task_run::find_run_by_id(&transaction, run_id.as_str()).await?
-            else {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-            };
-            if run_model.status != prepared_run_model.status
-                || run_model.updated_at != prepared_run_model.updated_at
-            {
-                anyhow::bail!("TaskRun changed during occurrence terminalization preparation");
-            }
-
-            // The occurrence identity is canonical and does not depend on
-            // optional/legacy lineage rows: Turn.id is exactly TaskRun.id.
-            let Some(turn_model) = turn::find_turn_by_id(&transaction, run_id.as_str()).await?
-            else {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-            };
-            if turn_kind_from_db(turn_model.turn_kind.as_str()) != Some(TurnKind::TaskRun) {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::InvalidBinding);
-            }
-            let current_status = turn_status_from_db(turn_model.status.as_str())
-                .with_context(|| format!("occurrence Turn `{run_id}` has an unknown status"))?;
-            if current_status == desired_status {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent);
-            }
-            if turn_model.status != prepared_turn_model.status
-                || turn_model.updated_at != prepared_turn_model.updated_at
-            {
-                anyhow::bail!("occurrence Turn changed during terminalization preparation");
-            }
-            let thread_model =
-                thread::find_thread_by_id(&transaction, turn_model.thread_id.as_str()).await?;
-            let Some(thread_model) = thread_model else {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-            };
-            if thread_model.id != prepared_thread_model.id
-                || thread_model.workspace_id != prepared_thread_model.workspace_id
-            {
-                anyhow::bail!("occurrence Thread changed during terminalization preparation");
-            }
-            self.append_and_project_turn_event_in_transaction(
-                &transaction,
-                terminal_event,
-                created_at,
-                claim_expires_at,
-                false,
-            )
-            .await?;
-
-            Ok(TaskRunOccurrenceTerminalizationOutcome::Changed)
-        }
-        .await;
-
-        match result {
-            Ok(outcome) => {
-                transaction
-                    .commit()
-                    .await
-                    .context("failed to commit TaskRun occurrence terminalization transaction")?;
-                Ok(outcome)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
     pub async fn claim_task_run_execution_for_dispatch(
         &self,
         run_id: &str,
@@ -14785,102 +14518,6 @@ impl CrudStore {
             limit,
         )
         .await
-    }
-
-    pub async fn compare_and_repair_terminal_task_occurrence(
-        &self,
-        run_id: &str,
-        now: i64,
-    ) -> Result<TaskOccurrenceTerminalRepairOutcome> {
-        let run_id = run_id.to_owned();
-        self.run_serialized_write(|| {
-            self.compare_and_repair_terminal_task_occurrence_once(run_id.clone(), now)
-        })
-        .await
-    }
-
-    async fn compare_and_repair_terminal_task_occurrence_once(
-        &self,
-        run_id: String,
-        now: i64,
-    ) -> Result<TaskOccurrenceTerminalRepairOutcome> {
-        let transaction = self
-            .connection
-            .begin()
-            .await
-            .context("failed to begin terminal Task occurrence repair transaction")?;
-        let result = async {
-            let Some(run) = task_run::find_run_by_id(&transaction, run_id.as_str()).await? else {
-                return Ok(TaskOccurrenceTerminalRepairOutcome::NotFound);
-            };
-            let Some(execution) =
-                task_run_execution::find_execution_by_run(&transaction, run_id.as_str()).await?
-            else {
-                return Ok(TaskOccurrenceTerminalRepairOutcome::NotRepairable);
-            };
-            let Some(occurrence_model) = pioneer_entity::task_occurrence_contract::Entity::find()
-                .filter(pioneer_entity::task_occurrence_contract::Column::RunId.eq(run_id.clone()))
-                .one(&transaction)
-                .await?
-            else {
-                return Ok(TaskOccurrenceTerminalRepairOutcome::NotFound);
-            };
-            let repair_at = now.max(occurrence_model.updated_at.timestamp());
-            let Some(task) =
-                task_repository::find_task_by_id(&transaction, run.task_id.as_str()).await?
-            else {
-                return Ok(TaskOccurrenceTerminalRepairOutcome::NotRepairable);
-            };
-            let agent_execution = if execution.executor_kind == "agent" {
-                pioneer_entity::agent_execution::Entity::find_by_id(execution.id.clone())
-                    .one(&transaction)
-                    .await
-                    .context("failed to revalidate terminal AgentExecution for occurrence repair")?
-            } else {
-                None
-            };
-            let Some(expected_status) = exact_terminal_occurrence_status(
-                &task,
-                &run,
-                &execution,
-                &occurrence_model,
-                agent_execution.as_ref(),
-            ) else {
-                return Ok(TaskOccurrenceTerminalRepairOutcome::NotRepairable);
-            };
-            if occurrence_model.status
-                == repositories::task_actor_contract::task_occurrence_status_to_db(&expected_status)
-            {
-                return Ok(TaskOccurrenceTerminalRepairOutcome::AlreadyConsistent);
-            }
-            let repaired =
-                repositories::task_actor_contract::repair_terminal_task_occurrence_status(
-                    &transaction,
-                    &occurrence_model,
-                    expected_status,
-                    repair_at,
-                )
-                .await?;
-            Ok(if repaired {
-                TaskOccurrenceTerminalRepairOutcome::Changed
-            } else {
-                TaskOccurrenceTerminalRepairOutcome::NotRepairable
-            })
-        }
-        .await;
-        match result {
-            Ok(outcome) => {
-                transaction
-                    .commit()
-                    .await
-                    .context("failed to commit terminal Task occurrence repair transaction")?;
-                Ok(outcome)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
     }
 
     pub async fn reserve_execution_for_run(
@@ -24123,6 +23760,57 @@ impl CrudStore {
         }))
     }
 
+    /// The latest canonical blocked transition owns this diagnostic. Never select a
+    /// job merely because it is the newest failure for the same Turn.
+    pub async fn get_blocked_turn_recovery_diagnostic(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<pioneer_protocol::RecoveryDiagnostic>> {
+        let row = self.connection.query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT e.payload, t.error, j.diagnostic FROM turn t \
+             JOIN turn_event e ON e.turn_id = t.id AND e.sequence = \
+               (SELECT MAX(sequence) FROM turn_event WHERE turn_id = t.id \
+                AND event_type IN ('turn/started', 'turn/blocked', 'turn/failed', 'turn/completed')) \
+             JOIN recovery_job j ON j.id = json_extract(e.payload, '$.payload.resume.blocked_recovery_job_id') \
+             JOIN recovery_terminalization_outbox o ON o.recovery_job_id = j.id \
+             WHERE t.id = ? AND t.status = 'blocked' AND e.event_type = 'turn/blocked' \
+             AND j.turn_id = t.id AND j.status = 'blocked' AND o.status = 'delivered' \
+             AND o.turn_id = j.turn_id AND o.item_id = j.item_id AND o.item_type = j.item_type \
+             AND o.recovery_status = j.status AND o.attempt_number = MAX(j.run_count, 1) \
+             AND o.error_message = COALESCE(j.last_error, j.reason, 'recovery reached a terminal outcome')",
+            [turn_id.into()],
+        )).await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let payload: String = row.try_get("", "payload")?;
+        let error: Option<String> = row.try_get("", "error")?;
+        let diagnostic: Option<String> = row.try_get("", "diagnostic")?;
+        let Ok(CanonicalTurnEventPayload::TurnBlocked(event)) = serde_json::from_str(&payload)
+        else {
+            return Ok(None);
+        };
+        let Some(job_id) = event
+            .resume
+            .and_then(|resume| resume.blocked_recovery_job_id)
+        else {
+            return Ok(None);
+        };
+        let diagnostic = diagnostic.as_deref().and_then(|value| {
+            serde_json::from_str::<pioneer_protocol::RecoveryDiagnostic>(value).ok()
+        });
+        Ok(diagnostic.filter(|value| {
+            value.stop_reason == Some(pioneer_protocol::RecoveryStopReason::NoProgress)
+                && value.last_failure.is_some()
+                && event.turn.id == turn_id
+                && event.turn.status == TurnStatus::Blocked
+                && event.turn.error == error
+                && error.as_deref()
+                    == Some(format!("{} (recovery job {job_id})", value.public_message()).as_str())
+        }))
+    }
+
     pub async fn get_recovery_job(&self, job_id: &str) -> Result<Option<RecoveryJobRecord>> {
         self.run_serialized_write(|| async {
             Ok(recovery_job::find_job_by_id(&self.connection, job_id)
@@ -24400,6 +24088,8 @@ impl CrudStore {
             if affected {
                 if let Some(value) = &diagnostic_json {
                     recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
+                } else if status == RecoveryJobStatus::Blocked {
+                    recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
                 }
                 enqueue_recovery_terminalization_if_required(
                     &tx,
@@ -24439,6 +24129,9 @@ impl CrudStore {
             )
             .await?;
             if affected {
+                if status == RecoveryJobStatus::Blocked {
+                    recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
+                }
                 enqueue_recovery_terminalization_if_required(
                     &tx,
                     job_id,
@@ -24494,6 +24187,8 @@ impl CrudStore {
             if affected {
                 if let Some(value) = &diagnostic_json {
                     recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
+                } else if status == RecoveryJobStatus::Blocked {
+                    recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
                 }
                 enqueue_recovery_terminalization_if_required(
                     &tx,
@@ -24558,6 +24253,8 @@ impl CrudStore {
             if affected {
                 if let Some(value) = &diagnostic_json {
                     recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
+                } else if status == RecoveryJobStatus::Blocked {
+                    recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
                 }
                 enqueue_recovery_terminalization_if_required(
                     &tx,
@@ -24742,6 +24439,8 @@ impl CrudStore {
                     {
                         bail!("native terminal-effect retry state is invalid");
                     }
+                    let legacy_manifest_revalidation = row.last_error_code.as_deref()
+                        == Some("memory.post_turn_extractor.legacy_manifest_revalidate");
                     Ok(ClaimedNativeTerminalEffectRecord {
                         effect_id: row.effect_id,
                         workspace_id: row.workspace_id,
@@ -24752,6 +24451,7 @@ impl CrudStore {
                         attempt_count,
                         max_attempts,
                         claim_token: claimed.claim_token.clone(),
+                        legacy_manifest_revalidation,
                     })
                 })();
                 match decoded {
@@ -25792,6 +25492,15 @@ impl CrudStore {
                 current_status,
             });
         }
+        let blocked_diagnostic = job
+            .diagnostic
+            .as_deref()
+            .and_then(|value| {
+                serde_json::from_str::<pioneer_protocol::RecoveryDiagnostic>(value).ok()
+            })
+            .filter(|value| {
+                value.stop_reason == Some(pioneer_protocol::RecoveryStopReason::NoProgress)
+            });
         let terminal_error = if job_status == RecoveryJobStatus::Blocked {
             if current_status == TurnStatus::Blocked {
                 turn_model
@@ -25807,7 +25516,11 @@ impl CrudStore {
                 })?;
                 format!(
                     "{} (recovery job {})",
-                    resume.human_message, record.recovery_job_id
+                    blocked_diagnostic
+                        .as_ref()
+                        .map(|value| value.public_message())
+                        .unwrap_or_else(|| resume.human_message.clone()),
+                    record.recovery_job_id
                 )
             }
         } else {
@@ -25948,7 +25661,12 @@ impl CrudStore {
                     turn: terminal_turn
                         .clone()
                         .expect("non-terminal recovery must construct a terminal Turn"),
-                    resume: resume.cloned(),
+                    resume: resume.cloned().map(|mut resume| {
+                        if let Some(diagnostic) = &blocked_diagnostic {
+                            resume.human_message = diagnostic.public_message();
+                        }
+                        resume
+                    }),
                 })
             } else {
                 TurnEventPayload::TurnFailed(pioneer_protocol::TurnFailedNotification {
@@ -29389,6 +29107,7 @@ impl CrudStore {
         &self,
         trigger_id: String,
         expected_next_fire_at: i64,
+        expected_snapshot: Option<(String, String)>,
         now: i64,
         events: Vec<TaskEventPayload>,
         occurrence_contracts: Vec<pioneer_protocol::TaskOccurrenceContract>,
@@ -29418,6 +29137,11 @@ impl CrudStore {
                 || trigger.next_fire_at.map(|value| value.timestamp())
                     != Some(expected_next_fire_at)
                 || expected_next_fire_at > now
+                || expected_snapshot
+                    .as_ref()
+                    .is_some_and(|(task_id, spec_json)| {
+                        &trigger.task_id != task_id || &trigger.spec_json != spec_json
+                    })
             {
                 return Ok(Vec::new());
             }
@@ -31342,6 +31066,10 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    #[path = "task_run_occurrence.rs"]
+    mod occurrence_tracker;
+    #[path = "task_occurrence_reconcile.rs"]
+    mod task_occurrence_tracker;
     use super::{
         AgentExecutionInput, AgentResourceStateInput, ArtifactBindingTargetRecord,
         AtomicRecoveryJobEnqueueOutcome, BLOCK_KIND_APPROVAL, BLOCK_KIND_USER_MESSAGE,
@@ -31367,8 +31095,9 @@ mod tests {
         SkillPackInstallationRecord, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
         THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES,
         TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES, TaskEventPayload, TaskOwnedTurnResumeOutcome,
-        TaskRunChildAnchor, TaskRunOccurrenceTerminalizationOutcome, ThreadAgentsDocError,
-        ThreadAgentsDocSaveReason, ThreadAgentsDocStatus, ThreadEpisodicActiveWriteSegmentRequest,
+        TaskRunChildAnchor, TaskRunOccurrenceReconcileCandidate,
+        TaskRunOccurrenceTerminalizationOutcome, ThreadAgentsDocError, ThreadAgentsDocSaveReason,
+        ThreadAgentsDocStatus, ThreadEpisodicActiveWriteSegmentRequest,
         ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleWriteState,
         ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility, ThreadEpisodicSourceActorRole,
         ThreadEpisodicSourceRuntimeKind, ThreadEpisodicWorkspaceActiveWriteSegmentRequest,
@@ -31969,6 +31698,15 @@ mod tests {
         turn_id: &str,
     ) -> (CrudStore, Thread, Turn) {
         let store = test_store_with_workspace(workspace_id).await;
+        start_test_turn(store, workspace_id, thread_id, turn_id).await
+    }
+
+    async fn start_test_turn(
+        store: CrudStore,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> (CrudStore, Thread, Turn) {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             workspace_id: workspace_id.to_owned(),
@@ -32776,74 +32514,24 @@ mod tests {
             .expect("the current execution owner should append the event");
     }
 
-    #[tokio::test]
-    async fn legacy_orphan_scan_requires_positive_native_runtime_evidence() {
-        let (store, _, _) = test_store_with_started_turn(
-            "ws_legacy_native_evidence",
-            "thr_legacy_native_evidence",
-            "turn_legacy_native_evidence",
-        )
-        .await;
-        assert!(
-            store
-                .list_in_progress_native_turns(10)
-                .await
-                .expect("legacy orphan scan should succeed")
-                .is_empty(),
-            "absence of a CLI binding must not classify an old Turn as native"
-        );
-
-        let timestamp = unix_to_datetime(1_700_000_100);
-        store
-            .upsert_turn_runtime_snapshot(NewTurnRuntimeSnapshot {
-                turn_id: "turn_legacy_native_evidence".to_owned(),
-                thread_id: "thr_legacy_native_evidence".to_owned(),
-                workspace_id: "ws_legacy_native_evidence".to_owned(),
-                mode_json: r#""Agent""#.to_owned(),
-                model: "test-model".to_owned(),
-                provider_name: "test-provider".to_owned(),
-                reasoning_effort: None,
-                agent_skill_versions_json: None,
-                hook_runtime_context_json: "{}".to_owned(),
-                workspace_skill_policies_json: "[]".to_owned(),
-                input_json: "[]".to_owned(),
-                capabilities_json: "[]".to_owned(),
-                resolved_artifacts_json: "[]".to_owned(),
-                runtime_environment_json: "{}".to_owned(),
-                history_json: "[]".to_owned(),
-                created_at: timestamp,
-                updated_at: timestamp,
-            })
-            .await
-            .expect("legacy native runtime evidence should persist");
-        let candidates = store
-            .list_in_progress_native_turns(10)
-            .await
-            .expect("legacy orphan scan should succeed");
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].turn_id, "turn_legacy_native_evidence");
-    }
-
-    #[tokio::test]
-    async fn native_optional_delivery_retries_without_reordering_a_turn() {
-        let (store, _, _) = test_store_with_started_turn(
-            "ws_native_outbox_order",
-            "thr_native_outbox_order",
-            "turn_native_outbox_order",
-        )
-        .await;
-        for index in 1..=2 {
+    async fn append_optional_delivery_test_items(
+        store: &CrudStore,
+        thread: &Thread,
+        turn_id: &str,
+        count: i64,
+    ) {
+        for index in 1..=count {
             store
                 .materialize_native_agent_turn_event(
                     CanonicalTurnEventPayload::ItemCompleted(ItemCompletedNotification {
-                        workspace_id: "ws_native_outbox_order".to_owned(),
-                        thread_id: "thr_native_outbox_order".to_owned(),
-                        turn_id: "turn_native_outbox_order".to_owned(),
+                        workspace_id: thread.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn_id: turn_id.to_owned(),
                         item: TurnItem::SystemEvent {
-                            id: format!("native_outbox_order_{index}"),
+                            id: format!("{turn_id}_item_{index}"),
                             level: SystemEventLevel::Info,
                             message: format!("committed {index}"),
-                            code: Some("native.outbox.order".to_owned()),
+                            code: None,
                             details: None,
                         },
                     }),
@@ -32851,58 +32539,462 @@ mod tests {
                     None,
                 )
                 .await
-                .expect("native event should commit with outbox");
+                .expect("native item should enqueue both optional consumers");
         }
+    }
 
-        let first = store
-            .claim_due_turn_event_deliveries("live_notification", 1_700_000_110, 10)
-            .await
-            .expect("first delivery should claim");
-        assert_eq!(first.len(), 1, "only the causal predecessor may be claimed");
+    #[tokio::test]
+    async fn native_optional_delivery_filters_blocked_turns_before_the_batch_limit() {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_delivery_fairness",
+            "thr_delivery_fairness",
+            "turn_a_delivery_fairness",
+        )
+        .await;
+        append_optional_delivery_test_items(&store, &thread, &turn.id, 4).await;
+        let healthy_turns = ["turn_b_delivery_fairness", "turn_c_delivery_fairness"];
+        for turn_id in healthy_turns {
+            let mut healthy = turn.clone();
+            healthy.id = turn_id.to_owned();
+            store
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &healthy,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("independent turn should start");
+            append_optional_delivery_test_items(&store, &thread, turn_id, 1).await;
+        }
+        let store = store.with_maintenance_access();
+        let now = 1_700_000_110;
+        let consumers = ["live_notification", "thread_episodic"];
+        let mut heads = Vec::new();
+        for consumer in consumers {
+            let head = store
+                .claim_due_turn_event_deliveries(consumer, now, 1)
+                .await
+                .unwrap();
+            assert_eq!(head.len(), 1);
+            assert_eq!(head[0].event.turn_id, turn.id);
+            heads.push(head.into_iter().next().unwrap());
+        }
         assert!(
             store
                 .fail_turn_event_delivery(
-                    first[0].id.as_str(),
-                    first[0].claim_token.as_str(),
-                    first[0].attempt_count,
-                    "injected live failure".to_owned(),
-                    1_700_000_110,
+                    &heads[0].id,
+                    &heads[0].claim_token,
+                    heads[0].attempt_count,
+                    "injected backoff".to_owned(),
+                    now,
                 )
                 .await
-                .expect("failure should persist")
+                .unwrap()
         );
-        assert!(
-            store
-                .claim_due_turn_event_deliveries("live_notification", 1_700_000_110, 10)
+        // Live's predecessor is in retry backoff; episodic's is still leased.
+        // Their due successors must not consume either consumer's batch slots.
+        for consumer in consumers {
+            let ready = store
+                .claim_due_turn_event_deliveries(consumer, now, 2)
                 .await
-                .expect("backoff lookup should succeed")
-                .is_empty(),
-            "a later event cannot overtake a failed predecessor during backoff"
-        );
-
-        let retried = store
-            .claim_due_turn_event_deliveries("live_notification", 1_700_000_111, 10)
+                .unwrap();
+            assert_eq!(ready.len(), 2, "blocked turn must not starve other turns");
+            assert_eq!(
+                ready
+                    .iter()
+                    .map(|claim| claim.event.turn_id.as_str())
+                    .collect::<Vec<_>>(),
+                healthy_turns
+            );
+            for claim in ready {
+                assert!(
+                    store
+                        .complete_turn_event_delivery(&claim.id, &claim.claim_token, now)
+                        .await
+                        .unwrap()
+                );
+            }
+            assert!(
+                store
+                    .claim_due_turn_event_deliveries(consumer, now, 2)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "successors must still wait for their own predecessor"
+            );
+        }
+        let retry = store
+            .claim_due_turn_event_deliveries(consumers[0], now + 1, 2)
             .await
-            .expect("failed predecessor should become due");
-        assert_eq!(retried.len(), 1);
-        assert_eq!(retried[0].id, first[0].id);
+            .unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].id, heads[0].id);
+        heads[0] = retry.into_iter().next().unwrap();
+        // A fresh store sees the durable claims and advances each turn in order.
+        let restored = CrudStore::new(store.database_connection());
+        for head in heads {
+            assert!(
+                restored
+                    .complete_turn_event_delivery(&head.id, &head.claim_token, now + 1)
+                    .await
+                    .unwrap()
+            );
+            for offset in 1..=3 {
+                let next = restored
+                    .claim_due_turn_event_deliveries(&head.consumer, now + 1, 2)
+                    .await
+                    .unwrap();
+                assert_eq!(next.len(), 1, "only one event per turn can be in flight");
+                assert_eq!(next[0].event.turn_id, turn.id);
+                assert_eq!(next[0].event.sequence, head.event.sequence + offset);
+                assert!(
+                    restored
+                        .complete_turn_event_delivery(&next[0].id, &next[0].claim_token, now + 1)
+                        .await
+                        .unwrap()
+                );
+            }
+            assert!(
+                restored
+                    .claim_due_turn_event_deliveries(&head.consumer, now + 1, 2)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_optional_delivery_reclaims_expired_heads_and_fences_stale_claims() {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_delivery_expiry",
+            "thr_delivery_expiry",
+            "turn_delivery_expiry",
+        )
+        .await;
+        append_optional_delivery_test_items(&store, &thread, &turn.id, 2).await;
+        let now = 1_700_000_110;
+        let first = store
+            .claim_due_turn_event_deliveries("live_notification", now, 10)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
         assert!(
             store
+                .claim_due_turn_event_deliveries("live_notification", now + 119, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let restored = CrudStore::new(store.database_connection());
+        let recovered = restored
+            .claim_due_turn_event_deliveries("live_notification", now + 120, 10)
+            .await
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, first[0].id);
+        assert_ne!(recovered[0].claim_token, first[0].claim_token);
+        assert!(
+            !restored
+                .complete_turn_event_delivery(&first[0].id, &first[0].claim_token, now + 120)
+                .await
+                .unwrap(),
+            "expired owner cannot complete a reclaimed head"
+        );
+        assert!(
+            restored
                 .complete_turn_event_delivery(
-                    retried[0].id.as_str(),
-                    retried[0].claim_token.as_str(),
-                    1_700_000_111,
+                    &recovered[0].id,
+                    &recovered[0].claim_token,
+                    now + 120
                 )
                 .await
-                .expect("retry completion should persist")
+                .unwrap()
         );
-
-        let successor = store
-            .claim_due_turn_event_deliveries("live_notification", 1_700_000_112, 10)
+        let next = restored
+            .claim_due_turn_event_deliveries("live_notification", now + 120, 10)
             .await
-            .expect("successor lookup should succeed");
-        assert_eq!(successor.len(), 1);
-        assert!(successor[0].event.sequence > retried[0].event.sequence);
+            .unwrap();
+        assert_eq!(next.len(), 1);
+        assert!(next[0].event.sequence > recovered[0].event.sequence);
+    }
+
+    #[tokio::test]
+    async fn native_optional_delivery_exhausted_head_unblocks_only_its_consumer() {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_delivery_exhausted",
+            "thr_delivery_exhausted",
+            "turn_delivery_exhausted",
+        )
+        .await;
+        append_optional_delivery_test_items(&store, &thread, &turn.id, 2).await;
+        let mut now = 1_700_000_110;
+        let mut head = None;
+        for attempt in 0..10 {
+            let claims = store
+                .claim_due_turn_event_deliveries("live_notification", now, 2)
+                .await
+                .unwrap();
+            assert_eq!(claims.len(), 1);
+            assert_eq!(claims[0].attempt_count, attempt);
+            let expected = head.get_or_insert_with(|| claims[0].id.clone());
+            assert_eq!(&claims[0].id, expected);
+            assert!(
+                store
+                    .fail_turn_event_delivery(
+                        &claims[0].id,
+                        &claims[0].claim_token,
+                        claims[0].attempt_count,
+                        "poison delivery".to_owned(),
+                        now,
+                    )
+                    .await
+                    .unwrap()
+            );
+            now += 2_i64.pow(attempt.min(8) as u32);
+        }
+        let exhausted = pioneer_entity::turn_event_delivery::Entity::find_by_id(head.unwrap())
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(exhausted.status, "exhausted");
+        let live = store
+            .claim_due_turn_event_deliveries("live_notification", now, 2)
+            .await
+            .unwrap();
+        let episodic = store
+            .claim_due_turn_event_deliveries("thread_episodic", now, 2)
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(episodic.len(), 1);
+        assert_eq!(live[0].event.sequence, exhausted.sequence + 1);
+        assert_eq!(episodic[0].event.sequence, exhausted.sequence);
+    }
+
+    #[derive(Default)]
+    struct OptionalDeliveryDatabaseObserver {
+        reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadClass>>,
+        events: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+        enqueued: tokio::sync::Notify,
+    }
+
+    impl pioneer_sqlite::SqliteReadObserver for OptionalDeliveryDatabaseObserver {
+        fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+            if let pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } = event {
+                self.reads.lock().unwrap().push(class);
+            }
+        }
+    }
+
+    impl pioneer_sqlite::SqliteWriteObserver for OptionalDeliveryDatabaseObserver {
+        fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+            self.events.lock().unwrap().push(event);
+            if matches!(event, pioneer_sqlite::SqliteWriteEvent::Enqueued { .. }) {
+                self.enqueued.notify_one();
+            }
+        }
+    }
+
+    impl OptionalDeliveryDatabaseObserver {
+        async fn wait_for_enqueued(&self, count: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let ready = self
+                        .events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|event| {
+                            matches!(event, pioneer_sqlite::SqliteWriteEvent::Enqueued { .. })
+                        })
+                        .count()
+                        >= count;
+                    if ready {
+                        break;
+                    }
+                    self.enqueued.notified().await;
+                }
+            })
+            .await
+            .expect("delivery claims should reach the writer queue");
+        }
+    }
+
+    struct OptionalDeliveryDatabasePath(std::path::PathBuf);
+
+    impl Drop for OptionalDeliveryDatabasePath {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_optional_delivery_preserves_scoped_routes_and_cancels_queued_claims() {
+        use pioneer_sqlite::{
+            SqliteDatabase, SqliteReadClass, SqliteWriteClass, SqliteWriteEvent,
+            SqliteWriteExecutor, sqlite_read_only_connection_url,
+        };
+        use sea_orm::{ConnectOptions, TransactionTrait};
+
+        let path = OptionalDeliveryDatabasePath(std::env::temp_dir().join(format!(
+            "pioneer-delivery-route-{}.sqlite",
+            uuid::Uuid::new_v4()
+        )));
+        let mut writer_options =
+            ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.0.display()));
+        writer_options.max_connections(1);
+        let writer = Database::connect(writer_options).await.unwrap();
+        Migrator::up(&writer, None).await.unwrap();
+        writer
+            .execute_unprepared("PRAGMA journal_mode=WAL")
+            .await
+            .unwrap();
+        let mut reader_options = ConnectOptions::new(sqlite_read_only_connection_url(&path.0));
+        reader_options.max_connections(2);
+        reader_options.map_sqlx_sqlite_opts(|options| {
+            options
+                .read_only(true)
+                .create_if_missing(false)
+                .pragma("query_only", "ON")
+        });
+        let reader = Database::connect(reader_options).await.unwrap();
+        let observer = Arc::new(OptionalDeliveryDatabaseObserver::default());
+        let database = SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            observer.clone(),
+        );
+        database.validate_reader().await.unwrap();
+        let interactive = CrudStore::new(database.clone());
+        let timestamp = unix_to_datetime(1_700_000_000);
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set("ws_delivery_scope".to_owned()),
+            name: Set("Delivery scope fixture".to_owned()),
+            is_active: Set(true),
+            is_current: Set(true),
+            created_at: Set(timestamp),
+            updated_at: Set(timestamp),
+        })
+        .exec(&interactive.connection)
+        .await
+        .unwrap();
+        let (interactive, thread, turn) = start_test_turn(
+            interactive,
+            "ws_delivery_scope",
+            "thr_delivery_scope",
+            "turn_delivery_scope",
+        )
+        .await;
+        append_optional_delivery_test_items(&interactive, &thread, &turn.id, 2).await;
+        observer.reads.lock().unwrap().clear();
+        observer.events.lock().unwrap().clear();
+        let maintenance = interactive.with_maintenance_access();
+        for (store, consumer, read, write) in [
+            (
+                &interactive,
+                "live_notification",
+                SqliteReadClass::Interactive,
+                SqliteWriteClass::Interactive,
+            ),
+            (
+                &maintenance,
+                "thread_episodic",
+                SqliteReadClass::Maintenance,
+                SqliteWriteClass::Maintenance,
+            ),
+        ] {
+            let claims = store
+                .claim_due_turn_event_deliveries(consumer, 1_700_000_110, 2)
+                .await
+                .unwrap();
+            assert_eq!(claims.len(), 1);
+            let reads = std::mem::take(&mut *observer.reads.lock().unwrap());
+            assert!(!reads.is_empty() && reads.iter().all(|class| *class == read));
+            let events = std::mem::take(&mut *observer.events.lock().unwrap());
+            assert_eq!(
+                events
+                    .iter()
+                    .filter_map(|event| match event {
+                        SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                vec![write]
+            );
+            assert!(
+                store
+                    .complete_turn_event_delivery(
+                        &claims[0].id,
+                        &claims[0].claim_token,
+                        1_700_000_110
+                    )
+                    .await
+                    .unwrap()
+            );
+            observer.events.lock().unwrap().clear();
+        }
+
+        let transaction = database.with_critical_writes().begin().await.unwrap();
+        observer.events.lock().unwrap().clear();
+        let cancelled = tokio::spawn({
+            let store = maintenance.clone();
+            async move {
+                store
+                    .claim_due_turn_event_deliveries("live_notification", 1_700_000_110, 2)
+                    .await
+            }
+        });
+        observer.wait_for_enqueued(1).await;
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        assert!(observer.events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            SqliteWriteEvent::Cancelled {
+                class: SqliteWriteClass::Maintenance,
+                queue,
+                ..
+            } if queue.maintenance == 0
+        )));
+        let mut pending = Vec::new();
+        for (store, consumer) in [
+            (interactive, "live_notification"),
+            (maintenance, "thread_episodic"),
+        ] {
+            pending.push(tokio::spawn(async move {
+                store
+                    .claim_due_turn_event_deliveries(consumer, 1_700_000_110, 2)
+                    .await
+            }));
+        }
+        observer.wait_for_enqueued(3).await;
+        transaction.rollback().await.unwrap();
+        for claim in pending {
+            assert_eq!(claim.await.unwrap().unwrap().len(), 1);
+        }
+        let events = observer.events.lock().unwrap();
+        let acquired = events
+            .iter()
+            .filter_map(|event| match event {
+                SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(acquired.len(), 2);
+        assert!(acquired.contains(&SqliteWriteClass::Interactive));
+        assert!(acquired.contains(&SqliteWriteClass::Maintenance));
+        assert!(matches!(
+            events.last(),
+            Some(SqliteWriteEvent::Released { queue, .. })
+                if queue.interactive == 0 && queue.maintenance == 0 && queue.critical == 0
+        ));
+        drop(events);
+        database.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -35167,6 +35259,91 @@ mod tests {
                 0,
                 "memory.post_turn_extractor.write_unclassified",
             ),
+            (
+                "memory.post_turn_extractor.manifest_domain_rejected",
+                false,
+                3_602,
+                0,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_invalid_stored_data",
+                false,
+                3_602,
+                0,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_unclassified",
+                false,
+                3_602,
+                0,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_storage_transient",
+                false,
+                3_602,
+                1,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_failed",
+                false,
+                3_602,
+                1,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_failed",
+                true,
+                3_602,
+                1,
+                "memory.post_turn_extractor.manifest_domain_rejected",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_failed",
+                false,
+                3_602,
+                1,
+                "memory.post_turn_extractor.manifest_invalid_stored_data",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_failed",
+                false,
+                3_602,
+                1,
+                "memory.post_turn_extractor.manifest_storage_transient",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_failed",
+                false,
+                3_599,
+                0,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.manifest_failed",
+                false,
+                86_401,
+                0,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            (
+                "memory.post_turn_extractor.legacy_manifest_revalidate",
+                false,
+                3_602,
+                0,
+                "memory.post_turn_extractor.manifest_unclassified",
+            ),
+            ("effect_timeout", false, 3_602, 1, "effect_timeout"),
+            (
+                "memory.post_turn_extractor.provider_network_transient",
+                false,
+                3_602,
+                1,
+                "effect_timeout",
+            ),
         ] {
             let timestamp = 1_700_040_000;
             let workspace_id = "ws_post_turn_reopen";
@@ -35275,6 +35452,15 @@ mod tests {
                 );
                 continue;
             }
+            // Repeat discovery through a newly scoped handle, as after restart.
+            assert_eq!(
+                store
+                    .with_maintenance_access()
+                    .requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 1)
+                    .await
+                    .unwrap(),
+                0
+            );
             let reopened = store
                 .claim_due_native_terminal_effects(timestamp + delay, 10, 1)
                 .await
@@ -35282,7 +35468,30 @@ mod tests {
                 .pop()
                 .unwrap();
             assert_eq!(reopened.effect_id, effect_id);
-            if code == "memory.post_turn_extractor.write_failed" {
+            assert_eq!(
+                reopened.legacy_manifest_revalidation,
+                code == "memory.post_turn_extractor.manifest_failed"
+            );
+            assert!(
+                !store
+                    .fail_native_terminal_effect(
+                        &effect_id,
+                        &first.claim_token,
+                        "stale_owner",
+                        "stale result",
+                        false,
+                        timestamp + delay,
+                        timestamp + delay
+                    )
+                    .await
+                    .unwrap()
+            );
+
+            if matches!(
+                code,
+                "memory.post_turn_extractor.write_failed"
+                    | "memory.post_turn_extractor.manifest_failed"
+            ) {
                 assert_eq!(
                     reopened.max_attempts, 1,
                     "legacy revalidation must not expand the budget"
@@ -35296,9 +35505,13 @@ mod tests {
                         .unwrap()
                         .last_error_code
                         .as_deref(),
-                    Some("memory.post_turn_extractor.legacy_write_revalidate")
+                    Some(if code == "memory.post_turn_extractor.manifest_failed" {
+                        "memory.post_turn_extractor.legacy_manifest_revalidate"
+                    } else {
+                        "memory.post_turn_extractor.legacy_write_revalidate"
+                    })
                 );
-                assert!(
+                assert_eq!(
                     store
                         .native_terminal_effect_handler_checkpoint(
                             &effect_id,
@@ -35306,7 +35519,8 @@ mod tests {
                         )
                         .await
                         .unwrap()
-                        .is_some()
+                        .is_some(),
+                    checkpoint
                 );
                 // The revalidated cause replaces the legacy marker and stays terminal.
                 store
@@ -35315,7 +35529,11 @@ mod tests {
                         &reopened.claim_token,
                         revalidated_code,
                         "safe classified failure",
-                        revalidated_code == "memory.post_turn_extractor.write_storage_transient",
+                        matches!(
+                            revalidated_code,
+                            "memory.post_turn_extractor.write_storage_transient"
+                                | "memory.post_turn_extractor.manifest_storage_transient"
+                        ),
                         timestamp + delay + 1,
                         timestamp + delay,
                     )
@@ -35330,9 +35548,11 @@ mod tests {
                     .unwrap();
                 assert_eq!(
                     reclassified_recovery,
-                    u64::from(
-                        revalidated_code == "memory.post_turn_extractor.write_storage_transient",
-                    )
+                    u64::from(matches!(
+                        revalidated_code,
+                        "memory.post_turn_extractor.write_storage_transient"
+                            | "memory.post_turn_extractor.manifest_storage_transient"
+                    ),)
                 );
             } else {
                 assert_eq!(
@@ -35665,6 +35885,12 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_diagnostic_rolls_back_with_outbox_and_survives_restart() {
+        for status in [RecoveryJobStatus::Exhausted, RecoveryJobStatus::Blocked] {
+            recovery_diagnostic_atomic_restart_impl(status).await;
+        }
+    }
+
+    async fn recovery_diagnostic_atomic_restart_impl(status: RecoveryJobStatus) {
         use pioneer_protocol::{
             ProviderFailureClass, ProviderFailureStage, ProviderTransportKind, RecoveryDiagnostic,
             RecoveryProviderFailure, RecoveryStopReason,
@@ -35686,6 +35912,8 @@ mod tests {
             .unwrap();
         let initial = RecoveryDiagnostic {
             last_failure: Some(RecoveryProviderFailure {
+                error_reason: None,
+                request_id: None,
                 class: ProviderFailureClass::StreamTruncated,
                 stage: ProviderFailureStage::MidStream,
                 transport: ProviderTransportKind::Stream,
@@ -35734,13 +35962,22 @@ mod tests {
             .unwrap();
         let final_diagnostic = RecoveryDiagnostic {
             last_failure: Some(RecoveryProviderFailure {
+                error_reason: Some(pioneer_protocol::ProviderErrorReason::PermissionDenied),
+                request_id: Some(
+                    pioneer_protocol::ProviderRequestId::try_from("gen-atomic_fixture".to_owned())
+                        .unwrap(),
+                ),
                 class: ProviderFailureClass::AuthOrPermission,
                 stage: ProviderFailureStage::Connect,
                 transport: ProviderTransportKind::NonStream,
                 http_status: Some(403),
                 retry_after_ms: None,
             }),
-            stop_reason: Some(RecoveryStopReason::AttemptsExhausted),
+            stop_reason: Some(if status == RecoveryJobStatus::Blocked {
+                RecoveryStopReason::NoProgress
+            } else {
+                RecoveryStopReason::AttemptsExhausted
+            }),
         };
         let raw = "raw body credential=secret https://secret.example /private/key HTTP 401";
         assert!(
@@ -35748,7 +35985,7 @@ mod tests {
                 .mark_recovery_job_terminal_after_attempt_with_diagnostic(
                     &job.id,
                     "stale_attempt",
-                    RecoveryJobStatus::Exhausted,
+                    status,
                     Some(raw.to_owned()),
                     Some(final_diagnostic.clone()),
                     1_700_000_004
@@ -35762,7 +35999,7 @@ mod tests {
                 .mark_recovery_job_terminal_after_attempt_with_diagnostic(
                     &job.id,
                     "diag_attempt",
-                    RecoveryJobStatus::Exhausted,
+                    status,
                     Some(raw.to_owned()),
                     Some(final_diagnostic.clone()),
                     1_700_000_004
@@ -35785,7 +36022,7 @@ mod tests {
                 .mark_recovery_job_terminal_after_attempt_with_diagnostic(
                     &job.id,
                     "diag_attempt",
-                    RecoveryJobStatus::Exhausted,
+                    status,
                     Some(raw.to_owned()),
                     Some(final_diagnostic.clone()),
                     1_700_000_004
@@ -35808,7 +36045,16 @@ mod tests {
         let applied = restarted
             .apply_claimed_recovery_terminalization(
                 &claims[0],
-                None,
+                (status == RecoveryJobStatus::Blocked).then(|| TurnBlockedResumeMetadata {
+                    reason_class: "execution_budget".to_owned(),
+                    human_message: "max_consecutive_no_progress_windows reached: limit=3"
+                        .to_owned(),
+                    resume_requirements: Vec::new(),
+                    resume_command: "turn.resume:turn_diag_atomic".to_owned(),
+                    blocked_recovery_job_id: Some(job.id.clone()),
+                    latest_checkpoint_id: None,
+                    can_resume_same_turn: false,
+                }),
                 RecoveryTerminalCleanupPlan {
                     runtime_generation: 77,
                     runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
@@ -35821,22 +36067,121 @@ mod tests {
             panic!("terminalization expected");
         };
         let expected = final_diagnostic.public_message();
+        let expected_turn_message = if status == RecoveryJobStatus::Blocked {
+            format!("{expected} (recovery job {})", job.id)
+        } else {
+            expected.clone()
+        };
+        let terminal_turn = applied.newly_terminal_turn.unwrap();
         assert_eq!(
-            applied.newly_terminal_turn.unwrap().error.as_deref(),
-            Some(expected.as_str())
+            terminal_turn.error.as_deref(),
+            Some(expected_turn_message.as_str())
         );
-        let serialized = serde_json::to_string(&applied.final_item.unwrap()).unwrap();
+        let serialized = serde_json::to_string(&terminal_turn).unwrap();
         assert!(serialized.contains("HTTP 403"));
-        for secret in ["credential", "secret.example", "/private", "HTTP 401"] {
+        for secret in [
+            "credential",
+            "secret.example",
+            "/private",
+            "HTTP 401",
+            "gen-atomic_fixture",
+        ] {
             assert!(!serialized.contains(secret));
         }
-        assert_eq!(
+        if status == RecoveryJobStatus::Blocked {
+            assert!(applied.final_item.is_none());
+            assert_eq!(
+                restarted
+                    .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                    .await
+                    .unwrap(),
+                Some(final_diagnostic.clone())
+            );
+            assert!(
+                restarted
+                    .get_failed_turn_recovery_diagnostic("turn_diag_atomic")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            // A stale/resumed/pending job cannot lend its facts to this result.
+            for job_status in ["pending", "active", "succeeded", "cancelled"] {
+                restarted
+                    .connection
+                    .execute_unprepared(&format!(
+                        "UPDATE recovery_job SET status = '{job_status}' WHERE id = '{}'",
+                        job.id
+                    ))
+                    .await
+                    .unwrap();
+                assert!(
+                    restarted
+                        .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
             restarted
-                .get_failed_turn_recovery_diagnostic("turn_diag_atomic")
+                .connection
+                .execute_unprepared(&format!(
+                    "UPDATE recovery_job SET status = 'blocked' WHERE id = '{}'",
+                    job.id
+                ))
                 .await
-                .unwrap(),
-            Some(final_diagnostic)
-        );
+                .unwrap();
+            restarted
+                .connection
+                .execute_unprepared(
+                    "UPDATE turn SET error = 'authorization denied' WHERE id = 'turn_diag_atomic'",
+                )
+                .await
+                .unwrap();
+            assert!(
+                restarted
+                    .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            restarted
+                .connection
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "UPDATE turn SET error = ? WHERE id = 'turn_diag_atomic'",
+                    [expected_turn_message.into()],
+                ))
+                .await
+                .unwrap();
+            restarted.connection.execute_unprepared("UPDATE turn_event SET payload = json_set(payload, '$.payload.resume.blocked_recovery_job_id', 'unrelated_job') WHERE turn_id = 'turn_diag_atomic' AND event_type = 'turn/blocked'").await.unwrap();
+            assert!(
+                restarted
+                    .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            assert_eq!(
+                restarted
+                    .get_failed_turn_recovery_diagnostic("turn_diag_atomic")
+                    .await
+                    .unwrap(),
+                Some(final_diagnostic)
+            );
+            assert!(
+                restarted
+                    .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                serde_json::to_string(&applied.final_item.unwrap())
+                    .unwrap()
+                    .contains("HTTP 403")
+            );
+        }
         assert!(
             restarted
                 .claim_due_recovery_terminalizations(1_700_000_100, 45, 10)
@@ -35849,7 +36194,7 @@ mod tests {
                 .mark_recovery_job_terminal_after_attempt_with_diagnostic(
                     &job.id,
                     "diag_attempt",
-                    RecoveryJobStatus::Exhausted,
+                    status,
                     Some("duplicate".to_owned()),
                     None,
                     1_700_000_100
@@ -42338,10 +42683,13 @@ mod tests {
 
         assert_eq!(
             store
-                .list_mismatched_terminal_task_run_occurrence_ids(10)
+                .discover_task_run_occurrence_reconcile(i64::MAX, 10)
                 .await
-                .expect("mismatched occurrences should list"),
-            vec![run.id.clone()],
+                .expect("due tracked occurrences should list"),
+            vec![TaskRunOccurrenceReconcileCandidate {
+                run_id: run.id.clone(),
+                generation: 1
+            }],
         );
         assert_eq!(
             store
@@ -42365,11 +42713,11 @@ mod tests {
         );
         assert!(
             store
-                .list_mismatched_terminal_task_run_occurrence_ids(10)
+                .discover_task_run_occurrence_reconcile(i64::MAX, 10)
                 .await
-                .expect("reconciled occurrences should list")
+                .expect("due tracked occurrences should list")
                 .is_empty(),
-            "a repaired occurrence must leave the polling candidate set",
+            "a repaired occurrence must leave the durable pending set",
         );
         let occurrence = store
             .get_turn("thr_task", run.id.as_str())
@@ -50313,6 +50661,7 @@ mod tests {
             .all(&connection)
             .await
             .expect("must query turn events");
+        assert!(store.get_turn_execution(&turn.id).await.unwrap().is_none());
         assert_eq!(events.len(), 2);
         assert_eq!(
             events[0].event_type,
@@ -50345,6 +50694,176 @@ mod tests {
             TurnItemEventPayload::TurnPermissionAudit(audit)
                 if audit.event_kind == TurnPermissionAuditEventKind::ProfileSelected
         )));
+    }
+
+    #[tokio::test]
+    async fn authorized_admission_rolls_back_on_owner_failure_and_replay_preserves_receipt() {
+        let store = test_store_with_workspace("ws_owner_admission").await;
+        let timestamp = 1_700_000_000;
+        let thread = sample_thread("ws_owner_admission", "thr_owner_admission", timestamp);
+        let security_snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            "/workspace/owner-admission",
+            timestamp * 1000,
+        );
+        for kind in [
+            crate::TurnExecutorKind::NativeAgent,
+            crate::TurnExecutorKind::ApiProvider,
+            crate::TurnExecutorKind::CliRuntime,
+            crate::TurnExecutorKind::AcpRuntime,
+        ] {
+            let mut turn = sample_turn(&format!("turn_owner_{}", kind.as_str()));
+            turn.mode = ThreadMode::Agent;
+            let audit = pioneer_protocol::TurnPermissionAuditEvent {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn_id: turn.id.clone(),
+                event_kind: TurnPermissionAuditEventKind::ProfileSelected,
+                profile_mode: turn.permission_profile.mode,
+                profile_source: turn.permission_profile.source,
+                security_snapshot_id: None,
+                security_snapshot_version: None,
+                security_reason_code: None,
+                security_capability: None,
+                item_id: None,
+                tool_call_id: None,
+                tool_name: None,
+                action_kind: None,
+                request_key: None,
+                decision: None,
+                reason: None,
+                cached: false,
+            };
+            let admission = crate::NewTurnAdmission {
+                turn_id: turn.id.clone(),
+                thread_id: thread.id.clone(),
+                workspace_id: thread.workspace_id.clone(),
+                request_digest: "a".repeat(64),
+                policy_generation: None,
+                role_key: None,
+                policy_fingerprint: None,
+                execution_lease: None,
+            };
+            let execution = crate::NewTurnExecution {
+                turn_id: turn.id.clone(),
+                thread_id: thread.id.clone(),
+                workspace_id: thread.workspace_id.clone(),
+                executor_kind: kind,
+                executor_key: Some("test-executor".to_owned()),
+                status: crate::TurnExecutionStatus::Starting,
+                owner_id: "admitting-owner".to_owned(),
+                lease_until: unix_to_datetime(timestamp + 45),
+                created_at: unix_to_datetime(timestamp),
+            };
+            // Fail at the ownership write, after Turn events, projections and
+            // admission have already been written inside the transaction.
+            store
+                .connection
+                .execute_unprepared(
+                    "CREATE TRIGGER reject_admission_owner BEFORE INSERT ON turn_execution \
+                 BEGIN SELECT RAISE(ABORT, 'injected ownership failure'); END",
+                )
+                .await
+                .unwrap();
+            for reject_owner in [true, false] {
+                let result = store
+                    .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
+                        &thread,
+                        SandboxMode::FullAccess,
+                        &turn,
+                        &[UserInput::Text {
+                            text: "execute admitted work".to_owned(),
+                            text_elements: Vec::new(),
+                        }],
+                        None,
+                        TurnWorkOwner::Turn,
+                        PersistedActorRef::System,
+                        audit.clone(),
+                        r#"{"kind":"test_explicit_authority"}"#,
+                        None,
+                        Some(admission.clone()),
+                        Some(execution.clone()),
+                        &security_snapshot,
+                        Vec::new(),
+                        None,
+                        None,
+                    )
+                    .await;
+                if reject_owner {
+                    let error = result.expect_err("owner failure must roll back admission");
+                    assert!(format!("{error:#}").contains("injected ownership failure"));
+                    assert!(
+                        store
+                            .get_turn(&thread.id, &turn.id)
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert!(store.get_turn_admission(&turn.id).await.unwrap().is_none());
+                    assert!(store.get_turn_execution(&turn.id).await.unwrap().is_none());
+                    assert!(
+                        pioneer_entity::turn_event::Entity::find()
+                            .filter(pioneer_entity::turn_event::Column::TurnId.eq(&turn.id))
+                            .all(&store.connection)
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                    assert!(
+                        pioneer_entity::turn_event_projection_state::Entity::find()
+                            .filter(
+                                pioneer_entity::turn_event_projection_state::Column::TurnId
+                                    .eq(&turn.id)
+                            )
+                            .all(&store.connection)
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                    store
+                        .connection
+                        .execute_unprepared("DROP TRIGGER reject_admission_owner")
+                        .await
+                        .unwrap();
+                } else {
+                    result.expect("Turn and ownership should commit together");
+                }
+            }
+            assert!(
+                store
+                    .get_turn(&thread.id, &turn.id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(store.get_turn_admission(&turn.id).await.unwrap().is_some());
+            let admitted = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+            assert_eq!(admitted.executor_kind, kind);
+            assert_eq!(admitted.owner_id, "admitting-owner");
+            assert_eq!(admitted.owner_generation, 1);
+            let claimed = store
+                .claim_expired_turn_execution(
+                    &admitted,
+                    "replacement-owner",
+                    timestamp + 46,
+                    timestamp + 91,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(claimed.owner_generation, 2);
+            // Projection-state loss permits replay of sequence 1. It must
+            // neither create an owner nor reset the existing ownership CAS.
+            mark_first_turn_projection_failed(&store, &turn.id, timestamp + 47).await;
+            let replay = store
+                .replay_due_turn_event_projections(timestamp + 47, 1)
+                .await
+                .unwrap();
+            assert_eq!(replay.projected, 1);
+            assert_eq!(
+                store.get_turn_execution(&turn.id).await.unwrap().unwrap(),
+                claimed
+            );
+        }
     }
 
     #[tokio::test]

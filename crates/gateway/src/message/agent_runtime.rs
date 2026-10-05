@@ -2250,7 +2250,7 @@ impl MessageProcessor {
         {
             return;
         }
-        let this = self.scoped_with_database_class(SqliteWriteClass::Critical);
+        let this = self.scoped_for_background_reconciliation();
         tokio::spawn(async move {
             struct KickGuard(Arc<AtomicBool>);
 
@@ -2296,7 +2296,7 @@ impl MessageProcessor {
         {
             return;
         }
-        let this = self.scoped_with_database_class(SqliteWriteClass::Critical);
+        let this = self.scoped_for_background_reconciliation();
         tokio::spawn(async move {
             loop {
                 this.native_terminal_effect_kick_pending
@@ -5716,6 +5716,14 @@ impl MessageProcessor {
                                     root_error,
                                 )
                             }
+                            Err(_) if record.legacy_manifest_revalidation => (
+                                "memory.post_turn_extractor.legacy_manifest_revalidation_timeout"
+                                    .to_owned(),
+                                "legacy manifest revalidation exceeded its execution deadline"
+                                    .to_owned(),
+                                false,
+                                None,
+                            ),
                             Err(_) => (
                                 "effect_timeout".to_owned(),
                                 format!(
@@ -5740,11 +5748,27 @@ impl MessageProcessor {
                             let failure_stage = root_error.as_ref().and_then(|error| {
                                 hook_error_metadata_text(error, "failure_stage")
                             });
-                            let termination = root_error.as_ref().and_then(|error| hook_error_metadata_text(error, "termination"));
-                            let parse_category = root_error.as_ref().and_then(|error| hook_error_metadata_text(error, "parse_category"));
-                            let parse_line = root_error.as_ref().and_then(|error| hook_error_metadata_i64(error, "parse_line"));
-                            let parse_column = root_error.as_ref().and_then(|error| hook_error_metadata_i64(error, "parse_column"));
-                            let response_bytes = root_error.as_ref().and_then(|error| hook_error_metadata_i64(error, "response_bytes"));
+                            let sqlite_primary_code = root_error.as_ref().and_then(|error| {
+                                hook_error_metadata_i64(error, "sqlite_primary_code")
+                            });
+                            let sqlite_extended_code = root_error.as_ref().and_then(|error| {
+                                hook_error_metadata_i64(error, "sqlite_extended_code")
+                            });
+                            let termination = root_error.as_ref().and_then(|error| {
+                                hook_error_metadata_text(error, "termination")
+                            });
+                            let parse_category = root_error.as_ref().and_then(|error| {
+                                hook_error_metadata_text(error, "parse_category")
+                            });
+                            let parse_line = root_error.as_ref().and_then(|error| {
+                                hook_error_metadata_i64(error, "parse_line")
+                            });
+                            let parse_column = root_error.as_ref().and_then(|error| {
+                                hook_error_metadata_i64(error, "parse_column")
+                            });
+                            let response_bytes = root_error.as_ref().and_then(|error| {
+                                hook_error_metadata_i64(error, "response_bytes")
+                            });
                             let http_status = root_error.as_ref().and_then(|error| {
                                 hook_error_metadata_i64(error, "http_status")
                             });
@@ -5761,6 +5785,8 @@ impl MessageProcessor {
                                     model = model.unwrap_or("unknown"),
                                     failure_class = failure_class.unwrap_or("unknown"),
                                     failure_stage = failure_stage.unwrap_or("unknown"),
+                                    sqlite_primary_code = sqlite_primary_code,
+                                    sqlite_extended_code = sqlite_extended_code,
                                     http_status = ?http_status,
                                     termination = ?termination,
                                     parse_category = ?parse_category,
@@ -5783,6 +5809,8 @@ impl MessageProcessor {
                                     model = model.unwrap_or("unknown"),
                                     failure_class = failure_class.unwrap_or("unknown"),
                                     failure_stage = failure_stage.unwrap_or("unknown"),
+                                    sqlite_primary_code = sqlite_primary_code,
+                                    sqlite_extended_code = sqlite_extended_code,
                                     http_status = ?http_status,
                                     termination = ?termination,
                                     parse_category = ?parse_category,
@@ -6034,7 +6062,7 @@ impl MessageProcessor {
                     turn_id,
                     reason,
                 } => {
-                    message_future(self.handle_recovery_blocked_event(job_id, turn_id, reason))
+                    message_future(self.handle_recovery_blocked_event(job_id, turn_id, reason, event_timestamp))
                         .await
                 }
                 crate::resilience::RecoveryCoordinatorEvent::RecoveryExhausted(outcome) => {
@@ -6505,7 +6533,39 @@ impl MessageProcessor {
         job_id: String,
         turn_id: String,
         reason: String,
+        event_timestamp: i64,
     ) -> bool {
+        // Use the durable outbox for typed no-progress stops in both live delivery
+        // and restart replay. Its claim and commit fences own the terminal event.
+        let job = match self.crud_store.get_recovery_job(&job_id).await {
+            Ok(Some(job))
+                if job.turn_id == turn_id
+                    && job.status == pioneer_protocol::RecoveryJobStatus::Blocked =>
+            {
+                job
+            }
+            _ => return false,
+        };
+        if job.diagnostic.as_ref().is_some_and(|value| {
+            value.stop_reason == Some(pioneer_protocol::RecoveryStopReason::NoProgress)
+        }) {
+            if self
+                .process_due_recovery_terminalizations(event_timestamp, 64)
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            let Ok(Some((thread_id, _))) = self.crud_store.get_turn_location(&turn_id).await else {
+                return false;
+            };
+            let expected = format!(
+                "{} (recovery job {job_id})",
+                job.diagnostic.as_ref().unwrap().public_message()
+            );
+            return matches!(self.crud_store.get_turn(&thread_id, &turn_id).await,
+                Ok(Some((_, turn))) if turn.status == TurnStatus::Blocked && turn.error.as_deref() == Some(expected.as_str()));
+        }
         let Some((thread_id, _workspace_id)) = self
             .crud_store
             .get_turn_location(turn_id.as_str())

@@ -162,7 +162,19 @@ pub(crate) fn prepare_request_with_catalog(
     {
         bail!("provider `bedrock`: None cannot be represented with tool continuation history");
     }
-    if disabled && matches!(provider, "bedrock" | "cohere" | "ollama" | "glm" | "novita") {
+    if disabled
+        && matches!(
+            provider,
+            "bedrock"
+                | "cohere"
+                | "ollama"
+                | "glm"
+                | "zai"
+                | "glm-coding"
+                | "zai-coding"
+                | "novita"
+        )
+    {
         request.tools = None;
         request.tool_choice = None;
         request.parallel_tool_calls = None;
@@ -206,7 +218,10 @@ pub(crate) fn prepare_request_with_catalog(
             "provider `anthropic`: this model family does not support Required/named tool choice"
         );
     }
-    if matches!(provider, "cohere" | "ollama" | "glm" | "novita") {
+    if matches!(
+        provider,
+        "cohere" | "ollama" | "glm" | "zai" | "glm-coding" | "zai-coding" | "novita"
+    ) {
         ensure!(
             matches!(request.tool_choice, None | Some(ToolChoice::Auto)),
             "provider `{provider}`: Required/named tool choice is not supported by this API profile"
@@ -232,7 +247,17 @@ pub(crate) fn prepare_request_with_catalog(
             .is_some_and(|m| m.api == "openai-completions" && metadata_control == Some(true));
         let native = (native_parallel_control(provider) && metadata_control != Some(false))
             || verified_chat_control
-                && !matches!(provider, "cohere" | "ollama" | "gemini" | "bedrock" | "glm");
+                && !matches!(
+                    provider,
+                    "cohere"
+                        | "ollama"
+                        | "gemini"
+                        | "bedrock"
+                        | "glm"
+                        | "zai"
+                        | "glm-coding"
+                        | "zai-coding"
+                );
         if request.parallel_tool_calls == Some(false) && !native {
             bail!(
                 "provider `{provider}`: parallel=false cannot be enforced by this API/model profile"
@@ -505,8 +530,10 @@ mod tests {
                 request.model = "anthropic.claude-3-5-sonnet-20240620-v1:0".into();
                 request.tool_choice = Some(choice.clone());
                 let forced = matches!(choice, ToolChoice::Required | ToolChoice::Tool { .. });
-                let unsupported = matches!(profile.name, "cohere" | "ollama" | "glm" | "novita")
-                    && forced
+                let unsupported = matches!(
+                    profile.name,
+                    "cohere" | "ollama" | "glm" | "zai" | "glm-coding" | "zai-coding" | "novita"
+                ) && forced
                     || profile.name == "synthetic" && matches!(choice, ToolChoice::Required);
                 let normalized = prepare_request(profile.name, request);
                 assert_eq!(
@@ -519,7 +546,14 @@ mod tests {
                     if matches!(choice, ToolChoice::None)
                         && matches!(
                             profile.name,
-                            "bedrock" | "cohere" | "ollama" | "glm" | "novita"
+                            "bedrock"
+                                | "cohere"
+                                | "ollama"
+                                | "glm"
+                                | "zai"
+                                | "glm-coding"
+                                | "zai-coding"
+                                | "novita"
                         )
                     {
                         assert!(request.tools.is_none());

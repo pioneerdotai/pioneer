@@ -196,3 +196,92 @@ async fn discovery_false_vetoes_positive_source_and_remains_authority_scoped() {
     })
     .await;
 }
+
+#[test]
+fn merged_glm_profiles_keep_standard_and_coding_capabilities_separate() {
+    let mut source = source_snapshot();
+    let body = &mut source.sources.get_mut(SOURCE_URLS[0]).unwrap().body;
+    let template = body["openai"]["models"]["gpt-5-nano"].clone();
+    for (upstream, support) in [
+        ("zai", false),
+        ("zhipuai", true),
+        ("zai-coding-plan", true),
+        ("zhipuai-coding-plan", false),
+    ] {
+        let mut model = template.clone();
+        model["tool_call"] = json!(support);
+        body[upstream]["models"]["g03-region-tools"] = model;
+    }
+    let mut generated = generator::generate(&source, false).unwrap();
+    let catalog = ModelCatalog::parse_with_capabilities(
+        &serde_json::to_string(&generated.models).unwrap(),
+        &serde_json::to_string(&generated.provenance).unwrap(),
+        generated.tool_capabilities.clone(),
+    )
+    .unwrap();
+    for (provider, support) in [
+        ("glm", true),
+        ("zhipu", true),
+        ("zai", false),
+        ("glm-global", false),
+        ("zai-coding", true),
+        ("zai-coding-plan", true),
+        ("glm-coding", false),
+        ("zhipuai-coding-plan", false),
+    ] {
+        assert_eq!(
+            catalog.tool_support(provider, "g03-region-tools"),
+            Some(support),
+            "{provider}"
+        );
+    }
+    // This model is absent from the global standard list. Its coding metadata
+    // lookup must not normalize the catalog key `zai` a second time to standard.
+    assert_eq!(
+        catalog
+            .model("zai-coding", "g03-region-tools")
+            .unwrap()
+            .provider,
+        "zai"
+    );
+    generated
+        .models
+        .get_mut("zai")
+        .unwrap()
+        .get_mut("g03-region-tools")
+        .unwrap()["toolCalling"] = json!(false);
+    let restricted = ModelCatalog::parse_with_capabilities(
+        &serde_json::to_string(&generated.models).unwrap(),
+        &serde_json::to_string(&generated.provenance).unwrap(),
+        generated.tool_capabilities.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        restricted.tool_support("zai-coding", "g03-region-tools"),
+        Some(false)
+    );
+    assert_eq!(
+        restricted.tool_support("glm", "g03-region-tools"),
+        Some(true)
+    );
+    for profile in ["glm", "zai", "glm-coding", "zai-coding"] {
+        let mut request = policy::test_request();
+        assert!(policy::prepare_request_with_catalog(profile, request.clone(), None).is_ok());
+        request.parallel_tool_calls = Some(false);
+        assert!(policy::prepare_request_with_catalog(profile, request.clone(), None).is_err());
+        request.tool_choice = Some(ToolChoice::None);
+        let disabled =
+            policy::prepare_request_with_catalog(profile, request.clone(), None).unwrap();
+        assert!(disabled.tools.is_none());
+        for choice in [
+            ToolChoice::Required,
+            ToolChoice::Tool {
+                name: "lookup".into(),
+            },
+        ] {
+            request.parallel_tool_calls = None;
+            request.tool_choice = Some(choice);
+            assert!(policy::prepare_request_with_catalog(profile, request.clone(), None).is_err());
+        }
+    }
+}

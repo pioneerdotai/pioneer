@@ -97,7 +97,11 @@ pub(crate) fn catalog_provider(provider: &str) -> String {
         "gemini" => "google",
         "bedrock" => "amazon-bedrock",
         "copilot" => "github-copilot",
-        "glm" => "zai",
+        "zai" => "zai-standard",
+        "zai-coding" => "zai",
+        "glm-coding" => "zai-coding-cn",
+        "zhipuai" => "glm",
+        "zhipuai-coding-plan" => "zai-coding-cn",
         "azure-openai" => "azure-openai-responses",
         other => other,
     }
@@ -113,7 +117,7 @@ pub struct ModelCatalog {
 impl ModelCatalog {
     pub fn tool_support(&self, provider: &str, id: &str) -> Option<bool> {
         let provider = catalog_provider(provider);
-        let model = self.model(&provider, id);
+        let model = self.models.get(&provider).and_then(|models| models.get(id));
         let explicit = model.and_then(|m| m.metadata.get("toolCalling")?.as_bool());
         if let Some(capabilities) = &self.tool_capabilities {
             return merge_tool_support(

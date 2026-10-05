@@ -5872,6 +5872,12 @@ impl MessageProcessor {
                         }
                     }
                 }
+                methods::MCP_OAUTH => {
+                    match serde_json::from_value::<pioneer_protocol::McpOAuthParams>(request.params.unwrap_or_else(empty_object_value)) {
+                        Ok(params)=>self.mcp_oauth(&context,request.id,params).await,
+                        Err(_)=>self.send_error(connection_id,JsonRpcErrorResponse::new(Some(request.id),INVALID_PARAMS_CODE,"Invalid MCP OAuth request")).await,
+                    }
+                }
                 methods::MCP_INSTALL => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<McpInstallParams>(params_value) {

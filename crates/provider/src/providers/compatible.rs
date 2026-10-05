@@ -455,10 +455,10 @@ impl OpenAiCompatibleProvider {
     /// Resolve the chat completions endpoint URL.
     /// If the base_url already ends with `/chat/completions`, use it as-is.
     fn chat_completions_url(&self) -> String {
-        if self.base_url.ends_with("/chat/completions") {
-            self.base_url.clone()
+        let base = self.base_url.trim_end_matches('/');
+        if base.ends_with("/chat/completions") {
+            base.to_owned()
         } else {
-            let base = self.base_url.trim_end_matches('/');
             format!("{base}/chat/completions")
         }
     }
@@ -477,6 +477,7 @@ impl OpenAiCompatibleProvider {
         let mut builder = self.client.get(url);
 
         match &self.auth_style {
+            AuthStyle::Bearer if self.credential.is_empty() => {}
             AuthStyle::Bearer => {
                 builder = builder.header("Authorization", format!("Bearer {}", self.credential));
             }
@@ -500,6 +501,7 @@ impl OpenAiCompatibleProvider {
         let mut builder = self.client.post(url);
 
         match &self.auth_style {
+            AuthStyle::Bearer if self.credential.is_empty() => {}
             AuthStyle::Bearer => {
                 builder = builder.header("Authorization", format!("Bearer {}", self.credential));
             }
@@ -1869,6 +1871,75 @@ mod tests {
             provider.chat_completions_url(),
             "https://api.example.com/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn registry_endpoint_profiles_construct_exact_chat_and_discovery_routes() {
+        let profiles: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../tests/fixtures/endpoint_profiles.json"))
+                .unwrap();
+        assert_eq!(profiles.len(), 41);
+        for fixture in profiles {
+            let name = fixture["provider"].as_str().unwrap();
+            let definition = crate::definition::provider_definition(name).unwrap();
+            let base = definition.default_base_url.unwrap();
+            assert_eq!(base, fixture["base"].as_str().unwrap(), "{name}");
+            let provider = OpenAiCompatibleProvider::new(
+                name,
+                format!("{base}/"),
+                "dummy-key",
+                AuthStyle::Bearer,
+            );
+            assert_eq!(
+                provider.chat_completions_url(),
+                fixture["chat"].as_str().unwrap(),
+                "{name}"
+            );
+            assert_eq!(
+                provider.models_url(),
+                fixture["models"].as_str().unwrap(),
+                "{name}"
+            );
+            for request in [
+                provider.authorized_get(&provider.models_url()),
+                provider.authorized_post(&provider.chat_completions_url()),
+            ] {
+                let request = request.build().unwrap();
+                assert_eq!(
+                    request.headers()["authorization"],
+                    "Bearer dummy-key",
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_chat_route_with_trailing_slash_and_keyless_local_override() {
+        for base in [
+            "https://example.test/team/v9",
+            "https://example.test/team/v9/",
+            "https://example.test/team/v9/chat/completions/",
+        ] {
+            let provider = OpenAiCompatibleProvider::new("custom", base, "", AuthStyle::Bearer);
+            assert_eq!(
+                provider.chat_completions_url(),
+                "https://example.test/team/v9/chat/completions"
+            );
+            assert_eq!(provider.models_url(), "https://example.test/team/v9/models");
+            for request in [
+                provider.authorized_get(&provider.models_url()),
+                provider.authorized_post(&provider.chat_completions_url()),
+            ] {
+                assert!(
+                    !request
+                        .build()
+                        .unwrap()
+                        .headers()
+                        .contains_key("authorization")
+                );
+            }
+        }
     }
 
     #[test]

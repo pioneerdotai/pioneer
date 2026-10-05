@@ -76,6 +76,9 @@ struct PreparedNativeTerminalEffectActivationRow {
     thread_id: String,
     effect_kind: String,
     gate_kind: String,
+    // Terminal repair preparation decoded these exact bytes. Hash columns
+    // and updated_at alone cannot fence a same-timestamp physical SQL edit.
+    expected_payload_json: String,
     payload_sha256: String,
     payload_identity_sha256: String,
     updated_at: DateTimeWithTimeZone,
@@ -722,6 +725,7 @@ pub(crate) async fn prepare_activation_for_terminal<C: ConnectionTrait>(
             thread_id: row.thread_id,
             effect_kind: row.effect_kind,
             gate_kind: row.gate_kind,
+            expected_payload_json: row.payload_json,
             payload_sha256: row.payload_sha256,
             payload_identity_sha256: row.payload_identity_sha256,
             updated_at: row.updated_at,
@@ -839,6 +843,9 @@ pub(crate) async fn activate_prepared_for_terminal<C: ConnectionTrait>(
             .filter(native_terminal_effect_outbox::Column::ThreadId.eq(row.thread_id))
             .filter(native_terminal_effect_outbox::Column::EffectKind.eq(row.effect_kind))
             .filter(native_terminal_effect_outbox::Column::GateKind.eq(row.gate_kind))
+            .filter(
+                native_terminal_effect_outbox::Column::PayloadJson.eq(row.expected_payload_json),
+            )
             .filter(native_terminal_effect_outbox::Column::PayloadSha256.eq(row.payload_sha256))
             .filter(
                 native_terminal_effect_outbox::Column::PayloadIdentitySha256
@@ -1573,7 +1580,9 @@ pub async fn mark_failed<C: ConnectionTrait>(
 /// typed failure can make progress after an external provider or storage
 /// outage clears. A legacy write_failed with a checkpoint gets one bounded
 /// revalidation attempt, not a fresh retry budget. The marker is committed with
-/// requeue so recovery cannot repeatedly reopen the legacy code.
+/// requeue so recovery cannot repeatedly reopen the legacy code. Legacy
+/// manifest_failed gets the same single attempt without requiring a checkpoint.
+/// Its distinct durable marker is excluded from discovery, including after restart.
 pub async fn requeue_retryable_unresolved<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,
@@ -1590,7 +1599,7 @@ pub async fn requeue_retryable_unresolved<C: ConnectionTrait>(
         "memory.post_turn_extractor.runtime_unavailable",
         "memory.post_turn_extractor.checkpoint_load_failed",
         "memory.post_turn_extractor.checkpoint_store_failed",
-        "memory.post_turn_extractor.manifest_failed",
+        "memory.post_turn_extractor.manifest_storage_transient",
         "memory.post_turn_extractor.write_storage_transient",
         "memory.post_turn_extractor.provider_network_transient",
         "memory.post_turn_extractor.provider_rate_limited",
@@ -1607,6 +1616,11 @@ pub async fn requeue_retryable_unresolved<C: ConnectionTrait>(
                         .eq("memory.post_turn_extractor.write_failed"),
                 )
                 .add(native_terminal_effect_outbox::Column::HandlerCheckpointJson.is_not_null()),
+        )
+        // No checkpoint is required: legacy manifest failures preceded extraction.
+        .add(
+            native_terminal_effect_outbox::Column::LastErrorCode
+                .eq("memory.post_turn_extractor.manifest_failed"),
         );
     let effect_ids = native_terminal_effect_outbox::Entity::find()
         .select_only()
@@ -1632,11 +1646,11 @@ pub async fn requeue_retryable_unresolved<C: ConnectionTrait>(
         )
         .col_expr(
             native_terminal_effect_outbox::Column::AttemptCount,
-            Expr::cust("CASE WHEN last_error_code = 'memory.post_turn_extractor.write_failed' THEN max_attempts - 1 ELSE 0 END"),
+            Expr::cust("CASE WHEN last_error_code IN ('memory.post_turn_extractor.write_failed', 'memory.post_turn_extractor.manifest_failed') THEN max_attempts - 1 ELSE 0 END"),
         )
         .col_expr(
             native_terminal_effect_outbox::Column::MaxAttempts,
-            Expr::cust("CASE WHEN last_error_code = 'memory.post_turn_extractor.write_failed' THEN max_attempts ELSE MAX(max_attempts, 8) END"),
+            Expr::cust("CASE WHEN last_error_code IN ('memory.post_turn_extractor.write_failed', 'memory.post_turn_extractor.manifest_failed') THEN max_attempts ELSE MAX(max_attempts, 8) END"),
         )
         .col_expr(
             native_terminal_effect_outbox::Column::NextRunAt,
@@ -1652,7 +1666,7 @@ pub async fn requeue_retryable_unresolved<C: ConnectionTrait>(
         )
         .col_expr(
             native_terminal_effect_outbox::Column::LastErrorCode,
-            Expr::cust("CASE WHEN last_error_code = 'memory.post_turn_extractor.write_failed' THEN 'memory.post_turn_extractor.legacy_write_revalidate' ELSE last_error_code END"),
+            Expr::cust("CASE WHEN last_error_code = 'memory.post_turn_extractor.write_failed' THEN 'memory.post_turn_extractor.legacy_write_revalidate' WHEN last_error_code = 'memory.post_turn_extractor.manifest_failed' THEN 'memory.post_turn_extractor.legacy_manifest_revalidate' ELSE last_error_code END"),
         )
         .filter(native_terminal_effect_outbox::Column::EffectId.is_in(effect_ids))
         .filter(native_terminal_effect_outbox::Column::Status.eq(STATUS_UNRESOLVED))
