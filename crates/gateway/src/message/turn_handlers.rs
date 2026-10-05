@@ -45,6 +45,7 @@ pub(crate) struct TurnStartFailure {
     public_code: pioneer_protocol::PublicErrorCode,
     diagnostic: String,
     expected_failure: Option<&'static str>,
+    task_failure: Option<pioneer_tasks::TaskStartFailure>,
 }
 
 impl TurnStartFailure {
@@ -53,12 +54,53 @@ impl TurnStartFailure {
             public_code,
             diagnostic: diagnostic.into(),
             expected_failure: None,
+            task_failure: None,
         }
     }
 
     fn expected(mut self, failure_class: &'static str) -> Self {
         self.expected_failure = Some(failure_class);
         self
+    }
+
+    fn with_task_cause(mut self, cause: pioneer_tasks::TaskStartCause) -> Self {
+        self.task_failure = Some(pioneer_tasks::TaskStartFailure::new(
+            pioneer_tasks::TaskStartStage::CliAdmission,
+            cause,
+        ));
+        self
+    }
+
+    pub(super) fn internal_typed(
+        stage: pioneer_tasks::TaskStartStage,
+        error: anyhow::Error,
+    ) -> Self {
+        let mut failure = Self::internal(format!("{error:#}"));
+        failure.task_failure = Some(pioneer_tasks::TaskStartFailure::from_error(stage, error));
+        failure
+    }
+
+    fn into_task_failure(
+        self,
+    ) -> (
+        pioneer_protocol::PublicError,
+        pioneer_tasks::TaskStartFailure,
+    ) {
+        let public_error = crate::public_error::build_public_error(
+            self.public_code,
+            pioneer_protocol::PublicErrorStage::Admission,
+        );
+        let failure = self
+            .task_failure
+            .unwrap_or_else(|| {
+                pioneer_tasks::TaskStartFailure::new(
+                    pioneer_tasks::TaskStartStage::CliAdmission,
+                    pioneer_tasks::TaskStartCause::Unclassified,
+                )
+            })
+            .with_public_error(public_error.clone())
+            .report();
+        (public_error, failure)
     }
 
     fn into_public_error(self) -> pioneer_protocol::PublicError {
@@ -81,8 +123,10 @@ impl TurnStartFailure {
         Self::new(pioneer_protocol::PublicErrorCode::InvalidInput, diagnostic)
     }
 
-    fn protocol_invalid_input(diagnostic: impl Into<String>) -> Self {
-        Self::invalid_input(diagnostic).expected("invalid_input")
+    pub(super) fn protocol_invalid_input(diagnostic: impl Into<String>) -> Self {
+        Self::invalid_input(diagnostic)
+            .expected("invalid_input")
+            .with_task_cause(pioneer_tasks::TaskStartCause::Validation)
     }
 
     fn policy_denied(diagnostic: impl Into<String>) -> Self {
@@ -96,9 +140,10 @@ impl TurnStartFailure {
     fn conflict(diagnostic: impl Into<String>) -> Self {
         Self::new(pioneer_protocol::PublicErrorCode::Conflict, diagnostic)
             .expected("admission_conflict")
+            .with_task_cause(pioneer_tasks::TaskStartCause::Refusal)
     }
 
-    fn internal(diagnostic: impl Into<String>) -> Self {
+    pub(super) fn internal(diagnostic: impl Into<String>) -> Self {
         Self::new(pioneer_protocol::PublicErrorCode::Internal, diagnostic)
     }
 
@@ -926,7 +971,8 @@ impl MessageProcessor {
         {
             return Err(TurnStartFailure::policy_denied(
                 "execution target differs from the authorized thread".to_owned(),
-            ));
+            )
+            .with_task_cause(pioneer_tasks::TaskStartCause::Policy));
         }
         let provider_authority_fingerprint = match params.execution_backend.as_ref() {
             Some(AgentExecutionBackend::CLIAgentRuntime { .. })
@@ -1036,7 +1082,8 @@ impl MessageProcessor {
             if !pioneer_skills::effective_policy_for_skill(skill, &policy_set).enabled {
                 return Err(TurnStartFailure::policy_denied(format!(
                     "skill `{skill_id}` is not enabled for workspace `{workspace_id}`"
-                )));
+                ))
+                .with_task_cause(pioneer_tasks::TaskStartCause::Policy));
             }
 
             match skill.identity.source_kind {
@@ -3343,6 +3390,27 @@ impl MessageProcessor {
         })
     }
 
+    #[cfg(test)]
+    pub(super) async fn send_turn_start_failure_for_test(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        success_response: &TurnStartSuccessResponse,
+        thread_id: &str,
+        turn_id: &str,
+        failure: TurnStartFailure,
+    ) {
+        self.send_turn_start_failure(
+            connection_id,
+            request_id,
+            success_response,
+            thread_id,
+            turn_id,
+            failure,
+        )
+        .await;
+    }
+
     async fn send_turn_start_failure(
         &self,
         connection_id: ConnectionId,
@@ -3353,7 +3421,12 @@ impl MessageProcessor {
         failure: impl Into<TurnStartFailure>,
     ) {
         let failure = failure.into();
-        let public_error = failure.into_public_error();
+        let (public_error, task_failure) = if success_response.is_task() {
+            let (public_error, task_failure) = failure.into_task_failure();
+            (public_error, Some(task_failure))
+        } else {
+            (failure.into_public_error(), None)
+        };
         match success_response {
             TurnStartSuccessResponse::TurnStart => {
                 self.send_error(
@@ -3395,8 +3468,12 @@ impl MessageProcessor {
                 )
                 .await;
             }
-            TurnStartSuccessResponse::Task { .. }
-            | TurnStartSuccessResponse::DurableAgent { .. } => {
+            TurnStartSuccessResponse::Task { .. } => {
+                success_response.complete_task(Err(anyhow::Error::new(
+                    task_failure.expect("Task reporting produced a typed failure"),
+                )));
+            }
+            TurnStartSuccessResponse::DurableAgent { .. } => {
                 let encoded = serde_json::to_string(&public_error)
                     .unwrap_or_else(|_| public_error.correlation_id.clone());
                 success_response.complete_task(Err(anyhow::anyhow!(encoded)));
@@ -3421,6 +3498,9 @@ impl MessageProcessor {
         agent_turn_response: pioneer_crud::AgentTurnResponseInput,
         admitted_outcome: Option<crate::thread::TurnStartOutcome>,
     ) -> anyhow::Result<PreparedCliRuntimeNativeTurnStart> {
+        #[cfg(test)]
+        self.task_cli_preparation_attempts
+            .fetch_add(1, Ordering::SeqCst);
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let response = TurnStartSuccessResponse::Task {
             permission_profile,
@@ -3598,17 +3678,29 @@ impl MessageProcessor {
         provider_claim_matches: bool,
     ) -> MessageFuture<'a, Result<PreparedCliRuntimeCombinedPreflight, TurnStartFailure>> {
         message_future(async move {
+            #[cfg(test)]
+            if let Some(failure) = self.task_cli_admission_failure.lock().unwrap().take() {
+                return Err(failure);
+            }
             let readiness_snapshot = {
                 let _startup_part = pioneer_observability::turn_startup::stage(
                     &params.turn_id,
                     pioneer_observability::turn_startup::Stage::ReadinessWait,
                 );
-                self.cli_runtime_probe_snapshot(thread.workspace_id.as_str(), runtime_id)
-                    .await
+                let readiness = self
+                    .cli_runtime_probe_snapshot(thread.workspace_id.as_str(), runtime_id)
+                    .await;
+                #[cfg(test)]
+                let readiness = {
+                    let injected = self.task_cli_readiness_failure.lock().unwrap().take();
+                    injected.map_or(readiness, Err)
+                };
+                readiness
                     .map_err(|error| {
-                        TurnStartFailure::internal(format!(
-                            "failed to load CLI runtime readiness snapshot: {error:#}"
-                        ))
+                        TurnStartFailure::internal_typed(
+                            pioneer_tasks::TaskStartStage::CliAdmission,
+                            error.context("failed to load CLI runtime readiness snapshot"),
+                        )
                     })?
                     .ok_or_else(|| {
                         TurnStartFailure::internal(format!(
@@ -5961,11 +6053,17 @@ impl MessageProcessor {
                 }
             };
             if let Some(sent) = sent_context_basis.as_ref() {
-                match crate::cli_runtime::thread_binding::completed_context_basis_is_current(
+                let revalidation = crate::cli_runtime::thread_binding::completed_context_basis_is_current(
                     self.crud_store.as_ref(),
                     outcome.started_notification.workspace_id.as_str(),
                     &sent.completed,
-                ).await {
+                ).await;
+                #[cfg(test)]
+                let revalidation = {
+                    let injected = self.task_cli_history_revalidation_failure.lock().unwrap().take();
+                    injected.map_or(revalidation, Err)
+                };
+                match revalidation {
                     Ok(true) => {}
                     Ok(false) => {
                         self.mark_turn_blocked(
@@ -5977,12 +6075,30 @@ impl MessageProcessor {
                         return;
                     }
                     Err(error) => {
-                        self.mark_turn_blocked(
-                            outcome.started_notification.thread_id.clone(),
-                            outcome.started_notification.turn.id.clone(),
-                            format!("failed to revalidate CLI accepted history: {error:#}"),
-                        ).await;
-                        send_turn_start_failure!(format!("failed to revalidate CLI accepted history: {error:#}"));
+                        if success_response.is_task() {
+                            // Build and report once before the existing Blocked
+                            // transition. The same value then owns completion.
+                            let (_, failure) = TurnStartFailure::internal_typed(
+                                pioneer_tasks::TaskStartStage::CliPreparation,
+                                error.context("failed to revalidate CLI accepted history"),
+                            ).into_task_failure();
+                            self.mark_task_turn_blocked_on_start_failure(
+                                outcome.started_notification.thread_id.clone(),
+                                outcome.started_notification.turn.id.clone(),
+                                failure.descriptor(),
+                            ).await;
+                            success_response.complete_task(Err(anyhow::Error::new(failure)));
+                        } else {
+                            self.mark_turn_blocked(
+                                outcome.started_notification.thread_id.clone(),
+                                outcome.started_notification.turn.id.clone(),
+                                format!("failed to revalidate CLI accepted history: {error:#}"),
+                            ).await;
+                            send_turn_start_failure!(TurnStartFailure::internal_typed(
+                                pioneer_tasks::TaskStartStage::CliPreparation,
+                                error.context("failed to revalidate CLI accepted history"),
+                            ));
+                        }
                         return;
                     }
                 }
@@ -11103,6 +11219,59 @@ fn cli_runtime_unavailable_reason(status: &RuntimeStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_expected_causes_are_explicit_and_public_admission_does_not_imply_policy() {
+        use crate::public_error::test_support::capture_events;
+        use pioneer_tasks::{TaskStartCause, TaskStartReporting};
+        let (_, events) = capture_events(|| {
+            for (failure, cause, class) in [
+                (
+                    TurnStartFailure::protocol_invalid_input("private validation"),
+                    TaskStartCause::Validation,
+                    pioneer_protocol::TaskErrorClass::Validation,
+                ),
+                (
+                    TurnStartFailure::policy_denied("private policy")
+                        .with_task_cause(TaskStartCause::Policy),
+                    TaskStartCause::Policy,
+                    pioneer_protocol::TaskErrorClass::Policy,
+                ),
+                (
+                    TurnStartFailure::conflict("private conflict"),
+                    TaskStartCause::Refusal,
+                    pioneer_protocol::TaskErrorClass::Internal,
+                ),
+            ] {
+                let (public, failure) = failure.into_task_failure();
+                assert_eq!(failure.reporting(), TaskStartReporting::Reported);
+                assert_eq!(failure.descriptor().cause, cause);
+                assert_eq!(failure.descriptor().task_error(None).class, class);
+                assert_eq!(
+                    failure.descriptor().correlation_id.as_deref(),
+                    Some(public.correlation_id.as_str())
+                );
+            }
+            // Flush local breadcrumbs into an event to check their safe fields.
+            tracing::error!("task refusal breadcrumb checkpoint");
+        });
+        assert_eq!(events.len(), 1, "only the test checkpoint creates an event");
+        assert!(!serde_json::to_string(&events).unwrap().contains("private"));
+        for failure in [
+            TurnStartFailure::internal("private internal"),
+            TurnStartFailure::policy_denied("private unclassified policy"),
+            TurnStartFailure::invalid_input("private unclassified validation"),
+        ] {
+            let ((_, failure), events) = capture_events(|| failure.into_task_failure());
+            assert_eq!(events.len(), 1);
+            assert_eq!(failure.descriptor().cause, TaskStartCause::Unclassified);
+            assert_eq!(
+                failure.descriptor().task_error(None).class,
+                pioneer_protocol::TaskErrorClass::Internal
+            );
+            assert!(!serde_json::to_string(&events).unwrap().contains("private"));
+        }
+    }
 
     #[test]
     fn typed_admission_refusals_are_silent_but_unclassified_and_unavailable_failures_are_errors() {

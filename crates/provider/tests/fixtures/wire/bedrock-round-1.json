@@ -1,0 +1,35 @@
+{
+  "output": {
+    "message": {
+      "role": "assistant",
+      "content": [
+        {
+          "reasoningContent": {
+            "reasoningText": {
+              "text": "Look up the forecast.",
+              "signature": "opaque-signature"
+            }
+          }
+        },
+        {
+          "toolUse": {
+            "toolUseId": "forecast_1",
+            "name": "forecast",
+            "input": {
+              "location": {
+                "city": "Moscow"
+              },
+              "days": 2,
+              "metric": true
+            }
+          }
+        }
+      ]
+    }
+  },
+  "stopReason": "tool_use",
+  "usage": {
+    "inputTokens": 21,
+    "outputTokens": 7
+  }
+}

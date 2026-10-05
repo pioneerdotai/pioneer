@@ -85,6 +85,7 @@ enum ApiMessageContentBlock {
     ToolUse {
         id: String,
         name: String,
+        #[serde(deserialize_with = "deserialize_tool_input")]
         input: serde_json::Value,
     },
     ToolResult {
@@ -387,7 +388,7 @@ impl AnthropicProvider {
                             content.push(ApiMessageContentBlock::ToolUse {
                                 id: call.id.clone(),
                                 name: call.name.clone(),
-                                input: parse_json_or_string(call.arguments.as_str()),
+                                input: parse_tool_input(call.arguments.as_str())?,
                             });
                         }
                     }
@@ -474,6 +475,93 @@ impl AnthropicProvider {
         format!("{}/v1/models", self.base_url)
     }
 
+    fn parse_response(api_response: ApiChatResponse) -> Result<ChatResponse> {
+        let termination = api_response
+            .stop_reason
+            .as_deref()
+            .map(ProviderTermination::from_openai_reason)
+            .unwrap_or_else(|| ProviderTermination::Unknown("missing_stop_reason".to_owned()));
+        let usage = api_response.usage.map(|u| u.normalized());
+
+        let mut text_parts = Vec::new();
+        let mut thinking_parts = Vec::new();
+        let mut tool_calls = Vec::new();
+        let mut replay_blocks = Vec::new();
+
+        for block in api_response.content {
+            match block.block_type.as_str() {
+                "text" => {
+                    if let Some(t) = block.text {
+                        text_parts.push(t);
+                    }
+                }
+                "thinking" => {
+                    let thinking = block.thinking.or(block.text).unwrap_or_default();
+                    if !thinking.is_empty() {
+                        thinking_parts.push(thinking.clone());
+                    }
+                    if let Some(signature) = block.signature {
+                        replay_blocks.push(ApiMessageContentBlock::Thinking {
+                            thinking,
+                            signature,
+                        });
+                    }
+                }
+                "redacted_thinking" => {
+                    if let Some(data) = block.data {
+                        replay_blocks.push(ApiMessageContentBlock::RedactedThinking { data });
+                    }
+                }
+                "tool_use" => {
+                    // Native tool_use requires an object input, including for zero-arg tools.
+                    // Missing/null is not Gemini's protobuf default and must not hide a call.
+                    let input = require_tool_input(block.input.ok_or_else(|| {
+                        anyhow!("Anthropic tool_use input must be a JSON object")
+                    })?)?;
+                    if let (Some(id), Some(name)) = (block.id, block.name) {
+                        tool_calls.push(ProviderToolCall {
+                            id,
+                            name,
+                            arguments: serde_json::to_string(&input)?,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let text = text_parts.join("");
+        let reasoning_content = if thinking_parts.is_empty() {
+            None
+        } else {
+            Some(thinking_parts.join(""))
+        };
+        let provider_replay_state = if replay_blocks.is_empty() {
+            None
+        } else {
+            Some(ProviderReplayState::new(
+                "anthropic",
+                serde_json::json!({ "blocks": replay_blocks }),
+            ))
+        };
+
+        if text.is_empty()
+            && tool_calls.is_empty()
+            && reasoning_content.as_deref().unwrap_or_default().is_empty()
+        {
+            return Err(anyhow!("no response from Anthropic"));
+        }
+
+        Ok(ChatResponse {
+            text,
+            usage,
+            termination,
+            reasoning_content,
+            tool_calls,
+            provider_replay_state,
+        })
+    }
+
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
         let status = response.status();
         let body = match crate::http::read_response_text_bounded(
@@ -490,9 +578,30 @@ impl AnthropicProvider {
     }
 }
 
-fn parse_json_or_string(raw: &str) -> serde_json::Value {
-    serde_json::from_str::<serde_json::Value>(raw)
-        .unwrap_or_else(|_| serde_json::Value::String(raw.to_owned()))
+// ToolUseBlockParam/ToolUseBlock.input is an object. Do not expose argument
+// contents or serde diagnostics in errors from this protocol boundary.
+fn require_tool_input(input: serde_json::Value) -> Result<serde_json::Value> {
+    if !input.is_object() {
+        return Err(anyhow!("Anthropic tool_use input must be a JSON object"));
+    }
+    Ok(input)
+}
+
+fn parse_tool_input(raw: &str) -> Result<serde_json::Value> {
+    let input = serde_json::from_str(raw)
+        .map_err(|_| anyhow!("Anthropic tool_use input must be valid JSON containing an object"))?;
+    require_tool_input(input)
+}
+
+// Replay blocks also enter the outgoing builder through deserialization.
+fn deserialize_tool_input<'de, D>(
+    deserializer: D,
+) -> std::result::Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let input = serde_json::Value::deserialize(deserializer)?;
+    require_tool_input(input).map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug)]
@@ -505,8 +614,8 @@ struct PendingToolUse {
 
 impl PendingToolUse {
     fn finalize(self) -> Result<ProviderToolCall> {
-        let value = serde_json::from_str::<serde_json::Value>(self.arguments.as_str())
-            .map_err(|error| anyhow!("Anthropic tool call contains invalid arguments: {error}"))?;
+        // Validate only the completed argument buffer, never partial_json fragments.
+        let value = parse_tool_input(self.arguments.as_str())?;
         let arguments = serde_json::to_string(&value)?;
 
         Ok(ProviderToolCall {
@@ -592,87 +701,7 @@ impl crate::traits::Provider for AnthropicProvider {
             "provider_response",
         )
         .await?;
-        let termination = api_response
-            .stop_reason
-            .as_deref()
-            .map(ProviderTermination::from_openai_reason)
-            .unwrap_or_else(|| ProviderTermination::Unknown("missing_stop_reason".to_owned()));
-        let usage = api_response.usage.map(|u| u.normalized());
-
-        let mut text_parts = Vec::new();
-        let mut thinking_parts = Vec::new();
-        let mut tool_calls = Vec::new();
-        let mut replay_blocks = Vec::new();
-
-        for block in api_response.content {
-            match block.block_type.as_str() {
-                "text" => {
-                    if let Some(t) = block.text {
-                        text_parts.push(t);
-                    }
-                }
-                "thinking" => {
-                    let thinking = block.thinking.or(block.text).unwrap_or_default();
-                    if !thinking.is_empty() {
-                        thinking_parts.push(thinking.clone());
-                    }
-                    if let Some(signature) = block.signature {
-                        replay_blocks.push(ApiMessageContentBlock::Thinking {
-                            thinking,
-                            signature,
-                        });
-                    }
-                }
-                "redacted_thinking" => {
-                    if let Some(data) = block.data {
-                        replay_blocks.push(ApiMessageContentBlock::RedactedThinking { data });
-                    }
-                }
-                "tool_use" => {
-                    if let (Some(id), Some(name), Some(input)) = (block.id, block.name, block.input)
-                    {
-                        tool_calls.push(ProviderToolCall {
-                            id,
-                            name,
-                            arguments: serde_json::to_string(&input)
-                                .unwrap_or_else(|_| "{}".to_owned()),
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let text = text_parts.join("");
-        let reasoning_content = if thinking_parts.is_empty() {
-            None
-        } else {
-            Some(thinking_parts.join(""))
-        };
-        let provider_replay_state = if replay_blocks.is_empty() {
-            None
-        } else {
-            Some(ProviderReplayState::new(
-                "anthropic",
-                serde_json::json!({ "blocks": replay_blocks }),
-            ))
-        };
-
-        if text.is_empty()
-            && tool_calls.is_empty()
-            && reasoning_content.as_deref().unwrap_or_default().is_empty()
-        {
-            return Err(anyhow!("no response from Anthropic"));
-        }
-
-        Ok(ChatResponse {
-            text,
-            usage,
-            termination,
-            reasoning_content,
-            tool_calls,
-            provider_replay_state,
-        })
+        Self::parse_response(api_response)
     }
 
     async fn stream_chat(
@@ -1653,3 +1682,7 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "wire_tests/anthropic.rs"]
+mod wire_contract_tests;

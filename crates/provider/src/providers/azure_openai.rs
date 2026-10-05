@@ -1545,3 +1545,13 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod wire_contract_tests {
+    use super::*;
+    type WireProvider = AzureOpenAiProvider;
+    fn wire_provider() -> WireProvider {
+        WireProvider::new("fixture", "fixture-resource", "fixture-deployment")
+    }
+    include!("wire_tests/chat.rs");
+}

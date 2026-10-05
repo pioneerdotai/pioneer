@@ -372,8 +372,8 @@ pub(crate) fn prepare_history(provider: &str, messages: &mut [ChatMessage]) -> R
 
 /// Legacy/template-compatible projection in call order (including repeated
 /// names), retaining original attachment indexes. Current Ollama native types
-/// also support optional tool_call_id; preserving that wire field belongs to
-/// G02 R2. Ordering alone does not establish native ID association.
+/// also support optional tool_call_id, now forwarded by the integrated G02
+/// converter. Ordering supplements that native ID association.
 pub(crate) fn ordered_tool_results(messages: &[ChatMessage]) -> Vec<usize> {
     let mut order = Vec::with_capacity(messages.len());
     let mut i = 0;

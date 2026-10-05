@@ -2662,3 +2662,13 @@ mod tests {
         assert!(caps.vision);
     }
 }
+
+#[cfg(test)]
+mod wire_contract_tests {
+    use super::*;
+    type WireProvider = OpenRouterProvider;
+    fn wire_provider() -> WireProvider {
+        WireProvider::new("fixture")
+    }
+    include!("wire_tests/chat.rs");
+}
