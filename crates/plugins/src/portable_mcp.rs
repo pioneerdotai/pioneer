@@ -128,14 +128,16 @@ fn reserved_env(key: &str) -> bool {
     }
 }
 fn valid_command(s: &str) -> bool {
-    if s.is_empty() || s.chars().any(|c| c.is_whitespace() || c == '\0') {
+    if s.is_empty() || s.contains('\0') {
         return false;
     }
     if s.starts_with("./") {
+        // A relative path is one literal Command::new token, even with spaces.
+        // Containment and file-kind checks happen separately; never shell-parse.
         return s.len() > 2;
     }
     // Bare executable names are resolved by Command::new on the Gateway.
-    !s.contains(['/', '\\', ':']) && s != "." && s != ".."
+    !s.chars().any(char::is_whitespace) && !s.contains(['/', '\\', ':']) && s != "." && s != ".."
 }
 fn valid_cwd(s: &str) -> bool {
     s.starts_with("./")

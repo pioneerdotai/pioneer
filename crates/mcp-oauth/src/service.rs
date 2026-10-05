@@ -256,7 +256,7 @@ fn identity(installation: &McpServerInstallation, client_secret: Option<&str>) -
         resource,
         &installation.auth,
         client_secret,
-        installation.transport.has_authorization_header(),
+        installation.explicit_authorization_overrides_oauth(),
     ))
     .expect("serializable OAuth identity");
     hex::encode(Sha256::digest(bytes))
@@ -598,7 +598,7 @@ impl McpOAuthService {
         explicit_sign_in: bool,
         preparation_failed: bool,
     ) -> Result<(), McpRuntimeError> {
-        if installation.transport.has_authorization_header() {
+        if installation.explicit_authorization_overrides_oauth() {
             return Ok(());
         }
         if !preparation_failed && !valid_redirect(redirect) {
@@ -717,7 +717,7 @@ impl McpOAuthService {
         redirect: &str,
         workspace: &str,
     ) -> Result<(), McpRuntimeError> {
-        if installation.transport.has_authorization_header() {
+        if installation.explicit_authorization_overrides_oauth() {
             return Err(McpRuntimeError::failed(
                 "Remove the explicit Authorization header before using OAuth",
             ));
@@ -1947,7 +1947,7 @@ impl McpOAuthService {
             .load(std::sync::atomic::Ordering::Acquire)
             || status == OAuthState::CleanupRequired;
         let state = if status == OAuthState::Idle
-            || (entry.installation.transport.has_authorization_header()
+            || (entry.installation.explicit_authorization_overrides_oauth()
                 && status != OAuthState::CleanupRequired)
         {
             None
@@ -1963,7 +1963,7 @@ impl McpOAuthService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .state;
-        if entry.installation.transport.has_authorization_header()
+        if entry.installation.explicit_authorization_overrides_oauth()
             && status != OAuthState::CleanupRequired
         {
             return None;
@@ -2492,8 +2492,8 @@ impl McpOAuthService {
             if let Some((installation, client)) = session {
                 if resource(&entry.installation).ok() != resource(installation).ok()
                     || entry.installation.auth != installation.auth
-                    || entry.installation.transport.has_authorization_header()
-                        != installation.transport.has_authorization_header()
+                    || entry.installation.explicit_authorization_overrides_oauth()
+                        != installation.explicit_authorization_overrides_oauth()
                 {
                     return;
                 }
@@ -2637,14 +2637,11 @@ impl McpOAuthProvider for McpOAuthService {
             .callers
             .enter()
             .map_err(|e| oauth_runtime_error(&e))?;
-        if let McpTransportConfig::StreamableHttp { headers, .. } = &installation.transport {
-            if headers
-                .keys()
-                .any(|k| k.eq_ignore_ascii_case("authorization"))
-            {
-                return Ok(None);
-            }
-        } else {
+        if !matches!(
+            installation.transport,
+            McpTransportConfig::StreamableHttp { .. }
+        ) || installation.explicit_authorization_overrides_oauth()
+        {
             return Ok(None);
         }
         let entry = self

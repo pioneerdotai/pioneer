@@ -9,7 +9,7 @@ pub(crate) fn build_streamable_http_transport(
     transport: &MaterializedHttpTransport,
     client: crate::oauth::ManagedHttpClient,
 ) -> Result<StreamableHttpClientTransport<crate::oauth::ManagedHttpClient>, McpRuntimeError> {
-    let portable = client.installation.source_ref.get("plugin_id").is_some();
+    let portable = client.installation.is_portable_plugin();
     let headers = configured_headers(&transport.headers, portable)?;
 
     let config = StreamableHttpClientTransportConfig::with_uri(transport.url.clone())

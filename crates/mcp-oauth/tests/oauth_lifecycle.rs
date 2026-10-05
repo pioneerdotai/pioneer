@@ -106,6 +106,7 @@ struct Fake {
     discovery_mode: AtomicUsize,
     authorization_server: Mutex<Option<String>>,
     discovery_headers: Mutex<Vec<HeaderMap>>,
+    mcp_headers: Mutex<Vec<HeaderMap>>,
     deny_mcp: AtomicUsize,
     resources: AtomicBool,
     stateful: AtomicBool,
@@ -141,6 +142,7 @@ impl Server {
             discovery_mode: AtomicUsize::new(0),
             authorization_server: Mutex::new(None),
             discovery_headers: Mutex::new(vec![]),
+            mcp_headers: Mutex::new(vec![]),
             deny_mcp: AtomicUsize::new(0),
             resources: AtomicBool::new(false),
             stateful: AtomicBool::new(false),
@@ -308,6 +310,7 @@ async fn token(
     Json(result).into_response()
 }
 async fn mcp(State(s): State<Arc<Fake>>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    s.mcp_headers.lock().unwrap().push(headers.clone());
     let deny = s.deny_mcp.load(Ordering::SeqCst);
     if deny == 6 && body["method"] == "resources/list" {
         return (
@@ -1727,12 +1730,125 @@ async fn explicit_authorization_header_never_starts_native_oauth() {
         .unwrap();
     let connector = RmcpRuntimeConnector::with_oauth(Arc::new(h.service.clone()));
     let mut session = connector
-        .connect(installation, "installation".into(), Arc::new(Empty), 0)
+        .connect(
+            installation.clone(),
+            "installation".into(),
+            Arc::new(Empty),
+            0,
+        )
         .await
         .unwrap();
     assert_eq!(h.sink.browsers(), 0);
     assert_eq!(h.server.data.registrations.load(Ordering::SeqCst), 0);
+    assert!(
+        h.service
+            .client("installation", &installation)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        h.service
+            .sign_in("installation", &installation, 10, REDIRECT)
+            .await
+            .is_err()
+    );
+    for headers in h.server.data.mcp_headers.lock().unwrap().iter() {
+        assert_eq!(headers["authorization"], "Bearer explicit");
+    }
     session.shutdown().await;
+    h.service.shutdown().await;
+}
+
+// Stage A-04 regression source: NOT_RUN; no fixture or test target was started.
+#[tokio::test]
+async fn portable_configured_authorization_is_fallback_to_existing_managed_oauth() {
+    let h = Harness::new(true).await;
+    let mut installation = h.server.installation();
+    installation.source_ref = json!({"plugin_id":"parent", "member_key":"http"});
+    if let McpTransportConfig::StreamableHttp { headers, .. } = &mut installation.transport {
+        headers.insert(
+            "aUtHoRiZaTiOn".into(),
+            pioneer_mcp::McpConfigValue::Literal {
+                value: "Bearer fallback".into(),
+            },
+        );
+        headers.insert(
+            "X-Context".into(),
+            pioneer_mcp::McpConfigValue::Literal {
+                value: "keep".into(),
+            },
+        );
+    }
+    h.service
+        .synchronize("installation", &installation)
+        .await
+        .unwrap();
+    // Explicit sign-in is allowed without deleting the package's configured header.
+    h.service
+        .sign_in("installation", &installation, 10, REDIRECT)
+        .await
+        .unwrap();
+    let event = h.sink.browser().await;
+    h.service
+        .callback("installation", 10, h.callback(&event))
+        .await
+        .unwrap();
+    h.sink
+        .wait_state(event.flow_id.as_deref(), OAuthState::Authorized)
+        .await;
+    assert!(
+        h.service
+            .client("installation", &installation)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        h.service
+            .management_projection("installation", &installation)
+            .await
+            .0,
+        Some(OAuthState::Authorized)
+    );
+    let connector = RmcpRuntimeConnector::with_oauth(Arc::new(h.service.clone()));
+    let mut session = connector
+        .connect(
+            installation.clone(),
+            "installation".into(),
+            Arc::new(Empty),
+            0,
+        )
+        .await
+        .unwrap();
+    {
+        let requests = h.server.data.mcp_headers.lock().unwrap();
+        assert!(!requests.is_empty());
+        for headers in requests.iter() {
+            let auth = headers.get("authorization").unwrap().to_str().unwrap();
+            assert!(auth.starts_with("Bearer access-"));
+            assert_eq!(headers.get_all("authorization").iter().count(), 1);
+            assert_eq!(headers["x-context"], "keep");
+        }
+    }
+    session.shutdown().await;
+    // Removing only the fallback header must retain the same native OAuth binding.
+    let mut updated = installation.clone();
+    if let McpTransportConfig::StreamableHttp { headers, .. } = &mut updated.transport {
+        headers.remove("aUtHoRiZaTiOn");
+    }
+    assert!(McpOAuthService::same_configuration(&installation, &updated));
+    h.service
+        .synchronize("installation", &updated)
+        .await
+        .unwrap();
+    assert!(
+        h.service
+            .client("installation", &updated)
+            .await
+            .unwrap()
+            .is_some()
+    );
     h.service.shutdown().await;
 }
 

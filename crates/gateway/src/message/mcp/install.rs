@@ -232,17 +232,38 @@ impl MessageProcessor {
                         ));
                     }
                 }
-            } else if installation
-                .name
-                .starts_with(super::portable::PLUGIN_MCP_PREFIX)
-            {
-                return Err(mcp_error(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    MCP_ERROR_INVALID_REQUEST,
-                    "reserved plugin MCP name",
-                    json!({}),
-                ));
+            } else {
+                let linked = match existing.as_ref().and_then(|row| row.id.as_deref()) {
+                    Some(id) => self
+                        .crud_store
+                        .find_mcp_plugin_owner(id)
+                        .await
+                        .map_err(|_| {
+                            mcp_error(
+                                Some(request_id.clone()),
+                                INVALID_REQUEST_CODE,
+                                MCP_ERROR_INTERNAL,
+                                "failed to check MCP ownership",
+                                json!({}),
+                            )
+                        })?,
+                    None => None,
+                };
+                if linked.is_some()
+                    || pioneer_crud::validate_standalone_mcp_name(
+                        &installation.name,
+                        existing.is_some(),
+                    )
+                    .is_err()
+                {
+                    return Err(mcp_error(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        MCP_ERROR_INVALID_REQUEST,
+                        "reserved or plugin-owned MCP installation",
+                        json!({}),
+                    ));
+                }
             }
             let old_secret_ref_ids = match existing.as_ref() {
                 Some(existing) => {

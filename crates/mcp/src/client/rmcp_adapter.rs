@@ -124,7 +124,7 @@ impl McpRuntimeConnector for RmcpRuntimeConnector {
                     // another origin. The OAuth client already disables redirects.
                     plain: {
                         let builder = reqwest_0_13::Client::builder();
-                        let builder = if installation.source_ref.get("plugin_id").is_some() {
+                        let builder = if installation.is_portable_plugin() {
                             builder.redirect(reqwest_0_13::redirect::Policy::none())
                         } else {
                             builder
@@ -133,7 +133,7 @@ impl McpRuntimeConnector for RmcpRuntimeConnector {
                     }
                     .map_err(|_| McpRuntimeError::failed("HTTP client initialization failed"))?,
                     authorized,
-                    owner: if installation.transport.has_authorization_header() {
+                    owner: if installation.explicit_authorization_overrides_oauth() {
                         None
                     } else {
                         self.oauth.clone()

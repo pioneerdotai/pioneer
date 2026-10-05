@@ -49,3 +49,12 @@ impl CrudStore {
         plugins::owner(&self.connection, "mcp", id).await
     }
 }
+
+/// Preserve pre-existing standalone names while reserving new plugin names.
+/// Ownership is checked separately, before side effects and under the writer.
+pub fn validate_standalone_mcp_name(name: &str, existing: bool) -> Result<()> {
+    if name.starts_with("pplugin_") && !existing {
+        bail!("reserved plugin MCP name");
+    }
+    Ok(())
+}

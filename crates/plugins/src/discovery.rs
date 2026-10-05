@@ -60,13 +60,7 @@ pub fn load(snapshot: &Snapshot) -> Result<LoadedPluginPlan, Diagnostic> {
                     .file(&file)
                     .and_then(|bytes| std::str::from_utf8(bytes).ok())
                 {
-                    Some(text)
-                        if valid_skill(text, name)
-                            && !snapshot.entries().iter().any(|(path, entry)| {
-                                path.starts_with(&format!("{key}/"))
-                                    && matches!(entry, Entry::Denied)
-                            }) =>
-                    {
+                    Some(text) if valid_skill(text, name) => {
                         components.push(ComponentPlan::Skill {
                             member_key: name.into(),
                             member_path: key.clone(),
@@ -133,6 +127,18 @@ pub fn load(snapshot: &Snapshot) -> Result<LoadedPluginPlan, Diagnostic> {
             "mcp.json",
             "MCP location must be a contained regular file",
         )),
+    }
+    // Access failures on ancillary paths do not change SKILL.md conformance.
+    // Native folder installation still applies its existing security policy.
+    for (path, entry) in snapshot.entries() {
+        if matches!(entry, Entry::Denied) {
+            diagnostics.push(Diagnostic::new(
+                "denied_package_path",
+                Boundary::HostEffect,
+                path,
+                "Access to this package path is denied",
+            ));
+        }
     }
     Ok(LoadedPluginPlan {
         spec_version: crate::SPEC_VERSION.into(),

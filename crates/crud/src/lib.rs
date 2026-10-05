@@ -1,5 +1,5 @@
 mod plugins;
-pub use plugins::PluginOwnershipWrite;
+pub use plugins::{PluginOwnershipWrite, validate_standalone_mcp_name};
 mod tool_output;
 pub use repositories::compaction;
 mod compaction_store;
@@ -20128,6 +20128,9 @@ impl CrudStore {
                 &record.name,
             )
             .await?;
+            if ownership.is_none() {
+                validate_standalone_mcp_name(&record.name, existing.is_some())?;
+            }
             let child_id = ownership
                 .map(|write| write.child_id.as_str())
                 .or_else(|| existing.as_ref().map(|row| row.id.as_str()))

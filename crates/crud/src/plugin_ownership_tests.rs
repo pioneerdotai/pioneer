@@ -448,3 +448,133 @@ async fn concurrent_interactive_and_maintenance_publication_cannot_share_child()
         1
     );
 }
+
+#[tokio::test]
+async fn legacy_reserved_standalone_updates_but_new_names_and_owned_adoption_are_rejected() {
+    let store = test_store_with_workspace("ws").await;
+    let mut legacy = mcp("old", "ws", "pplugin_custom");
+    // Seed the pre-plugin native record through the existing low-level operation.
+    store
+        .upsert_mcp_server_installation(&legacy, 1)
+        .await
+        .unwrap();
+    legacy.transport_json = "updated".into();
+    assert_eq!(
+        store
+            .upsert_mcp_server_installation_with_audit(&legacy, &mcp_audit(&legacy), 2,)
+            .await
+            .unwrap(),
+        "old"
+    );
+    assert!(store.find_mcp_plugin_owner("old").await.unwrap().is_none());
+    assert_eq!(
+        store
+            .find_mcp_server_installation("workspace", "ws", "pplugin_custom")
+            .await
+            .unwrap()
+            .unwrap()
+            .transport_json,
+        "updated"
+    );
+
+    let fresh = mcp("new", "ws", "pplugin_new");
+    assert!(
+        store
+            .upsert_mcp_server_installation_with_audit(&fresh, &mcp_audit(&fresh), 3,)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .find_mcp_server_installation("workspace", "ws", "pplugin_new")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    store
+        .insert_plugin_installation(&parent("plugin-a", "ws"))
+        .await
+        .unwrap();
+    let same_id = ownership("plugin-a", "old", "server");
+    assert!(
+        store
+            .upsert_mcp_server_installation_with_audit_and_ownership(
+                &legacy,
+                &mcp_audit(&legacy),
+                Some(&same_id),
+                3,
+            )
+            .await
+            .is_err(),
+        "a matching ID cannot adopt a standalone row"
+    );
+    let owned = mcp("child", "ws", "pplugin_owned");
+    let owner = ownership("plugin-a", "child", "server");
+    store
+        .upsert_mcp_server_installation_with_audit_and_ownership(
+            &owned,
+            &mcp_audit(&owned),
+            Some(&owner),
+            3,
+        )
+        .await
+        .unwrap();
+    let mut owned_update = owned.clone();
+    owned_update.transport_json = "owned-update".into();
+    assert_eq!(
+        store
+            .upsert_mcp_server_installation_with_audit_and_ownership(
+                &owned_update,
+                &mcp_audit(&owned_update),
+                Some(&owner),
+                4,
+            )
+            .await
+            .unwrap(),
+        "child",
+        "the genuine owned update remains allowed"
+    );
+    let mut attempt = owned.clone();
+    attempt.transport_json = "foreign-change".into();
+    assert!(
+        store
+            .upsert_mcp_server_installation_with_audit(&attempt, &mcp_audit(&attempt), 4,)
+            .await
+            .is_err()
+    );
+    store
+        .insert_plugin_installation(&parent("plugin-b", "ws"))
+        .await
+        .unwrap();
+    let foreign = ownership("plugin-b", "child", "server");
+    assert!(
+        store
+            .upsert_mcp_server_installation_with_audit_and_ownership(
+                &attempt,
+                &mcp_audit(&attempt),
+                Some(&foreign),
+                4,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .find_mcp_server_installation("workspace", "ws", "pplugin_owned")
+            .await
+            .unwrap()
+            .unwrap()
+            .transport_json,
+        "owned-update"
+    );
+    assert_eq!(
+        store
+            .find_mcp_plugin_owner("child")
+            .await
+            .unwrap()
+            .unwrap()
+            .plugin_id,
+        "plugin-a"
+    );
+}
