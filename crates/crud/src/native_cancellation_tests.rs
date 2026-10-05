@@ -1162,24 +1162,30 @@ async fn native_cancellation_owner_change_and_health_restore_cannot_clear_fence(
     );
 }
 
-// Isolate the cancellation migration's up/down boundary while keeping the
-// full registered schema. Later unrelated migrations must not become the
-// target of these guards merely because they were appended to the registry.
-// This ordering is fixture-only; the production migrator keeps chronological order.
-struct CancellationFixtureMigrator;
+fn cancellation_migration_name() -> String {
+    let names = Migrator::migrations()
+        .into_iter()
+        .filter(|migration| migration.name().ends_with("_native_cancellation_context"))
+        .map(|migration| migration.name().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names.len(),
+        1,
+        "exactly one cancellation migration must be registered"
+    );
+    names.into_iter().next().unwrap()
+}
 
-impl MigratorTrait for CancellationFixtureMigrator {
+// Existing-main fixture: omit only the PR's new migration, keeping every main
+// migration in its production order. The upgrade below uses Migrator itself.
+struct MainSchemaFixtureMigrator;
+
+impl MigratorTrait for MainSchemaFixtureMigrator {
     fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
-        let mut migrations = Migrator::migrations();
-        let index = migrations
-            .iter()
-            .position(|migration| {
-                migration.name() == "m20261001_000001_native_cancellation_context"
-            })
-            .expect("native cancellation migration must remain registered");
-        let cancellation = migrations.remove(index);
-        migrations.push(cancellation);
-        migrations
+        Migrator::migrations()
+            .into_iter()
+            .filter(|migration| !migration.name().ends_with("_native_cancellation_context"))
+            .collect()
     }
 }
 
@@ -1191,11 +1197,19 @@ async fn migrate_fixture(
     steps: Option<u32>,
     down: bool,
 ) -> std::result::Result<(), sea_orm::DbErr> {
+    migrate_with::<Migrator>(db, steps, down).await
+}
+
+async fn migrate_with<M: MigratorTrait>(
+    db: &pioneer_sqlite::SqliteDatabase,
+    steps: Option<u32>,
+    down: bool,
+) -> std::result::Result<(), sea_orm::DbErr> {
     let transaction = db.begin().await?;
     let result = if down {
-        CancellationFixtureMigrator::down(&*transaction, steps).await
+        M::down(&*transaction, steps).await
     } else {
-        CancellationFixtureMigrator::up(&*transaction, steps).await
+        M::up(&*transaction, steps).await
     };
     match result {
         Ok(()) => transaction.commit().await,
@@ -1204,6 +1218,779 @@ async fn migrate_fixture(
             Err(error)
         }
     }
+}
+
+struct HistoricalMigrationRows {
+    workspace: pioneer_entity::workspace::Model,
+    thread: pioneer_entity::thread::Model,
+    turn: pioneer_entity::turn::Model,
+    events: Vec<pioneer_entity::turn_event::Model>,
+    receipts: Vec<pioneer_entity::turn_event_projection_state::Model>,
+    obligation: pioneer_entity::native_terminal_effect_outbox::Model,
+}
+
+// An already projected, failed legacy turn with one activated cleanup retry.
+// Only pre-cancellation entities/columns and the canonical append repository
+// are used: the current terminal projector needs columns this schema lacks.
+async fn seed_main_schema_history(db: &pioneer_sqlite::SqliteDatabase) -> HistoricalMigrationRows {
+    use sea_orm::sea_query::{Alias, Query};
+    let workspace_id = "ws_main_upgrade";
+    let thread_id = "thread_main_upgrade";
+    let turn_id = "turn_main_upgrade";
+    let at = unix_to_datetime(NOW);
+    let terminal_at = unix_to_datetime(NOW + 1);
+    let thread = Thread {
+        workspace_id: workspace_id.to_owned(),
+        id: thread_id.to_owned(),
+        name: None,
+        preview: String::new(),
+        preview_author: None,
+        mode: ThreadMode::Agent,
+        model: "gpt-5.4".to_owned(),
+        model_provider: "openai".to_owned(),
+        reasoning_effort: None,
+        created_at: NOW,
+        updated_at: NOW,
+        status: ThreadStatus::Active,
+        origin_kind: ThreadOriginKind::User,
+        sidebar_visibility: ThreadSidebarVisibility::Visible,
+        agent_nickname: None,
+        agent_role: None,
+        visibility: None,
+        turns: Vec::new(),
+    };
+    let mut turn = Turn {
+        id: turn_id.to_owned(),
+        status: TurnStatus::InProgress,
+        turn_kind: Default::default(),
+        origin: Default::default(),
+        mode: ThreadMode::Agent,
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
+        error: None,
+        prompt_manifest: None,
+        permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+    };
+    let start = turn_event::PreparedTurnEvent::prepare(CanonicalTurnEventPayload::TurnStarted(
+        crate::CanonicalTurnStartedEventPayload {
+            thread: thread.clone(),
+            sandbox_mode: SandboxMode::FullAccess,
+            turn: turn.clone(),
+            input: Vec::new(),
+            actor: Some(pioneer_protocol::PersistedActorRef::System),
+            reasoning_effort: None,
+            work_owner: crate::TurnWorkOwner::Turn,
+        },
+    ))
+    .unwrap();
+    turn.status = TurnStatus::Failed;
+    turn.error = Some("parent turn failed".to_owned());
+    let terminal = turn_event::PreparedTurnEvent::prepare(CanonicalTurnEventPayload::TurnFailed(
+        TurnFailedNotification {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn: turn.clone(),
+        },
+    ))
+    .unwrap();
+    let plan = cleanup_effect_preparation(workspace_id, thread_id, turn_id, "historical");
+    native_terminal_effect_outbox::prepare_input(plan.clone()).unwrap();
+    let payload_json = serde_json::to_string(&plan.effects[0].payload).unwrap();
+    let payload_sha256 = native_terminal_effect_outbox::payload_sha256_hex(&payload_json);
+    let permission_json = serde_json::to_string(&turn.permission_profile).unwrap();
+    let stream = Query::insert()
+        .into_table(Alias::new("turn_event_projection_stream_state"))
+        .columns(
+            [
+                "turn_id",
+                "thread_id",
+                "status",
+                "projected_through_sequence",
+                "receipts_compacted_through_sequence",
+                "created_at",
+                "updated_at",
+            ]
+            .map(Alias::new),
+        )
+        .values_panic([
+            turn_id.into(),
+            thread_id.into(),
+            "healthy".into(),
+            2_i64.into(),
+            0_i64.into(),
+            at.into(),
+            terminal_at.into(),
+        ])
+        .to_owned();
+    let stream = DatabaseBackend::Sqlite.build(&stream);
+    // All JSON, hashing and statement preparation above precede the writer.
+    let transaction = db.begin().await.unwrap();
+    let workspace = pioneer_entity::workspace::ActiveModel {
+        id: Set(workspace_id.to_owned()),
+        name: Set("upgrade fixture".to_owned()),
+        is_active: Set(true),
+        is_current: Set(true),
+        created_at: Set(at),
+        updated_at: Set(at),
+    }
+    .insert(&transaction)
+    .await
+    .unwrap();
+    let thread = pioneer_entity::thread::ActiveModel {
+        id: Set(thread_id.to_owned()),
+        workspace_id: Set(workspace_id.to_owned()),
+        preview: Set(String::new()),
+        mode: Set("agent".to_owned()),
+        model: Set("gpt-5.4".to_owned()),
+        model_provider: Set("openai".to_owned()),
+        status: Set("idle".to_owned()),
+        origin_kind: Set("user".to_owned()),
+        sidebar_visibility: Set("visible".to_owned()),
+        access_class: Set("workspace".to_owned()),
+        created_by_actor_kind: Set(Some("system".to_owned())),
+        created_at: Set(at),
+        updated_at: Set(terminal_at),
+        ..Default::default()
+    }
+    .insert(&transaction)
+    .await
+    .unwrap();
+    let turn = pioneer_entity::turn::ActiveModel {
+        id: Set(turn_id.to_owned()),
+        thread_id: Set(thread_id.to_owned()),
+        status: Set("failed".to_owned()),
+        error: Set(turn.error.clone()),
+        prompt_manifest_json: Set("{}".to_owned()),
+        turn_kind: Set("conversation".to_owned()),
+        origin: Set("user".to_owned()),
+        initiated_by_actor_kind: Set(Some("system".to_owned())),
+        send_mode: Set(Some("agent".to_owned())),
+        work_owner: Set("turn".to_owned()),
+        permission_profile_mode: Set(Some("full_access".to_owned())),
+        permission_profile_source: Set(Some("defaulted".to_owned())),
+        permission_profile_snapshot_json: Set(Some(permission_json)),
+        mentions_json: Set("[]".to_owned()),
+        message_revision: Set(0),
+        created_at: Set(at),
+        updated_at: Set(terminal_at),
+        ..Default::default()
+    }
+    .insert(&transaction)
+    .await
+    .unwrap();
+    let mut events = Vec::with_capacity(2);
+    let mut receipts = Vec::with_capacity(2);
+    for (prepared, timestamp, sequence) in [(start, at, 1), (terminal, terminal_at, 2)] {
+        let appended = turn_event::append_prepared_event(&transaction, prepared, timestamp)
+            .await
+            .unwrap();
+        assert!(appended.was_inserted);
+        assert_eq!(appended.sequence, sequence);
+        receipts.push(
+            pioneer_entity::turn_event_projection_state::ActiveModel {
+                event_id: Set(appended.id.clone()),
+                thread_id: Set(thread_id.to_owned()),
+                turn_id: Set(turn_id.to_owned()),
+                sequence: Set(sequence),
+                status: Set("projected".to_owned()),
+                attempt_count: Set(0),
+                next_run_at: Set(timestamp),
+                projection_context_json: Set("{}".to_owned()),
+                projected_at: Set(Some(timestamp)),
+                created_at: Set(timestamp),
+                updated_at: Set(timestamp),
+                ..Default::default()
+            }
+            .insert(&transaction)
+            .await
+            .unwrap(),
+        );
+        events.push(
+            pioneer_entity::turn_event::Entity::find_by_id(appended.id)
+                .one(&transaction)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    transaction.execute_raw(stream).await.unwrap();
+    let obligation = pioneer_entity::native_terminal_effect_outbox::ActiveModel {
+        effect_id: Set(plan.effects[0].effect_id.clone()),
+        batch_id: Set(plan.batch_id),
+        workspace_id: Set(workspace_id.to_owned()),
+        thread_id: Set(thread_id.to_owned()),
+        turn_id: Set(turn_id.to_owned()),
+        runtime_generation: Set(1),
+        effect_kind: Set("attached_task_cleanup".to_owned()),
+        gate_kind: Set("terminal_commit".to_owned()),
+        payload_json: Set(payload_json),
+        payload_sha256: Set(payload_sha256.clone()),
+        payload_identity_sha256: Set(payload_sha256),
+        status: Set("retry_wait".to_owned()),
+        attempt_count: Set(1),
+        max_attempts: Set(i64::from(plan.effects[0].max_attempts)),
+        last_error_code: Set(Some("fixture_retry".to_owned())),
+        next_run_at: Set(Some(unix_to_datetime(NOW + 20))),
+        terminal_committed_at: Set(Some(terminal_at)),
+        prepared_at: Set(at),
+        created_at: Set(at),
+        updated_at: Set(unix_to_datetime(NOW + 2)),
+        ..Default::default()
+    }
+    .insert(&transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    HistoricalMigrationRows {
+        workspace,
+        thread,
+        turn,
+        events,
+        receipts,
+        obligation,
+    }
+}
+
+impl HistoricalMigrationRows {
+    async fn assert_preserved(&self, db: &pioneer_sqlite::SqliteDatabase) {
+        use sea_orm::sea_query::{Alias, Query};
+        assert_eq!(
+            pioneer_entity::workspace::Entity::find_by_id(self.workspace.id.clone())
+                .one(db)
+                .await
+                .unwrap(),
+            Some(self.workspace.clone())
+        );
+        assert_eq!(
+            pioneer_entity::thread::Entity::find_by_id(self.thread.id.clone())
+                .one(db)
+                .await
+                .unwrap(),
+            Some(self.thread.clone())
+        );
+        assert_eq!(
+            pioneer_entity::turn::Entity::find_by_id(self.turn.id.clone())
+                .one(db)
+                .await
+                .unwrap(),
+            Some(self.turn.clone())
+        );
+        for event in &self.events {
+            assert_eq!(
+                pioneer_entity::turn_event::Entity::find_by_id(event.id.clone())
+                    .one(db)
+                    .await
+                    .unwrap(),
+                Some(event.clone())
+            );
+        }
+        for receipt in &self.receipts {
+            assert_eq!(
+                pioneer_entity::turn_event_projection_state::Entity::find_by_id(
+                    receipt.event_id.clone()
+                )
+                .one(db)
+                .await
+                .unwrap(),
+                Some(receipt.clone())
+            );
+        }
+        assert_eq!(
+            pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(
+                self.obligation.effect_id.clone()
+            )
+            .one(db)
+            .await
+            .unwrap(),
+            Some(self.obligation.clone())
+        );
+        // Select only legacy stream fields, including before upgrade and after
+        // down. The current Entity would also select absent marker columns.
+        let query = Query::select()
+            .columns(
+                [
+                    "thread_id",
+                    "status",
+                    "projected_through_sequence",
+                    "receipts_compacted_through_sequence",
+                    "blocking_event_id",
+                    "last_error",
+                    "quarantined_at",
+                    "restored_at",
+                    "created_at",
+                    "updated_at",
+                ]
+                .map(Alias::new),
+            )
+            .from(Alias::new("turn_event_projection_stream_state"))
+            .and_where(Expr::col(Alias::new("turn_id")).eq(self.turn.id.clone()))
+            .to_owned();
+        let stream = db
+            .query_one_raw(DatabaseBackend::Sqlite.build(&query))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stream.try_get::<String>("", "thread_id").unwrap(),
+            self.thread.id
+        );
+        assert_eq!(stream.try_get::<String>("", "status").unwrap(), "healthy");
+        assert_eq!(
+            stream
+                .try_get::<i64>("", "projected_through_sequence")
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            stream
+                .try_get::<i64>("", "receipts_compacted_through_sequence")
+                .unwrap(),
+            0
+        );
+        for column in [
+            "blocking_event_id",
+            "last_error",
+            "quarantined_at",
+            "restored_at",
+        ] {
+            assert!(
+                stream
+                    .try_get::<Option<String>>("", column)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            stream
+                .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "created_at")
+                .unwrap(),
+            unix_to_datetime(NOW)
+        );
+        assert_eq!(
+            stream
+                .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "updated_at")
+                .unwrap(),
+            unix_to_datetime(NOW + 1)
+        );
+    }
+}
+
+async fn assert_upgrade_schema(db: &pioneer_sqlite::SqliteDatabase, installed: bool) {
+    use migration::SchemaManager;
+    let transaction = db.begin().await.unwrap();
+    let schema = SchemaManager::new(&*transaction);
+    assert_eq!(
+        schema
+            .has_table("native_cancellation_context")
+            .await
+            .unwrap(),
+        installed
+    );
+    for column in [
+        "accepted_terminal_event_id",
+        "accepted_terminal_event_type",
+        "accepted_terminal_sequence",
+    ] {
+        assert_eq!(
+            schema
+                .has_column("turn_event_projection_stream_state", column)
+                .await
+                .unwrap(),
+            installed
+        );
+    }
+    assert_eq!(
+        schema
+            .has_index(
+                "native_terminal_effect_outbox",
+                "uidx_native_terminal_effect_turn_kind"
+            )
+            .await
+            .unwrap(),
+        !installed
+    );
+    for index in [
+        "idx_native_terminal_effect_turn",
+        "idx_native_terminal_effect_due",
+        "idx_native_terminal_effect_completed",
+    ] {
+        assert!(
+            schema
+                .has_index("native_terminal_effect_outbox", index)
+                .await
+                .unwrap()
+        );
+    }
+    for table in [
+        "compaction_lifecycle_pending",
+        "compaction_lifecycle_scope",
+        "compaction_lifecycle_sequence",
+        "task_run_occurrence_reconcile_pending",
+        "task_occurrence_reconcile_pending",
+    ] {
+        assert!(schema.has_table(table).await.unwrap());
+    }
+    for (table, index) in [
+        (
+            "compaction_lifecycle_pending",
+            "idx_compaction_lifecycle_due",
+        ),
+        (
+            "compaction_lifecycle_scope",
+            "idx_compaction_lifecycle_scope_due",
+        ),
+        (
+            "turn_event_projection_stream_state",
+            "idx_turn_event_projection_stream_status",
+        ),
+    ] {
+        assert!(schema.has_index(table, index).await.unwrap());
+    }
+    transaction.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_cancellation_production_upgrade_and_latest_down() {
+    const OLD_NAME: &str = "m20261001_000001_native_cancellation_context";
+    const LATER_MAIN: [&str; 3] = [
+        "m20261002_000001_task_run_occurrence_reconcile",
+        "m20261004_000001_task_occurrence_reconcile",
+        "m20261004_000004_compaction_lifecycle_pending",
+    ];
+    let cancellation = cancellation_migration_name();
+    // Upgrade and down(1) must use the production registry's final migration.
+    assert_eq!(cancellation, "m20261005_000001_native_cancellation_context");
+    assert_ne!(cancellation, OLD_NAME);
+    assert!(cancellation.as_str() > LATER_MAIN[2]);
+    assert_eq!(Migrator::migrations().last().unwrap().name(), cancellation);
+    let db = pioneer_sqlite::SqliteDatabase::from_single_connection(
+        Database::connect("sqlite::memory:").await.unwrap(),
+    );
+    migrate_with::<MainSchemaFixtureMigrator>(&db, None, false)
+        .await
+        .unwrap();
+    let main_applied = Migrator::get_applied_migrations_read_only(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|migration| migration.name().to_owned())
+        .collect::<Vec<_>>();
+    for name in LATER_MAIN {
+        assert!(main_applied.iter().any(|applied| applied == name));
+    }
+    assert!(
+        !main_applied
+            .iter()
+            .any(|name| name == &cancellation || name == OLD_NAME)
+    );
+    assert_eq!(
+        Migrator::get_pending_migrations_read_only(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|migration| migration.name().to_owned())
+            .collect::<Vec<_>>(),
+        vec![cancellation.clone()],
+    );
+    assert_upgrade_schema(&db, false).await;
+    let historical = seed_main_schema_history(&db).await;
+    historical.assert_preserved(&db).await;
+    // Prepare a main-owned control row BEFORE the first cancellation upgrade.
+    // The legacy obligation satisfies the old unique index; cancellation data
+    // stays empty, so down(1) is a lawful, non-destructive downgrade.
+    let update = sea_orm::sea_query::Query::update()
+        .table(sea_orm::sea_query::Alias::new(
+            "compaction_lifecycle_sequence",
+        ))
+        .value(sea_orm::sea_query::Alias::new("generation"), 7_i64)
+        .and_where(Expr::col(sea_orm::sea_query::Alias::new("singleton")).eq(1))
+        .to_owned();
+    assert_eq!(
+        db.execute_raw(DatabaseBackend::Sqlite.build(&update))
+            .await
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+    let generation = sea_orm::sea_query::Query::select()
+        .column(sea_orm::sea_query::Alias::new("generation"))
+        .from(sea_orm::sea_query::Alias::new(
+            "compaction_lifecycle_sequence",
+        ))
+        .and_where(Expr::col(sea_orm::sea_query::Alias::new("singleton")).eq(1))
+        .to_owned();
+    assert_eq!(
+        db.query_one_raw(DatabaseBackend::Sqlite.build(&generation))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "generation")
+            .unwrap(),
+        7,
+    );
+    migrate_with::<Migrator>(&db, None, false).await.unwrap();
+    assert_upgrade_schema(&db, true).await;
+    historical.assert_preserved(&db).await;
+    let stream = repositories::turn_event_projection_stream_state::find(&db, &historical.turn.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stream.projected_through_sequence, 2);
+    assert_eq!(stream.receipts_compacted_through_sequence, 0);
+    assert_eq!(stream.status, "healthy");
+    assert!(stream.accepted_terminal_event_id.is_none());
+    assert!(stream.accepted_terminal_event_type.is_none());
+    assert!(stream.accepted_terminal_sequence.is_none());
+    assert!(
+        pioneer_entity::native_cancellation_context::Entity::find_by_id(historical.turn.id.clone())
+            .one(&db)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let updated = Migrator::get_applied_migrations_read_only(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|migration| migration.name().to_owned())
+        .collect::<Vec<_>>();
+    let mut expected = main_applied.clone();
+    expected.push(cancellation.clone());
+    assert_eq!(updated, expected);
+    assert!(!updated.iter().any(|name| name == OLD_NAME));
+    assert_eq!(
+        db.query_one_raw(DatabaseBackend::Sqlite.build(&generation))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "generation")
+            .unwrap(),
+        7,
+    );
+
+    migrate_with::<Migrator>(&db, None, false).await.unwrap();
+    historical.assert_preserved(&db).await;
+    assert!(
+        Migrator::get_pending_migrations_read_only(&db)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        db.query_one_raw(DatabaseBackend::Sqlite.build(&generation))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "generation")
+            .unwrap(),
+        7,
+    );
+    assert_eq!(
+        Migrator::get_applied_migrations_read_only(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|migration| migration.name().to_owned())
+            .collect::<Vec<_>>(),
+        updated,
+    );
+    migrate_with::<Migrator>(&db, Some(1), true).await.unwrap();
+    assert_eq!(
+        Migrator::get_applied_migrations_read_only(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|migration| migration.name().to_owned())
+            .collect::<Vec<_>>(),
+        main_applied,
+    );
+    assert_upgrade_schema(&db, false).await;
+    historical.assert_preserved(&db).await;
+    migrate_with::<Migrator>(&db, None, false).await.unwrap();
+    assert_upgrade_schema(&db, true).await;
+    historical.assert_preserved(&db).await;
+    assert_eq!(
+        Migrator::get_applied_migrations_read_only(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|migration| migration.name().to_owned())
+            .collect::<Vec<_>>(),
+        updated,
+    );
+    assert_eq!(
+        db.query_one_raw(DatabaseBackend::Sqlite.build(&generation))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "generation")
+            .unwrap(),
+        7,
+    );
+}
+
+#[tokio::test]
+async fn native_cancellation_production_up_preserves_accepted_context_markers_and_claim() {
+    let (store, turn, plan) = fixture("production_repeat_up").await;
+    cancel(&store, &turn, &plan, "accepted cancellation")
+        .await
+        .unwrap();
+    let claims = store
+        .claim_due_native_terminal_effects(NOW + 2, 30, 2)
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].effect_id, plan.effects[0].effect_id);
+    let context = pioneer_entity::native_cancellation_context::Entity::find_by_id(turn.id.clone())
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    let marker =
+        repositories::turn_event_projection_stream_state::find(&store.connection, &turn.id)
+            .await
+            .unwrap()
+            .unwrap();
+    let obligation = effect_row(&store, &plan.effects[0].effect_id).await;
+    assert!(context.accepted_event_id.is_some());
+    assert_eq!(marker.accepted_terminal_event_id, context.accepted_event_id);
+    assert!(marker.accepted_terminal_sequence.is_some());
+    assert_eq!(
+        marker.accepted_terminal_event_type.as_deref(),
+        Some("turn/failed")
+    );
+    assert_eq!(obligation.attempt_count, 1);
+    assert_eq!(obligation.status, "running");
+    assert!(obligation.claim_token.is_some());
+    assert!(obligation.terminal_committed_at.is_some());
+    let canonical_id = context.accepted_event_id.clone().unwrap();
+    let canonical = pioneer_entity::turn_event::Entity::find_by_id(canonical_id.clone())
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    let receipt =
+        pioneer_entity::turn_event_projection_state::Entity::find_by_id(canonical_id.clone())
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+    let durable_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+
+    for _ in 0..2 {
+        // This is production registry replay, with all accepted data retained.
+        // No fixture permutation, synthetic ACK or deletion makes it empty.
+        migrate_with::<Migrator>(&store.connection, None, false)
+            .await
+            .unwrap();
+        assert_upgrade_schema(&store.connection, true).await;
+        assert_eq!(
+            pioneer_entity::native_cancellation_context::Entity::find_by_id(turn.id.clone())
+                .one(&store.connection)
+                .await
+                .unwrap(),
+            Some(context.clone())
+        );
+        assert_eq!(
+            repositories::turn_event_projection_stream_state::find(&store.connection, &turn.id)
+                .await
+                .unwrap(),
+            Some(marker.clone())
+        );
+        assert_eq!(
+            effect_row(&store, &plan.effects[0].effect_id).await,
+            obligation
+        );
+        assert_eq!(
+            pioneer_entity::turn_event::Entity::find_by_id(canonical_id.clone())
+                .one(&store.connection)
+                .await
+                .unwrap(),
+            Some(canonical.clone())
+        );
+        assert_eq!(
+            pioneer_entity::turn_event_projection_state::Entity::find_by_id(canonical_id.clone())
+                .one(&store.connection)
+                .await
+                .unwrap(),
+            Some(receipt.clone())
+        );
+        assert_eq!(
+            pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
+                .one(&store.connection)
+                .await
+                .unwrap(),
+            Some(durable_turn.clone())
+        );
+        assert!(
+            store
+                .native_cancellation_was_accepted_owned(&turn.id, OWNER)
+                .await
+                .unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_cancellation_production_empty_down_and_reup_preserve_main_schema() {
+    let cancellation = cancellation_migration_name();
+    assert_ne!(cancellation, "m20261001_000001_native_cancellation_context");
+    assert_eq!(Migrator::migrations().last().unwrap().name(), cancellation);
+    let db = pioneer_sqlite::SqliteDatabase::from_single_connection(
+        Database::connect("sqlite::memory:").await.unwrap(),
+    );
+    migrate_with::<MainSchemaFixtureMigrator>(&db, None, false)
+        .await
+        .unwrap();
+    let main_applied = Migrator::get_applied_migrations_read_only(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|migration| migration.name().to_owned())
+        .collect::<Vec<_>>();
+    assert_upgrade_schema(&db, false).await;
+    migrate_with::<Migrator>(&db, None, false).await.unwrap();
+    assert_upgrade_schema(&db, true).await;
+    migrate_with::<Migrator>(&db, Some(1), true).await.unwrap();
+    assert_upgrade_schema(&db, false).await;
+    assert_eq!(
+        Migrator::get_applied_migrations_read_only(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|migration| migration.name().to_owned())
+            .collect::<Vec<_>>(),
+        main_applied,
+    );
+    assert_eq!(
+        Migrator::get_pending_migrations_read_only(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|migration| migration.name().to_owned())
+            .collect::<Vec<_>>(),
+        vec![cancellation.clone()],
+    );
+    migrate_with::<Migrator>(&db, None, false).await.unwrap();
+    assert_upgrade_schema(&db, true).await;
+    let mut expected = main_applied;
+    expected.push(cancellation);
+    assert_eq!(
+        Migrator::get_applied_migrations_read_only(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|migration| migration.name().to_owned())
+            .collect::<Vec<_>>(),
+        expected,
+    );
 }
 
 #[tokio::test]
@@ -1218,13 +2005,9 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
         );
         // Apply the pre-change schema, optionally install the real logical view,
         // then traverse the new migration. No migration runs in this work session.
-        migrate_fixture(
-            &db,
-            Some((CancellationFixtureMigrator::migrations().len() - 1) as u32),
-            false,
-        )
-        .await
-        .unwrap();
+        migrate_fixture(&db, Some((Migrator::migrations().len() - 1) as u32), false)
+            .await
+            .unwrap();
         let transaction = db.begin().await.unwrap();
         assert!(
             SchemaManager::new(&*transaction)
@@ -1302,15 +2085,18 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
                 .await
                 .unwrap()
         );
-        assert!(
-            schema
-                .has_index(
-                    "native_terminal_effect_outbox",
-                    "idx_native_terminal_effect_turn"
-                )
-                .await
-                .unwrap()
-        );
+        for index in [
+            "idx_native_terminal_effect_turn",
+            "idx_native_terminal_effect_due",
+            "idx_native_terminal_effect_completed",
+        ] {
+            assert!(
+                schema
+                    .has_index("native_terminal_effect_outbox", index)
+                    .await
+                    .unwrap()
+            );
+        }
         transaction.rollback().await.unwrap();
         // Empty down is safe and retryable; durable rows/markers are covered separately.
         migrate_fixture(&db, Some(1), true).await.unwrap();
@@ -1332,12 +2118,34 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
 #[tokio::test]
 async fn native_cancellation_migration_down_preserves_context_and_terminal_markers() {
     let (store, turn, plan) = fixture("down_guard").await;
+    let original = pioneer_entity::native_cancellation_context::Entity::find_by_id(turn.id.clone())
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
         migrate_fixture(&store.connection, Some(1), true)
             .await
             .is_err()
     );
+    assert_eq!(
+        pioneer_entity::native_cancellation_context::Entity::find_by_id(turn.id.clone())
+            .one(&store.connection)
+            .await
+            .unwrap(),
+        Some(original),
+    );
     cancel(&store, &turn, &plan, "cancel").await.unwrap();
+    let accepted = pioneer_entity::native_cancellation_context::Entity::find_by_id(turn.id.clone())
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    let effect = effect_row(&store, &plan.effects[0].effect_id).await;
+    let marker =
+        repositories::turn_event_projection_stream_state::find(&store.connection, &turn.id)
+            .await
+            .unwrap();
     assert!(
         migrate_fixture(&store.connection, Some(1), true)
             .await
@@ -1348,6 +2156,20 @@ async fn native_cancellation_migration_down_preserves_context_and_terminal_marke
             .native_cancellation_was_accepted(&turn.id)
             .await
             .unwrap()
+    );
+    assert_eq!(
+        pioneer_entity::native_cancellation_context::Entity::find_by_id(turn.id.clone())
+            .one(&store.connection)
+            .await
+            .unwrap(),
+        Some(accepted),
+    );
+    assert_eq!(effect_row(&store, &plan.effects[0].effect_id).await, effect);
+    assert_eq!(
+        repositories::turn_event_projection_stream_state::find(&store.connection, &turn.id)
+            .await
+            .unwrap(),
+        marker,
     );
 }
 
@@ -1493,6 +2315,10 @@ async fn native_cancellation_migration_down_rejects_marker_without_context() {
             .unwrap()
             .is_none()
     );
+    let before =
+        repositories::turn_event_projection_stream_state::find(&store.connection, &turn.id)
+            .await
+            .unwrap();
     assert!(
         migrate_fixture(&store.connection, Some(1), true)
             .await
@@ -1506,4 +2332,116 @@ async fn native_cancellation_migration_down_rejects_marker_without_context() {
         .await
         .unwrap()
     );
+    assert_eq!(
+        repositories::turn_event_projection_stream_state::find(&store.connection, &turn.id)
+            .await
+            .unwrap(),
+        before,
+    );
+}
+
+#[tokio::test]
+async fn native_cancellation_migration_down_rejects_duplicate_effect_kinds_atomically() {
+    use migration::SchemaManager;
+    let (store, thread, turn) = test_store_with_started_turn(
+        "ws_duplicate_down",
+        "thread_duplicate_down",
+        "turn_duplicate_down",
+    )
+    .await;
+    let first = cleanup_effect_preparation(&thread.workspace_id, &thread.id, &turn.id, "first");
+    let mut second = first.clone();
+    second.batch_id.push_str("-replacement");
+    second.effects[0].effect_id = format!("{}:cancellation-effect:attached-task-cleanup", turn.id);
+    // Both preparations use the ordinary production boundary. Replacing an
+    // unactivated plan retains its superseded row, so restoring the old unique
+    // (turn_id, effect_kind) index would discard a valid post-migration state.
+    store
+        .prepare_native_terminal_effects(first.clone(), NOW)
+        .await
+        .unwrap();
+    store
+        .prepare_native_terminal_effects(second.clone(), NOW + 1)
+        .await
+        .unwrap();
+    let first_before = effect_row(&store, &first.effects[0].effect_id).await;
+    let second_before = effect_row(&store, &second.effects[0].effect_id).await;
+    assert_eq!(first_before.status, "superseded");
+    assert_eq!(second_before.status, "prepared");
+    assert_eq!(first_before.effect_kind, second_before.effect_kind);
+    assert!(
+        store
+            .native_cancellation_context(&turn.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !repositories::turn_event_projection_stream_state::has_accepted_terminal(
+            &store.connection,
+            &turn.id,
+        )
+        .await
+        .unwrap()
+    );
+    let applied_before = Migrator::get_applied_migrations_read_only(&store.connection)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|migration| migration.name().to_owned())
+        .collect::<Vec<_>>();
+
+    assert!(
+        migrate_fixture(&store.connection, Some(1), true)
+            .await
+            .is_err()
+    );
+
+    assert_eq!(
+        effect_row(&store, &first.effects[0].effect_id).await,
+        first_before
+    );
+    assert_eq!(
+        effect_row(&store, &second.effects[0].effect_id).await,
+        second_before
+    );
+    assert_eq!(
+        Migrator::get_applied_migrations_read_only(&store.connection)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|migration| migration.name().to_owned())
+            .collect::<Vec<_>>(),
+        applied_before,
+    );
+    let transaction = store.connection.begin().await.unwrap();
+    let schema = SchemaManager::new(&*transaction);
+    assert!(
+        schema
+            .has_table("native_cancellation_context")
+            .await
+            .unwrap()
+    );
+    for column in [
+        "accepted_terminal_event_id",
+        "accepted_terminal_event_type",
+        "accepted_terminal_sequence",
+    ] {
+        assert!(
+            schema
+                .has_column("turn_event_projection_stream_state", column)
+                .await
+                .unwrap()
+        );
+    }
+    assert!(
+        !schema
+            .has_index(
+                "native_terminal_effect_outbox",
+                "uidx_native_terminal_effect_turn_kind"
+            )
+            .await
+            .unwrap()
+    );
+    transaction.rollback().await.unwrap();
 }

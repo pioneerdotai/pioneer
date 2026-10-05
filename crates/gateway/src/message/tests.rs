@@ -26257,8 +26257,9 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
             )))
             .await;
         let thread = format!("pending-heartbeat-{case}");
+        let history_created_at = super::now_timestamp_secs().saturating_sub(1);
         for index in 0..12 {
-            seed_completed_task_parent_with_inputs(
+            seed_completed_task_parent_with_inputs_at(
                 &processor,
                 &workspace,
                 &thread,
@@ -26268,6 +26269,7 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
                     text: format!("PENDING HEARTBEAT CHUNK {index:02} {}", "a ".repeat(6_500)),
                     text_elements: Vec::new(),
                 }],
+                history_created_at,
             )
             .await;
         }
@@ -26452,10 +26454,21 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
             &format!("pending-heartbeat-resume-{case}"),
         )
         .await;
+        // Verify the production order directly: created_at, durable creation
+        // sequence, legacy rowid, then ID. ID spelling alone proves no order.
         let next = format!("pending-heartbeat-next-{case}");
+        assert_eq!(
+            store
+                .latest_turn_id_by_creation_order(&thread)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(turn.as_str()),
+            "{case}: the undispatched attempt must be the persisted head before retry",
+        );
         let next_id = generate_test_request_id("pending-heartbeat-next", &next);
         let next_context = sessions.connection_context(connection).await.unwrap();
-        Arc::clone(&next_processor).process_owned_request(next_context, json!({
+        let next_payload = json!({
             "jsonrpc":"2.0", "id":next_id, "method":"turn/start",
             "params":{"thread_id":thread,"turn_id":next,
                 "input":[{"type":"text","text":"NEXT AFTER PENDING HEARTBEAT"}],
@@ -26463,12 +26476,30 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
                 "execution_backend":{"type":"cliAgentRuntime","runtime_id":"codex",
                     "runtime_kind":CLIAgentRuntimeKind::Codex},
                 "permission_profile":pioneer_protocol::TurnPermissionProfileSelection::full_access()}
-        }).to_string()).await;
+        }).to_string();
+        let (_, admission_events) = crate::public_error::test_support::capture_events_async(
+            Arc::clone(&next_processor).process_owned_request(next_context, next_payload),
+        )
+        .await;
         let payload = recv_jsonrpc_payload_by_id(&mut rx, &next_id).await;
-        let response: JsonRpcResponse = serde_json::from_str(&payload)
-            .unwrap_or_else(|error| panic!("{case}: next turn failed: {error}; {payload}"));
+        let response: JsonRpcResponse = match serde_json::from_str(&payload) {
+            Ok(response) => response,
+            Err(error) => panic!(
+                "{case}: next turn failed: {error}; {payload}; admission_reports={admission_events:#?}; durable={:?}; local={:?}",
+                store.get_turn(&thread, &next).await,
+                next_processor.thread_manager.turn_get(&thread, &next).await,
+            ),
+        };
         let accepted: TurnStartResponse = serde_json::from_value(response.result).unwrap();
         assert_eq!(accepted.turn.id, next);
+        assert_eq!(
+            store
+                .turn_before_launch_and_intervening_by_creation_order(&thread, &next, &next)
+                .await
+                .unwrap(),
+            Some((Some(turn.clone()), false)),
+            "{case}: retry must follow the terminal attempt in durable creation order",
+        );
         assert_eq!(
             wait_for_cli_runtime_turn_starts_or_turn_error(
                 &cli, 1, store.as_ref(), &thread, &next,

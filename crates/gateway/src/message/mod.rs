@@ -401,6 +401,18 @@ where
         pioneer_observability::turn_startup::current_key(),
         future,
     );
+    // Test-local reporting scopes must follow the same owned request tasks as
+    // the admission path. This does not install a global subscriber or change
+    // production reporting; it only preserves the fixture's local capture.
+    #[cfg(test)]
+    let future = {
+        use sentry::SentryFutureExt;
+        use tracing::instrument::WithSubscriber;
+        let dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
+        future
+            .with_subscriber(dispatch)
+            .bind_hub(sentry::Hub::current())
+    };
     AbortOnDropMessageTask::new(tokio::spawn(future))
         .join()
         .await
