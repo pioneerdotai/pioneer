@@ -4473,31 +4473,43 @@ impl MessageProcessor {
         if binding.status != crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING {
             return None;
         }
-        let selected = self
+        let selected = match self
             .crud_store
-            .cli_runtime_turn_terminal_guard(&binding)
+            .cli_runtime_turn_terminal_guard_by_id(&binding.turn_id)
             .await
-            .ok()
-            .flatten()?;
+        {
+            Ok(Some(selected)) => selected,
+            Ok(None) => return None,
+            Err(error) => {
+                warn!(error = %error, "Codex segment source lookup failed");
+                return None;
+            }
+        };
         let _transition = self
             .cli_runtime_session_transition_mutex(key)
             .await
             .lock_owned()
             .await;
-        if self
+        let current = match self
             .crud_store
-            .cli_runtime_turn_terminal_guard(&binding)
+            .cli_runtime_turn_terminal_guard_by_id(&binding.turn_id)
             .await
-            .ok()
-            .flatten()
-            .as_ref()
-            != Some(&selected)
+        {
+            Ok(Some(current)) => current,
+            Ok(None) => return None,
+            Err(error) => {
+                warn!(error = %error, "Codex segment source refresh failed");
+                return None;
+            }
+        };
+        if !selected.same_execution_after_admission(&current)
+            || !self.cli_runtime_instance_is_current(instance).await
+            || current.binding.status
+                != crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
         {
             return None;
         }
-        if binding.status != crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING {
-            return None;
-        }
+        let binding = current.binding;
         let (binding, _, _) = match self
             .crud_store
             .register_cli_runtime_execution_segment(
@@ -4619,28 +4631,48 @@ impl MessageProcessor {
         else {
             return;
         };
-        let selected = self
+        let selected = match self
             .crud_store
-            .cli_runtime_turn_terminal_guard(&binding)
+            .cli_runtime_turn_terminal_guard_by_id(&binding.turn_id)
             .await
-            .ok()
-            .flatten();
+        {
+            Ok(Some(selected)) => selected,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(error = %error, "Codex Goal source lookup failed");
+                return;
+            }
+        };
+        #[cfg(test)]
+        self.completed_history_preparation_barrier
+            .wait_if_armed(
+                "__cli_goal_before_gate__",
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
         let transition = self
             .cli_runtime_session_transition_mutex(instance.key())
             .await
             .lock_owned()
             .await;
-        if selected.is_none()
-            || self
-                .crud_store
-                .cli_runtime_turn_terminal_guard(&binding)
-                .await
-                .ok()
-                .flatten()
-                != selected
+        let current = match self
+            .crud_store
+            .cli_runtime_turn_terminal_guard_by_id(&binding.turn_id)
+            .await
+        {
+            Ok(Some(current)) => current,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(error = %error, "Codex Goal source refresh failed");
+                return;
+            }
+        };
+        if !selected.same_execution_after_admission(&current)
+            || !self.cli_runtime_instance_is_current(instance).await
         {
             return;
         }
+        let binding = current.binding.clone();
         let binding = match self
             .crud_store
             .set_cli_runtime_turn_native_goal_state(
@@ -4648,10 +4680,13 @@ impl MessageProcessor {
                 status,
                 native_goal_turn_id,
                 chrono::Utc::now().fixed_offset(),
+                Some(current),
+                self.turn_execution_owner_id.as_ref(),
             )
             .await
         {
-            Ok(binding) => binding,
+            Ok(Some(binding)) => binding,
+            Ok(None) => return,
             Err(error) => {
                 warn!(
                     turn_id = binding.turn_id.as_str(),
@@ -5340,7 +5375,11 @@ impl MessageProcessor {
             if !self
                 .crud_store
                 .with_maintenance_access()
-                .persist_cli_runtime_terminal_event(record.clone(), &source)
+                .persist_cli_runtime_terminal_event(
+                    record.clone(),
+                    &source,
+                    self.turn_execution_owner_id.as_ref(),
+                )
                 .await?
             {
                 return Ok(false);
@@ -5383,15 +5422,14 @@ impl MessageProcessor {
                 .context("saved CLI terminal outcome disappeared")?;
             let (selected, event): (pioneer_protocol::CliRuntimeBlockedTurnGuard, RuntimeEvent) =
                 serde_json::from_str(&saved.payload_redacted_json)?;
-            if !selected.same_execution(&source) {
+            if !selected.same_native_execution(&source) {
                 return Ok(false);
             }
             let goal_completion = matches!(event, RuntimeEvent::TurnCompleted(_))
-                && selected
-                    .native_goal_status
-                    .as_deref()
-                    .is_some_and(|status| status != "complete")
-                && binding.native_goal_status.as_deref() == Some("complete");
+                && selected.segment_ack_needs_goal_completion(
+                    binding.native_goal_observed_at.is_some(),
+                    binding.native_goal_status.as_deref(),
+                );
             // A segment ACK is not the canonical completion of its Goal.
             if !goal_completion
                 && self
@@ -5402,7 +5440,18 @@ impl MessageProcessor {
             {
                 return Ok(true);
             }
-            let mut delivery = selected;
+            let Some(mut delivery) = self
+                .crud_store
+                .authorize_cli_runtime_terminal_event(
+                    &saved,
+                    &selected,
+                    &source,
+                    self.turn_execution_owner_id.as_ref(),
+                )
+                .await?
+            else {
+                return Ok(false);
+            };
             delivery.terminal_delivery_id = Some(record.id.clone());
             let applied = self
                 .process_bound_cli_runtime_event_inner(
@@ -5422,7 +5471,7 @@ impl MessageProcessor {
         match result {
             Ok(applied) => applied,
             Err(error) => {
-                warn!(turn_id = turn_binding.turn_id, error = %error, "CLI terminal delivery remains durable and retryable");
+                warn!(turn_id = turn_binding.turn_id, error = %error, "failed to save or deliver CLI terminal outcome");
                 false
             }
         }
@@ -5478,15 +5527,14 @@ impl MessageProcessor {
         };
         let (selected, event): (pioneer_protocol::CliRuntimeBlockedTurnGuard, RuntimeEvent) =
             serde_json::from_str(&saved.payload_redacted_json)?;
-        if !selected.same_execution(&source) {
+        if !selected.same_native_execution(&source) {
             return Ok(false);
         }
         let goal_completion = matches!(event, RuntimeEvent::TurnCompleted(_))
-            && selected
-                .native_goal_status
-                .as_deref()
-                .is_some_and(|status| status != "complete")
-            && source.native_goal_status.as_deref() == Some("complete");
+            && selected.segment_ack_needs_goal_completion(
+                expected.binding.native_goal_observed_at.is_some(),
+                source.native_goal_status.as_deref(),
+            );
         if !goal_completion
             && self
                 .crud_store
@@ -5496,6 +5544,18 @@ impl MessageProcessor {
         {
             return Ok(false);
         }
+        let Some(mut delivery) = self
+            .crud_store
+            .authorize_cli_runtime_terminal_event(
+                &saved,
+                &selected,
+                &source,
+                self.turn_execution_owner_id.as_ref(),
+            )
+            .await?
+        else {
+            anyhow::bail!("accepted CLI terminal outcome awaits current execution authority");
+        };
         let manager = self
             .cli_runtime_manager
             .as_ref()
@@ -5515,7 +5575,6 @@ impl MessageProcessor {
             .await?;
         // Event and Claude transcript UUID are on disk; no old process snapshot
         // is consulted. Retained ownership covers the real lane through ACK.
-        let mut delivery = selected;
         delivery.terminal_delivery_id = Some(record.id.clone());
         anyhow::ensure!(
             self.process_bound_cli_runtime_event_inner(
@@ -13037,9 +13096,10 @@ fn cli_runtime_turn_binding_status_is_active(status: &str) -> bool {
 fn cli_runtime_native_goal_keeps_turn_open(
     binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
 ) -> bool {
-    binding.native_goal_observed_at.is_some()
-        && binding.native_goal_status.as_deref() != Some("complete")
-        && binding.native_goal_status.is_some()
+    pioneer_protocol::CliRuntimeBlockedTurnGuard::goal_keeps_turn_open(
+        binding.native_goal_observed_at.is_some(),
+        binding.native_goal_status.as_deref(),
+    )
 }
 
 fn cli_runtime_native_goal_status_for_storage(
@@ -13089,18 +13149,7 @@ pub(super) fn cli_runtime_terminal_event_record(
     source: &pioneer_protocol::CliRuntimeBlockedTurnGuard,
     payload_redacted_json: String,
 ) -> pioneer_crud::NewCliRuntimeNativeEvent {
-    use sha2::Digest;
-    let identity = serde_json::to_vec(&(
-        &source.turn_id,
-        &source.attempt_id,
-        source.segment.as_ref().map(|(id, _, _)| id),
-        &source.execution_owner,
-    ))
-    .expect("native source identity serializes");
-    let id = format!(
-        "cli-terminal:{}",
-        hex::encode(sha2::Sha256::digest(identity))
-    );
+    let id = source.terminal_delivery_id();
     let now = chrono::Utc::now().fixed_offset();
     pioneer_crud::NewCliRuntimeNativeEvent {
         id,

@@ -1763,6 +1763,16 @@ impl RecoveryCoordinator {
         execution: &TurnExecutionRecord,
         now_unix: i64,
     ) -> Result<()> {
+        if execution.executor_kind == TurnExecutorKind::CliRuntime
+            && self
+                .crud_store
+                .has_pending_cli_runtime_terminal_event(&execution.turn_id)
+                .await?
+        {
+            // Ownership takeover precedes the active scan. Preserve the exact
+            // accepted outcome for that scan instead of synthesizing a restart.
+            return Ok(());
+        }
         if self
             .open_recovery_for_turn(execution.turn_id.as_str())
             .await?
@@ -2068,6 +2078,46 @@ impl RecoveryCoordinator {
         let Some(claim_token) = job.claim_token.clone() else {
             bail!("claimed recovery job `{}` has no claim token", job.id);
         };
+
+        if self
+            .crud_store
+            .get_turn_execution(&job.turn_id)
+            .await?
+            .is_some_and(|execution| {
+                execution.executor_kind == TurnExecutorKind::CliRuntime
+                    && execution.status.is_active()
+                    && (execution.owner_id != self.turn_execution_owner_id.as_ref()
+                        || execution.lease_until.timestamp() <= now_unix)
+            })
+        {
+            self.crud_store
+                .release_claimed_recovery_job(
+                    &job.id,
+                    &claim_token,
+                    now_unix.saturating_add(5),
+                    Some("Turn execution authority awaits ownership takeover".into()),
+                    now_unix,
+                )
+                .await?;
+            return Ok(events);
+        }
+
+        if self
+            .crud_store
+            .has_pending_cli_runtime_terminal_event(&job.turn_id)
+            .await?
+        {
+            self.crud_store
+                .release_claimed_recovery_job(
+                    &job.id,
+                    &claim_token,
+                    now_unix.saturating_add(5),
+                    Some("accepted CLI terminal outcome awaits delivery".into()),
+                    now_unix,
+                )
+                .await?;
+            return Ok(events);
+        }
 
         let run_index = job.run_count.saturating_add(1);
 

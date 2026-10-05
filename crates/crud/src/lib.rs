@@ -908,6 +908,65 @@ pub struct CliRuntimeTurnTerminalGuard {
     pub turn_status: TurnStatus,
 }
 
+impl CliRuntimeTurnTerminalGuard {
+    pub fn terminal_event_source(&self) -> Option<pioneer_protocol::CliRuntimeBlockedTurnGuard> {
+        cli_runtime_event_guard_from_snapshot(self)
+    }
+    /// Provider events waiting behind admission may observe its own activation.
+    /// Metadata/status changes do not replace the selected physical execution.
+    pub fn same_execution_after_admission(&self, current: &Self) -> bool {
+        let (Some(mut selected), Some(actual)) = (
+            cli_runtime_event_guard_from_snapshot(self),
+            cli_runtime_event_guard_from_snapshot(current),
+        ) else {
+            return false;
+        };
+        if selected.attempt_status == "starting" && selected.attempt_native_turn_id.is_none() {
+            selected.binding_native_turn_id = actual.binding_native_turn_id.clone();
+            selected.attempt_native_turn_id = actual.attempt_native_turn_id.clone();
+            // Activation registers the initial segment for this same attempt.
+            if selected.segment.is_none()
+                && actual.segment.as_ref().is_none_or(|(_, native, _)| {
+                    Some(native) == actual.attempt_native_turn_id.as_ref()
+                })
+            {
+                selected.segment = actual.segment.clone();
+            }
+        }
+        selected.same_execution(&actual)
+    }
+}
+
+async fn cli_runtime_turn_terminal_snapshot<C: ConnectionTrait>(
+    connection: &C,
+    turn_id: &str,
+) -> Result<Option<CliRuntimeTurnTerminalGuard>> {
+    let Some(binding) = cli_runtime_binding::find_turn_binding(connection, turn_id).await? else {
+        return Ok(None);
+    };
+    let Some(turn) =
+        turn::find_turn_by_thread_and_id(connection, &binding.thread_id, turn_id).await?
+    else {
+        return Ok(None);
+    };
+    let attempt = cli_runtime_binding::latest_turn_attempt(connection, turn_id).await?;
+    let segment = if let Some(attempt) = &attempt {
+        cli_runtime_binding::latest_execution_segment_for_attempt(connection, &attempt.id).await?
+    } else {
+        None
+    };
+    let execution_owner = turn_execution::find(connection, turn_id)
+        .await?
+        .map(|execution| (execution.owner_id, execution.owner_generation));
+    Ok(Some(CliRuntimeTurnTerminalGuard {
+        binding,
+        attempt,
+        segment,
+        execution_owner,
+        turn_status: turn_status_from_db(&turn.status).context("unknown canonical Turn status")?,
+    }))
+}
+
 fn cli_runtime_blocked_guard_from_snapshot(
     snapshot: &CliRuntimeTurnTerminalGuard,
 ) -> Option<pioneer_protocol::CliRuntimeBlockedTurnGuard> {
@@ -5172,17 +5231,42 @@ impl CrudStore {
         status: Option<String>,
         native_goal_turn_id: Option<String>,
         observed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
-    ) -> Result<CliRuntimeTurnBindingRecord> {
+        expected: Option<CliRuntimeTurnTerminalGuard>,
+        execution_owner_id: &str,
+    ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
         let turn_id = turn_id.to_owned();
         self.run_serialized_write(|| async {
-            cli_runtime_binding::set_turn_native_goal_state(
-                &self.connection,
+            let transaction = self.connection.begin().await?;
+            if let Some(expected) = &expected {
+                let current = cli_runtime_turn_terminal_snapshot(&transaction, &turn_id).await?;
+                if let Some(owner) = turn_execution::find(&transaction, &turn_id).await?
+                    && (owner.owner_id != execution_owner_id
+                        || !owner.status.is_active()
+                        || owner.lease_until <= chrono::Utc::now().fixed_offset())
+                {
+                    transaction.rollback().await?;
+                    return Ok(None);
+                }
+                if !current.as_ref().is_some_and(|current| {
+                    expected
+                        .terminal_event_source()
+                        .zip(current.terminal_event_source())
+                        .is_some_and(|(selected, actual)| selected.same_execution(&actual))
+                }) {
+                    transaction.rollback().await?;
+                    return Ok(None);
+                }
+            }
+            let binding = cli_runtime_binding::set_turn_native_goal_state(
+                &transaction,
                 turn_id.as_str(),
                 status.clone(),
                 native_goal_turn_id.clone(),
                 observed_at,
             )
-            .await
+            .await?;
+            transaction.commit().await?;
+            Ok(Some(binding))
         })
         .await
     }
@@ -5723,6 +5807,7 @@ impl CrudStore {
         execution_window_index: u32,
         previous_failure_reason: String,
         prepared_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+        terminal_source: Option<(pioneer_protocol::CliRuntimeBlockedTurnGuard, String, String)>,
     ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
         if execution_window_index == 0 {
             bail!("CLI runtime recovery execution window index must be positive");
@@ -5736,6 +5821,7 @@ impl CrudStore {
             let recovery_job_id = recovery_job_id.clone();
             let recovery_attempt_id = recovery_attempt_id.clone();
             let previous_failure_reason = previous_failure_reason.clone();
+            let terminal_source = terminal_source.clone();
             async move {
             let transaction = self
                 .connection
@@ -5748,6 +5834,27 @@ impl CrudStore {
                 transaction.rollback().await.ok();
                 bail!("CLI runtime turn binding `{turn_id}` is missing");
             };
+
+            if let Some((expected, id, owner_id)) = terminal_source.as_ref() {
+                let snapshot = cli_runtime_turn_terminal_snapshot(&transaction, &turn_id).await?;
+                let actual = snapshot.as_ref().and_then(cli_runtime_event_guard_from_snapshot);
+                anyhow::ensure!(actual.as_ref().is_some_and(|actual| actual.same_execution(expected)),
+                    "CLI execution changed before recovery preparation");
+                if let Some(owner) = turn_execution::find(&transaction, &turn_id).await? {
+                    anyhow::ensure!(owner.owner_id == *owner_id && owner.status.is_active()
+                        && owner.lease_until > chrono::Utc::now().fixed_offset(),
+                        "CLI recovery execution authority unavailable");
+                }
+                if cli_runtime_binding::find_native_event(&transaction, id).await?.is_some() {
+                    let ack = cli_runtime_binding::find_native_event(&transaction, &format!("{id}:ack")).await?;
+                    let goal_completion = snapshot.as_ref().is_some_and(|snapshot|
+                        snapshot.segment.as_ref().is_some_and(|segment| segment.status == CliRuntimeExecutionSegmentStatus::Completed)
+                        && snapshot.binding.native_goal_observed_at.is_some()
+                        && !pioneer_protocol::CliRuntimeBlockedTurnGuard::goal_keeps_turn_open(true, snapshot.binding.native_goal_status.as_deref()));
+                    anyhow::ensure!(ack.is_some() && !goal_completion,
+                        "accepted CLI terminal outcome must be delivered before recovery preparation");
+                }
+            }
 
             if let Some(existing) = cli_runtime_binding::find_turn_attempt_by_recovery_attempt(
                 &transaction,
@@ -6136,42 +6243,18 @@ impl CrudStore {
         &self,
         expected_binding: &CliRuntimeTurnBindingRecord,
     ) -> Result<Option<CliRuntimeTurnTerminalGuard>> {
-        let snapshot = self.connection.begin_read().await?;
-        let binding =
-            cli_runtime_binding::find_turn_binding(&snapshot, expected_binding.turn_id.as_str())
-                .await?;
-        if binding.as_ref() != Some(expected_binding) {
-            return Ok(None);
-        }
-        let Some(turn) = turn::find_turn_by_thread_and_id(
-            &snapshot,
-            expected_binding.thread_id.as_str(),
-            expected_binding.turn_id.as_str(),
-        )
-        .await?
-        else {
-            return Ok(None);
-        };
-        let attempt =
-            cli_runtime_binding::latest_turn_attempt(&snapshot, expected_binding.turn_id.as_str())
-                .await?;
-        let segment = if let Some(attempt) = attempt.as_ref() {
-            cli_runtime_binding::latest_execution_segment_for_attempt(&snapshot, &attempt.id)
-                .await?
-        } else {
-            None
-        };
-        let execution_owner = turn_execution::find(&snapshot, &expected_binding.turn_id)
+        Ok(self
+            .cli_runtime_turn_terminal_guard_by_id(&expected_binding.turn_id)
             .await?
-            .map(|execution| (execution.owner_id, execution.owner_generation));
-        Ok(Some(CliRuntimeTurnTerminalGuard {
-            binding: expected_binding.clone(),
-            attempt,
-            segment,
-            execution_owner,
-            turn_status: turn_status_from_db(&turn.status)
-                .context("unknown canonical Turn status")?,
-        }))
+            .filter(|snapshot| &snapshot.binding == expected_binding))
+    }
+
+    pub async fn cli_runtime_turn_terminal_guard_by_id(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<CliRuntimeTurnTerminalGuard>> {
+        let snapshot = self.connection.begin_read().await?;
+        cli_runtime_turn_terminal_snapshot(&snapshot, turn_id).await
     }
 
     /// Coherent provenance of an ordinary native terminal event. Unlike a
@@ -6204,6 +6287,77 @@ impl CrudStore {
         cli_runtime_binding::find_native_event(&self.connection, id).await
     }
 
+    /// A point seek for current physical execution; never a journal/history scan.
+    /// Recovery must let an accepted outcome run before replacing that execution.
+    pub async fn has_pending_cli_runtime_terminal_event(&self, turn_id: &str) -> Result<bool> {
+        let Some(snapshot) = self.cli_runtime_turn_terminal_guard_by_id(turn_id).await? else {
+            return Ok(false);
+        };
+        let Some(source) = cli_runtime_event_guard_from_snapshot(&snapshot) else {
+            return Ok(false);
+        };
+        let id = source.terminal_delivery_id();
+        if self.get_cli_runtime_native_event(&id).await?.is_none() {
+            return Ok(false);
+        }
+        let ack = self
+            .get_cli_runtime_native_event(&format!("{id}:ack"))
+            .await?;
+        Ok(ack.is_none()
+            || (snapshot.segment.as_ref().is_some_and(|segment| {
+                segment.status == CliRuntimeExecutionSegmentStatus::Completed
+            }) && snapshot.binding.native_goal_observed_at.is_some()
+                && !pioneer_protocol::CliRuntimeBlockedTurnGuard::goal_keeps_turn_open(
+                    true,
+                    snapshot.binding.native_goal_status.as_deref(),
+                )))
+    }
+
+    /// Re-authorize an immutable accepted outcome under the current process
+    /// lease. An unsaved producer still uses the strict source CAS below.
+    /// JSON/hash are prepared before this short validation writer transaction.
+    pub async fn authorize_cli_runtime_terminal_event(
+        &self,
+        record: &CliRuntimeNativeEventRecord,
+        accepted: &pioneer_protocol::CliRuntimeBlockedTurnGuard,
+        expected: &pioneer_protocol::CliRuntimeBlockedTurnGuard,
+        owner_id: &str,
+    ) -> Result<Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>> {
+        self.run_serialized_write(|| async {
+            let transaction = self.connection.begin().await?;
+            let stored = cli_runtime_binding::find_native_event(&transaction, &record.id).await?;
+            let snapshot =
+                cli_runtime_turn_terminal_snapshot(&transaction, &accepted.turn_id).await?;
+            let actual = snapshot
+                .as_ref()
+                .and_then(cli_runtime_event_guard_from_snapshot);
+            let owner = turn_execution::find(&transaction, &accepted.turn_id).await?;
+            let owns = match &owner {
+                Some(owner) => {
+                    owner.owner_id == owner_id
+                        && owner.status.is_active()
+                        && owner.executor_kind == TurnExecutorKind::CliRuntime
+                        && owner.executor_key.as_deref() == Some(expected.runtime_id.as_str())
+                        && owner.lease_until > chrono::Utc::now().fixed_offset()
+                }
+                None => accepted.execution_owner.is_none() && expected.execution_owner.is_none(),
+            };
+            if !owns
+                || stored.as_ref() != Some(record)
+                || record.native_method != "gateway/terminal_delivery"
+                || !actual.as_ref().is_some_and(|actual| {
+                    actual.same_execution(expected) && actual.same_native_execution(accepted)
+                })
+            {
+                transaction.rollback().await?;
+                return Ok(None);
+            }
+            transaction.commit().await?;
+            Ok(actual)
+        })
+        .await
+    }
+
     /// Persist the accepted native outcome before waiting for transition
     /// ownership. Payload preparation is outside capacity; the source CAS and
     /// insert share this writer commit. First outcome of an execution wins.
@@ -6211,6 +6365,7 @@ impl CrudStore {
         &self,
         event: NewCliRuntimeNativeEvent,
         expected: &pioneer_protocol::CliRuntimeBlockedTurnGuard,
+        owner_id: &str,
     ) -> Result<bool> {
         anyhow::ensure!(
             event.runtime_id == expected.runtime_id
@@ -6230,6 +6385,14 @@ impl CrudStore {
         );
         self.run_serialized_write(|| async {
             let transaction = self.connection.begin().await?;
+            if let Some(owner) = turn_execution::find(&transaction, &expected.turn_id).await?
+                && (owner.owner_id != owner_id
+                    || !owner.status.is_active()
+                    || owner.lease_until <= chrono::Utc::now().fixed_offset())
+            {
+                transaction.rollback().await?;
+                return Ok(false);
+            }
             let Some(binding) =
                 cli_runtime_binding::find_turn_binding(&transaction, &expected.turn_id).await?
             else {

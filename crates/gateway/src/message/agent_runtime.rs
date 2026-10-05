@@ -1321,38 +1321,55 @@ impl MessageProcessor {
                             "native terminal delivery identity mismatch",
                         ));
                     }
-                    let native = source
-                        .segment
-                        .as_ref()
-                        .map(|(_, native, _)| native.as_str())
-                        .or(source.attempt_native_turn_id.as_deref());
-                    let actual = match (
-                        self.crud_store
-                            .get_cli_runtime_turn_binding(&source.turn_id)
-                            .await,
-                        native,
-                    ) {
-                        (Ok(Some(binding)), Some(native)) => {
-                            self.crud_store
-                                .cli_runtime_terminal_event_source(&binding, native)
-                                .await
-                        }
-                        (Err(error), _) => Err(error),
-                        _ => Ok(None),
-                    }
-                    .map_err(|_| {
-                        DurableCommitRejection::retryable(
-                            "source_unavailable",
-                            "native terminal source storage lookup failed",
+                    let id = source
+                        .terminal_delivery_id
+                        .as_deref()
+                        .expect("delivery identity checked");
+                    let saved = self
+                        .crud_store
+                        .get_cli_runtime_native_event(id)
+                        .await
+                        .map_err(|_| {
+                            DurableCommitRejection::retryable(
+                                "source_unavailable",
+                                "native terminal journal lookup failed",
+                            )
+                        })?
+                        .ok_or_else(|| {
+                            DurableCommitRejection::permanent(
+                                "source_superseded",
+                                "accepted native outcome disappeared",
+                            )
+                        })?;
+                    let (accepted, _): (
+                        pioneer_protocol::CliRuntimeBlockedTurnGuard,
+                        serde_json::Value,
+                    ) = serde_json::from_str(&saved.payload_redacted_json).map_err(|_| {
+                        DurableCommitRejection::permanent(
+                            "invalid_terminal_delivery",
+                            "invalid saved terminal outcome",
                         )
                     })?;
-                    if !actual
-                        .as_ref()
-                        .is_some_and(|actual| actual.same_execution(source))
+                    if self
+                        .crud_store
+                        .authorize_cli_runtime_terminal_event(
+                            &saved,
+                            &accepted,
+                            source,
+                            self.turn_execution_owner_id.as_ref(),
+                        )
+                        .await
+                        .map_err(|_| {
+                            DurableCommitRejection::retryable(
+                                "source_unavailable",
+                                "native terminal authority validation failed",
+                            )
+                        })?
+                        .is_none()
                     {
                         return Err(DurableCommitRejection::permanent(
                             "source_superseded",
-                            "native terminal producer execution changed",
+                            "native execution or replay authority changed",
                         ));
                     }
                 }

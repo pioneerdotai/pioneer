@@ -45926,6 +45926,8 @@ async fn turn_cancel_clears_codex_goal_and_interrupts_latest_execution_segment()
             Some("active".to_owned()),
             Some(second_segment_id.to_owned()),
             now,
+            None,
+            processor.turn_execution_owner_id.as_ref(),
         )
         .await
         .expect("active Codex Goal state should persist");
@@ -51975,6 +51977,27 @@ async fn seed_cli_runtime_turn_with_text(
     )
     .await;
 
+    seed_cli_runtime_binding(
+        crud_store,
+        workspace_id,
+        runtime_id,
+        runtime_kind,
+        thread_id,
+        turn_id,
+        native_thread_id,
+    )
+    .await;
+}
+
+async fn seed_cli_runtime_binding(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    runtime_id: &str,
+    runtime_kind: &str,
+    thread_id: &str,
+    turn_id: &str,
+    native_thread_id: &str,
+) {
     let now = chrono::Utc::now().fixed_offset();
     let (_, attempt) = crud_store
         .prepare_cli_runtime_initial_turn_attempt(
@@ -52003,10 +52026,25 @@ async fn seed_cli_runtime_turn_with_text(
         )
         .await
         .expect("CLI approval test turn attempt should prepare");
-    crud_store
-        .activate_cli_runtime_turn_attempt(turn_id, attempt.id.as_str(), turn_id, None, now)
-        .await
-        .expect("CLI approval test turn attempt should activate");
+    if let Some(execution) = crud_store.get_turn_execution(turn_id).await.unwrap() {
+        crud_store
+            .activate_cli_runtime_turn_attempt_owned(
+                turn_id,
+                &attempt.id,
+                turn_id,
+                None,
+                now,
+                &execution.owner_id,
+                execution.lease_until,
+            )
+            .await
+            .unwrap();
+    } else {
+        crud_store
+            .activate_cli_runtime_turn_attempt(turn_id, &attempt.id, turn_id, None, now)
+            .await
+            .unwrap();
+    }
     if runtime_kind == "codex" {
         crud_store
             .register_cli_runtime_execution_segment(turn_id, native_thread_id, turn_id, now)
@@ -52038,6 +52076,25 @@ async fn materialize_cli_runtime_turn_with_text(
     turn_id: &str,
     user_text: &str,
 ) {
+    materialize_cli_runtime_turn_with_execution(
+        crud_store,
+        workspace_id,
+        thread_id,
+        turn_id,
+        user_text,
+        None,
+    )
+    .await;
+}
+
+async fn materialize_cli_runtime_turn_with_execution(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    user_text: &str,
+    execution: Option<pioneer_crud::NewTurnExecution>,
+) {
     ensure_test_superuser_execution_authority(crud_store).await;
     let execution_principal = authenticated_test_superuser();
     let now_secs = chrono::Utc::now().timestamp();
@@ -52061,7 +52118,7 @@ async fn materialize_cli_runtime_turn_with_text(
         visibility: None,
         turns: Vec::new(),
     };
-    let turn = Turn {
+    let mut turn = Turn {
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::default(),
@@ -52076,6 +52133,83 @@ async fn materialize_cli_runtime_turn_with_text(
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
     };
+    if let Some(execution) = execution {
+        let actor = pioneer_protocol::PersistedActorRef::Principal(
+            execution_principal.principal_id.clone(),
+        );
+        turn.author = Some(pioneer_protocol::TurnAuthorSnapshot {
+            actor: actor.clone(),
+            display_name: "Superuser".into(),
+            nickname: "superuser".into(),
+            avatar_revision: None,
+            agent: None,
+        });
+        let backend = AgentExecutionBackend::CLIAgentRuntime {
+            runtime_id: execution.executor_key.clone().unwrap(),
+            runtime_kind: if execution.executor_key.as_deref() == Some("claude") {
+                CLIAgentRuntimeKind::Claude
+            } else {
+                CLIAgentRuntimeKind::Codex
+            },
+        };
+        let authority = crate::authorization::ExecutionAuthorizationContext::for_test(
+            execution_principal.as_ref(),
+            workspace_id,
+            thread_id,
+            &turn.permission_profile,
+            Some(&backend),
+        )
+        .to_persisted_json()
+        .unwrap();
+        let audit = pioneer_protocol::TurnPermissionAuditEvent {
+            workspace_id: workspace_id.into(),
+            thread_id: thread_id.into(),
+            turn_id: turn_id.into(),
+            event_kind: pioneer_protocol::TurnPermissionAuditEventKind::ProfileSelected,
+            profile_mode: turn.permission_profile.mode,
+            profile_source: turn.permission_profile.source,
+            security_snapshot_id: None,
+            security_snapshot_version: None,
+            security_reason_code: None,
+            security_capability: None,
+            item_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            action_kind: None,
+            request_key: None,
+            decision: None,
+            reason: None,
+            cached: false,
+        };
+        crud_store
+            .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[UserInput::Text {
+                    text: user_text.into(),
+                    text_elements: Vec::new(),
+                }],
+                None,
+                pioneer_crud::TurnWorkOwner::Turn,
+                actor,
+                audit,
+                &authority,
+                None,
+                None,
+                Some(execution),
+                &pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                    "/tmp/project",
+                    chrono::Utc::now().timestamp_millis(),
+                ),
+                Vec::new(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        return;
+    }
     crud_store
         .materialize_turn_start(
             &thread,

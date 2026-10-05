@@ -7732,6 +7732,58 @@ impl MessageProcessor {
                 }
             }
         }
+        if self
+            .crud_store
+            .has_pending_cli_runtime_terminal_event(&binding.turn_id)
+            .await?
+        {
+            return Err(CliRuntimeRecoveryStartFailure::Unavailable {
+                diagnostic: "accepted native outcome awaits delivery".into(),
+            });
+        }
+        let terminal_source = self
+            .crud_store
+            .cli_runtime_turn_terminal_guard_by_id(&binding.turn_id)
+            .await?
+            .and_then(|snapshot| snapshot.terminal_event_source())
+            .map(|source| {
+                let id = source.terminal_delivery_id();
+                (source, id, self.turn_execution_owner_id.to_string())
+            });
+        let recovery_authority = self
+            .load_turn_execution_authorization_context(&binding.turn_id)
+            .await?;
+        let prepared_at = chrono::Utc::now().fixed_offset();
+        let (prepared_binding, attempt) = self
+            .crud_store
+            .prepare_cli_runtime_recovery_turn_attempt(
+                binding.turn_id.as_str(),
+                pioneer_protocol::generate_id(21),
+                request.job_id.clone(),
+                request.recovery_attempt_id.clone(),
+                request.execution_window_index,
+                request.previous_failure_reason.clone(),
+                prepared_at,
+                terminal_source,
+            )
+            .await?;
+        match attempt.status {
+            pioneer_crud::CliRuntimeTurnAttemptStatus::Running
+                if attempt.native_turn_id.is_some() =>
+            {
+                return Ok(false);
+            }
+            pioneer_crud::CliRuntimeTurnAttemptStatus::Starting => {}
+            status => {
+                return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                    diagnostic: format!(
+                        "CLI runtime recovery attempt `{}` is `{}` and cannot start",
+                        attempt.id,
+                        status.as_str()
+                    ),
+                });
+            }
+        }
         let manager = self
             .cli_runtime_manager
             .as_ref()
@@ -7778,39 +7830,6 @@ impl MessageProcessor {
                 .context("failed to reset Codex Goal before recovery")?;
         }
 
-        let recovery_authority = self
-            .load_turn_execution_authorization_context(&binding.turn_id)
-            .await?;
-        let prepared_at = chrono::Utc::now().fixed_offset();
-        let (prepared_binding, attempt) = self
-            .crud_store
-            .prepare_cli_runtime_recovery_turn_attempt(
-                binding.turn_id.as_str(),
-                pioneer_protocol::generate_id(21),
-                request.job_id.clone(),
-                request.recovery_attempt_id.clone(),
-                request.execution_window_index,
-                request.previous_failure_reason.clone(),
-                prepared_at,
-            )
-            .await?;
-        match attempt.status {
-            pioneer_crud::CliRuntimeTurnAttemptStatus::Running
-                if attempt.native_turn_id.is_some() =>
-            {
-                return Ok(false);
-            }
-            pioneer_crud::CliRuntimeTurnAttemptStatus::Starting => {}
-            status => {
-                return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
-                    diagnostic: format!(
-                        "CLI runtime recovery attempt `{}` is `{}` and cannot start",
-                        attempt.id,
-                        status.as_str()
-                    ),
-                });
-            }
-        }
         if let Err(error) = self
             .publish_cli_runtime_attempt_window_started(
                 session_handle.instance(),

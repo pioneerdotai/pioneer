@@ -1238,9 +1238,42 @@ pub struct CliRuntimeBlockedTurnGuard {
 }
 
 impl CliRuntimeBlockedTurnGuard {
+    pub fn goal_keeps_turn_open(observed: bool, status: Option<&str>) -> bool {
+        observed && status.is_some_and(|status| status != "complete")
+    }
+
+    pub fn segment_ack_needs_goal_completion(&self, observed: bool, status: Option<&str>) -> bool {
+        self.native_goal_status
+            .as_deref()
+            .is_some_and(|status| status != "complete")
+            && observed
+            && !Self::goal_keeps_turn_open(observed, status)
+    }
+    /// Accepted outcome identity belongs to the physical provider execution,
+    /// not the Gateway lease holder. Compute outside database capacity.
+    pub fn terminal_delivery_id(&self) -> String {
+        use sha2::Digest;
+        let identity = serde_json::to_vec(&(
+            &self.turn_id,
+            &self.attempt_id,
+            self.segment.as_ref().map(|(id, _, _)| id),
+        ))
+        .expect("native source identity serializes");
+        format!(
+            "cli-terminal:{}",
+            hex::encode(sha2::Sha256::digest(identity))
+        )
+    }
+
     /// Native event provenance survives legitimate activity/status/Goal changes
     /// of this execution, but never a different attempt, segment or owner epoch.
     pub fn same_execution(&self, other: &Self) -> bool {
+        self.same_native_execution(other) && self.execution_owner == other.execution_owner
+    }
+
+    /// Only an already accepted journal outcome may cross a process takeover.
+    /// Its replay still needs current owner/generation authorization in writer.
+    pub fn same_native_execution(&self, other: &Self) -> bool {
         self.turn_id == other.turn_id
             && self.thread_id == other.thread_id
             && self.workspace_id == other.workspace_id
@@ -1255,6 +1288,5 @@ impl CliRuntimeBlockedTurnGuard {
             && self.recovery_attempt_id == other.recovery_attempt_id
             && self.segment.as_ref().map(|(id, native, _)| (id, native))
                 == other.segment.as_ref().map(|(id, native, _)| (id, native))
-            && self.execution_owner == other.execution_owner
     }
 }

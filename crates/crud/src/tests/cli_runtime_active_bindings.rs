@@ -554,6 +554,7 @@ async fn cli_terminal_guard_rejects_same_timestamp_status_aba_with_new_recovery_
             2,
             "resume".into(),
             guard.binding.updated_at,
+            None,
         )
         .await
         .unwrap();
@@ -907,6 +908,7 @@ async fn cli_blocked_atomic_source_guard_rejects_new_attempt_and_changed_recover
             2,
             "next execution".into(),
             timestamp,
+            None,
         )
         .await
         .unwrap();
@@ -1123,7 +1125,7 @@ async fn cli_native_terminal_source_write_preserves_first_outcome_and_rolls_back
     ).await.unwrap();
     assert!(
         store
-            .persist_cli_runtime_terminal_event(event.clone(), &source)
+            .persist_cli_runtime_terminal_event(event.clone(), &source, "native-delivery-owner")
             .await
             .is_err()
     );
@@ -1148,7 +1150,7 @@ async fn cli_native_terminal_source_write_preserves_first_outcome_and_rolls_back
         .unwrap();
     assert!(
         store
-            .persist_cli_runtime_terminal_event(event.clone(), &source)
+            .persist_cli_runtime_terminal_event(event.clone(), &source, "native-delivery-owner")
             .await
             .unwrap()
     );
@@ -1156,7 +1158,7 @@ async fn cli_native_terminal_source_write_preserves_first_outcome_and_rolls_back
     later.payload_redacted_json = "{\"outcome\":\"different\"}".into();
     assert!(
         store
-            .persist_cli_runtime_terminal_event(later, &source)
+            .persist_cli_runtime_terminal_event(later, &source, "native-delivery-owner")
             .await
             .unwrap()
     );
@@ -1223,7 +1225,7 @@ async fn cli_native_terminal_source_write_rejects_owner_aba_even_with_same_bindi
     );
     assert!(
         !store
-            .persist_cli_runtime_terminal_event(event.clone(), &source)
+            .persist_cli_runtime_terminal_event(event.clone(), &source, "native-delivery-owner")
             .await
             .unwrap()
     );
@@ -1250,5 +1252,73 @@ async fn cli_native_terminal_source_write_rejects_owner_aba_even_with_same_bindi
             .unwrap()
             .status
             .is_active()
+    );
+}
+
+#[tokio::test]
+async fn cli_accepted_outcome_wins_recovery_preparation_writer_and_preserves_sources() {
+    let (store, source, mut event) = native_delivery_fixture().await;
+    event.id = source.terminal_delivery_id();
+    assert!(
+        store
+            .persist_cli_runtime_terminal_event(event.clone(), &source, "native-delivery-owner")
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .has_pending_cli_runtime_terminal_event(&source.turn_id)
+            .await
+            .unwrap()
+    );
+    let before = store
+        .cli_runtime_turn_terminal_guard_by_id(&source.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // The final writer check is necessary even when a coordinator's earlier
+    // read saw no journal row and already dispatched its recovery request.
+    assert!(
+        store
+            .prepare_cli_runtime_recovery_turn_attempt(
+                &source.turn_id,
+                "receipt-recovery-attempt".into(),
+                "receipt-recovery-job".into(),
+                "receipt-recovery-run".into(),
+                2,
+                "restart must wait".into(),
+                event.created_at,
+                Some((
+                    source.clone(),
+                    event.id.clone(),
+                    "native-delivery-owner".into()
+                ))
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .cli_runtime_turn_terminal_guard_by_id(&source.turn_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    assert!(
+        store
+            .get_cli_runtime_turn_attempt("receipt-recovery-attempt")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .get_cli_runtime_native_event(&event.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .payload_redacted_json,
+        event.payload_redacted_json
     );
 }
