@@ -14,6 +14,15 @@ use pioneer_protocol::ProviderModelInfo;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// An explicit all-string marker list is evidence; absent/null/malformed is unknown.
+/// Shared by periodic sources and authority-native model discovery.
+pub(crate) fn tool_support_from_marker_list(value: &Value, marker: &str) -> Option<bool> {
+    value
+        .as_array()
+        .filter(|values| values.iter().all(Value::is_string))
+        .map(|values| values.iter().any(|value| value == marker))
+}
+
 pub const UNKNOWN_CONTEXT_WINDOW: u64 = 128_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

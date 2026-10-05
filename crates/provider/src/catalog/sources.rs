@@ -765,16 +765,15 @@ pub(super) fn tool_capabilities(snapshot: &SourceSnapshot) -> super::super::Tool
             };
             // Missing/null/malformed metadata is unknown, an explicit valid
             // list without the capability is negative (including an empty list).
-            let Some(values) = model[field]
-                .as_array()
-                .filter(|a| a.iter().all(Value::is_string))
+            let Some(supported) =
+                crate::catalog::tool_support_from_marker_list(&model[field], marker)
             else {
                 continue;
             };
             result
                 .entry(provider.into())
                 .or_default()
-                .insert(id.into(), values.iter().any(|v| v == marker));
+                .insert(id.into(), supported);
         }
     }
     result
