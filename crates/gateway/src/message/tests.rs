@@ -1,6 +1,9 @@
 #[path = "tests/history_continuation.rs"]
 mod history_continuation;
 
+#[path = "tests/compaction_lifecycle_poll.rs"]
+mod compaction_lifecycle_poll;
+
 #[path = "tests/task_run_occurrence_tracker.rs"]
 mod task_run_occurrence_tracker;
 
@@ -75659,7 +75662,7 @@ async fn check_completed_history(
             );
             let missing = harness
                 .crud_store
-                .compaction_lifecycle_recovery((phase_13_now_secs() as u64) * 1000, "")
+                .compaction_due_lifecycle(phase_13_now_secs() * 1000)
                 .await
                 .unwrap();
             assert_eq!(
@@ -75667,7 +75670,16 @@ async fn check_completed_history(
                 1,
                 "committed checkpoint is missing terminal publication"
             );
-            assert_eq!(missing[0].status, "completed");
+            assert_eq!(
+                harness
+                    .crud_store
+                    .compaction_operation(&missing[0].operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "completed"
+            );
             assert!(provider.call_count() > 0);
             Some(provider.call_count())
         } else {

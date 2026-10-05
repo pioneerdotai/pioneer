@@ -15,6 +15,18 @@ use sea_orm::{ActiveModelTrait, FromQueryResult, IntoActiveModel};
 
 const NOW: i64 = 4_000_000_000;
 const AT: i64 = 1_700_000_000;
+const MIGRATION: &str = "m20261004_000001_task_occurrence_reconcile";
+
+fn tracker_rollback_steps() -> u32 {
+    (Migrator::migrations()
+        .iter()
+        .rev()
+        .position(|migration| migration.name() == MIGRATION)
+        .expect("occurrence tracker migration is registered")
+        + 1)
+    .try_into()
+    .unwrap()
+}
 
 async fn task(store: &CrudStore, kind: TaskExecutorKind) -> Task {
     let mut task = sample_task(AT);
@@ -853,7 +865,9 @@ async fn migration_objects_and_marker_rollback_on_trigger_installation_failure()
         .await
         .with_maintenance_access();
     let tx = store.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(1)).await.unwrap();
+    Migrator::down(&*tx, Some(tracker_rollback_steps()))
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     store.connection.execute_unprepared("CREATE TRIGGER task_occurrence_reconcile_task_run_update AFTER UPDATE ON task_run WHEN 0 BEGIN SELECT 1; END").await.unwrap();
     let tx = store.connection.begin().await.unwrap();
@@ -904,7 +918,9 @@ async fn seed_interruption_keeps_fixed_bound_and_accepts_terminal_history() {
     let store = test_store_with_workspace("ws_task").await;
     let maintenance = store.with_maintenance_access();
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(1)).await.unwrap();
+    Migrator::down(&*tx, Some(tracker_rollback_steps()))
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     let task = task(&store, TaskExecutorKind::System).await;
     for n in 0..40 {
