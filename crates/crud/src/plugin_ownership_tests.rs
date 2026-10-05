@@ -901,3 +901,577 @@ async fn install_failure_preserves_native_sibling_and_closes_failed_child() {
         Some(false)
     );
 }
+
+// C1 source regressions: NOT_RUN / NOT_COMPILED.
+#[tokio::test]
+async fn closed_gate_reconciliation_and_enable_preserve_native_restrictions() {
+    let store = test_store_with_workspace("ws-c1").await;
+    let id = "P".repeat(21);
+    store
+        .insert_plugin_installation(&parent(&id, "ws-c1"))
+        .await
+        .unwrap();
+    let child = skill('S', "ws-c1");
+    let write = ownership(&id, child.skill_id.as_str(), "one");
+    store
+        .install_skill_lifecycle_with_ownership(&child, &policy(&child), &[], None, Some(&write), 1)
+        .await
+        .unwrap();
+    store
+        .settle_plugin_installation(&id, 1, "installed", None)
+        .await
+        .unwrap();
+    let restrictions = store.list_workspace_skill_policies("ws-c1").await.unwrap();
+    let operation = store
+        .begin_plugin_mutation(
+            "ws-c1",
+            &id,
+            1,
+            "updating",
+            false,
+            "{\"kind\":\"set_enabled\",\"children\":[]}",
+        )
+        .await
+        .unwrap();
+    assert_eq!(operation.revision, 2);
+    assert!(
+        store
+            .begin_plugin_mutation(
+                "ws-c1",
+                &id,
+                2,
+                "updating",
+                true,
+                "{\"kind\":\"replacement\"}"
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .find_plugin_installation(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_json,
+        operation.pending_json
+    );
+    assert!(
+        !store
+            .plugin_child_available("skill", child.skill_id.as_str(), "ws-c1")
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .begin_plugin_mutation("foreign", &id, 2, "updating", true, "{}")
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .begin_plugin_mutation("ws-c1", &id, 1, "updating", true, "{}")
+            .await
+            .is_err()
+    );
+    store
+        .with_maintenance_access()
+        .interrupt_unfinished_plugins()
+        .await
+        .unwrap();
+    let interrupted = store.find_plugin_installation(&id).await.unwrap().unwrap();
+    assert_eq!(interrupted.state, "interrupted");
+    assert_eq!(interrupted.pending_json, operation.pending_json);
+    store
+        .finish_plugin_mutation(&id, 2, "installed", None)
+        .await
+        .unwrap();
+    let enable = store
+        .begin_plugin_mutation("ws-c1", &id, 2, "updating", true, "{}")
+        .await
+        .unwrap();
+    store
+        .prepare_plugin_reload(&id, enable.revision)
+        .await
+        .unwrap();
+    let reload = store.find_plugin_installation(&id).await.unwrap().unwrap();
+    assert_eq!(reload.state, "installed");
+    assert!(reload.pending_json.is_some());
+    assert!(
+        !store
+            .plugin_child_available("skill", child.skill_id.as_str(), "ws-c1")
+            .await
+            .unwrap()
+    );
+    // Cancellation/restart during reload must retain an executable repair plan.
+    store
+        .with_maintenance_access()
+        .interrupt_unfinished_plugins()
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .find_plugin_installation(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "interrupted"
+    );
+    store
+        .finish_plugin_mutation(&id, enable.revision, "installed", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.list_workspace_skill_policies("ws-c1").await.unwrap(),
+        restrictions
+    );
+    assert!(
+        store
+            .delete_plugin_parent(&id, enable.revision)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn failed_assets_only_update_preserves_the_last_committed_tree_for_retry() {
+    let store = test_store_with_workspace("ws-c1-assets").await;
+    let id = "P".repeat(21);
+    store
+        .insert_plugin_installation(&parent(&id, "ws-c1-assets"))
+        .await
+        .unwrap();
+    let child = skill('S', "ws-c1-assets");
+    let write = ownership(&id, child.skill_id.as_str(), "one");
+    store
+        .install_skill_lifecycle_with_ownership(&child, &policy(&child), &[], None, Some(&write), 1)
+        .await
+        .unwrap();
+    let mut failed = write.clone();
+    failed.package_fingerprint = "assets-only-new-tree".into();
+    store
+        .record_plugin_component_failure(&failed, "skill", "component_update_failed")
+        .await
+        .unwrap();
+    let link = store
+        .find_skill_plugin_owner(&child.skill_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(link.status, "failed");
+    assert_eq!(
+        link.package_fingerprint.as_deref(),
+        Some(write.package_fingerprint.as_str())
+    );
+    assert_eq!(link.skill_id.as_deref(), Some(child.skill_id.as_str()));
+}
+
+#[tokio::test]
+async fn native_policy_audit_override_and_parent_commit_marker_are_atomic() {
+    let store = test_store_with_workspace("ws-c1-policy").await;
+    let parent_id = "P".repeat(21);
+    let child_id = "M".repeat(21);
+    store
+        .insert_plugin_installation(&parent(&parent_id, "ws-c1-policy"))
+        .await
+        .unwrap();
+    let original = mcp(&child_id, "ws-c1-policy", "pplugin_native_policy");
+    store
+        .upsert_mcp_server_installation_with_audit_and_ownership(
+            &original,
+            &mcp_audit(&original),
+            Some(&ownership(&parent_id, &child_id, "one")),
+            1,
+        )
+        .await
+        .unwrap();
+    store
+        .settle_plugin_installation(&parent_id, 1, "installed", None)
+        .await
+        .unwrap();
+    let gate = store
+        .begin_plugin_mutation(
+            "ws-c1-policy",
+            &parent_id,
+            1,
+            "updating",
+            true,
+            "{\"kind\":\"native\",\"native_committed\":false}",
+        )
+        .await
+        .unwrap();
+    let write = PluginNativeWrite {
+        plugin_id: parent_id.clone(),
+        expected_revision: gate.revision,
+        member_key: "one".into(),
+        child_id: child_id.clone(),
+        override_fields_json: "[\"enabled\"]".into(),
+        pending_after: "{\"kind\":\"native\",\"native_committed\":true}".into(),
+    };
+    let mut edited = original.clone();
+    edited.enabled = true;
+    let mut stale = write.clone();
+    stale.expected_revision -= 1;
+    assert!(
+        store
+            .upsert_mcp_server_installation_with_plugin_native_change(
+                &edited,
+                &mcp_audit(&edited),
+                None,
+                Some(&stale),
+                2
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .find_mcp_server_installation("workspace", "ws-c1-policy", &original.name)
+            .await
+            .unwrap()
+            .unwrap(),
+        original
+    );
+    assert_eq!(
+        store
+            .find_mcp_plugin_owner(&child_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .override_fields_json,
+        "[]"
+    );
+    assert_eq!(
+        store
+            .find_plugin_installation(&parent_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_json,
+        gate.pending_json
+    );
+    store
+        .database_connection()
+        .execute_unprepared(
+            "CREATE TRIGGER c1_native_audit_failure BEFORE INSERT ON mcp_audit_event \
+         BEGIN SELECT RAISE(ABORT, 'fixture audit failure'); END",
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .upsert_mcp_server_installation_with_plugin_native_change(
+                &edited,
+                &mcp_audit(&edited),
+                None,
+                Some(&write),
+                2
+            )
+            .await
+            .is_err()
+    );
+    // This failure occurs after the native row write, before link/parent effect
+    // publication. The same transaction must roll all of them back.
+    assert!(
+        !store
+            .find_mcp_server_installation("workspace", "ws-c1-policy", &original.name)
+            .await
+            .unwrap()
+            .unwrap()
+            .enabled
+    );
+    assert_eq!(
+        store
+            .find_mcp_plugin_owner(&child_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .override_fields_json,
+        "[]"
+    );
+    assert_eq!(
+        store
+            .find_plugin_installation(&parent_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_json,
+        gate.pending_json
+    );
+    store
+        .database_connection()
+        .execute_unprepared("DROP TRIGGER c1_native_audit_failure")
+        .await
+        .unwrap();
+    let mut malformed = mcp_audit(&edited);
+    malformed.decision = "invalid".into();
+    // Foreign child binding is rejected without changing native policy/masks.
+    let mut foreign = write.clone();
+    foreign.child_id = "F".repeat(21);
+    assert!(
+        store
+            .upsert_mcp_server_installation_with_plugin_native_change(
+                &edited,
+                &malformed,
+                None,
+                Some(&foreign),
+                2
+            )
+            .await
+            .is_err()
+    );
+    store
+        .upsert_mcp_server_installation_with_plugin_native_change(
+            &edited,
+            &mcp_audit(&edited),
+            None,
+            Some(&write),
+            2,
+        )
+        .await
+        .unwrap();
+    let link = store
+        .find_mcp_plugin_owner(&child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(link.override_fields_json, write.override_fields_json);
+    assert_eq!(link.package_fingerprint.as_deref(), Some("member-tree"));
+    assert_eq!(
+        store
+            .find_plugin_installation(&parent_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_json,
+        Some(write.pending_after.clone())
+    );
+    assert!(
+        store
+            .find_mcp_server_installation("workspace", "ws-c1-policy", &original.name)
+            .await
+            .unwrap()
+            .unwrap()
+            .enabled
+    );
+    assert!(
+        !store
+            .plugin_child_available("mcp", &child_id, "ws-c1-policy")
+            .await
+            .unwrap()
+    );
+    store
+        .finish_plugin_mutation(
+            &parent_id,
+            gate.revision,
+            "interrupted",
+            Some("uncertain reply".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .find_plugin_installation(&parent_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_json,
+        Some(write.pending_after.clone())
+    );
+    // Runtime admission is distinct from model invocation during final reload.
+    store
+        .prepare_plugin_reload(&parent_id, gate.revision)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .plugin_child_runtime_available(&child_id, "ws-c1-policy")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .plugin_child_available("mcp", &child_id, "ws-c1-policy")
+            .await
+            .unwrap()
+    );
+    store
+        .finish_plugin_mutation(&parent_id, gate.revision, "installed", None)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .plugin_child_available("mcp", &child_id, "ws-c1-policy")
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn owned_skill_policy_and_user_removal_revalidate_in_the_native_writer() {
+    let store = test_store_with_workspace("ws-c1-skill").await;
+    let parent_id = "P".repeat(21);
+    store
+        .insert_plugin_installation(&parent(&parent_id, "ws-c1-skill"))
+        .await
+        .unwrap();
+    let child = skill('S', "ws-c1-skill");
+    store
+        .install_skill_lifecycle_with_ownership(
+            &child,
+            &policy(&child),
+            &[],
+            None,
+            Some(&ownership(&parent_id, child.skill_id.as_str(), "one")),
+            1,
+        )
+        .await
+        .unwrap();
+    store
+        .settle_plugin_installation(&parent_id, 1, "installed", None)
+        .await
+        .unwrap();
+    let gate = store
+        .begin_plugin_mutation(
+            "ws-c1-skill",
+            &parent_id,
+            1,
+            "updating",
+            true,
+            "{\"kind\":\"native\",\"action\":\"policy\",\"native_committed\":false}",
+        )
+        .await
+        .unwrap();
+    let mut write = PluginNativeWrite {
+        plugin_id: parent_id.clone(),
+        expected_revision: gate.revision,
+        member_key: "one".into(),
+        child_id: child.skill_id.to_string(),
+        override_fields_json: "[\"enabled\"]".into(),
+        pending_after: "{\"kind\":\"native\",\"native_committed\":true}".into(),
+    };
+    let mut restricted = policy(&child);
+    restricted.enabled = Some(true);
+    assert!(
+        store
+            .upsert_workspace_skill_policy(&restricted, 2)
+            .await
+            .is_err()
+    );
+    store
+        .upsert_workspace_skill_policy_with_plugin_change(&restricted, Some(&write), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .find_skill_plugin_owner(&child.skill_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .override_fields_json,
+        write.override_fields_json
+    );
+    store
+        .finish_plugin_mutation(&parent_id, gate.revision, "installed", None)
+        .await
+        .unwrap();
+    let remove = store
+        .begin_plugin_mutation(
+            "ws-c1-skill",
+            &parent_id,
+            gate.revision,
+            "updating",
+            true,
+            "{\"kind\":\"native\",\"action\":\"uninstall\",\"native_committed\":false}",
+        )
+        .await
+        .unwrap();
+    write.expected_revision = remove.revision;
+    let mut audit = skill_audit(&child);
+    audit.action = "uninstall".into();
+    assert!(
+        store
+            .uninstall_skill_installation_lifecycle(&child, &[audit.clone()], 3)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .find_skill_installation(&child.skill_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    store
+        .database_connection()
+        .execute_unprepared(
+            "CREATE TRIGGER c1_skill_audit_failure BEFORE INSERT ON skill_audit_event \
+         BEGIN SELECT RAISE(ABORT, 'fixture audit failure'); END",
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .uninstall_skill_installation_lifecycle_with_plugin_change(
+                &child,
+                &[audit.clone()],
+                Some(&write),
+                3
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .find_skill_installation(&child.skill_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .find_skill_plugin_owner(&child.skill_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    store
+        .database_connection()
+        .execute_unprepared("DROP TRIGGER c1_skill_audit_failure")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .uninstall_skill_installation_lifecycle_with_plugin_change(
+                &child,
+                &[audit],
+                Some(&write),
+                3
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .find_skill_installation(&child.skill_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let link = store
+        .list_plugin_components(&parent_id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(link.status, "removed_by_user");
+    assert!(link.skill_id.is_none());
+    assert!(
+        store
+            .list_workspace_skill_policies("ws-c1-skill")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

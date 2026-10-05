@@ -1,5 +1,5 @@
 mod plugins;
-pub use plugins::{PluginOwnershipWrite, validate_standalone_mcp_name};
+pub use plugins::{PluginNativeWrite, PluginOwnershipWrite, validate_standalone_mcp_name};
 mod tool_output;
 pub use repositories::compaction;
 mod compaction_store;
@@ -18347,31 +18347,69 @@ impl CrudStore {
         record: &WorkspaceSkillPolicyRecord,
         event_timestamp_secs: i64,
     ) -> Result<()> {
-        self.run_serialized_write(|| async {
-            let now = unix_to_datetime(event_timestamp_secs);
-            skill_workspace_policy::upsert_workspace_skill_policy(
-                &self.connection,
-                record,
-                now,
-                now,
-            )
+        self.upsert_workspace_skill_policy_with_plugin_change(record, None, event_timestamp_secs)
             .await
+    }
+    pub async fn upsert_workspace_skill_policy_with_plugin_change(
+        &self,
+        record: &WorkspaceSkillPolicyRecord,
+        native: Option<&PluginNativeWrite>,
+        event_timestamp_secs: i64,
+    ) -> Result<()> {
+        plugins::validate_native_write_input(native)?;
+        self.run_serialized_write(|| async {
+            let db = self.connection.begin().await?;
+            repositories::plugins::validate_native_write(
+                &db,
+                native,
+                &record.workspace_id,
+                "skill",
+                record.skill_id.as_str(),
+            )
+            .await?;
+            let now = unix_to_datetime(event_timestamp_secs);
+            skill_workspace_policy::upsert_workspace_skill_policy(&db, record, now, now).await?;
+            if let Some(native) = native {
+                repositories::plugins::publish_native_write(&db, native, "skill", false).await?;
+            }
+            db.commit().await?;
+            Ok(())
         })
         .await
     }
-
     pub async fn delete_workspace_skill_policy(
         &self,
         workspace_id: &str,
         skill_id: &SkillId,
     ) -> Result<bool> {
-        self.run_serialized_write(|| async {
-            skill_workspace_policy::delete_workspace_skill_policy(
-                &self.connection,
-                workspace_id,
-                skill_id,
-            )
+        self.delete_workspace_skill_policy_with_plugin_change(workspace_id, skill_id, None)
             .await
+    }
+    pub async fn delete_workspace_skill_policy_with_plugin_change(
+        &self,
+        workspace_id: &str,
+        skill_id: &SkillId,
+        native: Option<&PluginNativeWrite>,
+    ) -> Result<bool> {
+        plugins::validate_native_write_input(native)?;
+        self.run_serialized_write(|| async {
+            let db = self.connection.begin().await?;
+            repositories::plugins::validate_native_write(
+                &db,
+                native,
+                workspace_id,
+                "skill",
+                skill_id.as_str(),
+            )
+            .await?;
+            let removed =
+                skill_workspace_policy::delete_workspace_skill_policy(&db, workspace_id, skill_id)
+                    .await?;
+            if let Some(native) = native {
+                repositories::plugins::publish_native_write(&db, native, "skill", false).await?;
+            }
+            db.commit().await?;
+            Ok(removed)
         })
         .await
     }
@@ -19760,6 +19798,22 @@ impl CrudStore {
         audit_records: &[SkillAuditEventRecord],
         event_timestamp_secs: i64,
     ) -> Result<bool> {
+        self.uninstall_skill_installation_lifecycle_with_plugin_change(
+            expected,
+            audit_records,
+            None,
+            event_timestamp_secs,
+        )
+        .await
+    }
+    pub async fn uninstall_skill_installation_lifecycle_with_plugin_change(
+        &self,
+        expected: &SkillInstallationRecord,
+        audit_records: &[SkillAuditEventRecord],
+        native: Option<&PluginNativeWrite>,
+        event_timestamp_secs: i64,
+    ) -> Result<bool> {
+        plugins::validate_native_write_input(native)?;
         if audit_records.is_empty()
             || audit_records
                 .iter()
@@ -19839,6 +19893,15 @@ impl CrudStore {
                         }
                     }
 
+                    repositories::plugins::validate_native_write(
+                        &transaction,
+                        native,
+                        &expected.scope_key,
+                        "skill",
+                        expected.skill_id.as_str(),
+                    )
+                    .await?;
+
                     skill_workspace_policy::delete_workspace_skill_policy(
                         &transaction,
                         expected.scope_key.as_str(),
@@ -19873,6 +19936,15 @@ impl CrudStore {
                         prepared_audit_records,
                     )
                     .await?;
+                    if let Some(native) = native {
+                        repositories::plugins::publish_native_write(
+                            &transaction,
+                            native,
+                            "skill",
+                            true,
+                        )
+                        .await?;
+                    }
                     Ok(true)
                 }
                 .await;
@@ -20151,6 +20223,28 @@ impl CrudStore {
         ownership: Option<&PluginOwnershipWrite>,
         event_timestamp_secs: i64,
     ) -> Result<String> {
+        self.upsert_mcp_server_installation_with_plugin_native_change(
+            record,
+            audit,
+            ownership,
+            None,
+            event_timestamp_secs,
+        )
+        .await
+    }
+
+    pub async fn upsert_mcp_server_installation_with_plugin_native_change(
+        &self,
+        record: &McpServerInstallationRecord,
+        audit: &McpAuditEventRecord,
+        ownership: Option<&PluginOwnershipWrite>,
+        native: Option<&PluginNativeWrite>,
+        event_timestamp_secs: i64,
+    ) -> Result<String> {
+        plugins::validate_native_write_input(native)?;
+        if native.is_some() && ownership.is_some() {
+            bail!("ambiguous plugin write");
+        }
         let prepared_link =
             ownership.map(|write| repositories::plugins::prepare_link(write, "mcp"));
         self.run_serialized_write(|| async {
@@ -20168,7 +20262,7 @@ impl CrudStore {
                 &record.name,
             )
             .await?;
-            if ownership.is_none() {
+            if ownership.is_none() && native.is_none() {
                 validate_standalone_mcp_name(&record.name, existing.is_some())?;
             }
             let child_id = ownership
@@ -20181,15 +20275,31 @@ impl CrudStore {
             {
                 bail!("owned MCP publication requires reserved ID and workspace scope");
             }
-            repositories::plugins::validate_publication(
-                &transaction,
-                ownership,
-                &record.scope_key,
-                "mcp",
-                child_id,
-                existing.as_ref().map(|row| row.id.as_str()),
-            )
-            .await?;
+            if native.is_some() {
+                if record.scope_kind != "workspace"
+                    || existing.as_ref().map(|row| row.id.as_str()) != Some(child_id)
+                {
+                    bail!("owned native settings cannot adopt an installation");
+                }
+                repositories::plugins::validate_native_write(
+                    &transaction,
+                    native,
+                    &record.scope_key,
+                    "mcp",
+                    child_id,
+                )
+                .await?;
+            } else {
+                repositories::plugins::validate_publication(
+                    &transaction,
+                    ownership,
+                    &record.scope_key,
+                    "mcp",
+                    child_id,
+                    existing.as_ref().map(|row| row.id.as_str()),
+                )
+                .await?;
+            }
             let installation_id = match mcp_server_installation::upsert_mcp_server_installation(
                 &transaction,
                 record,
@@ -20218,6 +20328,10 @@ impl CrudStore {
                     bail!("MCP publication identity changed");
                 }
                 repositories::plugins::publish(&transaction, link).await?;
+            }
+            if let Some(native) = native {
+                repositories::plugins::publish_native_write(&transaction, native, "mcp", false)
+                    .await?;
             }
             transaction
                 .commit()
@@ -20296,6 +20410,16 @@ impl CrudStore {
         record: &McpServerInstallationRecord,
         audit: &McpAuditEventRecord,
     ) -> Result<()> {
+        self.delete_mcp_server_installation_with_plugin_change(record, audit, None)
+            .await
+    }
+    pub async fn delete_mcp_server_installation_with_plugin_change(
+        &self,
+        record: &McpServerInstallationRecord,
+        audit: &McpAuditEventRecord,
+        native: Option<&PluginNativeWrite>,
+    ) -> Result<()> {
+        plugins::validate_native_write_input(native)?;
         let scope_kind = record.scope_kind.clone();
         let scope_key = record.scope_key.clone();
         let name = record.name.clone();
@@ -20316,6 +20440,36 @@ impl CrudStore {
                     .await
                     .context("failed to begin MCP uninstall transaction")?;
 
+                let current = mcp_server_installation::find_mcp_server_installation(
+                    &transaction,
+                    &scope_kind,
+                    &scope_key,
+                    &name,
+                )
+                .await?;
+                if let Some(native) = native {
+                    let current = current.as_ref().context("MCP installation missing")?;
+                    if Some(current.id.as_str()) != server_installation_id.as_deref() {
+                        bail!("MCP uninstall installation identity changed");
+                    }
+                    repositories::plugins::validate_native_write(
+                        &transaction,
+                        Some(native),
+                        &scope_key,
+                        "mcp",
+                        &current.id,
+                    )
+                    .await?;
+                } else if let Some(current) = current {
+                    repositories::plugins::validate_native_write(
+                        &transaction,
+                        None,
+                        &scope_key,
+                        "mcp",
+                        &current.id,
+                    )
+                    .await?;
+                }
                 if let Some(server_installation_id) = server_installation_id.as_deref() {
                     if let Err(error) =
                         mcp_server_catalog_snapshot::delete_mcp_server_catalog_snapshot(
@@ -20348,6 +20502,10 @@ impl CrudStore {
                     return Err(error);
                 }
 
+                if let Some(native) = native {
+                    repositories::plugins::publish_native_write(&transaction, native, "mcp", true)
+                        .await?;
+                }
                 transaction
                     .commit()
                     .await

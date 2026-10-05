@@ -1,7 +1,7 @@
 use crate::{CrudStore, repositories::plugins};
 use anyhow::{Result, bail};
 use pioneer_entity::{plugin_component, plugin_installation};
-pub use plugins::PluginOwnershipWrite;
+pub use plugins::{PluginNativeWrite, PluginOwnershipWrite};
 
 impl CrudStore {
     pub async fn get_plugin_selection(
@@ -76,6 +76,7 @@ impl CrudStore {
                         .ok_or_else(|| anyhow::anyhow!("plugin missing"))?;
                     if !parent.enabled
                         || parent.state != "installed"
+                        || parent.pending_json.is_some()
                         || parent.revision != selected.revision
                     {
                         bail!("plugin changed during preparation");
@@ -256,7 +257,33 @@ impl CrudStore {
         Ok(parent.workspace_id == workspace
             && parent.enabled
             && parent.state == "installed"
+            && parent.pending_json.is_none()
             && link.status == "installed")
+    }
+    /// Native MCP sessions may be recreated during the final reload while
+    /// execution is still fenced by the retained parent pending plan. This
+    /// check is only for process admission, never tool/capability selection.
+    pub async fn plugin_child_runtime_available(
+        &self,
+        child: &str,
+        workspace: &str,
+    ) -> Result<bool> {
+        let Some(link) = plugins::owner(&self.connection, "mcp", child).await? else {
+            return Ok(true);
+        };
+        let Some(parent) = plugins::find(&self.connection, &link.plugin_id).await? else {
+            return Ok(false);
+        };
+        Ok(parent.workspace_id == workspace
+            && parent.enabled
+            && parent.state == "installed"
+            && link.status == "installed")
+    }
+    pub async fn prepare_plugin_reload(&self, id: &str, revision: i64) -> Result<()> {
+        self.run_serialized_write(|| async move {
+            plugins::prepare_reload(&self.connection, id, revision).await
+        })
+        .await
     }
     pub async fn insert_plugin_installation(
         &self,
@@ -384,4 +411,187 @@ fn selection_has_child(
         .children
         .iter()
         .any(|child| child.kind == kind && child.id == id)
+}
+
+impl CrudStore {
+    pub async fn begin_plugin_mutation(
+        &self,
+        workspace: &str,
+        id: &str,
+        revision: i64,
+        state: &str,
+        enabled: bool,
+        pending: &str,
+    ) -> Result<plugin_installation::Model> {
+        if !matches!(state, "updating" | "removing") || pending.len() > 65536 {
+            bail!("invalid plugin mutation");
+        }
+        let _: serde_json::Value = serde_json::from_str(pending)?;
+        self.run_serialized_write(|| async move {
+            plugins::begin_mutation(
+                &self.connection,
+                workspace,
+                id,
+                revision,
+                state,
+                enabled,
+                pending.into(),
+            )
+            .await
+        })
+        .await
+    }
+    pub async fn finish_plugin_mutation(
+        &self,
+        id: &str,
+        revision: i64,
+        state: &str,
+        error: Option<String>,
+    ) -> Result<()> {
+        if !matches!(state, "installed" | "interrupted") {
+            bail!("invalid plugin outcome");
+        }
+        self.run_serialized_write(|| {
+            let error = error.clone();
+            async move { plugins::finish_mutation(&self.connection, id, revision, state, error).await }
+        }).await
+    }
+    pub async fn replace_plugin_pending(
+        &self,
+        id: &str,
+        revision: i64,
+        pending: &str,
+    ) -> Result<()> {
+        if pending.len() > 65536 {
+            bail!("plugin pending too large");
+        }
+        let _: serde_json::Value = serde_json::from_str(pending)?;
+        self.run_serialized_write(|| async move {
+            plugins::replace_pending(&self.connection, id, revision, pending.into()).await
+        })
+        .await
+    }
+    pub async fn delete_plugin_parent(&self, id: &str, revision: i64) -> Result<()> {
+        use sea_orm::TransactionTrait;
+        self.run_serialized_write(|| async move {
+            let db = self.connection.begin().await?;
+            plugins::delete_parent(&db, id, revision).await?;
+            db.commit().await?;
+            Ok(())
+        })
+        .await
+    }
+    pub async fn interrupt_unfinished_plugins(&self) -> Result<()> {
+        use sea_orm::TransactionTrait;
+        // Only the bounded parent-state scan/write runs here. No installer replay.
+        self.run_serialized_write(|| async move {
+            let db = self.connection.begin().await?;
+            plugins::interrupt_unfinished(&db).await?;
+            db.commit().await?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+impl CrudStore {
+    pub async fn plugin_workspace_native_threads(
+        &self,
+        workspace: &str,
+        ids: &[String],
+    ) -> Result<Vec<String>> {
+        if ids.len() > 65536 {
+            bail!("native thread inventory too large");
+        }
+        plugins::workspace_native_threads(&self.connection, workspace, ids).await
+    }
+}
+
+impl CrudStore {
+    /// Restore the still-owned bounded action after settle/reload uncertainty.
+    /// Request cancellation outside this catch leaves the prior closed plan.
+    pub async fn interrupt_plugin_mutation(
+        &self,
+        id: &str,
+        revision: i64,
+        pending: &str,
+        error: &str,
+    ) -> Result<()> {
+        if pending.len() > 65536 {
+            bail!("plugin pending too large");
+        }
+        let _: serde_json::Value = serde_json::from_str(pending)?;
+        self.run_serialized_write(|| async move {
+            plugins::interrupt_mutation(
+                &self.connection,
+                id,
+                revision,
+                pending.into(),
+                error.into(),
+            )
+            .await
+        })
+        .await
+    }
+}
+
+impl CrudStore {
+    pub async fn plugin_graph_stop_candidates(
+        &self,
+        workspace: &str,
+        parent: &str,
+    ) -> Result<Vec<(String, String)>> {
+        plugins::graph_stop_candidates(&self.connection, workspace, parent).await
+    }
+}
+
+pub(crate) fn validate_native_write_input(write: Option<&PluginNativeWrite>) -> Result<()> {
+    if let Some(write) = write {
+        if write.pending_after.len() > 65536 || write.override_fields_json.len() > 4096 {
+            bail!("plugin native write exceeds bounds");
+        }
+        let _: serde_json::Value = serde_json::from_str(&write.pending_after)?;
+        let fields: Vec<String> = serde_json::from_str(&write.override_fields_json)?;
+        if fields.len() > 32
+            || fields.iter().any(|field| {
+                !matches!(
+                    field.as_str(),
+                    "enabled"
+                        | "allow_implicit_invocation"
+                        | "transport"
+                        | "auth"
+                        | "secret_refs"
+                        | "display_name"
+                        | "required"
+                        | "skill_source"
+                )
+            })
+        {
+            bail!("unknown plugin override field");
+        }
+    }
+    Ok(())
+}
+
+impl CrudStore {
+    /// Publish an existing OAuth operation's completed effect; the OAuth
+    /// engine/persistence remains authoritative for credentials and cleanup.
+    pub async fn complete_plugin_native_effect(
+        &self,
+        write: &PluginNativeWrite,
+        workspace: &str,
+        kind: &str,
+    ) -> Result<()> {
+        use sea_orm::TransactionTrait;
+        validate_native_write_input(Some(write))?;
+        self.run_serialized_write(|| async move {
+            let db = self.connection.begin().await?;
+            plugins::validate_native_write(&db, Some(write), workspace, kind, &write.child_id)
+                .await?;
+            plugins::publish_native_write(&db, write, kind, false).await?;
+            db.commit().await?;
+            Ok(())
+        })
+        .await
+    }
 }
