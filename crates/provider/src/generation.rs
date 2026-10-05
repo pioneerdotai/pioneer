@@ -25,6 +25,10 @@ use crate::{
 
 pub(crate) type Fields = Map<String, Value>;
 
+fn native_glm_profile(provider: &str) -> bool {
+    matches!(provider, "glm" | "zai" | "glm-coding" | "zai-coding")
+}
+
 pub(crate) fn selected_off(reasoning: Option<ReasoningConfig>) -> bool {
     matches!(
         reasoning,
@@ -364,7 +368,9 @@ fn chat_fields_with_model(
     };
     let off = selected_off(request.reasoning);
     ensure!(
-        !(provider == "glm" && off && request.model.to_ascii_lowercase().starts_with("glm-5.3")),
+        !(native_glm_profile(provider)
+            && off
+            && request.model.to_ascii_lowercase().starts_with("glm-5.3")),
         "GLM-5.3 has mandatory thinking"
     );
     if model.is_some_and(|m| !m.reasoning) {
@@ -393,7 +399,7 @@ fn chat_fields_with_model(
     });
     let format = if provider == "deepseek" {
         "deepseek"
-    } else if provider == "glm" {
+    } else if native_glm_profile(provider) {
         "zai"
     } else if provider == "siliconflow" {
         "siliconflow"
@@ -465,7 +471,7 @@ fn chat_fields_with_model(
         "zai" => {
             let id = request.model.to_ascii_lowercase();
             ensure!(
-                provider == "glm" || mapped.is_some(),
+                native_glm_profile(provider) || mapped.is_some(),
                 "hosted GLM profile has no verified mapping for the selected control"
             );
             let toggle_family = ["glm-4.5", "glm-4.6", "glm-4.7", "glm-5", "glm-5.2"]
@@ -1015,7 +1021,9 @@ pub(crate) fn protocol_mandatory(provider: &str, id: &str) -> bool {
         "openai" | "azure-openai" | "azure_openai" => {
             id.starts_with("gpt-6-astra") || id.starts_with("gpt-6.1-sol")
         }
-        "glm" => id.to_ascii_lowercase().starts_with("glm-5.3"),
+        "glm" | "zai" | "glm-coding" | "zai-coding" => {
+            id.to_ascii_lowercase().starts_with("glm-5.3")
+        }
         "anthropic" | "bedrock" => claude_id(provider, id).is_some_and(|id| {
             let id = id.replace('.', "-");
             [

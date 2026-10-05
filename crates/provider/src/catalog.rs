@@ -119,8 +119,10 @@ impl ModelCatalog {
             "gemini" => "google",
             "bedrock" => "amazon-bedrock",
             "copilot" => "github-copilot",
-            "glm" => "zai",
             "azure_openai" | "azure-openai" => "azure-openai-responses",
+            "zai" | "glm-global" | "zhipu-global" => "zai-standard",
+            "zai-coding" => "zai",
+            "glm-coding" => "zai-coding-cn",
             other => other,
         };
         self.models.get(provider)?.get(id)

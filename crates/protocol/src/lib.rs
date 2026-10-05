@@ -32,7 +32,10 @@ mod patch_history;
 mod provider;
 mod public_error;
 mod recovery_diagnostic;
-pub use recovery_diagnostic::{RecoveryDiagnostic, RecoveryProviderFailure, RecoveryStopReason};
+pub use recovery_diagnostic::{
+    ProviderErrorReason, ProviderRequestId, RecoveryDiagnostic, RecoveryProviderFailure,
+    RecoveryStopReason,
+};
 mod schema;
 mod settings;
 mod skills;
@@ -230,12 +233,13 @@ pub use mcp::{
     McpAuditEventSummary, McpChangedAction, McpChangedItem, McpChangedNotification,
     McpDiagnosticLevel, McpInstallParams, McpInstallResponse, McpInstallResult,
     McpInstallResultStatus, McpInstallStatus, McpLifecycleAuditSummary, McpListItem, McpListParams,
-    McpListResponse, McpManagementDetails, McpPolicySetParams, McpPolicySetResponse,
-    McpPolicyState, McpPromptCatalogItem, McpResourceCatalogItem, McpResourceTemplateCatalogItem,
-    McpRuntimeState, McpRuntimeStatus, McpScopeKind, McpServerCatalogChangedNotification,
-    McpServerCatalogDetails, McpServerDetailsParams, McpServerDetailsResponse,
-    McpServerHealthDetails, McpServerPolicy, McpServerRestartParams, McpServerRestartResponse,
-    McpServerStatus, McpServerStatusChangedNotification, McpServerStatusItem, McpSourceKind,
+    McpListResponse, McpManagementDetails, McpOAuthAction, McpOAuthNotification, McpOAuthParams,
+    McpOAuthResponse, McpOAuthState, McpPolicySetParams, McpPolicySetResponse, McpPolicyState,
+    McpPromptCatalogItem, McpResourceCatalogItem, McpResourceTemplateCatalogItem, McpRuntimeState,
+    McpRuntimeStatus, McpScopeKind, McpServerCatalogChangedNotification, McpServerCatalogDetails,
+    McpServerDetailsParams, McpServerDetailsResponse, McpServerHealthDetails, McpServerPolicy,
+    McpServerRestartParams, McpServerRestartResponse, McpServerStatus,
+    McpServerStatusChangedNotification, McpServerStatusItem, McpSourceKind,
     McpToolAnnotationSummary, McpToolCatalogItem, McpTransportSummary, McpTurnBindingSummary,
     McpUninstallParams, McpUninstallResponse, McpValidationDiagnostic,
 };

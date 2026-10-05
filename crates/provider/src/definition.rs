@@ -6,6 +6,21 @@ use crate::providers::{
 };
 use anyhow::{Result, bail};
 
+/// RFC 3986 segment encoding for deployment names and AWS model IDs/ARNs.
+/// Unlike form encoding, spaces become %20, `*` is escaped and `~` is retained.
+pub(crate) fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            write!(&mut encoded, "%{byte:02X}").expect("write to String");
+        }
+    }
+    encoded
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProviderEndpointDefinition {
     pub name: &'static str,
@@ -13,6 +28,22 @@ pub struct ProviderEndpointDefinition {
     pub supports_base_url_override: bool,
     /// A locally hosted compatible endpoint can be used without an API key.
     pub base_url_without_key: bool,
+}
+
+impl ProviderEndpointDefinition {
+    /// Retirement applies to this public product, including its saved aliases.
+    /// A private replacement must be configured explicitly as `custom`.
+    pub fn retirement_reason(self) -> Option<&'static str> {
+        match self.name {
+            "yi" => Some(
+                "Yi public API was retired on 2026-09-03. Saved credentials and history are retained; choose another provider explicitly.",
+            ),
+            "hyperbolic" => Some(
+                "Hyperbolic serverless inference API was retired. Saved credentials and history are retained; the GPU rental product is not an automatic replacement.",
+            ),
+            _ => None,
+        }
+    }
 }
 
 impl ProviderEndpointDefinition {
@@ -55,17 +86,21 @@ impl ProviderEndpointDefinition {
 const COMPATIBLE: &[ProviderEndpointDefinition] = &[
     ProviderEndpointDefinition::compatible("groq", "https://api.groq.com/openai/v1", false),
     ProviderEndpointDefinition::compatible("mistral", "https://api.mistral.ai/v1", false),
-    ProviderEndpointDefinition::compatible("xai", "https://api.x.ai", false),
-    ProviderEndpointDefinition::compatible("together", "https://api.together.xyz", false),
+    ProviderEndpointDefinition::compatible("xai", "https://api.x.ai/v1", false),
+    ProviderEndpointDefinition::compatible("together", "https://api.together.ai/v1", false),
     ProviderEndpointDefinition::compatible(
         "fireworks",
         "https://api.fireworks.ai/inference/v1",
         false,
     ),
-    ProviderEndpointDefinition::compatible("novita", "https://api.novita.ai/openai", false),
+    ProviderEndpointDefinition::compatible("novita", "https://api.novita.ai/openai/v1", false),
     ProviderEndpointDefinition::compatible("perplexity", "https://api.perplexity.ai", false),
-    ProviderEndpointDefinition::compatible("cohere", "https://api.cohere.com/compatibility", false),
-    ProviderEndpointDefinition::compatible("venice", "https://api.venice.ai", false),
+    ProviderEndpointDefinition::compatible(
+        "cohere",
+        "https://api.cohere.ai/compatibility/v1",
+        false,
+    ),
+    ProviderEndpointDefinition::compatible("venice", "https://api.venice.ai/api/v1", false),
     ProviderEndpointDefinition::compatible("cerebras", "https://api.cerebras.ai/v1", false),
     ProviderEndpointDefinition::compatible("sambanova", "https://api.sambanova.ai/v1", false),
     ProviderEndpointDefinition::compatible("hyperbolic", "https://api.hyperbolic.xyz/v1", false),
@@ -122,7 +157,9 @@ const COMPATIBLE: &[ProviderEndpointDefinition] = &[
         "https://ark.cn-beijing.volces.com/api/v3",
         false,
     ),
-    ProviderEndpointDefinition::compatible("qianfan", "https://aip.baidubce.com", false),
+    // V2 uses a supplied Bearer API key; the legacy aip host uses a different
+    // RPC/access-token contract and cannot be served by this Chat transport.
+    ProviderEndpointDefinition::compatible("qianfan", "https://qianfan.baidubce.com/v2", false),
     ProviderEndpointDefinition::compatible("lmstudio", "http://localhost:1234/v1", true),
     ProviderEndpointDefinition::compatible("llamacpp", "http://localhost:8080/v1", true),
     ProviderEndpointDefinition::compatible("sglang", "http://localhost:30000/v1", true),
@@ -147,6 +184,9 @@ const SPECIAL: &[ProviderEndpointDefinition] = &[
     ProviderEndpointDefinition::fixed("telnyx", telnyx::BASE_URL, true),
     ProviderEndpointDefinition::fixed("copilot", copilot::BASE_URL, true),
     ProviderEndpointDefinition::fixed("glm", glm::DEFAULT_BASE_URL, true),
+    ProviderEndpointDefinition::fixed("zai", glm::GLOBAL_BASE_URL, true),
+    ProviderEndpointDefinition::fixed("glm-coding", glm::CN_CODING_BASE_URL, true),
+    ProviderEndpointDefinition::fixed("zai-coding", glm::GLOBAL_CODING_BASE_URL, true),
     ProviderEndpointDefinition::without_endpoint("local"),
     ProviderEndpointDefinition::without_endpoint("bedrock"),
     ProviderEndpointDefinition::overridable_without_endpoint("azure-openai"),
@@ -161,7 +201,10 @@ pub fn provider_definition(name: &str) -> Option<ProviderEndpointDefinition> {
     let canonical = match name.as_str() {
         "google" | "google-gemini" => "gemini",
         "github-copilot" => "copilot",
-        "zhipu" | "bigmodel" | "glm-global" | "zhipu-global" | "glm-cn" | "zhipu-cn" => "glm",
+        "zhipu" | "bigmodel" | "glm-cn" | "zhipu-cn" => "glm",
+        "glm-global" | "zhipu-global" | "z.ai" | "z-ai" => "zai",
+        "glm-coding-cn" | "zhipu-coding" | "zai-coding-cn" => "glm-coding",
+        "glm-coding-global" | "zai-coding-plan" => "zai-coding",
         "aws-bedrock" => "bedrock",
         "azure_openai" | "azure" => "azure-openai",
         "grok" => "xai",
@@ -210,6 +253,22 @@ pub fn validate_provider_base_url(provider: &str, value: &str) -> Result<String>
             "API base URL must be an HTTP(S) URL with a host and without credentials, query, or fragment"
         );
     }
+    if definition.name == "qianfan" && parsed.host_str() == Some("aip.baidubce.com") {
+        bail!(
+            "Qianfan legacy aip RPC/access-token API is not supported by this Chat adapter; use the V2 compatible API with its Bearer credentials"
+        );
+    }
+    if definition.name == "azure-openai" {
+        let path = parsed.path().trim_end_matches('/');
+        if path.contains("/openai/deployments/")
+            || path.ends_with("/chat/completions")
+            || path.ends_with("/responses")
+        {
+            bail!(
+                "Azure Chat base URL must be a resource/gateway root or openai/v1 prefix, not a final request URL"
+            );
+        }
+    }
     Ok(value.trim_end_matches('/').to_owned())
 }
 
@@ -219,12 +278,92 @@ pub fn provider_is_available(
     base_url: bool,
     definition: ProviderEndpointDefinition,
 ) -> bool {
-    definition.name == "local" || api_key || proxy || (base_url && definition.base_url_without_key)
+    if definition.name == "bedrock" {
+        // This adapter supports environment SigV4 credentials, including a
+        // session token. A saved generic API key/proxy is not an AWS identity.
+        return crate::providers::BedrockProvider::environment_is_configured();
+    }
+    definition.retirement_reason().is_none()
+        && (definition.name == "local"
+            || api_key
+            || proxy
+            || (base_url && definition.base_url_without_key))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glm_aliases_keep_cn_credentials_separate_from_global_and_coding() {
+        for (alias, canonical, endpoint) in [
+            ("glm", "glm", glm::DEFAULT_BASE_URL),
+            ("zhipu", "glm", glm::DEFAULT_BASE_URL),
+            ("bigmodel", "glm", glm::DEFAULT_BASE_URL),
+            ("glm-cn", "glm", glm::DEFAULT_BASE_URL),
+            ("zhipu-cn", "glm", glm::DEFAULT_BASE_URL),
+            ("glm-global", "zai", glm::GLOBAL_BASE_URL),
+            ("zhipu-global", "zai", glm::GLOBAL_BASE_URL),
+            ("z.ai", "zai", glm::GLOBAL_BASE_URL),
+            ("glm-coding-cn", "glm-coding", glm::CN_CODING_BASE_URL),
+            ("zai-coding-plan", "zai-coding", glm::GLOBAL_CODING_BASE_URL),
+        ] {
+            let profile = provider_definition(alias).unwrap();
+            assert_eq!(profile.name, canonical, "{alias}");
+            assert_eq!(profile.default_base_url, Some(endpoint), "{alias}");
+            assert_eq!(
+                validate_provider_base_url(alias, "https://example.test/private/v7/").unwrap(),
+                "https://example.test/private/v7"
+            );
+        }
+        assert_eq!(provider_definitions().count(), 56);
+    }
+
+    #[test]
+    fn retirement_is_terminal_with_saved_keys_proxy_or_endpoint_override() {
+        for alias in ["yi", "01ai", "lingyiwanwu", "hyperbolic"] {
+            let profile = provider_definition(alias).unwrap();
+            assert!(profile.retirement_reason().unwrap().contains("retired"));
+            assert!(!provider_is_available(true, true, true, profile));
+            // Configuration stays parseable; lifecycle gates operations.
+            assert!(validate_provider_base_url(alias, "https://example.test/v1").is_ok());
+        }
+        for legacy in ["nebius", "anyscale", "ovhcloud", "lepton"] {
+            assert!(
+                provider_definition(legacy)
+                    .unwrap()
+                    .retirement_reason()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn path_segments_encode_reserved_bytes_without_form_encoding() {
+        assert_eq!(encode_path_segment("a b/+?%*~"), "a%20b%2F%2B%3F%25%2A~");
+    }
+
+    #[test]
+    fn incompatible_legacy_qianfan_and_azure_protocol_overrides_are_explicit() {
+        assert!(
+            validate_provider_base_url("baidu", "https://aip.baidubce.com")
+                .unwrap_err()
+                .to_string()
+                .contains("legacy")
+        );
+        assert!(validate_provider_base_url("qianfan", "https://example.test/private/v2/").is_ok());
+        for base in [
+            "https://example.test/openai/v1/responses",
+            "https://example.test/openai/deployments/name/chat/completions",
+        ] {
+            assert!(
+                validate_provider_base_url("azure", base)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("resource/gateway root")
+            );
+        }
+    }
 
     #[test]
     fn metadata_is_available_without_credentials_or_runtime_instances() {

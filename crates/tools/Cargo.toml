@@ -41,7 +41,7 @@ futures-util.workspace = true
 fff-search = "0.11.0"
 globset = "0.4"
 regex = "1"
-jsonschema = { version = "0.29.1", default-features = false }
+jsonschema = { version = "0.58", default-features = false }
 xa11y = { workspace = true, optional = true }
 xcap = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
