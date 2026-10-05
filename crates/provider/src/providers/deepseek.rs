@@ -401,12 +401,15 @@ mod tests {
         state.model = Some("deepseek-v4-flash".into());
         let request = ChatRequest {
             model: "deepseek-v4-flash".to_owned(),
-            messages: vec![ChatMessage::assistant_tool_calls_with_provider_state(
-                None::<String>,
-                None::<String>,
-                calls,
-                Some(state),
-            )],
+            messages: vec![
+                ChatMessage::assistant_tool_calls_with_provider_state(
+                    None::<String>,
+                    None::<String>,
+                    calls,
+                    Some(state),
+                ),
+                ChatMessage::tool_result("call_1", "read_file", "file contents"),
+            ],
             temperature: None,
             max_tokens: None,
             tools: None,
@@ -424,6 +427,7 @@ mod tests {
             "compatible replay must remain byte-for-byte equivalent"
         );
         assert_eq!(wire["messages"][0]["reasoning_content"], "");
+        assert_eq!(wire["messages"][1]["tool_call_id"], "call_1");
     }
 
     #[test]

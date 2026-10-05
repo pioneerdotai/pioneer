@@ -653,6 +653,8 @@ pub(super) fn openrouter(data: &Value) -> Vec<Candidate> {
                 (4096, 4096),
             );
             c.model["name"] = m["name"].clone();
+            // This source's candidates were filtered by supported_parameters.
+            c.tool_calling = Some(has(&m["supported_parameters"], "tools"));
             c.model["reasoning"] = json!(has(&m["supported_parameters"], "reasoning"));
             c.model["input"] = if text(&m["architecture"]["modality"]).contains("image") {
                 json!(["text", "image"])
@@ -714,6 +716,7 @@ pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
                 (4096, 4096),
             );
             c.model["reasoning"] = json!(has(&m["tags"], "reasoning"));
+            c.tool_calling = Some(has(&m["tags"], "tool-use"));
             c.model["input"] = if has(&m["tags"], "vision") {
                 json!(["text", "image"])
             } else {
@@ -734,4 +737,58 @@ pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
             c
         })
         .collect()
+}
+
+/// Capability-only supplement collected before tool-capable list filtering.
+/// No limits/pricing/routes are generated for negative or unknown entries.
+/// Dedicated endpoint listings override models.dev only with explicit evidence.
+pub(super) fn tool_capabilities(snapshot: &SourceSnapshot) -> super::super::ToolCapabilities {
+    let mut result = super::super::ToolCapabilities::new();
+    for (provider, data) in snapshot.sources[SOURCE_URLS[0]]
+        .body
+        .as_object()
+        .into_iter()
+        .flatten()
+    {
+        let provider = super::super::catalog_provider(provider);
+        for (id, model) in data["models"].as_object().into_iter().flatten() {
+            if let Some(supported) = model["tool_call"].as_bool() {
+                result
+                    .entry(provider.clone())
+                    .or_default()
+                    .insert(id.clone(), supported);
+            }
+        }
+    }
+    for (url, provider, field, marker) in [
+        (
+            SOURCE_URLS[1],
+            "openrouter",
+            "supported_parameters",
+            "tools",
+        ),
+        (SOURCE_URLS[2], "vercel-ai-gateway", "tags", "tool-use"),
+    ] {
+        for model in snapshot.sources[url].body["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = model["id"].as_str().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            // Missing/null/malformed metadata is unknown, an explicit valid
+            // list without the capability is negative (including an empty list).
+            let Some(supported) =
+                crate::catalog::tool_support_from_marker_list(&model[field], marker)
+            else {
+                continue;
+            };
+            result
+                .entry(provider.into())
+                .or_default()
+                .insert(id.into(), supported);
+        }
+    }
+    result
 }
