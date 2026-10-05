@@ -436,6 +436,12 @@ fn chat_fields_with_model(
         "deepseek" => {
             let id = request.model.as_str();
             ensure!(
+                provider == "deepseek"
+                    || !off
+                    || compat.is_some_and(|c| c["supportsThinkingToggle"] == true),
+                "hosted DeepSeek profile has no verified thinking off control"
+            );
+            ensure!(
                 provider == "deepseek" || mapped.is_some(),
                 "hosted DeepSeek profile has no verified mapping for the selected control"
             );

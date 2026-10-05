@@ -1755,7 +1755,7 @@ mod tests {
         let err = GeminiProvider::build_request_result(&request)
             .expect_err("xhigh should not be serialized for Gemini thinkingConfig");
 
-        assert!(err.to_string().contains("xhigh"));
+        assert!(err.to_string().to_ascii_lowercase().contains("xhigh"));
     }
 
     #[test]

@@ -51,6 +51,12 @@ pub(super) fn models_dev(data: &Value, nvidia: &Value, strict: bool) -> Result<V
             "https://api.openai.com/v1",
         ),
         (
+            "deepseek",
+            "deepseek",
+            "openai-completions",
+            "https://api.deepseek.com",
+        ),
+        (
             "groq",
             "groq",
             "openai-completions",
@@ -179,6 +185,20 @@ pub(super) fn models_dev(data: &Value, nvidia: &Value, strict: bool) -> Result<V
             }
             candidate.model["name"] =
                 json!(m["name"].as_str().filter(|s| !s.is_empty()).unwrap_or(id));
+            if matches!(provider, "glm" | "zai-standard") {
+                // These are native CN/global GLM endpoints, not hosted relays.
+                // Use the same documented controls as the coding profiles,
+                // with each profile's own updateable source options and limits.
+                // https://docs.z.ai/guides/llm/glm-5.3
+                candidate.compat(json!({"supportsDeveloperRole":false,"thinkingFormat":"zai"}));
+                if let Some(mut map) = effort_map(&m["reasoning_options"]) {
+                    if matches!(id.as_str(), "glm-5.2" | "glm-5.2-highspeed") {
+                        map["off"] = json!("none");
+                    }
+                    candidate.thinking(map);
+                    candidate.compat(json!({"supportsReasoningEffort":true}));
+                }
+            }
             match provider {
                 "amazon-bedrock"=>{if id.starts_with("eu."){candidate.model["baseUrl"]=json!("https://bedrock-runtime.eu-central-1.amazonaws.com");}
 if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":true}));}},

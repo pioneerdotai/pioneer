@@ -1569,6 +1569,73 @@ mod tests {
                         assert!(body.get("reasoning_effort").is_none());
                         assert!(body.get("thinking").is_none());
                         assert_eq!(body["max_tokens"], 1024);
+                    } else {
+                        let error = result.unwrap_err().to_string();
+                        assert!(
+                            error.contains(if crate::generation::selected_off(reasoning) {
+                                "no verified thinking off control"
+                            } else {
+                                "explicitly does not support"
+                            })
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_deepseek_source_profiles_preserve_caps_and_selected_controls() {
+        let catalog = crate::generation::test_catalog(true);
+        let provider = OpenAiCompatibleProvider::new(
+            "deepseek",
+            "https://example.test/v1",
+            "",
+            AuthStyle::Bearer,
+        );
+        for id in ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-flash"] {
+            let model = catalog.model("deepseek", id).unwrap();
+            assert_ne!(model.metadata["compat"]["supportsReasoningEffort"], false);
+            let discovered = crate::generation::test_discovery(&catalog, "deepseek", id);
+            assert!(
+                discovered
+                    .capabilities
+                    .reasoning
+                    .as_ref()
+                    .unwrap()
+                    .effort_options
+                    .contains(&"high".into())
+            );
+            for reasoning in [
+                None,
+                Some(ReasoningConfig::Disabled),
+                Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+            ] {
+                let mut request = crate::generation::test_request(id);
+                request.reasoning = reasoning;
+                for stream in [false, true] {
+                    let body = serde_json::to_value(
+                        provider
+                            .build_chat_request_with_catalog(
+                                request.clone(),
+                                stream,
+                                prepared_for(&provider, &request.messages),
+                                Some(&catalog),
+                            )
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(body["max_tokens"], 1024);
+                    assert_eq!(body["stream"], stream);
+                    if reasoning.is_none() {
+                        assert!(body.get("thinking").is_none());
+                    } else if crate::generation::selected_off(reasoning) {
+                        assert_eq!(body["thinking"]["type"], "disabled");
+                        assert!(body.get("reasoning_effort").is_none());
+                    } else {
+                        assert_eq!(body["thinking"]["type"], "enabled");
+                        assert_eq!(body["reasoning_effort"], "high");
                     }
                 }
             }

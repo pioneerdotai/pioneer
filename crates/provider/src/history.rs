@@ -43,7 +43,10 @@ fn completed_message_indexes(messages: &[ChatMessage]) -> BTreeSet<usize> {
             complete: true,
             ..Default::default()
         });
+        // Protection applies to the whole unit, even when every call has a
+        // result. Such continuation inputs cannot be rewritten portably.
         unit.complete &= origin.complete
+            && !origin.protected_input
             && !origin.unit_id.is_empty()
             && !origin.sources.is_empty()
             && origin.sources.iter().all(|source| {
@@ -516,6 +519,53 @@ mod tests {
             source_aliases: vec![],
             ambiguous_input_aliases: vec![],
         });
+    }
+
+    #[test]
+    fn a_protected_member_keeps_the_whole_foreign_round_incompatible() {
+        let mut assistant = ChatMessage::assistant_tool_calls_with_provider_state(
+            None::<String>,
+            None::<String>,
+            vec![ProviderToolCall {
+                id: "call".into(),
+                name: "inspect".into(),
+                arguments: "{}".into(),
+            }],
+            Some(ProviderReplayState::for_model(
+                "openrouter",
+                "source-model",
+                serde_json::json!({"opaque":"retained"}),
+            )),
+        );
+        let mut result = ChatMessage::tool_result("call", "inspect", "observed");
+        complete(&mut assistant, "round");
+        complete(&mut result, "round");
+        for protected_index in 0..2 {
+            let mut canonical = vec![assistant.clone(), result.clone()];
+            canonical[protected_index]
+                .provenance
+                .as_mut()
+                .unwrap()
+                .protected_input = true;
+            let bytes = serde_json::to_vec(&canonical).unwrap();
+            for reasoning in [
+                None,
+                Some(crate::ReasoningConfig::Disabled),
+                Some(crate::ReasoningConfig::Effort(crate::ReasoningEffort::None)),
+                Some(crate::ReasoningConfig::Effort(crate::ReasoningEffort::High)),
+            ] {
+                let mut request = crate::generation::test_request("deepseek-v4-flash");
+                request.messages = canonical.clone();
+                request.reasoning = reasoning;
+                let error = project_request_for_provider("deepseek", request).unwrap_err();
+                assert!(
+                    error
+                        .downcast_ref::<IncompatibleProviderReplayContinuation>()
+                        .is_some()
+                );
+                assert_eq!(serde_json::to_vec(&canonical).unwrap(), bytes);
+            }
+        }
     }
 
     #[test]

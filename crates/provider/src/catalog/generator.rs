@@ -357,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn entire_pinned_catalog_matches_pi_reference() {
+    fn entire_catalog_matches_pi_reference_with_source_owned_deepseek_profiles() {
         let mut generated = generate(&snapshot(), true).unwrap();
         // Pioneer exposes standard CN/global profiles as well as Pi's coding
         // plans. The supplements are verified against their own source below.
@@ -365,9 +365,18 @@ mod tests {
             assert!(generated.models.remove(supplement).is_some());
             assert!(generated.provenance.remove(supplement).is_some());
         }
-        let reference: Value =
+        // Pi's explicit DeepSeek definitions predate the pinned source snapshot.
+        // Pioneer keeps source limits/modalities/prices authoritative. This
+        // explicit golden overlay covers the full changed provider subtree,
+        // including the source-only alias, without dropping it from comparison.
+        let deepseek: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/catalog/pioneer-deepseek.json"
+        ))
+        .unwrap();
+        let mut reference: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/provenance.json"))
                 .unwrap();
+        reference["deepseek"] = deepseek["provenance"].clone();
         let mut origins = Vec::new();
         for (p, models) in &generated.provenance {
             if reference.get(p).is_none() {
@@ -390,8 +399,9 @@ mod tests {
             origins.join("\n")
         );
         let actual = serde_json::to_value(generated.models).unwrap();
-        let expected: Value =
+        let mut expected: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json")).unwrap();
+        expected["deepseek"] = deepseek["models"].clone();
         // Pioneer-only profiles augment the pinned Pi transformation; compare
         // every original provider in full, and cover additions separately.
         let mut actual: Value = Value::Object(
