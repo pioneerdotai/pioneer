@@ -4065,6 +4065,8 @@ mod tests {
                 mcp_install(
                     &PanicTransport,
                     McpInstallParams {
+                        oauth_callback_unavailable: false,
+                        oauth_redirect_uri: None,
                         workspace_id: "ws_1".to_owned(),
                         config_json: " ".to_owned(),
                         scope_kind: McpScopeKind::Workspace,

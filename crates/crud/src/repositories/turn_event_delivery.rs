@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use pioneer_entity::turn_event_delivery;
 use pioneer_protocol::generate_id;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::ExprTrait;
+use sea_orm::sea_query::{Expr, ExprTrait, Query, SimpleExpr};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect, Set,
@@ -86,8 +86,12 @@ pub async fn claim_due<C: ConnectionTrait>(
         .add(turn_event_delivery::Column::Consumer.eq(consumer.to_owned()))
         .add(turn_event_delivery::Column::Status.eq(DELIVERY_STATUS_DELIVERING))
         .add(turn_event_delivery::Column::ClaimExpiresAt.lte(now));
+    let no_pending_predecessor = no_pending_predecessor();
     let candidates = turn_event_delivery::Entity::find()
         .filter(Condition::any().add(due.clone()).add(expired.clone()))
+        // Apply causal eligibility before LIMIT so a blocked turn's backlog
+        // cannot consume all slots and starve independent turns.
+        .filter(no_pending_predecessor.clone())
         .order_by_asc(turn_event_delivery::Column::TurnId)
         .order_by_asc(turn_event_delivery::Column::Sequence)
         .limit(limit)
@@ -97,21 +101,6 @@ pub async fn claim_due<C: ConnectionTrait>(
 
     let mut claimed = Vec::new();
     for candidate in candidates {
-        let predecessor_pending = turn_event_delivery::Entity::find()
-            .filter(turn_event_delivery::Column::Consumer.eq(consumer.to_owned()))
-            .filter(turn_event_delivery::Column::TurnId.eq(candidate.turn_id.clone()))
-            .filter(turn_event_delivery::Column::Sequence.lt(candidate.sequence))
-            .filter(
-                turn_event_delivery::Column::Status
-                    .is_not_in([DELIVERY_STATUS_DELIVERED, DELIVERY_STATUS_EXHAUSTED]),
-            )
-            .one(db)
-            .await
-            .context("failed to check turn event delivery predecessor")?
-            .is_some();
-        if predecessor_pending {
-            continue;
-        }
         let claim_token = generate_id(DB_ID_LEN);
         let affected = turn_event_delivery::Entity::update_many()
             .col_expr(
@@ -132,6 +121,9 @@ pub async fn claim_due<C: ConnectionTrait>(
             )
             .filter(turn_event_delivery::Column::Id.eq(candidate.id.clone()))
             .filter(Condition::any().add(due.clone()).add(expired.clone()))
+            // Candidate discovery does not replace the claim's state guard.
+            // Revalidate causal eligibility in the same UPDATE as its lease.
+            .filter(no_pending_predecessor.clone())
             .exec(db)
             .await
             .context("failed to claim turn event delivery")?
@@ -148,6 +140,38 @@ pub async fn claim_due<C: ConnectionTrait>(
         }
     }
     Ok(claimed)
+}
+
+fn no_pending_predecessor() -> SimpleExpr {
+    Expr::exists(
+        Query::select()
+            .expr(Expr::val(1_i64))
+            .from_as(turn_event_delivery::Entity, "predecessor")
+            .and_where(
+                Expr::col(("predecessor", turn_event_delivery::Column::Consumer)).eq(Expr::col((
+                    turn_event_delivery::Entity,
+                    turn_event_delivery::Column::Consumer,
+                ))),
+            )
+            .and_where(
+                Expr::col(("predecessor", turn_event_delivery::Column::TurnId)).eq(Expr::col((
+                    turn_event_delivery::Entity,
+                    turn_event_delivery::Column::TurnId,
+                ))),
+            )
+            .and_where(
+                Expr::col(("predecessor", turn_event_delivery::Column::Sequence)).lt(Expr::col((
+                    turn_event_delivery::Entity,
+                    turn_event_delivery::Column::Sequence,
+                ))),
+            )
+            .and_where(
+                Expr::col(("predecessor", turn_event_delivery::Column::Status))
+                    .is_not_in([DELIVERY_STATUS_DELIVERED, DELIVERY_STATUS_EXHAUSTED]),
+            )
+            .to_owned(),
+    )
+    .not()
 }
 
 pub async fn mark_delivered<C: ConnectionTrait>(

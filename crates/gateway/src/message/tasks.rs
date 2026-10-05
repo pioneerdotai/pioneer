@@ -1,11 +1,142 @@
 use super::*;
 use anyhow::{Result, bail};
-use pioneer_crud::TaskRunOccurrenceTerminalizationOutcome;
+use pioneer_crud::{
+    TaskRunOccurrenceClaimDeferral, TaskRunOccurrenceClaimFailure,
+    TaskRunOccurrenceClaimFailurePhase, TaskRunOccurrenceClock,
+    TaskRunOccurrenceTerminalizationOutcome,
+};
 use pioneer_protocol::{
     ItemUpdatedNotification, TaskAttachmentMode, TaskDeliveryStatus, TaskEventPayload,
     TaskGetResponse, TaskRescheduleReason, TaskTriggerKind,
 };
 use serde_json::json;
+
+/// Batch ownership is local to terminal-child reconciliation. Only descriptors
+/// enter this aggregate; TaskStartFailure's private source never does.
+#[derive(Debug, Default)]
+pub(super) struct TaskChildReconciliationFailures {
+    reported: Vec<pioneer_tasks::TaskStartFailureDescriptor>,
+    independent: Vec<String>,
+}
+
+impl TaskChildReconciliationFailures {
+    fn push(&mut self, thread_id: &str, turn_id: &str, mut error: anyhow::Error) {
+        if let Some(failure) = error.downcast_mut::<pioneer_tasks::TaskStartFailure>() {
+            failure.report_in_place();
+            self.reported.push(failure.descriptor().clone());
+        } else {
+            // Preserve the former independent-error diagnostic and retry input.
+            self.independent
+                .push(format!("{thread_id}/{turn_id}: {error:#}"));
+        }
+    }
+
+    pub(super) fn retry_transient_storage_access(&self) -> bool {
+        !self.independent.is_empty()
+            && is_anyhow_sqlite_transient_access(&anyhow::anyhow!(self.independent.join("; ")))
+    }
+
+    pub(super) fn report_worker_failure(&self) {
+        if !self.independent.is_empty() {
+            error!(
+                error = %self.independent.join("; "),
+                "task child terminal reconciler failed"
+            );
+        }
+    }
+}
+
+impl std::fmt::Display for TaskChildReconciliationFailures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "terminal task child reconciliation failed: reported={:?}",
+            self.reported
+        )?;
+        if !self.independent.is_empty() {
+            write!(f, "; {}", self.independent.join("; "))?;
+        }
+        Ok(())
+    }
+}
+
+// Deliberately no source: private typed causes must not become a worker chain.
+impl std::error::Error for TaskChildReconciliationFailures {}
+
+pub(super) fn retry_task_child_reconciliation_error(error: &anyhow::Error) -> bool {
+    if error
+        .downcast_ref::<pioneer_tasks::TaskStartFailure>()
+        .is_some()
+    {
+        return false;
+    }
+    if let Some(batch) = error.downcast_ref::<TaskChildReconciliationFailures>() {
+        return batch.retry_transient_storage_access();
+    }
+    is_anyhow_sqlite_transient_access(error)
+}
+
+pub(super) fn report_task_child_reconciliation_error(mut error: anyhow::Error) {
+    if let Some(batch) = error.downcast_ref::<TaskChildReconciliationFailures>() {
+        batch.report_worker_failure();
+    } else if let Some(failure) = error.downcast_mut::<pioneer_tasks::TaskStartFailure>() {
+        failure.report_in_place();
+    } else {
+        error!(error = %format!("{error:#}"), "task child terminal reconciler failed");
+    }
+}
+
+/// Partial progress survives candidate errors. Only an allowlisted diagnostic
+/// classification of first_error reaches reporting; no IDs or raw errors.
+#[derive(Default)]
+pub(super) struct TaskRunOccurrenceReconcileSummary {
+    pub selected: usize,
+    pub claimed: usize,
+    pub changed: usize,
+    pub lost_claims: usize,
+    pub stale: usize,
+    pub unresolved: usize,
+    pub no_change: usize,
+    pub claim_errors: usize,
+    pub claim_deferrals: usize,
+    pub claim_deferral_conflicts: usize,
+    pub claim_deferral_errors: usize,
+    pub claim_without_snapshot: usize,
+    pub claim_commit_unknown: usize,
+    pub repair_errors: usize,
+    pub storage_errors: usize,
+    pub notification_errors: usize,
+    pub queue_state_errors: usize,
+    // None means unobserved/unknown, never evidence of recovery.
+    pub pending: Option<bool>,
+    pub first_error: Option<anyhow::Error>,
+}
+impl TaskRunOccurrenceReconcileSummary {
+    pub(super) fn record_pending_state(&mut self, result: Result<bool>) {
+        match result {
+            Ok(pending) => self.pending = Some(pending),
+            Err(error) => {
+                self.pending = None;
+                self.queue_state_errors += 1;
+                self.record_error(error);
+            }
+        }
+    }
+    fn record_error(&mut self, error: anyhow::Error) {
+        let storage = super::reconciliation_diagnostics::is_storage_failure(&error);
+        self.storage_errors += usize::from(storage);
+        // A later global storage failure must not be hidden by an earlier poison
+        // candidate. Retain at most one error for typed, allowlisted reporting.
+        if self.first_error.is_none()
+            || (storage
+                && self.first_error.as_ref().is_some_and(|first| {
+                    !super::reconciliation_diagnostics::is_storage_failure(first)
+                }))
+        {
+            self.first_error = Some(error);
+        }
+    }
+}
 
 struct TaskTimelineChangedTarget {
     workspace_id: String,
@@ -15,13 +146,26 @@ struct TaskTimelineChangedTarget {
 }
 
 impl MessageProcessor {
+    pub(super) async fn reconcile_terminal_task_child_turns_with_retry(
+        &self,
+        limit: u64,
+    ) -> Result<usize> {
+        retry_with_backoff(
+            || self.reconcile_terminal_task_child_turns(limit),
+            retry_task_child_reconciliation_error,
+            DEFAULT_LOCK_RETRY_ATTEMPTS,
+            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+        )
+        .await
+    }
+
     pub(super) async fn reconcile_terminal_task_child_turns(&self, limit: u64) -> Result<usize> {
         let turns = self
             .crud_store
             .list_unreconciled_terminal_task_child_turns(limit)
             .await?;
         let mut reconciled = 0usize;
-        let mut errors = Vec::new();
+        let mut errors = TaskChildReconciliationFailures::default();
         for turn in turns {
             let result = match turn.status {
                 TurnStatus::Completed => {
@@ -96,16 +240,11 @@ impl MessageProcessor {
                     reconciled = reconciled.saturating_add(1);
                 }
                 Ok(false) => {}
-                Err(error) => {
-                    errors.push(format!("{}/{}: {error:#}", turn.thread_id, turn.turn_id))
-                }
+                Err(error) => errors.push(&turn.thread_id, &turn.turn_id, error),
             }
         }
-        if !errors.is_empty() {
-            bail!(
-                "terminal task child reconciliation failed: {}",
-                errors.join("; ")
-            );
+        if !errors.reported.is_empty() || !errors.independent.is_empty() {
+            return Err(anyhow::Error::new(errors));
         }
         Ok(reconciled)
     }
@@ -113,35 +252,116 @@ impl MessageProcessor {
     pub(super) async fn reconcile_terminal_task_run_occurrence_turns(
         &self,
         limit: u64,
-    ) -> Result<usize> {
-        let run_ids = self
+    ) -> Result<TaskRunOccurrenceReconcileSummary> {
+        self.reconcile_task_run_occurrences_with_clock(&now_timestamp_secs, limit)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn reconcile_task_run_occurrences_at(
+        &self,
+        now: i64,
+        limit: u64,
+    ) -> Result<TaskRunOccurrenceReconcileSummary> {
+        self.reconcile_task_run_occurrences_with_clock(&|| now, limit)
+            .await
+    }
+
+    pub(super) async fn reconcile_task_run_occurrences_with_clock(
+        &self,
+        clock: &TaskRunOccurrenceClock<'_>,
+        limit: u64,
+    ) -> Result<TaskRunOccurrenceReconcileSummary> {
+        // Exactly one advisory discovery per pass. Every selected candidate
+        // consumes budget, including lost claims and failed preparations.
+        let candidates = self
             .crud_store
-            .list_mismatched_terminal_task_run_occurrence_ids(limit)
+            .discover_task_run_occurrence_reconcile(clock(), limit)
             .await?;
-        let mut reconciled = 0usize;
-        for run_id in run_ids {
-            let Some(run) = self.crud_store.get_task_run(run_id.as_str()).await? else {
-                continue;
-            };
-            match self
-                .mark_task_run_occurrence_turn_terminal(run.id.as_str())
-                .await?
+        let mut summary = TaskRunOccurrenceReconcileSummary {
+            selected: candidates.len(),
+            ..Default::default()
+        };
+        for candidate in candidates {
+            let claim = match self
+                .crud_store
+                .claim_task_run_occurrence_reconcile(&candidate, clock)
+                .await
             {
-                TaskRunOccurrenceTerminalizationOutcome::Changed => {
-                    reconciled = reconciled.saturating_add(1);
+                Ok(Some(claim)) => claim,
+                Ok(None) => {
+                    summary.lost_claims += 1;
+                    continue;
                 }
-                TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent => {}
-                TaskRunOccurrenceTerminalizationOutcome::NotFound => warn!(
-                    run_id = run.id.as_str(),
-                    "TaskRun occurrence reconciliation could not find the canonical occurrence Turn"
-                ),
-                TaskRunOccurrenceTerminalizationOutcome::InvalidBinding => warn!(
-                    run_id = run.id.as_str(),
-                    "TaskRun occurrence reconciliation rejected a non-task_run canonical Turn binding"
-                ),
+                Err(error) => {
+                    summary.claim_errors += 1;
+                    match error.downcast::<TaskRunOccurrenceClaimFailure>() {
+                        Ok(failure) => {
+                            summary.claim_commit_unknown += usize::from(
+                                failure.phase
+                                    == TaskRunOccurrenceClaimFailurePhase::CommitOutcomeUnknown,
+                            );
+                            match failure.deferral {
+                                TaskRunOccurrenceClaimDeferral::Deferred => {
+                                    summary.claim_deferrals += 1
+                                }
+                                TaskRunOccurrenceClaimDeferral::StateChanged => {
+                                    summary.claim_deferral_conflicts += 1
+                                }
+                                TaskRunOccurrenceClaimDeferral::Failed => {
+                                    summary.claim_deferral_errors += 1
+                                }
+                                TaskRunOccurrenceClaimDeferral::NoSnapshot => {
+                                    summary.claim_without_snapshot += 1
+                                }
+                            }
+                            summary.record_error(failure.error);
+                            if let Some(error) = failure.deferral_error {
+                                summary.record_error(error);
+                            }
+                        }
+                        Err(error) => summary.record_error(error),
+                    }
+                    continue;
+                }
+            };
+            summary.claimed += 1;
+            match self
+                .crud_store
+                .reconcile_claimed_task_run_occurrence(&claim, clock())
+                .await
+            {
+                Ok(TaskRunOccurrenceTerminalizationOutcome::Changed) => {
+                    summary.changed += 1;
+                    if self
+                        .notify_task_run_occurrence_terminal(&claim.run_id)
+                        .await
+                        .is_err()
+                    {
+                        summary.notification_errors += 1;
+                    }
+                }
+                Ok(TaskRunOccurrenceTerminalizationOutcome::StaleClaim) => summary.stale += 1,
+                Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound) => summary.unresolved += 1,
+                Ok(
+                    TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent
+                    | TaskRunOccurrenceTerminalizationOutcome::InvalidBinding,
+                ) => summary.no_change += 1,
+                Err(error) => {
+                    summary.repair_errors += 1;
+                    summary.record_error(error);
+                }
             }
         }
-        Ok(reconciled)
+        // LIMIT 1 service-table probe, not due discovery or a queue COUNT.
+        // A read failure remains visible in the partial summary and cannot
+        // turn an unknown queue state into recovery.
+        summary.record_pending_state(
+            self.crud_store
+                .has_pending_task_run_occurrence_reconcile()
+                .await,
+        );
+        Ok(summary)
     }
 
     pub(super) async fn emit_task_event(
@@ -1094,41 +1314,28 @@ impl MessageProcessor {
             return Ok(outcome);
         }
 
-        // Durable CAS is authoritative. Subscriber fan-out is deliberately
-        // best-effort and cannot turn an already committed reconciliation into
-        // an apparent failure that would be retried and counted again.
-        let Some((parent_thread_id, _workspace_id)) =
-            (match self.crud_store.get_turn_location(run_id).await {
-                Ok(location) => location,
-                Err(error) => {
-                    warn!(
-                        run_id,
-                        error = %format!("{error:#}"),
-                        "failed to locate reconciled TaskRun occurrence for subscriber fan-out"
-                    );
-                    None
-                }
-            })
-        else {
-            return Ok(outcome);
-        };
-        let Some((workspace_id, turn)) = (match self
-            .crud_store
-            .get_turn(parent_thread_id.as_str(), run_id)
+        // Commit is authoritative; fanout failure cannot retry a domain change.
+        if self
+            .notify_task_run_occurrence_terminal(run_id)
             .await
+            .is_err()
         {
-            Ok(turn) => turn,
-            Err(error) => {
-                warn!(
-                    run_id,
-                    thread_id = parent_thread_id.as_str(),
-                    error = %format!("{error:#}"),
-                    "failed to load reconciled TaskRun occurrence for subscriber fan-out"
-                );
-                None
-            }
-        }) else {
-            return Ok(outcome);
+            warn!(
+                cause = "notification",
+                "TaskRun occurrence subscriber fanout failed after commit"
+            );
+        }
+        Ok(outcome)
+    }
+
+    pub(super) async fn notify_task_run_occurrence_terminal(&self, run_id: &str) -> Result<()> {
+        let Some((parent_thread_id, _)) = self.crud_store.get_turn_location(run_id).await? else {
+            return Ok(());
+        };
+        let Some((workspace_id, turn)) =
+            self.crud_store.get_turn(&parent_thread_id, run_id).await?
+        else {
+            return Ok(());
         };
 
         match turn.status {
@@ -1191,11 +1398,11 @@ impl MessageProcessor {
                 .await;
             }
             TurnStatus::InProgress => warn!(
-                run_id,
-                "TaskRun occurrence remained in_progress after terminal CAS"
+                cause = "changed_again",
+                "TaskRun occurrence changed before subscriber fanout"
             ),
         }
-        Ok(outcome)
+        Ok(())
     }
 }
 
@@ -1280,5 +1487,54 @@ async fn task_delivery_child_lineage(
             );
             (None, None)
         }
+    }
+}
+
+#[cfg(test)]
+mod task_child_failure_tests {
+    use super::*;
+    use pioneer_tasks::{TaskStartCause, TaskStartFailure, TaskStartStage};
+
+    #[test]
+    fn aggregate_owns_only_safe_reported_descriptors_and_preserves_independent_retry_input() {
+        let (_, events) = crate::public_error::test_support::capture_events(|| {
+            let mut batch = TaskChildReconciliationFailures::default();
+            // A typed expected refusal cannot be reclassified from the Context.
+            batch.push(
+                "PRIVATE_THREAD",
+                "PRIVATE_TURN",
+                anyhow::Error::new(
+                    TaskStartFailure::new(TaskStartStage::CliAdmission, TaskStartCause::Policy)
+                        .with_correlation_id("existing-correlation".to_owned()),
+                )
+                .context("PRIVATE_SQL_PATH_HISTORY_SECRET unable to open database file"),
+            );
+            assert!(!batch.retry_transient_storage_access());
+            let display = format!("{batch}");
+            let debug = format!("{batch:?}");
+            assert!(!display.contains("PRIVATE_"));
+            assert!(!debug.contains("PRIVATE_"));
+            assert!(std::error::Error::source(&batch).is_none());
+            assert_eq!(
+                batch.reported[0].correlation_id.as_deref(),
+                Some("existing-correlation")
+            );
+            batch.report_worker_failure();
+            // The independent legacy storage failure still drives its former
+            // predicate and retains a separate worker ERROR in a mixed batch.
+            batch.push(
+                "independent-thread",
+                "independent-turn",
+                anyhow::anyhow!("unable to open database file"),
+            );
+            assert!(batch.retry_transient_storage_access());
+            batch.report_worker_failure();
+        });
+        assert_eq!(
+            events.len(),
+            1,
+            "only the independent failure creates ERROR"
+        );
+        assert!(!serde_json::to_string(&events).unwrap().contains("PRIVATE_"));
     }
 }

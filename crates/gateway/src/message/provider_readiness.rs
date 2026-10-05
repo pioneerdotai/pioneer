@@ -980,6 +980,11 @@ impl MessageProcessor {
         workspace_id: &str,
     ) -> anyhow::Result<BTreeSet<String>> {
         let mut provider_names = BTreeSet::from(["local".to_owned()]);
+        if pioneer_provider::provider_definition("bedrock").is_some_and(|definition| {
+            pioneer_provider::provider_is_available(false, false, false, definition)
+        }) {
+            provider_names.insert("bedrock".to_owned());
+        }
         provider_names.extend(
             self.gateway_secrets
                 .list_configured_workspace_provider_names(workspace_id)?,
@@ -1001,6 +1006,12 @@ impl MessageProcessor {
                 })
                 .map(|(provider, _)| provider),
         );
+        // Retired public products are terminally unavailable, not transient
+        // warm-up failures to retry. Saved secrets remain in the settings list.
+        provider_names.retain(|name| {
+            pioneer_provider::provider_definition(name)
+                .is_none_or(|definition| definition.retirement_reason().is_none())
+        });
         Ok(provider_names)
     }
 

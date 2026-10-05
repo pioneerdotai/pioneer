@@ -77,6 +77,16 @@ pub(crate) struct ProviderSecretWorkspaceMigrationReport {
 }
 
 impl GatewaySecrets {
+    pub(crate) fn mcp_oauth_persistence(&self) -> pioneer_mcp_oauth::OAuthPersistence {
+        pioneer_mcp_oauth::OAuthPersistence::new(
+            self.store.clone(),
+            self.auth_key_initialization_lock_path
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(|p| p.join("mcp-oauth-locks")),
+        )
+    }
+
     pub(crate) fn open(runtime_home: &Path) -> Result<Self> {
         let store = DbKeyStore::open(DbKeyStoreConfig::for_runtime_home(runtime_home))
             .context("failed to open gateway keystore")?;

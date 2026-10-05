@@ -45,7 +45,10 @@ impl GatewayEventRoute {
             | CLIRuntimeRequestResolved(_)
             | TurnPermissionRequestOpened(_)
             | TurnPermissionRequestResolved(_) => Self::PendingRequest,
-            McpChanged(_) | McpServerStatusChanged(_) | McpServerCatalogChanged(_) => Self::Mcp,
+            McpOAuthChanged(_)
+            | McpChanged(_)
+            | McpServerStatusChanged(_)
+            | McpServerCatalogChanged(_) => Self::Mcp,
             SkillsChanged(_) | SkillsUploadChunkAck(_) => Self::Skills,
             TaskCreated(_)
             | TaskScheduled(_)

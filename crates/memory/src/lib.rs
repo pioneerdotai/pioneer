@@ -7,6 +7,11 @@ mod debug;
 mod extractor_ontology;
 pub mod hooks;
 mod lifecycle;
+mod manifest_failure;
+pub use manifest_failure::{
+    MemoryManifestFailure, MemoryManifestFailureClass, MemoryManifestFailureStage,
+    is_invalid_stored_memory_data,
+};
 mod memvid;
 mod ownership_route;
 mod policy;

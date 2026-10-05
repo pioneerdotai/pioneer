@@ -5479,6 +5479,8 @@ impl MessageProcessor {
                     "runtime:provider_failure".to_owned(),
                     pioneer_protocol::TurnItemType::SystemEvent,
                     pioneer_protocol::ProviderFailureDetails {
+                        error_reason: None,
+                        request_id: None,
                         provider: turn_binding.runtime_kind.clone(),
                         model: turn_binding
                             .model
@@ -8825,6 +8827,22 @@ impl MessageProcessor {
             }
             None => anyhow::bail!("Pioneer turn `{}` is missing", binding.turn_id),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn cleanup_completed_cli_task_fixture(&self, turn_id: &str) {
+        let binding = self
+            .crud_store
+            .get_cli_runtime_turn_binding(turn_id)
+            .await
+            .unwrap()
+            .expect("completed CLI fixture must have a native binding");
+        self.cleanup_cli_runtime_terminal_turn_status(
+            &binding,
+            TurnStatus::Completed,
+            "completed CLI task fixture",
+        )
+        .await;
     }
 
     pub(super) async fn cleanup_cli_runtime_terminal_turn_status(

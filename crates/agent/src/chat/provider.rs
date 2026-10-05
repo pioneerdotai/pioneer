@@ -149,22 +149,28 @@ pub(super) async fn request_agent_round(
         let model_name = request.model.clone();
 
         let target = FailureTarget::new(thinking_item_id, TurnItemType::Reasoning);
-        let mut stream = {
+        let pioneer_provider::ProviderStream {
+            mut stream,
+            diagnostics,
+        } = {
             let _startup_part = pioneer_observability::turn_startup::stage(
                 turn_id,
                 pioneer_observability::turn_startup::Stage::ProviderConnect,
             );
-            provider.stream_chat(request).await.map_err(|error| {
-                adapter_error_for_target(
-                    target,
-                    provider.as_ref(),
-                    model_name.as_str(),
-                    ProviderTransportKind::Stream,
-                    ProviderFailureStage::Connect,
-                    "provider stream error",
-                    &error,
-                )
-            })?
+            provider
+                .stream_chat_with_diagnostics(request)
+                .await
+                .map_err(|error| {
+                    adapter_error_for_target(
+                        target,
+                        provider.as_ref(),
+                        model_name.as_str(),
+                        ProviderTransportKind::Stream,
+                        ProviderFailureStage::Connect,
+                        "provider stream error",
+                        &error,
+                    )
+                })?
         };
 
         let mut full_text = String::new();
@@ -180,6 +186,7 @@ pub(super) async fn request_agent_round(
             while let Some(mut chunk) = read_next_stream_chunk(
                 &mut stream,
                 &mut seen_any_chunk,
+                &diagnostics,
                 target,
                 provider,
                 model_name.as_str(),
@@ -427,22 +434,28 @@ pub(super) async fn stream_provider_response(
     let model_name = request.model.clone();
 
     let connect_target = FailureTarget::new(thinking_item_id, TurnItemType::Reasoning);
-    let mut stream = {
+    let pioneer_provider::ProviderStream {
+        mut stream,
+        diagnostics,
+    } = {
         let _startup_part = pioneer_observability::turn_startup::stage(
             turn_id,
             pioneer_observability::turn_startup::Stage::ProviderConnect,
         );
-        provider.stream_chat(request).await.map_err(|error| {
-            adapter_error_for_target(
-                connect_target,
-                provider.as_ref(),
-                model_name.as_str(),
-                ProviderTransportKind::Stream,
-                ProviderFailureStage::Connect,
-                "provider stream error",
-                &error,
-            )
-        })?
+        provider
+            .stream_chat_with_diagnostics(request)
+            .await
+            .map_err(|error| {
+                adapter_error_for_target(
+                    connect_target,
+                    provider.as_ref(),
+                    model_name.as_str(),
+                    ProviderTransportKind::Stream,
+                    ProviderFailureStage::Connect,
+                    "provider stream error",
+                    &error,
+                )
+            })?
     };
 
     let mut full_text = String::new();
@@ -459,6 +472,7 @@ pub(super) async fn stream_provider_response(
         while let Some(chunk) = read_next_stream_chunk(
             &mut stream,
             &mut seen_any_chunk,
+            &diagnostics,
             response_stream_target(message_started, thinking_item_id, message_item_id),
             provider,
             model_name.as_str(),
@@ -933,24 +947,6 @@ fn response_stream_target<'a>(
     }
 }
 
-fn stream_error_for_target(
-    target: FailureTarget<'_>,
-    provider: &str,
-    model: &str,
-    stage: ProviderFailureStage,
-    error_message: String,
-) -> ChatTurnError {
-    provider_failure_error(
-        target.item_id,
-        target.item_type,
-        provider,
-        model,
-        ProviderTransportKind::Stream,
-        stage,
-        error_message,
-    )
-}
-
 fn adapter_error_for_target(
     target: FailureTarget<'_>,
     provider: &dyn Provider,
@@ -1196,6 +1192,7 @@ fn should_replace_tool_arguments(current: &str, next: &str) -> bool {
 async fn read_next_stream_chunk<S>(
     stream: &mut S,
     seen_any_chunk: &mut bool,
+    diagnostics: &pioneer_provider::ProviderStreamDiagnostics,
     target: FailureTarget<'_>,
     provider: &Arc<dyn Provider>,
     model_name: &str,
@@ -1217,12 +1214,18 @@ where
     };
 
     let next_chunk = timeout(wait, stream.next()).await.map_err(|_| {
-        stream_error_for_target(
-            target,
+        let mut classification =
+            ProviderFailureClassification::new(ProviderFailureClass::StreamStall);
+        classification.request_id = diagnostics.request_id();
+        provider_failure_error_with_classification(
+            target.item_id,
+            target.item_type,
             provider.name(),
             model_name,
+            ProviderTransportKind::Stream,
             stage,
             "stream stall: chunk timeout exceeded".to_owned(),
+            Some(classification),
         )
     })?;
 
@@ -1247,6 +1250,7 @@ where
     Ok(Some(chunk))
 }
 
+#[cfg(test)]
 pub(super) fn provider_failure_error(
     item_id: &str,
     item_type: TurnItemType,
@@ -1278,6 +1282,10 @@ fn provider_failure_error_with_classification(
     error_message: String,
     classification: Option<ProviderFailureClassification>,
 ) -> ChatTurnError {
+    let error_reason = classification.as_ref().and_then(|value| value.error_reason);
+    let request_id = classification
+        .as_ref()
+        .and_then(|value| value.request_id.clone());
     let lower = error_message.to_ascii_lowercase();
     let inferred_http_status = extract_http_status(error_message.as_str());
     let inferred_retry_after_ms = extract_retry_after_ms(lower.as_str());
@@ -1303,6 +1311,8 @@ fn provider_failure_error_with_classification(
         item_id: item_id.to_owned(),
         item_type,
         failure: ProviderFailureDetails {
+            error_reason,
+            request_id,
             provider: provider.to_owned(),
             model: model.to_owned(),
             transport,
@@ -1372,33 +1382,170 @@ mod tests {
         message: &'static str,
         stream_request: bool,
     ) -> ProviderFailureDetails {
+        failure_from_overridden_endpoint_body(provider_name, status, message, stream_request, None)
+            .await
+    }
+
+    async fn failure_from_overridden_endpoint_body(
+        provider_name: &'static str,
+        status: u16,
+        message: &'static str,
+        stream_request: bool,
+        response_body: Option<String>,
+    ) -> ProviderFailureDetails {
+        failure_from_local_endpoint(
+            provider_name,
+            status,
+            message,
+            stream_request,
+            response_body,
+            true,
+            "",
+            false,
+        )
+        .await
+    }
+
+    // Injected adapter fixtures use the required authority wrapper without
+    // custom-endpoint redaction masking leaks in standard diagnostics.
+    async fn failure_from_local_endpoint(
+        provider_name: &'static str,
+        status: u16,
+        message: &'static str,
+        stream_request: bool,
+        response_body: Option<String>,
+        redacted: bool,
+        headers: &'static str,
+        truncated_transport: bool,
+    ) -> ProviderFailureDetails {
+        failure_from_local_response(
+            provider_name,
+            status,
+            message,
+            stream_request,
+            response_body.map(String::into_bytes),
+            redacted,
+            headers,
+            truncated_transport,
+        )
+        .await
+    }
+
+    async fn failure_from_local_response(
+        provider_name: &'static str,
+        status: u16,
+        message: &'static str,
+        stream_request: bool,
+        response_body: Option<Vec<u8>>,
+        redacted: bool,
+        headers: &'static str,
+        truncated_transport: bool,
+    ) -> ProviderFailureDetails {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            failure_from_local_response_inner(
+                provider_name,
+                status,
+                message,
+                stream_request,
+                response_body,
+                redacted,
+                headers,
+                truncated_transport,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "local provider failure fixture exceeded its deadline: provider={provider_name}, status={status}, stream={stream_request}, redacted={redacted}, truncated={truncated_transport}"
+            )
+        })
+    }
+
+    async fn failure_from_local_response_inner(
+        provider_name: &'static str,
+        status: u16,
+        message: &'static str,
+        stream_request: bool,
+        response_body: Option<Vec<u8>>,
+        redacted: bool,
+        headers: &'static str,
+        truncated_transport: bool,
+    ) -> ProviderFailureDetails {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_address = listener.local_addr().unwrap();
         let secret = "override-private-token";
         let url = format!("http://{}/{secret}/v1", listener.local_addr().unwrap());
         let echoed_url = url.clone();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 8192];
-            stream.read(&mut request).await.unwrap();
-            let body = serde_json::json!({
-                "error": {"message": format!("{message} at {echoed_url}")}
-            })
-            .to_string();
+            // Read the complete request before closing the connection. Closing
+            // with unread request bytes can reset the socket on Linux, obscuring
+            // the response failure this fixture is intended to exercise.
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0u8; 2048];
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert!(count > 0, "fixture request ended before its body");
+                assert!(request.len() + count <= 8192, "fixture request too large");
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(start) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let header = std::str::from_utf8(&request[..start]).unwrap();
+                    let length = header
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .expect("fixture request Content-Length");
+                    if request.len() >= start + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let body = response_body.unwrap_or_else(|| {
+                serde_json::json!({
+                    "error": {"message": format!("{message} at {echoed_url}")}
+                })
+                .to_string()
+                .into_bytes()
+            });
             stream.write_all(format!(
-                "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
+                "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n",
+                body.len() + usize::from(truncated_transport) * 100
             ).as_bytes()).await.unwrap();
+            // A bounded reader can close immediately after seeing Content-Length.
+            let _ = stream.write_all(&body).await;
         });
         let registry = pioneer_provider::ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
             |_, _| Ok("key".into()), |_, _| Ok(None),
             move |_, _| Ok(Some(url.clone())), ProviderTimeoutPolicy::default(),
         );
-        let provider = registry
-            .get_or_create_for_workspace("fixture-workspace", provider_name)
-            .unwrap();
+        let provider: Arc<dyn Provider> = if redacted {
+            registry
+                .get_or_create_for_workspace("fixture-workspace", provider_name)
+                .unwrap()
+        } else {
+            assert_eq!(provider_name, "openrouter");
+            // A raw adapter lacks the authority scope needed during input
+            // preparation and would fail before connecting to the fixture.
+            // Injecting it supplies that scope while leaving redaction disabled.
+            pioneer_provider::ProviderRegistry::with_provider(
+                "openrouter",
+                Arc::new(
+                    pioneer_provider::providers::OpenRouterProvider::with_base_url(
+                        "key",
+                        format!("http://{}/v1", listener_address),
+                    ),
+                ),
+            )
+            .get_or_create("openrouter")
+            .unwrap()
+        };
         let request = ChatRequest {
             model: "fixture".into(),
             messages: vec![pioneer_provider::ChatMessage::user("hello")],
@@ -1411,11 +1558,31 @@ mod tests {
             compiled_prompt: None,
         };
         let error = if stream_request {
-            provider.stream_chat(request).await.err().unwrap()
+            match provider.stream_chat(request).await {
+                Err(error) => error,
+                Ok(mut stream) => {
+                    use futures_util::StreamExt;
+                    loop {
+                        if let Err(error) = stream.next().await.expect("error event expected") {
+                            break error;
+                        }
+                    }
+                }
+            }
         } else {
             provider.chat(request).await.err().unwrap()
         };
         server.await.unwrap();
+        assert!(
+            error
+                .chain()
+                .skip(1)
+                .all(|cause| { cause.is::<pioneer_provider::failure::ProviderStreamIncomplete>() })
+        );
+        assert!(!error.chain().any(
+            |cause| cause.is::<std::string::FromUtf8Error>() || cause.is::<serde_json::Error>()
+        ));
+        assert!(!format!("{error:#?}").contains("private_fixture"));
         assert!(!format!("{error:#?}").contains(secret));
         assert!(
             !error
@@ -1431,7 +1598,11 @@ mod tests {
             } else {
                 ProviderTransportKind::NonStream
             },
-            ProviderFailureStage::Connect,
+            if status == 200 && stream_request {
+                ProviderFailureStage::MidStream
+            } else {
+                ProviderFailureStage::Connect
+            },
             "provider request failed",
             &error,
         ) else {
@@ -1439,6 +1610,527 @@ mod tests {
         };
         assert!(!serde_json::to_string(&failure).unwrap().contains(secret));
         failure
+    }
+
+    #[tokio::test]
+    async fn openrouter_agent_deadlines_keep_request_owned_ids_without_progress_chunks() {
+        use pioneer_protocol::RecoveryDiagnostic;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for agent_round in [false, true] {
+            for custom_endpoint in [false, true] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}/v1", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    let mut connections = tokio::task::JoinSet::new();
+                    for _ in 0..4 {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        connections.spawn(async move {
+                            let mut request = Vec::new();
+                            let model = loop {
+                                let mut buffer = [0; 2048];
+                                let count = socket.read(&mut buffer).await.unwrap();
+                                assert!(count > 0 && request.len() + count <= 8192);
+                                request.extend_from_slice(&buffer[..count]);
+                                if let Some(start) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                                    if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&request[start + 4..]) {
+                                        break body["model"].as_str().unwrap().to_owned();
+                                    }
+                                }
+                            };
+                            let header = if model == "none" { "" } else { "X-Generation-Id: gen-header\r\n" };
+                            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 1000000\r\n{header}\r\n").as_bytes()).await.unwrap();
+                            if model == "body" {
+                                socket.write_all(b"data: {\"id\":\"gen-body\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n").await.unwrap();
+                            } else if model == "id_only" {
+                                socket.write_all(b"data: {\"id\":\"gen-id_only\",\"choices\":[]}\n\ndata: {\"id\":\"https://private_fixture\",\"choices\":[]}\n\n").await.unwrap();
+                            }
+                            // Stay open until the agent deadline cancels this request.
+                            let mut buffer = [0; 1];
+                            let _ = socket.read(&mut buffer).await;
+                        });
+                    }
+                    while let Some(result) = connections.join_next().await {
+                        result.unwrap();
+                    }
+                });
+                let mut policy = ProviderTimeoutPolicy::default();
+                policy.first_chunk_timeout = std::time::Duration::from_millis(500);
+                policy.inter_chunk_idle_timeout = std::time::Duration::from_millis(100);
+                let registry = if custom_endpoint {
+                    pioneer_provider::ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+                        |_, _| Ok("key".into()), |_, _| Ok(None),
+                        move |_, _| Ok(Some(url.clone())), policy,
+                    )
+                } else {
+                    // Exercise the authority wrapper with its standard-endpoint
+                    // behavior as well as the custom-endpoint redaction above.
+                    pioneer_provider::ProviderRegistry::with_provider("openrouter",
+                        Arc::new(pioneer_provider::providers::OpenRouterProvider::with_base_url_and_timeout_policy("key", url, policy)))
+                };
+                let provider = registry
+                    .get_or_create_for_workspace("fixture", "openrouter")
+                    .unwrap();
+                // Same provider, concurrent requests, including a request with no ID.
+                let calls = ["header", "body", "id_only", "none"]
+                    .into_iter()
+                    .map(|model| {
+                        let provider = provider.clone();
+                        async move {
+                            let hub = AgentEventHub::new();
+                            let mut events = hub.take_durable_receiver().await.unwrap();
+                            let acknowledger = tokio::spawn(async move {
+                                while events.recv().await.is_some() {
+                                    events.acknowledge_last(Ok(()));
+                                }
+                            });
+                            let request = ChatRequest {
+                                model: model.to_owned(),
+                                messages: vec![pioneer_provider::ChatMessage::user("hello")],
+                                temperature: None,
+                                max_tokens: None,
+                                tools: None,
+                                tool_choice: None,
+                                parallel_tool_calls: None,
+                                reasoning: None,
+                                compiled_prompt: None,
+                            };
+                            let result = if agent_round {
+                                request_agent_round(
+                                    &provider, request, "ws", "thread", model, "thinking", false,
+                                    policy, &hub,
+                                )
+                                .await
+                                .map(|_| ())
+                            } else {
+                                stream_provider_response(
+                                    &provider, request, "ws", "thread", model, "thinking",
+                                    "message", policy, &hub,
+                                )
+                                .await
+                                .map(|_| ())
+                            };
+                            acknowledger.abort();
+                            let _ = acknowledger.await;
+                            let Err(ChatTurnError::ProviderFailure { failure, .. }) = result else {
+                                panic!("agent timeout expected");
+                            };
+                            assert_eq!(failure.class, ProviderFailureClass::StreamStall);
+                            assert_eq!(
+                                failure.stage,
+                                if model == "body" {
+                                    ProviderFailureStage::MidStream
+                                } else {
+                                    ProviderFailureStage::FirstChunk
+                                }
+                            );
+                            assert_eq!(failure.transport, ProviderTransportKind::Stream);
+                            assert_eq!(failure.http_status, None);
+                            assert!(failure.error_reason.is_none());
+                            assert!(failure.is_recoverable_hint);
+                            let expected = match model {
+                                "header" => Some("gen-header"),
+                                "body" => Some("gen-body"),
+                                "id_only" => Some("gen-id_only"),
+                                _ => None,
+                            };
+                            let diagnostic = RecoveryDiagnostic::provider(&failure);
+                            assert_eq!(
+                                diagnostic
+                                    .last_failure
+                                    .as_ref()
+                                    .unwrap()
+                                    .request_id
+                                    .clone()
+                                    .map(String::from)
+                                    .as_deref(),
+                                expected
+                            );
+                            if let Some(id) = expected {
+                                assert!(!diagnostic.public_message().contains(id));
+                            }
+                            assert!(
+                                !serde_json::to_string(&failure)
+                                    .unwrap()
+                                    .contains("private_fixture")
+                            );
+                        }
+                    });
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    futures_util::future::join_all(calls),
+                )
+                .await
+                .unwrap();
+                server.abort();
+                let _ = server.await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openrouter_post_header_failures_keep_facts_and_discard_owned_response_bytes() {
+        use pioneer_protocol::RecoveryDiagnostic;
+        for redacted in [false, true] {
+            for (body, truncated, expected) in [
+                (
+                    vec![b'x'; 16 * 1024 + 1],
+                    false,
+                    ProviderFailureClass::Provider5xx,
+                ),
+                (
+                    b"private_fixture incomplete response".to_vec(),
+                    true,
+                    if redacted {
+                        ProviderFailureClass::NetworkTransient
+                    } else {
+                        ProviderFailureClass::Unknown
+                    },
+                ),
+                (
+                    [b"private_fixture ".as_slice(), &[0xff]].concat(),
+                    false,
+                    ProviderFailureClass::Unknown,
+                ),
+            ] {
+                let failure = failure_from_local_response(
+                    "openrouter",
+                    502,
+                    "",
+                    false,
+                    Some(body),
+                    redacted,
+                    "X-Generation-Id: gen-header\r\nRetry-After: 3\r\n",
+                    truncated,
+                )
+                .await;
+                assert_eq!(failure.class, expected);
+                assert_eq!(failure.http_status, Some(502));
+                assert_eq!(failure.retry_after_ms, Some(3000));
+                assert!(failure.error_reason.is_none());
+                let diagnostic = RecoveryDiagnostic::provider(&failure);
+                let last = diagnostic.last_failure.unwrap();
+                assert_eq!(
+                    last.request_id.map(String::from).as_deref(),
+                    Some("gen-header")
+                );
+                assert_eq!(last.retry_after_ms, Some(3000));
+                assert_eq!(last.http_status, Some(502));
+            }
+            for (body, expected_id) in [
+                ("private_fixture invalid JSON", "gen-header"),
+                (
+                    r#"{"id":"gen-body","choices":"private_fixture"}"#,
+                    "gen-body",
+                ),
+                (
+                    r#"{"id":"https://private_fixture","choices":[]}"#,
+                    "gen-header",
+                ),
+                (r#"{"id":"gen-body","choices":[]}"#, "gen-body"),
+                (
+                    r#"{"id":"gen-body","choices":[{"message":{"content":""}}]}"#,
+                    "gen-body",
+                ),
+            ] {
+                let failure = failure_from_local_response(
+                    "openrouter",
+                    200,
+                    "",
+                    false,
+                    Some(body.as_bytes().to_vec()),
+                    redacted,
+                    "X-Generation-Id: gen-header\r\nRetry-After: 3\r\n",
+                    false,
+                )
+                .await;
+                assert_eq!(failure.class, ProviderFailureClass::Unknown);
+                assert_eq!(failure.http_status, None);
+                assert!(failure.error_reason.is_none());
+                assert_eq!(failure.retry_after_ms, Some(3000));
+                let diagnostic = RecoveryDiagnostic::provider(&failure);
+                assert!(!diagnostic.public_message().contains(expected_id));
+                let last = diagnostic.last_failure.unwrap();
+                assert_eq!(
+                    last.request_id.map(String::from).as_deref(),
+                    Some(expected_id)
+                );
+                assert_eq!(last.http_status, None);
+                assert_eq!(last.retry_after_ms, Some(3000));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_openrouter_error_envelopes_reach_recovery_without_raw_metadata() {
+        use pioneer_protocol::{ProviderErrorReason, RecoveryDiagnostic};
+        for stream in [false, true] {
+            for metadata in [
+                None,
+                Some(
+                    serde_json::json!({"error_type": "provider_unavailable", "raw": "private_fixture"}),
+                ),
+                Some(serde_json::json!({"error_type": "private_fixture"})),
+                Some(serde_json::json!("private_fixture")),
+                Some(serde_json::json!(["private_fixture"])),
+                Some(serde_json::json!({"error_type": {"private_fixture": true}})),
+            ] {
+                let known = metadata.as_ref().and_then(|value| value.get("error_type"))
+                    == Some(&serde_json::json!("provider_unavailable"));
+                let mut envelope = serde_json::json!({"id": "gen-fixture", "error": {
+                    "code": 502, "message": "Provider returned an empty response override-private-token"
+                }});
+                if let Some(metadata) = metadata {
+                    envelope["error"]["metadata"] = metadata;
+                }
+                // Non-streaming HTTP 200 intentionally has no choices.
+                let body = if stream {
+                    format!("data: {envelope}\n\n")
+                } else {
+                    envelope.to_string()
+                };
+                let failure = failure_from_local_endpoint(
+                    "openrouter",
+                    200,
+                    "",
+                    stream,
+                    Some(body),
+                    false,
+                    "",
+                    false,
+                )
+                .await;
+                assert_eq!(failure.class, ProviderFailureClass::Provider5xx);
+                assert_eq!(failure.http_status, Some(502));
+                assert_eq!(
+                    failure
+                        .request_id
+                        .as_ref()
+                        .map(|id| String::from(id.clone()))
+                        .as_deref(),
+                    Some("gen-fixture")
+                );
+                let diagnostic = RecoveryDiagnostic::provider(&failure);
+                assert!(!diagnostic.public_message().contains("gen-fixture"));
+                assert_eq!(
+                    diagnostic.last_failure.as_ref().unwrap().error_reason,
+                    known.then_some(ProviderErrorReason::ProviderUnavailable)
+                );
+                for value in [
+                    serde_json::to_string(&failure).unwrap(),
+                    serde_json::to_string(&diagnostic).unwrap(),
+                    diagnostic.public_message(),
+                ] {
+                    assert!(!value.contains("private_fixture"));
+                    assert!(!value.contains("override-private-token"));
+                }
+            }
+        }
+        let choice_error = serde_json::json!({"id":"gen-fixture", "choices":[{"error":{
+            "code":502,"metadata":{"error_type":"provider_unavailable"}
+        }}]})
+        .to_string();
+        for stream in [false, true] {
+            let body = if stream {
+                format!("data: {choice_error}\n\n")
+            } else {
+                choice_error.clone()
+            };
+            let failure = failure_from_local_endpoint(
+                "openrouter",
+                200,
+                "",
+                stream,
+                Some(body),
+                false,
+                "",
+                false,
+            )
+            .await;
+            assert_eq!(
+                RecoveryDiagnostic::provider(&failure)
+                    .last_failure
+                    .unwrap()
+                    .error_reason,
+                Some(ProviderErrorReason::ProviderUnavailable)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn openrouter_generation_ids_survive_header_fallback_and_stream_failures() {
+        use pioneer_protocol::RecoveryDiagnostic;
+        for (id, headers, expected) in [
+            (None, "X-Generation-Id: gen-header\r\n", "gen-header"),
+            (
+                Some("https://private_fixture"),
+                "X-Generation-Id: gen-header\r\nX-Request-Id: req-header\r\n",
+                "gen-header",
+            ),
+            (
+                Some("gen-body"),
+                "X-Generation-Id: gen-header\r\n",
+                "gen-body",
+            ),
+            (
+                None,
+                "X-Generation-Id: invalid\r\nX-Request-Id: req-header\r\n",
+                "req-header",
+            ),
+        ] {
+            let body = serde_json::json!({"id": id, "error":{"code":502}}).to_string();
+            let failure = failure_from_local_endpoint(
+                "openrouter",
+                502,
+                "",
+                false,
+                Some(body),
+                false,
+                headers,
+                false,
+            )
+            .await;
+            assert_eq!(
+                RecoveryDiagnostic::provider(&failure)
+                    .last_failure
+                    .unwrap()
+                    .request_id
+                    .map(String::from)
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+        for (suffix, truncated_transport) in [
+            ("", false),
+            ("", true),
+            ("data: {", false),
+            (
+                "data: {\"id\":\"https://private_fixture\",\"choices\":[]}\n\n",
+                false,
+            ),
+            (
+                "data: {\"id\": \"private_fixture\", \"choices\": \"private_fixture\"}\n\n",
+                false,
+            ),
+        ] {
+            let body = format!("data: {{\"id\":\"gen-body\",\"choices\":[]}}\n\n{suffix}");
+            let failure = failure_from_local_endpoint(
+                "openrouter",
+                200,
+                "",
+                true,
+                Some(body),
+                false,
+                "X-Generation-Id: gen-header\r\n",
+                truncated_transport,
+            )
+            .await;
+            assert_eq!(failure.class, ProviderFailureClass::StreamStall);
+            assert_eq!(failure.http_status, None);
+            let diagnostic = RecoveryDiagnostic::provider(&failure);
+            assert_eq!(
+                diagnostic
+                    .last_failure
+                    .unwrap()
+                    .request_id
+                    .map(String::from)
+                    .as_deref(),
+                Some("gen-body")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn openrouter_typed_http_and_sse_facts_reach_safe_recovery_diagnostics() {
+        use pioneer_protocol::{ProviderErrorReason, ProviderRequestId, RecoveryDiagnostic};
+        for stream in [false, true] {
+            for (code, id, expected_reason, expected_id) in [
+                (
+                    Some("provider_unavailable"),
+                    "gen-fixture_123",
+                    Some(ProviderErrorReason::ProviderUnavailable),
+                    true,
+                ),
+                (None, "gen-fixture_123", None, true),
+                (Some("future-secret-value"), "gen-fixture_123", None, true),
+                (
+                    Some("provider_overloaded"),
+                    "https://secret.example?token=credential",
+                    Some(ProviderErrorReason::ProviderOverloaded),
+                    false,
+                ),
+            ] {
+                let envelope = serde_json::json!({
+                    "id": id,
+                    "error": {
+                        "message": "JSON error injected into SSE stream retry-after: 2 override-private-token",
+                        "code": 502,
+                        "type": "provider_overloaded",
+                        "metadata": {"error_type": code, "raw": "credential /private/request history", "provider_code": "secret-value"}
+                    }
+                });
+                let body = if stream {
+                    let mut error_envelope = envelope.clone();
+                    error_envelope.as_object_mut().unwrap().remove("id");
+                    format!(
+                        "data: {}\n\ndata: {error_envelope}\n\n",
+                        serde_json::json!({"id": id, "choices": []})
+                    )
+                } else {
+                    envelope.to_string()
+                };
+                let failure = failure_from_overridden_endpoint_body(
+                    "openrouter",
+                    if stream { 200 } else { 502 },
+                    "",
+                    stream,
+                    Some(body),
+                )
+                .await;
+                assert_eq!(failure.class, ProviderFailureClass::Provider5xx);
+                assert_eq!(failure.http_status, Some(502));
+                assert_eq!(failure.retry_after_ms, Some(2000));
+                assert_eq!(
+                    failure.stage,
+                    if stream {
+                        ProviderFailureStage::MidStream
+                    } else {
+                        ProviderFailureStage::Connect
+                    }
+                );
+                assert_eq!(failure.error_reason, expected_reason);
+                assert_eq!(failure.request_id, expected_id.then(|| ProviderRequestId::try_from("gen-fixture_123".to_owned()).unwrap()));
+                let diagnostic = RecoveryDiagnostic::provider(&failure);
+                assert_eq!(
+                    diagnostic.last_failure.as_ref().unwrap().error_reason,
+                    expected_reason
+                );
+                assert_eq!(
+                    diagnostic.last_failure.as_ref().unwrap().request_id,
+                    failure.request_id
+                );
+                let public = diagnostic.public_message();
+                if let Some(reason) = expected_reason {
+                    assert!(public.contains(reason.public_description()));
+                } else {
+                    assert!(!public.contains("overloaded"));
+                }
+                assert!(!public.contains("gen-fixture"));
+                let stored = serde_json::to_string(&failure).unwrap();
+                let safe = serde_json::to_string(&diagnostic).unwrap();
+                for secret in [
+                    "credential",
+                    "secret.example",
+                    "future-secret",
+                    "secret-value",
+                    "override-private-token",
+                    "/private",
+                    "history",
+                ] {
+                    assert!(!stored.contains(secret));
+                    assert!(!safe.contains(secret));
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -1741,6 +2433,9 @@ mod tests {
                 ProviderFailureStage::Connect,
                 "provider error: HTTP 400 opaque rejection".to_owned(),
                 Some(ProviderFailureClassification {
+                    is_network_error: false,
+                    error_reason: None,
+                    request_id: None,
                     class: ProviderFailureClass::UnsupportedStreaming,
                     http_status: Some(400),
                     provider_code: Some("streaming_not_supported".to_owned()),

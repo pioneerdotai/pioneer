@@ -166,7 +166,13 @@ async fn all_chat_decoders_do_not_hide_native_error_after_finish() {
             .find_map(|chunk| chunk.as_ref().err())
             .unwrap();
         assert_eq!(
-            crate::failure::classify_stream_error(error).unwrap().class,
+            crate::failure::classify_stream_error(error)
+                .or_else(|| crate::Provider::classify_failure(
+                    &OpenRouterProvider::new("fixture"),
+                    error
+                ))
+                .unwrap()
+                .class,
             pioneer_protocol::ProviderFailureClass::Provider5xx
         );
         assert!(!format!("{error:?}").contains("private"));
@@ -499,9 +505,9 @@ async fn native_terminal_reasons_are_immutable_even_with_same_normalized_outcome
             .await;
         assert_contradictory_chunks(&chunks, 1);
     }
-    // Legacy snake_case is recognized by today's parser; NOT canonical Gemini conformance (G02).
+    // main includes G02's canonical part casing; exercise that wire format here.
     let input = wire(
-        json!({"candidates":[{"content":{"parts":[{"function_call":{"name":"read","args":{}}}]},"finishReason":"STOP"}]}),
+        json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"read","args":{}}}]},"finishReason":"STOP"}]}),
     ) + &wire(json!({"candidates":[{"finishReason":"MAX_TOKENS"}]}));
     let chunks = GeminiProvider::decode_stream(fragmented(&input))
         .collect::<Vec<_>>()

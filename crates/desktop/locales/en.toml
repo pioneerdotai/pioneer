@@ -1749,3 +1749,7 @@ reason_updated = "Updated one skill."
 reason_rolled_back = "Restored a previous skill version."
 reason_cancelled = "The run was cancelled."
 reason_unknown = "The operation did not complete as expected. Check the gateway logs."
+
+[mcp.oauth]
+callback_received = "Callback accepted. Return to Pioneer to check the sign-in result."
+callback_rejected = "Callback rejected. Return to Pioneer to retry sign-in."

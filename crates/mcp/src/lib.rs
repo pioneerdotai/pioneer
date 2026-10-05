@@ -5,6 +5,7 @@ mod config;
 mod domain;
 mod error;
 mod fingerprint;
+mod oauth;
 mod policy;
 mod redaction;
 mod runtime;
@@ -16,9 +17,9 @@ pub use catalog::McpCatalogSnapshot;
 pub use client::rmcp_adapter::RmcpRuntimeConnector;
 pub use config::{InstallParseContext, McpInstallPlan, McpInstallPlanItem, parse_install_config};
 pub use domain::{
-    McpAuthConfig, McpAvailabilitySnapshot, McpConfigValue, McpDependencyKey, McpRuntimeState,
-    McpScopeKind, McpSecretRef, McpServerInstallation, McpServerRuntimeSnapshot, McpSourceKind,
-    McpTransportConfig, McpUnavailableReason,
+    McpAuthConfig, McpAvailabilitySnapshot, McpConfigValue, McpDependencyKey, McpOAuthConfig,
+    McpRuntimeState, McpScopeKind, McpSecretRef, McpServerInstallation, McpServerRuntimeSnapshot,
+    McpSourceKind, McpTransportConfig, McpUnavailableReason,
 };
 pub use error::{McpConfigDocumentError, McpDiagnosticLevel, McpValidationDiagnostic};
 pub use fingerprint::fingerprint_installation;
@@ -32,3 +33,5 @@ pub use runtime::{
     McpSecretResolver, McpSessionEvent, McpToolCallResult, effective_secret_material_fingerprint,
 };
 pub use secrets::McpSecretMaterialization;
+
+pub use oauth::{McpOAuthProvider, OAuthFailureCause, OAuthHttpClient, oauth_runtime_error};

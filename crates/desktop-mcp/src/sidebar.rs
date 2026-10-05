@@ -61,7 +61,7 @@ impl CatalogSidebar {
                                     .items_center()
                                     .justify_start()
                                     .gap_2()
-                                    .child(sidebar_pioneer_icon(PioneerIconName::RefreshCw))
+                                    .child(sidebar_menu_icon(PioneerIconName::RefreshCw))
                                     .child(sidebar_label(t!("mcp.sidebar.refresh").to_string())),
                             )
                             .on_click(cx.listener(|view, _, _, cx| {
@@ -92,6 +92,10 @@ impl CatalogSidebar {
         let restart_disabled = selected
             .as_ref()
             .is_none_or(|server| !server.policy.enabled);
+
+        let oauth_actions = selected
+            .as_ref()
+            .and_then(|server| self.render_mcp_oauth_actions(server));
 
         v_flex()
             .size_full()
@@ -148,6 +152,7 @@ impl CatalogSidebar {
                                 }
                             }),
                     )
+                    .when_some(oauth_actions, |this, actions| this.child(actions))
                     .when(can_manage_capabilities, |this| {
                         this.child(
                             Button::new("mcp-details-sidebar-update")
@@ -161,7 +166,7 @@ impl CatalogSidebar {
                                         .items_center()
                                         .justify_start()
                                         .gap_2()
-                                        .child(sidebar_pioneer_icon(PioneerIconName::RefreshCw))
+                                        .child(sidebar_menu_icon(PioneerIconName::RefreshCw))
                                         .child(sidebar_label(
                                             t!("mcp.sidebar.update_config").to_string(),
                                         )),
@@ -196,7 +201,7 @@ impl CatalogSidebar {
                                         .items_center()
                                         .justify_start()
                                         .gap_2()
-                                        .child(sidebar_pioneer_icon(PioneerIconName::RotateCcw))
+                                        .child(sidebar_menu_icon(PioneerIconName::RotateCcw))
                                         .child(sidebar_label(
                                             t!("mcp.sidebar.restart").to_string(),
                                         )),
@@ -229,7 +234,7 @@ impl CatalogSidebar {
                                         .items_center()
                                         .justify_start()
                                         .gap_2()
-                                        .child(sidebar_pioneer_icon(PioneerIconName::Trash))
+                                        .child(sidebar_menu_icon(PioneerIconName::Trash))
                                         .child(sidebar_label(
                                             t!("mcp.sidebar.uninstall").to_string(),
                                         )),
@@ -271,7 +276,7 @@ fn sidebar_icon(icon: IconName, cx: &mut Context<CatalogSidebar>) -> AnyElement 
         .into_any_element()
 }
 
-fn sidebar_pioneer_icon(icon: PioneerIconName) -> AnyElement {
+pub(crate) fn sidebar_menu_icon(icon: impl Into<Icon>) -> AnyElement {
     div()
         .size_6()
         .rounded_full()
@@ -282,7 +287,7 @@ fn sidebar_pioneer_icon(icon: PioneerIconName) -> AnyElement {
         .into_any_element()
 }
 
-fn sidebar_label(label: String) -> AnyElement {
+pub(crate) fn sidebar_label(label: String) -> AnyElement {
     div()
         .line_height(relative(1.))
         .opacity(SIDEBAR_MENU_ITEM_OPACITY)
