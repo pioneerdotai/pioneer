@@ -680,3 +680,71 @@ mod partial_source_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod specialized_zero_regressions {
+    use super::*;
+    #[test]
+    fn nvidia_zero_eligible_never_refills_from_generic_source() {
+        for strict in [false, true] {
+            for (source_id, live_id, input, output, accepted) in [
+                (
+                    "stale/id",
+                    "different/live",
+                    json!(["text"]),
+                    json!(["text"]),
+                    false,
+                ),
+                (
+                    "google/gemma-2-2b-it",
+                    "google/gemma-2-2b-it",
+                    json!(["text"]),
+                    json!(["text"]),
+                    false,
+                ),
+                (
+                    "native/id",
+                    "native/id",
+                    json!(["image"]),
+                    json!(["text"]),
+                    false,
+                ),
+                (
+                    "native/id",
+                    "native/id",
+                    json!(["text"]),
+                    json!(["image"]),
+                    false,
+                ),
+                (
+                    "Native_ID",
+                    "native.id",
+                    json!(["text", "image"]),
+                    json!(["text"]),
+                    true,
+                ),
+            ] {
+                let mut s: SourceSnapshot =
+                    serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                        .unwrap();
+                s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["nvidia"]["models"] = json!({source_id:{"name":"native","tool_call":true,"modalities":{"input":input,"output":output},"limit":{"context":4096,"output":1024},"cost":{"input":0,"output":0}}});
+                s.sources.get_mut(SOURCE_URLS[3]).unwrap().body = json!({"data":[{"id":live_id}]});
+                s.validate().unwrap();
+                let generated = generate(&s, strict).unwrap();
+                let models = generated.models.get("nvidia");
+                assert_eq!(
+                    models.is_some_and(|m| !m.is_empty()),
+                    accepted,
+                    "{source_id}, {strict}"
+                );
+                if accepted {
+                    let row = &generated.models["nvidia"][live_id];
+                    assert_eq!(row["id"], live_id);
+                    assert_eq!(row["headers"]["NVCF-POLL-SECONDS"], "3600");
+                    assert_eq!(row["compat"]["supportsDeveloperRole"], false);
+                    assert_eq!(row["compat"]["supportsStore"], false);
+                }
+            }
+        }
+    }
+}

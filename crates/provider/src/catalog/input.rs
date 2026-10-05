@@ -122,8 +122,10 @@ pub(crate) fn effective_input_model(
                 .any(|s| names.iter().any(|n| s.eq_ignore_ascii_case(n)))
             {
                 InputCapabilityState::Supported
-            } else {
+            } else if discovery_input_covers(provider, kind) {
                 InputCapabilityState::Unsupported
+            } else {
+                InputCapabilityState::Unknown
             }
         } else if kind == InputContentType::Image {
             match discovery.capabilities.vision {
@@ -151,7 +153,7 @@ pub(crate) fn effective_input_model(
     entry
         .metadata
         .insert("effectiveInput".into(), json!(states));
-    entry.metadata.insert("discoveryInputEvidence".into(),json!({"input":discovery.capabilities.input_modalities,"vision":discovery.capabilities.vision,"scope":"provider authority instance"}));
+    entry.metadata.insert("discoveryInputEvidence".into(),json!({"input":discovery.capabilities.input_modalities,"vision":discovery.capabilities.vision,"scope":"provider authority instance","contract":if provider == "bedrock" {"FoundationModelSummary: TEXT/IMAGE/EMBEDDING only"} else {"explicit input modalities"}}));
     if let Some(context) = discovery.limits.context_window.filter(|v| *v > 0) {
         entry.context_window = if entry.context_window > 0 {
             entry.context_window.min(context)
@@ -309,4 +311,11 @@ mod discovery_consistency_tests {
             assert_eq!(m.capabilities.input_modalities, Some(vec!["text".into()]));
         }
     }
+}
+
+/// FoundationModelSummary does not enumerate Converse documents, audio or video.
+/// This is an API evidence rule, not a model entitlement or deployment mapping.
+pub(crate) fn discovery_input_covers(provider: &str, kind: InputContentType) -> bool {
+    !crate::definition::provider_definition(provider).is_some_and(|d| d.name == "bedrock")
+        || matches!(kind, InputContentType::Text | InputContentType::Image)
 }

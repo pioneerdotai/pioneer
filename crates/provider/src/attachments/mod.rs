@@ -3,6 +3,8 @@ mod budget;
 mod contracts;
 mod errors;
 pub(crate) mod input_estimate;
+#[cfg(test)]
+pub(crate) mod media_fixtures;
 mod normalize;
 mod observability;
 mod plan;
@@ -13,6 +15,7 @@ mod resolve;
 pub(crate) mod runtime;
 mod security;
 mod types;
+mod webm;
 
 use crate::attachments::errors::AttachmentPipelineError;
 use crate::attachments::normalize::{normalize_attachment_name, reconcile_mime};

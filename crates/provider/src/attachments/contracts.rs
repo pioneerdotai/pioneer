@@ -549,13 +549,13 @@ pub(super) fn validate_model_media_limits(
             .iter()
             .filter(|a| a.kind == InputContentType::Audio)
         {
-            duration = duration.saturating_add(super::input_estimate::duration_millis(
+            duration = duration.saturating_add(super::input_estimate::duration_nanos(
                 super::attachment_bytes(audio)?,
                 &audio.mime_type,
             )?);
         }
         ensure!(
-            duration <= 34_200_000,
+            duration <= 34_200_000_000_000,
             "Gemini audio exceeds 9.5 hours per prompt"
         );
     }

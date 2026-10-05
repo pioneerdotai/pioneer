@@ -14,3 +14,13 @@ authorized. The fixtures and tests were not executed during this revision.
 source fixture; it is evidence for source semantics, not a second model registry.
 `anthropic-parallel-results.json` describes the complete parallel tool-round wire
 shape; the test separately compares native data to the budget-pinned bytes.
+
+Round 3: `hermes-feature-connect.webp` copies
+`apps/desktop/src/assets/tiers/feature-connect.webp` at Hermes
+`a3b56cac95488242856b6fb1f121842a38c3e391`; `HERMES-LICENSE` preserves MIT.
+Future Rust builders extract the unchanged VP8 keyframe into bounded WebM
+containers with TrackType/DocType metadata, paired with RFC 7845 Opus silence
+packets. No fixture construction, parsing, playback or transcoding was executed.
+`bedrock-claude-source.json` is the existing pinned models.dev direct Claude row;
+`bedrock-summary.json` and `openrouter-models.json` are schema-shaped native
+discovery fixtures, not live responses or a new model registry.

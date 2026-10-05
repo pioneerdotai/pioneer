@@ -1992,3 +1992,196 @@ mod document_projection_regressions {
         }
     }
 }
+
+#[cfg(test)]
+mod summary_document_regressions {
+    use super::*;
+    use crate::{
+        Provider,
+        attachments::{admission::AdmissionState, regression as fixture},
+    };
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn native_summary_keeps_catalog_document_before_after_discovery_and_replay() {
+        let source: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/capabilities/bedrock-claude-source.json"
+        ))
+        .unwrap();
+        let id = "anthropic.claude-sonnet-4-6";
+        let row = serde_json::json!({"id":id,"name":source["name"],"provider":"amazon-bedrock","api":"bedrock-converse-stream","baseUrl":"https://bedrock-runtime.us-east-1.amazonaws.com","contextWindow":source["limit"]["context"],"maxTokens":source["limit"]["output"],"reasoning":false,"input":source["modalities"]["input"],"cost":{},"inputOrigin":{"kind":"source","expression":"pinned models.dev raw row"},"sourceMetadata":source});
+        let catalog = Arc::new(
+            crate::catalog::ModelCatalog::parse(
+                &serde_json::json!({"amazon-bedrock":{id:row}}).to_string(),
+                include_str!("../../tests/fixtures/capabilities/provenance.json"),
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(AdmissionState::for_test(catalog.clone()));
+        let provider = BedrockProvider::new("unused", "unused", "us-east-1");
+        let req = fixture::request(
+            id,
+            vec![fixture::part(
+                InputContentType::File,
+                "application/pdf",
+                &fixture::pdf(1),
+            )],
+        );
+        let before = fixture::scoped(state.clone(), provider.prepare_input_budget(req.clone()))
+            .await
+            .unwrap();
+        let response: BedrockModelsResponse = serde_json::from_str(include_str!(
+            "../../tests/fixtures/capabilities/bedrock-summary.json"
+        ))
+        .unwrap();
+        let raw = response
+            .model_summaries
+            .into_iter()
+            .map(provider_model_from_bedrock_model_summary)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            raw[0].capabilities.input_modalities.as_ref().unwrap(),
+            &["TEXT", "IMAGE"]
+        );
+        state.replace_discovery(raw.clone());
+        let mut dto = raw;
+        catalog.enrich("bedrock", &mut dto);
+        assert!(
+            dto[0]
+                .capabilities
+                .input_modalities
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|v| v == "pdf")
+        );
+        for req in [req, before.request] {
+            let budget = fixture::scoped(state.clone(), provider.prepare_input_budget(req))
+                .await
+                .unwrap();
+            for _stream in [false, true] {
+                // both production routes use this same builder
+                let prepared = fixture::scoped(
+                    state.clone(),
+                    crate::attachments::prepare_messages_for_provider_async(
+                        "bedrock",
+                        id,
+                        &provider.capabilities(),
+                        &budget.request.messages,
+                    ),
+                )
+                .await
+                .unwrap();
+                let wire = serde_json::to_value(
+                    BedrockProvider::build_request(&budget.request, &prepared).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(wire["messages"][0]["content"][0]["text"], "analyze");
+                assert_eq!(
+                    wire["messages"][0]["content"][1]["document"]["source"]["bytes"],
+                    BASE64.encode(
+                        crate::attachments::attachment_bytes(&prepared.attachments[0]).unwrap()
+                    )
+                );
+            }
+        }
+        for raw_json in [
+            serde_json::json!({"modelId":"unknown","inputModalities":["TEXT","IMAGE"]}),
+            serde_json::json!({"modelId":"unknown"}),
+        ] {
+            let other = Arc::new(AdmissionState::for_test(catalog.clone()));
+            other.replace_discovery(vec![provider_model_from_bedrock_model_summary(
+                serde_json::from_value(raw_json).unwrap(),
+            )]);
+            let req = fixture::request(
+                "unknown",
+                vec![fixture::part(
+                    InputContentType::File,
+                    "application/pdf",
+                    &fixture::pdf(1),
+                )],
+            );
+            assert!(
+                fixture::scoped(other, provider.prepare_input_budget(req))
+                    .await
+                    .is_err()
+            );
+        }
+        // Types the summary does enumerate retain real negatives.
+        state.replace_discovery(vec![provider_model_from_bedrock_model_summary(
+            serde_json::from_value(serde_json::json!({"modelId":id,"inputModalities":["TEXT"]}))
+                .unwrap(),
+        )]);
+        let image = fixture::request(
+            id,
+            vec![fixture::part(
+                InputContentType::Image,
+                "image/png",
+                &fixture::image(image::ImageFormat::Png, 1, 1),
+            )],
+        );
+        assert!(
+            fixture::scoped(state.clone(), provider.prepare_input_budget(image.clone()))
+                .await
+                .is_err()
+        );
+        let isolated = Arc::new(AdmissionState::for_test(catalog));
+        assert!(
+            fixture::scoped(isolated, provider.prepare_input_budget(image))
+                .await
+                .is_ok()
+        );
+    }
+}
+
+#[cfg(test)]
+mod webm_wire_regressions {
+    use super::*;
+    use crate::{
+        Provider,
+        attachments::{media_fixtures::webm, regression as fixture},
+    };
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn identified_webm_audio_video_and_mixed_keep_native_union_and_pinned_bytes() {
+        let provider = BedrockProvider::new("unused", "unused", "us-east-1");
+        for (audio, video, kind, mime, union) in [
+            (true, false, InputContentType::Audio, "audio/webm", "audio"),
+            (false, true, InputContentType::Video, "video/webm", "video"),
+            (true, true, InputContentType::Video, "video/webm", "video"),
+        ] {
+            let bytes = webm(audio, video, "webm");
+            let state = Arc::new(fixture::state("bedrock", "media", serde_json::json!({})));
+            let budget = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(fixture::request(
+                    "media",
+                    vec![fixture::part(kind, mime, &bytes)],
+                )),
+            )
+            .await
+            .unwrap();
+            for _stream in [false, true] {
+                let prepared = fixture::scoped(
+                    state.clone(),
+                    crate::attachments::prepare_messages_for_provider_async(
+                        "bedrock",
+                        "media",
+                        &provider.capabilities(),
+                        &budget.request.messages,
+                    ),
+                )
+                .await
+                .unwrap();
+                let wire = serde_json::to_value(
+                    BedrockProvider::build_request(&budget.request, &prepared).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(wire["messages"][0]["content"][1][union]["format"], "webm");
+                assert_eq!(
+                    wire["messages"][0]["content"][1][union]["source"]["bytes"],
+                    BASE64.encode(&bytes)
+                );
+            }
+        }
+    }
+}

@@ -57,11 +57,8 @@ pub fn reconcile_mime(
     };
 
     // Inspect actual tracks: audio-only MP4 and video MP4 share file magic.
-    let actual = if sniffed == "video/webm" && declared == "audio/webm" {
-        // Validate the container parser below; source does not establish codec-
-        // specific native acceptance, so those absent rules remain Unknown.
-        super::input_estimate::duration_millis(data, "audio/webm")?;
-        "audio/webm"
+    let actual = if sniffed == "video/webm" {
+        super::webm::actual_mime(data)?
     } else if sniffed == "video/mp4" {
         let context = mp4parse::read_mp4(&mut std::io::Cursor::new(data))?;
         if context

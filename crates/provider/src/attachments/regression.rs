@@ -44,7 +44,10 @@ pub(crate) fn pdf(pages: usize) -> Vec<u8> {
 }
 pub(crate) fn wav() -> Vec<u8> {
     // Valid 16-bit mono PCM, 8000 Hz, one second; not a truncated magic header.
-    let data = 16000u32;
+    wav_frames(8000, 8000)
+}
+pub(crate) fn wav_frames(frames: u32, rate: u32) -> Vec<u8> {
+    let data = frames * 2;
     let mut b = Vec::new();
     b.extend(b"RIFF");
     b.extend((36 + data).to_le_bytes());
@@ -52,8 +55,8 @@ pub(crate) fn wav() -> Vec<u8> {
     b.extend(16u32.to_le_bytes());
     b.extend(1u16.to_le_bytes());
     b.extend(1u16.to_le_bytes());
-    b.extend(8000u32.to_le_bytes());
-    b.extend(16000u32.to_le_bytes());
+    b.extend(rate.to_le_bytes());
+    b.extend((rate * 2).to_le_bytes());
     b.extend(2u16.to_le_bytes());
     b.extend(16u16.to_le_bytes());
     b.extend(b"data");
@@ -576,10 +579,12 @@ async fn count_and_duration_boundary_constraints_are_native_admission_not_token_
             accepted
         );
     }
-    // WAV has exactly 8000 PCM frames at 8000 Hz; allow the estimator's
-    // conservative final-frame interval, never a base64-length token estimate.
-    let duration = super::input_estimate::duration_millis(&wav(), "audio/wav").unwrap();
-    for (limit, accepted) in [(duration, true), (duration - 1, false)] {
+    // Independent native boundary: 8000 frames / 8000 Hz = exactly 1000ms.
+    assert_eq!(
+        super::input_estimate::duration_millis(&wav(), "audio/wav").unwrap(),
+        1000
+    );
+    for (limit, accepted) in [(1000, true), (999, false)] {
         let s = Arc::new(state(
             "openrouter",
             "media",
@@ -773,4 +778,219 @@ async fn effective_audio_mime_restriction_rejects_actual_mp3_despite_wav_declara
         .await
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn webm_actual_tracks_restrict_declarations_without_changing_kind_or_bytes() {
+    use super::media_fixtures::webm;
+    for provider in ["bedrock", "gemini", "openrouter"] {
+        for (audio, video) in [(true, false), (false, true), (true, true), (false, false)] {
+            let bytes = webm(audio, video, "webm");
+            for (kind, mime) in [
+                (InputContentType::Audio, "audio/webm"),
+                (InputContentType::Video, "video/webm"),
+            ] {
+                for strict in [false, true] {
+                    let mut s = state(provider, "media", json!({}));
+                    let mut config = super::default_attachment_pipeline_config();
+                    config.normalization.strict_mime_match = strict;
+                    s.pipeline_config = Some(config);
+                    let caps = capabilities();
+                    let expected = if video {
+                        kind == InputContentType::Video
+                    } else {
+                        audio && kind == InputContentType::Audio && provider == "bedrock"
+                    };
+                    let result = scoped(
+                        Arc::new(s),
+                        super::prepare_messages_for_provider_async(
+                            provider,
+                            "media",
+                            &caps,
+                            &request("media", vec![part(kind, mime, &bytes)]).messages,
+                        ),
+                    )
+                    .await;
+                    assert_eq!(
+                        result.is_ok(),
+                        expected,
+                        "{provider} audio={audio} video={video} {mime} strict={strict}"
+                    );
+                    if let Ok(prepared) = result {
+                        assert_eq!(prepared.attachments[0].mime_type, mime);
+                        assert_eq!(
+                            super::attachment_bytes(&prepared.attachments[0]).unwrap(),
+                            bytes
+                        );
+                    }
+                }
+            }
+        }
+        for bytes in [
+            webm(true, false, "matroska"),
+            vec![0x1a, 0x45, 0xdf, 0xa3],
+            webm(false, false, "webm"),
+        ] {
+            assert!(
+                scoped(
+                    Arc::new(state(provider, "media", json!({}))),
+                    super::prepare_messages_for_provider_async(
+                        provider,
+                        "media",
+                        &capabilities(),
+                        &request(
+                            "media",
+                            vec![part(InputContentType::Video, "video/webm", &bytes)]
+                        )
+                        .messages
+                    )
+                )
+                .await
+                .is_err()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_duration_exact_metadata_and_packet_scan_boundaries_are_independent() {
+    use super::{input_estimate::duration_millis, media_fixtures::webm};
+    assert_eq!(duration_millis(&wav(), "audio/wav").unwrap(), 1000);
+    // Packet scan has 50 x 20ms Opus frames and one 1000ms VP8 display span.
+    for bytes in [
+        webm(true, false, "webm"),
+        webm(false, true, "webm"),
+        webm(true, true, "webm"),
+    ] {
+        let mime = super::webm::actual_mime(&bytes).unwrap();
+        assert_eq!(duration_millis(&bytes, mime).unwrap(), 1000);
+        for limit in [999, 1000] {
+            let kind = if mime.starts_with("audio") {
+                InputContentType::Audio
+            } else {
+                InputContentType::Video
+            };
+            let key = admission::input_key(kind);
+            let req = request("media", vec![part(kind, mime, &bytes)]);
+            assert_eq!(
+                scoped(
+                    Arc::new(state(
+                        "bedrock",
+                        "media",
+                        json!({key:{"maxDurationMillis":limit}})
+                    )),
+                    super::input_estimate::prepare("bedrock", &capabilities(), req)
+                )
+                .await
+                .is_ok(),
+                limit == 1000
+            );
+        }
+    }
+    // Actual one-sample overrun at 8kHz = 1000.125ms, rounded up to 1001ms.
+    let mut over = wav();
+    over.extend([0, 0]);
+    let riff = (over.len() - 8) as u32;
+    let data = (over.len() - 44) as u32;
+    over[4..8].copy_from_slice(&riff.to_le_bytes());
+    over[40..44].copy_from_slice(&data.to_le_bytes());
+    assert_eq!(duration_millis(&over, "audio/wav").unwrap(), 1001);
+    assert!(
+        scoped(
+            Arc::new(state(
+                "openrouter",
+                "media",
+                json!({"audio":{"maxDurationMillis":1000}})
+            )),
+            super::input_estimate::prepare(
+                "openrouter",
+                &capabilities(),
+                request(
+                    "media",
+                    vec![part(InputContentType::Audio, "audio/wav", &over)]
+                )
+            )
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn gemini_native_audio_duration_aggregates_spans_before_millisecond_rounding() {
+    for (seconds, accepted) in [
+        (vec![34200], true),
+        (vec![17100, 17100], true),
+        (vec![17100, 17101], false),
+    ] {
+        // 1 Hz PCM is a valid small WAVE fixture: independent exact frame count.
+        let parts = seconds
+            .iter()
+            .map(|s| part(InputContentType::Audio, "audio/wav", &wav_frames(*s, 1)))
+            .collect();
+        let req = request("media", parts);
+        let result = scoped(
+            Arc::new(state("gemini", "media", json!({}))),
+            super::prepare_messages_for_provider_async(
+                "gemini",
+                "media",
+                &capabilities(),
+                &req.messages,
+            ),
+        )
+        .await;
+        assert_eq!(result.is_ok(), accepted);
+    }
+    let half_ms = wav_frames(1, 2000);
+    assert_eq!(
+        super::input_estimate::duration_nanos(&half_ms, "audio/wav").unwrap(),
+        500_000
+    );
+    assert_eq!(
+        super::input_estimate::duration_millis(&half_ms, "audio/wav").unwrap(),
+        1
+    );
+    // Exact metadata spans combine without per-input millisecond overhead.
+    let sum = 2 * super::input_estimate::duration_nanos(&half_ms, "audio/wav").unwrap();
+    assert_eq!(sum, 1_000_000);
+}
+
+#[tokio::test]
+async fn webm_unknown_track_and_mime_only_constraint_fail_before_projection() {
+    let mut unknown = super::media_fixtures::webm(true, false, "webm");
+    // Change a valid TrackType integer from audio (2) to subtitle (17), without
+    // changing the EBML structure or encoded packet bytes.
+    let pos = unknown
+        .windows(7)
+        .position(|w| w == [0x83, 0x40, 0x04, 0, 0, 0, 2])
+        .unwrap();
+    unknown[pos + 6] = 17;
+    for strict in [false, true] {
+        let mut s = state(
+            "bedrock",
+            "media",
+            json!({"video":{"mimeTypes":["video/webm"],"sources":["bytes"]}}),
+        );
+        let mut config = super::default_attachment_pipeline_config();
+        config.normalization.strict_mime_match = strict;
+        s.pipeline_config = Some(config);
+        let s = Arc::new(s);
+        for bytes in [
+            unknown.clone(),
+            super::media_fixtures::webm(true, false, "webm"),
+        ] {
+            let req = request(
+                "media",
+                vec![part(InputContentType::Video, "video/webm", &bytes)],
+            );
+            assert!(
+                scoped(
+                    s.clone(),
+                    super::input_estimate::prepare("bedrock", &capabilities(), req)
+                )
+                .await
+                .is_err()
+            );
+        }
+    }
 }

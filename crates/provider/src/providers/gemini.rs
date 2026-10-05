@@ -1735,3 +1735,50 @@ mod async_media_admission_regressions {
         // dependency; this fixture verifies typed representation, not acceptance.
     }
 }
+
+#[cfg(test)]
+mod webm_wire_regressions {
+    use super::*;
+    use crate::{
+        Provider,
+        attachments::{media_fixtures::webm, regression as fixture},
+    };
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn identified_webm_video_budget_and_generate_content_keep_mime_and_bytes() {
+        let provider = GeminiProvider::new("unused");
+        for audio in [false, true] {
+            let bytes = webm(audio, true, "webm");
+            let state = Arc::new(fixture::state("gemini", "media", serde_json::json!({})));
+            let budget = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(fixture::request(
+                    "media",
+                    vec![fixture::part(InputContentType::Video, "video/webm", &bytes)],
+                )),
+            )
+            .await
+            .unwrap();
+            let prepared = fixture::scoped(
+                state,
+                crate::attachments::prepare_messages_for_provider_async(
+                    "gemini",
+                    "media",
+                    &provider.capabilities(),
+                    &budget.request.messages,
+                ),
+            )
+            .await
+            .unwrap();
+            let wire =
+                GeminiProvider::build_request_from_prepared(&budget.request, &prepared).unwrap();
+            let native = wire.contents[0]
+                .parts
+                .iter()
+                .find_map(|p| p.inline_data.as_ref())
+                .unwrap();
+            assert_eq!(native.mime_type, "video/webm");
+            assert_eq!(native.data, BASE64.encode(&bytes));
+        }
+    }
+}

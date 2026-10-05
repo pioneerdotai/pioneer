@@ -359,6 +359,36 @@ struct OpenRouterModelEntry {
     pricing: Option<OpenRouterPricing>,
     #[serde(default)]
     reasoning: Option<OpenRouterReasoningMetadata>,
+    #[serde(default)]
+    architecture: Option<OpenRouterArchitecture>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterArchitecture {
+    #[serde(default)]
+    input_modalities: Option<Vec<String>>,
+    #[serde(default)]
+    output_modalities: Option<Vec<String>>,
+    #[serde(default)]
+    modality: Option<String>,
+}
+impl OpenRouterArchitecture {
+    fn legacy_side(&self, input: bool) -> Option<Vec<String>> {
+        let (left, right) = self.modality.as_deref()?.split_once("->")?;
+        let side = if input { left } else { right };
+        let values = side
+            .split('+')
+            .map(|v| v.trim().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        (!values.is_empty()
+            && values.iter().all(|v| {
+                matches!(
+                    v.as_str(),
+                    "text" | "image" | "audio" | "video" | "file" | "pdf"
+                )
+            }))
+        .then_some(values)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -416,6 +446,29 @@ impl OpenRouterProvider {
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
         }
+    }
+
+    fn build_request_from_prepared(
+        request: &ChatRequest,
+        prepared: &PreparedProviderMessages,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        let rendered_messages = Self::convert_messages(prepared)?;
+        let reasoning = Self::reasoning_options(request.reasoning);
+        Ok(ApiChatRequest {
+            model: request.model.clone(),
+            messages: rendered_messages,
+            temperature: request.temperature,
+            max_tokens: request.max_tokens,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: request.tool_choice.clone().map(Self::convert_tool_choice),
+            parallel_tool_calls: request.parallel_tool_calls,
+            reasoning,
+            stream,
+        })
     }
 
     fn audio_format_from_mime(mime: &str) -> Result<&'static str> {
@@ -834,23 +887,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         )
         .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let rendered_messages = Self::convert_messages(&prepared)?;
-        let reasoning = Self::reasoning_options(request.reasoning);
-
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages: rendered_messages,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            reasoning,
-            stream: false,
-        };
+        let api_request = Self::build_request_from_prepared(&request, &prepared, false)?;
 
         let request_builder = Self::with_app_attribution(
             self.client
@@ -925,23 +962,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         )
         .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let rendered_messages = Self::convert_messages(&prepared)?;
-        let reasoning = Self::reasoning_options(request.reasoning);
-
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages: rendered_messages,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            reasoning,
-            stream: true,
-        };
+        let api_request = Self::build_request_from_prepared(&request, &prepared, true)?;
 
         let request_builder = Self::with_app_attribution(
             self.client
@@ -1242,6 +1263,20 @@ fn provider_model_from_openrouter_model_entry(m: OpenRouterModelEntry) -> Provid
     });
     let reasoning = m.reasoning.and_then(openrouter_reasoning_capabilities);
     let mut capabilities = ProviderModelCapabilities::default();
+    if let Some(architecture) = m.architecture {
+        capabilities.input_modalities = architecture
+            .input_modalities
+            .clone()
+            .or_else(|| architecture.legacy_side(true));
+        capabilities.output_modalities = architecture
+            .output_modalities
+            .clone()
+            .or_else(|| architecture.legacy_side(false));
+        capabilities.vision = capabilities
+            .input_modalities
+            .as_ref()
+            .map(|v| v.iter().any(|m| m.eq_ignore_ascii_case("image")));
+    }
     if let Some(reasoning) = reasoning {
         capabilities.thinking = reasoning.supported;
         capabilities.reasoning = Some(reasoning);
@@ -2232,6 +2267,180 @@ mod encoded_audio_regressions {
             "audio/mpeg;unexpected",
         ] {
             assert!(OpenRouterProvider::audio_format_from_mime(mime).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod discovery_input_regressions {
+    use super::*;
+    use crate::{
+        Provider,
+        attachments::{admission::AdmissionState, regression as fixture},
+    };
+    use std::sync::Arc;
+    fn decode() -> Vec<ProviderModelInfo> {
+        let response: ModelsListResponse = serde_json::from_str(include_str!(
+            "../../tests/fixtures/capabilities/openrouter-models.json"
+        ))
+        .unwrap();
+        response
+            .data
+            .into_iter()
+            .map(provider_model_from_openrouter_model_entry)
+            .collect()
+    }
+    #[tokio::test]
+    async fn native_architecture_decoder_enrichment_refresh_and_both_mode_admission() {
+        let provider = OpenRouterProvider::new("unused");
+        let state = Arc::new(fixture::state("openrouter", "media", serde_json::json!({})));
+        let raw = decode();
+        assert_eq!(
+            raw[0].capabilities.input_modalities.as_ref().unwrap(),
+            &["text"]
+        );
+        assert_eq!(
+            raw[0].capabilities.output_modalities.as_ref().unwrap(),
+            &["image"]
+        );
+        assert_eq!(raw[3].capabilities.vision, Some(false));
+        assert_eq!(raw[4].capabilities.vision, Some(true));
+        assert_eq!(raw[5].capabilities.input_modalities, None);
+        state.replace_discovery(raw.clone()); // same raw production mapper snapshot boundary as list_models
+        let mut dto = raw;
+        state
+            .catalog
+            .as_ref()
+            .unwrap()
+            .enrich("openrouter", &mut dto);
+        assert_eq!(dto[0].capabilities.vision, Some(false));
+        let png = fixture::image(image::ImageFormat::Png, 1, 1);
+        for (id, accepted) in [
+            ("vision", false),
+            ("new/vision", true),
+            ("missing", false),
+            ("empty", false),
+            ("legacy", true),
+            ("invalid-legacy", false),
+            ("text", false),
+        ] {
+            let request = fixture::request(
+                id,
+                vec![fixture::part(InputContentType::Image, "image/png", &png)],
+            );
+            let result = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(request.clone()),
+            )
+            .await;
+            assert_eq!(result.is_ok(), accepted, "{id}");
+            for stream in [false, true] {
+                let req = result
+                    .as_ref()
+                    .map(|b| b.request.clone())
+                    .unwrap_or(request.clone());
+                let prepared = fixture::scoped(
+                    state.clone(),
+                    prepare_messages_for_provider_async(
+                        "openrouter",
+                        id,
+                        &provider.capabilities(),
+                        &req.messages,
+                    ),
+                )
+                .await;
+                assert_eq!(prepared.is_ok(), accepted, "{id}, stream={stream}");
+                if let Ok(prepared) = prepared {
+                    let wire = serde_json::to_value(
+                        OpenRouterProvider::build_request_from_prepared(&req, &prepared, stream)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(wire["stream"], stream);
+                    assert_eq!(
+                        wire["messages"][0]["content"][1]["image_url"]["url"],
+                        format!("data:image/png;base64,{}", BASE64.encode(&png))
+                    );
+                }
+            }
+        }
+        let other = Arc::new(AdmissionState::for_test(
+            state.catalog.as_ref().unwrap().clone(),
+        ));
+        let req = fixture::request(
+            "new/vision",
+            vec![fixture::part(InputContentType::Image, "image/png", &png)],
+        );
+        assert!(
+            fixture::scoped(other, provider.prepare_input_budget(req.clone()))
+                .await
+                .is_err()
+        );
+        state.replace_discovery(Vec::new()); // successful explicit refresh replaces, never merges stale evidence
+        assert!(
+            fixture::scoped(state, provider.prepare_input_budget(req))
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod webm_wire_regressions {
+    use super::*;
+    use crate::{
+        Provider,
+        attachments::{media_fixtures::webm, regression as fixture},
+    };
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn webm_video_tracks_survive_budget_both_mode_projection_and_replay() {
+        let provider = OpenRouterProvider::new("unused");
+        for audio in [false, true] {
+            let bytes = webm(audio, true, "webm");
+            let state = Arc::new(fixture::state("openrouter", "media", serde_json::json!({})));
+            let budget = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(fixture::request(
+                    "media",
+                    vec![fixture::part(InputContentType::Video, "video/webm", &bytes)],
+                )),
+            )
+            .await
+            .unwrap();
+            for stream in [false, true] {
+                let replay = fixture::scoped(
+                    state.clone(),
+                    provider.prepare_input_budget(budget.request.clone()),
+                )
+                .await
+                .unwrap();
+                let prepared = fixture::scoped(
+                    state.clone(),
+                    prepare_messages_for_provider_async(
+                        "openrouter",
+                        "media",
+                        &provider.capabilities(),
+                        &replay.request.messages,
+                    ),
+                )
+                .await
+                .unwrap();
+                let wire = serde_json::to_value(
+                    OpenRouterProvider::build_request_from_prepared(
+                        &replay.request,
+                        &prepared,
+                        stream,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(wire["stream"], stream);
+                assert_eq!(
+                    wire["messages"][0]["content"][1]["video_url"]["url"],
+                    format!("data:video/webm;base64,{}", BASE64.encode(&bytes))
+                );
+            }
         }
     }
 }

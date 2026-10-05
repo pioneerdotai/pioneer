@@ -192,7 +192,23 @@ impl ModelCatalog {
                 .input_modalities
                 .clone()
                 .or_else(|| entry.input_is_known().then(|| entry.input.clone()));
-            model.capabilities.input_modalities = input.map(|input| {
+            model.capabilities.input_modalities = input.map(|mut input| {
+                // Limited native summaries cannot erase supported catalog kinds
+                // outside their vocabulary. Raw evidence remains in the scope.
+                for name in &entry.input {
+                    let kind = match name.to_ascii_lowercase().as_str() {
+                        "pdf" | "file" | "document" => crate::InputContentType::File,
+                        "audio" => crate::InputContentType::Audio,
+                        "video" => crate::InputContentType::Video,
+                        _ => continue,
+                    };
+                    if !input::discovery_input_covers(provider, kind)
+                        && effective.input_capability(kind) == InputCapabilityState::Supported
+                        && !input.iter().any(|v| v.eq_ignore_ascii_case(name))
+                    {
+                        input.push(name.clone());
+                    }
+                }
                 input
                     .into_iter()
                     .filter(|name| {

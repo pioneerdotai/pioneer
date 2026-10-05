@@ -242,6 +242,10 @@ pub fn image_tokens(provider: &str, model: &str, width: u32, height: u32) -> Res
 }
 
 pub(super) fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
+    Ok(duration_nanos(bytes, mime)?.div_ceil(1_000_000))
+}
+/// Native span, rounded up only at nanosecond resolution; no additional sample.
+pub(super) fn duration_nanos(bytes: &[u8], mime: &str) -> Result<u64> {
     if matches!(
         mime,
         "video/mp4" | "audio/mp4" | "video/quicktime" | "audio/x-m4a"
@@ -258,7 +262,7 @@ pub(super) fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
                 .context("MP4 track time base is unavailable")?;
             ensure!(scale.0 > 0, "MP4 track time base is zero");
             duration = duration.max(
-                ((u128::from(ticks.0) * 1000).div_ceil(u128::from(scale.0)))
+                ((u128::from(ticks.0) * 1_000_000_000).div_ceil(u128::from(scale.0)))
                     .min(u128::from(u64::MAX)) as u64,
             );
         }
@@ -284,6 +288,7 @@ pub(super) fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
     )?;
     let mut bases = BTreeMap::new();
     let mut duration = 0_u64;
+    let mut unknown = std::collections::BTreeSet::new();
     let mut all_known = !format.tracks().is_empty();
     for track in format.tracks() {
         let base = track.time_base.or_else(|| {
@@ -299,11 +304,19 @@ pub(super) fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
             if let Some(ticks) = track
                 .duration
                 .map(symphonia::core::units::Duration::get)
-                .or(track.num_frames)
+                .or_else(|| {
+                    // num_frames is a count; it is ticks only at reciprocal
+                    // audio sample rate, never arbitrary video timebase.
+                    let rate = track.codec_params.as_ref()?.audio()?.sample_rate?;
+                    (u64::from(base.numer.get()) * u64::from(rate) == u64::from(base.denom.get()))
+                        .then_some(track.num_frames)
+                        .flatten()
+                })
             {
-                duration = duration.max(ticks_millis(ticks.saturating_add(1), base));
+                duration = duration.max(ticks_nanos(ticks, base));
             } else {
                 all_known = false;
+                unknown.insert(track.id);
             }
         } else {
             anyhow::bail!("media track time base is unavailable");
@@ -312,13 +325,28 @@ pub(super) fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
     if !all_known {
         // Demux packet timestamps without decoding or transcribing audio/video.
         let mut complete = false;
+        let mut spans = BTreeMap::<u32, (i64, i64)>::new();
         for _ in 0..1_000_000 {
             match format.next_packet() {
                 Ok(Some(packet)) => {
-                    if let Some(base) = bases.get(&packet.track_id) {
-                        let end = packet.pts.saturating_add(packet.dur).get().max(0) as u64;
-                        duration = duration.max(ticks_millis(end.saturating_add(1), *base));
-                    }
+                    ensure!(
+                        bases.contains_key(&packet.track_id),
+                        "packet references unknown timed track"
+                    );
+                    ensure!(
+                        !unknown.contains(&packet.track_id) || packet.dur.get() > 0,
+                        "unknown packet end duration; native span is not established"
+                    );
+                    let start = packet.pts.get();
+                    let end = packet.pts.saturating_add(packet.dur).get();
+                    ensure!(end >= start, "invalid packet time span");
+                    spans
+                        .entry(packet.track_id)
+                        .and_modify(|span| {
+                            span.0 = span.0.min(start);
+                            span.1 = span.1.max(end);
+                        })
+                        .or_insert((start, end));
                 }
                 Ok(None) => {
                     complete = true;
@@ -337,14 +365,25 @@ pub(super) fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
             complete,
             "media timing scan exceeded its bounded packet quantum"
         );
+        for id in unknown {
+            let (start, end) = spans
+                .get(&id)
+                .context("media track timing is unavailable")?;
+            let ticks = end
+                .checked_sub(*start)
+                .and_then(|v| u64::try_from(v).ok())
+                .context("invalid media span")?;
+            ensure!(ticks > 0, "media track duration is unavailable");
+            duration = duration.max(ticks_nanos(ticks, bases[&id]));
+        }
     }
     ensure!(duration > 0, "media duration is unavailable");
     Ok(duration)
 }
-fn ticks_millis(ticks: u64, base: symphonia::core::units::TimeBase) -> u64 {
+fn ticks_nanos(ticks: u64, base: symphonia::core::units::TimeBase) -> u64 {
     (u128::from(ticks)
         .saturating_mul(u128::from(base.numer.get()))
-        .saturating_mul(1000)
+        .saturating_mul(1_000_000_000)
         .div_ceil(u128::from(base.denom.get())))
     .min(u128::from(u64::MAX)) as u64
 }
@@ -422,9 +461,10 @@ mod tests {
         let audio = attachment(InputContentType::Audio, "audio/wav", wav());
         assert_eq!(
             duration_millis(audio.bytes.as_ref().unwrap(), "audio/wav").unwrap(),
-            1001
+            1000
         );
-        assert_eq!(estimate("gemini", "gemini-fixture", &audio).unwrap(), 51);
+        // Context estimate remains a rounded duration heuristic, not billing.
+        assert_eq!(estimate("gemini", "gemini-fixture", &audio).unwrap(), 50);
         let video = attachment(InputContentType::Video, "video/mp4", mp4(2500));
         assert_eq!(estimate("gemini", "gemini-fixture", &video).unwrap(), 875);
         assert!(duration_millis(&mp4(u32::MAX), "video/mp4").is_err());
@@ -591,5 +631,26 @@ mod tests {
             next.attachments[0].sha256,
             image.sha256.as_ref().unwrap().as_str()
         );
+    }
+}
+
+#[cfg(test)]
+mod native_span_rounding_tests {
+    use super::*;
+    #[test]
+    fn native_timebase_rounding_has_no_inclusive_timestamp_tick() {
+        use std::num::NonZeroU32;
+        let base = symphonia::core::units::TimeBase::new(
+            NonZeroU32::new(1).unwrap(),
+            NonZeroU32::new(8000).unwrap(),
+        );
+        assert_eq!(ticks_nanos(8000, base), 1_000_000_000);
+        assert_eq!(ticks_nanos(8001, base), 1_000_125_000);
+        let thirds = symphonia::core::units::TimeBase::new(
+            NonZeroU32::new(1).unwrap(),
+            NonZeroU32::new(3).unwrap(),
+        );
+        assert_eq!(ticks_nanos(1, thirds), 333_333_334);
+        assert_eq!(ticks_nanos(3, thirds), 1_000_000_000);
     }
 }

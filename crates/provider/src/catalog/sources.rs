@@ -19,6 +19,7 @@ fn constrained_compat() -> Value {
 
 pub(super) fn models_dev(data: &Value, nvidia: &Value, strict: bool) -> Result<Vec<Candidate>> {
     let mut result = Vec::new();
+    let mut specialized = BTreeSet::new();
     let specs = [
         (
             "amazon-bedrock",
@@ -119,6 +120,7 @@ pub(super) fn models_dev(data: &Value, nvidia: &Value, strict: bool) -> Result<V
         ),
     ];
     for (source, provider, api, url) in specs {
+        specialized.insert(provider);
         for (id, m) in entries(data, source) {
             if m["tool_call"] != true {
                 continue;
@@ -172,6 +174,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
             result.push(candidate);
         }
     }
+    specialized.insert("cloudflare-ai-gateway");
     let mut cloudflare_ids = BTreeSet::new();
     for (prefixed, m) in entries(data, "cloudflare-ai-gateway") {
         if m["tool_call"] != true {
@@ -216,6 +219,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         c.compat(json!({"sendSessionAffinityHeaders":true}));
         result.push(c);
     }
+    specialized.insert("nvidia");
     let mut live = BTreeMap::new();
     for m in nvidia["data"].as_array().into_iter().flatten() {
         let id = text(&m["id"]);
@@ -262,6 +266,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
             "https://open.bigmodel.cn/api/coding/paas/v4",
         ),
     ] {
+        specialized.insert(provider);
         for (id, m) in entries(data, source) {
             if m["tool_call"] != true {
                 continue;
@@ -282,6 +287,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
             result.push(c);
         }
     }
+    specialized.insert("together");
     let together_source = ["together", "togetherai", "together-ai"]
         .into_iter()
         .find(|p| !data[*p].is_null())
@@ -301,6 +307,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         together(&mut c);
         result.push(c);
     }
+    specialized.insert("baseten");
     for (id, m) in entries(data, "baseten") {
         if m["status"] == "deprecated" {
             continue;
@@ -337,6 +344,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         }
         result.push(c);
     }
+    specialized.insert("fireworks");
     for (id, m) in entries(data, "fireworks-ai") {
         if m["tool_call"] != true {
             continue;
@@ -375,6 +383,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         } else {
             "https://opencode.ai/zen/go"
         };
+        specialized.insert(provider);
         for (id, m) in entries(data, provider) {
             if m["tool_call"] != true || m["status"] == "deprecated" {
                 continue;
@@ -432,6 +441,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
             result.push(c);
         }
     }
+    specialized.insert("github-copilot");
     for (id, m) in entries(data, "github-copilot") {
         if m["tool_call"] != true || m["status"] == "deprecated" {
             continue;
@@ -482,6 +492,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         }
         result.push(c);
     }
+    specialized.insert("kimi-coding");
     for (id, m) in entries(data, "kimi-for-coding") {
         if m["tool_call"] != true {
             continue;
@@ -534,6 +545,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         ("moonshotai", "https://api.moonshot.ai/v1"),
         ("moonshotai-cn", "https://api.moonshot.cn/v1"),
     ] {
+        specialized.insert(provider);
         for (id, m) in entries(data, provider) {
             if m["tool_call"] != true {
                 continue;
@@ -576,6 +588,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         ),
     ] {
         let mut emitted = BTreeSet::new();
+        specialized.insert(provider);
         for (id, m) in entries(data, source) {
             if m["tool_call"] != true
                 || QWEN_TOKEN_PLAN_EXCLUDED_MODEL_IDS.contains(&id.as_str())
@@ -634,10 +647,10 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         }
         // Never refill entries intentionally filtered by specialized routing
         // (notably NVIDIA's live model list and provider-specific exclusions).
-        if result
-            .iter()
-            .any(|candidate| candidate.provider() == provider)
-        {
+        if specialized.iter().any(|route| {
+            crate::definition::provider_definition(route)
+                .map_or(*route == provider, |d| d.name == provider)
+        }) {
             continue;
         }
         let Some(url) = definition.default_base_url else {
