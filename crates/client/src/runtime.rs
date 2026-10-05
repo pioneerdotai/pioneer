@@ -268,7 +268,7 @@ pub fn reduce_gateway_notification(
     context: ClientRuntimeNotificationContext<'_>,
 ) -> Option<ClientRuntimeNotification> {
     match notification {
-        GatewayNotification::McpOAuthChanged(_) => None,
+        GatewayNotification::McpOAuthChanged(_) | GatewayNotification::PluginsChanged(_) => None,
         GatewayNotification::AccessChanged(notification) => {
             Some(ClientRuntimeNotification::AccessChanged(notification))
         }

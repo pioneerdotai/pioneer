@@ -963,6 +963,7 @@ pub struct ClientCore {
         Mutex<crate::settings::model_picker::SettingsModelPickerController>,
     pub(crate) settings_runtime: Mutex<crate::settings::runtime::SettingsRuntime>,
     pub(crate) agents_documents: Mutex<crate::agents_doc::runtime::DocumentRuntime>,
+    pub(crate) plugin_catalog_changes: tokio::sync::watch::Sender<u64>,
     pub(crate) skills_controller: Mutex<crate::skills::operations::SkillsController>,
     pub(crate) skills_store: Mutex<crate::skills::store::SkillsStore>,
     pub(crate) mcp_controller: Mutex<crate::mcp::operations::McpController>,
@@ -1181,6 +1182,7 @@ impl Default for ClientCore {
 impl ClientCore {
     pub fn new() -> Self {
         Self {
+            plugin_catalog_changes: tokio::sync::watch::channel(0).0,
             skills_controller: Mutex::new(crate::skills::operations::SkillsController::default()),
             agents_documents: Mutex::new(Default::default()),
             onboarding: Mutex::new(Default::default()),
@@ -1733,6 +1735,20 @@ impl ClientCore {
             return None;
         }
         if let crate::transport::ws::GatewayWsEvent::Notification { notification, .. } = event {
+            if matches!(
+                notification,
+                pioneer_protocol::GatewayNotification::PluginsChanged(_)
+                    | pioneer_protocol::GatewayNotification::McpServerStatusChanged(_)
+            ) {
+                self.plugin_catalog_changes
+                    .send_modify(|revision| *revision = revision.saturating_add(1));
+            }
+            if matches!(
+                notification,
+                pioneer_protocol::GatewayNotification::PluginsChanged(_)
+            ) {
+                return None;
+            }
             self.observe_administration_notification(notification);
             self.observe_provider_runtime_notification(notification);
             if self.observe_mcp_oauth_notification(notification) {

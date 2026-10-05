@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientFeature",
+  "type": "string",
+  "enum": [
+    "session",
+    "navigation",
+    "workspace_tree",
+    "task",
+    "thread",
+    "timeline",
+    "composer",
+    "pending_request",
+    "artifact",
+    "avatar",
+    "provider",
+    "administration",
+    "mcp",
+    "skills",
+    "settings",
+    "onboarding_invitation",
+    "agents_document",
+    "desktop_update"
+  ]
+}

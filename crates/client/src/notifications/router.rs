@@ -949,6 +949,7 @@ mod tests {
 
     fn mcp_server(id: &str, status: McpServerStatus) -> McpListItem {
         McpListItem {
+            plugin_owner: None,
             id: id.to_owned(),
             name: id.to_owned(),
             display_name: None,

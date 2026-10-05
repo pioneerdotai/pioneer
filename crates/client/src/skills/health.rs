@@ -54,6 +54,7 @@ mod tests {
 
     fn skill(slug: &str, source_kind: &str) -> SkillListItem {
         SkillListItem {
+            plugin_owner: None,
             skill_id: test_id(slug, source_kind),
             pack: None,
             owner: None,

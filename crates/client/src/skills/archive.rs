@@ -17,6 +17,7 @@ pub struct SkillUploadArchive {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SkillUploadSourceKind {
+    Plugin,
     Skill,
     Pack,
 }
@@ -28,6 +29,86 @@ struct ArchiveEntry {
     is_dir: bool,
     size_bytes: u64,
     mode: u32,
+}
+
+/// Folder delivery uses a bounded logical snapshot, preserving assets and
+/// modes and normalizing contained links. Archive bytes remain opaque until
+/// the chosen Gateway's existing bounded extractor and pure loader validate it.
+pub fn build_plugin_upload_archive(source: &Path) -> Result<SkillUploadArchive> {
+    const MAX_BYTES: u64 = 256 * 1024 * 1024;
+    if source.is_file() {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(source)?
+            .take(MAX_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_BYTES {
+            bail!("plugin archive size limit");
+        }
+        return Ok(SkillUploadArchive {
+            file_name: source
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("plugin.tar.gz")
+                .into(),
+            sha256: hex::encode(Sha256::digest(&bytes)),
+            bytes,
+            uncompressed_size_bytes: 0,
+        });
+    }
+    let snapshot = pioneer_plugins::Snapshot::capture(source, Default::default(), || false)?;
+    let encoder = GzBuilder::new()
+        .mtime(0)
+        .write(Vec::new(), Compression::default());
+    let mut builder = Builder::new(encoder);
+    let mut header = Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Directory);
+    header.set_size(0);
+    header.set_mode(snapshot.root_mode());
+    header.set_cksum();
+    builder.append_data(&mut header, "plugin", io::empty())?;
+    let mut uncompressed_size_bytes = 0;
+    for (key, entry) in snapshot.entries() {
+        let mut header = Header::new_gnu();
+        let path = format!("plugin/{key}");
+        match entry {
+            pioneer_plugins::Entry::Directory { mode } => {
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_size(0);
+                header.set_mode(*mode);
+                header.set_cksum();
+                builder.append_data(&mut header, path, io::empty())?;
+            }
+            pioneer_plugins::Entry::File { bytes, mode } => {
+                header.set_size(bytes.len() as u64);
+                header.set_mode(*mode);
+                header.set_cksum();
+                builder.append_data(&mut header, path, bytes.as_slice())?;
+                uncompressed_size_bytes += bytes.len() as u64;
+            }
+            pioneer_plugins::Entry::Denied => {
+                // Carry the unavailable logical path without exposing its
+                // original host target or reading it. The Gateway records a
+                // containment diagnostic; the native installer still denies it.
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                header.set_mode(0o777);
+                header.set_link_name("/pioneer-denied-package-path")?;
+                header.set_cksum();
+                builder.append_data(&mut header, path, io::empty())?;
+            }
+        }
+    }
+    let bytes = builder.into_inner()?.finish()?;
+    if bytes.len() as u64 > MAX_BYTES {
+        bail!("plugin archive size limit");
+    }
+    Ok(SkillUploadArchive {
+        file_name: "plugin.tar.gz".into(),
+        sha256: hex::encode(Sha256::digest(&bytes)),
+        bytes,
+        uncompressed_size_bytes,
+    })
 }
 
 pub fn build_skill_upload_archive(source_path: &Path) -> Result<SkillUploadArchive> {

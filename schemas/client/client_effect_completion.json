@@ -1,0 +1,525 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientEffectCompletion",
+  "type": "object",
+  "properties": {
+    "generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "operation_id": {
+      "type": "string"
+    },
+    "result": {
+      "$ref": "#/$defs/ClientEffectResult"
+    }
+  },
+  "required": [
+    "operation_id",
+    "generation",
+    "result"
+  ],
+  "$defs": {
+    "AuthSessionId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "ClientEffectResult": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "environment": {
+              "$ref": "#/$defs/OnboardingEnvironment"
+            },
+            "kind": {
+              "type": "string",
+              "const": "gateway_environment_loaded"
+            }
+          },
+          "required": [
+            "kind",
+            "environment"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "local_gateway_prepared"
+            },
+            "prepared": {
+              "$ref": "#/$defs/LocalGatewayPreparation"
+            }
+          },
+          "required": [
+            "kind",
+            "prepared"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "activation": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "local_device_activation_created"
+            }
+          },
+          "required": [
+            "kind",
+            "activation"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "envelope": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/GatewaySessionEnvelope"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "gateway_session_envelope_loaded"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "completed"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "failed"
+            }
+          },
+          "required": [
+            "kind",
+            "code"
+          ]
+        }
+      ]
+    },
+    "ClientInstallationDescriptor": {
+      "type": "object",
+      "properties": {
+        "client_kind": {
+          "$ref": "#/$defs/ClientKind"
+        },
+        "client_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "installation_id": {
+          "type": "string"
+        },
+        "platform": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "installation_id",
+        "display_name",
+        "client_kind"
+      ]
+    },
+    "ClientKind": {
+      "type": "string",
+      "enum": [
+        "desktop",
+        "mobile",
+        "other"
+      ]
+    },
+    "DeviceId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "Duration": {
+      "type": "object",
+      "properties": {
+        "nanos": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "secs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "secs",
+        "nanos"
+      ]
+    },
+    "GatewayBindingJournalRecord": {
+      "type": "object",
+      "properties": {
+        "document": {
+          "type": "string"
+        },
+        "gateway_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "gateway_id",
+        "document"
+      ]
+    },
+    "GatewayEndpoint": {
+      "type": "object",
+      "properties": {
+        "gateway_base_url": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/GatewayEndpointKind"
+        },
+        "name": {
+          "type": "string"
+        },
+        "server_gateway_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "service_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "gateway_base_url",
+        "kind"
+      ]
+    },
+    "GatewayEndpointKind": {
+      "type": "string",
+      "enum": [
+        "local",
+        "remote"
+      ]
+    },
+    "GatewayId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "GatewayRegistry": {
+      "type": "object",
+      "properties": {
+        "active_gateway_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "installation_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "local": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayEndpoint"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "remotes": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/GatewayEndpoint"
+          }
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version"
+      ]
+    },
+    "GatewaySessionEnvelope": {
+      "type": "object",
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "gateway_id": {
+          "$ref": "#/$defs/GatewayId"
+        },
+        "installation_id": {
+          "type": "string"
+        },
+        "pending_refresh_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        },
+        "refresh_expires_at_unix": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "refresh_generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "refresh_token": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "$ref": "#/$defs/AuthSessionId"
+        },
+        "token_family_id": {
+          "$ref": "#/$defs/TokenFamilyId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "gateway_id",
+        "principal_id",
+        "device_id",
+        "session_id",
+        "token_family_id",
+        "installation_id",
+        "refresh_generation",
+        "refresh_expires_at_unix",
+        "refresh_token"
+      ]
+    },
+    "GatewayTimings": {
+      "type": "object",
+      "properties": {
+        "connect_timeout": {
+          "$ref": "#/$defs/Duration"
+        },
+        "poll_interval": {
+          "$ref": "#/$defs/Duration"
+        },
+        "startup_timeout": {
+          "$ref": "#/$defs/Duration"
+        }
+      },
+      "required": [
+        "connect_timeout",
+        "startup_timeout",
+        "poll_interval"
+      ]
+    },
+    "GatewayWsTimings": {
+      "type": "object",
+      "properties": {
+        "connect_timeout": {
+          "$ref": "#/$defs/Duration"
+        },
+        "ping_interval": {
+          "$ref": "#/$defs/Duration"
+        },
+        "pong_timeout": {
+          "$ref": "#/$defs/Duration"
+        },
+        "reconnect_initial": {
+          "$ref": "#/$defs/Duration"
+        },
+        "reconnect_jitter_percent": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "reconnect_max": {
+          "$ref": "#/$defs/Duration"
+        }
+      },
+      "required": [
+        "connect_timeout",
+        "ping_interval",
+        "pong_timeout",
+        "reconnect_initial",
+        "reconnect_max",
+        "reconnect_jitter_percent"
+      ]
+    },
+    "LocalGatewayPreparation": {
+      "type": "object",
+      "properties": {
+        "activation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "endpoint": {
+          "$ref": "#/$defs/GatewayEndpoint"
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "endpoint",
+        "warnings"
+      ]
+    },
+    "OnboardingEnvironment": {
+      "type": "object",
+      "properties": {
+        "binding_journals": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/GatewayBindingJournalRecord"
+          }
+        },
+        "default_remote_name": {
+          "type": "string"
+        },
+        "discard_unbound_remote_candidates": {
+          "type": "boolean",
+          "default": false
+        },
+        "installation": {
+          "$ref": "#/$defs/ClientInstallationDescriptor"
+        },
+        "local_install_required": {
+          "type": "boolean"
+        },
+        "local_provisioned": {
+          "type": "boolean"
+        },
+        "local_update_required": {
+          "type": "boolean"
+        },
+        "registry": {
+          "$ref": "#/$defs/GatewayRegistry"
+        },
+        "remote_connect_timeout_min": {
+          "$ref": "#/$defs/Duration"
+        },
+        "timings": {
+          "$ref": "#/$defs/GatewayTimings"
+        },
+        "ws_timings": {
+          "$ref": "#/$defs/GatewayWsTimings"
+        }
+      },
+      "required": [
+        "registry",
+        "default_remote_name",
+        "remote_connect_timeout_min",
+        "installation",
+        "timings",
+        "ws_timings",
+        "local_provisioned",
+        "local_install_required",
+        "local_update_required"
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "TokenFamilyId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

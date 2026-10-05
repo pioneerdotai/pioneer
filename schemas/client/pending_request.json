@@ -51,6 +51,12 @@
         "null"
       ]
     },
+    "visible_thread_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "workspace_id": {
       "type": "string"
     }
@@ -98,6 +104,7 @@
       "enum": [
         "command_approval",
         "file_change_approval",
+        "permission_approval",
         "user_input",
         "other"
       ]
@@ -107,6 +114,7 @@
       "enum": [
         "command_approval",
         "file_change_approval",
+        "permission_approval",
         "user_input",
         "other"
       ]
@@ -204,6 +212,8 @@
         "dynamic_skill_tool",
         "computer_use",
         "task_subagent",
+        "memory_write",
+        "agent_action",
         "internal",
         "unknown"
       ]

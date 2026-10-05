@@ -337,6 +337,7 @@ mod tests {
 
     fn skill(character: char, slug: &str, pack: Option<(SkillPackId, &str)>) -> SkillListItem {
         SkillListItem {
+            plugin_owner: None,
             skill_id: skill_id(character),
             pack: pack.map(|(pack_id, member_key)| SkillPackMembership {
                 pack_id,

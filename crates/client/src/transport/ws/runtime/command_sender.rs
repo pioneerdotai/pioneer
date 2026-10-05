@@ -794,6 +794,30 @@ impl GatewayWsCommandSender {
         client_ws_commands::task_cancel(self, params)
     }
 
+    pub fn plugins_list(
+        &self,
+        params: pioneer_protocol::PluginsListParams,
+    ) -> Result<pioneer_protocol::PluginsListResponse> {
+        client_ws_commands::plugins_list(self, params)
+    }
+    pub fn plugins_details(
+        &self,
+        params: pioneer_protocol::PluginsDetailsParams,
+    ) -> Result<pioneer_protocol::PluginItem> {
+        client_ws_commands::plugins_details(self, params)
+    }
+    pub fn plugins_preview(
+        &self,
+        params: pioneer_protocol::PluginsSourceParams,
+    ) -> Result<pioneer_protocol::PluginsPreviewResponse> {
+        client_ws_commands::plugins_preview(self, params)
+    }
+    pub fn plugins_install(
+        &self,
+        params: pioneer_protocol::PluginsInstallParams,
+    ) -> Result<pioneer_protocol::PluginItem> {
+        client_ws_commands::plugins_install(self, params)
+    }
     pub fn skills_list(&self, params: SkillListParams) -> Result<SkillListResponse> {
         client_ws_commands::skills_list(self, params)
     }

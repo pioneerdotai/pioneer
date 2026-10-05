@@ -7,6 +7,22 @@
       "properties": {
         "kind": {
           "type": "string",
+          "const": "set_member_workspaces"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        }
+      },
+      "required": [
+        "kind",
+        "principal_id"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
           "const": "create_invitation"
         }
       },

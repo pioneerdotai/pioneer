@@ -26,6 +26,7 @@ pub enum SettingsRoute {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SemanticDestination {
+    Plugins,
     Threads,
     AgentsDocument,
     Providers {

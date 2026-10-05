@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayDestinationsPublication",
+  "type": "object",
+  "properties": {
+    "action_generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "endpoints": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/GatewayEndpoint"
+      }
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "installation_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "loading": {
+      "type": "boolean"
+    },
+    "local_install_required": {
+      "type": "boolean"
+    },
+    "local_update_required": {
+      "type": "boolean"
+    },
+    "outcome": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewayDestinationOutcome"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "pending_endpoint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "registry_revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "selected_endpoint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/GatewaySetupWarning"
+      }
+    },
+    "workspace_outcomes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/GatewayWorkspaceOutcome"
+      }
+    }
+  },
+  "required": [
+    "endpoints",
+    "registry_revision",
+    "loading",
+    "action_generation",
+    "workspace_outcomes",
+    "warnings",
+    "local_install_required",
+    "local_update_required"
+  ],
+  "$defs": {
+    "GatewayDestinationOutcome": {
+      "type": "object",
+      "properties": {
+        "endpoint_id": {
+          "type": "string"
+        },
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "succeeded": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "generation",
+        "endpoint_id",
+        "succeeded"
+      ]
+    },
+    "GatewayEndpoint": {
+      "type": "object",
+      "properties": {
+        "gateway_base_url": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/GatewayEndpointKind"
+        },
+        "name": {
+          "type": "string"
+        },
+        "server_gateway_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "service_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "gateway_base_url",
+        "kind"
+      ]
+    },
+    "GatewayEndpointKind": {
+      "type": "string",
+      "enum": [
+        "local",
+        "remote"
+      ]
+    },
+    "GatewayId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "GatewaySetupWarning": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "message"
+      ]
+    },
+    "GatewayWorkspaceOutcome": {
+      "type": "object",
+      "properties": {
+        "endpoint_id": {
+          "type": "string"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "succeeded": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "request_id",
+        "endpoint_id",
+        "succeeded"
+      ]
+    }
+  }
+}

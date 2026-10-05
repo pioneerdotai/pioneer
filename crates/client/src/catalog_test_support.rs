@@ -87,6 +87,7 @@ pub fn settings_client() -> Arc<ClientCore> {
 pub fn skill(character: char) -> SkillListItem {
     let id = SkillId::new(character.to_string().repeat(21)).unwrap();
     SkillListItem {
+        plugin_owner: None,
         skill_id: id,
         pack: None,
         owner: None,
@@ -126,6 +127,7 @@ pub fn mcp(ids: &[&str]) -> McpListResponse {
         servers: ids
             .iter()
             .map(|id| McpListItem {
+                plugin_owner: None,
                 id: (*id).into(),
                 name: (*id).into(),
                 display_name: None,

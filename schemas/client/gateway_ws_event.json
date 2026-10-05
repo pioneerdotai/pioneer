@@ -1611,6 +1611,7 @@
       "enum": [
         "command_approval",
         "file_change_approval",
+        "permission_approval",
         "user_input",
         "other"
       ]
@@ -1645,6 +1646,13 @@
             "null"
           ]
         },
+        "visible_thread_ids": {
+          "description": "Additional ancestor Thread capsules in which this child execution\nrequest is intentionally visible and actionable.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "workspace_id": {
           "type": "string"
         }
@@ -1664,6 +1672,18 @@
             "status": {
               "type": "string",
               "const": "approved"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "approved_for_session"
             }
           },
           "required": [
@@ -1772,6 +1792,13 @@
             "string",
             "null"
           ]
+        },
+        "visible_thread_ids": {
+          "description": "Mirrors the opened notification so clients can remove an ancestor-\nprojected request without waiting for a separate timeline refresh.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "workspace_id": {
           "type": "string"
@@ -2745,10 +2772,42 @@
           "properties": {
             "kind": {
               "type": "string",
+              "const": "plugins_changed"
+            },
+            "params": {
+              "$ref": "#/$defs/PluginsChangedNotification"
+            }
+          },
+          "required": [
+            "kind",
+            "params"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
               "const": "skills_upload_chunk_ack"
             },
             "params": {
               "$ref": "#/$defs/SkillsUploadChunkAckNotification"
+            }
+          },
+          "required": [
+            "kind",
+            "params"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "mcp_o_auth_changed"
+            },
+            "params": {
+              "$ref": "#/$defs/McpOAuthNotification"
             }
           },
           "required": [
@@ -3533,22 +3592,6 @@
             },
             "params": {
               "$ref": "#/$defs/UnknownGatewayNotification"
-            }
-          },
-          "required": [
-            "kind",
-            "params"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "kind": {
-              "type": "string",
-              "const": "mcp_o_auth_changed"
-            },
-            "params": {
-              "$ref": "#/$defs/McpOAuthNotification"
             }
           },
           "required": [
@@ -4858,6 +4901,71 @@
         "snapshot_version"
       ]
     },
+    "McpOAuthNotification": {
+      "type": "object",
+      "properties": {
+        "authorization_url": {
+          "description": "Authorization URLs contain ephemeral state. Debug must redact them.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diagnostic": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "flow_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "scope_kind": {
+          "$ref": "#/$defs/McpScopeKind"
+        },
+        "server_id": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/McpOAuthState"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "server_id",
+        "name",
+        "scope_kind",
+        "state"
+      ]
+    },
+    "McpOAuthState": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "preparing",
+        "awaiting_callback",
+        "exchanging",
+        "resolving",
+        "retired",
+        "cleanup_required",
+        "authorized",
+        "auth_required",
+        "insufficient_scope",
+        "denied",
+        "cancelled",
+        "timed_out",
+        "failed"
+      ]
+    },
     "McpRuntimeState": {
       "type": "string",
       "enum": [
@@ -5281,6 +5389,22 @@
         }
       }
     },
+    "MemoryRecallEligibility": {
+      "type": "object",
+      "properties": {
+        "eligible": {
+          "type": "boolean"
+        },
+        "reason": {
+          "description": "Low-cardinality policy reason, never a payload or identifier.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "eligible",
+        "reason"
+      ]
+    },
     "MemoryRecord": {
       "type": "object",
       "properties": {
@@ -5356,6 +5480,17 @@
         },
         "provenance": {
           "$ref": "#/$defs/MemoryProvenance"
+        },
+        "recall_eligibility": {
+          "description": "Response-only assessment for this read; absence means not assessed.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryRecallEligibility"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "scope": {
           "$ref": "#/$defs/MemoryScope"
@@ -5513,6 +5648,26 @@
             "kind"
           ]
         }
+      ]
+    },
+    "PluginsChangedNotification": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "plugin_id",
+        "revision"
       ]
     },
     "PolicyGeneration": {
@@ -6078,6 +6233,16 @@
         "class": {
           "$ref": "#/$defs/ProviderFailureClass"
         },
+        "errorReason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderErrorReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "httpStatus": {
           "type": [
             "integer",
@@ -6086,6 +6251,16 @@
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0
+        },
+        "requestId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderRequestId"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "retryAfterMs": {
           "type": [
@@ -6100,26 +6275,6 @@
         },
         "transport": {
           "$ref": "#/$defs/ProviderTransportKind"
-        },
-        "errorReason": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ProviderErrorReason"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "requestId": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ProviderRequestId"
-            },
-            {
-              "type": "null"
-            }
-          ]
         }
       },
       "additionalProperties": false,
@@ -7382,6 +7537,17 @@
           "items": {
             "$ref": "#/$defs/TurnFilesystemSandboxEntry"
           }
+        },
+        "maxFilesystemKind": {
+          "description": "Distinguishes a restricted cap with zero roots from an unrestricted\ncap, whose bounded-root list is also empty. Legacy records omit this\nfield and are interpreted conservatively by the Gateway.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnFilesystemSandboxKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "maxNetworkPolicy": {
           "$ref": "#/$defs/TurnNetworkPolicySnapshot"
@@ -10038,6 +10204,13 @@
         "threadId": {
           "type": "string"
         },
+        "turnWorkTombstones": {
+          "description": "Revisioned removals prevent delayed pages or state notifications from\nresurrecting a work row after its authoritative projection disappeared.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnWorkTombstone"
+          }
+        },
         "workspaceId": {
           "type": "string"
         }
@@ -10629,17 +10802,28 @@
     "ToolPermissionPolicySnapshot": {
       "type": "object",
       "properties": {
+        "agent_action": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
         "allowed_paths": {
           "type": "array",
           "items": {
             "type": "string"
           }
         },
+        "allowed_paths_restricted": {
+          "description": "See `allowed_tools_restricted`.  A restricted empty path set is a\ndurable deny-all result, while an unrestricted empty set is the legacy\nwildcard.",
+          "type": "boolean"
+        },
         "allowed_tools": {
           "type": "array",
           "items": {
             "type": "string"
           }
+        },
+        "allowed_tools_restricted": {
+          "description": "`allowed_tools = []` historically means \"no allow-list\".  This bit\npreserves the distinct result of intersecting two disjoint allow-lists:\na restricted empty set must deny every tool rather than reopen all of\nthem.",
+          "type": "boolean"
         },
         "computer_use": {
           "$ref": "#/$defs/PermissionBehavior"
@@ -10668,6 +10852,9 @@
         "mcp_write_or_unknown": {
           "$ref": "#/$defs/PermissionBehavior"
         },
+        "memory_write": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
         "network": {
           "$ref": "#/$defs/PermissionBehavior"
         },
@@ -10688,7 +10875,9 @@
         "mcp_write_or_unknown",
         "dynamic_skill_tool",
         "computer_use",
-        "task_subagent"
+        "task_subagent",
+        "memory_write",
+        "agent_action"
       ]
     },
     "ToolRecoveryIdempotencyMode": {
@@ -11229,6 +11418,27 @@
         {
           "type": "object",
           "properties": {
+            "expectedRevision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "pluginId": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "plugin"
+            }
+          },
+          "required": [
+            "type",
+            "pluginId",
+            "expectedRevision"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "packId": {
               "anyOf": [
                 {
@@ -11718,6 +11928,13 @@
         "path",
         "access",
         "provenance"
+      ]
+    },
+    "TurnFilesystemSandboxKind": {
+      "type": "string",
+      "enum": [
+        "restricted",
+        "unrestricted"
       ]
     },
     "TurnFilesystemSandboxPath": {
@@ -12999,6 +13216,8 @@
         "dynamic_skill_tool",
         "computer_use",
         "task_subagent",
+        "memory_write",
+        "agent_action",
         "internal",
         "unknown"
       ]
@@ -13204,6 +13423,26 @@
         "thread_id",
         "turn_id",
         "resolution"
+      ]
+    },
+    "TurnPluginCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "expectedRevision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "label": {
+          "type": "string"
+        },
+        "pluginId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pluginId",
+        "expectedRevision",
+        "label"
       ]
     },
     "TurnProcessPolicySnapshot": {
@@ -13797,6 +14036,31 @@
         "reason"
       ]
     },
+    "TurnWorkTombstone": {
+      "type": "object",
+      "properties": {
+        "blockId": {
+          "type": "string"
+        },
+        "projectionUpdatedAtUnixMicros": {
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        },
+        "sourceHighWatermark": {
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "turnId",
+        "blockId"
+      ]
+    },
     "UnknownGatewayNotification": {
       "type": "object",
       "properties": {
@@ -14197,6 +14461,22 @@
           "type": "object",
           "properties": {
             "capability": {
+              "$ref": "#/$defs/TurnPluginCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "plugin"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
               "$ref": "#/$defs/TurnSkillPackCapabilitySummary"
             },
             "type": {
@@ -14453,71 +14733,6 @@
       "required": [
         "revision",
         "workspace_id"
-      ]
-    },
-    "McpOAuthNotification": {
-      "type": "object",
-      "properties": {
-        "authorization_url": {
-          "description": "Authorization URLs contain ephemeral state. Debug must redact them.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "diagnostic": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "flow_id": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "name": {
-          "type": "string"
-        },
-        "scope_kind": {
-          "$ref": "#/$defs/McpScopeKind"
-        },
-        "server_id": {
-          "type": "string"
-        },
-        "state": {
-          "$ref": "#/$defs/McpOAuthState"
-        },
-        "workspace_id": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "workspace_id",
-        "server_id",
-        "name",
-        "scope_kind",
-        "state"
-      ]
-    },
-    "McpOAuthState": {
-      "type": "string",
-      "enum": [
-        "idle",
-        "preparing",
-        "awaiting_callback",
-        "exchanging",
-        "resolving",
-        "retired",
-        "cleanup_required",
-        "authorized",
-        "auth_required",
-        "insufficient_scope",
-        "denied",
-        "cancelled",
-        "timed_out",
-        "failed"
       ]
     }
   }

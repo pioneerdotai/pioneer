@@ -23,6 +23,7 @@ impl SkillUploadState {
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SkillUploadPublication {
+    pub plugin_result: Option<PluginItem>,
     pub operation_id: u64,
     pub generation: u64,
     pub revision: u64,
@@ -49,6 +50,7 @@ pub(crate) enum UploadCompletion {
     Chunk(SkillsUploadChunkAckNotification),
     Finish(SkillsUploadFinishResponse),
     Applied,
+    PluginApplied(PluginItem),
 }
 pub(crate) struct SkillUploadFlow {
     pub publication: SkillUploadPublication,
@@ -65,6 +67,7 @@ impl SkillUploadFlow {
     pub fn new(operation: u64, workspace: String) -> Self {
         Self {
             publication: SkillUploadPublication {
+                plugin_result: None,
                 operation_id: operation,
                 generation: operation,
                 revision: 0,
@@ -171,7 +174,10 @@ impl SkillUploadFlow {
                         .as_ref()
                         .is_some_and(|a| a.sha256 == finish.sha256)
             }
-            (UploadCompletion::Applied, SkillUploadState::Applying) => true,
+            (
+                UploadCompletion::Applied | UploadCompletion::PluginApplied(_),
+                SkillUploadState::Applying,
+            ) => true,
             _ => return false,
         };
         if !valid {
@@ -205,6 +211,11 @@ impl SkillUploadFlow {
             }
             UploadCompletion::Finish(_) => {
                 self.publication.state = SkillUploadState::Applying;
+            }
+            UploadCompletion::PluginApplied(item) => {
+                self.publication.plugin_result = Some(item);
+                self.terminate(SkillUploadState::Succeeded);
+                self.cleanup_upload = None;
             }
             UploadCompletion::Applied => {
                 self.terminate(SkillUploadState::Succeeded);

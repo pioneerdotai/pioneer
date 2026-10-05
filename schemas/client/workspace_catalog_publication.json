@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkspaceCatalogPublication",
+  "type": "object",
+  "properties": {
+    "action_pending": {
+      "type": "boolean"
+    },
+    "bootstrapped_connection_id": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "loading": {
+      "type": "boolean"
+    },
+    "operation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WorkspaceCatalogOperation"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "workspaces": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Workspace"
+      }
+    }
+  },
+  "required": [
+    "revision",
+    "workspaces",
+    "loading",
+    "action_pending"
+  ],
+  "$defs": {
+    "Workspace": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "type": "string"
+        },
+        "is_active": {
+          "type": "boolean"
+        },
+        "is_current": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "is_active",
+        "is_current",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "WorkspaceCatalogOperation": {
+      "type": "string",
+      "enum": [
+        "bootstrap",
+        "select",
+        "create",
+        "rename"
+      ]
+    }
+  }
+}

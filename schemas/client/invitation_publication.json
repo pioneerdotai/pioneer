@@ -1,0 +1,244 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "InvitationPublication",
+  "type": "object",
+  "properties": {
+    "active": {
+      "type": "boolean"
+    },
+    "avatar_error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "avatar_preview": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "can_cancel": {
+      "type": "boolean"
+    },
+    "completed_endpoint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "first_name": {
+      "type": "string"
+    },
+    "last_name": {
+      "type": "string"
+    },
+    "name_error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "name_valid": {
+      "type": "boolean"
+    },
+    "nickname": {
+      "type": "string"
+    },
+    "nickname_error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "nickname_valid": {
+      "type": "boolean"
+    },
+    "owner_generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "phase": {
+      "$ref": "#/$defs/InvitationJoinPhase"
+    },
+    "preview": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/InvitationPreviewResponse"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "preview_pending": {
+      "type": "boolean"
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "submitting": {
+      "type": "boolean"
+    },
+    "username_editing": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "active",
+    "can_cancel",
+    "owner_generation",
+    "revision",
+    "phase",
+    "first_name",
+    "last_name",
+    "nickname",
+    "username_editing",
+    "name_valid",
+    "nickname_valid",
+    "preview_pending",
+    "submitting"
+  ],
+  "$defs": {
+    "GatewayId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "InvitationInviterSummary": {
+      "type": "object",
+      "properties": {
+        "display_name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/PrincipalKind"
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        }
+      },
+      "required": [
+        "principal_id",
+        "kind",
+        "display_name",
+        "nickname"
+      ]
+    },
+    "InvitationJoinPhase": {
+      "description": "Shell-neutral, non-serializable invitation join phase.\n\nThe phase is safe to project into UI state. The secret presentation itself\nremains owned by [`InvitationJoinFlow`] and is never part of a snapshot.",
+      "type": "string",
+      "enum": [
+        "parsing",
+        "previewing",
+        "editing_profile",
+        "accepting",
+        "committing",
+        "complete",
+        "terminal"
+      ]
+    },
+    "InvitationPreviewResponse": {
+      "type": "object",
+      "properties": {
+        "expires_at_unix": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "gateway_display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "gateway_id": {
+          "$ref": "#/$defs/GatewayId"
+        },
+        "inviter": {
+          "$ref": "#/$defs/InvitationInviterSummary"
+        },
+        "role_key": {
+          "$ref": "#/$defs/RoleKey"
+        },
+        "transport": {
+          "$ref": "#/$defs/InvitationTransportSecurity"
+        },
+        "workspaces": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/InvitationWorkspaceSummary"
+          }
+        }
+      },
+      "required": [
+        "gateway_id",
+        "inviter",
+        "role_key",
+        "workspaces",
+        "expires_at_unix",
+        "transport"
+      ]
+    },
+    "InvitationTransportSecurity": {
+      "type": "string",
+      "enum": [
+        "secure_wss",
+        "insecure_ws"
+      ]
+    },
+    "InvitationWorkspaceSummary": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "name"
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "PrincipalKind": {
+      "type": "string",
+      "enum": [
+        "superuser",
+        "user"
+      ]
+    },
+    "RoleKey": {
+      "type": "string",
+      "maxLength": 32,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+    },
+    "WorkspaceId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

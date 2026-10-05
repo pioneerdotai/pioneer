@@ -389,6 +389,7 @@ fn normalize_output(text: &str) -> String {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimelineAttachmentKind {
+    Plugin,
     Artifact,
     File,
     Image,
@@ -414,6 +415,13 @@ pub(crate) fn project_attachment(
     use TimelineAttachmentKind as K;
     use pioneer_protocol::UserMessageAttachment as A;
     let (id, kind, title, parent_title, artifact) = match attachment {
+        A::Plugin { capability } => (
+            pioneer_protocol::plugin_capability_key(&capability.plugin_id),
+            K::Plugin,
+            capability.label.clone(),
+            None,
+            None,
+        ),
         A::Artifact { artifact } => (
             format!(
                 "artifact:{}:{}",

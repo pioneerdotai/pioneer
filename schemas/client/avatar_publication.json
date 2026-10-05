@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AvatarPublication",
+  "type": "object",
+  "properties": {
+    "avatar_revision": {
+      "type": "string"
+    },
+    "error": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AvatarCacheError"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "local_path": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ClientPath"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "media_type": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProfileAvatarMediaType"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "principal_id": {
+      "type": "string"
+    },
+    "source": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AvatarCacheSource"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "principal_id",
+    "avatar_revision"
+  ],
+  "$defs": {
+    "AvatarCacheError": {
+      "type": "string",
+      "enum": [
+        "invalid_request",
+        "authentication",
+        "hidden_or_missing",
+        "offline",
+        "invalid_response",
+        "corrupt",
+        "disk",
+        "cancelled"
+      ]
+    },
+    "AvatarCacheSource": {
+      "type": "string",
+      "enum": [
+        "downloaded",
+        "revalidated",
+        "offline_cache"
+      ]
+    },
+    "ClientPath": {
+      "type": "string"
+    },
+    "ProfileAvatarMediaType": {
+      "type": "string",
+      "enum": [
+        "image/png",
+        "image/jpeg",
+        "image/webp"
+      ]
+    }
+  }
+}

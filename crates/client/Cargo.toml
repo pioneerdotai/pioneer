@@ -25,6 +25,7 @@ hex.workspace = true
 libc.workspace = true
 mime_guess.workspace = true
 pioneer-protocol.workspace = true
+pioneer-plugins.workspace = true
 pioneer-observability.workspace = true
 pioneer-skills.workspace = true
 qrcode.workspace = true

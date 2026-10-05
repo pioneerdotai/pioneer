@@ -2069,6 +2069,67 @@ where
     )
 }
 
+pub fn plugins_list<T: JsonRpcRequestTransport>(
+    transport: &T,
+    params: pioneer_protocol::PluginsListParams,
+) -> Result<pioneer_protocol::PluginsListResponse> {
+    require_non_empty_field(&params.workspace_id, "workspace_id", methods::PLUGINS_LIST)?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::PLUGINS_LIST,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+pub fn plugins_details<T: JsonRpcRequestTransport>(
+    transport: &T,
+    params: pioneer_protocol::PluginsDetailsParams,
+) -> Result<pioneer_protocol::PluginItem> {
+    require_non_empty_field(
+        &params.workspace_id,
+        "workspace_id",
+        methods::PLUGINS_DETAILS,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::PLUGINS_DETAILS,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+pub fn plugins_preview<T: JsonRpcRequestTransport>(
+    transport: &T,
+    params: pioneer_protocol::PluginsSourceParams,
+) -> Result<pioneer_protocol::PluginsPreviewResponse> {
+    require_non_empty_field(
+        &params.workspace_id,
+        "workspace_id",
+        methods::PLUGINS_PREVIEW,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::PLUGINS_PREVIEW,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+pub fn plugins_install<T: JsonRpcRequestTransport>(
+    transport: &T,
+    params: pioneer_protocol::PluginsInstallParams,
+) -> Result<pioneer_protocol::PluginItem> {
+    require_non_empty_field(
+        &params.workspace_id,
+        "workspace_id",
+        methods::PLUGINS_INSTALL,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::PLUGINS_INSTALL,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
 pub fn skills_list<TTransport>(
     transport: &TTransport,
     params: SkillListParams,
@@ -4009,6 +4070,7 @@ mod tests {
                 skills_upload_start(
                     &PanicTransport,
                     SkillsUploadStartParams {
+                        purpose: Default::default(),
                         workspace_id: "ws_1".to_owned(),
                         file_name: "skill.tar.gz".to_owned(),
                         archive_format: SkillArchiveFormat::TarGz,

@@ -424,6 +424,7 @@ mod tests {
 
     fn server(id: &str, name: &str) -> McpListItem {
         McpListItem {
+            plugin_owner: None,
             id: id.to_owned(),
             name: name.to_owned(),
             display_name: None,
