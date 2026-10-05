@@ -111,9 +111,18 @@ struct AnthropicToolDefinition {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct AnthropicToolChoice {
+    #[serde(flatten)]
+    mode: AnthropicToolChoiceMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disable_parallel_tool_use: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum AnthropicToolChoice {
+enum AnthropicToolChoiceMode {
     Auto,
+    None,
     Any,
     Tool { name: String },
 }
@@ -442,13 +451,23 @@ impl AnthropicProvider {
             .collect()
     }
 
-    fn convert_tool_choice(choice: ToolChoice) -> AnthropicToolChoice {
-        match choice {
-            ToolChoice::Auto => AnthropicToolChoice::Auto,
-            ToolChoice::None => AnthropicToolChoice::Auto,
-            ToolChoice::Required => AnthropicToolChoice::Any,
-            ToolChoice::Tool { name } => AnthropicToolChoice::Tool { name },
+    fn convert_tool_choice(
+        choice: Option<ToolChoice>,
+        parallel: Option<bool>,
+    ) -> Option<AnthropicToolChoice> {
+        if choice.is_none() && parallel.is_none() {
+            return None;
         }
+        let mode = match choice.unwrap_or(ToolChoice::Auto) {
+            ToolChoice::Auto => AnthropicToolChoiceMode::Auto,
+            ToolChoice::None => AnthropicToolChoiceMode::None,
+            ToolChoice::Required => AnthropicToolChoiceMode::Any,
+            ToolChoice::Tool { name } => AnthropicToolChoiceMode::Tool { name },
+        };
+        Some(AnthropicToolChoice {
+            mode,
+            disable_parallel_tool_use: parallel.map(|enabled| !enabled),
+        })
     }
 
     fn output_config(reasoning: Option<ReasoningConfig>) -> Option<AnthropicOutputConfig> {
@@ -1131,13 +1150,15 @@ impl crate::traits::Provider for AnthropicProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider_async(
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let (system, messages) = Self::prepare_messages(&prepared)?;
 
@@ -1151,7 +1172,10 @@ impl crate::traits::Provider for AnthropicProvider {
                 .tools
                 .as_ref()
                 .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
+            tool_choice: Self::convert_tool_choice(
+                request.tool_choice,
+                request.parallel_tool_calls,
+            ),
             output_config: Self::output_config(request.reasoning),
             stream: false,
         };
@@ -1184,13 +1208,15 @@ impl crate::traits::Provider for AnthropicProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let prepared = prepare_messages_for_provider_async(
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let (system, messages) = Self::prepare_messages(&prepared)?;
 
@@ -1204,7 +1230,10 @@ impl crate::traits::Provider for AnthropicProvider {
                 .tools
                 .as_ref()
                 .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
+            tool_choice: Self::convert_tool_choice(
+                request.tool_choice,
+                request.parallel_tool_calls,
+            ),
             output_config: Self::output_config(request.reasoning),
             stream: true,
         };
@@ -1301,6 +1330,42 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_tool_modes_and_parallel_control_are_nested() {
+        for parallel in [None, Some(true), Some(false)] {
+            for (choice, expected) in [
+                (ToolChoice::Auto, "auto"),
+                (ToolChoice::None, "none"),
+                (ToolChoice::Required, "any"),
+                (
+                    ToolChoice::Tool {
+                        name: "lookup".into(),
+                    },
+                    "tool",
+                ),
+            ] {
+                let value = serde_json::to_value(AnthropicProvider::convert_tool_choice(
+                    Some(choice),
+                    parallel,
+                ))
+                .unwrap();
+                assert_eq!(value["type"], expected);
+                if let Some(enabled) = parallel {
+                    assert_eq!(value["disable_parallel_tool_use"], !enabled);
+                } else {
+                    assert!(value.get("disable_parallel_tool_use").is_none());
+                }
+            }
+        }
+        let default_choice =
+            serde_json::to_value(AnthropicProvider::convert_tool_choice(None, Some(false)))
+                .unwrap();
+        assert_eq!(
+            default_choice,
+            serde_json::json!({"type":"auto","disable_parallel_tool_use":true})
+        );
+    }
+
     #[test]
     fn usage_normalization_requires_complete_separate_cache_counters() {
         let complete: super::ApiUsage = serde_json::from_value(serde_json::json!({

@@ -37,6 +37,13 @@ pub trait Provider: Send + Sync {
         ProviderCapabilities::default()
     }
 
+    /// Adapter capability is a protocol ceiling; known catalog model support
+    /// can narrow it. Absence remains unknown, not evidence for every model.
+    fn model_tool_calling(&self, model: &str) -> bool {
+        self.capabilities().tool_calling
+            && crate::tools::policy::model_tool_support(self.name(), model) != Some(false)
+    }
+
     /// Selects the native file-tool wire contract for this provider/model.
     /// The decision is provider-owned and fail-closed for unknown families;
     /// callers must use the same result for both catalog and prompt output.

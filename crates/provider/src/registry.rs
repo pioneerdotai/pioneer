@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
@@ -149,11 +149,33 @@ impl ProviderCacheKey {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ProviderOrigin {
+    Factory,
+    Injected,
+}
+
+impl ProviderOrigin {
+    fn use_public_catalog(self, provider: &str, base_url: Option<&str>) -> bool {
+        // Resolver URLs do not attest the endpoint of an injected inner.
+        matches!(self, Self::Factory)
+            && base_url.is_none_or(|endpoint| {
+                crate::provider_definition(provider)
+                    .and_then(|definition| definition.default_base_url)
+                    .is_some_and(|stock| {
+                        stock.trim_end_matches('/') == endpoint.trim_end_matches('/')
+                    })
+            })
+    }
+}
+
 struct AuthorityBoundProvider {
     inner: Arc<dyn Provider>,
     authority_fingerprint: ProviderAuthorityFingerprint,
     revoked: Arc<AtomicBool>,
     redact_endpoint_errors: bool,
+    discovery_tools: RwLock<BTreeMap<String, bool>>,
+    use_public_catalog: bool,
 }
 
 /// The request's endpoint can contain a secret path. Never retain a raw
@@ -274,6 +296,46 @@ fn redacted_endpoint_error(
 }
 
 impl AuthorityBoundProvider {
+    fn model_tool_calling_with_catalog(
+        &self,
+        model: &str,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> bool {
+        let discovery = self
+            .discovery_tools
+            .read()
+            .expect("discovery tools lock")
+            .get(model)
+            .copied();
+        let source = self
+            .use_public_catalog
+            .then(|| catalog.and_then(|c| c.tool_support(self.name(), model)))
+            .flatten();
+        self.capabilities().tool_calling
+            && crate::catalog::merge_tool_support(discovery, source) != Some(false)
+    }
+
+    fn enrich_discovery(
+        &self,
+        catalog: &crate::catalog::ModelCatalog,
+        models: &mut [ProviderModelInfo],
+    ) {
+        // Keep raw discovery capability in this authority's existing instance;
+        // enrichment must never export it to another credential/endpoint scope.
+        *self.discovery_tools.write().expect("discovery tools lock") = models
+            .iter()
+            .filter_map(|m| m.capabilities.tool_calling.map(|v| (m.id.clone(), v)))
+            .collect();
+        catalog.enrich_for_tool_scope(self.inner.name(), models, self.use_public_catalog);
+    }
+
+    fn discovery_tool_snapshot(&self) -> BTreeMap<String, bool> {
+        self.discovery_tools
+            .read()
+            .expect("discovery tools lock")
+            .clone()
+    }
+
     fn ensure_not_revoked(&self) -> Result<()> {
         if self.revoked.load(Ordering::Acquire) {
             return Err(ProviderAuthorityRevoked.into());
@@ -313,6 +375,11 @@ impl Provider for AuthorityBoundProvider {
         self.inner.capabilities()
     }
 
+    fn model_tool_calling(&self, model: &str) -> bool {
+        let catalog = crate::catalog::model_catalog().ok();
+        self.model_tool_calling_with_catalog(model, catalog.as_deref())
+    }
+
     fn native_file_tool_capability(
         &self,
         model: &str,
@@ -346,7 +413,12 @@ impl Provider for AuthorityBoundProvider {
         self.public_result(
             crate::attachments::runtime::with_async_authority_scope(
                 self.authority_fingerprint.as_str().to_owned(),
-                self.inner.chat(request),
+                crate::tools::policy::with_discovery_tools(
+                    self.name(),
+                    self.use_public_catalog,
+                    self.discovery_tool_snapshot(),
+                    self.inner.chat(request),
+                ),
             )
             .await,
         )
@@ -367,7 +439,12 @@ impl Provider for AuthorityBoundProvider {
         let mut response = self.public_result(
             crate::attachments::runtime::with_async_authority_scope(
                 self.authority_fingerprint.as_str().to_owned(),
-                self.inner.stream_chat_with_diagnostics(request),
+                crate::tools::policy::with_discovery_tools(
+                    self.name(),
+                    self.use_public_catalog,
+                    self.discovery_tool_snapshot(),
+                    self.inner.stream_chat_with_diagnostics(request),
+                ),
             )
             .await,
         )?;
@@ -386,7 +463,7 @@ impl Provider for AuthorityBoundProvider {
         self.ensure_not_revoked()?;
         let catalog = crate::catalog::model_catalog()?;
         let mut models = self.public_result(self.inner.list_models().await)?;
-        catalog.enrich(self.inner.name(), &mut models);
+        self.enrich_discovery(&catalog, &mut models);
         Ok(models)
     }
 
@@ -412,7 +489,9 @@ impl Provider for AuthorityBoundProvider {
 }
 
 struct ProviderCacheEntry {
-    provider: Arc<dyn Provider>,
+    // Keep the authority wrapper type; coercion at the public API boundary
+    // preserves the same Arc lease/revocation semantics.
+    provider: Arc<AuthorityBoundProvider>,
     revoked: Arc<AtomicBool>,
     last_access: Instant,
     access_sequence: u64,
@@ -758,17 +837,20 @@ impl ProviderRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(provider_name.as_str())
             .cloned();
-        let provider: Arc<dyn Provider> = match injected {
-            Some(provider) => provider,
-            None => Arc::from(
-                create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
-                    provider_name.as_str(),
-                    &api_key,
-                    self.timeout_policy,
-                    proxy_url.as_deref(),
-                    base_url.as_deref(),
-                    authority_fingerprint.as_str(),
-                )?,
+        let (provider, origin): (Arc<dyn Provider>, _) = match injected {
+            Some(provider) => (provider, ProviderOrigin::Injected),
+            None => (
+                Arc::from(
+                    create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
+                        provider_name.as_str(),
+                        &api_key,
+                        self.timeout_policy,
+                        proxy_url.as_deref(),
+                        base_url.as_deref(),
+                        authority_fingerprint.as_str(),
+                    )?,
+                ),
+                ProviderOrigin::Factory,
             ),
         };
 
@@ -780,11 +862,14 @@ impl ProviderRegistry {
         cache.prune_expired(now, self.limits.idle_ttl);
         let access_sequence = cache.next_sequence();
         let revoked = Arc::new(AtomicBool::new(false));
-        let provider: Arc<dyn Provider> = Arc::new(AuthorityBoundProvider {
+        let use_public_catalog = origin.use_public_catalog(provider.name(), base_url.as_deref());
+        let provider = Arc::new(AuthorityBoundProvider {
             inner: provider,
             authority_fingerprint,
             revoked: revoked.clone(),
             redact_endpoint_errors: base_url.is_some(),
+            use_public_catalog,
+            discovery_tools: RwLock::new(BTreeMap::new()),
         });
         if !cache.make_room_for_insert(self.limits.max_cached_instances) {
             return Err(ProviderRegistryCapacityExceeded {
@@ -903,11 +988,14 @@ impl ProviderRegistry {
         let now = Instant::now();
         let access_sequence = cache.next_sequence();
         let revoked = Arc::new(AtomicBool::new(false));
-        let provider: Arc<dyn Provider> = Arc::new(AuthorityBoundProvider {
+        let use_public_catalog = ProviderOrigin::Injected.use_public_catalog(provider.name(), None);
+        let provider = Arc::new(AuthorityBoundProvider {
             inner: provider,
             authority_fingerprint: authority_fingerprint.clone(),
             revoked: revoked.clone(),
             redact_endpoint_errors: false,
+            use_public_catalog,
+            discovery_tools: RwLock::new(BTreeMap::new()),
         });
         cache.prune_expired(now, self.limits.idle_ttl);
         if cache.make_room_for_insert(self.limits.max_cached_instances) {
@@ -1103,6 +1191,476 @@ mod tests {
         let error = provider.list_models().await.unwrap_err();
         assert!(error.to_string().contains("Model catalog is not loaded"));
         assert!(provider.chat(chat_request()).await.is_ok());
+    }
+
+    struct ToolDiscoveryProvider;
+    #[async_trait]
+    impl Provider for ToolDiscoveryProvider {
+        fn name(&self) -> &str {
+            "openai"
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                tool_calling: true,
+                ..Default::default()
+            }
+        }
+        async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+            Ok(vec![crate::catalog::tool_tests::discovered(
+                "g03-positive",
+                Some(false),
+            )])
+        }
+        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+            crate::tools::policy::prepare_request(self.name(), request)?;
+            anyhow::bail!("fixture reached model boundary")
+        }
+        async fn stream_chat(
+            &self,
+            request: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+            crate::tools::policy::prepare_request(self.name(), request)?;
+            anyhow::bail!("fixture reached model boundary")
+        }
+    }
+
+    #[tokio::test]
+    async fn discovered_false_reaches_agent_consumer_and_both_authority_request_paths() {
+        let catalog = crate::catalog::tool_tests::generated_catalog();
+        let wrapper = |authority: &str| AuthorityBoundProvider {
+            inner: Arc::new(ToolDiscoveryProvider),
+            authority_fingerprint: ProviderAuthorityFingerprint(authority.into()),
+            revoked: Arc::new(AtomicBool::new(false)),
+            redact_endpoint_errors: false,
+            use_public_catalog: false,
+            discovery_tools: RwLock::new(BTreeMap::new()),
+        };
+        let mut public = wrapper("public-authority");
+        public.use_public_catalog = true;
+        // Same method as the actual agent's Provider::model_tool_calling,
+        // with an isolated source-generated snapshot rather than global state.
+        assert!(!public.model_tool_calling_with_catalog("g03-negative", Some(&catalog)));
+        assert!(public.model_tool_calling_with_catalog("g03-positive", Some(&catalog)));
+        assert!(public.model_tool_calling_with_catalog("unknown", Some(&catalog)));
+        let a = wrapper("authority-a");
+        let b = wrapper("authority-b");
+        let mut models = a.inner.list_models().await.unwrap();
+        a.enrich_discovery(&catalog, &mut models);
+        assert_eq!(models[0].capabilities.tool_calling, Some(false));
+        assert!(!a.model_tool_calling("g03-positive"));
+        assert!(b.model_tool_calling("g03-positive"));
+        let mut request = crate::tools::policy::test_request();
+        request.model = "g03-positive".into();
+        assert!(
+            a.chat(request.clone())
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("does not support tool definitions")
+        );
+        assert!(
+            a.stream_chat(request.clone())
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("does not support tool definitions")
+        );
+        assert!(
+            b.chat(request.clone())
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("fixture reached model boundary")
+        );
+        request.tool_choice = Some(crate::ToolChoice::None);
+        assert!(
+            a.chat(request)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("does not support tool definitions")
+        );
+        // A fresh discovery listing atomically replaces previous known values.
+        a.enrich_discovery(
+            &catalog,
+            &mut [crate::catalog::tool_tests::discovered(
+                "g03-positive",
+                Some(true),
+            )],
+        );
+        assert!(a.model_tool_calling("g03-positive"));
+    }
+
+    // Native response data, not hand-built ProviderModelInfo capability bools.
+    const NATIVE_TOOL_MODELS: &str = r#"{"data":[
+        {"id":"g03-positive","supported_parameters":[]},
+        {"id":"negative-no-source","supported_parameters":["temperature"]},
+        {"id":"native-positive","supported_parameters":["tools"]},
+        {"id":"g03-negative","supported_parameters":["tools"]},
+        {"id":"missing"}, {"id":"null","supported_parameters":null},
+        {"id":"malformed","supported_parameters":["tools",42]}
+    ]}"#;
+
+    struct NativeModelsProvider {
+        name: &'static str,
+        catalog: Arc<crate::catalog::ModelCatalog>,
+    }
+    #[async_trait]
+    impl Provider for NativeModelsProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                tool_calling: true,
+                ..Default::default()
+            }
+        }
+        async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+            Ok(
+                crate::providers::openrouter::models_from_native_discovery_fixture(
+                    NATIVE_TOOL_MODELS,
+                ),
+            )
+        }
+        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+            crate::tools::policy::prepare_request_with_catalog(
+                self.name(),
+                request,
+                Some(&self.catalog),
+            )?;
+            Ok(ChatResponse {
+                text: "local boundary".into(),
+                usage: None,
+                reasoning_content: None,
+                tool_calls: vec![],
+                provider_replay_state: None,
+                termination: ProviderTermination::Complete,
+            })
+        }
+        async fn stream_chat(
+            &self,
+            request: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+            self.chat(request).await?;
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    fn scoped_registry(endpoint: Option<&str>) -> ProviderRegistry {
+        let endpoint = endpoint.map(str::to_owned);
+        ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+            |_, _| Ok(String::new()),
+            |_, _| Ok(None),
+            move |_, _| Ok(endpoint.clone()),
+            ProviderTimeoutPolicy::default(),
+        )
+    }
+
+    // Inspect the actual cached wrapper, without extra production metadata or
+    // changing its flag. Cache stores the same single Arc used by public leases.
+    fn cached_wrapper(
+        registry: &ProviderRegistry,
+        workspace: Option<&str>,
+        name: &str,
+    ) -> Arc<AuthorityBoundProvider> {
+        let name = normalize_provider_name(name);
+        registry
+            .cache
+            .read()
+            .unwrap()
+            .entries
+            .iter()
+            .find(|(key, _)| key.workspace_id.as_deref() == workspace && key.provider_name == name)
+            .unwrap()
+            .1
+            .provider
+            .clone()
+    }
+
+    async fn wrapper_support(
+        wrapper: &AuthorityBoundProvider,
+        model: &str,
+        catalog: &crate::catalog::ModelCatalog,
+    ) -> Option<bool> {
+        crate::tools::policy::with_discovery_tools(
+            wrapper.name(),
+            wrapper.use_public_catalog,
+            wrapper.discovery_tool_snapshot(),
+            async {
+                crate::tools::policy::tool_support_with_catalog(
+                    wrapper.name(),
+                    model,
+                    Some(catalog),
+                )
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn native_openrouter_discovery_reaches_scoped_consumers_and_both_preflights() {
+        let catalog = Arc::new(crate::catalog::tool_tests::generated_catalog());
+        for endpoint in [
+            None,
+            Some("https://openrouter.ai/api/v1"),
+            Some("https://private.invalid/api/v1"),
+        ] {
+            let registry = scoped_registry(endpoint);
+            // Factory path determines real stock/override scope; no HTTP.
+            let actual = registry.get_or_create("openrouter").unwrap();
+            let wrapper = cached_wrapper(&registry, None, "openrouter");
+            assert_eq!(
+                wrapper.use_public_catalog,
+                endpoint != Some("https://private.invalid/api/v1")
+            );
+            let mut models = crate::providers::openrouter::models_from_native_discovery_fixture(
+                NATIVE_TOOL_MODELS,
+            );
+            wrapper.enrich_discovery(&catalog, &mut models);
+            for id in ["g03-positive", "negative-no-source"] {
+                assert_eq!(wrapper_support(&wrapper, id, &catalog).await, Some(false));
+                assert!(!actual.model_tool_calling(id));
+                assert!(!wrapper.model_tool_calling_with_catalog(id, Some(&catalog)));
+                for choice in [None, Some(crate::ToolChoice::None)] {
+                    let mut request = crate::tools::policy::test_request();
+                    request.model = id.into();
+                    request.tool_choice = choice;
+                    // Actual OpenRouter adapter entrypoints reject before HTTP,
+                    // including disabled new calls with definitions supplied.
+                    assert!(actual.chat(request.clone()).await.is_err());
+                    assert!(actual.stream_chat(request.clone()).await.is_err());
+                    assert!(actual.stream_chat_with_diagnostics(request).await.is_err());
+                }
+            }
+            for id in [
+                "native-positive",
+                "missing",
+                "null",
+                "malformed",
+                "custom-unknown",
+            ] {
+                assert!(wrapper.model_tool_calling_with_catalog(id, Some(&catalog)));
+            }
+            // A public source negative is still a veto against discovery true;
+            // a foreign endpoint never inherits that same source restriction.
+            assert_eq!(
+                wrapper_support(&wrapper, "g03-negative", &catalog).await,
+                Some(!wrapper.use_public_catalog)
+            );
+            let other = registry
+                .get_or_create_for_workspace("other", "openrouter")
+                .unwrap();
+            assert!(other.model_tool_calling("negative-no-source"));
+
+            // Native-normalized fixture adapter permits the allowed-path cases
+            // without HTTP/preparation/runtime; registry constructors stay real.
+            let isolated = scoped_registry(endpoint);
+            isolated
+                .insert(
+                    "openrouter",
+                    Arc::new(NativeModelsProvider {
+                        name: "openrouter",
+                        catalog: catalog.clone(),
+                    }),
+                )
+                .unwrap();
+            let provider = isolated
+                .get_or_create_for_workspace("a", "openrouter")
+                .unwrap();
+            let fixture = cached_wrapper(&isolated, Some("a"), "openrouter");
+            let mut models = fixture.inner.list_models().await.unwrap();
+            fixture.enrich_discovery(&catalog, &mut models);
+            for id in [
+                "g03-positive",
+                "negative-no-source",
+                "native-positive",
+                "missing",
+                "null",
+                "malformed",
+                "custom-unknown",
+            ] {
+                for disabled in [false, true] {
+                    let mut request = crate::tools::policy::test_request();
+                    request.model = id.into();
+                    if disabled {
+                        request.tool_choice = Some(crate::ToolChoice::None);
+                    }
+                    let allowed = !matches!(id, "g03-positive" | "negative-no-source");
+                    assert_eq!(provider.chat(request.clone()).await.is_ok(), allowed);
+                    assert_eq!(provider.stream_chat(request.clone()).await.is_ok(), allowed);
+                    request.tools = None;
+                    request.tool_choice = Some(crate::ToolChoice::None);
+                    assert!(provider.chat(request.clone()).await.is_ok());
+                    assert!(provider.stream_chat(request).await.is_ok());
+                }
+            }
+        }
+    }
+
+    fn catalog_with_restricted_parallel() -> Arc<crate::catalog::ModelCatalog> {
+        let mut generated = crate::catalog::generator::generate(
+            &crate::catalog::tool_tests::source_snapshot(),
+            false,
+        )
+        .unwrap();
+        // Isolated protocol metadata, not a global catalog publication. Source
+        // bools still come from generation of the real source fixtures.
+        generated
+            .models
+            .get_mut("openai")
+            .unwrap()
+            .get_mut("g03-positive")
+            .unwrap()["compat"]["supportsParallelToolCalls"] = serde_json::json!(false);
+        Arc::new(
+            crate::catalog::ModelCatalog::parse_with_capabilities(
+                &serde_json::to_string(&generated.models).unwrap(),
+                &serde_json::to_string(&generated.provenance).unwrap(),
+                generated.tool_capabilities,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn injected_origin_stays_isolated_on_insert_workspace_and_global_reconstruction() {
+        let catalog = catalog_with_restricted_parallel();
+        for endpoint in [
+            None,
+            Some("https://api.openai.com/v1"),
+            Some("https://private.invalid/v1"),
+        ] {
+            let registry = scoped_registry(endpoint);
+            registry
+                .insert(
+                    " OPENAI ",
+                    Arc::new(NativeModelsProvider {
+                        name: "openai",
+                        catalog: catalog.clone(),
+                    }),
+                )
+                .unwrap();
+            for path in 0..3 {
+                let (workspace, provider) = match path {
+                    0 => (None, registry.get_or_create("openai").unwrap()),
+                    1 => (
+                        Some("workspace-a"),
+                        registry
+                            .get_or_create_for_workspace("workspace-a", "openai")
+                            .unwrap(),
+                    ),
+                    _ => {
+                        registry.invalidate_global_provider("openai");
+                        (None, registry.get_or_create("openai").unwrap())
+                    }
+                };
+                let wrapper = cached_wrapper(&registry, workspace, "openai");
+                assert!(
+                    !wrapper.use_public_catalog,
+                    "path {path}, endpoint {endpoint:?}"
+                );
+                // Public negative, positive and compat controls all stay out.
+                for id in ["g03-positive", "g03-negative"] {
+                    assert_eq!(wrapper_support(&wrapper, id, &catalog).await, None);
+                    assert!(wrapper.model_tool_calling_with_catalog(id, Some(&catalog)));
+                    let mut request = crate::tools::policy::test_request();
+                    request.model = id.into();
+                    request.parallel_tool_calls = Some(false);
+                    assert!(provider.chat(request.clone()).await.is_ok());
+                    assert!(provider.stream_chat(request).await.is_ok());
+                }
+                let mut models = wrapper.inner.list_models().await.unwrap();
+                wrapper.enrich_discovery(&catalog, &mut models);
+                assert_eq!(
+                    wrapper_support(&wrapper, "g03-positive", &catalog).await,
+                    Some(false)
+                );
+                assert!(!provider.model_tool_calling("g03-positive"));
+                let mut request = crate::tools::policy::test_request();
+                request.model = "g03-positive".into();
+                assert!(provider.chat(request.clone()).await.is_err());
+                assert!(provider.stream_chat(request).await.is_err());
+                // Native positive does not inherit public negative.
+                assert_eq!(
+                    wrapper_support(&wrapper, "g03-negative", &catalog).await,
+                    Some(true)
+                );
+                assert!(provider.model_tool_calling("g03-negative"));
+                let mut positive = crate::tools::policy::test_request();
+                positive.model = "g03-negative".into();
+                positive.parallel_tool_calls = Some(false);
+                assert!(provider.chat(positive.clone()).await.is_ok());
+                assert!(provider.stream_chat(positive).await.is_ok());
+                let other = registry
+                    .get_or_create_for_workspace(&format!("other-{path}"), "openai")
+                    .unwrap();
+                let other_wrapper =
+                    cached_wrapper(&registry, Some(&format!("other-{path}")), "openai");
+                assert_eq!(
+                    wrapper_support(&other_wrapper, "g03-positive", &catalog).await,
+                    None
+                );
+                assert!(other.model_tool_calling("g03-positive"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn factory_origin_retains_only_stock_source_and_control_scope_after_reconstruction() {
+        let catalog = catalog_with_restricted_parallel();
+        for endpoint in [
+            None,
+            Some("https://api.openai.com/v1/"),
+            Some("https://private.invalid/v1"),
+        ] {
+            let registry = scoped_registry(endpoint);
+            let public = endpoint != Some("https://private.invalid/v1");
+            for path in 0..3 {
+                let workspace = (path == 1).then_some("workspace-a");
+                if path == 2 {
+                    registry.invalidate_global_provider("openai");
+                }
+                let _lease = match workspace {
+                    Some(ws) => registry.get_or_create_for_workspace(ws, "openai").unwrap(),
+                    None => registry.get_or_create("openai").unwrap(),
+                };
+                let wrapper = cached_wrapper(&registry, workspace, "openai");
+                assert_eq!(wrapper.use_public_catalog, public);
+                assert_eq!(
+                    wrapper_support(&wrapper, "g03-negative", &catalog).await,
+                    public.then_some(false)
+                );
+                assert_eq!(
+                    wrapper_support(&wrapper, "g03-positive", &catalog).await,
+                    public.then_some(true)
+                );
+                assert_eq!(
+                    wrapper.model_tool_calling_with_catalog("g03-negative", Some(&catalog)),
+                    !public
+                );
+                let mut request = crate::tools::policy::test_request();
+                request.model = "g03-positive".into();
+                request.parallel_tool_calls = Some(false);
+                let result = crate::tools::policy::with_discovery_tools(
+                    wrapper.name(),
+                    wrapper.use_public_catalog,
+                    wrapper.discovery_tool_snapshot(),
+                    async {
+                        crate::tools::policy::prepare_request_with_catalog(
+                            wrapper.name(),
+                            request,
+                            Some(&catalog),
+                        )
+                    },
+                )
+                .await;
+                assert_eq!(result.is_err(), public); // explicit public compat restriction
+            }
+        }
     }
 
     #[test]
