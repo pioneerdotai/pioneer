@@ -463,9 +463,7 @@ pub(crate) async fn final_response_aliases(
     reasoning_id: Option<&str>,
 ) -> Result<FinalResponseAliasEvidence> {
     let fence = store.compaction_history_read_fence().await?;
-    let mut aliases = Vec::new();
-    let mut final_seen = false;
-    let mut reasoning_seen = reasoning_id.is_none();
+    let mut events = Vec::new();
     let mut after = 0;
     loop {
         let page = store
@@ -478,30 +476,98 @@ pub(crate) async fn final_response_aliases(
                 fence.event_order,
             )
             .await?;
-        for event in page.entries {
-            if event
+        events.extend(page.entries.into_iter().filter(|event| {
+            event
                 .item_id
                 .as_deref()
                 .is_some_and(|id| id == final_id || Some(id) == reasoning_id)
-                && !matches!(
-                    event.projection_kind.as_deref(),
-                    Some("start" | "technical")
-                )
-            {
-                final_seen |= event.item_id.as_deref() == Some(final_id);
-                reasoning_seen |= event.item_id.as_deref() == reasoning_id;
-                aliases.push(MessageSourceAlias {
-                    represented_thread_id: thread.into(),
-                    represented_source: runtime_source_ref(represented),
-                    thread_id: thread.into(),
-                    source: runtime_source_ref(&event.reference),
-                });
-            }
-        }
+        }));
         if page.next_sequence <= after {
             break;
         }
         after = page.next_sequence;
+    }
+    final_response_evidence_at_fence(
+        store,
+        workspace,
+        thread,
+        turn,
+        represented,
+        final_id,
+        reasoning_id,
+        &events,
+    )
+    .await
+}
+
+/// Completion and model projection are separate facts. In particular, an empty
+/// completed Reasoning/AgentMessage is omitted, but still completes its exact UI
+/// identity. Read only matching completed revisions; never infer completion from
+/// a technical classification or a started/updated item. The caller's captured
+/// metadata fence selects revisions, and the repository authenticates each read.
+#[allow(clippy::too_many_arguments)]
+async fn final_response_evidence_at_fence(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    represented: &SourceRef,
+    final_id: &str,
+    reasoning_id: Option<&str>,
+    events: &[SourceRecord],
+) -> Result<FinalResponseAliasEvidence> {
+    ensure!(
+        represented.scope == format!("context:{turn}") && !represented.version.is_empty(),
+        "final response source authority mismatch"
+    );
+    let mut aliases = Vec::new();
+    let mut final_seen = false;
+    let mut reasoning_seen = reasoning_id.is_none();
+    for row in events {
+        if row.source_type != pioneer_protocol::constants::events::ITEM_COMPLETED
+            || row.reference.scope != format!("event:{turn}")
+            || row.reference.version.is_empty()
+            || !row
+                .item_id
+                .as_deref()
+                .is_some_and(|id| id == final_id || Some(id) == reasoning_id)
+        {
+            continue;
+        }
+        // Released exact repository read, then typed decoding outside DB access.
+        // This also works with legacy cached `technical` or missing metadata.
+        let payload = reference_payload(store, workspace, thread, &row.reference).await?;
+        let event: Event = serde_json::from_str(&payload)?;
+        ensure!(
+            event.workspace_id() == workspace
+                && event.thread_id() == thread
+                && event.turn_id() == turn,
+            "final UI completion scope mismatch"
+        );
+        let Event::ItemCompleted(completed) = &event else {
+            continue;
+        };
+        let item = &completed.item;
+        if row.item_id.as_deref() != Some(item.item_id()) {
+            continue;
+        }
+        let is_final = matches!(item, pioneer_protocol::TurnItem::AgentMessage {id, phase: pioneer_protocol::AgentMessagePhase::FinalAnswer, ..} if id == final_id);
+        let is_reasoning = matches!(item, pioneer_protocol::TurnItem::Reasoning {id, ..} if Some(id.as_str()) == reasoning_id);
+        if !is_final && !is_reasoning {
+            continue;
+        }
+        final_seen |= is_final;
+        reasoning_seen |= is_reasoning;
+        // Omitted UI copies need no model-facing suppression edge. Visible
+        // copies retain exact source/version aliases for checkpoint publication.
+        if !pioneer_crud::canonical_event_model_projection(&event).is_omitted() {
+            aliases.push(MessageSourceAlias {
+                represented_thread_id: thread.into(),
+                represented_source: runtime_source_ref(represented),
+                thread_id: thread.into(),
+                source: runtime_source_ref(&row.reference),
+            });
+        }
     }
     Ok(FinalResponseAliasEvidence {
         aliases,
@@ -2060,50 +2126,31 @@ async fn load_line_history_inner(
                             if let Some(item) = row.item_id.as_ref() {
                                 aliases.insert(item.clone());
                             }
+                            let evidence = if envelope.calls.is_empty() {
+                                final_response_evidence_at_fence(
+                                    store,
+                                    workspace,
+                                    thread,
+                                    &turn.id,
+                                    &row.reference,
+                                    &envelope.round_id,
+                                    row.item_id.as_deref(),
+                                    &alias_events,
+                                )
+                                .await?
+                            } else {
+                                FinalResponseAliasEvidence {
+                                    aliases: Vec::new(),
+                                    ready: true,
+                                }
+                            };
                             pending = Some(Round {
                                 sequence: starts
                                     .get(&envelope.round_id)
                                     .copied()
                                     .unwrap_or(row.sequence),
-                                response_copies_ready: alias_events.iter().any(|event| {
-                                    event.item_id.as_ref() == Some(&envelope.round_id)
-                                        && !matches!(
-                                            event.projection_kind.as_deref(),
-                                            Some("start" | "technical")
-                                        )
-                                }) && row.item_id.as_ref().is_none_or(
-                                    |item| {
-                                        alias_events.iter().any(|event| {
-                                            event.item_id.as_ref() == Some(item)
-                                                && !matches!(
-                                                    event.projection_kind.as_deref(),
-                                                    Some("start" | "technical")
-                                                )
-                                        })
-                                    },
-                                ),
-                                response_aliases: if envelope.calls.is_empty() {
-                                    alias_events
-                                        .iter()
-                                        .filter(|event| {
-                                            event.item_id.as_ref().is_some_and(|item| {
-                                                item == &envelope.round_id
-                                                    || row.item_id.as_ref() == Some(item)
-                                            }) && !matches!(
-                                                event.projection_kind.as_deref(),
-                                                Some("start" | "technical")
-                                            )
-                                        })
-                                        .map(|event| MessageSourceAlias {
-                                            represented_thread_id: thread.into(),
-                                            represented_source: runtime_source_ref(&row.reference),
-                                            thread_id: thread.into(),
-                                            source: runtime_source_ref(&event.reference),
-                                        })
-                                        .collect()
-                                } else {
-                                    Vec::new()
-                                },
+                                response_copies_ready: evidence.ready,
+                                response_aliases: evidence.aliases,
                                 assistant_source: row.reference,
                                 envelope,
                                 results: BTreeMap::new(),

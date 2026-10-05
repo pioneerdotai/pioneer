@@ -3998,32 +3998,10 @@ impl RecoveryCoordinator {
         rows.retain(|row| !verified_legacy.contains(&row.sequence));
         // Capture the exact round/item mapping before the existing recovery
         // assembler orders results and synthesizes safe interrupted observations.
-        let mut origins = retained_history_origins(&workspace, &thread, turn_id, &rows, &sources)?;
-        for row in rows.iter().filter(|row| row.source == "assistant_round") {
-            let Ok(envelope) = serde_json::from_str::<
-                pioneer_provider::CanonicalProviderRoundEnvelope,
-            >(&row.payload) else {
-                continue;
-            };
-            if envelope.calls.is_empty() {
-                if let (Some(round), Some(source)) =
-                    (origins.get_mut(&row.sequence), sources.get(&row.sequence))
-                {
-                    let evidence = crate::compaction::final_response_aliases(
-                        &self.crud_store,
-                        &workspace,
-                        &thread,
-                        turn_id,
-                        source,
-                        &envelope.round_id,
-                        row.item_id.as_deref(),
-                    )
-                    .await?;
-                    round.assistant.source_aliases = evidence.aliases;
-                    round.assistant.complete &= evidence.ready;
-                }
-            }
-        }
+        let origins = hydrated_retained_history_origins(
+            &store, &workspace, &thread, turn_id, &rows, &sources,
+        )
+        .await?;
         // A terminal shell item is acknowledged before the replay row. Recover
         // that known outcome if the process stopped between the two appends.
         let recorded_items = rows
@@ -4353,6 +4331,77 @@ struct RetainedRoundOrigins {
 struct RetainedToolOrigin {
     item_id: String,
     provenance: Option<pioneer_provider::MessageProvenance>,
+}
+
+async fn hydrated_retained_history_origins(
+    store: &pioneer_crud::CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    rows: &[RetainedProviderHistoryRow],
+    sources: &HashMap<i64, pioneer_compaction::SourceRef>,
+) -> Result<HashMap<i64, RetainedRoundOrigins>> {
+    let mut origins = retained_history_origins(workspace, thread, turn, rows, sources)?;
+    for row in rows.iter().filter(|row| row.source == "assistant_round") {
+        let Ok(envelope) =
+            serde_json::from_str::<pioneer_provider::CanonicalProviderRoundEnvelope>(&row.payload)
+        else {
+            continue;
+        };
+        if envelope.calls.is_empty() {
+            if let (Some(round), Some(source)) =
+                (origins.get_mut(&row.sequence), sources.get(&row.sequence))
+            {
+                let evidence = crate::compaction::final_response_aliases(
+                    store,
+                    workspace,
+                    thread,
+                    turn,
+                    source,
+                    &envelope.round_id,
+                    row.item_id.as_deref(),
+                )
+                .await?;
+                round.assistant.source_aliases = evidence.aliases;
+                round.assistant.complete &= evidence.ready;
+            }
+        }
+    }
+    Ok(origins)
+}
+
+// Uses the same durable hydration as recovery, without starting a coordinator,
+// provider or recovery runner in the regression fixture.
+#[cfg(test)]
+pub(crate) async fn recovered_final_origin_for_test(
+    store: &pioneer_crud::CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    row: &pioneer_crud::TurnLlmContextEntry,
+    source: &pioneer_compaction::SourceRef,
+) -> Result<pioneer_provider::MessageProvenance> {
+    let row = RetainedProviderHistoryRow {
+        sequence: row.sequence,
+        source: row.source.clone(),
+        item_id: row.item_id.clone(),
+        tool_name: row.tool_name.clone(),
+        payload: row.payload.clone(),
+    };
+    let sequence = row.sequence;
+    let mut origins = hydrated_retained_history_origins(
+        &store.with_maintenance_access(),
+        workspace,
+        thread,
+        turn,
+        &[row],
+        &HashMap::from([(sequence, source.clone())]),
+    )
+    .await?;
+    Ok(origins
+        .remove(&sequence)
+        .ok_or_else(|| anyhow::anyhow!("final origin missing"))?
+        .assistant)
 }
 
 fn retained_history_origins(

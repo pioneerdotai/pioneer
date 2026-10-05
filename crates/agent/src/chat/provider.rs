@@ -1508,6 +1508,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_final_without_native_state_or_reasoning_does_not_expect_ui_aliases() {
+        let hub = AgentEventHub::new();
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        persist_completed_response(
+            &hub, "thread", "turn", "final", "thinking", "answer", "", None,
+        )
+        .await
+        .unwrap();
+        assert!(futures_util::FutureExt::now_or_never(receiver.recv()).is_none());
+    }
+
+    #[tokio::test]
     async fn completed_native_response_waits_for_durable_history_acknowledgement() {
         let hub = AgentEventHub::new();
         let mut receiver = hub.take_durable_receiver().await.unwrap();

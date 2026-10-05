@@ -12,15 +12,92 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[tokio::test]
 async fn durable_final_response_aliases_survive_checkpoint_cleanup_and_frozen_restart() {
+    for (provider, model, native, reasoning, ui_final, content) in [
+        (
+            "deepseek",
+            "deepseek-reasoner",
+            json!({"schema_version":1,"assistant_message":{"reasoning_content":"canonical reasoning","content":"canonical final answer"}}),
+            "canonical reasoning",
+            "canonical final answer",
+            "canonical final answer",
+        ),
+        (
+            "anthropic",
+            "claude-sonnet-4-6",
+            json!({"schema_version":2,"blocks":[{"type":"text","text":"canonical final answer"}]}),
+            "",
+            "canonical final answer",
+            "canonical final answer",
+        ),
+        (
+            "gemini",
+            "gemini-2.5-flash",
+            json!({"schema_version":2,"parts":[{"text":"canonical final answer"}]}),
+            "",
+            "canonical final answer",
+            "canonical final answer",
+        ),
+        (
+            "anthropic",
+            "claude-sonnet-4-6",
+            json!({"schema_version":2,"blocks":[{"type":"redacted_thinking","data":"synthetic opaque"},{"type":"text","text":"canonical final answer"}]}),
+            "",
+            "canonical final answer",
+            "canonical final answer",
+        ),
+        (
+            "deepseek",
+            "deepseek-reasoner",
+            json!({"schema_version":1,"assistant_message":{"reasoning_content":"","content":"canonical final answer"}}),
+            "",
+            "canonical final answer",
+            "canonical final answer",
+        ),
+        (
+            "deepseek",
+            "deepseek-reasoner",
+            json!({"schema_version":1,"assistant_message":{"reasoning_content":"canonical reasoning","content":""}}),
+            "canonical reasoning",
+            " \n",
+            "",
+        ),
+        (
+            "deepseek",
+            "deepseek-reasoner",
+            json!({"schema_version":1,"assistant_message":{"reasoning_content":"canonical reasoning","content":""}}),
+            "canonical reasoning",
+            "",
+            "",
+        ),
+        // Native text is available even though both portable UI copies are omitted.
+        (
+            "gemini",
+            "gemini-2.5-flash",
+            json!({"schema_version":2,"parts":[{"text":"native answer"}]}),
+            "",
+            "",
+            "",
+        ),
+    ] {
+        durable_final_case(provider, model, native, reasoning, ui_final, content).await;
+    }
+}
+
+async fn durable_final_case(
+    provider: &str,
+    model: &str,
+    native: serde_json::Value,
+    reasoning: &str,
+    ui_final: &str,
+    content: &str,
+) {
     let thread = "g05-final-thread";
     let turn = "g05-final-turn";
     let (processor, store, workspace) = setup_execution_window_terminal_turn(thread, turn).await;
-    let mut answer = ChatMessage::assistant("canonical final answer");
-    answer.reasoning_content = Some("canonical reasoning".into());
+    let mut answer = ChatMessage::assistant(content);
+    answer.reasoning_content = (!reasoning.is_empty()).then(|| reasoning.to_owned());
     answer.provider_replay_state = Some(pioneer_provider::ProviderReplayState::for_model(
-        "deepseek",
-        "deepseek-reasoner",
-        json!({"schema_version":1,"assistant_message":{"reasoning_content":"canonical reasoning","content":"canonical final answer"}}),
+        provider, model, native,
     ));
     let envelope = CanonicalProviderRoundEnvelope {
         version: 1,
@@ -45,15 +122,10 @@ async fn durable_final_response_aliases_survive_checkpoint_cleanup_and_frozen_re
     };
     let (ack, ()) = tokio::join!(append, commit);
     ack.unwrap();
-    let before_ui = load_line_history(
-        &store,
-        &workspace,
-        thread,
-        None,
-        &store.compaction_history_read_fence().await.unwrap(),
-    )
-    .await
-    .unwrap();
+    let pending_fence = store.compaction_history_read_fence().await.unwrap();
+    let before_ui = load_line_history(&store, &workspace, thread, None, &pending_fence)
+        .await
+        .unwrap();
     assert!(
         !before_ui
             .iter()
@@ -65,15 +137,104 @@ async fn durable_final_response_aliases_survive_checkpoint_cleanup_and_frozen_re
             .complete,
         "ACK alone cannot publish copy aliases before UI revisions exist"
     );
+    let pending_origin = before_ui
+        .iter()
+        .find(|m| m.provider_replay_state.is_some())
+        .unwrap()
+        .provenance
+        .as_ref()
+        .unwrap();
+    let pending_source = SourceRef {
+        scope: pending_origin.sources[0].scope.clone(),
+        id: pending_origin.sources[0].id.clone(),
+        version: pending_origin.sources[0].version.clone(),
+    };
+    let row = store.list_turn_llm_context(turn).await.unwrap().remove(0);
+    let recovered_pending = crate::resilience::recovered_final_origin_for_test(
+        &store,
+        &workspace,
+        thread,
+        turn,
+        &row,
+        &pending_source,
+    )
+    .await
+    .unwrap();
+    assert!(!recovered_pending.complete);
+    // Started records with the expected IDs cannot discharge the boundary.
     for item in [
         TurnItem::Reasoning {
             id: "reasoning-item".into(),
             summary: vec![],
-            content: vec!["canonical reasoning".into()],
+            content: vec![],
         },
         TurnItem::AgentMessage {
             id: "final-item".into(),
-            text: "canonical final answer".into(),
+            text: String::new(),
+            phase: Default::default(),
+            markdown: None,
+            markdown_version: None,
+        },
+    ] {
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: workspace.clone(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item,
+                },
+                now_timestamp_secs(),
+            )
+            .await
+            .unwrap();
+    }
+    let started = load_line_history(
+        &store,
+        &workspace,
+        thread,
+        None,
+        &store.compaction_history_read_fence().await.unwrap(),
+    )
+    .await
+    .unwrap();
+    let started_canonical = started
+        .iter()
+        .find(|m| m.provider_replay_state.is_some())
+        .unwrap();
+    assert!(!started_canonical.provenance.as_ref().unwrap().complete);
+    for mode in [CompactionMode::Normal, CompactionMode::Emergency] {
+        let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+            &workspace,
+            thread,
+            std::slice::from_ref(started_canonical),
+            &[100],
+        )
+        .unwrap();
+        assert!(
+            pioneer_compaction::plan_compaction(
+                &layout.units,
+                &ModelBudget::new(Some(32768), None, None),
+                256,
+                0,
+                512,
+                mode,
+                CoverageDomain::WorkingContext,
+                true,
+                "pending"
+            )
+            .is_err()
+        );
+    }
+    for item in [
+        TurnItem::Reasoning {
+            id: "reasoning-item".into(),
+            summary: vec![],
+            content: vec![reasoning.into()],
+        },
+        TurnItem::AgentMessage {
+            id: "final-item".into(),
+            text: ui_final.into(),
             phase: Default::default(),
             markdown: None,
             markdown_version: None,
@@ -99,24 +260,39 @@ async fn durable_final_response_aliases_survive_checkpoint_cleanup_and_frozen_re
             .await
             .unwrap();
     }
+    let old_fence = load_line_history(&store, &workspace, thread, None, &pending_fence)
+        .await
+        .unwrap();
+    assert!(
+        !old_fence
+            .iter()
+            .find(|m| m.provider_replay_state.is_some())
+            .unwrap()
+            .provenance
+            .as_ref()
+            .unwrap()
+            .complete,
+        "later completion cannot escape the captured fence"
+    );
     let fence = store.compaction_history_read_fence().await.unwrap();
     let messages = load_line_history(&store, &workspace, thread, None, &fence)
         .await
         .unwrap();
-    assert_eq!(
-        messages
-            .iter()
-            .filter(|m| m.content == "canonical final answer")
-            .count(),
-        1
-    );
+    assert_eq!(messages.iter().filter(|m| m.content == content).count(), 1);
     let canonical = messages
         .iter()
         .find(|m| m.provider_replay_state.is_some())
         .unwrap()
         .clone();
     let origin = canonical.provenance.as_ref().unwrap();
-    assert_eq!(origin.source_aliases.len(), 2);
+    assert!(
+        origin.complete,
+        "completed omitted UI copies must not hold a final pending"
+    );
+    assert_eq!(
+        origin.source_aliases.len(),
+        usize::from(!reasoning.trim().is_empty()) + usize::from(!ui_final.trim().is_empty())
+    );
     let source = SourceRef {
         scope: origin.sources[0].scope.clone(),
         id: origin.sources[0].id.clone(),
@@ -132,7 +308,8 @@ async fn durable_final_response_aliases_survive_checkpoint_cleanup_and_frozen_re
     .await
     .unwrap();
     assert_eq!(selected.len(), 1);
-    assert_eq!(selected[0].content, "canonical final answer");
+    assert!(selected[0].provenance.as_ref().unwrap().complete);
+    assert_eq!(selected[0].content, content);
     assert_eq!(
         selected[0].provenance.as_ref().unwrap().source_aliases,
         origin.source_aliases,
@@ -158,6 +335,73 @@ async fn durable_final_response_aliases_survive_checkpoint_cleanup_and_frozen_re
     .unwrap();
     assert_eq!(selected_neighbor.len(), 1);
     assert_eq!(selected_neighbor[0].content, "unrelated neighbor");
+    // Actual provider preparation sees one native answer before publication.
+    let prepared = pioneer_provider::attachments::prepare_messages_for_provider_async(
+        provider,
+        model,
+        &pioneer_provider::ProviderCapabilities::default(),
+        &messages,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        prepared
+            .messages
+            .iter()
+            .filter(|m| m.provider_replay_state.is_some())
+            .count(),
+        1
+    );
+    for mode in [CompactionMode::Normal, CompactionMode::Emergency] {
+        let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+            &workspace,
+            thread,
+            &messages,
+            &vec![100; messages.len()],
+        )
+        .unwrap();
+        assert!(layout.units.iter().all(|unit| unit.complete));
+        let plan = pioneer_compaction::plan_compaction(
+            &layout.units,
+            &ModelBudget::new(Some(32768), None, None),
+            256,
+            0,
+            512,
+            mode,
+            CoverageDomain::WorkingContext,
+            true,
+            "g05-completed-ui",
+        )
+        .unwrap();
+        assert!(
+            plan.coverage.contains(&source),
+            "final eligible in {mode:?}"
+        );
+    }
+    let row = store
+        .list_turn_llm_context(turn)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.source == "assistant_round")
+        .unwrap();
+    let recovered = crate::resilience::recovered_final_origin_for_test(
+        &store, &workspace, thread, turn, &row, &source,
+    )
+    .await
+    .unwrap();
+    assert!(recovered.complete);
+    assert_eq!(recovered.source_aliases, origin.source_aliases);
+    let mut recovered_message = canonical.clone();
+    recovered_message.provenance = Some(recovered);
+    let recovered_layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+        &workspace,
+        thread,
+        &[recovered_message],
+        &[100],
+    )
+    .unwrap();
+    assert!(recovered_layout.units[0].complete);
     let allowed = BTreeSet::from([thread.to_owned()]);
     let accepted_descriptor = frozen::capture(&store, &workspace, thread, &allowed, &messages)
         .await
@@ -181,6 +425,7 @@ async fn durable_final_response_aliases_survive_checkpoint_cleanup_and_frozen_re
     )
     .await
     .unwrap();
+    assert!(hot.provenance.as_ref().unwrap().complete);
     assert_eq!(
         hot.provenance.as_ref().unwrap().source_aliases,
         origin.source_aliases
@@ -318,7 +563,9 @@ async fn durable_final_response_aliases_survive_checkpoint_cleanup_and_frozen_re
         !accepted
             .messages
             .iter()
-            .any(|m| m.content == "canonical final answer" || m.content == "canonical reasoning")
+            .any(|m| m.provider_replay_state.is_some()
+                || (!ui_final.trim().is_empty() && m.content == ui_final)
+                || m.content.contains("canonical reasoning"))
     );
     assert!(
         accepted
@@ -344,8 +591,46 @@ async fn durable_final_response_aliases_survive_checkpoint_cleanup_and_frozen_re
         !cold
             .messages
             .iter()
-            .any(|m| m.content == "canonical final answer" || m.content == "canonical reasoning")
+            .any(|m| m.provider_replay_state.is_some()
+                || (!ui_final.trim().is_empty() && m.content == ui_final)
+                || m.content.contains("canonical reasoning"))
     );
+    let prepared = pioneer_provider::attachments::prepare_messages_for_provider_async(
+        provider,
+        model,
+        &pioneer_provider::ProviderCapabilities::default(),
+        &cold.messages,
+    )
+    .await
+    .unwrap();
+    assert!(
+        prepared
+            .messages
+            .iter()
+            .all(|m| m.provider_replay_state.is_none())
+    );
+    assert!(
+        !prepared
+            .messages
+            .iter()
+            .any(|m| (!ui_final.trim().is_empty() && m.content == ui_final)
+                || m.content.contains("canonical reasoning")),
+        "summary must not replay the original visible UI answer/reasoning"
+    );
+    assert!(
+        prepared
+            .messages
+            .iter()
+            .any(|m| m.content == "unrelated neighbor")
+    );
+    let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+        &workspace,
+        thread,
+        &cold.messages,
+        &vec![100; cold.messages.len()],
+    )
+    .unwrap();
+    assert!(layout.units.iter().all(|unit| unit.complete));
     let restored = frozen::restore(&store, &workspace, &allowed, &cold.descriptor)
         .await
         .unwrap();
@@ -355,4 +640,235 @@ async fn durable_final_response_aliases_survive_checkpoint_cleanup_and_frozen_re
             .await
             .unwrap();
     assert_eq!(restarted.messages, cold.messages);
+}
+
+#[tokio::test]
+async fn unrelated_technical_completion_and_foreign_identity_do_not_discharge_final_boundary() {
+    let thread = "g05-negative-thread";
+    let turn = "g05-negative-turn";
+    let (processor, store, workspace) = setup_execution_window_terminal_turn(thread, turn).await;
+    let mut answer = ChatMessage::assistant("answer");
+    answer.provider_replay_state = Some(pioneer_provider::ProviderReplayState::for_model(
+        "gemini",
+        "gemini-2.5-flash",
+        json!({"schema_version":2,"parts":[{"text":"answer"}]}),
+    ));
+    let hub = pioneer_agent::AgentEventHub::new();
+    let mut receiver = hub.take_durable_receiver().await.unwrap();
+    let append = hub.publish_durable_and_wait(AgentDurableEvent::TurnProviderHistoryAppended {
+        thread_id: thread.into(),
+        turn_id: turn.into(),
+        item_id: "expected-reasoning".into(),
+        sequence: 1,
+        payload: serde_json::to_value(CanonicalProviderRoundEnvelope {
+            version: 1,
+            round_id: "expected-final".into(),
+            termination: ProviderTermination::Complete,
+            message: answer,
+            calls: vec![],
+        })
+        .unwrap(),
+    });
+    let commit = async {
+        assert!(
+            processor
+                .handle_durable_agent_event(receiver.recv().await.unwrap())
+                .await
+        );
+        receiver.acknowledge_last(Ok(()));
+    };
+    let (ack, ()) = tokio::join!(append, commit);
+    ack.unwrap();
+    for item in [
+        // Same expected identity, wrong typed completion: technical is not proof.
+        context_compaction_item("expected-reasoning"),
+        TurnItem::Reasoning {
+            id: "foreign-reasoning".into(),
+            summary: vec![],
+            content: vec![],
+        },
+        TurnItem::AgentMessage {
+            id: "expected-final".into(),
+            text: "answer".into(),
+            phase: Default::default(),
+            markdown: None,
+            markdown_version: None,
+        },
+    ] {
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: workspace.clone(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item,
+                },
+                now_timestamp_secs(),
+            )
+            .await
+            .unwrap();
+    }
+    let fence = store.compaction_history_read_fence().await.unwrap();
+    let messages = load_line_history(&store, &workspace, thread, None, &fence)
+        .await
+        .unwrap();
+    let canonical = messages
+        .iter()
+        .find(|m| m.provider_replay_state.is_some())
+        .unwrap();
+    let origin = canonical.provenance.as_ref().unwrap();
+    assert!(!origin.complete);
+    assert_eq!(origin.source_aliases.len(), 1);
+    let source = SourceRef {
+        scope: origin.sources[0].scope.clone(),
+        id: origin.sources[0].id.clone(),
+        version: origin.sources[0].version.clone(),
+    };
+    let exact = load_exact_line_history(
+        &store,
+        &workspace,
+        thread,
+        &fence,
+        &BTreeSet::from([source.clone()]),
+    )
+    .await
+    .unwrap();
+    assert!(!exact[0].provenance.as_ref().unwrap().complete);
+    let row = store.list_turn_llm_context(turn).await.unwrap().remove(0);
+    assert!(
+        !crate::resilience::recovered_final_origin_for_test(
+            &store, &workspace, thread, turn, &row, &source
+        )
+        .await
+        .unwrap()
+        .complete
+    );
+    let allowed = BTreeSet::from([thread.to_owned()]);
+    let mut hot = canonical.clone();
+    hot.provenance = Some(pioneer_agent::compaction::history::pending_origin(
+        &workspace,
+        thread,
+        turn,
+        "expected-final",
+        pioneer_agent::compaction::history::PendingOriginKind::Assistant,
+        "expected-reasoning",
+    ));
+    crate::compaction::resolve_message_origins(
+        &store,
+        &workspace,
+        thread,
+        turn,
+        &allowed,
+        std::slice::from_mut(&mut hot),
+    )
+    .await
+    .unwrap();
+    assert!(!hot.provenance.as_ref().unwrap().complete);
+    // Foreign source scopes/revisions cannot authorize the canonical projection.
+    for invalid in [
+        SourceRef {
+            scope: "context:foreign-turn".into(),
+            ..source.clone()
+        },
+        SourceRef {
+            version: "revision:999999".into(),
+            ..source.clone()
+        },
+    ] {
+        assert!(
+            store
+                .compaction_reference_payload(&workspace, thread, &invalid)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(
+        store
+            .compaction_reference_payload("foreign-workspace", thread, &source)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .compaction_reference_payload(&workspace, "foreign-thread", &source)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for mode in [CompactionMode::Normal, CompactionMode::Emergency] {
+        let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+            &workspace,
+            thread,
+            std::slice::from_ref(canonical),
+            &[100],
+        )
+        .unwrap();
+        assert!(
+            pioneer_compaction::plan_compaction(
+                &layout.units,
+                &ModelBudget::new(Some(32768), None, None),
+                256,
+                0,
+                512,
+                mode,
+                CoverageDomain::WorkingContext,
+                true,
+                "negative"
+            )
+            .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn ordinary_ui_only_final_keeps_existing_cold_history_eligibility() {
+    let thread = "g05-ordinary-thread";
+    let turn = "g05-ordinary-turn";
+    let (_, store, workspace) = setup_execution_window_terminal_turn(thread, turn).await;
+    store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: TurnItem::AgentMessage {
+                    id: "ordinary-final".into(),
+                    text: "ordinary answer".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    let messages = load_line_history(
+        &store,
+        &workspace,
+        thread,
+        None,
+        &store.compaction_history_read_fence().await.unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m.content == "ordinary answer")
+            .count(),
+        1
+    );
+    assert!(messages.iter().all(|m| m.provider_replay_state.is_none()));
+    assert!(store.list_turn_llm_context(turn).await.unwrap().is_empty());
+    let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+        &workspace,
+        thread,
+        &messages,
+        &vec![100; messages.len()],
+    )
+    .unwrap();
+    assert!(layout.units.iter().all(|u| u.complete));
 }

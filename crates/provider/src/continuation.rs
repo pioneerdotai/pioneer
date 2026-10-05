@@ -1,5 +1,5 @@
 //! Protocol rules for immutable continuation, not model availability/limits.
-//! Protocol sources (reviewed 2026-10-02):
+//! Protocol sources (reviewed 2026-10-02; OpenRouter detail leaf rechecked 2026-10-05):
 //! https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
 //! https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html
 //! https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures
@@ -139,15 +139,60 @@ pub fn retention(state: &ProviderReplayState) -> Retention {
             let Some(details) = p["reasoning_details"].as_array() else {
                 return Retention::Unsupported;
             };
-            if details.iter().any(|d| {
-                d["type"] == "reasoning.encrypted"
-                    || d.get("signature").is_some_and(|v| !v.is_null())
+            // Empty arrays contain no continuation blocks. The response producer
+            // already omits replay state for them; accept equivalent legacy state.
+            if details.is_empty() {
+                return Retention::Ordinary;
+            }
+            // Positively identify documented readable variants, not merely the
+            // absence of a known encrypted marker. Format/model names cannot
+            // prove upstream authority. Unknown/opaque details remain stored.
+            // https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#reasoning-detail-types
+            if details.iter().all(|detail| {
+                let Some(object) = detail.as_object() else {
+                    return false;
+                };
+                if object
+                    .get("signature")
+                    .is_some_and(|value| !value.is_null())
+                {
+                    return false;
+                }
+                // Additional opaque extension fields are not a proven readable
+                // contract either; common metadata is preserved, not authority.
+                if object.keys().any(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "type" | "text" | "summary" | "signature" | "id" | "format" | "index"
+                    )
+                }) {
+                    return false;
+                }
+                if !object
+                    .get("id")
+                    .is_none_or(|value| value.is_null() || value.is_string())
+                    || !object.get("format").is_none_or(Value::is_string)
+                    || !object.get("index").is_none_or(Value::is_number)
+                {
+                    return false;
+                }
+                match object.get("type").and_then(Value::as_str) {
+                    Some("reasoning.text") => {
+                        object.get("text").is_some_and(Value::is_string)
+                            && !object.contains_key("summary")
+                    }
+                    Some("reasoning.summary") => {
+                        object.get("summary").is_some_and(Value::is_string)
+                            && !object.contains_key("text")
+                    }
+                    _ => false,
+                }
             }) {
-                // Chat route does not expose original upstream system/tools or
-                // account authority. Even a Claude model name is not that proof.
-                Retention::Unsupported
-            } else {
                 Retention::ActiveTurn
+            } else {
+                // Chat exposes neither original upstream prefix nor account
+                // authority for encrypted/signed or an unknown native contract.
+                Retention::Unsupported
             }
         }
         _ if p["schema_version"] == 1 && p["assistant_message"].is_object() => {
@@ -311,8 +356,103 @@ pub(crate) fn validate_prefix(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    // Hypothetical unknown variants are policy fixtures, not observed responses.
+    pub(crate) fn openrouter_detail_cases() -> Vec<(Value, Retention)> {
+        use serde_json::json;
+        vec![
+            (
+                json!([{"type":"reasoning.text","text":"first","signature":null,"format":"anthropic-claude-v1","index":0},{"type":"reasoning.summary","summary":"second","index":1}]),
+                Retention::ActiveTurn,
+            ),
+            (
+                json!([{"type":"reasoning.text","text":"","id":null}]),
+                Retention::ActiveTurn,
+            ),
+            (
+                json!([{"type":"reasoning.summary","summary":"","signature":null}]),
+                Retention::ActiveTurn,
+            ),
+            (
+                json!([{"type":"reasoning.encrypted","data":"opaque"}]),
+                Retention::Unsupported,
+            ),
+            (
+                json!([{"type":"reasoning.text","text":"signed","signature":"opaque"}]),
+                Retention::Unsupported,
+            ),
+            (
+                json!([{"type":"reasoning.text","text":"signed","signature":""}]),
+                Retention::Unsupported,
+            ),
+            (
+                json!([{"type":"reasoning.summary","summary":"known"},{"type":"reasoning.native-v-next","data":"opaque"}]),
+                Retention::Unsupported,
+            ),
+            (
+                json!([{"type":"reasoning.native-v-next","data":"opaque"}]),
+                Retention::Unsupported,
+            ),
+            (
+                json!([{"data":"opaque","format":"openai-responses-v1"}]),
+                Retention::Unsupported,
+            ),
+            (json!(["opaque", null, 42]), Retention::Unsupported),
+            (
+                json!([{"type":"reasoning.text","data":"opaque"}]),
+                Retention::Unsupported,
+            ),
+            (
+                json!([{"type":"reasoning.text","text":"known","opaque_extension":"unknown"}]),
+                Retention::Unsupported,
+            ),
+            (
+                json!([{"type":"reasoning.text","text":"known","id":{"opaque":"unknown"}}]),
+                Retention::Unsupported,
+            ),
+            (
+                json!([{"type":"reasoning.summary","summary":"known","text":{"opaque":"unknown"}}]),
+                Retention::Unsupported,
+            ),
+            (json!([]), Retention::Ordinary),
+        ]
+    }
+
+    #[test]
+    fn openrouter_readable_details_require_positive_contract_and_preserve_original_state() {
+        for (details, expected) in openrouter_detail_cases() {
+            let state = ProviderReplayState::for_model(
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":details}),
+            );
+            let original = state.clone();
+            assert_eq!(retention(&state), expected, "{}", state.payload);
+            let mut tail = ChatMessage::assistant("answer");
+            tail.provider_replay_state = Some(state.clone());
+            let messages = [ChatMessage::user("old prefix"), tail];
+            assert_eq!(
+                validate_compaction(&messages, &std::collections::BTreeSet::from([0])).is_err(),
+                expected.preserves_prefix()
+            );
+            assert!(
+                validate_compaction(&messages, &std::collections::BTreeSet::from([0, 1])).is_ok()
+            );
+            let body = serde_json::json!({"messages":[{"role":"user","content":"rewritten prefix"},{"role":"assistant","content":"answer"}]});
+            assert_eq!(
+                validate_prefix(
+                    &body,
+                    std::iter::once((1, state.clone())),
+                    "selected",
+                    "fixture"
+                )
+                .is_err(),
+                expected == Retention::Unsupported
+            );
+            assert_eq!(state, original);
+        }
+    }
     #[test]
     fn every_registry_profile_uses_actual_state_without_a_brand_only_retention_rule() {
         for profile in crate::provider_definitions() {

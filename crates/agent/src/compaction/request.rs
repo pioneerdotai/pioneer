@@ -324,6 +324,24 @@ mod tests {
                 false,
             ),
             (
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":[{"type":"reasoning.native-v-next","data":"opaque"}]}),
+                false,
+            ),
+            (
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":[{"type":"reasoning.text","text":"readable","signature":null},{"type":"reasoning.summary","summary":"summary"}]}),
+                true,
+            ),
+            (
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":[]}),
+                true,
+            ),
+            (
                 "gemini",
                 "gemini-3-flash",
                 serde_json::json!({"schema_version":2,"parts":[{"text":"answer"},{"text":"","thoughtSignature":"signed"}]}),

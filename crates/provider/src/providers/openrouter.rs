@@ -1614,6 +1614,70 @@ mod tests {
     }
 
     #[test]
+    fn detail_contract_is_checked_after_production_preparation_before_native_conversion() {
+        for (details, retention) in crate::continuation::tests::openrouter_detail_cases() {
+            // Producer preserves unknown response state without normalizing it.
+            let produced =
+                OpenRouterProvider::reasoning_details_state(details.as_array().unwrap().clone());
+            if details.as_array().unwrap().is_empty() {
+                assert!(produced.is_none());
+            } else {
+                assert_eq!(
+                    produced.as_ref().unwrap().payload["reasoning_details"],
+                    details
+                );
+            }
+            let state = ProviderReplayState::for_model(
+                "openrouter",
+                "same-model",
+                serde_json::json!({"reasoning_details":details}),
+            );
+            let mut assistant = ChatMessage::assistant("answer");
+            assistant.provider_replay_state = Some(state.clone());
+            let stored = serde_json::to_value(&assistant).unwrap();
+            for closed in [false, true] {
+                let mut history = vec![ChatMessage::user("previous prefix"), assistant.clone()];
+                if closed {
+                    history.extend([
+                        ChatMessage::assistant("final closure"),
+                        ChatMessage::user("next turn"),
+                    ]);
+                }
+                let provider = OpenRouterProvider::new("test-key");
+                let prepared = prepare_messages_for_provider_model(
+                    provider.name(),
+                    "same-model",
+                    &provider.capabilities(),
+                    &history,
+                )
+                .unwrap();
+                let rendered = OpenRouterProvider::convert_messages(&prepared);
+                if retention == crate::continuation::Retention::Unsupported {
+                    assert!(
+                        rendered
+                            .unwrap_err()
+                            .to_string()
+                            .contains("opaque native replay unsupported")
+                    );
+                } else {
+                    assert_eq!(
+                        serde_json::to_value(
+                            rendered.unwrap()[1].reasoning_details.as_ref().unwrap()
+                        )
+                        .unwrap(),
+                        details
+                    );
+                }
+                assert_eq!(
+                    prepared.messages[1].provider_replay_state.as_ref().unwrap(),
+                    &state
+                );
+                assert_eq!(serde_json::to_value(&assistant).unwrap(), stored);
+            }
+        }
+    }
+
+    #[test]
     fn unknown_encrypted_relay_state_is_preserved_but_refused_before_native_send() {
         let reasoning_details = serde_json::json!([
             {

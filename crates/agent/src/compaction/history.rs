@@ -354,6 +354,42 @@ mod tests {
                 true,
             ),
             (
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":[{"type":"reasoning.text","text":"readable","signature":null},{"type":"reasoning.summary","summary":"summary"}]}),
+                true,
+            ),
+            (
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":[{"type":"reasoning.native-v-next","data":"opaque"}]}),
+                true,
+            ),
+            (
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":[{"type":"reasoning.summary","summary":"known"},{"type":"reasoning.native-v-next","data":"opaque"}]}),
+                true,
+            ),
+            (
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":[{"data":"opaque"}]}),
+                true,
+            ),
+            (
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":["opaque"]}),
+                true,
+            ),
+            (
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":[]}),
+                false,
+            ),
+            (
                 "anthropic",
                 "claude-sonnet-4-6",
                 serde_json::json!({"schema_version":2,"blocks":[{"type":"text","text":"ordinary"},{"type":"tool_use","id":"call","name":"read","input":{}}]}),
@@ -453,6 +489,23 @@ mod tests {
                     NativeHistoryLayout::from_messages("ws", "thread", &messages, &[100; 6])
                         .unwrap();
                 assert!(closed.units.iter().all(|unit| unit.complete));
+                // Final closure restores pair/unit eligibility, but unknown or
+                // binding state still forbids prefix rewriting while retained.
+                let expected_refusal =
+                    messages[1]
+                        .provider_replay_state
+                        .as_ref()
+                        .is_some_and(|state| {
+                            pioneer_provider::continuation::retention(state).preserves_prefix()
+                        });
+                assert_eq!(
+                    pioneer_provider::continuation::validate_compaction(
+                        &messages,
+                        &BTreeSet::from([0]),
+                    )
+                    .is_err(),
+                    expected_refusal
+                );
             }
         }
     }
