@@ -48,11 +48,10 @@ async fn capture_preflight<F: std::future::Future>(
         "agent tests retain the default consent without changing it"
     );
     let transport = sentry::test::TestTransport::new();
-    let client = sentry::Client::from(sentry::ClientOptions {
-        dsn: Some("https://public@sentry.invalid/1".parse().unwrap()),
-        transport: Some(Arc::new(transport.clone())),
-        ..Default::default()
-    });
+    let mut options = sentry::ClientOptions::default();
+    options.dsn = Some("https://public@sentry.invalid/1".parse().unwrap());
+    options.transport = Some(Arc::new(transport.clone()));
+    let client = sentry::Client::from(options);
     let hub = Arc::new(sentry::Hub::new(
         Some(Arc::new(client)),
         Arc::new(Default::default()),
