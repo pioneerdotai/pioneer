@@ -750,6 +750,7 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
     ),
     method_entry(MCP_LIST, McpDiscover, Workspace, NotFound, Read),
     method_entry(MCP_INSTALL, McpManage, Capability, Forbidden, Management),
+    method_entry(MCP_OAUTH, McpManage, Capability, Forbidden, Management),
     method_entry(MCP_POLICY_SET, McpManage, Capability, Forbidden, Management),
     method_entry(
         MCP_SERVER_RESTART,
@@ -1085,6 +1086,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn oauth_rpc_requires_installation_management_and_keeps_capability_disclosure() {
+        let oauth = normal_method_entry(methods::MCP_OAUTH).unwrap();
+        let install = normal_method_entry(methods::MCP_INSTALL).unwrap();
+        assert_eq!(oauth.action, ResourceAction::McpManage);
+        assert_eq!(oauth.resolver, install.resolver);
+        assert_eq!(oauth.disclosure, DisclosurePolicy::Forbidden);
+        assert_eq!(oauth.audit, AuthorizationAuditClass::Management);
+    }
+
+    #[test]
     fn normal_registry_exactly_matches_the_authoritative_protocol_method_set() {
         validate_method_registry(NORMAL_METHOD_REGISTRY).expect("valid method registry");
         let registry = NORMAL_METHOD_REGISTRY
@@ -1099,7 +1110,7 @@ mod tests {
         assert_eq!(NORMAL_METHOD_REGISTRY.len(), registry.len());
         assert_eq!(methods::NORMAL_METHODS.len(), protocol.len());
         assert_eq!(registry, protocol);
-        assert_eq!(registry.len(), 152);
+        assert_eq!(registry.len(), 153);
         for entry in NORMAL_METHOD_REGISTRY {
             assert_eq!(normal_method_entry(entry.method), Ok(entry));
             assert!(!entry.action.safe_name().is_empty());

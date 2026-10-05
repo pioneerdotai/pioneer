@@ -1,0 +1,55 @@
+{
+  "oracle": {
+    "crate": "aws-sigv4",
+    "version": "1.6.0",
+    "revision": "dd4d62780ee72db9adae16134e5dac47a9b6393e",
+    "encoding": "Double",
+    "session": "Include",
+    "checksum": "NoHeader",
+    "signature": "Headers"
+  },
+  "access_key": "AKIDEXAMPLE",
+  "secret_key": "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+  "service": "bedrock",
+  "timestamp": "2026-10-01T12:00:00Z",
+  "amz_date": "20261001T120000Z",
+  "body": "{}",
+  "cases": [
+    {
+      "model": "model:0",
+      "region": "us-east-1",
+      "session_token": null,
+      "transmitted_url": "https://bedrock-runtime.us-east-1.amazonaws.com/model/model%3A0/converse",
+      "transmitted_path": "/model/model%3A0/converse",
+      "canonical_uri": "/model/model%253A0/converse",
+      "canonical_request": "POST\n/model/model%253A0/converse\n\ncontent-type:application/json\nhost:bedrock-runtime.us-east-1.amazonaws.com\nx-amz-date:20261001T120000Z\n\ncontent-type;host;x-amz-date\n44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+    },
+    {
+      "model": "model:0",
+      "region": "us-east-1",
+      "session_token": "dummy-session-token",
+      "transmitted_url": "https://bedrock-runtime.us-east-1.amazonaws.com/model/model%3A0/converse",
+      "transmitted_path": "/model/model%3A0/converse",
+      "canonical_uri": "/model/model%253A0/converse",
+      "canonical_request": "POST\n/model/model%253A0/converse\n\ncontent-type:application/json\nhost:bedrock-runtime.us-east-1.amazonaws.com\nx-amz-date:20261001T120000Z\nx-amz-security-token:dummy-session-token\n\ncontent-type;host;x-amz-date;x-amz-security-token\n44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+    },
+    {
+      "model": "arn:aws-cn:bedrock:cn-north-1::foundation-model/anthropic.claude-v1:0",
+      "region": "cn-north-1",
+      "session_token": null,
+      "transmitted_url": "https://bedrock-runtime.cn-north-1.amazonaws.com.cn/model/arn%3Aaws-cn%3Abedrock%3Acn-north-1%3A%3Afoundation-model%2Fanthropic.claude-v1%3A0/converse",
+      "transmitted_path": "/model/arn%3Aaws-cn%3Abedrock%3Acn-north-1%3A%3Afoundation-model%2Fanthropic.claude-v1%3A0/converse",
+      "canonical_uri": "/model/arn%253Aaws-cn%253Abedrock%253Acn-north-1%253A%253Afoundation-model%252Fanthropic.claude-v1%253A0/converse",
+      "canonical_request": "POST\n/model/arn%253Aaws-cn%253Abedrock%253Acn-north-1%253A%253Afoundation-model%252Fanthropic.claude-v1%253A0/converse\n\ncontent-type:application/json\nhost:bedrock-runtime.cn-north-1.amazonaws.com.cn\nx-amz-date:20261001T120000Z\n\ncontent-type;host;x-amz-date\n44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+    },
+    {
+      "model": "arn:aws-cn:bedrock:cn-north-1::foundation-model/anthropic.claude-v1:0",
+      "region": "cn-north-1",
+      "session_token": "dummy-session-token",
+      "transmitted_url": "https://bedrock-runtime.cn-north-1.amazonaws.com.cn/model/arn%3Aaws-cn%3Abedrock%3Acn-north-1%3A%3Afoundation-model%2Fanthropic.claude-v1%3A0/converse",
+      "transmitted_path": "/model/arn%3Aaws-cn%3Abedrock%3Acn-north-1%3A%3Afoundation-model%2Fanthropic.claude-v1%3A0/converse",
+      "canonical_uri": "/model/arn%253Aaws-cn%253Abedrock%253Acn-north-1%253A%253Afoundation-model%252Fanthropic.claude-v1%253A0/converse",
+      "canonical_request": "POST\n/model/arn%253Aaws-cn%253Abedrock%253Acn-north-1%253A%253Afoundation-model%252Fanthropic.claude-v1%253A0/converse\n\ncontent-type:application/json\nhost:bedrock-runtime.cn-north-1.amazonaws.com.cn\nx-amz-date:20261001T120000Z\nx-amz-security-token:dummy-session-token\n\ncontent-type;host;x-amz-date;x-amz-security-token\n44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+    }
+  ]
+}

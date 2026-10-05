@@ -2276,3 +2276,129 @@ async fn old_checkpoint_invalid_facts_are_rejected_on_every_replay_without_model
     }
     assert_eq!(checkpoint.checkpoint_json, checkpoint_json);
 }
+
+#[tokio::test]
+async fn manifest_failure_stops_extraction_and_writes_with_safe_durable_and_skip_metadata() {
+    use crate::{
+        MemoryManifestFailure, MemoryManifestFailureClass as Class,
+        MemoryManifestFailureStage as Stage,
+    };
+    for class in [
+        Class::StorageTransient,
+        Class::AuthorizationOrDomain,
+        Class::InvalidStoredData,
+        Class::Unclassified,
+    ] {
+        for stage in [
+            Stage::Runtime,
+            Stage::Authorization,
+            Stage::Active,
+            Stage::Candidates,
+        ] {
+            for durable in [false, true] {
+                let failure = MemoryManifestFailure::new(class, stage);
+                let writes = Arc::new(TestMemoryWriteProvider {
+                    manifest_failures: Mutex::new(vec![failure].into()),
+                    ..Default::default()
+                });
+                let extractor = Arc::new(TestPostTurnExtractorProvider::json(
+                    valid_post_turn_extractor_json(),
+                ));
+                let hook = MemoryPostTurnExtractorHook {
+                    write_provider: Some(writes.clone()),
+                    extractor_provider: Some(extractor.clone()),
+                    config: MemoryPostTurnExtractorConfig::default(),
+                };
+                let mut request = test_post_turn_hook_request(
+                    memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                    "Меня зовут Александр",
+                    "Понял.",
+                );
+                if durable {
+                    request.context.metadata.insert(
+                        hook_metadata_key("native_terminal_effect_id"),
+                        HookValue::Text("effect".into()),
+                    );
+                    request.context.metadata.insert(
+                        hook_metadata_key("native_terminal_effect_claim_token"),
+                        HookValue::Text("claim".into()),
+                    );
+                }
+                let result = hook.execute(request.clone()).await;
+                if durable {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.code.as_str(), failure.code());
+                    assert_eq!(error.retryable, failure.retryable());
+                    assert_eq!(
+                        error.metadata[&hook_metadata_key("failure_class")],
+                        failure.class_name()
+                    );
+                    assert_eq!(
+                        error.metadata[&hook_metadata_key("failure_stage")],
+                        stage.as_str()
+                    );
+                } else {
+                    let response = result.unwrap();
+                    let diagnostic = response
+                        .diagnostics
+                        .iter()
+                        .find(|d| d.code.as_str() == "memory.post_turn_extractor.skipped")
+                        .unwrap();
+                    assert_eq!(
+                        diagnostic.metadata[&hook_metadata_key("manifest_failure_code")],
+                        HookValue::Text(failure.code().into())
+                    );
+                    assert_eq!(
+                        diagnostic.metadata[&hook_metadata_key("failure_stage")],
+                        HookValue::Text(stage.as_str().into())
+                    );
+                }
+                assert_eq!(extractor.call_count(), 0);
+                assert_eq!(writes.write_call_count(), 0);
+                if failure.retryable() {
+                    hook.execute(request).await.unwrap();
+                    assert_eq!(extractor.call_count(), 1);
+                    assert_eq!(writes.write_call_count(), 1);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn manifest_failure_precedes_checkpoint_replay() {
+    let failure = crate::MemoryManifestFailure::new(
+        crate::MemoryManifestFailureClass::Unclassified,
+        crate::MemoryManifestFailureStage::Active,
+    );
+    let writes = Arc::new(TestMemoryWriteProvider {
+        manifest_failures: Mutex::new(vec![failure].into()),
+        ..Default::default()
+    });
+    // Invalid checkpoint would panic in this fixture if reached.
+    let hook = MemoryPostTurnExtractorHook {
+        write_provider: Some(writes.clone()),
+        extractor_provider: Some(Arc::new(CheckpointOnlyPostTurnExtractor {
+            checkpoint_json: "must not be decoded".into(),
+        })),
+        config: MemoryPostTurnExtractorConfig::default(),
+    };
+    let mut request = test_post_turn_hook_request(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        "Меня зовут Александр",
+        "Понял.",
+    );
+    request.context.metadata.insert(
+        hook_metadata_key("native_terminal_effect_id"),
+        HookValue::Text("effect".into()),
+    );
+    request.context.metadata.insert(
+        hook_metadata_key("native_terminal_effect_claim_token"),
+        HookValue::Text("claim".into()),
+    );
+    assert_eq!(
+        hook.execute(request).await.unwrap_err().code.as_str(),
+        failure.code()
+    );
+    assert_eq!(writes.write_call_count(), 0);
+}

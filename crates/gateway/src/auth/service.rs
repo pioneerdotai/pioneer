@@ -768,6 +768,23 @@ impl GatewayAuthService {
         principal: &AuthenticatedSessionPrincipal,
         trace: Option<&pioneer_observability::GatewayOperationTrace>,
     ) -> Result<SessionLeaseSnapshot, AuthError> {
+        self.validate_session_lease_in_scope(principal, trace, &self.database)
+            .await
+    }
+    pub(crate) async fn validate_session_lease_with_database(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        database: &SqliteDatabase,
+    ) -> Result<SessionLeaseSnapshot, AuthError> {
+        self.validate_session_lease_in_scope(principal, None, database)
+            .await
+    }
+    async fn validate_session_lease_in_scope(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        trace: Option<&pioneer_observability::GatewayOperationTrace>,
+        database: &SqliteDatabase,
+    ) -> Result<SessionLeaseSnapshot, AuthError> {
         let now_unix =
             unix_timestamp_secs().map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         if now_unix >= principal.access_expires_at_unix {
@@ -779,21 +796,21 @@ impl GatewayAuthService {
         let session = trace_auth_me_database_read(
             trace,
             pioneer_observability::GatewayOperationStage::AuthMeSessionLoad,
-            load_session(&self.database, &principal.session_id),
+            load_session(database, &principal.session_id),
         )
         .await?
         .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let device = trace_auth_me_database_read(
             trace,
             pioneer_observability::GatewayOperationStage::AuthMeDeviceLoad,
-            load_device(&self.database, &principal.device_id),
+            load_device(database, &principal.device_id),
         )
         .await?
         .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let owner = trace_auth_me_database_read(
             trace,
             pioneer_observability::GatewayOperationStage::AuthMePrincipalLoad,
-            load_principal_by_id(&self.database, &principal.principal_id),
+            load_principal_by_id(database, &principal.principal_id),
         )
         .await?
         .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
@@ -828,7 +845,7 @@ impl GatewayAuthService {
         let avatar_revision = trace_auth_me_database_read(
             trace,
             pioneer_observability::GatewayOperationStage::AuthMeAvatarLoad,
-            load_principal_avatar(&self.database, &principal.principal_id),
+            load_principal_avatar(database, &principal.principal_id),
         )
         .await?
         .map(|avatar| hex::encode(avatar.content_hash));

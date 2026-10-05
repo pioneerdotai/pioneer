@@ -1,11 +1,20 @@
 #[path = "tests/history_continuation.rs"]
 mod history_continuation;
 
+#[path = "tests/task_run_occurrence_tracker.rs"]
+mod task_run_occurrence_tracker;
+
+#[path = "tests/mcp_oauth_rpc_queue.rs"]
+mod mcp_oauth_rpc_queue;
+
 #[path = "tests/memory_post_turn_response.rs"]
 mod memory_post_turn_response;
 
 #[path = "tests/task_capsule.rs"]
 mod task_capsule;
+
+#[path = "tests/reconciliation_workers.rs"]
+mod reconciliation_workers;
 
 use super::{
     AuthenticatedTransferOwner, CLIRuntimeMachineRequestKey, MessageProcessor,
@@ -191,6 +200,30 @@ mod member_client_harness;
 
 fn default_test_permission_profile() -> pioneer_protocol::TurnPermissionProfileSnapshot {
     pioneer_protocol::default_turn_permission_profile_snapshot()
+}
+
+async fn assert_admitted_turn_owner(processor: &MessageProcessor, thread_id: &str, turn_id: &str) {
+    let receipt = processor
+        .crud_store
+        .get_turn_execution(turn_id)
+        .await
+        .expect("ownership lookup should succeed")
+        .expect("an admitted executable Turn must have an ownership receipt");
+    assert_eq!(receipt.thread_id, thread_id);
+    assert_eq!(receipt.turn_id, turn_id);
+    assert_eq!(
+        receipt.owner_id.as_str(),
+        processor.turn_execution_owner_id.as_ref()
+    );
+    assert_eq!(receipt.owner_generation, 1);
+    assert!(
+        processor
+            .crud_store
+            .get_turn_admission(turn_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 async fn registered_request_context(
@@ -19047,6 +19080,7 @@ async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_
         !wait_response.completed.is_empty(),
         "child echo turn should complete the task"
     );
+    assert_admitted_turn_owner(&processor, &lineage.child_thread_id, &lineage.child_turn_id).await;
     let completed = &wait_response.completed[0];
     assert_eq!(
         completed.child_turn_id.as_deref(),
@@ -19293,11 +19327,35 @@ async fn review_enabled_child_completion_creates_pending_candidate_without_final
         include_result: true,
         format: TaskDeliveryFormat::Summary,
     });
+    let (_, reviewer_launch) = super::agent_action_tools::resolve_workspace_task_launch(
+        &processor,
+        &workspace_id,
+        "openai",
+        "test-model",
+        None,
+        None,
+        "turn_parent_review_success",
+    )
+    .await
+    .expect("reviewer must use an available exact workspace identity");
+    let reviewer_identity = reviewer_launch
+        .expect("native reviewer launch must be exact")
+        .0;
+    let mut review_policy = TaskAgentReviewPolicy::parent_agent_default(2);
+    review_policy
+        .reviewers
+        .push(pioneer_protocol::TaskResultReviewerSpec {
+            reviewer_kind: TaskResultReviewerKind::ReviewAgent,
+            agent_nickname: Some(reviewer_identity.nickname),
+            agent_role: None,
+            required: false,
+            weight: None,
+        });
     params
         .agent_spec
         .as_mut()
         .expect("agent spec should exist")
-        .review_policy = Some(TaskAgentReviewPolicy::parent_agent_default(2));
+        .review_policy = Some(review_policy);
 
     let response = create_task_for_test(&processor, params)
         .await
@@ -19313,6 +19371,28 @@ async fn review_enabled_child_completion_creates_pending_candidate_without_final
         TaskResultCandidateStatus::PendingReview,
     )
     .await;
+
+    // A reviewer context may become visible before its executable admission.
+    // Wait for that admission, then verify the same receipt as every child.
+    let mut reviewer = None;
+    for _ in 0..100 {
+        let turns = crud_store.list_task_run_turns(&run.id).await.unwrap();
+        if let Some(turn) = turns
+            .into_iter()
+            .find(|turn| turn.kind == TaskRunTurnKind::Review)
+            && crud_store
+                .get_turn_execution(&turn.turn_id)
+                .await
+                .unwrap()
+                .is_some()
+        {
+            reviewer = Some(turn);
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    let reviewer = reviewer.expect("reviewer must reach executable admission");
+    assert_admitted_turn_owner(&processor, &reviewer.thread_id, &reviewer.turn_id).await;
 
     assert_eq!(candidate.thread_id, lineage.child_thread_id);
     assert_eq!(candidate.turn_id, lineage.child_turn_id);
@@ -19907,7 +19987,8 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         processor
             .reconcile_terminal_task_run_occurrence_turns(10)
             .await
-            .expect("terminal occurrence reconciliation should succeed"),
+            .expect("terminal occurrence reconciliation should succeed")
+            .changed,
         0,
         "live task-event projection should already terminalize the occurrence"
     );
@@ -19919,7 +20000,8 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         processor
             .reconcile_terminal_task_run_occurrence_turns(10)
             .await
-            .expect("terminal occurrence reconciliation should succeed"),
+            .expect("terminal occurrence reconciliation should succeed")
+            .changed,
         0,
         "delivery must not own parent occurrence terminalization"
     );
@@ -19927,7 +20009,8 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         processor
             .reconcile_terminal_task_run_occurrence_turns(10)
             .await
-            .expect("idempotent terminal occurrence reconciliation should succeed"),
+            .expect("idempotent terminal occurrence reconciliation should succeed")
+            .changed,
         0,
         "an already repaired occurrence must not be counted or polled again"
     );
@@ -20243,6 +20326,7 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_i
         TaskResultCandidateStatus::PendingReview,
     )
     .await;
+    assert_admitted_turn_owner(&processor, &revised.child_thread_id, &revised.child_turn_id).await;
     assert_eq!(next_candidate.round, 1);
     assert_eq!(next_candidate.thread_id, revised.child_thread_id);
     assert_eq!(next_candidate.turn_id, revised.child_turn_id);
@@ -26291,6 +26375,18 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
         } else {
             processor.clone()
         };
+        // Next-turn admission requires a loaded thread. Explicitly reopen the
+        // persisted thread through the authorized path in every cleanup case
+        // before testing reuse of the same CLI runtime session and its lease.
+        open_persisted_child_for_test(
+            &next_processor,
+            connection,
+            &mut rx,
+            &workspace,
+            &thread,
+            &format!("pending-heartbeat-resume-{case}"),
+        )
+        .await;
         let next = format!("pending-heartbeat-next-{case}");
         let next_id = generate_test_request_id("pending-heartbeat-next", &next);
         let next_context = sessions.connection_context(connection).await.unwrap();
@@ -30965,6 +31061,15 @@ async fn assert_detached_native_child_turn_cancellation() {
         .created_by_turn_id
         .as_deref()
         .expect("detached child lineage should point at its parent occurrence turn");
+    assert!(
+        crud_store
+            .get_turn_execution(parent_occurrence_turn_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "parent TaskRun occurrences are execution-free projections"
+    );
+
     let parent_anchor = wait_for_task_anchor_item_status(
         crud_store.clone(),
         parent_occurrence_turn_id,
@@ -33090,6 +33195,7 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         .as_str()
         .expect("direct Agent child turn id should be present")
         .to_owned();
+    assert_admitted_turn_owner(&processor, thread_id, &child_turn_id).await;
     assert_ne!(child_turn_id, root_turn_id);
     let permission_request_id = opened_request["request_id"]
         .as_str()
@@ -34751,13 +34857,18 @@ async fn failed_task_thread_delivery_is_a_sanitized_system_state_without_work_gr
         .deliveries
         .first()
         .expect("failed result should still have a delivered notification");
-    assert!(
-        delivery
-            .error_snapshot
-            .as_ref()
-            .is_some_and(|error| error.message.contains("internal path /srv/pioneer")),
-        "the durable Task diagnostic must retain the real internal cause"
+    let saved_error = delivery
+        .error_snapshot
+        .as_ref()
+        .expect("failed delivery keeps a safe descriptor");
+    assert_eq!(saved_error.code, "task_executor_start_unclassified_failed");
+    assert_eq!(
+        saved_error.class,
+        pioneer_protocol::TaskErrorClass::Internal
     );
+    assert_eq!(saved_error.message, "Task preparation or launch failed.");
+    let encoded = serde_json::to_string(saved_error).unwrap();
+    assert!(!encoded.contains("internal path /srv/pioneer"));
     let delivered_turn_id = delivery
         .delivered_turn_id
         .as_deref()
@@ -34775,7 +34886,7 @@ async fn failed_task_thread_delivery_is_a_sanitized_system_state_without_work_gr
     );
     assert_eq!(
         delivered_turn.error.as_deref(),
-        Some("Scheduled task could not start.")
+        Some("Scheduled task failed.")
     );
     assert!(
         !delivered_turn
@@ -34800,9 +34911,7 @@ async fn failed_task_thread_delivery_is_a_sanitized_system_state_without_work_gr
         .expect("delivery timeline blocks should query");
     assert!(blocks.iter().any(|block| {
         block.block_kind == pioneer_crud::BLOCK_KIND_SYSTEM
-            && block
-                .metadata_json
-                .contains("Scheduled task could not start.")
+            && block.metadata_json.contains("Scheduled task failed.")
     }));
     assert!(
         blocks
@@ -38152,6 +38261,8 @@ async fn invalid_request_provider_failure_is_terminal_without_retry() {
             item_id.to_owned(),
             TurnItemType::Reasoning,
             ProviderFailureDetails {
+                error_reason: None,
+                request_id: None,
                 provider: "test-provider".to_owned(),
                 model: "test-model".to_owned(),
                 transport: ProviderTransportKind::Stream,
@@ -38390,6 +38501,8 @@ async fn durable_recovery_events_reject_ack_without_canonical_persistence() {
             item_id: "item_missing_provider_failure".to_owned(),
             item_type: TurnItemType::AgentMessage,
             failure: ProviderFailureDetails {
+                error_reason: None,
+                request_id: None,
                 provider: "openai".to_owned(),
                 model: "o4-mini".to_owned(),
                 transport: ProviderTransportKind::Stream,
@@ -41068,6 +41181,7 @@ async fn turn_start_without_execution_backend_uses_api_provider_path() {
     )
     .await;
 
+    assert_admitted_turn_owner(&processor, "thr_turn_start_api_old", "turn_start_api_old").await;
     for _ in 0..20 {
         if capture_provider.snapshot_requests().iter().any(|request| {
             request
@@ -41164,6 +41278,7 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
         .await
         .expect("native turn/start preparation should succeed");
 
+    assert_admitted_turn_owner(&processor, "thread_security_native", "turn_security_native").await;
     let author = crud_store
         .get_turn("thread_security_native", "turn_security_native")
         .await
@@ -67369,7 +67484,7 @@ async fn setup_workspace_manager() -> (Arc<WorkspaceManager>, Arc<CrudStore>, St
 }
 
 /// Exercise concurrent preparation with the Gateway reader/writer contour.
-async fn setup_pooled_file_workspace_manager() -> (
+pub(super) async fn setup_pooled_file_workspace_manager() -> (
     tempfile::TempDir,
     Arc<WorkspaceManager>,
     Arc<CrudStore>,
@@ -68482,11 +68597,27 @@ async fn setup_memory_agent_e2e_harness_with_tool_loop_config(
     provider_registry: Arc<pioneer_provider::ProviderRegistry>,
     tool_loop_config: ToolLoopConfig,
 ) -> MemoryAgentE2eHarness {
+    let workspace = setup_workspace_manager().await;
+    setup_memory_agent_e2e_harness_on_workspace(
+        case_id,
+        provider_registry,
+        tool_loop_config,
+        workspace,
+    )
+    .await
+}
+
+async fn setup_memory_agent_e2e_harness_on_workspace(
+    case_id: &str,
+    provider_registry: Arc<pioneer_provider::ProviderRegistry>,
+    tool_loop_config: ToolLoopConfig,
+    workspace: (Arc<WorkspaceManager>, Arc<CrudStore>, String),
+) -> MemoryAgentE2eHarness {
     let session_manager = Arc::new(SessionManager::new());
     let (tx, rx) = mpsc::channel(128);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let (workspace_manager, crud_store, workspace_id) = workspace;
     session_manager
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
@@ -76520,6 +76651,383 @@ fn recovery_plan_and_start_refusals_reach_task_consumers() {
     });
 }
 
+#[test]
+fn blocked_provider_diagnostics_match_live_outbox_and_task_reconciliation() {
+    run_standard_stack_message_test("blocked provider diagnostics", async {
+        for path in ["normal", "outbox"] {
+            for scenario in ["no_progress", "authorization"] {
+                blocked_provider_task_consumers_impl(scenario, path).await;
+            }
+        }
+    });
+}
+
+async fn blocked_provider_task_consumers_impl(scenario: &str, path: &str) {
+    let parent_is_task_run = false;
+    let provider = Arc::new(HangingChildProvider::new());
+    let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
+    ));
+    let (workspace_manager, store, workspace_id) = setup_workspace_manager().await;
+    let processor = Arc::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("test-model", "openai")),
+        registry,
+        Arc::new(SessionManager::new()),
+        workspace_manager,
+        store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    processor.bind_task_bridge().await;
+    let parent_kind = if parent_is_task_run {
+        "task_run"
+    } else {
+        "agent"
+    };
+    let parent_thread = format!("thr_recovery_task_{scenario}_{path}_{parent_kind}");
+    let parent_turn = format!("turn_recovery_task_{scenario}_{path}_{parent_kind}");
+    let mut params = test_task_create_params(
+        &workspace_id,
+        &parent_thread,
+        &parent_turn,
+        "Recovery task",
+        3,
+    );
+    params.delivery_policy = Some(TaskDeliveryPolicy {
+        mode: TaskDeliveryMode::Thread,
+        thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
+        thread_id: Some(parent_thread.clone()),
+        webhook_url: None,
+        include_result: true,
+        format: TaskDeliveryFormat::Summary,
+    });
+    let created = create_task_for_test(&processor, params).await.unwrap();
+    let run = created.run.unwrap();
+    if parent_is_task_run {
+        // A visible Task occurrence closes with its child; a delegating Agent Turn stays active.
+        store
+            .database_connection()
+            .execute_unprepared(&format!(
+                "UPDATE turn SET turn_kind = 'task_run' WHERE id = '{}'",
+                parent_turn
+            ))
+            .await
+            .unwrap();
+    }
+    let lineage = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
+    for _ in 0..100 {
+        if provider.child_main_call_count() > 0 {
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert!(provider.child_main_call_count() > 0);
+    let now = super::now_timestamp_secs();
+    let failure = ProviderFailureDetails {
+        provider: "fixture".to_owned(),
+        model: "fixture".to_owned(),
+        class: ProviderFailureClass::Provider5xx,
+        stage: ProviderFailureStage::MidStream,
+        transport: ProviderTransportKind::Stream,
+        http_status: Some(502),
+        provider_code: None,
+        retry_after_ms: Some(2000),
+        error_reason: Some(pioneer_protocol::ProviderErrorReason::ProviderUnavailable),
+        request_id: Some(
+            pioneer_protocol::ProviderRequestId::try_from("gen-task_fixture".to_owned()).unwrap(),
+        ),
+        is_recoverable_hint: true,
+        message: Some("provider request failed".to_owned()),
+    };
+    let job = processor
+        .recovery_coordinator
+        .enqueue_provider_failure_job(
+            &crate::resilience::ProviderFailureCandidate {
+                turn_id: lineage.child_turn_id.clone(),
+                item_id: "diagnostic_reasoning".to_owned(),
+                item_type: TurnItemType::Reasoning,
+                failure: failure.clone(),
+            },
+            now,
+        )
+        .await
+        .unwrap()
+        .into_job();
+    // The initial provider failure includes Retry-After, so enqueue schedules
+    // this job in the future. Advance the fixture clock to the persisted due
+    // time rather than assuming that enqueue makes the job immediately due.
+    let first_due = job.next_run_at_unix;
+    assert_eq!(first_due, now + 2);
+    assert!(
+        store
+            .claim_due_recovery_jobs(now, 45, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let claims = store
+        .claim_due_recovery_jobs(first_due, 45, 1)
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1, "initial recovery must be due");
+    assert_eq!(claims[0].id, job.id);
+    store
+        .mark_claimed_recovery_job_active(
+            &job.id,
+            claims[0].claim_token.as_deref().unwrap(),
+            "first_attempt",
+            first_due,
+        )
+        .await
+        .unwrap();
+    let events = processor
+        .recovery_coordinator
+        .record_recovery_provider_failure(&job.id, "first_attempt", failure.clone(), first_due + 1)
+        .await
+        .unwrap();
+    assert!(matches!(
+        events.as_slice(),
+        [crate::resilience::RecoveryCoordinatorEvent::RetryScheduled { .. }]
+    ));
+    let pending = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+    let due = pending.next_run_at_unix;
+    let claims = store.claim_due_recovery_jobs(due, 45, 1).await.unwrap();
+    assert_eq!(claims.len(), 1, "retry recovery must be due");
+    assert_eq!(claims[0].id, job.id);
+    store
+        .mark_claimed_recovery_job_active(
+            &job.id,
+            claims[0].claim_token.as_deref().unwrap(),
+            "blocked_attempt",
+            due,
+        )
+        .await
+        .unwrap();
+    let active = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+    let reason = if scenario == "no_progress" {
+        "max_consecutive_no_progress_windows reached: limit=3, observed=3"
+    } else {
+        "authorization denied"
+    };
+    let events = if scenario == "no_progress" {
+        processor
+            .recovery_coordinator
+            .handle_recovery_start_error_for_test(
+                active,
+                "blocked_attempt".to_owned(),
+                pioneer_agent::AgentControlError::ExecutionWindowContinuationBlocked {
+                    reason: reason.to_owned(),
+                    stop_reason: Some(pioneer_protocol::RecoveryStopReason::NoProgress),
+                },
+                due + 1,
+            )
+            .await
+            .unwrap()
+    } else {
+        // Simulate a stop left on a resumed job. A real authorization block must
+        // not inherit it, even though prior provider facts are still present.
+        let mut stale = active.diagnostic.clone().unwrap();
+        stale.stop_reason = Some(pioneer_protocol::RecoveryStopReason::NoProgress);
+        store
+            .database_connection()
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "UPDATE recovery_job SET diagnostic = ? WHERE id = ?",
+                [
+                    serde_json::to_string(&stale).unwrap().into(),
+                    job.id.clone().into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        store
+            .mark_recovery_job_terminal_after_attempt(
+                &job.id,
+                "blocked_attempt",
+                pioneer_protocol::RecoveryJobStatus::Blocked,
+                Some(reason.to_owned()),
+                due + 1,
+            )
+            .await
+            .unwrap();
+        vec![
+            crate::resilience::RecoveryCoordinatorEvent::RecoveryBlocked {
+                job_id: job.id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                reason: reason.to_owned(),
+            },
+        ]
+    };
+    let terminal = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+    if scenario == "no_progress" {
+        assert_eq!(terminal.last_error, pending.last_error);
+        assert_eq!(
+            terminal.diagnostic.as_ref().unwrap().last_failure,
+            Some((&failure).into())
+        );
+        assert_eq!(
+            terminal.diagnostic.as_ref().unwrap().stop_reason,
+            Some(pioneer_protocol::RecoveryStopReason::NoProgress)
+        );
+    } else {
+        assert!(terminal.diagnostic.as_ref().unwrap().stop_reason.is_none());
+        assert_eq!(
+            terminal.diagnostic.as_ref().unwrap().last_failure,
+            pending.diagnostic.as_ref().unwrap().last_failure
+        );
+    }
+    if path == "normal" {
+        for event in events {
+            assert!(processor.handle_recovery_event(event, due + 1).await);
+        }
+        processor
+            .process_due_recovery_terminalizations(due + 2, 64)
+            .await
+            .unwrap();
+    } else {
+        let restarted = pioneer_crud::CrudStore::new(store.database_connection());
+        let claims = restarted
+            .claim_due_recovery_terminalizations(due + 2, 45, 10)
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        restarted
+            .apply_claimed_recovery_terminalization(
+                &claims[0],
+                Some(pioneer_protocol::TurnBlockedResumeMetadata {
+                    reason_class: "fixture".to_owned(),
+                    human_message: reason.to_owned(),
+                    resume_requirements: Vec::new(),
+                    resume_command: format!("turn.resume:{}", lineage.child_turn_id),
+                    blocked_recovery_job_id: Some(job.id.clone()),
+                    latest_checkpoint_id: None,
+                    can_resume_same_turn: false,
+                }),
+                pioneer_crud::RecoveryTerminalCleanupPlan {
+                    runtime_generation: 77,
+                    runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
+                },
+                due + 2,
+            )
+            .await
+            .unwrap();
+    }
+    let (_, child) = store
+        .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.status, TurnStatus::Blocked);
+    processor
+        .task_agent_executor
+        .reconcile_child_turn_blocked(
+            &lineage.child_thread_id,
+            &lineage.child_turn_id,
+            "untrusted event reason",
+            if path == "outbox" {
+                super::TaskChildReconciliationOrigin::DurableBackground
+            } else {
+                super::TaskChildReconciliationOrigin::Live
+            },
+        )
+        .await
+        .unwrap();
+    let restarted = pioneer_crud::CrudStore::new(store.database_connection());
+    let response = restarted.get_task(&created.task.id).await.unwrap().unwrap();
+    let error = response.task.error.as_ref().unwrap();
+    assert_eq!(error.code, "child_turn_blocked");
+    assert_eq!(response.runs[0].error.as_ref(), Some(error));
+    assert_eq!(
+        response.task_run_turns[0].status,
+        pioneer_protocol::TaskRunTurnStatus::Blocked
+    );
+    let events = restarted
+        .get_task_events(&created.task.id, None)
+        .await
+        .unwrap();
+    let turn_error = events
+        .events
+        .iter()
+        .find_map(|event| match &event.payload {
+            pioneer_protocol::TaskEventPayload::TaskRunTurnBlocked { error, .. } => error.as_ref(),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(turn_error, error);
+    let public = crate::task_projection::project_task_get(&response, false);
+    let public_error = &public.task.error.as_ref().unwrap().error;
+    if scenario == "no_progress" {
+        assert_eq!(error.class, pioneer_protocol::TaskErrorClass::Provider);
+        assert_eq!(error.recovery_diagnostic, terminal.diagnostic);
+        assert_eq!(
+            public.task.error.as_ref().unwrap().recovery_diagnostic,
+            terminal.diagnostic
+        );
+        assert_eq!(
+            public.runs[0].error.as_ref().unwrap().recovery_diagnostic,
+            terminal.diagnostic
+        );
+        assert_eq!(
+            public_error.code,
+            pioneer_protocol::PublicErrorCode::Unavailable
+        );
+        let expected = terminal.diagnostic.unwrap().public_message();
+        assert_eq!(public_error.message, expected);
+        assert!(child.error.unwrap().starts_with(&expected));
+        assert!(expected.contains("HTTP 502"));
+        assert!(expected.contains("no progress limit reached"));
+        assert!(!expected.contains("gen-task_fixture"));
+        let card = crate::task_tools::task_turn_item_from_response(&processor, &response)
+            .await
+            .unwrap();
+        assert_eq!(card.error_preview.as_deref(), Some(expected.as_str()));
+    } else {
+        assert_eq!(error.class, pioneer_protocol::TaskErrorClass::Policy);
+        assert!(error.recovery_diagnostic.is_none());
+        assert!(
+            public
+                .task
+                .error
+                .as_ref()
+                .unwrap()
+                .recovery_diagnostic
+                .is_none()
+        );
+        assert_eq!(
+            public_error.code,
+            pioneer_protocol::PublicErrorCode::PolicyDenied
+        );
+        assert_eq!(public_error.message, "This operation is not permitted.");
+    }
+    let before = restarted
+        .get_task_events(&created.task.id, None)
+        .await
+        .unwrap()
+        .events
+        .len();
+    processor
+        .task_agent_executor
+        .reconcile_child_turn_blocked(
+            &lineage.child_thread_id,
+            &lineage.child_turn_id,
+            "duplicate",
+            super::TaskChildReconciliationOrigin::Live,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted
+            .get_task_events(&created.task.id, None)
+            .await
+            .unwrap()
+            .events
+            .len(),
+        before
+    );
+}
+
 async fn recovery_failure_task_consumers_impl(
     scenario: &str,
     path: &str,
@@ -76589,6 +77097,8 @@ async fn recovery_failure_task_consumers_impl(
     let now = super::now_timestamp_secs();
     let private = "private-response-body https://secret.example?token=credential /private/provider-key HTTP 401";
     let mut initial = ProviderFailureDetails {
+        error_reason: None,
+        request_id: None,
         provider: "test-provider".to_owned(),
         model: "test-model".to_owned(),
         transport: ProviderTransportKind::Stream,
@@ -76627,11 +77137,15 @@ async fn recovery_failure_task_consumers_impl(
         );
     }
     let last = ProviderFailureDetails {
+        error_reason: None,
+        request_id: None,
         class: ProviderFailureClass::AuthOrPermission,
         stage: ProviderFailureStage::Connect,
         http_status: Some(403),
         provider_code: Some(private.to_owned()),
         ..ProviderFailureDetails {
+            error_reason: None,
+            request_id: None,
             provider: private.to_owned(),
             model: private.to_owned(),
             transport: ProviderTransportKind::NonStream,
@@ -76958,6 +77472,8 @@ fn provider_replay_is_fenced_after_retryable_recovery_start_error() {
         let (processor, store, _) = setup_execution_window_terminal_turn(thread, turn).await;
         let now = super::now_timestamp_secs();
         let failure = ProviderFailureDetails {
+            error_reason: None,
+            request_id: None,
             provider: "test-provider".to_owned(),
             model: "test-model".to_owned(),
             transport: ProviderTransportKind::Stream,
@@ -77126,3 +77642,6 @@ mod task_delivery_cancellation;
 
 #[path = "tests/memory_post_turn_recovery.rs"]
 mod memory_post_turn_recovery;
+
+#[path = "tests/task_start_failure.rs"]
+mod task_start_failure;

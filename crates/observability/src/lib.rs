@@ -397,7 +397,9 @@ fn load_local_dotenv() {
     });
 }
 
-fn sentry_tracing_layer<S>() -> impl tracing_subscriber::Layer<S>
+/// Production event mapper, also usable with thread-local subscribers for local capture.
+#[doc(hidden)]
+pub fn sentry_tracing_layer<S>() -> impl tracing_subscriber::Layer<S>
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
 {

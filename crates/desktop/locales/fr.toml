@@ -1749,3 +1749,7 @@ reason_updated = "Un skill a été mis à jour."
 reason_rolled_back = "Une version précédente du skill a été restaurée."
 reason_cancelled = "L’exécution a été annulée."
 reason_unknown = "L’opération ne s’est pas terminée comme prévu. Consultez les journaux du gateway."
+
+[mcp.oauth]
+callback_received = "Réponse acceptée. Consultez le résultat de la connexion dans Pioneer."
+callback_rejected = "Connexion refusée. Revenez à Pioneer pour réessayer."

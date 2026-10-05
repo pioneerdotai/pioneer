@@ -96,6 +96,7 @@ enum ApiMessageContentBlock {
     ToolUse {
         id: String,
         name: String,
+        #[serde(deserialize_with = "deserialize_tool_input")]
         input: serde_json::Value,
     },
     ToolResult {
@@ -349,13 +350,14 @@ impl AnthropicProvider {
                 }
                 "redacted_thinking" => {}
                 "tool_use" => {
-                    if let (Some(id), Some(name), Some(input)) = (block.id, block.name, block.input)
-                    {
+                    let input = require_tool_input(block.input.ok_or_else(|| {
+                        anyhow!("Anthropic tool_use input must be a JSON object")
+                    })?)?;
+                    if let (Some(id), Some(name)) = (block.id, block.name) {
                         tool_calls.push(ProviderToolCall {
                             id,
                             name,
-                            arguments: serde_json::to_string(&input)
-                                .unwrap_or_else(|_| "{}".to_owned()),
+                            arguments: serde_json::to_string(&input)?,
                         });
                     }
                 }
@@ -506,16 +508,31 @@ impl AnthropicProvider {
                             .get("blocks")
                             .cloned()
                             .ok_or_else(|| anyhow!("anthropic replay state is missing `blocks`"))?;
+                        // Native v2 blocks keep their original fields, but tool input
+                        // must satisfy the same object contract as ordinary/legacy calls.
+                        let native_blocks = blocks
+                            .as_array()
+                            .ok_or_else(|| anyhow!("invalid anthropic replay blocks"))?;
+                        for block in native_blocks {
+                            if block.get("type").and_then(serde_json::Value::as_str)
+                                == Some("tool_use")
+                            {
+                                require_tool_input(block.get("input").cloned().ok_or_else(
+                                    || anyhow!("Anthropic tool_use input must be a JSON object"),
+                                )?)?;
+                            }
+                        }
                         if payload
                             .get("schema_version")
                             .and_then(serde_json::Value::as_u64)
                             == Some(2)
                         {
-                            let blocks = blocks
-                                .as_array()
-                                .ok_or_else(|| anyhow!("invalid anthropic replay blocks"))?;
-                            content
-                                .extend(blocks.iter().cloned().map(ApiMessageContentBlock::Native));
+                            content.extend(
+                                native_blocks
+                                    .iter()
+                                    .cloned()
+                                    .map(ApiMessageContentBlock::Native),
+                            );
                             api_messages.push(ApiMessage {
                                 role: role.to_owned(),
                                 content,
@@ -540,7 +557,7 @@ impl AnthropicProvider {
                             content.push(ApiMessageContentBlock::ToolUse {
                                 id: call.id.clone(),
                                 name: call.name.clone(),
-                                input: parse_json_or_string(call.arguments.as_str()),
+                                input: parse_tool_input(call.arguments.as_str())?,
                             });
                         }
                     }
@@ -617,6 +634,10 @@ impl AnthropicProvider {
         format!("{}/v1/models", self.base_url)
     }
 
+    fn parse_response(api_response: ApiChatResponse) -> Result<ChatResponse> {
+        Self::decode_response(api_response)
+    }
+
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
         let status = response.status();
         let body = match crate::http::read_response_text_bounded(
@@ -633,9 +654,30 @@ impl AnthropicProvider {
     }
 }
 
-fn parse_json_or_string(raw: &str) -> serde_json::Value {
-    serde_json::from_str::<serde_json::Value>(raw)
-        .unwrap_or_else(|_| serde_json::Value::String(raw.to_owned()))
+// ToolUseBlockParam/ToolUseBlock.input is an object. Do not expose argument
+// contents or serde diagnostics in errors from this protocol boundary.
+fn require_tool_input(input: serde_json::Value) -> Result<serde_json::Value> {
+    if !input.is_object() {
+        return Err(anyhow!("Anthropic tool_use input must be a JSON object"));
+    }
+    Ok(input)
+}
+
+fn parse_tool_input(raw: &str) -> Result<serde_json::Value> {
+    let input = serde_json::from_str(raw)
+        .map_err(|_| anyhow!("Anthropic tool_use input must be valid JSON containing an object"))?;
+    require_tool_input(input)
+}
+
+// Replay blocks also enter the outgoing builder through deserialization.
+fn deserialize_tool_input<'de, D>(
+    deserializer: D,
+) -> std::result::Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let input = serde_json::Value::deserialize(deserializer)?;
+    require_tool_input(input).map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug)]
@@ -648,8 +690,8 @@ struct PendingToolUse {
 
 impl PendingToolUse {
     fn finalize(self) -> Result<ProviderToolCall> {
-        let value = serde_json::from_str::<serde_json::Value>(self.arguments.as_str())
-            .map_err(|error| anyhow!("Anthropic tool call contains invalid arguments: {error}"))?;
+        // Validate only the completed argument buffer, never partial_json fragments.
+        let value = parse_tool_input(self.arguments.as_str())?;
         let arguments = serde_json::to_string(&value)?;
 
         Ok(ProviderToolCall {
@@ -716,7 +758,7 @@ impl crate::traits::Provider for AnthropicProvider {
             "provider_response",
         )
         .await?;
-        let mut response = Self::decode_response(api_response)?;
+        let mut response = Self::parse_response(api_response)?;
         if let Some(state) = response.provider_replay_state.as_mut() {
             if self.base_url != BASE_URL
                 && crate::continuation::retention(state) != crate::continuation::Retention::Ordinary
@@ -841,7 +883,7 @@ impl crate::traits::Provider for AnthropicProvider {
                                     .map(|(index, call)| {
                                         let call = call.finalize()?;
                                         if let Some(block) = replay_blocks.get_mut(&index) {
-                                            block["input"] = parse_json_or_string(&call.arguments);
+                                            block["input"] = parse_tool_input(&call.arguments)?;
                                         }
                                         Ok(call)
                                     })
@@ -974,8 +1016,10 @@ impl crate::traits::Provider for AnthropicProvider {
                                     match call.finalize() {
                                         Ok(call) => {
                                             if let Some(block) = replay_blocks.get_mut(&index) {
-                                                block["input"] =
-                                                    parse_json_or_string(&call.arguments);
+                                                block["input"] = serde_json::from_str(
+                                                    &call.arguments,
+                                                )
+                                                .expect("finalized tool input is valid JSON");
                                             }
                                             if tx
                                                 .send(Ok(StreamChunk::tool_calls(vec![call])))
@@ -1286,6 +1330,56 @@ mod tests {
             serde_json::to_value(&wire[0]).unwrap()["content"],
             raw["content"]
         );
+    }
+
+    #[test]
+    fn ordered_v2_replay_preserves_blocks_without_bypassing_tool_input_validation() {
+        let provider = AnthropicProvider::new("fixture");
+        for input in [
+            Some(serde_json::json!({"nested":{"values":[null,true,2,"text"]}})),
+            Some(serde_json::json!([])),
+            Some(serde_json::json!(42)),
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("private-input")),
+            None,
+        ] {
+            let mut call = serde_json::json!({"type":"tool_use","id":"call_1","name":"clock"});
+            if let Some(input) = input.as_ref() {
+                call["input"] = input.clone();
+            }
+            let blocks = serde_json::json!([
+                {"type":"text","text":"before"},
+                call,
+                {"type":"text","text":"after"}
+            ]);
+            let mut assistant = ChatMessage::assistant("beforeafter");
+            assistant.provider_replay_state = Some(ProviderReplayState::for_model(
+                "anthropic",
+                "claude-sonnet-4-5",
+                serde_json::json!({"schema_version":2,"blocks":blocks}),
+            ));
+            let original = assistant.provider_replay_state.clone();
+            let prepared = prepare_messages_for_provider_model(
+                provider.name(),
+                "claude-sonnet-4-5",
+                &provider.capabilities(),
+                &[assistant],
+            )
+            .unwrap();
+            let rendered = AnthropicProvider::prepare_messages(&prepared);
+            if input.as_ref().is_some_and(serde_json::Value::is_object) {
+                let (_, messages) = rendered.unwrap();
+                assert_eq!(
+                    serde_json::to_value(messages).unwrap()[0]["content"],
+                    blocks
+                );
+            } else {
+                let error = rendered.unwrap_err().to_string();
+                assert!(error.contains("Anthropic tool_use input must be a JSON object"));
+                assert!(!error.contains("private-input"));
+            }
+            assert_eq!(prepared.messages[0].provider_replay_state, original);
+        }
     }
 
     #[tokio::test]
@@ -1856,3 +1950,7 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "wire_tests/anthropic.rs"]
+mod wire_contract_tests;

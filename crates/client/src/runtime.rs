@@ -163,6 +163,14 @@ impl ClientRuntime {
         self.ws_client.command_sender()
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_test_event(&self, event: GatewayWsEvent) {
+        self.ws_client.inject_test_event(event);
+    }
+    #[cfg(test)]
+    pub(crate) fn close_test_ingress(&self) {
+        self.ws_client.close_test_events();
+    }
     pub fn recv_ws_event(&self) -> Option<GatewayWsEvent> {
         self.ws_client.recv_event()
     }
@@ -260,6 +268,7 @@ pub fn reduce_gateway_notification(
     context: ClientRuntimeNotificationContext<'_>,
 ) -> Option<ClientRuntimeNotification> {
     match notification {
+        GatewayNotification::McpOAuthChanged(_) => None,
         GatewayNotification::AccessChanged(notification) => {
             Some(ClientRuntimeNotification::AccessChanged(notification))
         }

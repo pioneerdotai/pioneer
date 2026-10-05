@@ -24,8 +24,9 @@ use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 
 use pioneer_protocol::{
-    ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits, ProviderModelPricing,
-    ProviderModelReasoningCapabilities, ReasoningCapabilitySource,
+    ProviderErrorReason, ProviderFailureStage, ProviderModelCapabilities, ProviderModelInfo,
+    ProviderModelLimits, ProviderModelPricing, ProviderModelReasoningCapabilities,
+    ProviderRequestId, ReasoningCapabilitySource,
 };
 
 pub(crate) const BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -240,6 +241,8 @@ struct ApiEmbeddingData {
 #[derive(Debug, Deserialize)]
 struct StreamResponse {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     usage: Option<ApiUsage>,
     #[serde(default)]
     choices: Vec<StreamChoice>,
@@ -249,6 +252,8 @@ struct StreamResponse {
 
 #[derive(Debug, Deserialize)]
 struct StreamChoice {
+    #[serde(default)]
+    error: Option<StreamError>,
     #[serde(default)]
     delta: StreamDelta,
     #[serde(default)]
@@ -301,6 +306,8 @@ impl StreamDelta {
 
 #[derive(Debug, Deserialize)]
 struct StreamError {
+    #[serde(default, deserialize_with = "deserialize_error_metadata")]
+    metadata: Option<ErrorMetadata>,
     #[serde(default)]
     message: Option<String>,
     #[serde(default)]
@@ -309,16 +316,242 @@ struct StreamError {
     error_type: Option<String>,
 }
 
-impl StreamError {
-    fn description(self) -> String {
-        let mut parts = Vec::new();
-        if let Some(message) = self.message.filter(|message| !message.is_empty()) {
-            parts.push(message);
+#[derive(Debug)]
+struct ErrorMetadata {
+    error_type: Option<ProviderErrorReason>,
+}
+
+// Optional diagnostics must not invalidate the error envelope. Retain only the
+// allowlisted fact; neither malformed metadata nor raw details enter an error.
+fn deserialize_error_metadata<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<ErrorMetadata>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_object().map(|metadata| ErrorMetadata {
+        error_type: metadata
+            .get("error_type")
+            .and_then(serde_json::Value::as_str)
+            .and_then(ProviderErrorReason::from_openrouter_code),
+    }))
+}
+
+/// Safe facts from this response only. A successful HTTP status is not a
+/// generation error code. Valid body IDs supersede the validated header fallback.
+#[derive(Default)]
+struct ResponseFailureFacts {
+    request_id: Option<String>,
+    http_status: Option<u16>,
+    retry_after_ms: Option<u64>,
+}
+
+impl ResponseFailureFacts {
+    fn capture(response: &reqwest::Response) -> Self {
+        Self {
+            request_id: OpenRouterProvider::response_request_id(response),
+            http_status: (!response.status().is_success()).then(|| response.status().as_u16()),
+            retry_after_ms: response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|seconds| seconds.saturating_mul(1000)),
         }
-        if let Some(error_type) = self.error_type.filter(|error_type| !error_type.is_empty()) {
+    }
+
+    fn observe_body_id(&mut self, body: &serde_json::Value) {
+        if let Some(id) = body
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| ProviderRequestId::try_from((*id).to_owned()).is_ok())
+        {
+            self.request_id = Some(id.to_owned());
+        }
+    }
+
+    fn failure(&self, error: anyhow::Error, stage: ProviderFailureStage) -> anyhow::Error {
+        // Classify the original failure, not the additional response status:
+        // response facts must not change read/decode/limit recovery policy.
+        let description = if error.is::<serde_json::Error>() {
+            "malformed OpenRouter response".to_owned()
+        } else if error.is::<std::string::FromUtf8Error>() {
+            "provider response body was not valid UTF-8".to_owned()
+        } else {
+            error.to_string()
+        };
+        let source_status = error
+            .downcast_ref::<reqwest::Error>()
+            .and_then(reqwest::Error::status)
+            .map(|status| status.as_u16());
+        let mut failure = OpenRouterFailure::from_envelope(
+            None,
+            self.request_id.clone(),
+            source_status,
+            self.retry_after_ms,
+            &description,
+            stage,
+        );
+        if let Some(oversized) = error.downcast_ref::<crate::types::ProviderHttpErrorBodyTooLarge>()
+        {
+            failure.classification.class =
+                crate::failure::classify_http_error_body_too_large(oversized.status).class;
+            failure.classification.http_status = Some(oversized.status);
+        } else if error.is::<crate::types::ProviderResponseTooLarge>() {
+            failure.classification.class = pioneer_protocol::ProviderFailureClass::ProviderRejected;
+        }
+        failure.classification.http_status =
+            self.http_status.or(failure.classification.http_status);
+        failure.classification.is_network_error =
+            error.chain().any(|cause| cause.is::<reqwest::Error>());
+        // No source chain: FromUtf8Error owns raw bytes, serde errors can own
+        // provider-controlled values, and reqwest errors can carry secret URLs.
+        failure.into()
+    }
+}
+
+/// The raw envelope is used only for the established classification, then discarded.
+#[derive(Debug)]
+struct OpenRouterFailure {
+    classification: crate::types::ProviderFailureClassification,
+    // Only the established, data-free completion enum may survive as a source.
+    incomplete: Option<ProviderStreamIncomplete>,
+}
+
+impl std::fmt::Display for OpenRouterFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OpenRouter provider request failed")
+    }
+}
+
+impl std::error::Error for OpenRouterFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.incomplete
+            .as_ref()
+            .map(|cause| cause as &(dyn std::error::Error + 'static))
+    }
+}
+
+impl OpenRouterFailure {
+    fn from_envelope(
+        error: Option<StreamError>,
+        id: Option<String>,
+        status: Option<u16>,
+        retry_after_ms: Option<u64>,
+        legacy_description: &str,
+        stage: ProviderFailureStage,
+    ) -> Self {
+        let provider_code = crate::failure::extract_provider_code(legacy_description);
+        let lower = legacy_description.to_ascii_lowercase();
+        let class = crate::failure::classify_provider_failure_class(
+            &lower,
+            stage,
+            status,
+            provider_code.as_deref(),
+        );
+        let mut classification = crate::types::ProviderFailureClassification::new(class);
+        classification.http_status = status;
+        classification.retry_after_ms =
+            retry_after_ms.or_else(|| crate::failure::extract_retry_after_ms(&lower));
+        classification.error_reason = error
+            .and_then(|error| error.metadata)
+            .and_then(|metadata| metadata.error_type);
+        classification.request_id = id.and_then(|id| ProviderRequestId::try_from(id).ok());
+        Self {
+            classification,
+            incomplete: None,
+        }
+    }
+
+    fn stream(error: StreamError, id: Option<String>) -> Self {
+        Self::generation(error, id, ProviderFailureStage::MidStream, None)
+    }
+
+    fn generation(
+        error: StreamError,
+        id: Option<String>,
+        stage: ProviderFailureStage,
+        retry_after_ms: Option<u64>,
+    ) -> Self {
+        let status = error
+            .code
+            .as_ref()
+            .and_then(|code| {
+                code.as_u64()
+                    .or_else(|| code.as_str().and_then(|code| code.parse().ok()))
+            })
+            .and_then(|code| u16::try_from(code).ok())
+            .filter(|code| (100..=599).contains(code));
+        let description = error.description();
+        Self::from_envelope(Some(error), id, status, retry_after_ms, &description, stage)
+    }
+
+    // Classify the original transport failure before discarding its text and
+    // source chain. Adding an ID must not turn a transport failure into a 5xx.
+    fn stream_transport(error: anyhow::Error, id: Option<String>) -> anyhow::Error {
+        let incomplete = crate::failure::provider_stream_incomplete(&error);
+        let description = error.to_string();
+        let status = error
+            .downcast_ref::<reqwest::Error>()
+            .and_then(reqwest::Error::status)
+            .map(|status| status.as_u16());
+        let mut failure = Self::from_envelope(
+            None,
+            id,
+            status,
+            None,
+            &description,
+            ProviderFailureStage::MidStream,
+        );
+        if error.is::<crate::types::ProviderResponseTooLarge>() {
+            failure.classification.class = pioneer_protocol::ProviderFailureClass::ProviderRejected;
+        }
+        failure.incomplete = incomplete;
+        failure.into()
+    }
+
+    fn http(
+        body: &str,
+        status: u16,
+        retry_after_ms: Option<u64>,
+        request_id: Option<String>,
+    ) -> Self {
+        let value = serde_json::from_str::<serde_json::Value>(body).ok();
+        let mut facts = ResponseFailureFacts {
+            request_id,
+            http_status: Some(status),
+            retry_after_ms,
+        };
+        if let Some(value) = &value {
+            facts.observe_body_id(value);
+        }
+        let error = value
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .and_then(|error| serde_json::from_value::<StreamError>(error.clone()).ok());
+        Self::from_envelope(
+            error,
+            facts.request_id,
+            Some(status),
+            retry_after_ms,
+            body,
+            ProviderFailureStage::Connect,
+        )
+    }
+}
+
+impl StreamError {
+    fn description(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(message) = self.message.as_ref().filter(|message| !message.is_empty()) {
+            parts.push(message.clone());
+        }
+        if let Some(error_type) = self
+            .error_type
+            .as_ref()
+            .filter(|error_type| !error_type.is_empty())
+        {
             parts.push(format!("type={error_type}"));
         }
-        if let Some(code) = self.code {
+        if let Some(code) = &self.code {
             let code = code
                 .as_str()
                 .map(str::to_owned)
@@ -752,8 +985,23 @@ impl OpenRouterProvider {
             .header("X-OpenRouter-Categories", APP_CATEGORIES)
     }
 
+    fn response_request_id(response: &reqwest::Response) -> Option<String> {
+        // A validated body ID takes precedence later. Among headers, prefer
+        // OpenRouter's generation ID, then the existing request-ID fallback.
+        ["x-generation-id", "x-request-id"]
+            .into_iter()
+            .find_map(|name| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .filter(|value| ProviderRequestId::try_from((*value).to_owned()).is_ok())
+                    .map(str::to_owned)
+            })
+    }
+
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
-        let status = response.status();
+        let facts = ResponseFailureFacts::capture(&response);
         let body = match crate::http::read_response_text_bounded(
             response,
             16 * 1024,
@@ -762,9 +1010,15 @@ impl OpenRouterProvider {
         .await
         {
             Ok(body) => body,
-            Err(error) => return error,
+            Err(error) => return facts.failure(error, ProviderFailureStage::Connect),
         };
-        anyhow!("OpenRouter API error ({status}): {body}")
+        OpenRouterFailure::http(
+            &body,
+            facts.http_status.expect("non-success response"),
+            facts.retry_after_ms,
+            facts.request_id,
+        )
+        .into()
     }
 
     async fn list_model_entries(
@@ -791,6 +1045,15 @@ impl OpenRouterProvider {
 
 #[async_trait]
 impl crate::traits::Provider for OpenRouterProvider {
+    fn classify_failure(
+        &self,
+        error: &anyhow::Error,
+    ) -> Option<crate::types::ProviderFailureClassification> {
+        error
+            .downcast_ref::<OpenRouterFailure>()
+            .map(|failure| failure.classification.clone())
+    }
+
     fn name(&self) -> &str {
         "openrouter"
     }
@@ -881,22 +1144,54 @@ impl crate::traits::Provider for OpenRouterProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
+        let mut facts = ResponseFailureFacts::capture(&response);
+        let body: serde_json::Value = crate::http::read_response_json_bounded(
             response,
             Default::default(),
             "provider_response",
         )
-        .await?;
+        .await
+        .map_err(|error| facts.failure(error, ProviderFailureStage::Connect))?;
+        facts.observe_body_id(&body);
+        // Chat Completions can report generation failure inside HTTP 200,
+        // either at the top level or in a choice. The envelope code, not 200,
+        // is the failure status in this case.
+        if let Some(error) = body
+            .get("error")
+            .filter(|error| !error.is_null())
+            .or_else(|| {
+                body.get("choices")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|choices| {
+                        choices
+                            .iter()
+                            .find_map(|choice| choice.get("error").filter(|error| !error.is_null()))
+                    })
+            })
+        {
+            let error: StreamError = serde_json::from_value(error.clone())
+                .map_err(|error| facts.failure(error.into(), ProviderFailureStage::Connect))?;
+            return Err(OpenRouterFailure::generation(
+                error,
+                facts.request_id,
+                ProviderFailureStage::Connect,
+                facts.retry_after_ms,
+            )
+            .into());
+        }
+        let api_response: ApiChatResponse = serde_json::from_value(body)
+            .map_err(|error| facts.failure(error.into(), ProviderFailureStage::Connect))?;
         let usage = api_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         });
 
-        let choice = api_response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("no response from OpenRouter"))?;
+        let choice = api_response.choices.into_iter().next().ok_or_else(|| {
+            facts.failure(
+                anyhow!("no response from OpenRouter"),
+                ProviderFailureStage::Connect,
+            )
+        })?;
         let termination = choice
             .finish_reason
             .as_deref()
@@ -908,14 +1203,18 @@ impl crate::traits::Provider for OpenRouterProvider {
             Self::reasoning_details_state(message.reasoning_details.clone().unwrap_or_default());
         let text = message.effective_content();
         let tool_calls =
-            parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())?;
+            parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())
+                .map_err(|error| facts.failure(error, ProviderFailureStage::Connect))?;
         let reasoning_content = message.reasoning_content.or(message.reasoning);
 
         if text.is_empty()
             && tool_calls.is_empty()
             && reasoning_content.as_deref().unwrap_or_default().is_empty()
         {
-            return Err(anyhow!("no response from OpenRouter"));
+            return Err(facts.failure(
+                anyhow!("no response from OpenRouter"),
+                ProviderFailureStage::Connect,
+            ));
         }
 
         Ok(ChatResponse {
@@ -932,6 +1231,13 @@ impl crate::traits::Provider for OpenRouterProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        Ok(self.stream_chat_with_diagnostics(request).await?.stream)
+    }
+
+    async fn stream_chat_with_diagnostics(
+        &self,
+        request: ChatRequest,
+    ) -> Result<crate::ProviderStream> {
         let prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
@@ -971,6 +1277,15 @@ impl crate::traits::Provider for OpenRouterProvider {
             return Err(Self::api_error(response).await);
         }
 
+        let request_id = Self::response_request_id(&response);
+        let diagnostics = crate::ProviderStreamDiagnostics::default();
+        if let Some(id) = request_id
+            .clone()
+            .and_then(|id| ProviderRequestId::try_from(id).ok())
+        {
+            diagnostics.set_request_id(id);
+        }
+        let stream_diagnostics = diagnostics.clone();
         let byte_stream = crate::http::bounded_response_stream(
             response,
             crate::types::ProviderResponseLimits::default().max_transport_bytes,
@@ -983,6 +1298,7 @@ impl crate::traits::Provider for OpenRouterProvider {
             let mut decoder = IncrementalLineDecoder::default();
             let mut tool_call_accumulator = StreamToolCallAccumulator::default();
             let mut terminal_reason = None;
+            let mut generation_id = request_id;
             let mut reasoning_details = Vec::new();
 
             tokio::pin!(byte_stream);
@@ -995,7 +1311,14 @@ impl crate::traits::Provider for OpenRouterProvider {
                 let bytes = match result {
                     Ok(bytes) => bytes,
                     Err(e) => {
-                        if tx.send(Err(anyhow!(e))).await.is_err() {
+                        if tx
+                            .send(Err(OpenRouterFailure::stream_transport(
+                                e,
+                                generation_id.clone(),
+                            )))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                         return;
@@ -1005,7 +1328,14 @@ impl crate::traits::Provider for OpenRouterProvider {
                 let lines = match decoder.push(bytes.as_ref()) {
                     Ok(lines) => lines,
                     Err(error) => {
-                        if tx.send(Err(error)).await.is_err() {
+                        if tx
+                            .send(Err(OpenRouterFailure::stream_transport(
+                                error,
+                                generation_id.clone(),
+                            )))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                         return;
@@ -1030,17 +1360,34 @@ impl crate::traits::Provider for OpenRouterProvider {
                                     ProviderStreamIncomplete::DoneWithoutFinishReason,
                                 )
                             });
-                        let _ = tx.send(terminal).await;
+                        let _ = tx
+                            .send(terminal.map_err(|error| {
+                                OpenRouterFailure::stream_transport(error, generation_id.clone())
+                            }))
+                            .await;
                         return;
                     }
 
                     match serde_json::from_str::<StreamResponse>(data) {
-                        Ok(resp) => {
+                        Ok(mut resp) => {
+                            if let Some(id) = resp
+                                .id
+                                .clone()
+                                .filter(|id| ProviderRequestId::try_from(id.clone()).is_ok())
+                            {
+                                stream_diagnostics.set_request_id(
+                                    ProviderRequestId::try_from(id.clone()).expect("validated ID"),
+                                );
+                                generation_id = Some(id);
+                            }
                             if terminal_reason.is_some()
                                 && resp.choices.iter().any(|choice| choice.delta.has_payload())
                             {
                                 let _ = tx
-                                    .send(Err(anyhow!("provider sent payload after finish_reason")))
+                                    .send(Err(OpenRouterFailure::stream_transport(
+                                        anyhow!("provider sent payload after finish_reason"),
+                                        generation_id.clone(),
+                                    )))
                                     .await;
                                 return;
                             }
@@ -1056,12 +1403,17 @@ impl crate::traits::Provider for OpenRouterProvider {
                                     return;
                                 }
                             }
-                            if let Some(error) = resp.error {
+                            if let Some(error) = resp.error.take().or_else(|| {
+                                resp.choices
+                                    .iter_mut()
+                                    .find_map(|choice| choice.error.take())
+                            }) {
                                 if tx
-                                    .send(Err(anyhow!(
-                                        "OpenRouter stream error: {}",
-                                        error.description()
-                                    )))
+                                    .send(Err(OpenRouterFailure::stream(
+                                        error,
+                                        generation_id.clone(),
+                                    )
+                                    .into()))
                                     .await
                                     .is_err()
                                 {
@@ -1073,8 +1425,11 @@ impl crate::traits::Provider for OpenRouterProvider {
                                 if terminal_reason.is_some() {
                                     if choice.delta.has_payload() {
                                         let _ = tx
-                                            .send(Err(anyhow!(
-                                                "provider sent payload after finish_reason"
+                                            .send(Err(OpenRouterFailure::stream_transport(
+                                                anyhow!(
+                                                    "provider sent payload after finish_reason"
+                                                ),
+                                                generation_id.clone(),
                                             )))
                                             .await;
                                         return;
@@ -1129,7 +1484,14 @@ impl crate::traits::Provider for OpenRouterProvider {
                                     let tool_calls = match tool_call_accumulator.take_tool_calls() {
                                         Ok(calls) => calls,
                                         Err(error) => {
-                                            if tx.send(Err(error)).await.is_err() {
+                                            if tx
+                                                .send(Err(OpenRouterFailure::stream_transport(
+                                                    error,
+                                                    generation_id.clone(),
+                                                )))
+                                                .await
+                                                .is_err()
+                                            {
                                                 return;
                                             }
                                             return;
@@ -1148,9 +1510,12 @@ impl crate::traits::Provider for OpenRouterProvider {
                                 }
                             }
                         }
-                        Err(e) => {
+                        Err(_) => {
                             if tx
-                                .send(Err(anyhow!("malformed OpenRouter SSE frame: {e}")))
+                                .send(Err(OpenRouterFailure::stream_transport(
+                                    anyhow!("malformed OpenRouter SSE frame"),
+                                    generation_id.clone(),
+                                )))
                                 .await
                                 .is_err()
                             {
@@ -1170,11 +1535,18 @@ impl crate::traits::Provider for OpenRouterProvider {
                         anyhow::Error::from(ProviderStreamIncomplete::EofWithoutTerminalMarker)
                     }),
             };
-            let _ = tx.send(terminal).await;
+            let _ = tx
+                .send(terminal.map_err(|error| {
+                    OpenRouterFailure::stream_transport(error, generation_id.clone())
+                }))
+                .await;
         });
 
         let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(Box::pin(chunk_stream))
+        Ok(crate::ProviderStream {
+            stream: Box::pin(chunk_stream),
+            diagnostics,
+        })
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -2125,6 +2497,138 @@ mod tests {
         assert!(!response.choices[0].delta.has_payload());
     }
 
+    #[tokio::test]
+    async fn chat_still_decodes_successful_completion_and_usage() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8192];
+            socket.read(&mut request).await.unwrap();
+            let body = r#"{"id":"gen-success","choices":[{"message":{"content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1}}"#;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let provider = crate::ProviderRegistry::with_provider(
+            "openrouter",
+            std::sync::Arc::new(OpenRouterProvider::with_base_url("key", url)),
+        )
+        .get_or_create("openrouter")
+        .unwrap();
+        let response = provider
+            .chat(ChatRequest {
+                model: "fixture".into(),
+                messages: vec![ChatMessage::user("hello")],
+                temperature: None,
+                max_tokens: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                compiled_prompt: None,
+            })
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(response.text, "hello");
+        assert_eq!(response.termination, ProviderTermination::Complete);
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(2));
+        assert_eq!(usage.output_tokens, Some(1));
+    }
+
+    #[test]
+    fn stream_transport_ids_do_not_change_failure_classes_or_retain_sources() {
+        use pioneer_protocol::ProviderFailureClass;
+        for (error, expected) in [
+            (
+                anyhow!("connection reset private_fixture"),
+                ProviderFailureClass::NetworkTransient,
+            ),
+            (
+                anyhow!("provider stream ended before a terminal marker"),
+                ProviderFailureClass::StreamStall,
+            ),
+            (
+                ProviderStreamIncomplete::EofWithoutTerminalMarker.into(),
+                ProviderFailureClass::StreamStall,
+            ),
+            (
+                ProviderStreamIncomplete::DoneWithoutFinishReason.into(),
+                ProviderFailureClass::StreamStall,
+            ),
+            (
+                IncrementalLineDecoder::default()
+                    .push(&[0xff, b'\n'])
+                    .unwrap_err(),
+                ProviderFailureClass::StreamStall,
+            ),
+            (
+                crate::types::ProviderResponseTooLarge::new("provider_stream", 10, 11).into(),
+                ProviderFailureClass::ProviderRejected,
+            ),
+        ] {
+            let incomplete = crate::failure::provider_stream_incomplete(&error);
+            let error = OpenRouterFailure::stream_transport(error, Some("gen-fixture".to_owned()));
+            assert_eq!(
+                crate::failure::provider_stream_incomplete(&error),
+                incomplete
+            );
+            let failure = error.downcast_ref::<OpenRouterFailure>().unwrap();
+            assert_eq!(failure.classification.class, expected);
+            assert_eq!(failure.classification.http_status, None);
+            assert_eq!(
+                failure.classification.request_id,
+                Some(ProviderRequestId::try_from("gen-fixture".to_owned()).unwrap())
+            );
+            assert!(!format!("{error:#?}").contains("private_fixture"));
+            assert_eq!(error.chain().count(), 1 + usize::from(incomplete.is_some()));
+        }
+    }
+
+    #[test]
+    fn structured_failures_discard_raw_details_and_keep_only_allowlisted_facts() {
+        for reason in [
+            serde_json::json!("provider_unavailable"),
+            serde_json::json!("secret-reason"),
+            serde_json::json!({"raw": "secret"}),
+            serde_json::Value::Null,
+        ] {
+            let body = serde_json::json!({
+                "id": "https://secret.example?key=credential",
+                "error": {"code": 502, "message": "private credential provider_overloaded",
+                    "metadata": {"error_type": reason, "raw": "private request history", "provider_code": "private credential"}}
+            }).to_string();
+            let failure =
+                OpenRouterFailure::http(&body, 502, Some(5000), Some("req-fixture_123".to_owned()));
+            assert_eq!(
+                failure.classification.class,
+                pioneer_protocol::ProviderFailureClass::Provider5xx
+            );
+            assert_eq!(failure.classification.retry_after_ms, Some(5000));
+            assert_eq!(
+                failure.classification.error_reason,
+                (reason == "provider_unavailable")
+                    .then_some(ProviderErrorReason::ProviderUnavailable)
+            );
+            assert!(failure.classification.provider_code.is_none());
+            assert_eq!(
+                failure.classification.request_id,
+                Some(ProviderRequestId::try_from("req-fixture_123".to_owned()).unwrap())
+            );
+            let safe = format!("{failure:?} {failure}");
+            for secret in [
+                "credential",
+                "secret.example",
+                "secret-reason",
+                "private",
+                "history",
+            ] {
+                assert!(!safe.contains(secret));
+            }
+        }
+    }
+
     #[test]
     fn stream_response_deserializes_error_envelope_without_delta() {
         let json = r#"{"error":{"message":"upstream failed","type":"provider_error","code":524},"choices":[{"finish_reason":"error"}]}"#;
@@ -2185,4 +2689,14 @@ mod tests {
         assert!(caps.streaming);
         assert!(caps.vision);
     }
+}
+
+#[cfg(test)]
+mod wire_contract_tests {
+    use super::*;
+    type WireProvider = OpenRouterProvider;
+    fn wire_provider() -> WireProvider {
+        WireProvider::new("fixture")
+    }
+    include!("wire_tests/chat.rs");
 }

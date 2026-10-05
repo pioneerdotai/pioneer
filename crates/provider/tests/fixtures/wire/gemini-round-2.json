@@ -1,0 +1,19 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "role": "model",
+        "parts": [
+          {
+            "functionCall": {
+              "id": "clock_2",
+              "name": "clock"
+            },
+            "thoughtSignature": "BQYHCA=="
+          }
+        ]
+      },
+      "finishReason": "STOP"
+    }
+  ]
+}

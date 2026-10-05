@@ -3769,7 +3769,7 @@ async fn reconciliation_repairs_only_an_exact_terminal_occurrence_mismatch() {
 }
 
 #[tokio::test]
-async fn terminal_occurrence_scan_cursor_advances_past_unrepairable_rows() {
+async fn diagnostic_terminal_occurrence_pages_advance_past_unrepairable_rows() {
     let runtime = runtime().await;
     let store = runtime.service().store();
     store
@@ -4260,6 +4260,378 @@ async fn recurring_due_trigger_with_active_serial_run_skips_fire_and_moves_next_
         .expect("task should read after repeated pass");
     assert_eq!(after_repeat.runs.len(), 1);
     assert_eq!(after_repeat.triggers[0].next_fire_at, Some(4_000_000_020));
+}
+
+#[tokio::test]
+async fn long_missed_cron_recovers_latest_and_skip_without_duplicate_runs() {
+    for policy in [None, Some(TaskTriggerCatchUpPolicy::skip_missed())] {
+        let runtime = runtime().await;
+        runtime
+            .register_executor(Arc::new(CompletingSystemExecutor))
+            .await;
+        let response = runtime
+            .service()
+            .create_task(
+                TaskCreateContext::default(),
+                create_params(TaskTriggerSpec::Cron {
+                    cron_expr: "* * * * *".to_owned(),
+                    timezone: "UTC".to_owned(),
+                    catch_up_policy: policy,
+                }),
+            )
+            .await
+            .expect("cron task should create");
+        let first = response.trigger.next_fire_at.unwrap();
+        let healthy = runtime
+            .service()
+            .create_task(
+                TaskCreateContext::default(),
+                create_params(TaskTriggerSpec::ScheduledAt {
+                    scheduled_at: first + 1,
+                    timezone: Some("UTC".to_owned()),
+                    catch_up_policy: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let latest = first + 20_000 * 60;
+        let expected_runs = usize::from(policy.is_none());
+        assert_eq!(
+            runtime.process_due_once(latest + 5).await.unwrap(),
+            expected_runs + 1
+        );
+        assert_eq!(runtime.process_due_once(latest + 5).await.unwrap(), 0);
+        let task = runtime
+            .service()
+            .get_task(pioneer_protocol::TaskGetParams {
+                task_id: response.task.id,
+            })
+            .await
+            .unwrap();
+        assert_eq!(task.runs.len(), expected_runs);
+        if let Some(run) = task.runs.first() {
+            assert_eq!(run.status, TaskRunStatus::Succeeded);
+        }
+        assert_eq!(task.triggers[0].last_fire_at, Some(latest));
+        assert_eq!(task.triggers[0].next_fire_at, Some(latest + 60));
+        assert_eq!(task.triggers[0].status, TaskTriggerStatus::Active);
+        let healthy = runtime
+            .service()
+            .get_task(pioneer_protocol::TaskGetParams {
+                task_id: healthy.task.id,
+            })
+            .await
+            .unwrap();
+        assert_eq!(healthy.runs.len(), 1);
+        assert_eq!(healthy.runs[0].status, TaskRunStatus::Succeeded);
+    }
+}
+
+#[tokio::test]
+async fn invalid_cron_is_isolated_without_blocking_scheduled_or_retry_work() {
+    let runtime = runtime().await;
+    runtime
+        .register_executor(Arc::new(FailingSystemExecutor))
+        .await;
+    let mut retry_params = create_params(TaskTriggerSpec::Immediate);
+    retry_params.retry_policy = Some(TaskRetryPolicy {
+        max_attempts: 2,
+        backoff: TaskRetryBackoffKind::Fixed,
+        initial_delay_seconds: Some(5),
+        max_delay_seconds: None,
+        retry_on: vec![TaskErrorClass::Internal],
+    });
+    let retry = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), retry_params)
+        .await
+        .unwrap();
+    let before_retry = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: retry.task.id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(before_retry.runs.len(), 2);
+    assert_eq!(before_retry.runs[1].status, TaskRunStatus::Queued);
+
+    let invalid = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Cron {
+                cron_expr: "* * * * *".to_owned(),
+                timezone: "UTC".to_owned(),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .unwrap();
+    // Model an invalid historical schedule through the existing event seam.
+    // The malformed expression still decodes, so the scheduler can isolate
+    // its owning Task without changing normal creation validation.
+    let mut trigger = invalid.trigger;
+    trigger.spec = TaskTriggerSpec::Cron {
+        cron_expr: "invalid".to_owned(),
+        timezone: "UTC".to_owned(),
+        catch_up_policy: None,
+    };
+    trigger.next_fire_at = Some(1);
+    runtime
+        .service()
+        .append_event(
+            TaskEventPayload::TaskRescheduled {
+                task_id: invalid.task.id.clone(),
+                trigger,
+                rescheduled_at: 1,
+                reason: TaskRescheduleReason::UserRequested,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    runtime
+        .register_executor(Arc::new(CompletingSystemExecutor))
+        .await;
+    let scheduled = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::ScheduledAt {
+                scheduled_at: 2,
+                timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .unwrap();
+    let now = 4_000_000_000;
+    assert_eq!(runtime.process_due_once(now).await.unwrap(), 2);
+    let blocked = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: invalid.task.id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(blocked.task.status, TaskStatus::Blocked);
+    assert!(blocked.runs.is_empty());
+    assert_eq!(blocked.triggers[0].status, TaskTriggerStatus::Paused);
+    assert_eq!(blocked.triggers[0].next_fire_at, None);
+    assert_eq!(
+        blocked.task.error.as_ref().unwrap().code,
+        "task_trigger_schedule_invalid"
+    );
+    let scheduled = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: scheduled.task.id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(scheduled.runs[0].status, TaskRunStatus::Succeeded);
+    let retried = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: retry.task.id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(retried.runs.len(), 2);
+    assert_eq!(retried.runs[1].status, TaskRunStatus::Succeeded);
+    assert_eq!(runtime.process_due_once(now).await.unwrap(), 0);
+    let restarted = TaskRuntime::new(runtime.service().store());
+    assert_eq!(restarted.process_due_once(now).await.unwrap(), 0);
+    let events = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id: invalid.task.id,
+            after_sequence: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .events
+            .iter()
+            .filter(|event| matches!(event.payload, TaskEventPayload::TaskBlocked { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn stale_cron_failure_does_not_block_a_repaired_spec_with_the_same_fire_time() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Cron {
+                cron_expr: "* * * * *".to_owned(),
+                timezone: "UTC".to_owned(),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .unwrap();
+    let mut stale = response.trigger.clone();
+    stale.spec = TaskTriggerSpec::Cron {
+        cron_expr: "invalid".to_owned(),
+        timezone: "UTC".to_owned(),
+        catch_up_policy: None,
+    };
+    let now = stale.next_fire_at.unwrap();
+    stale.updated_at = now - 1;
+    runtime
+        .service()
+        .append_event(
+            TaskEventPayload::TaskRescheduled {
+                task_id: response.task.id.clone(),
+                trigger: stale.clone(),
+                rescheduled_at: now - 1,
+                reason: TaskRescheduleReason::UserRequested,
+            },
+            now - 1,
+        )
+        .await
+        .unwrap();
+    let mut repaired = stale.clone();
+    repaired.updated_at = now;
+    repaired.spec = TaskTriggerSpec::Cron {
+        cron_expr: "*/2 * * * *".to_owned(),
+        timezone: "UTC".to_owned(),
+        catch_up_policy: None,
+    };
+    runtime
+        .service()
+        .append_event(
+            TaskEventPayload::TaskRescheduled {
+                task_id: response.task.id.clone(),
+                trigger: repaired,
+                rescheduled_at: now,
+                reason: TaskRescheduleReason::UserRequested,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    let error = TaskError {
+        recovery_diagnostic: None,
+        code: "task_trigger_schedule_invalid".to_owned(),
+        message: "stale calculation failure".to_owned(),
+        class: TaskErrorClass::Validation,
+        details: None,
+        failed_run_id: None,
+    };
+    let appended = runtime
+        .service()
+        .store()
+        .block_task_for_due_trigger_failure(&stale, error, now)
+        .await
+        .unwrap();
+    assert!(appended.is_empty());
+    let task = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: response.task.id,
+        })
+        .await
+        .unwrap();
+    assert_ne!(task.task.status, TaskStatus::Blocked);
+    assert_eq!(task.triggers[0].status, TaskTriggerStatus::Active);
+    assert_eq!(task.triggers[0].next_fire_at, stale.next_fire_at);
+}
+
+#[tokio::test]
+async fn cron_failure_quarantine_rolls_back_and_can_be_retried_atomically() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Cron {
+                cron_expr: "* * * * *".to_owned(),
+                timezone: "UTC".to_owned(),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .unwrap();
+    let store = runtime.service().store().with_maintenance_access();
+    let database = store.database_connection();
+    let now = response.trigger.next_fire_at.unwrap();
+    let error = TaskError {
+        recovery_diagnostic: None,
+        code: "task_trigger_schedule_invalid".to_owned(),
+        message: "test schedule failure".to_owned(),
+        class: TaskErrorClass::Validation,
+        details: None,
+        failed_run_id: None,
+    };
+    // Fail the trigger pause after the TaskBlocked event has started being
+    // projected. Both the canonical event and every projection must roll back.
+    database
+        .execute_unprepared(
+            "CREATE TRIGGER reject_trigger_pause BEFORE UPDATE OF status ON task_trigger \
+         WHEN NEW.status = 'paused' BEGIN SELECT RAISE(ABORT, 'test pause failure'); END",
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .block_task_for_due_trigger_failure(&response.trigger, error.clone(), now)
+            .await
+            .is_err()
+    );
+    let after_failure = store.get_task(&response.task.id).await.unwrap().unwrap();
+    assert_ne!(after_failure.task.status, TaskStatus::Blocked);
+    assert_eq!(after_failure.triggers[0].status, TaskTriggerStatus::Active);
+    assert_eq!(after_failure.triggers[0].next_fire_at, Some(now));
+    assert!(
+        !store
+            .get_task_events(&response.task.id, None)
+            .await
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| matches!(event.payload, TaskEventPayload::TaskBlocked { .. }))
+    );
+    // Acquiring the writer again also proves the failed transaction released it.
+    database
+        .execute_unprepared("DROP TRIGGER reject_trigger_pause")
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .block_task_for_due_trigger_failure(&response.trigger, error.clone(), now)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let blocked = store.get_task(&response.task.id).await.unwrap().unwrap();
+    assert_eq!(blocked.task.status, TaskStatus::Blocked);
+    assert_eq!(blocked.triggers[0].status, TaskTriggerStatus::Paused);
+    assert!(
+        store
+            .block_task_for_due_trigger_failure(&response.trigger, error, now)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .get_task_events(&response.task.id, None)
+            .await
+            .unwrap()
+            .events
+            .iter()
+            .filter(|event| matches!(event.payload, TaskEventPayload::TaskBlocked { .. }))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -7994,6 +8366,257 @@ async fn immediate_dispatch_inherits_request_scope_and_scheduler_keeps_maintenan
     observer.assert_scope(SqliteReadClass::Interactive, SqliteWriteClass::Interactive);
     assert_eq!(runtime.process_due_once(4_000_000_000).await.unwrap(), 1);
     observer.assert_scope(SqliteReadClass::Maintenance, SqliteWriteClass::Maintenance);
+
+    let invalid = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Cron {
+                cron_expr: "* * * * *".to_owned(),
+                timezone: "UTC".to_owned(),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .unwrap();
+    let mut trigger = invalid.trigger;
+    let now = trigger.next_fire_at.unwrap();
+    trigger.spec = TaskTriggerSpec::Cron {
+        cron_expr: "invalid".to_owned(),
+        timezone: "UTC".to_owned(),
+        catch_up_policy: None,
+    };
+    runtime
+        .service()
+        .append_event(
+            TaskEventPayload::TaskRescheduled {
+                task_id: invalid.task.id.clone(),
+                trigger,
+                rescheduled_at: now,
+                reason: TaskRescheduleReason::UserRequested,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    observer.assert_scope(SqliteReadClass::Interactive, SqliteWriteClass::Interactive);
+    assert_eq!(runtime.process_due_once(now).await.unwrap(), 0);
+    observer.assert_scope(SqliteReadClass::Maintenance, SqliteWriteClass::Maintenance);
+    let invalid = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: invalid.task.id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(invalid.task.status, TaskStatus::Blocked);
+}
+
+/// Exercises the real scheduler dispatch and fail_run transition, including the
+/// existing retry_on selection. A start error must never invoke start_run twice.
+struct StartFailureSystemExecutor {
+    failure: std::sync::Mutex<Option<anyhow::Error>>,
+    starts: AtomicUsize,
+}
+
+#[async_trait]
+impl TaskExecutor for StartFailureSystemExecutor {
+    fn kind(&self) -> TaskExecutorKind {
+        TaskExecutorKind::System
+    }
+
+    async fn start_run(
+        &self,
+        _context: TaskExecutionContext,
+        _run: TaskRun,
+        _handle: TaskExecutionHandle,
+    ) -> TaskRuntimeResult<TaskExecutorStartOutcome> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        Err(self.failure.lock().unwrap().take().expect("only one start"))
+    }
+
+    async fn cancel_run(
+        &self,
+        _context: TaskExecutionContext,
+        _run_id: &str,
+        _reason: &str,
+        _handle: TaskExecutionHandle,
+    ) -> TaskRuntimeResult<()> {
+        Ok(())
+    }
+
+    async fn recover_run(
+        &self,
+        _context: TaskExecutionContext,
+        _run: TaskRun,
+        _handle: TaskExecutionHandle,
+    ) -> TaskRuntimeResult<TaskExecutorRecoveryOutcome> {
+        Ok(TaskExecutorRecoveryOutcome::LeftUnchanged)
+    }
+}
+
+#[tokio::test]
+async fn scheduler_start_failure_preserves_safe_error_and_existing_retry_selection() {
+    use crate::{TaskStartCause, TaskStartFailure, TaskStartStage};
+    for (cause, class, retry) in [
+        (TaskStartCause::Policy, TaskErrorClass::Policy, true),
+        (
+            TaskStartCause::Validation,
+            TaskErrorClass::Validation,
+            false,
+        ),
+        (
+            TaskStartCause::Unclassified,
+            TaskErrorClass::Internal,
+            false,
+        ),
+        (TaskStartCause::Storage, TaskErrorClass::Internal, false),
+    ] {
+        let runtime = runtime().await;
+        let failure = TaskStartFailure::new(TaskStartStage::CliAdmission, cause);
+        let expected = failure.descriptor().clone();
+        let executor = Arc::new(StartFailureSystemExecutor {
+            failure: std::sync::Mutex::new(Some(
+                anyhow::Error::new(failure).context("secret start chain"),
+            )),
+            starts: AtomicUsize::new(0),
+        });
+        runtime.register_executor(executor.clone()).await;
+        let mut params = create_params(TaskTriggerSpec::ScheduledAt {
+            scheduled_at: 10,
+            timezone: Some("UTC".to_owned()),
+            catch_up_policy: None,
+        });
+        params.retry_policy = Some(TaskRetryPolicy {
+            max_attempts: 2,
+            backoff: TaskRetryBackoffKind::Fixed,
+            initial_delay_seconds: Some(60),
+            max_delay_seconds: Some(60),
+            retry_on: vec![TaskErrorClass::Policy],
+        });
+        let created = runtime
+            .service()
+            .create_task(task_create_context_for(&params), params)
+            .await
+            .unwrap();
+        runtime.process_due_once(10).await.unwrap();
+        let saved = runtime
+            .service()
+            .get_task(pioneer_protocol::TaskGetParams {
+                task_id: created.task.id,
+            })
+            .await
+            .unwrap();
+        let run = &saved.runs[0];
+        assert_eq!(run.status, TaskRunStatus::Failed);
+        assert_eq!(
+            run.error.as_ref(),
+            Some(&expected.task_error(Some(run.id.clone())))
+        );
+        assert_eq!(run.error.as_ref().unwrap().class, class);
+        assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(saved.runs.len(), if retry { 2 } else { 1 });
+        if retry {
+            assert_eq!(saved.runs[1].attempt_number, 2);
+            assert!(saved.runs[1].ready_at.unwrap() >= run.completed_at.unwrap() + 60);
+        } else {
+            assert_eq!(saved.task.error, run.error);
+        }
+    }
+}
+
+#[tokio::test]
+async fn scheduler_unknown_executor_error_never_saves_json_or_raw_chain() {
+    let runtime = runtime().await;
+    let executor = Arc::new(StartFailureSystemExecutor {
+        failure: std::sync::Mutex::new(Some(anyhow::anyhow!(
+            "{}",
+            r#"{"reported":true,"stage":"admission","code":"PolicyDenied","message":"/private SQL secret"}"#
+        ))),
+        starts: AtomicUsize::new(0),
+    });
+    runtime.register_executor(executor.clone()).await;
+    let params = create_params(TaskTriggerSpec::ScheduledAt {
+        scheduled_at: 10,
+        timezone: Some("UTC".to_owned()),
+        catch_up_policy: None,
+    });
+    let created = runtime
+        .service()
+        .create_task(task_create_context_for(&params), params)
+        .await
+        .unwrap();
+    runtime.process_due_once(10).await.unwrap();
+    let saved = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: created.task.id,
+        })
+        .await
+        .unwrap();
+    let error = saved.runs[0].error.as_ref().unwrap();
+    assert_eq!(error.class, TaskErrorClass::Internal);
+    assert_eq!(error.code, "task_executor_start_unclassified_failed");
+    assert_eq!(error.message, "Task preparation or launch failed.");
+    let encoded = serde_json::to_string(error).unwrap();
+    assert!(!encoded.contains("/private"));
+    assert!(!encoded.contains("PolicyDenied"));
+    assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn reported_start_failure_does_not_swallow_failed_state_persistence_error() {
+    use crate::{TaskStartCause, TaskStartFailure, TaskStartStage};
+    let runtime = runtime().await;
+    runtime
+        .service()
+        .store()
+        .database_connection()
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "CREATE TRIGGER start_failed_state_failure BEFORE INSERT ON task_event \
+         WHEN NEW.event_type = 'task/run/failed' \
+         BEGIN SELECT RAISE(ABORT, 'failed state persistence fixture'); END;"
+                .to_owned(),
+        ))
+        .await
+        .unwrap();
+    let failure =
+        TaskStartFailure::new(TaskStartStage::CliAdmission, TaskStartCause::Unclassified).report();
+    let executor = Arc::new(StartFailureSystemExecutor {
+        failure: std::sync::Mutex::new(Some(anyhow::Error::new(failure))),
+        starts: AtomicUsize::new(0),
+    });
+    runtime.register_executor(executor.clone()).await;
+    let params = create_params(TaskTriggerSpec::ScheduledAt {
+        scheduled_at: 10,
+        timezone: Some("UTC".to_owned()),
+        catch_up_policy: None,
+    });
+    let created = runtime
+        .service()
+        .create_task(task_create_context_for(&params), params)
+        .await
+        .unwrap();
+    let error = runtime
+        .process_due_once(10)
+        .await
+        .expect_err("new persistence failure must escape dispatch");
+    assert!(error.downcast_ref::<TaskStartFailure>().is_none());
+    let saved = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: created.task.id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(saved.runs.len(), 1);
+    assert_eq!(
+        saved.runs[0].status,
+        TaskRunStatus::Starting,
+        "failed state did not commit"
+    );
+    assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
 }
 
 #[path = "tests_delivery_lifecycle.rs"]

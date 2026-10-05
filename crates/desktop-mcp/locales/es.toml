@@ -143,3 +143,20 @@ load_details_failed = "No se pudieron cargar los detalles del servidor MCP: %{er
 policy_update_failed = "No se pudo actualizar la política MCP: %{error}"
 restart_failed = "No se pudo reiniciar el servidor MCP: %{error}"
 uninstall_failed = "No se pudo desinstalar el servidor MCP: %{error}"
+
+[mcp.oauth]
+callback_port_invalid = "La configuración del puerto de callback no es válida. Revise desktop.mcp_oauth.callback_port: use un entero de 1 a 65535, excepto 80. Reinicie Desktop después de corregirlo."
+configuration_load_failed = "No se pudo cargar la configuración de Desktop. Revise el archivo de configuración y reinicie Desktop después de corregirlo."
+sign_in = "Iniciar sesión"
+disconnect = "Desconectar cuenta"
+open_link = "Abrir página de acceso"
+failed = "No se pudo iniciar sesión. Inténtalo de nuevo."
+browser_failed = "No se pudo abrir el navegador. Usa el enlace de acceso."
+callback_unavailable = "El puerto de inicio de sesión no está disponible. Cierra la otra app, cancela este inicio de sesión e inténtalo de nuevo."
+registration_required = "Este proveedor requiere un cliente OAuth registrado. Añade su ID de cliente a la configuración del servidor."
+redirect_mismatch = "La dirección de inicio de sesión difiere de la guardada. Usa el dispositivo original o desconecta la cuenta e inicia sesión de nuevo."
+recovering = "La conexión no está disponible temporalmente. Pioneer volverá a intentarlo."
+
+clear_sign_in = "Restablecer acceso"
+prepare_failed = "No se pudo preparar el acceso. Cierra la aplicación que usa el puerto de retorno e inténtalo de nuevo."
+client_auth_unsupported = "El método de autenticación de este cliente OAuth no es compatible. Comprueba su registro."

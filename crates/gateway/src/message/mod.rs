@@ -27,6 +27,7 @@ mod patch_history_handlers;
 mod permission_handlers;
 mod provider_handlers;
 mod provider_readiness;
+mod reconciliation_diagnostics;
 pub(crate) mod skills;
 mod summary;
 mod task_agent_executor;
@@ -266,6 +267,7 @@ use std::pin::Pin;
 use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
@@ -555,6 +557,20 @@ pub struct MessageProcessor {
     #[cfg(test)]
     completed_history_preparation_barrier:
         Arc<compaction_background::CompletedHistoryPreparationBarrier>,
+    #[cfg(test)]
+    task_history_preparation_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
+    #[cfg(test)]
+    task_cli_terminal_preparation_finished: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    task_cli_admission_failure: Arc<std::sync::Mutex<Option<turn_handlers::TurnStartFailure>>>,
+    #[cfg(test)]
+    task_cli_preparation_attempts: Arc<AtomicU64>,
+    #[cfg(test)]
+    task_cli_history_revalidation_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
+    #[cfg(test)]
+    task_cli_readiness_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
+    #[cfg(test)]
+    task_output_capture_failures: Arc<std::sync::Mutex<HashMap<String, anyhow::Error>>>,
     pub(crate) compaction_coordinator: Arc<crate::compaction::ContextCompactionCoordinator>,
     cli_history_shutdown: tokio_util::sync::CancellationToken,
     #[cfg(test)]
@@ -1145,6 +1161,20 @@ impl MessageProcessor {
             completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             completed_history_preparation_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            task_history_preparation_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_terminal_preparation_finished: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            task_cli_admission_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_preparation_attempts: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            task_cli_history_revalidation_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_readiness_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_output_capture_failures: Arc::new(std::sync::Mutex::new(HashMap::new())),
             compaction_coordinator: Arc::new(
                 crate::compaction::ContextCompactionCoordinator::default(),
             ),
@@ -2199,6 +2229,9 @@ impl MessageProcessor {
     }
 
     async fn run_projection_delivery_resilience_worker(processor: Weak<Self>) {
+        let mut finalization_reporting = reconciliation_diagnostics::Reporter::new(
+            reconciliation_diagnostics::Operation::NativeFinalization,
+        );
         loop {
             let Some(this) = processor.upgrade() else {
                 break;
@@ -2234,14 +2267,15 @@ impl MessageProcessor {
                     ),
                 }
 
-                match crate::database::attribution::scope_database_workload_result(
+                let result = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::FinalizationRecovery,
                     retry_transient_storage_access(|| {
                         this.reconcile_prepared_native_turn_finalizations(now, 64)
                     }),
                 )
-                .await
-                {
+                .await;
+                finalization_reporting.observe(&result, Instant::now());
+                match result {
                     Ok(summary) => {
                         let committed = summary.committed_count();
                         if committed > 0 {
@@ -2264,10 +2298,7 @@ impl MessageProcessor {
                             );
                         }
                     }
-                    Err(error) => error!(
-                        error = %format!("{error:#}"),
-                        "native Turn finalization reconciler failed"
-                    ),
+                    Err(_) => {}
                 }
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
@@ -2294,6 +2325,9 @@ impl MessageProcessor {
     }
 
     async fn run_task_lifecycle_resilience_worker(processor: Weak<Self>) {
+        let mut occurrence_reporting = reconciliation_diagnostics::Reporter::new(
+            reconciliation_diagnostics::Operation::TaskRunOccurrence,
+        );
         loop {
             let Some(this) = processor.upgrade() else {
                 break;
@@ -2303,7 +2337,7 @@ impl MessageProcessor {
                 let now = now_timestamp_secs();
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
-                    retry_transient_storage_access(|| this.reconcile_terminal_task_child_turns(64)),
+                    this.reconcile_terminal_task_child_turns_with_retry(64),
                 )
                 .await
                 {
@@ -2312,29 +2346,38 @@ impl MessageProcessor {
                         "reconciled terminal child Turns with their TaskRun aggregates"
                     ),
                     Ok(_) => {}
-                    Err(error) => error!(
-                        error = %format!("{error:#}"),
-                        "task child terminal reconciler failed"
-                    ),
+                    Err(error) => tasks::report_task_child_reconciliation_error(error),
                 }
 
-                match crate::database::attribution::scope_database_workload_result(
+                let result = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
-                    retry_transient_storage_access(|| {
-                        this.reconcile_terminal_task_run_occurrence_turns(64)
-                    }),
+                    this.reconcile_terminal_task_run_occurrence_turns(64),
                 )
-                .await
+                .await;
+                occurrence_reporting.observe_occurrences(&result, Instant::now());
+                if let Ok(summary) = result
+                    && summary.selected > 0
                 {
-                    Ok(reconciled) if reconciled > 0 => info!(
-                        reconciled,
-                        "reconciled terminal TaskRuns with parent occurrence Turns"
-                    ),
-                    Ok(_) => {}
-                    Err(error) => error!(
-                        error = %format!("{error:#}"),
-                        "task parent occurrence reconciler failed"
-                    ),
+                    info!(
+                        selected = summary.selected,
+                        claimed = summary.claimed,
+                        reconciled = summary.changed,
+                        lost_claims = summary.lost_claims,
+                        stale = summary.stale,
+                        unresolved = summary.unresolved,
+                        no_change = summary.no_change,
+                        claim_errors = summary.claim_errors,
+                        claim_deferrals = summary.claim_deferrals,
+                        claim_deferral_conflicts = summary.claim_deferral_conflicts,
+                        claim_deferral_errors = summary.claim_deferral_errors,
+                        claim_without_snapshot = summary.claim_without_snapshot,
+                        claim_commit_unknown = summary.claim_commit_unknown,
+                        repair_errors = summary.repair_errors,
+                        storage_errors = summary.storage_errors,
+                        notification_errors = summary.notification_errors,
+                        queue_state_errors = summary.queue_state_errors,
+                        "TaskRun parent occurrence reconciliation pass"
+                    );
                 }
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
@@ -4543,6 +4586,20 @@ impl MessageProcessor {
             completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             completed_history_preparation_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            task_history_preparation_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_terminal_preparation_finished: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            task_cli_admission_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_preparation_attempts: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            task_cli_history_revalidation_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_readiness_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_output_capture_failures: Arc::new(std::sync::Mutex::new(HashMap::new())),
             compaction_coordinator: Arc::new(
                 crate::compaction::ContextCompactionCoordinator::default(),
             ),

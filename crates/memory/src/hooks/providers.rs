@@ -443,7 +443,7 @@ pub trait AgentMemoryWriteProvider: Send + Sync {
         &self,
         context: MemoryTurnContext,
         request: MemoryManifestRequest,
-    ) -> Result<MemoryManifest, String>;
+    ) -> Result<MemoryManifest, crate::MemoryManifestFailure>;
 
     async fn write_semantic_memory(
         &self,
