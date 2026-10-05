@@ -53370,6 +53370,16 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
                 release: provider_release,
             }),
         ));
+        // Preflight runs before manifest compilation and window registration.
+        // Let it finish through its own provider so the barrier gates only the
+        // main response, after the actor's durable startup events have ACKed.
+        let preflight_provider = Arc::new(PreflightCaptureProvider::new("unexpected main request"));
+        provider_registry
+            .insert("preflight-capture", preflight_provider.clone())
+            .expect("preflight provider should fit the bounded test registry");
+        let mut tool_loop_config = test_tool_loop_config();
+        tool_loop_config.preflight.provider_name = Some("preflight-capture".to_owned());
+        tool_loop_config.preflight.model = Some("test-model".to_owned());
         let processor = MessageProcessor::new(
             thread_manager.clone(),
             provider_registry,
@@ -53378,7 +53388,7 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_tool_loop_config(),
+            tool_loop_config,
         );
 
         let thread_id = "thr_000000000000000090";
@@ -53427,6 +53437,12 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
         tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
             .await
             .expect("manifest fixture provider should enter after durable startup");
+        let preflight_requests = preflight_provider.snapshot_requests();
+        assert!(
+            !preflight_requests.is_empty(),
+            "preflight should run before main provider entry"
+        );
+        assert!(preflight_requests.iter().all(is_turn_preflight_request));
         let window = crud_store
             .latest_turn_execution_window(turn_id)
             .await
