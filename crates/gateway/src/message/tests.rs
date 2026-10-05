@@ -47161,9 +47161,38 @@ async fn cli_runtime_terminal_cleanup_keeps_session_open_for_other_active_turn()
         .await
         .expect("test CLI runtime session should start");
 
-    processor
-        .ensure_cli_runtime_turn_blocked_cleanup(thread_id, old_turn_id, Some("test block"))
-        .await;
+    materialize_cli_runtime_turn_with_text(
+        &crud_store,
+        &workspace_id,
+        thread_id,
+        old_turn_id,
+        "terminal cleanup fixture",
+    )
+    .await;
+    crud_store
+        .update_turn_status(
+            thread_id,
+            old_turn_id,
+            TurnStatus::Blocked,
+            Some("test block"),
+            now.timestamp(),
+        )
+        .await
+        .unwrap();
+    let old_binding = crud_store
+        .get_cli_runtime_turn_binding(old_turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        processor
+            .cleanup_cli_runtime_terminal_turn_status(
+                &old_binding,
+                TurnStatus::Blocked,
+                "test block",
+            )
+            .await
+    );
 
     assert_eq!(
         *cli_session.interrupts.lock().await,

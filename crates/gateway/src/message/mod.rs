@@ -3305,9 +3305,10 @@ impl MessageProcessor {
                     continue;
                 }
                 Ok(
-                    cli_runtime::CLIRuntimeAuthoritativeTurnState::Unavailable
+                    cli_runtime::CLIRuntimeAuthoritativeTurnState::Deferred
                     | cli_runtime::CLIRuntimeAuthoritativeTurnState::Superseded,
-                ) => {
+                ) => continue,
+                Ok(cli_runtime::CLIRuntimeAuthoritativeTurnState::Unavailable) => {
                     self.cli_runtime_command_heartbeats
                         .mark_attempt_failed(&key, now_unix)
                         .await;

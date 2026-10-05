@@ -1365,3 +1365,367 @@ async fn cli_blocked_atomic_commit_keeps_queued_consumer_owned_after_publisher_c
         assert_eq!(session.interrupts.lock().await.len(), 1);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_timeout_and_command_heartbeat_defer_busy_transition_without_timeout_evidence() {
+    let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
+    drop(rx);
+    let processor = processor.scoped_for_background_reconciliation();
+    let now = chrono::Utc::now().timestamp();
+    materialize_expired_cli_command_attempt(&store, &workspace, now).await;
+    *session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
+        status: CLIAgentRuntimeObservedTurnStatus::Blocked,
+        message: Some("must not observe while transition is owned".into()),
+        reconciliation_events: Vec::new(),
+    });
+    let binding = store
+        .get_cli_runtime_turn_binding(GUARDED_TURN)
+        .await
+        .unwrap()
+        .unwrap();
+    let source = store
+        .cli_runtime_turn_terminal_guard(&binding)
+        .await
+        .unwrap();
+    let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", GUARDED_THREAD).unwrap();
+    let gate = processor.cli_runtime_session_transition_mutex(&key).await;
+    let owned = gate.lock_owned().await;
+    let heartbeat_at = now + processor.cli_runtime_command_heartbeats.interval_secs() + 2;
+    let (timeouts, heartbeat) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let timeouts = processor
+            .poll_timeouts_respecting_human_wait(heartbeat_at, 64)
+            .await
+            .unwrap();
+        let heartbeat = processor
+            .heartbeat_due_cli_runtime_command_items(heartbeat_at)
+            .await;
+        (timeouts, heartbeat)
+    })
+    .await
+    .expect("background entry points must finish while the gate remains owned");
+    assert!(timeouts.is_empty());
+    assert_eq!(heartbeat, 0);
+    assert_eq!(
+        store
+            .cli_runtime_turn_terminal_guard(&binding)
+            .await
+            .unwrap(),
+        source
+    );
+    assert!(!has_recovery(&store, GUARDED_TURN).await);
+    assert!(session.interrupts.lock().await.is_empty());
+    assert!(session.mcp_terminals.lock().await.is_empty());
+    assert!(session.goal_clears.lock().await.is_empty());
+    assert_eq!(session.closes.load(Ordering::SeqCst), 0);
+    drop(owned);
+    *session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
+        status: CLIAgentRuntimeObservedTurnStatus::InProgress,
+        message: None,
+        reconciliation_events: Vec::new(),
+    });
+    *session.turn_liveness_probe.lock().await =
+        Some(CLIAgentRuntimeTurnLivenessProbe::ConfirmedActive);
+    assert_eq!(
+        processor
+            .heartbeat_due_cli_runtime_command_items(heartbeat_at)
+            .await,
+        1,
+        "busy does not discard the due command or advance its heartbeat deadline"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_common_blocked_reconciliation_retains_consumer_ownership_after_cancel_until_ack() {
+    for kind in ["codex", "claude"] {
+        let temp = tempfile::tempdir().unwrap();
+        let (processor, store, session, workspace) =
+            blocked_observation_fixture(&temp.path().join("common-blocked.sqlite"), kind, true)
+                .await;
+        let binding = store
+            .get_cli_runtime_turn_binding(BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, turn) = store
+            .get_turn(BLOCKED_THREAD, BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap();
+        processor.arm_completed_history_preparation_barrier("__cli_blocked_after_atomic_commit__");
+        let key = CLIAgentRuntimeSessionKey::new(&workspace, kind, BLOCKED_THREAD).unwrap();
+        let gate = processor.cli_runtime_session_transition_mutex(&key).await;
+        let mut admission = Box::pin(processor.cli_runtime_turn_resume_transition(BLOCKED_TURN));
+        {
+            let reconciliation =
+                processor.reconcile_cli_runtime_turn_from_runtime(&binding, &workspace, &turn);
+            tokio::pin!(reconciliation);
+            tokio::select! {
+                _ = processor.wait_for_completed_history_preparation_barrier() => {},
+                _ = &mut reconciliation => panic!("common entry must reach atomic consumer commit"),
+            }
+            assert_eq!(
+                store
+                    .get_turn(BLOCKED_THREAD, BLOCKED_TURN)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .status,
+                TurnStatus::Blocked
+            );
+            assert_eq!(
+                store
+                    .latest_cli_runtime_turn_attempt(BLOCKED_TURN)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                pioneer_crud::CliRuntimeTurnAttemptStatus::Interrupted
+            );
+            assert!(futures_util::poll!(&mut admission).is_pending());
+            assert!(gate.try_lock().is_err());
+            // Cancel the real common-entry publisher before ACK.
+        }
+        assert!(
+            gate.try_lock().is_err(),
+            "the queued consumer retains ownership independently of publisher cancellation"
+        );
+        assert!(futures_util::poll!(&mut admission).is_pending());
+        processor.release_completed_history_preparation_barrier();
+        let admitted = admission.await.unwrap().unwrap();
+        assert_eq!(
+            store
+                .get_cli_runtime_turn_binding(BLOCKED_TURN)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "blocked"
+        );
+        assert_eq!(blocked_event_count(&store).await, 1);
+        assert_eq!(
+            session.interrupts.lock().await.as_slice(),
+            &[(
+                Some(BLOCKED_NATIVE_THREAD.into()),
+                Some(BLOCKED_TURN.into())
+            )]
+        );
+        assert_eq!(session.mcp_terminals.lock().await.len(), 1);
+        drop(admitted);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_timeout_terminal_cleanup_rejects_resume_and_late_effects_after_competing_scan() {
+    // Both the direct timeout race and timeout competing with a complete scan
+    // use the actual supervisor entry, not the owned cleanup inner helper.
+    for scan_first in [false, true] {
+        let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
+        drop(rx);
+        let processor = processor.scoped_for_background_reconciliation();
+        let now = chrono::Utc::now().timestamp();
+        materialize_expired_cli_command_attempt(&store, &workspace, now).await;
+        let job = block_guarded_fixture(&store).await;
+        processor.arm_completed_history_preparation_barrier("__cli_cleanup_before_gate__");
+        let timeout = processor.poll_timeouts_respecting_human_wait(now, 64);
+        tokio::pin!(timeout);
+        tokio::select! {
+            _ = processor.wait_for_completed_history_preparation_barrier() => {},
+            _ = &mut timeout => panic!("timeout must pause with old canonical terminal source"),
+        }
+        if scan_first {
+            let summary = processor
+                .fail_stale_cli_runtime_turns(now * 1_000, &mut CliRuntimeStaleTurnScan::default())
+                .await;
+            assert_eq!((summary.selected, summary.processed), (4, 4));
+            assert_eq!(session.interrupts.lock().await.len(), 1);
+        }
+        let transition = processor
+            .cli_runtime_turn_resume_transition(GUARDED_TURN)
+            .await
+            .unwrap();
+        let next = resume_guarded_fixture(&store, &job).await;
+        pending_for_new_execution(&store, &workspace).await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _invocation = processor
+            .mcp_service
+            .hold_test_turn_mcp_invocation(GUARDED_TURN, cancel.clone());
+        processor
+            .cli_runtime_session_turn_leases
+            .lock()
+            .await
+            .insert(
+                GUARDED_TURN.into(),
+                Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+            );
+        let binding = store
+            .get_cli_runtime_turn_binding(GUARDED_TURN)
+            .await
+            .unwrap()
+            .unwrap();
+        let source = store
+            .cli_runtime_turn_terminal_guard(&binding)
+            .await
+            .unwrap();
+        let effects = (
+            session.interrupts.lock().await.len(),
+            session.mcp_terminals.lock().await.len(),
+            session.goal_clears.lock().await.len(),
+            session.closes.load(Ordering::SeqCst),
+        );
+        let events = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(GUARDED_TURN))
+            .count(&store.database_connection())
+            .await
+            .unwrap();
+        if scan_first {
+            let due = now + processor.cli_runtime_command_heartbeats.interval_secs() + 2;
+            assert_eq!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    processor.heartbeat_due_cli_runtime_command_items(due)
+                )
+                .await
+                .unwrap(),
+                0
+            );
+        }
+        drop(transition);
+        processor.release_completed_history_preparation_barrier();
+        assert!(timeout.await.unwrap().is_empty());
+        assert_eq!(
+            store
+                .cli_runtime_turn_terminal_guard(&binding)
+                .await
+                .unwrap(),
+            source
+        );
+        assert_eq!(
+            store
+                .latest_cli_runtime_turn_attempt(GUARDED_TURN)
+                .await
+                .unwrap()
+                .unwrap(),
+            next
+        );
+        assert_eq!(
+            store
+                .get_turn(GUARDED_THREAD, GUARDED_TURN)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            TurnStatus::InProgress
+        );
+        assert_eq!(
+            store
+                .get_cli_runtime_pending_request("guard-new-human")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            pioneer_crud::CliRuntimePendingRequestStatus::Pending
+        );
+        assert!(!cancel.is_cancelled());
+        assert!(
+            processor
+                .cli_runtime_session_turn_leases
+                .lock()
+                .await
+                .contains_key(GUARDED_TURN)
+        );
+        assert_eq!(
+            (
+                session.interrupts.lock().await.len(),
+                session.mcp_terminals.lock().await.len(),
+                session.goal_clears.lock().await.len(),
+                session.closes.load(Ordering::SeqCst)
+            ),
+            effects
+        );
+        assert_eq!(
+            pioneer_entity::turn_event::Entity::find()
+                .filter(pioneer_entity::turn_event::Column::TurnId.eq(GUARDED_TURN))
+                .count(&store.database_connection())
+                .await
+                .unwrap(),
+            events
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_normal_terminal_consumer_rejects_busy_without_blocking_lane_and_fences_effects() {
+    let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
+    drop(rx);
+    let binding = store
+        .get_cli_runtime_turn_binding(GUARDED_TURN)
+        .await
+        .unwrap()
+        .unwrap();
+    let before = store
+        .cli_runtime_turn_terminal_guard(&binding)
+        .await
+        .unwrap();
+    let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", GUARDED_THREAD).unwrap();
+    let gate = processor.cli_runtime_session_transition_mutex(&key).await;
+    let owned = gate.clone().lock_owned().await;
+    let event = AgentDurableEvent::TurnBlocked {
+        thread_id: GUARDED_THREAD.into(),
+        turn_id: GUARDED_TURN.into(),
+        reason: "normal terminal event".into(),
+        recovery: None,
+    };
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            processor.commit_durable_agent_event(event.clone())
+        )
+        .await
+        .unwrap()
+        .is_err(),
+        "a busy terminal event must not hold up the admission window ACK behind it"
+    );
+    assert_eq!(
+        store
+            .cli_runtime_turn_terminal_guard(&binding)
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(session.interrupts.lock().await.is_empty());
+    drop(owned);
+    processor.arm_completed_history_preparation_barrier("__cli_terminal_after_commit__");
+    let commit = processor.commit_durable_agent_event(event);
+    tokio::pin!(commit);
+    tokio::select! {
+        _ = processor.wait_for_completed_history_preparation_barrier() => {},
+        _ = &mut commit => panic!("normal consumer must reach guarded terminal effects"),
+    }
+    assert!(gate.try_lock().is_err());
+    let resume = processor.cli_runtime_turn_resume_transition(GUARDED_TURN);
+    tokio::pin!(resume);
+    assert!(futures_util::poll!(&mut resume).is_pending());
+    processor.release_completed_history_preparation_barrier();
+    let (committed, resumed) = tokio::join!(commit, resume);
+    committed.unwrap();
+    let resumed = resumed.unwrap().unwrap();
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_binding(GUARDED_TURN)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "blocked"
+    );
+    assert_eq!(
+        session.interrupts.lock().await.as_slice(),
+        &[(
+            Some("codex-thread-command".into()),
+            Some(GUARDED_TURN.into())
+        )]
+    );
+    drop(resumed);
+}

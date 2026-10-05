@@ -6563,7 +6563,7 @@ impl MessageProcessor {
         let transition_mutex = self
             .cli_runtime_session_transition_mutex(session_instance.key())
             .await;
-        let _transition = transition_mutex.lock().await;
+        let transition = Arc::new(transition_mutex.lock_owned().await);
         self.interrupt_completed_history_for_new_input(
             &outcome.started_notification.workspace_id,
             &outcome.started_notification.thread_id,
@@ -6583,10 +6583,11 @@ impl MessageProcessor {
             {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    self.mark_turn_blocked(
+                    self.mark_turn_blocked_with_transition(
                         outcome.started_notification.thread_id.clone(),
                         pioneer_turn_id.clone(),
                         format!("failed to reserve CLI MCP turn lease: {error:#}"),
+                        Some(transition.clone()),
                     )
                     .await;
                     self.release_cli_runtime_session_turn_lease(pioneer_turn_id.as_str())
@@ -6602,10 +6603,11 @@ impl MessageProcessor {
                     let _ = cli_session
                         .terminal_mcp_turn(pioneer_turn_id.as_str())
                         .await;
-                    self.mark_turn_blocked(
+                    self.mark_turn_blocked_with_transition(
                         outcome.started_notification.thread_id.clone(),
                         pioneer_turn_id.clone(),
                         "CLI MCP session generation exceeds durable range".to_owned(),
+                        Some(transition.clone()),
                     )
                     .await;
                     self.release_cli_runtime_session_turn_lease(pioneer_turn_id.as_str())
@@ -6620,10 +6622,11 @@ impl MessageProcessor {
                         let _ = cli_session
                             .terminal_mcp_turn(pioneer_turn_id.as_str())
                             .await;
-                        self.mark_turn_blocked(
+                        self.mark_turn_blocked_with_transition(
                             outcome.started_notification.thread_id.clone(),
                             pioneer_turn_id.clone(),
                             "CLI MCP activation generation exceeds durable range".to_owned(),
+                            Some(transition.clone()),
                         )
                         .await;
                         self.release_cli_runtime_session_turn_lease(pioneer_turn_id.as_str())
@@ -6650,10 +6653,11 @@ impl MessageProcessor {
                 let _ = cli_session
                     .terminal_mcp_turn(pioneer_turn_id.as_str())
                     .await;
-                self.mark_turn_blocked(
+                self.mark_turn_blocked_with_transition(
                     outcome.started_notification.thread_id.clone(),
                     pioneer_turn_id.clone(),
                     format!("failed to persist CLI MCP turn lease: {error:#}"),
+                    Some(transition.clone()),
                 )
                 .await;
                 self.release_cli_runtime_session_turn_lease(pioneer_turn_id.as_str())
@@ -6732,10 +6736,11 @@ impl MessageProcessor {
                     // The failed read is not evidence that the canonical Turn
                     // is terminal. The conditional finish path rechecks its
                     // state and preserves a concurrent cancel/completion.
-                    self.mark_turn_blocked(
+                    self.mark_turn_blocked_with_transition(
                         outcome.started_notification.thread_id.clone(),
                         pioneer_turn_id.clone(),
                         reason.clone(),
+                        Some(transition.clone()),
                     )
                     .await;
                 } else {
@@ -6772,10 +6777,11 @@ impl MessageProcessor {
                     format!("failed to start native CLI runtime turn: {error:#}"),
                 )
                 .await;
-                self.mark_turn_blocked(
+                self.mark_turn_blocked_with_transition(
                     outcome.started_notification.thread_id.clone(),
                     pioneer_turn_id,
                     format!("failed to start CLI runtime turn: {error:#}"),
+                    Some(transition.clone()),
                 )
                 .await;
                 return;
@@ -6805,10 +6811,11 @@ impl MessageProcessor {
                     format!("failed to persist native CLI runtime owner: {error:#}"),
                 )
                 .await;
-                self.mark_turn_blocked(
+                self.mark_turn_blocked_with_transition(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
                     format!("failed to persist CLI runtime native turn id: {error:#}"),
+                    Some(transition.clone()),
                 )
                 .await;
                 let _ = cli_session
@@ -6844,10 +6851,11 @@ impl MessageProcessor {
                 format!("failed to confirm CLI context delivery: {error:#}"),
             )
             .await;
-            self.mark_turn_blocked(
+            self.mark_turn_blocked_with_transition(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
                 format!("failed to confirm CLI runtime context delivery: {error:#}"),
+                Some(transition.clone()),
             )
             .await;
             let _ = cli_session
@@ -6874,10 +6882,11 @@ impl MessageProcessor {
                 let _ = cli_session
                     .terminal_mcp_turn(pioneer_turn_id.as_str())
                     .await;
-                self.mark_turn_blocked(
+                self.mark_turn_blocked_with_transition(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
                     "CLI runtime native turn started without a durable attempt".to_owned(),
+                    Some(transition.clone()),
                 )
                 .await;
                 let _ = cli_session
@@ -6892,10 +6901,11 @@ impl MessageProcessor {
                 let _ = cli_session
                     .terminal_mcp_turn(pioneer_turn_id.as_str())
                     .await;
-                self.mark_turn_blocked(
+                self.mark_turn_blocked_with_transition(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
                     format!("failed to load CLI runtime attempt after native start: {error:#}"),
+                    Some(transition.clone()),
                 )
                 .await;
                 let _ = cli_session
@@ -6919,10 +6929,11 @@ impl MessageProcessor {
                 format!("failed to open CLI runtime execution window: {error:#}"),
             )
             .await;
-            self.mark_turn_blocked(
+            self.mark_turn_blocked_with_transition(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
                 format!("failed to open CLI runtime execution window: {error:#}"),
+                Some(transition.clone()),
             )
             .await;
             let _ = cli_session
@@ -6955,14 +6966,18 @@ impl MessageProcessor {
                     Some(native_turn_id.as_str()),
                 )
                 .await;
-            self.mark_turn_blocked(
+            self.mark_turn_blocked_with_transition(
                 outcome.started_notification.thread_id.clone(),
                 pioneer_turn_id,
                 format!("failed to activate CLI MCP turn lease: {error:#}"),
+                Some(transition.clone()),
             )
             .await;
             return;
         }
+        // Native admission and MCP activation are complete. Buffered events
+        // enter through the ordinary consumer, which owns its terminal transition.
+        drop(transition);
         if turn_binding.runtime_kind == "codex" {
             self.bind_buffered_codex_root_execution_segments(
                 &session_instance,
@@ -7872,6 +7887,7 @@ impl MessageProcessor {
             .await;
             return Err(error.into());
         }
+        drop(_transition);
         if prepared_binding.runtime_kind == "codex" {
             self.bind_buffered_codex_root_execution_segments(
                 session_handle.instance(),
@@ -9557,6 +9573,26 @@ impl MessageProcessor {
             return;
         }
 
+        let cli_transition = match self.cli_runtime_turn_resume_transition(&turn_id).await {
+            Ok(transition) => transition.map(Arc::new),
+            Err(error) => {
+                self.user_turn_cancel_intents
+                    .lock()
+                    .await
+                    .remove(&cancel_intent_key);
+                self.send_error(
+                    connection_id,
+                    public_turn_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
+                        format!("failed to acquire CLI cancellation ownership: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
         self.mcp_service
             .cancel_turn_mcp_invocations(turn_id.as_str());
 
@@ -9629,9 +9665,11 @@ impl MessageProcessor {
                 .await;
                 return;
             }
-            self.ensure_cli_runtime_turn_interrupted_cleanup(
+            self.cleanup_cli_runtime_terminal_turn_status_with_transition(
                 &cli_turn_binding,
-                Some(reason.as_str()),
+                TurnStatus::Interrupted,
+                &reason,
+                cli_transition.as_ref(),
             )
             .await;
             self.user_turn_cancel_intents
@@ -9792,6 +9830,23 @@ impl MessageProcessor {
                 binding.thread_id
             );
         }
+        let expected = self
+            .crud_store
+            .cli_runtime_turn_terminal_guard(&binding)
+            .await?;
+        let transition = self
+            .try_cli_runtime_turn_transition(&binding)
+            .await?
+            .context("CLI session cancellation is deferred while its transition is owned")?;
+        anyhow::ensure!(
+            expected.is_some()
+                && self
+                    .crud_store
+                    .cli_runtime_turn_terminal_guard(&binding)
+                    .await?
+                    == expected,
+            "CLI cancellation source changed"
+        );
         self.mcp_service.cancel_turn_mcp_invocations(turn_id);
         if !self
             .mark_turn_interrupted(thread_id.to_owned(), turn_id.to_owned(), reason.to_owned())
@@ -9799,8 +9854,13 @@ impl MessageProcessor {
         {
             anyhow::bail!("failed to interrupt CLI runtime turn `{turn_id}`");
         }
-        self.ensure_cli_runtime_turn_interrupted_cleanup(&binding, Some(reason))
-            .await;
+        self.cleanup_cli_runtime_terminal_turn_status_with_transition(
+            &binding,
+            TurnStatus::Interrupted,
+            reason,
+            Some(&transition),
+        )
+        .await;
         Ok(true)
     }
 

@@ -135,17 +135,21 @@ impl DurableEventReceiver {
         self.pending_cli_blocked_guard.as_ref()
     }
 
+    pub fn turn_transition(&self) -> Option<&Arc<tokio::sync::OwnedMutexGuard<()>>> {
+        self.pending_turn_transition.as_ref()
+    }
+
     pub fn owns_turn_transition(&self) -> bool {
         self.pending_turn_transition.is_some()
     }
 
     pub fn acknowledge_last(&mut self, result: Result<(), DurableCommitRejection>) {
         self.pending_enqueue_age = None;
-        self.pending_turn_transition = None;
-        self.pending_cli_blocked_guard = None;
         if let Some(committed_tx) = self.pending_commit.take() {
             let _ = committed_tx.send(result);
         }
+        self.pending_turn_transition = None;
+        self.pending_cli_blocked_guard = None;
     }
 }
 
