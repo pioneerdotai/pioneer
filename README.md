@@ -5,7 +5,7 @@
 <h1 align="center">Pioneer</h1>
 
 <p align="center">
-  Multiplayer harness where people and agents work together and build on shared context.
+  Spaces where people and agents collaborate and build on shared context.
 </p>
 
 <p align="center">
@@ -15,8 +15,16 @@
 
 <p align="center">
   <a href="https://github.com/pioneerdotai/pioneer/releases">Download</a>
-  · <a href="https://docs.getpioneer.dev">Docs</a>
-  · <a href="https://docs.getpioneer.dev/getting-started/quickstart">Quick start</a>
+  ·
+  <a href="https://docs.getpioneer.dev/getting-started/installation">Installation</a>
+  ·
+  <a href="https://docs.getpioneer.dev/getting-started/quickstart">Quick Start</a>
+  ·
+  <a href="https://docs.getpioneer.dev">Docs</a>
+  ·
+  <a href="https://docs.getpioneer.dev/architecture/overview">Architecture</a>
+  ·
+  <a href="https://docs.getpioneer.dev/protocol/introduction">Protocol reference</a>
 </p>
 
 <p align="center">
@@ -75,12 +83,20 @@ Agents retrieve relevant context within workspace and thread permissions and a b
 
 Pioneer is a Rust workspace with a native GPUI desktop app and a gateway backed by SQLite. Clients connect over a JSON-RPC WebSocket API.
 
-```text
-Desktop / mobile / custom clients
-                |
-         Pioneer gateway
-         /      |       \
-     Context  Agents   Tools
+```mermaid
+flowchart TB
+    subgraph Clients["Clients"]
+        direction LR
+        Desktop["Desktop app<br/>Native GPUI"]
+        Mobile["Mobile app"]
+        Custom["Custom clients"]
+    end
+
+    Clients <-->|JSON-RPC over WebSocket| Gateway("Pioneer gateway<br/>Local machine or server")
+
+    Gateway <--> Context[("Shared context<br/>History, memory, artifacts")]
+    Gateway <--> Agents["Models & agent runtimes<br/>Cloud or local models<br/>Claude Code, Codex"]
+    Gateway <--> Tools["Tools & integrations<br/>Files, shell, web<br/>MCP, skills"]
 ```
 
 The gateway owns state and runs model calls, CLI runtimes, tools, and scheduled tasks. A remote gateway uses that machine's files and execution environment. One desktop app can connect to multiple gateways.
