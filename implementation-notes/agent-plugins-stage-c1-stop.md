@@ -139,3 +139,90 @@ NOT_COMPILED. No behavior or source-test compilation success is claimed.
 No known unresolved source compilation error. Coordinator must review lifetime,
 legacy timing and failure behavior before full C1 resumes; full lifecycle/UI,
 C2/D/E and testing remain explicitly unimplemented/unapproved.
+
+
+## CS-01 / CS-02 correction delivery (2026-10-05)
+
+Status: **READY_FOR_C1_STOP_REVIEW**, not coordinator acceptance. This section supersedes
+implementation descriptions above for these two findings; earlier checks/statuses
+remain historical evidence. Full C1/UI/C2/D and behavioral testing remain outside scope.
+
+- Branch/worktree/cwd unchanged: `feature/agent-plugins-simple`,
+  `/Users/alexander/Code/pioneer/pioneer/.worktrees/agent-plugins-simple`.
+- Correction base: `940cda21a05afe0f47eb9ea9d2167131adf518d0`, initially clean.
+- Final implementation HEAD: `c3e4e904a80acb3b97c6e95a0c47bdbeac1fcf22`, clean at check start.
+- Linked commits: `cec905eb` native ownership/quiescence; `c3e4e904` bounded
+  graph bindings and Gateway selection. Delivery adds a handoff-only commit;
+  its exact final SHA and clean-tree status accompany the delivery response.
+
+**CS-01:** `agent_domain::cancel_agent_work_graph_targets` now returns one-to-many
+response targets. The collect branch projects exact Turn thread/status plus CLI
+binding presence inside the existing serialized writer/fence; execution parent
+thread is not the response runtime thread. Graph nodes remain bounded by policy
+(max 4,096). Response bindings have an independent 65,536-row limit, queried in
+128-execution batches with a remaining-budget +1 overflow check; no silent truncation
+or node-count/single-Turn assumption. Only short binding columns are loaded.
+Rust-only target fields `turn_pending` and `has_cli_binding` do not change RPC schemas.
+The standalone branch retains active-only selection and its existing targeting.
+
+`AgentManager::capture_native_stop_owners` captures latest controls and exact
+pending predecessors under the existing retirement/replacement gate. Native
+thread/Turn/run handles are kept in a vector, never overwritten by execution ID.
+`select_native_graph_owners` matches actual captured thread/Turn identities to the
+writer-derived execution bindings before Task/native cancellation; every selected
+run is awaited with the existing deadline and errors propagate. Latest proven
+outcomes can serve still-pending projection rows; completed historical rows do not
+replay their old errors. Queued/unbound nodes need no invented native join.
+Missing pending root/response owner, foreign outstanding run, and CLI binding fail
+closed. Snapshot thread/actor/run counts are explicitly limited to 65,536.
+
+Quiescence proof is the native lifetime invariant: activate retains every
+unconfirmed predecessor; retirement publishes its plane and actual shared actor
+join before removal, holds replacement gating through actor join, and releases
+only proven-drained ownership. Cancelled retirement/join waiters retain real handles.
+A retiring actor that has not finished yields UnknownOwner; an observed join error
+propagates and the native join result stays sticky. Snapshot never substitutes DB
+terminal status or turn-ID lookup absence for process completion. Registry/DB
+capacity is released before native joins. No permanent historical receipts added.
+
+**CS-02:** `NativeRunCompletion::{retain_predecessor,finish,is_quiescent}` separates
+sticky run outcome from pending ownership. A drained A panic remains Err through its
+captured handle, while B/C record their own results and release A. Pending cleanup
+is retained/retried. `has_pending_cleanup` and retirement pruning use proven
+quiescence, including actor join. `UnifiedExecHandler::{stop_and_wait,close_session}`
+and `drain_shell_readers` drain other readers/processes after an error. Child-wait
+failure retains the process; joined reader panic releases drained handles while
+keeping the error. Native process-group/security policy, fast legacy cancel ACK
+and parallel tool dispatch remain. No new installer/OAuth/schema/jobs/worker/UI.
+
+**Actual checks**, cwd above, stable implementation HEAD `c3e4e904`:
+
+- `CARGO_INCREMENTAL=0 cargo check -p pioneer-gateway --lib`: **exit 0**, 5m10s;
+  `/tmp/pioneer-c1-stop-fix-final-gateway-check.log`. Two existing dead-code warnings:
+  future full-C1 graph-await entrypoint and `set_mcp_policy`.
+- Scoped `rustfmt --edition 2024 --config skip_children=true --check` on the six
+  changed Rust files: **exit 0**; `/tmp/pioneer-c1-stop-fix-final-format.log`.
+  Formatting parsed sources; it did not compile test targets.
+- `git diff --check 940cda21..c3e4e904`: **exit 0**;
+  `/tmp/pioneer-c1-stop-fix-final-diff.log`.
+- Intermediate dirty-tree Gateway library checks 1/2/3: **0 / 101 / 0**;
+  `/tmp/pioneer-c1-stop-fix-gateway-check-{1,2,3}.log`. Check 2 failed on a
+  nonexistent `sea_orm::QueryJoin` import, removed before final compilation.
+  Sources changed during intermediate work; these are not stable-HEAD evidence.
+
+Regression sources: native_completion (drained root/tool panic A then B/C; delayed
+predecessor cancellation/retry; exact initial/revision snapshot, fenced retry;
+retirement actor join cancellation/unknown; release drained failed run with captured
+sticky Err); shell (panic drains all readers/processes, cached error with new reader,
+cancelled unconfirmed reader join/retry); agent_domain (four initial/revision
+bindings exceed node count, actual response thread, active-only legacy, fence retry,
+queued node); message/tests (multiple bindings not overwritten, historical sibling
+plus active run, foreign/unknown root/child, latest joined outcome on retry).
+All tests **NOT_RUN**, all test targets **NOT_COMPILED**. No application, fixture,
+provider, device, smoke, functional scenario or migration run. Historical external
+test compilation remains **UNKNOWN_EXTERNAL_ACTIVITY**, separate from own checks.
+
+Unresolved: coordinator review and all behavioral validation; an unfinished retiring
+actor or genuinely unknown admission remains fail-closed with retained ownership.
+No known unresolved non-test compilation error; checks above are not behavior verification.
+No full C1/UI/provider expansion has been started in this correction iteration.
