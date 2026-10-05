@@ -12,6 +12,7 @@ mod reconciliation;
 mod review;
 mod scheduler;
 mod service;
+mod start_failure;
 mod task_boundary;
 mod trigger;
 mod wait;
@@ -54,3 +55,8 @@ pub use service::{
     TaskService, WriteLockDecision,
 };
 pub use trigger::TaskTriggerCalculator;
+
+pub use start_failure::{
+    TaskStartCause, TaskStartFailure, TaskStartFailureDescriptor, TaskStartReporting,
+    TaskStartStage,
+};
