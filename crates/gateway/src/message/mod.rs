@@ -552,8 +552,8 @@ pub struct MessageProcessor {
     invitation_gateway_base_url: Arc<pioneer_protocol::GatewayBaseUrl>,
     summary_config: Arc<summary::SummaryConfig>,
     compaction_settings: Arc<StdRwLock<pioneer_compaction::CompactionSettings>>,
-    compaction_recovery_cursor: Arc<StdRwLock<String>>,
     completed_history_checks: Arc<Mutex<HashMap<(String, String), compaction_background::OwnedHistoryCheck>>>,
+    compaction_lifecycle_not_before: Arc<StdRwLock<Option<tokio::time::Instant>>>,
     #[cfg(test)]
     completed_history_preparation_barrier:
         Arc<compaction_background::CompletedHistoryPreparationBarrier>,
@@ -1143,8 +1143,8 @@ impl MessageProcessor {
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
             ),
-            compaction_recovery_cursor: Arc::new(StdRwLock::new(String::new())),
             completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
+            compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
             #[cfg(test)]
             completed_history_preparation_barrier: Arc::new(Default::default()),
             compaction_coordinator: Arc::new(
@@ -4557,8 +4557,8 @@ impl MessageProcessor {
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
             ),
-            compaction_recovery_cursor: Arc::new(StdRwLock::new(String::new())),
             completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
+            compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
             #[cfg(test)]
             completed_history_preparation_barrier: Arc::new(Default::default()),
             compaction_coordinator: Arc::new(

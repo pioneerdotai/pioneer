@@ -15,9 +15,12 @@ pub const MODEL_HISTORY_CONTEXT_SOURCES: [&str; 2] = ["assistant_round", "tool_r
 pub fn model_history_context_source(source: &str) -> bool {
     MODEL_HISTORY_CONTEXT_SOURCES.contains(&source)
 }
+pub use super::compaction_lifecycle_pending::{
+    CompactionLifecycleCandidate, CompactionLifecycleClaim, CompactionLifecycleStorageError,
+};
 use crate::CrudStore;
 use anyhow::{Result, ensure};
-pub use background::{CompactionLifecycleRecovery, CompletedHistoryCheck};
+pub use background::CompletedHistoryCheck;
 #[cfg(any(test, feature = "test-support"))]
 pub use frozen_import::{CheckpointImportGraphReadObserver, observe_checkpoint_import_graph_reads};
 pub use frozen_import::{
@@ -28,6 +31,7 @@ pub use history::{
     AcceptedTaskBasis, HistoryCausalBoundary, HistoryReadFence, HistoryTurnBoundary,
     TaskInputCopyAlias, event_projection_metadata,
 };
+pub use lifecycle::PreparedCompactionLifecycle;
 use pioneer_compaction::{
     Checkpoint, FORMAT_VERSION, OperationSnapshot, SourceRef,
     frozen::{FrozenEventInputRole, FrozenMessageRef},
