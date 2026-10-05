@@ -1,119 +1,156 @@
-# Stage C1 handoff
+# Agent Plugins — C1 handoff
 
-Status: **READY_FOR_STAGE_C1_REVIEW — partial delivery; C1 NOT_COMPLETE**.
-The package mutation / execution acknowledgement boundary is blocked below.
-This is not acceptance, a behavioral check, or permission to start C2/testing.
+Status: **READY_FOR_STAGE_C1_REVIEW**. Source implementation submitted for review;
+no test execution or behavior acceptance is claimed. This replaces the historical
+partial C1 handoff; its native-stop blocker was accepted separately at the baseline.
 
-- Worktree: `/Users/alexander/Code/pioneer/pioneer/.worktrees/agent-plugins-simple`.
+## Revision and scope
+
 - Branch: `feature/agent-plugins-simple`.
-- Base: `39eb03b79eb8685002c00db5ee51120528d0edfa` (accepted B); initial tree clean.
-- Final implementation HEAD: `a312c27e86f1ca87f531099766a77292407f95ae`.
-- Dirty state: initial and final implementation trees clean; delivery status
-  is checked after the handoff commit and reported with delivery.
-- Delivery HEAD: the subsequent handoff-only commit on this branch; its exact SHA
-  is reported with delivery. No implementation changes after the implementation HEAD.
-- Commits: `392d1b00` native policy operation; `38a2761b` cancellable native
-  runtime stop ownership; `a312c27e` stopping-actor admission.
+- Worktree/cwd for every command below:
+  `/Users/alexander/Code/pioneer/pioneer/.worktrees/agent-plugins-simple`.
+- Resume base HEAD: `9e468ea67f1ad67d67783f496c6649384df43383`, initially clean.
+- Final implementation HEAD: `3e007cdd199fcdd1575f0380c63fcf5b5ebb3a23`.
+  A documentation-only commit delivers this handoff; its hash is in the final response.
+- Resume commits: `386c011f` native stop/gate foundation; `d274303a` native atomic
+  contracts; `1b6d206f` foreground lifecycle/shared contracts; `3e007cdd` desktop.
+- Implementation was clean before writing this handoff. Main, archived branches,
+  mobile/FFI and mobile worktree were not changed. No merge/rebase/push/deployment.
 
-## Completed native changes
+## Implemented paths and genuine operation reuse
 
-`message/mcp/policy.rs`: `set_mcp_policy` returns a typed native response without
-an internal websocket request. The RPC and business entrypoint share the same
-`prepare_mcp_policy_change` and `finish_mcp_policy_change`: original workspace
-validation, native lifecycle lock, native policy/audit write, changed publication,
-and runtime reload. The RPC retains response-before-publication ordering and
-holds its native lifecycle guard until the former release point. Admission is
-still the caller's normal authorization boundary. No owned-policy bypass added.
+Parent enable/disable, upload update/confirmation, explicit component retry/restore,
+Continue repair and remove/purge run sequentially under one parent mutex. Gate/revision
+commit precedes actual native graph/fallback and MCP stop acknowledgements. Unknown
+owners, cancellation, transition, timeout or cleanup failure leave execution closed.
+The accepted stop machinery is reused; no independent plugin execution engine exists.
 
-`mcp_service.rs`: shutdown requests consume their sender once, but keep the
-original handle in the **existing native task map** until its task ends. A caller
-cancelled while waiting leaves a subsequent stop able to observe that owner and
-join it. Taking the handle after the wait rechecks its completion identity; a
-replacement runtime with the same installation ID is not removed. Join failures
-retain the legacy warning behavior. Stopping handles cannot receive new tool
-calls/OAuth recovery and cannot satisfy the same-configuration runtime reuse
-shortcut. This fixes native stop ownership; it is **not** a complete plugin
-execution stop/ack contract.
+Ordinary turn launch and native recovery share this same mutex through publication
+acknowledgement. Inventory adds the existing manager's admitted/retiring identities and
+trusted queued graph candidates. Final MCP reload takes the owning typed parent guard;
+startup, restart and OAuth background launch cannot use the installed-but-pending gate.
+Maintenance reconciliation only marks unfinished parents interrupted.
 
-No public DTO/schema/storage contract changed; no schema generation required.
-No new tables, parent pending phases, OAuth engine, installers, UI, client intents,
-or provider support were introduced. Existing Skills/MCP installations and
-accepted A/B package/composer paths remain authoritative.
+- Skills package install/update use `install_skill_source` / `update_skill_source`,
+  the original materializer, security validator, prepare/commit/rollback, audit and
+  native installation/policy stores. Assets-only changes force the full native update.
+  Package update preserves the native ID, policy, stored trust and override mask.
+- Removal calls extracted `uninstall_skill_with_plugin_change` and
+  `uninstall_mcp_with_plugin_change`, which are also used by standalone handlers.
+- Portable MCP uses the accepted typed adapter and the same `install_mcp_plan` body.
+  Same-key native IDs, enabled/implicit flags and configured field overrides survive.
+  OAuth compatibility is decided by the existing OAuth synchronize/disconnect engine.
+- Native owned policy/config/source/uninstall edits acquire parent before native
+  lifecycle admission. Their native record, policy/audit, override mask and pending
+  outcome marker commit in the existing writer transaction. Standalone branches keep
+  the legacy parsing, explicit Authorization, response and cleanup behavior.
+- New secret values use existing keystore writers with fresh opaque refs. Pending
+  retention precedes writing them; atomic publication changes the cleanup set. Strict
+  owned cleanup retains the parent on error. Existing GC retains native and pending
+  references from a bounded database snapshot, parsed after releasing DB capacity.
 
-Native lock order remains installation lifecycle guard -> brief task-map lock;
-completion/join happen outside that map lock and outside DB capacity. Policy
-preparation holds its native lifecycle guard through the ordinary DB write;
-publication and reload run after the write has returned. A plugin parent guard
-and atomic owned user-override/removal contracts are **not implemented** yet.
+No tables, child installers, settings copies, OAuth engine, jobs, leases, operation
+polling, version compatibility machinery or app domain data were added in C1.
 
-## Concrete blocker and minimal next contract
+## Lifecycle interruption and repetition
 
-[C1 prompt, section 6](/Users/alexander/Code/pioneer/pioneer-proposal/research-04/plugin-implementation-proposal-v2/stage-c1-implementation-prompt.md)
-permits stopping the affected part when its API requires a larger mechanism.
-An await on current cancellation or status cannot authorize package replacement:
+The current bounded parent plan (64 KiB / 256 members) holds keys, reserved IDs,
+fingerprints, fixed host staging names and opaque cleanup refs, never native settings
+or credential values. Upload owner/workspace/purpose/TTL validation, consumption and
+the update gate commit atomically through existing upload repositories.
 
-- `agent/src/agent_loop.rs:975`: CancelTurn acknowledges admission **before**
-  waiting for the root task. Its grace fallback joins an aborted root task.
-- `agent/src/chat/mod.rs:306`: dropping a model tool join wrapper requests abort
-  without awaiting the nested task; joining the root does not join that task.
-- `tools/src/runtime.rs:404`: dispatch cancellation waits a one-second grace,
-  then drops dispatch. The one-shot `Child` in `handlers/shell.rs:586` is local to
-  that future; its later process wait cannot be recovered by a Gateway await.
-- `handlers/shell.rs:98`: persistent-session Drop uses try-lock and kill signalling,
-  not an acknowledged async process wait. Root graph cancellation at
-  `message/agent_runtime.rs:7437` also signals descendants and tolerates cleanup
-  errors; a durable cancelled graph is not proof of execution completion.
+- Before stop ACK: Continue repeats genuine stop; used package/child files stay intact.
+- Around package rename: fixed package/next/repair/backup paths and fingerprints detect
+  the first rename, completed swap and wrong files. Continue repeats remaining work.
+- Around native publication: actual rows/ownership and committed tree fingerprints
+  distinguish committed siblings. Retry touches only requested failed components;
+  omitted keys select failed components only. Successful siblings are retained.
+- Package removal interrupted before forgetting a link uses an existing failed status
+  plus `component_removed_for_update`; user removal stays `removed_by_user`. A fresh
+  replacement that re-adds a deleted native identity explicitly warns/asks consent for
+  new ID/default permissions. Normal updates never restore user-removed children.
+- Lost package payload accepts an explicit fresh upload or Remove. Changed files fail
+  integrity checks. Uncommitted native config/source/policy requires explicit reapply
+  through the existing editor; Continue reports `reapply_native_change`. A committed
+  native marker permits cleanup/reload/settle without replaying an unknown config.
+- Remove repeats verified native uninstalls and strict OAuth/secret cleanup before
+  deleting package and parent. Default preserves host data; explicit purge deletes
+  only this parent's host data after stop ACK. No data receipt/restore service.
+- Cancellation after a final writer commit rereads its authoritative state instead
+  of restoring a stale pending plan. Partial component outcomes remain partial.
 
-Minimal next step: extend the **existing native execution owner** to provide an
-explicit stop-and-wait result for host-derived selected-plugin execution. Preserve
-standalone cancellation's legacy branch. Retain ownership through dispatch grace
-expiry/forced root retirement/recovery handoff; await nested tool and shell
-process cleanup (including persistent sessions), then expose actual completion.
-Timeout/owner loss must fail closed rather than treating NoActiveTurn, a terminal
-DB status, or a cancellation count as success. Reuse native graph cancellation
-and require its descendants' acknowledgements. No plugin jobs, leases, operation
-polling, or new coordinator should be needed. The attempted broader Agent/shell
-tracking prototype was removed; only the completed MCP changes above are delivered.
+Concrete local addition: `package.integrity`, a bounded private 64-byte published-tree
+hash outside package assets. Secure publication omits denied assets, so the authored
+snapshot hash alone cannot verify published files on repair. This file stores no data,
+settings or credentials; invalid/oversized/symlink metadata fails closed.
 
-Consequently parent disable/update/remove, stable-root swap, bounded package
-pending/replay, retry/repair, native owned overrides/OAuth actions, client intents
-and desktop management remain **C1 work**, not deferred to C2. No package files
-were changed via an unconfirmed stop. Their source-tracing acceptance scenarios
-are NOT_IMPLEMENTED here. After that contract, implement the C1 orchestration and
-UI against genuine A installers and current OAuth. C2 providers/continuations,
-D mobile/native contracts, and E separately authorized testing remain outstanding.
+## Protocol and desktop
 
-## Actual checks
+Specific RPCs: `plugins/setEnabled`, `update`, `remove`, `retry`, `continue`.
+`plugins/preview` accepts optional target `{plugin_id, expected_revision}`; update
+preview returns authored inventory and concrete additions/updates/removals,
+authorization changes and identity-reset warnings. Mutations return final PluginItem
+or confirmed removal, with existing busy/stale/forbidden/interrupted error patterns.
+`PluginManagementIntent`/`PluginsMutateParams` are typed shared client adapters, not a
+new generic wire endpoint. Protocol schemas were generated from the production exporter.
 
-All commands ran in the worktree above. Own test targets **NOT_COMPILED**;
-all source tests **NOT_RUN**. No app, MCP fixture, migration or functional/device
-scenario was executed.
+Desktop Plugins uses the shared typed client and uncertain-outcome refetch state.
+Native Skills/MCP retained presenters receive a local details destination and verify
+actual ownership; original config/policy/restart/OAuth controllers and browser callback
+lifecycle are reused. The MCP editor constrains an owned edit to its authoritative
+single server identity. Parent enable, archive/folder update preview/confirmation,
+individual Retry/Restore, Continue and remove/data checkbox are localized EN/RU.
+Busy, stale, network, auth, partial and interrupted states clear local pending/refetch.
+Standalone screens/pickers still hide owned children; B composer remains one parent
+chip. MEMBER disclosures redact hidden keys, identifiers and pointers in new preview,
+repair/results and existing publications.
 
-- Stable final implementation `a312c27e`: `CARGO_INCREMENTAL=0 cargo check -p pioneer-gateway --lib`:
-  exit **0**, 7m57s; log `/tmp/pioneer-c1-a312c27e-gateway-check.log`.
-  One dead-code warning: `set_mcp_policy` is not yet consumed by C1 orchestration;
-  the RPC already shares its underlying native preparation/publication operations.
-- `rustfmt --edition 2024 --check crates/gateway/src/message/mcp/policy.rs crates/gateway/src/mcp_service.rs`:
-  exit **0**, `a312c27e`.
-- `rustfmt --edition 2024 --config skip_children=true --check crates/gateway/src/message/tests.rs`:
-  exit **0**, `a312c27e`.
-- `git diff --check 39eb03b79eb8685002c00db5ee51120528d0edfa..HEAD`:
-  exit **0**, `a312c27e`.
-- Earlier same non-test cargo command: `/tmp/pioneer-c1-native-policy-check.log`
-  exit **101** (discarded prototype referenced a private UnifiedExecHandler path);
-  `/tmp/pioneer-c1-native-check-2.log` and `/tmp/pioneer-c1-native-stop-check.log`
-  exit **0** on intermediate trees containing that subsequently removed prototype.
-  `/tmp/pioneer-c1-final-gateway-check.log`, `/tmp/pioneer-c1-final-gateway-check-2.log`
-  and `/tmp/pioneer-c1-38a2761b-gateway-check.log` exit **0** on subsequent intermediate
-  trees. These are compilation observations, not final behavior evidence.
+## Actual permitted checks
 
-Regression sources: expanded `mcp_list_empty_then_install_stdio_persists_redacts_and_notifies`
-compares direct business/RPC native policy and ID/audit preservation;
-`cancelled_stop_retains_native_handle_until_a_retry_observes_completion` covers
-caller cancellation, OAuth recovery exclusion and a still-pending retry;
-`delayed_stop_does_not_remove_a_replacement_runtime_with_the_same_installation_id`
-covers stale stop identity. All **NOT_RUN / NOT_COMPILED**.
+Final production source snapshot equals final implementation HEAD (the two final
+code commits only partitioned these already-checked files).
 
-Known external activity: the B handoff's historical UNKNOWN_EXTERNAL_ACTIVITY
-(`cargo check --tests`, unknown owner/outcome) is external evidence, not a C1
-command or a testing result. No conclusion is drawn from it.
+| Command/check | Actual result / evidence |
+| --- | --- |
+| `CARGO_INCREMENTAL=0 cargo check -p pioneer-gateway -p pioneer-desktop-plugins --lib` | exit **0**, 1m25s, `target/plugin-c1-production-final-check.log`; includes changed production Agent/CRUD/Client/native desktop crates |
+| `CARGO_INCREMENTAL=0 cargo run -p pioneer-protocol --bin schema -- schemas` | exit **0**, 33.16s, `target/plugin-c1-schema-generation.log`; exporter inspected, schemas only |
+| `rustfmt --edition 2024 --config skip_children=true --check` over changed Rust files | exit **0**; also formatted changed files with rustfmt |
+| `git diff --check` | exit **0**, final source snapshot |
+| Parse changed locale TOML and plugin schema JSON | exit **0**, Python standard library only |
+
+Earlier intermediate combined production checks also exited 0:
+`target/plugin-c1-production-check-3.log` (4m08s), `...-4.log` (2m17s).
+Intermediate scoped Gateway/desktop checks had exit 101 for SeaORM/raw-query and
+lifecycle argument errors, the new upload enum's exhaustive match, and GPUI Task/
+Checkbox imports; corrected before final checks. Earlier successful scoped checks
+are intermediate compilation evidence only. Early `/tmp` logs became unavailable;
+no behavior conclusion or final success is inferred from their command invocation.
+Remaining compiler notices: existing unused `set_mcp_policy`; dependency `block 0.1.6`
+future compatibility warning. No new unresolved production compilation error.
+
+## Regression sources and remaining work
+
+All regression sources **NOT_RUN**; own test targets **NOT_COMPILED**.
+
+- CRUD ownership tests: scheduling/rollback, atomic native policy/audit/mask/marker,
+  same-key ID/policy/override and sibling retention, package-vs-user removal,
+  atomic upload owner/TTL/consumption, failure fingerprints and Maintenance interruption.
+- Gateway: shared start/recovery admission, closed-parent direct MCP start, actual
+  pending/retiring owners, fresh-secret typed remapping and pending GC protection.
+- Package lifecycle: assets-only swap, both rename boundaries, lost-payload fresh
+  repair, repeated swap, wrong fingerprint, bounded integrity/symlink rejection,
+  MEMBER preview redaction. The prior B owned-policy fixture now uses admitted CRUD.
+- Client: uncertain action requires refetch, parent-only history/draft selection,
+  fixed-identity single-server native editor preserving explicit Authorization.
+
+No app/fixture/provider/migration/smoke/device/functional scenario was run. These are
+source regressions and compilation evidence, not behavior checks. Historical B
+UNKNOWN_EXTERNAL_ACTIVITY (`cargo check --tests`, unknown owner/outcome) remains
+external evidence and is not attributed to this C1 implementation.
+
+No known C1 blocker is intentionally deferred. Coordinator review is still required;
+UI/browser/stop/interruption behavior has not been exercised. C2 full provider and
+continuation coverage, D mobile/generated native contracts/platform effects, and E
+final review plus separately authorized tests remain outstanding. Unsupported native
+provider continuation/CLI stop bindings stay explicit failures. **Stop after C1 review;
+this submission does not accept implementation, authorize tests or start C2/mobile.**
