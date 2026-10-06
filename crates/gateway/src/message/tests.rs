@@ -47831,6 +47831,56 @@ async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unbound_native_listener_owns_processor_until_abort() {
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = Box::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        Arc::new(SessionManager::new()),
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    assert!(processor.task_agent_executor.processor_weak().is_err());
+    // This fixture-only field is held exclusively by processor instances.
+    let owner_state = Arc::downgrade(&processor.native_cancellation_materialization_failure);
+    let agent_manager = processor.agent_manager.clone();
+    let thread_id = "unbound-listener-owner";
+    processor
+        .agent_manager
+        .ensure_thread(thread_id, &workspace_id)
+        .await
+        .unwrap();
+    processor
+        .ensure_agent_listener_task(thread_id)
+        .await
+        .unwrap();
+    let listener = processor
+        .agent_listener_tasks
+        .lock()
+        .await
+        .remove(thread_id)
+        .unwrap();
+    drop(processor);
+    assert!(
+        owner_state.upgrade().is_some(),
+        "the spawned listener must own its processor after the fixture is dropped"
+    );
+    listener.handle.abort();
+    let stopped = tokio::time::timeout(Duration::from_secs(2), listener.handle)
+        .await
+        .unwrap();
+    assert!(stopped.unwrap_err().is_cancelled());
+    assert!(
+        owner_state.upgrade().is_none(),
+        "joining the aborted listener must release its owned processor"
+    );
+    agent_manager.remove_thread(thread_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
     let (tx, _rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());

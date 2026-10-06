@@ -827,7 +827,9 @@ impl MessageProcessor {
     pub(super) async fn ensure_agent_listener_task(&self, thread_id: &str) -> Result<()> {
         let this = self.task_agent_executor.processor_weak().ok();
         #[cfg(test)]
-        let raw_this = (!this.is_some()).then_some(self as *const MessageProcessor as usize);
+        // Unbound fixtures can move or drop their processor while this task runs.
+        // Own a clone rather than borrowing its address across the spawn.
+        let test_this = this.is_none().then(|| self.clone());
         #[cfg(not(test))]
         if this.is_none() {
             bail!("task agent executor is not bound");
@@ -894,7 +896,7 @@ impl MessageProcessor {
                                 this.commit_durable_agent_event(event).await
                             } else {
                                 #[cfg(test)]
-                                { unsafe { (&*(raw_this.expect("raw listener owner") as *const MessageProcessor)).commit_durable_agent_event(event).await } }
+                                { test_this.as_ref().expect("test listener owner").commit_durable_agent_event(event).await }
                                 #[cfg(not(test))]
                                 { Err(DurableCommitRejection::permanent(
                                     "processor_stopped",
@@ -965,7 +967,7 @@ impl MessageProcessor {
                                         this.handle_progress_agent_event(event).await;
                                     } else {
                                         #[cfg(test)]
-                                        { unsafe { (&*(raw_this.expect("raw listener owner") as *const MessageProcessor)).handle_progress_agent_event(event).await; } }
+                                        { test_this.as_ref().expect("test listener owner").handle_progress_agent_event(event).await; }
                                     }
                                 })
                                     .catch_unwind()
