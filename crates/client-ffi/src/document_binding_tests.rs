@@ -14,6 +14,8 @@ fn direct_and_ffi_document_replay_preserve_drafts_failure_retry_and_scope_releas
         let direct = pioneer_client::catalog_test_support::client();
         let wire = pioneer_client::catalog_test_support::client();
         let runtime = ClientFfiRuntime {
+            native_oauth: Arc::new(plugin_shell::NativeOAuthShell::new(&wire)),
+            plugin_uploads: Default::default(),
             core: wire.clone(),
             config: Default::default(),
             client_subscriptions: Default::default(),
