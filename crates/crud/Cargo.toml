@@ -12,6 +12,7 @@ test-support = ["dep:tokio"]
 [dependencies]
 pioneer-compaction.workspace = true
 anyhow.workspace = true
+futures-util.workspace = true
 pioneer-entity.workspace = true
 pioneer-hooks.workspace = true
 pioneer-protocol.workspace = true

@@ -2884,19 +2884,39 @@ impl MessageProcessor {
                     continue;
                 }
 
-                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    retry_transient_storage_access(|| {
-                        agent_action_tools::process_due_agent_action_outbox(&this, 64)
-                    }),
+                    // One input quantum. Report errors/back off only after all
+                    // independent known-committed rows have had their dispatch.
+                    agent_action_tools::process_due_agent_action_outbox(&this, 64),
                 )
                 .await
                 {
-                    record_resilience_worker_poll_error(
-                        "agent domain agent action outbox",
-                        &error,
-                        &mut transient_storage_poll_failed,
-                    );
+                    Ok(batch) => {
+                        if !batch.errors.is_empty() {
+                            tracing::warn!(
+                                delivered = batch.delivered,
+                                candidate_failures = batch.errors.len(),
+                                "agent action outbox quantum made partial progress"
+                            );
+                            transient_storage_poll_failed = true;
+                            for error in batch.errors {
+                                record_resilience_worker_poll_error(
+                                    "agent domain agent action outbox",
+                                    &error,
+                                    &mut transient_storage_poll_failed,
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        transient_storage_poll_failed = true;
+                        record_resilience_worker_poll_error(
+                            "agent domain agent action outbox",
+                            &error,
+                            &mut transient_storage_poll_failed,
+                        );
+                    }
                 }
                 if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
                     continue;

@@ -729,6 +729,13 @@ async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_obj
     let target = migrations.iter().find(|m| m.name() == MIGRATION).unwrap();
     assert_eq!(target.name(), MIGRATION);
     assert_eq!(target.use_transaction(), Some(true));
+    assert!(
+        !Migrator::get_applied_migrations(&store.connection)
+            .await
+            .unwrap()
+            .iter()
+            .any(|migration| migration.name() == MIGRATION)
+    );
 }
 
 #[tokio::test]

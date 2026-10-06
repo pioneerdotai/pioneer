@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
+use futures_util::FutureExt;
 use pioneer_entity::{
     actor_nickname_index, agent_action, agent_action_outbox, agent_action_receipt,
     agent_action_timeline_target, agent_delegation_route, agent_delegation_route_event,
@@ -30,11 +31,12 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{OnConflict, Query};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait,
-    ExprTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
-    TransactionSession, TransactionTrait, TryGetable,
+    ExprTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    Statement, TransactionSession, TransactionTrait, TryGetable,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::panic::AssertUnwindSafe;
 
 pub const SOURCE_NATIVE_AGENT: &str = "native_agent";
 pub const SOURCE_CLI_RUNTIME_INSTANCE: &str = "cli_runtime_instance";
@@ -45,7 +47,14 @@ pub const NICKNAME_OWNER_AGENT: &str = "agent";
 pub const NICKNAME_OWNER_RESERVED: &str = "reserved";
 pub const NICKNAME_ACTIVE: &str = "active";
 pub const NICKNAME_TOMBSTONED: &str = "tombstoned";
+// The two partial-index predicates pin this policy to 8. Changing the retry
+// budget requires a migration replacing their predicates, plus the queries below.
 pub const AGENT_ACTION_OUTBOX_MAX_ATTEMPTS: i64 = 8;
+const _: () = assert!(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS == 8);
+const AGENT_ACTION_OUTBOX_BATCH_LIMIT: u64 = 64;
+const AGENT_ACTION_OUTBOX_RANGE_LIMIT: u64 = 32;
+const AGENT_ACTION_OUTBOX_IMMEDIATE_SQL: &str = "SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 ORDER BY created_at,id LIMIT ?";
+const AGENT_ACTION_OUTBOX_TIMED_SQL: &str = "SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NOT NULL AND (status='pending' OR (status='failed' AND attempts<8)) AND next_attempt_at<=? ORDER BY next_attempt_at,created_at,id LIMIT ?";
 const AGENT_ACTION_OUTBOX_FAILURE_CLASS: &str = "outbox_delivery_failed";
 pub const AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS: i64 = 30;
 pub const AGENT_ROUTE_GRAPH_MAX_EDGES: usize = 2_048;
@@ -4937,101 +4946,276 @@ fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Claim a bounded batch of post-commit action outbox rows.  The schema keeps
-/// the public status set intentionally small; `next_attempt_at` is the
-/// lease/fencing field that prevents two workers from processing the same row
-/// concurrently without introducing a second state machine.
-pub async fn claim_agent_action_outbox<C: ConnectionTrait>(
+#[derive(FromQueryResult)]
+struct AgentActionOutboxId {
+    id: String,
+}
+
+// Keep these predicates literally aligned with the partial indexes in
+// m20261004_000007_agent_action_outbox_ranges. Only clocks and limits are binds.
+async fn discover_agent_action_outbox<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,
     limit: u64,
-) -> Result<Vec<agent_action_outbox::Model>> {
+) -> Result<Vec<AgentActionOutboxId>> {
+    let immediate_limit = std::cmp::min(limit.div_ceil(2), AGENT_ACTION_OUTBOX_RANGE_LIMIT);
+    let timed_limit = std::cmp::min(limit / 2, AGENT_ACTION_OUTBOX_RANGE_LIMIT);
+    let mut ids = AgentActionOutboxId::find_by_statement(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        AGENT_ACTION_OUTBOX_IMMEDIATE_SQL,
+        [immediate_limit.into()],
+    ))
+    .all(db)
+    .await
+    .context("failed to list immediate agent action outbox IDs")?;
+    ids.extend(
+        AgentActionOutboxId::find_by_statement(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            AGENT_ACTION_OUTBOX_TIMED_SQL,
+            [now.into(), timed_limit.into()],
+        ))
+        .all(db)
+        .await
+        .context("failed to list timed agent action outbox IDs")?,
+    );
+    // A concurrent source transition can move an ID between these two reads.
+    // Retain range order but never transition the same input twice per quantum.
+    let mut seen = std::collections::BTreeSet::new();
+    ids.retain(|row| seen.insert(row.id.clone()));
+    Ok(ids)
+}
+
+/// Known-committed claims and independent candidate failures from one input quantum.
+#[derive(Debug, Default)]
+pub struct AgentActionOutboxClaimBatch {
+    pub rows: Vec<agent_action_outbox::Model>,
+    pub errors: Vec<anyhow::Error>,
+}
+
+/// Claim at most 32 immediate and 32 timed inputs. Expired final leases share
+/// this budget with delivery work. Nonzero limits must be 2..=64 so both ranges
+/// receive a share. Dispatch only `rows`, whose commits are known to have succeeded.
+pub async fn claim_agent_action_outbox<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    limit: u64,
+) -> Result<AgentActionOutboxClaimBatch> {
+    claim_agent_action_outbox_with_clock(db, limit, &utc_now).await
+}
+
+// An immediate clock callback makes writer-admission timing testable without
+// sleeps. It performs no preparation or I/O while the transaction is open.
+async fn claim_agent_action_outbox_with_clock<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    limit: u64,
+    clock: &(impl Fn() -> DateTimeWithTimeZone + Sync),
+) -> Result<AgentActionOutboxClaimBatch> {
     if limit == 0 {
-        return Ok(Vec::new());
+        return Ok(AgentActionOutboxClaimBatch::default());
     }
-    if limit > AGENT_BACKGROUND_BATCH_LIMIT {
-        bail!("Agent action outbox batch exceeds its bounded limit");
+    if !(2..=AGENT_ACTION_OUTBOX_BATCH_LIMIT).contains(&limit) {
+        bail!("Agent action outbox nonzero batch limit must be 2..=64");
     }
-    // A worker can disappear after taking its final lease. Once that lease
-    // expires there is no acknowledgement from which to derive an external
-    // error, so close the row with a bounded diagnostic instead of leaving a
-    // permanently pending, unclaimable outbox entry.
-    agent_action_outbox::Entity::update_many()
-        .col_expr(
-            agent_action_outbox::Column::Status,
-            sea_orm::sea_query::Expr::value("failed"),
-        )
+    let ids = discover_agent_action_outbox(db, clock(), limit).await?;
+    let mut batch = AgentActionOutboxClaimBatch::default();
+    for id in ids {
+        // The entire point operation is inside the boundary, including future
+        // creation and polling. Dropping it releases transactions/reservations;
+        // cancellation still drops the owning future rather than becoming Err.
+        let outcome = AssertUnwindSafe(async {
+            let transaction =
+                match db.begin().await {
+                    Ok(transaction) => transaction,
+                    Err(error) => {
+                        batch.errors.push(anyhow::Error::new(error).context(
+                            "failed to begin outbox claim; no snapshot for durable deferral",
+                        ));
+                        return;
+                    }
+                };
+            let now = clock(); // after serialized writer admission, for each row
+            // Original source payload is authoritative. Do not decode it under capacity.
+            let mut candidate =
+                match agent_action_outbox::Entity::find_by_id(id.id)
+                    .one(&transaction)
+                    .await
+                {
+                    Ok(Some(candidate)) => candidate,
+                    Ok(None) => {
+                        if let Err(error) = transaction.rollback().await {
+                            batch.errors.push(error.into());
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        batch.errors.push(anyhow::Error::new(error).context(
+                            "failed to load outbox input; no snapshot for durable deferral",
+                        ));
+                        if let Err(error) = transaction.rollback().await {
+                            batch.errors.push(error.into());
+                        }
+                        return;
+                    }
+                };
+            let row = match transition_agent_action_outbox(&transaction, &mut candidate, now).await
+            {
+                Ok(row) => row,
+                Err(error) => {
+                    batch.errors.push(error);
+                    // Only a known rollback permits a separate snapshot-fenced delay.
+                    match transaction.rollback().await {
+                        Ok(()) => {
+                            match defer_unclaimed_agent_action_outbox(db, &candidate, clock).await {
+                                Ok(true) => {}
+                                Ok(false) => batch.errors.push(anyhow::anyhow!(
+                                    "outbox claim deferral skipped: source snapshot changed"
+                                )),
+                                Err(error) => batch.errors.push(error.context(
+                                    "outbox claim deferral not confirmed; durability unavailable",
+                                )),
+                            }
+                        }
+                        Err(error) => batch.errors.push(
+                            anyhow::Error::new(error)
+                                .context("outbox rollback not confirmed; no claim repair allowed"),
+                        ),
+                    }
+                    return;
+                }
+            };
+            // Unknown commit excludes only this row. Never repair, rediscover or
+            // claim it again here; previously confirmed rows still reach dispatch.
+            match transaction.commit().await {
+                Ok(()) => {
+                    if row {
+                        batch.rows.push(candidate);
+                    }
+                }
+                Err(error) => batch.errors.push(
+                    anyhow::Error::new(error)
+                        .context("agent action outbox claim commit outcome unknown"),
+                ),
+            }
+        })
+        .catch_unwind()
+        .await;
+        if outcome.is_err() {
+            // Unwind is not a commit/rollback acknowledgement. No repair or
+            // same-quantum retry; only prior known commits are dispatchable.
+            batch
+                .errors
+                .push(anyhow!("outbox_claim_panic_outcome_unknown"));
+        }
+    }
+    Ok(batch)
+}
+
+// A failed, rolled-back claim consumes no execution attempt. Preserve status
+// and attempt budget, using the existing 30s lease as a retry delay. The exact
+// original nullable lease fences any new ownership acquired after rollback.
+async fn defer_unclaimed_agent_action_outbox<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    snapshot: &agent_action_outbox::Model,
+    clock: &(impl Fn() -> DateTimeWithTimeZone + Sync),
+) -> Result<bool> {
+    let transaction = db.begin().await?;
+    let now = clock();
+    let lease_guard = match snapshot.next_attempt_at {
+        Some(lease) => agent_action_outbox::Column::NextAttemptAt.eq(lease),
+        None => agent_action_outbox::Column::NextAttemptAt.is_null(),
+    };
+    let result = agent_action_outbox::Entity::update_many()
         .col_expr(
             agent_action_outbox::Column::NextAttemptAt,
-            sea_orm::sea_query::Expr::value::<Option<DateTimeWithTimeZone>>(None),
+            sea_orm::sea_query::Expr::value(Some(
+                now + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS),
+            )),
         )
         .col_expr(
             agent_action_outbox::Column::LastError,
-            sea_orm::sea_query::Expr::value(Some(
-                "outbox delivery lease expired after the retry limit".to_owned(),
-            )),
+            sea_orm::sea_query::Expr::value(Some(AGENT_ACTION_OUTBOX_FAILURE_CLASS.to_owned())),
         )
-        .filter(agent_action_outbox::Column::Status.eq("pending"))
-        .filter(agent_action_outbox::Column::Attempts.gte(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS))
-        .filter(agent_action_outbox::Column::NextAttemptAt.lte(now.clone()))
+        .filter(agent_action_outbox::Column::Id.eq(&snapshot.id))
+        .filter(agent_action_outbox::Column::Status.eq(&snapshot.status))
+        .filter(agent_action_outbox::Column::Attempts.eq(snapshot.attempts))
+        .filter(lease_guard)
+        .exec(&transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(result.rows_affected == 1)
+}
+
+// One bounded point transition. Exact snapshot guards also fence a replaced
+// lease with the same attempt count (e.g. after permit/runtime budget return).
+async fn transition_agent_action_outbox<C: ConnectionTrait>(
+    db: &C,
+    candidate: &mut agent_action_outbox::Model,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    if !matches!(candidate.status.as_str(), "pending" | "failed")
+        || candidate
+            .next_attempt_at
+            .as_ref()
+            .is_some_and(|due| due > &now)
+    {
+        return Ok(false);
+    }
+    let exhausted = candidate.attempts >= AGENT_ACTION_OUTBOX_MAX_ATTEMPTS;
+    if exhausted && (candidate.status != "pending" || candidate.next_attempt_at.is_none()) {
+        // Final attempt with a NULL lease was never supported closure eligibility.
+        return Ok(false);
+    }
+    let lease_guard = match candidate.next_attempt_at.clone() {
+        Some(lease) => agent_action_outbox::Column::NextAttemptAt.eq(lease),
+        None => agent_action_outbox::Column::NextAttemptAt.is_null(),
+    };
+    let update = agent_action_outbox::Entity::update_many()
+        .filter(agent_action_outbox::Column::Id.eq(candidate.id.clone()))
+        .filter(agent_action_outbox::Column::Status.eq(candidate.status.clone()))
+        .filter(agent_action_outbox::Column::Attempts.eq(candidate.attempts))
+        .filter(lease_guard);
+    let (status, attempts, next_attempt_at, last_error) = if exhausted {
+        (
+            "failed",
+            candidate.attempts,
+            None,
+            Some("outbox delivery lease expired after the retry limit".to_owned()),
+        )
+    } else {
+        (
+            "pending",
+            candidate.attempts + 1,
+            Some(now + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS)),
+            None,
+        )
+    };
+    let result = update
+        .col_expr(
+            agent_action_outbox::Column::Status,
+            sea_orm::sea_query::Expr::value(status),
+        )
+        .col_expr(
+            agent_action_outbox::Column::Attempts,
+            sea_orm::sea_query::Expr::value(attempts),
+        )
+        .col_expr(
+            agent_action_outbox::Column::NextAttemptAt,
+            sea_orm::sea_query::Expr::value(next_attempt_at.clone()),
+        )
+        .col_expr(
+            agent_action_outbox::Column::LastError,
+            sea_orm::sea_query::Expr::value(last_error.clone()),
+        )
         .exec(db)
         .await
-        .context("failed to dead-letter expired agent domain outbox leases")?;
-
-    let candidates = agent_action_outbox::Entity::find()
-        .filter(agent_action_outbox::Column::Status.is_in(["pending", "failed"]))
-        .filter(agent_action_outbox::Column::Attempts.lt(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS))
-        .filter(
-            agent_action_outbox::Column::NextAttemptAt
-                .is_null()
-                .or(agent_action_outbox::Column::NextAttemptAt.lte(now.clone())),
-        )
-        .order_by_asc(agent_action_outbox::Column::CreatedAt)
-        .limit(limit)
-        .all(db)
-        .await
-        .context("failed to list agent domain action outbox rows")?;
-    let lease_until = now.clone() + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS);
-    let mut claimed = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        let result = agent_action_outbox::Entity::update_many()
-            .col_expr(
-                agent_action_outbox::Column::Attempts,
-                sea_orm::sea_query::Expr::cust("attempts + 1"),
-            )
-            .col_expr(
-                agent_action_outbox::Column::Status,
-                sea_orm::sea_query::Expr::value("pending"),
-            )
-            .col_expr(
-                agent_action_outbox::Column::NextAttemptAt,
-                sea_orm::sea_query::Expr::value(lease_until.clone()),
-            )
-            .col_expr(
-                agent_action_outbox::Column::LastError,
-                sea_orm::sea_query::Expr::value::<Option<String>>(None),
-            )
-            .filter(agent_action_outbox::Column::Id.eq(candidate.id.clone()))
-            .filter(agent_action_outbox::Column::Status.is_in(["pending", "failed"]))
-            .filter(agent_action_outbox::Column::Attempts.lt(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS))
-            .filter(
-                agent_action_outbox::Column::NextAttemptAt
-                    .is_null()
-                    .or(agent_action_outbox::Column::NextAttemptAt.lte(now.clone())),
-            )
-            .exec(db)
-            .await
-            .context("failed to claim agent domain action outbox row")?;
-        if result.rows_affected == 1
-            && let Some(row) = agent_action_outbox::Entity::find_by_id(candidate.id)
-                .one(db)
-                .await
-                .context("failed to reload claimed agent domain outbox row")?
-        {
-            claimed.push(row);
-        }
+        .context("failed to transition agent action outbox input")?;
+    if result.rows_affected != 1 || exhausted {
+        return Ok(false);
     }
-    Ok(claimed)
+    candidate.status = status.to_owned();
+    candidate.attempts = attempts;
+    candidate.next_attempt_at = next_attempt_at;
+    candidate.last_error = last_error;
+    Ok(true)
 }
 
 pub async fn mark_agent_action_outbox_delivered<C: ConnectionTrait>(
@@ -7633,9 +7817,10 @@ mod tests {
         .await
         .unwrap();
 
-        let claimed = claim_agent_action_outbox(&db, now.clone(), 1)
+        let claimed = claim_agent_action_outbox_with_clock(&db, 2, &|| now.clone())
             .await
-            .unwrap();
+            .unwrap()
+            .rows;
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].attempts, 1);
         assert!(
@@ -7708,9 +7893,10 @@ mod tests {
         )
         .await;
 
-        let claimed = claim_agent_action_outbox(&db, now.clone(), 1)
+        let claimed = claim_agent_action_outbox_with_clock(&db, 2, &|| now.clone())
             .await
-            .unwrap();
+            .unwrap()
+            .rows;
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].attempts, 1);
         assert!(
@@ -8058,3 +8244,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "agent_domain/action_outbox_tests.rs"]
+mod action_outbox_tests;

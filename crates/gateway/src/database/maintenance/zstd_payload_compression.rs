@@ -5,13 +5,14 @@ use tracing::{debug, info, warn};
 
 use crate::database::zstd_column::{
     PERIODIC_BACKLOG_RECHECK_MILLIS, PERIODIC_MAINTENANCE_INTERVAL_SECONDS,
-    PERIODIC_MAINTENANCE_SECONDS, PERIODIC_TARGET_DB_LOAD, ZSTD_PAYLOAD_COLUMNS,
-    run_cooperative_maintenance_cycle,
+    PERIODIC_MAINTENANCE_SECONDS, PERIODIC_TARGET_DB_LOAD, PreparedDictionaryCache,
+    ZSTD_PAYLOAD_COLUMNS, run_cooperative_maintenance_cycle,
 };
 
-pub(super) async fn run(
+pub(crate) async fn run(
     crud_store: Arc<CrudStore>,
     cancellation: tokio_util::sync::CancellationToken,
+    mut cache: PreparedDictionaryCache,
 ) {
     loop {
         if cancellation.is_cancelled() {
@@ -20,6 +21,7 @@ pub(super) async fn run(
         let mut made_progress_with_backlog = false;
         match run_cooperative_maintenance_cycle(
             crud_store.as_ref(),
+            &mut cache,
             ZSTD_PAYLOAD_COLUMNS,
             Some(PERIODIC_MAINTENANCE_SECONDS),
             PERIODIC_TARGET_DB_LOAD,
@@ -67,6 +69,11 @@ pub(super) async fn run(
                     "sqlite-zstd periodic payload maintenance failed"
                 );
             }
+        }
+
+        #[cfg(test)]
+        if let Some(after_cycle) = cache.after_cycle.as_ref() {
+            after_cycle(&cache);
         }
 
         let delay = if made_progress_with_backlog {
