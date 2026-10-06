@@ -27,8 +27,10 @@ fn fence(path: &Path) -> JobFence {
         .lock()
         .unwrap()
         .insert(path.to_path_buf(), Dirty::new(1, std::time::Instant::now()));
+    let live = signals.roots.lock().unwrap()[path].live.clone();
     JobFence {
         signals,
+        live,
         root: path.to_path_buf(),
         incarnation: 1,
         stop: tokio_util::sync::CancellationToken::new(),
@@ -1629,4 +1631,120 @@ async fn large_lock_preserves_foreign_entries_and_serializes_a_foreground_writer
         serde_json::from_slice(&fs::read(wrapper.join("previous-lock-entry.json")).unwrap())
             .unwrap();
     assert_eq!(previous, Some(old));
+}
+
+#[tokio::test]
+async fn real_commit_failure_adopts_existing_bytes_and_new_edits_forward_without_blind_rollback() {
+    use sea_orm::ConnectionTrait;
+    let harness = harness().await;
+    let (candidate, snapshot, stage, wrapper) = publication_fixture(&harness).await;
+    let destination = candidate.destination.clone();
+    let source = harness.directory.path().join("source");
+    harness.processor.crud_store.database_connection().execute_unprepared("PRAGMA foreign_keys=ON; CREATE TABLE watched_commit_parent(id INTEGER PRIMARY KEY); CREATE TABLE watched_commit_child(parent INTEGER REFERENCES watched_commit_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER fail_watched_commit AFTER UPDATE ON skill_installation BEGIN INSERT INTO watched_commit_child VALUES(123); END").await.unwrap();
+    let error = storage::publish_watched_candidate(
+        &harness.processor.crud_store,
+        &harness.processor.skills_write_lock,
+        candidate,
+        snapshot.clone(),
+        Some(harness.workspace.clone()),
+        Some(stage),
+        None,
+        Default::default(),
+        || true,
+        |_, _| Ok(()),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<pioneer_crud::SkillReconciliationError>()
+            .unwrap()
+            .outcome,
+        pioneer_crud::SkillReconciliationFailure::Unknown
+    );
+    assert_eq!(
+        harness
+            .processor
+            .crud_store
+            .list_skill_reconciliation_page("user", "ws", None, 1)
+            .await
+            .unwrap(),
+        vec![snapshot]
+    );
+    let attempts: Attempts = Arc::default();
+    attempts.lock().unwrap().insert(
+        super::super::physical_root(&wrapper).unwrap(),
+        Attempt::new(source.clone()),
+    );
+    for _ in 0..2 {
+        let result = consume(root_job(
+            harness.processor.clone(),
+            source.clone(),
+            vec![Mapping::Import(
+                config(&harness, &source),
+                Some(harness.workspace.clone()),
+            )],
+            Arc::default(),
+            attempts.clone(),
+            fence(&source),
+        ))
+        .await;
+        assert_eq!(result, (0, 1));
+        assert_eq!(
+            attempts.lock().unwrap().len(),
+            1,
+            "uncertain acknowledgement of identical bytes must reuse the owned wrapper"
+        );
+        assert!(wrapper.join("backup/SKILL.md").exists());
+    }
+    package(
+        &source.join("pkg"),
+        "new source edit while outcome uncertain",
+    );
+    let result = consume(root_job(
+        harness.processor.clone(),
+        source.clone(),
+        vec![Mapping::Import(
+            config(&harness, &source),
+            Some(harness.workspace.clone()),
+        )],
+        Arc::default(),
+        attempts.clone(),
+        fence(&source),
+    ))
+    .await;
+    assert_eq!(result, (0, 1));
+    assert_eq!(attempts.lock().unwrap().len(), 2);
+    assert_eq!(
+        fs::read_to_string(wrapper.join("backup/assets/value.txt")).unwrap(),
+        "old destination"
+    );
+    harness
+        .processor
+        .crud_store
+        .database_connection()
+        .execute_unprepared("DROP TRIGGER fail_watched_commit")
+        .await
+        .unwrap();
+    assert_eq!(
+        consume(root_job(
+            harness.processor.clone(),
+            source.clone(),
+            vec![Mapping::Import(
+                config(&harness, &source),
+                Some(harness.workspace.clone())
+            )],
+            Arc::default(),
+            attempts.clone(),
+            fence(&source)
+        ))
+        .await,
+        (1, 0)
+    );
+    assert!(attempts.lock().unwrap().is_empty());
+    assert!(!wrapper.exists());
+    assert_eq!(
+        fs::read_to_string(destination.join("assets/value.txt")).unwrap(),
+        "new source edit while outcome uncertain"
+    );
 }

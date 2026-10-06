@@ -560,7 +560,7 @@ fn has_pending_attempt(
 // Resolve an earlier unknown publication by forwarding current prepared facts
 // under fresh row/Workspace/pack guards. A confirmed forward commit makes the
 // old backup unnecessary; failure leaves its marker protected across restart.
-fn recover_noop(
+fn recover_publication(
     this: Arc<MessageProcessor>,
     snapshot: pioneer_crud::SkillReconciliationSnapshot,
     workspace: Option<pioneer_entity::workspace::Model>,
@@ -1017,7 +1017,8 @@ fn import_job(
         };
         // Full content comparison coalesces own writes, retries and restart. An
         // unchanged SKILL.md alone must not hide changed supporting files.
-        if current == destination && storage::row_metadata_matches(&row, &metadata) {
+        {
+            let unchanged = current == destination && storage::row_metadata_matches(&row, &metadata);
             let path = destination.clone();
             let tree = owned_fs(&fence.stop, move || {
                 match Tree::new(path, None, max_bytes, false) {
@@ -1047,9 +1048,18 @@ fn import_job(
                     }
                 };
                 if source_hash == target_hash {
-                    let mut recovery = recover_noop(this.clone(), snapshot, workspace, root.managed_root.clone(), destination, metadata, max_bytes, attempts.clone(), fence.clone());
-                    while let Some(progress) = recovery.next().await { yield progress?; }
-                    return;
+                    // A failed COMMIT can leave the old DB row while publication
+                    // already placed these bytes at destination. Forward with fresh
+                    // guards using the owned artifact; never copy the same tree
+                    // again solely because its acknowledgement was uncertain.
+                    let mut recovery = recover_publication(this.clone(), snapshot.clone(), workspace.clone(), root.managed_root.clone(), destination.clone(), metadata.clone(), max_bytes, attempts.clone(), fence.clone());
+                    let mut recovered = false;
+                    while let Some(progress) = recovery.next().await {
+                        let progress = progress?;
+                        recovered |= matches!(progress, Progress::Changed(_));
+                        yield progress;
+                    }
+                    if unchanged || recovered { return; }
                 }
             }
         }
@@ -1057,19 +1067,31 @@ fn import_job(
             .parent()
             .context("skill destination has no parent")?
             .to_path_buf();
+        let parent = owned_fs(&fence.stop, move || { fs::create_dir_all(&parent)?; Ok(fs::canonicalize(parent)?) }).await?;
+        // A protected unknown backup does not block newer source edits. Known
+        // garbage must finish cleanup first, so failed GC cannot grow staging.
+        let mut after = None;
+        loop {
+            let page = {
+                let tracked = attempts.lock().expect("skills attempts lock");
+                let lower = after.as_ref().map_or(std::ops::Bound::Included(&parent), std::ops::Bound::Excluded);
+                tracked.range::<PathBuf, _>((lower, std::ops::Bound::Unbounded)).take_while(|(path, _)| path.starts_with(&parent)).take(FILES).map(|(path, attempt)| (path.clone(), attempt.committed)).collect::<Vec<_>>()
+            };
+            if page.is_empty() { break; }
+            after = page.last().map(|(path, _)| path.clone());
+            let expected_parent = parent.clone();
+            let blocked = owned_fs(&fence.stop, move || {
+                for (path, committed) in page {
+                    if path.parent() == Some(expected_parent.as_path()) && path.try_exists()? && (committed || attempt_marker(&path)?.is_none_or(|marker| !marker.publishing)) { return Ok(true); }
+                }
+                Ok(false)
+            }).await?;
+            yield Progress::Quantum;
+            if blocked { Err::<(), anyhow::Error>(anyhow::anyhow!("previous skill stage cleanup is pending"))?; }
+        }
         let registry = attempts.clone();
         let owner = fence.root.clone();
         let attempt = owned_fs(&fence.stop, move || {
-            fs::create_dir_all(&parent)?;
-            let parent = fs::canonicalize(parent)?;
-            if registry
-                .lock()
-                .expect("skills attempts lock")
-                .keys()
-                .any(|path| path.parent() == Some(parent.as_path()) && attempt_marker(path).is_ok_and(|marker| marker.is_some_and(|marker| !marker.publishing)))
-            {
-                Err::<(), anyhow::Error>(anyhow::anyhow!("previous skill stage cleanup is pending"))?;
-            }
             let path = new_attempt(&parent, owner.clone())?;
             fs::create_dir(path.join("payload"))?;
             registry
@@ -1310,7 +1332,7 @@ fn managed_job(
         };
         if source == destination && storage::row_metadata_matches(&row, &metadata) {
             let availability_changed = fence.valid() && changed_availability(&baseline, &row, Some(content));
-            let mut recovery = recover_noop(this.clone(), snapshot, workspace, managed_root, source, metadata, max_bytes, attempts.clone(), fence.clone());
+            let mut recovery = recover_publication(this.clone(), snapshot, workspace, managed_root, source, metadata, max_bytes, attempts.clone(), fence.clone());
             let mut notified = false;
             while let Some(progress) = recovery.next().await {
                 let progress = progress?;

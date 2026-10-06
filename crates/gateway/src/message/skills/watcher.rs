@@ -94,6 +94,7 @@ impl Default for Registration {
 /// Callback state is bounded by registered physical roots, never by events.
 struct Dirty {
     incarnation: u64,
+    live: Arc<AtomicBool>,
     generation: u64,
     acknowledged: u64,
     first: Option<Instant>,
@@ -108,6 +109,7 @@ impl Dirty {
     fn new(incarnation: u64, now: Instant) -> Self {
         Self {
             incarnation,
+            live: Arc::new(AtomicBool::new(true)),
             generation: 1,
             acknowledged: 0,
             first: Some(now - DEBOUNCE),
@@ -181,6 +183,8 @@ struct Signals {
     #[cfg(test)]
     snapshot_failure_page: StdMutex<Option<usize>>,
     #[cfg(test)]
+    backend_unavailable: AtomicBool,
+    #[cfg(test)]
     loop_iterations: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     snapshots: std::sync::atomic::AtomicU64,
@@ -249,7 +253,9 @@ impl Signals {
 
 #[derive(Clone)]
 struct JobFence {
+    #[cfg(test)]
     signals: Arc<Signals>,
+    live: Arc<AtomicBool>,
     root: PathBuf,
     incarnation: u64,
     stop: CancellationToken,
@@ -258,17 +264,12 @@ struct JobFence {
 impl JobFence {
     fn check(&self) -> Result<()> {
         if !self.valid() {
-            bail!("stale skills root incarnation");
+            bail!("stale skills root incarnation {}", self.incarnation);
         }
         Ok(())
     }
     fn valid(&self) -> bool {
-        !self.stop.is_cancelled()
-            && self.signals.roots.try_lock().is_ok_and(|roots| {
-                roots
-                    .get(&self.root)
-                    .is_some_and(|dirty| dirty.incarnation == self.incarnation)
-            })
+        !self.stop.is_cancelled() && self.live.load(Ordering::Acquire)
     }
 }
 
@@ -385,6 +386,11 @@ impl Native {
             signals.invalidate_all();
         }
         if self.watcher.is_none() {
+            #[cfg(test)]
+            if signals.backend_unavailable.load(Ordering::Acquire) {
+                self.request_recovery();
+                return self;
+            }
             let callback = signals.clone();
             match RecommendedWatcher::new(
                 move |event| callback.event(event),
@@ -804,7 +810,13 @@ async fn run_with_signals(
                     #[cfg(test)]
                     signals.snapshots.fetch_add(1, Ordering::Relaxed);
                     let mut dirty = signals.roots.lock().expect("skills roots lock");
-                    dirty.retain(|path, _| next.contains_key(path));
+                    dirty.retain(|path, dirty| {
+                        let keep = next.contains_key(path);
+                        if !keep {
+                            dirty.live.store(false, Ordering::Release);
+                        }
+                        keep
+                    });
                     for (path, registration) in &mut next {
                         let unchanged = registrations.get(path).is_some_and(|old| {
                             old.mappings
@@ -829,6 +841,7 @@ async fn run_with_signals(
                             incarnation = next_incarnation;
                             let mut fresh = Dirty::new(incarnation, Instant::now());
                             if let Some(old) = dirty.get(path) {
+                                old.live.store(false, Ordering::Release);
                                 fresh.retry_at = old.retry_at;
                                 fresh.attempts = old.attempts;
                             }
@@ -890,15 +903,17 @@ async fn run_with_signals(
                 .clone();
             last_root = Some(path.clone());
             if !jobs.contains_key(&path) {
-                let (job_incarnation, generation) = {
+                let (job_incarnation, generation, live) = {
                     let mut roots = signals.roots.lock().expect("skills roots lock");
                     let dirty = roots.get_mut(&path).expect("registered root");
                     dirty.first = None;
-                    (dirty.incarnation, dirty.generation)
+                    (dirty.incarnation, dirty.generation, dirty.live.clone())
                 };
                 let registration = &registrations[&path];
                 let fence = JobFence {
+                    #[cfg(test)]
                     signals: signals.clone(),
+                    live,
                     root: path.clone(),
                     incarnation: job_incarnation,
                     stop: stop.clone(),

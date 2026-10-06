@@ -724,17 +724,75 @@ fn prepared_guard_never_waits_for_the_callback_mutex_under_writer_capacity() {
         .lock()
         .unwrap()
         .insert(root.clone(), Dirty::new(1, Instant::now()));
+    let live = signals.roots.lock().unwrap()[&root].live.clone();
     let guard = JobFence {
         signals: signals.clone(),
+        live: live.clone(),
         root,
         incarnation: 1,
         stop: CancellationToken::new(),
     };
     let lock = signals.roots.lock().unwrap();
     assert!(
+        guard.valid(),
+        "a callback storm must neither block the writer nor falsely retire a live incarnation"
+    );
+    live.store(false, Ordering::Release);
+    assert!(
         !guard.valid(),
-        "contention rejects the prepared write instead of waiting under DB capacity"
+        "retired incarnation must remain fenced even while the callback mutex is held"
     );
     drop(lock);
-    assert!(guard.valid());
+    assert!(!guard.valid());
+}
+
+#[tokio::test]
+async fn unavailable_backend_keeps_real_worker_initial_reconciliation_and_idle_backoff() {
+    let harness = harness().await;
+    let source = harness.directory.path().join("source/pkg");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("SKILL.md"),
+        "---\nname: Degraded\n---\nInitial import",
+    )
+    .unwrap();
+    let signals = Arc::new(Signals::default());
+    signals.backend_unavailable.store(true, Ordering::Release);
+    let stop = CancellationToken::new();
+    let worker = tokio::spawn(run_with_signals(
+        harness.processor.clone(),
+        stop.clone(),
+        signals.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let roots = signals.roots.lock().unwrap();
+            let complete = !roots.is_empty()
+                && roots
+                    .values()
+                    .all(|dirty| dirty.generation == dirty.acknowledged);
+            drop(roots);
+            if complete {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("initial work must continue with explicit degraded native observation");
+    let rows = harness
+        .processor
+        .crud_store
+        .list_skill_installations_scope_page("user", "ws", None, 64)
+        .await
+        .unwrap();
+    assert!(rows.iter().any(|row| !row.fingerprint.is_empty()));
+    tokio::time::sleep(Duration::from_millis(100)).await; // drain post-ACK notifications
+    let reads = harness.observer.reads.lock().unwrap().len();
+    let iterations = signals.loop_iterations.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(harness.observer.reads.lock().unwrap().len(), reads);
+    assert!(signals.loop_iterations.load(Ordering::Relaxed) - iterations < 3);
+    stop.cancel();
+    worker.await.unwrap();
 }
