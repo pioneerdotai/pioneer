@@ -363,6 +363,22 @@ mod tests {
             (a, b) => out.push(format!("{path}: actual {a}; expected {b}")),
         }
     }
+
+    fn project_pinned_cost_fields(actual: &mut Value, expected: &Value, raw: &Value) {
+        let prices = actual.as_object_mut().unwrap();
+        // Only source-backed additions absent from Pi's normalized contract
+        // may be projected out. Changed known rates still reach differences.
+        for (field, value) in prices.iter() {
+            if expected.get(field).is_none() {
+                assert_eq!(
+                    raw.get(field),
+                    Some(value),
+                    "additional cost field {field} must retain its exact source value"
+                );
+            }
+        }
+        prices.retain(|field, _| expected.get(field).is_some());
+    }
     #[test]
     fn missing_source_price_is_unknown_and_explicit_zero_is_free() {
         let c = cost(
@@ -435,7 +451,8 @@ mod tests {
             "origin differences:\n{}",
             origins.join("\n")
         );
-        let mut actual = serde_json::to_value(generated.models).unwrap();
+        let unprojected = serde_json::to_value(generated.models).unwrap();
+        let mut actual = unprojected.clone();
         let expected: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json")).unwrap();
         // The Pi fixture collapsed missing prices into zero. Keep every
@@ -484,6 +501,25 @@ mod tests {
                     model.as_object_mut().unwrap().remove(field);
                 }
                 let reference = &expected[provider][id]["cost"];
+                if let (Some(fallbacks), Some(old)) = (
+                    model
+                        .get_mut("compat")
+                        .and_then(|compat| compat.get_mut("allowedFallbackModels"))
+                        .and_then(Value::as_array_mut),
+                    expected[provider][id]["compat"]["allowedFallbackModels"].as_array(),
+                ) {
+                    assert_eq!(fallbacks.len(), old.len());
+                    for (fallback, old) in fallbacks.iter_mut().zip(old) {
+                        let canonical = &unprojected[fallback["provider"].as_str().unwrap()]
+                            [fallback["model"].as_str().unwrap()];
+                        assert_eq!(fallback["cost"], canonical["cost"]);
+                        project_pinned_cost_fields(
+                            &mut fallback["cost"],
+                            &old["cost"],
+                            &canonical["pricingSource"]["raw"],
+                        );
+                    }
+                }
                 let prices = model["cost"].as_object_mut().unwrap();
                 // Native source fields remain in production; the old fixture
                 // compares normalized fields only. Separate tests assert their
@@ -534,7 +570,9 @@ mod tests {
                     prices.get_mut("tiers").and_then(Value::as_array_mut),
                     reference["tiers"].as_array(),
                 ) {
-                    for (tier, old) in tiers.iter_mut().zip(old) {
+                    assert_eq!(tiers.len(), old.len());
+                    for (index, (tier, old)) in tiers.iter_mut().zip(old).enumerate() {
+                        project_pinned_cost_fields(tier, old, &source["raw"]["tiers"][index]);
                         for (field, native) in [
                             ("input", "input"),
                             ("output", "output"),
