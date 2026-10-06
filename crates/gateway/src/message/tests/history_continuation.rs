@@ -540,9 +540,32 @@ async fn durable_final_case(
             .unwrap(),
         CommitOutcome::Applied
     );
-    // Cleanup uses the existing serialized repository writer; UI records remain.
-    store.delete_turn_llm_context_for_turn(turn).await.unwrap();
-    assert_eq!(store.list_turn_llm_context(turn).await.unwrap().len(), 0);
+    // Normal cleanup removes transient context, retaining canonical history
+    // sources even after publication. The checkpoint projection, not deletion
+    // of those sources, prevents the UI answer from reappearing on restart.
+    store
+        .insert_turn_llm_context(pioneer_crud::NewTurnLlmContextEntry {
+            turn_id: turn.into(),
+            item_id: None,
+            attempt_id: None,
+            sequence: 2,
+            source: "tool_result".into(),
+            tool_name: None,
+            payload: "temporary context".into(),
+            output_policy_snapshot: "{}".into(),
+            created_at: chrono::Utc::now().fixed_offset(),
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store.delete_turn_llm_context_for_turn(turn).await.unwrap(),
+        1
+    );
+    let retained = store.list_turn_llm_context(turn).await.unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].id, row.id);
+    assert_eq!(retained[0].payload, row.payload);
     for id in ["final-item", "reasoning-item", "unrelated-item"] {
         assert!(
             store.get_turn_item(turn, id).await.unwrap().is_some(),

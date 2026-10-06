@@ -10274,14 +10274,21 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
         [
             "original request",
             "",
-            "Reasoning recorded for a previous response:\nrecorded reasoning",
             "first completed result",
             "",
-            "Reasoning recorded for a previous response:\nrecorded reasoning",
             "same observed text",
             "same observed text",
             "late result",
         ]
+    );
+    assert_eq!(
+        prepared
+            .messages
+            .iter()
+            .filter(|message| message.reasoning_content.as_deref() == Some("recorded reasoning"))
+            .count(),
+        2,
+        "each completed canonical round owns its reasoning; its exact UI copy is suppressed"
     );
     let prepared_scopes = super::frozen::accepted_history_scopes(
         &f.store,

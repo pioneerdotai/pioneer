@@ -1238,7 +1238,12 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
         let projected =
             crate::history::project_messages_for_provider("gemini", "fixture", &[stored]).unwrap();
-        let req = request(projected);
+        let mut req = request(projected);
+        let calls = req.messages[0].tool_calls.clone().unwrap();
+        for call in calls {
+            req.messages
+                .push(ChatMessage::tool_result(call.id, call.name, "{}"));
+        }
         let prepared = prepare_messages_for_provider(
             "gemini",
             &GeminiProvider::new("key").capabilities(),
