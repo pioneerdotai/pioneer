@@ -361,12 +361,19 @@ impl ComposerView {
         cx: &mut Context<Self>,
     ) -> Option<Entity<CapabilityPickerState>> {
         let capabilities = self.principal_presentation_capabilities();
-        if !self.can_start_active_thread_agent_presentation()
-            || !match kind {
-                ComposerPickerKind::Skills => capabilities.can_use_skills,
-                ComposerPickerKind::Mcp => capabilities.can_use_mcp,
-            }
-        {
+        let (allowed, placeholder) = match kind {
+            ComposerPickerKind::Skills => (
+                capabilities.can_use_skills,
+                t!("chat.composer.capability_picker.search_skills").to_string(),
+            ),
+            ComposerPickerKind::Mcp => (
+                capabilities.can_use_mcp,
+                t!("chat.composer.capability_picker.search_mcp").to_string(),
+            ),
+            // Plugins use their own parent-only picker in open_composer_plugins_picker.
+            ComposerPickerKind::Plugins => return None,
+        };
+        if !self.can_start_active_thread_agent_presentation() || !allowed {
             return None;
         }
         if let Some(old) = self.capability_picker.take() {
@@ -392,12 +399,6 @@ impl ComposerView {
             .as_ref()?
             .identity
             .clone();
-        let placeholder = match kind {
-            ComposerPickerKind::Skills => {
-                t!("chat.composer.capability_picker.search_skills").to_string()
-            }
-            ComposerPickerKind::Mcp => t!("chat.composer.capability_picker.search_mcp").to_string(),
-        };
         let registrar = self.thread_bindings.registrar();
         let picker = cx.new(|cx| {
             CapabilityPickerState::new(client, registrar, identity, window, cx, placeholder)
