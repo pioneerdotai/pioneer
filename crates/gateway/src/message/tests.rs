@@ -1,3 +1,6 @@
+#[path = "tests/agent_action_outbox.rs"]
+mod agent_action_outbox;
+
 #[path = "tests/compaction_lifecycle_poll.rs"]
 mod compaction_lifecycle_poll;
 
@@ -33166,11 +33169,16 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
 
     let mut child_dispatched = false;
     for _ in 0..200 {
-        if crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
-            .await
-            .expect("direct Agent outbox dispatch should succeed")
-            > 0
-        {
+        let batch =
+            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                .await
+                .expect("direct Agent outbox dispatch should succeed");
+        assert!(
+            batch.errors.is_empty(),
+            "direct Agent outbox storage should succeed: {:?}",
+            batch.errors
+        );
+        if batch.delivered > 0 {
             child_dispatched = true;
             break;
         }

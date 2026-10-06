@@ -730,6 +730,13 @@ async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_obj
         migrations[migrations.len() - tracker_rollback_steps() as usize].name(),
         MIGRATION
     );
+    assert!(
+        !Migrator::get_applied_migrations(&store.connection)
+            .await
+            .unwrap()
+            .iter()
+            .any(|migration| migration.name() == MIGRATION)
+    );
 }
 
 #[tokio::test]
