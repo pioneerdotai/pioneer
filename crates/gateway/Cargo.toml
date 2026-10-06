@@ -84,6 +84,7 @@ toml.workspace = true
 
 [dev-dependencies]
 tokio-tungstenite.workspace = true
+pioneer-mcp-oauth = { workspace = true, features = ["test-support"] }
 sentry = { workspace = true, features = ["test"] }
 pioneer-sqlite = { workspace = true, features = ["test-support"] }
 pioneer-client.workspace = true
