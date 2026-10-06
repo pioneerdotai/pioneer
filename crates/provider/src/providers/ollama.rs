@@ -189,11 +189,10 @@ impl OllamaProvider {
     }
 
     fn convert_messages(prepared: &PreparedProviderMessages) -> Result<Vec<OllamaMessage>> {
-        prepared
-            .messages
-            .iter()
-            .enumerate()
-            .map(|(message_index, m)| {
+        crate::tools::policy::ordered_tool_results(&prepared.messages)
+            .into_iter()
+            .map(|message_index| {
+                let m = &prepared.messages[message_index];
                 let mut images = Vec::new();
                 for attachment in prepared.attachments_for_message(message_index) {
                     match attachment.kind {
@@ -383,13 +382,15 @@ impl crate::traits::Provider for OllamaProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider_async(
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let options = Self::build_options(&request);
         let api_request = OllamaChatRequest {
@@ -465,13 +466,15 @@ impl crate::traits::Provider for OllamaProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let prepared = prepare_messages_for_provider_async(
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let options = Self::build_options(&request);
         let api_request = OllamaChatRequest {
@@ -691,7 +694,7 @@ impl crate::traits::Provider for OllamaProvider {
                     limits: ProviderModelLimits::default(),
                     capabilities: ProviderModelCapabilities {
                         streaming: Some(true),
-                        tool_calling: Some(true),
+                        tool_calling: None,
                         ..ProviderModelCapabilities::default()
                     },
                     transcription: None,
@@ -716,6 +719,46 @@ mod tests {
     use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
     use crate::traits::Provider;
     use crate::types::{ChatMessage, ProviderReplayState};
+
+    #[test]
+    fn legacy_name_order_projection_preserves_canonical_ids() {
+        let provider = OllamaProvider::new();
+        let mut assistant = crate::ChatMessage::assistant("");
+        assistant.tool_calls = Some(vec![
+            ProviderToolCall {
+                id: "first".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            },
+            ProviderToolCall {
+                id: "second".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            },
+        ]);
+        let messages = vec![
+            assistant,
+            crate::ChatMessage::tool_result("second", "lookup", "second-result"),
+            crate::ChatMessage::tool_result("first", "lookup", "first-result"),
+        ];
+        let mut prepared = crate::attachments::prepare_messages_for_provider(
+            "ollama",
+            &provider.capabilities(),
+            &messages,
+        )
+        .unwrap();
+        crate::tools::policy::prepare_history("ollama", &mut prepared.messages).unwrap();
+        let wire = OllamaProvider::convert_messages(&prepared).unwrap();
+        assert_eq!(wire[1].content.as_deref(), Some("first-result"));
+        assert_eq!(wire[2].content.as_deref(), Some("second-result"));
+        assert_eq!(wire[1].tool_call_id.as_deref(), Some("first"));
+        assert_eq!(wire[2].tool_call_id.as_deref(), Some("second"));
+        assert_eq!(
+            serde_json::to_value(&wire[1]).unwrap()["tool_name"],
+            "lookup"
+        );
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("second"));
+    }
 
     #[test]
     fn active_foreign_replay_is_rejected_before_ollama_serializer_can_ignore_it() {

@@ -787,7 +787,10 @@ impl BedrockProvider {
     fn convert_tool_config(
         tools: &[ToolDefinition],
         choice: Option<ToolChoice>,
-    ) -> BedrockToolConfig {
+    ) -> Result<BedrockToolConfig> {
+        if matches!(choice, Some(ToolChoice::None)) {
+            anyhow::bail!("Bedrock None must omit toolConfig; it cannot become Auto");
+        }
         let tools = tools
             .iter()
             .map(|tool| BedrockToolEntry {
@@ -803,19 +806,22 @@ impl BedrockProvider {
 
         let tool_choice = choice.map(|choice| match choice {
             ToolChoice::Auto => serde_json::json!({ "auto": {} }),
-            ToolChoice::None => serde_json::json!({ "auto": {} }),
+            ToolChoice::None => serde_json::Value::Null, // rejected above
             ToolChoice::Required => serde_json::json!({ "any": {} }),
             ToolChoice::Tool { name } => serde_json::json!({ "tool": { "name": name } }),
         });
 
-        BedrockToolConfig { tools, tool_choice }
+        Ok(BedrockToolConfig { tools, tool_choice })
     }
 
     fn build_request(
         request: &ChatRequest,
         prepared: &PreparedProviderMessages,
     ) -> Result<BedrockRequest> {
-        let (messages, system) = Self::convert_messages(prepared)?;
+        let request = crate::tools::policy::prepare_request("bedrock", request.clone())?;
+        let mut prepared = prepared.clone();
+        crate::tools::policy::prepare_history("bedrock", &mut prepared.messages)?;
+        let (messages, system) = Self::convert_messages(&prepared)?;
 
         let inference_config = if request.temperature.is_some() || request.max_tokens.is_some() {
             Some(BedrockInferenceConfig {
@@ -833,7 +839,8 @@ impl BedrockProvider {
             tool_config: request
                 .tools
                 .as_ref()
-                .map(|tools| Self::convert_tool_config(tools, request.tool_choice.clone())),
+                .map(|tools| Self::convert_tool_config(tools, request.tool_choice.clone()))
+                .transpose()?,
             additional_model_request_fields: Self::additional_model_request_fields(
                 request.model.as_str(),
                 request.reasoning,
@@ -1038,6 +1045,7 @@ impl crate::traits::Provider for BedrockProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
         self.validate_connection()?;
         let prepared = prepare_messages_for_provider_async(
             self.name(),
@@ -1100,6 +1108,7 @@ impl crate::traits::Provider for BedrockProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
         // Bedrock Converse streaming uses a different binary event-stream protocol.
         // Fall back to a single non-streaming call returned as one chunk.
         let response = self.chat(request).await?;
@@ -1225,6 +1234,54 @@ mod signing_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_modes_none_and_unsupported_limit_are_validated_before_converse() {
+        let provider = BedrockProvider::new("unused", "unused", "us-east-1");
+        for (choice, expected) in [
+            (ToolChoice::Auto, "auto"),
+            (ToolChoice::Required, "any"),
+            (
+                ToolChoice::Tool {
+                    name: "lookup".into(),
+                },
+                "tool",
+            ),
+        ] {
+            let mut request = crate::tools::policy::test_request();
+            request.model = "anthropic.claude-3-5-sonnet-20240620-v1:0".into();
+            request.tool_choice = Some(choice);
+            let prepared = prepare_messages_for_provider(
+                "bedrock",
+                &provider.capabilities(),
+                &request.messages,
+            )
+            .unwrap();
+            let wire = BedrockProvider::build_request(&request, &prepared).unwrap();
+            assert!(
+                wire.tool_config
+                    .unwrap()
+                    .tool_choice
+                    .unwrap()
+                    .get(expected)
+                    .is_some()
+            );
+        }
+        let mut request = crate::tools::policy::test_request();
+        request.tool_choice = Some(ToolChoice::None);
+        let prepared =
+            prepare_messages_for_provider("bedrock", &provider.capabilities(), &request.messages)
+                .unwrap();
+        assert!(
+            BedrockProvider::build_request(&request, &prepared)
+                .unwrap()
+                .tool_config
+                .is_none()
+        );
+        request.tool_choice = Some(ToolChoice::Auto);
+        request.parallel_tool_calls = Some(false);
+        assert!(BedrockProvider::build_request(&request, &prepared).is_err());
+    }
+
     #[test]
     fn usage_normalization_requires_complete_separate_cache_counters() {
         let complete: super::BedrockUsage = serde_json::from_value(serde_json::json!({
