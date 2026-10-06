@@ -10,12 +10,69 @@ partial C1 handoff; its native-stop blocker was accepted separately at the basel
 - Worktree/cwd for every command below:
   `/Users/alexander/Code/pioneer/pioneer/.worktrees/agent-plugins-simple`.
 - Resume base HEAD: `9e468ea67f1ad67d67783f496c6649384df43383`, initially clean.
-- Final implementation HEAD: `3e007cdd199fcdd1575f0380c63fcf5b5ebb3a23`.
-  A documentation-only commit delivers this handoff; its hash is in the final response.
+- Initial C1 implementation HEAD: `3e007cdd199fcdd1575f0380c63fcf5b5ebb3a23`.
+- C1 fixes base/delivery HEAD: `35615c38309bb58a92f227d61f598b897e3456d3`, initially clean.
+- Final fixes code HEAD: `181d59f374e4c4da6b920be6f71758d147d7e9ea`.
+  The documentation-only delivery HEAD is the commit containing this handoff;
+  its exact hash is supplied in the final response. Worktree was clean after the code commit.
 - Resume commits: `386c011f` native stop/gate foundation; `d274303a` native atomic
   contracts; `1b6d206f` foreground lifecycle/shared contracts; `3e007cdd` desktop.
 - Implementation was clean before writing this handoff. Main, archived branches,
   mobile/FFI and mobile worktree were not changed. No merge/rebase/push/deployment.
+
+## C1-01…C1-03 local fixes — submitted for repeat review
+
+- **C1-01** — `gateway/src/message/skills/workspace.rs::load_skills_catalog_from_store`
+  reads the existing authoritative `override_fields_json`. With `skill_source`, it
+  retains the entire genuine native catalog context: definition, SKILL file, folder
+  and assets, including native invalid/missing-package availability. No bundled
+  fallback. Ordinary bundled members retain the original contained full-package
+  path and sibling references. Explicit-only and parent enabled/state/pending/child
+  gates still apply in both branches; native policy/trust/resolution remain unchanged.
+  Shared `build_skill_runtime_plan` therefore supplies the same correct context to
+  read_skill and dynamic descriptors. No native store/installer/runtime copy changed.
+- **C1-02** — `desktop-plugins/src/lib.rs::status_label` now maps actual Skill states
+  active/disabled/blocked/unavailable to localized EN/RU labels. Existing MCP
+  authorized/auth-required/offline labels remain distinct. Installation status does
+  not infer readiness and the native resolver is unchanged.
+- **C1-03** — `desktop-plugins/src/management.rs::confirm_restore_component` uses the
+  neighboring native `window.prompt` pattern. Its localized title names the exact
+  Skill/MCP member, body displays the existing new-installation/default-permissions
+  notice, and Restore/Cancel are explicit. A retained local prompt task prevents
+  duplicate submission; Cancel/dismissal sends nothing. Confirm revalidates the
+  current parent ID/revision/state and exact removed member key, then sends one
+  existing typed Retry intent with `restore_removed=true`. Scope/connection changes
+  discard old callbacks; stale confirmation refreshes instead of restoring. Ordinary
+  failed-component Retry remains immediate with `restore_removed=false` and retained
+  native identity. No restore service, old grants transfer, RPC or state machine.
+
+Own fix regression sources **NOT_RUN / test targets NOT_COMPILED**:
+`message/tests_plugin_source.rs` covers distinct bundled/uploaded body/scripts,
+ordinary bundled siblings, shared read_skill/dynamic roots, same-key package v2
+metadata with retained native source/ID/policy/trust, invalid/missing override without
+fallback, disabled parent and unchanged standalone context. Native publication is
+seeded through the existing CRUD lifecycle writer; no live upload/provider scenario
+has been exercised. Desktop source cases cover actual display labels, canceled restore,
+exact one-member intent, stale revision/parent, interrupted state and failed-ID targets.
+Native prompt/rendering/keyboard/browser behavior remains NOT_RUN; GPUI Kit/design
+review checklists were assessed by source only.
+
+Fix checks all ran in the worktree/cwd above on the source snapshot committed at
+`181d59f3`, using `CARGO_INCREMENTAL=0` for production compilation:
+
+| Check | Actual result / evidence |
+| --- | --- |
+| `cargo check -p pioneer-gateway -p pioneer-desktop-plugins --lib` final snapshot | exit **0**, 5.81s, `target/plugin-c1-fixes-production-final-check.log` |
+| Same scoped command, intermediate snapshot before final prompt copy | exit **0**, 4m02s, `target/plugin-c1-fixes-production-check.log` |
+| `rustfmt --edition 2024 --config skip_children=true --check` for the five changed Rust files (including source regressions) | exit **0**; changed Rust files also formatted |
+| `git diff --check` | exit **0** |
+| Python standard-library TOML parse + verify used Plugins locale keys in EN/RU | exit **0** |
+
+Compiler notices remain the historical unused `set_mcp_policy` and `block 0.1.6`
+future-compat warning. No contracts/schemas changed, so no regeneration was needed.
+No tests/test-target compilation, app/provider/process/fixture/migration/browser/
+functional/device scenario ran. Historical UNKNOWN_EXTERNAL_ACTIVITY below remains
+separate. No C2/provider projection/mobile/FFI or other accepted scope was changed.
 
 ## Implemented paths and genuine operation reuse
 
@@ -105,10 +162,10 @@ Standalone screens/pickers still hide owned children; B composer remains one par
 chip. MEMBER disclosures redact hidden keys, identifiers and pointers in new preview,
 repair/results and existing publications.
 
-## Actual permitted checks
+## Historical initial C1 permitted checks
 
-Final production source snapshot equals final implementation HEAD (the two final
-code commits only partitioned these already-checked files).
+These original results are retained for the initial implementation HEAD `3e007cdd`.
+The two initial final code commits only partitioned those already-checked files.
 
 | Command/check | Actual result / evidence |
 | --- | --- |
