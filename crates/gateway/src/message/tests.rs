@@ -13772,247 +13772,300 @@ impl Drop for PendingVoiceRelease {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g09_owned_voice_ingress_cancel_disconnect_and_terminal_branches() {
-    use crate::voice::transcription::{VoiceTranscriptionErrorKind, transcription_error};
-    for terminal in ["transcript", "no_speech", "runtime_error"] {
-        for action in ["cancel", "disconnect", "winner"] {
-            let (tx, mut rx) = mpsc::channel(128);
-            let sessions = Arc::new(SessionManager::new());
-            let connection_id = register_authenticated_test_connection(&sessions, tx).await;
-            let context = sessions.connection_context(connection_id).await.unwrap();
-            let (foreign_tx, mut foreign_rx) = mpsc::channel(16);
-            let foreign_id = register_authenticated_test_connection(&sessions, foreign_tx).await;
-            let foreign_context = sessions.connection_context(foreign_id).await.unwrap();
-            let (workspace_manager, crud, workspace_id) = setup_workspace_manager().await;
-            let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-            let release = PendingVoiceRelease(gate.clone());
-            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-            let entered_tx = std::sync::Mutex::new(Some(entered_tx));
-            let mut processor = MessageProcessor::new(
-                Arc::new(ThreadManager::new("test-model", "openai")),
-                test_provider(),
-                sessions,
-                workspace_manager,
-                crud.clone(),
-                test_gateway_secrets(),
-                test_summary_config(),
-                test_tool_loop_config(),
-            )
-            .with_voice_input_supervisor(ready_gateway_voice_supervisor("unused native stub"));
-            processor.voice_test_transcriber = Some(Arc::new(move |_buffer| {
-                // Observe the production blocking scope before installing anything
-                // in the fake. This must come from the actual request dispatcher.
-                entered_tx
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .unwrap()
-                    .send(pioneer_observability::turn_startup::current_key())
-                    .unwrap();
-                let (released, condition) = &*gate;
-                let mut flag = released.lock().unwrap();
-                while !*flag {
-                    flag = condition.wait(flag).unwrap();
-                }
-                match terminal {
-                    "runtime_error" => Err(transcription_error(
-                        VoiceTranscriptionErrorKind::RuntimeFailure,
-                        "controlled fake failure",
-                    )),
-                    "no_speech" => Ok("  ".to_owned()),
-                    _ => Ok("controlled transcript".to_owned()),
-                }
-            }));
-            let processor = Arc::new(processor);
-            let thread_id = "thr_g09_owned_voice";
-            // Two distinct request contexts and a valid business ID outside the
-            // telemetry key length bound. The latter must preserve None rather
-            // than synthesizing a context from the session's turn ID.
-            let turn_id_owned = match terminal {
-                "runtime_error" => "t".repeat(513),
-                _ => format!("turn_g09_owned_voice_{terminal}_{action}"),
-            };
-            let turn_id = turn_id_owned.as_str();
-            let thread = start_thread_for_artifact_test(
-                &processor,
-                connection_id,
-                &mut rx,
-                &workspace_id,
-                thread_id,
-            )
-            .await;
-            let start_id = generate_test_request_id("voice", "start");
-            let finalize_id = generate_test_request_id("voice", "finalize");
-            let repeat_id = generate_test_request_id("voice", "repeat");
-            let foreign_request_id = generate_test_request_id("voice", "foreign");
-            let cancel_id = generate_test_request_id("voice", "cancel");
-            let late_cancel_id = generate_test_request_id("voice", "latecancel");
-            // Exercise business ingress with protocol-valid IDs; malformed IDs
-            // are rejected before the owned worker or session handler can run.
-            for id in [
-                &start_id,
-                &finalize_id,
-                &repeat_id,
-                &foreign_request_id,
-                &cancel_id,
-                &late_cancel_id,
-            ] {
-                pioneer_protocol::RequestId::new(id.as_str()).expect("valid voice RPC fixture ID");
-            }
-            let session = start_test_voice_session(
-                &processor,
-                connection_id,
-                &mut rx,
-                &workspace_id,
-                &thread.thread.id,
-                turn_id,
-                start_id.as_str(),
-            )
-            .await;
-            processor
-                .process_binary_frame_for_connection(
-                    connection_id,
-                    voice_test_frame(&session.session_id, 0, 960, 12000).as_slice(),
-                )
-                .await
-                .unwrap();
-            let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
-            let before = crud
-                .get_thread_history(thread_id, Some(64))
-                .await
-                .unwrap()
-                .expect("voice target history must exist");
-            let before_events = serde_json::to_value(&before.events).unwrap();
-            let finalize = json!({"jsonrpc":"2.0","id":finalize_id,"method":"voice/session/finalize","params":{
-                "session_id":session.session_id,"context":{"workspace_id":workspace_id,"thread_id":thread_id,"turn_id":turn_id}
-            }});
-            let expected_startup_key = if terminal == "runtime_error" {
-                None
-            } else {
-                Some(turn_id.to_owned())
-            };
-            let request = &finalize;
-            assert_eq!(
-                pioneer_observability::turn_startup::request_key(&request["params"]),
-                expected_startup_key
+macro_rules! owned_voice_ingress_test {
+    ($name:ident, $terminal:literal, $action:literal) => {
+        #[test]
+        fn $name() {
+            // Use the production runtime and a separately spawned fixture task.
+            // A block_on fixture otherwise adds its large poll frame to CRUD
+            // and connection-cleanup frames on the libtest thread.
+            run_standard_stack_message_test(
+                stringify!($name),
+                owned_voice_ingress_case($terminal, $action),
             );
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                // An unrelated caller key must not override request-derived
-                // context or leak into the absent-context case.
-                pioneer_observability::turn_startup::scope(
-                    Some("unrelated-ingress-context".to_owned()),
-                    processor
-                        .clone()
-                        .process_owned_request(context.clone(), finalize.to_string()),
-                ),
-            )
-            .await
-            .expect("reader must return at ACK while transcriber remains pending");
-            let ack = recv_response_by_id(&mut rx, finalize_id.as_str()).await;
-            assert_eq!(ack.result["status"], json!("transcribing"));
-            let worker_startup_key = tokio::time::timeout(Duration::from_secs(5), entered_rx)
-                .await
+        }
+    };
+}
+
+owned_voice_ingress_test!(
+    owned_voice_ingress_transcript_cancel,
+    "transcript",
+    "cancel"
+);
+owned_voice_ingress_test!(
+    owned_voice_ingress_transcript_disconnect,
+    "transcript",
+    "disconnect"
+);
+owned_voice_ingress_test!(
+    owned_voice_ingress_transcript_winner,
+    "transcript",
+    "winner"
+);
+owned_voice_ingress_test!(owned_voice_ingress_no_speech_cancel, "no_speech", "cancel");
+owned_voice_ingress_test!(
+    owned_voice_ingress_no_speech_disconnect,
+    "no_speech",
+    "disconnect"
+);
+owned_voice_ingress_test!(owned_voice_ingress_no_speech_winner, "no_speech", "winner");
+owned_voice_ingress_test!(
+    owned_voice_ingress_runtime_error_cancel,
+    "runtime_error",
+    "cancel"
+);
+owned_voice_ingress_test!(
+    owned_voice_ingress_runtime_error_disconnect,
+    "runtime_error",
+    "disconnect"
+);
+owned_voice_ingress_test!(
+    owned_voice_ingress_runtime_error_winner,
+    "runtime_error",
+    "winner"
+);
+
+// Erase the case future before the runtime/test wrapper polls it. Keep the
+// nine combinations independent so CI identifies a failing terminal boundary.
+fn owned_voice_ingress_case(
+    terminal: &'static str,
+    action: &'static str,
+) -> MessageFuture<'static, ()> {
+    message_future(async move {
+        use crate::voice::transcription::{VoiceTranscriptionErrorKind, transcription_error};
+        let (tx, mut rx) = mpsc::channel(128);
+        let sessions = Arc::new(SessionManager::new());
+        let connection_id = register_authenticated_test_connection(&sessions, tx).await;
+        let context = sessions.connection_context(connection_id).await.unwrap();
+        let (foreign_tx, mut foreign_rx) = mpsc::channel(16);
+        let foreign_id = register_authenticated_test_connection(&sessions, foreign_tx).await;
+        let foreign_context = sessions.connection_context(foreign_id).await.unwrap();
+        let (workspace_manager, crud, workspace_id) = setup_workspace_manager().await;
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release = PendingVoiceRelease(gate.clone());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let mut processor = MessageProcessor::new(
+            Arc::new(ThreadManager::new("test-model", "openai")),
+            test_provider(),
+            sessions,
+            workspace_manager,
+            crud.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        )
+        .with_voice_input_supervisor(ready_gateway_voice_supervisor("unused native stub"));
+        processor.voice_test_transcriber = Some(Arc::new(move |_buffer| {
+            // Observe the production blocking scope before installing anything
+            // in the fake. This must come from the actual request dispatcher.
+            entered_tx
+                .lock()
                 .unwrap()
+                .take()
+                .unwrap()
+                .send(pioneer_observability::turn_startup::current_key())
                 .unwrap();
-            assert_eq!(worker_startup_key, expected_startup_key);
-            // Same owner repeated finalize is bounded/rejected; another connection
-            // cannot claim the authenticated owner's session (connection_id retained).
-            let mut repeated_finalize = finalize.clone();
-            repeated_finalize["id"] = json!(repeat_id);
-            processor
-                .clone()
-                .process_owned_request(context.clone(), repeated_finalize.to_string())
-                .await;
-            let _ = recv_error_by_id(&mut rx, repeat_id.as_str()).await;
-            let mut cancel = json!({"jsonrpc":"2.0","id":foreign_request_id,"method":"voice/session/cancel","params":{"session_id":session.session_id}});
-            processor
-                .clone()
-                .process_owned_request(foreign_context, cancel.to_string())
-                .await;
-            let _ = recv_error_by_id(&mut foreign_rx, foreign_request_id.as_str()).await;
-            assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
-            if action == "cancel" {
-                cancel["id"] = json!(cancel_id);
-                tokio::time::timeout(
-                    Duration::from_secs(5),
-                    processor
-                        .clone()
-                        .process_owned_request(context.clone(), cancel.to_string()),
-                )
-                .await
-                .expect("same-connection cancel must complete BEFORE fake release");
-                let response = recv_response_by_id(&mut rx, cancel_id.as_str()).await;
-                assert_eq!(response.result["cancelled"], json!(true));
-                let event =
-                    recv_notification_by_method(&mut rx, events::VOICE_SESSION_RESULT).await;
-                let result: VoiceSessionResultNotification =
-                    serde_json::from_value(event.params.unwrap()).unwrap();
-                assert_eq!(result.outcome, VoiceSessionOutcome::Cancelled);
-            } else if action == "disconnect" {
-                processor.connection_closed(connection_id).await;
-                assert!(!processor.voice_sessions.has_active_sessions().unwrap());
-                assert!(
-                    processor
-                        .voice_session_buffers
-                        .take_session_audio(&session.session_id)
-                        .is_err()
-                );
+            let (released, condition) = &*gate;
+            let mut flag = released.lock().unwrap();
+            while !*flag {
+                flag = condition.wait(flag).unwrap();
             }
-            release.release();
-            // Closing the tracker enables waiting for completion; it does
-            // not cancel the pipeline or forbid spawning by itself. Await exact worker completion, no sleeps.
-            processor.voice_finalizations.tasks.close();
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                processor.voice_finalizations.tasks.wait(),
+            match terminal {
+                "runtime_error" => Err(transcription_error(
+                    VoiceTranscriptionErrorKind::RuntimeFailure,
+                    "controlled fake failure",
+                )),
+                "no_speech" => Ok("  ".to_owned()),
+                _ => Ok("controlled transcript".to_owned()),
+            }
+        }));
+        let processor = Arc::new(processor);
+        let thread_id = "thr_g09_owned_voice";
+        // Two distinct request contexts and a valid business ID outside the
+        // telemetry key length bound. The latter must preserve None rather
+        // than synthesizing a context from the session's turn ID.
+        let turn_id_owned = match terminal {
+            "runtime_error" => "t".repeat(513),
+            _ => format!("turn_g09_owned_voice_{terminal}_{action}"),
+        };
+        let turn_id = turn_id_owned.as_str();
+        let thread = start_thread_for_artifact_test(
+            &processor,
+            connection_id,
+            &mut rx,
+            &workspace_id,
+            thread_id,
+        )
+        .await;
+        let start_id = generate_test_request_id("voice", "start");
+        let finalize_id = generate_test_request_id("voice", "finalize");
+        let repeat_id = generate_test_request_id("voice", "repeat");
+        let foreign_request_id = generate_test_request_id("voice", "foreign");
+        let cancel_id = generate_test_request_id("voice", "cancel");
+        let late_cancel_id = generate_test_request_id("voice", "latecancel");
+        // Exercise business ingress with protocol-valid IDs; malformed IDs
+        // are rejected before the owned worker or session handler can run.
+        for id in [
+            &start_id,
+            &finalize_id,
+            &repeat_id,
+            &foreign_request_id,
+            &cancel_id,
+            &late_cancel_id,
+        ] {
+            pioneer_protocol::RequestId::new(id.as_str()).expect("valid voice RPC fixture ID");
+        }
+        let session = start_test_voice_session(
+            &processor,
+            connection_id,
+            &mut rx,
+            &workspace_id,
+            &thread.thread.id,
+            turn_id,
+            start_id.as_str(),
+        )
+        .await;
+        processor
+            .process_binary_frame_for_connection(
+                connection_id,
+                voice_test_frame(&session.session_id, 0, 960, 12000).as_slice(),
             )
             .await
             .unwrap();
-            if action == "winner" {
-                let event =
-                    recv_notification_by_method(&mut rx, events::VOICE_SESSION_RESULT).await;
-                let result: VoiceSessionResultNotification =
-                    serde_json::from_value(event.params.unwrap()).unwrap();
-                let expected = match terminal {
-                    "transcript" => VoiceSessionOutcome::TurnStarted,
-                    "no_speech" => VoiceSessionOutcome::NoSpeech,
-                    _ => VoiceSessionOutcome::Failed,
-                };
-                assert_eq!(result.outcome, expected);
-                assert_eq!(
-                    crud.get_turn(thread_id, turn_id).await.unwrap().is_some(),
-                    terminal == "transcript"
-                );
-                cancel["id"] = json!(late_cancel_id);
+        let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
+        let before = crud
+            .get_thread_history(thread_id, Some(64))
+            .await
+            .unwrap()
+            .expect("voice target history must exist");
+        let before_events = serde_json::to_value(&before.events).unwrap();
+        let finalize = json!({"jsonrpc":"2.0","id":finalize_id,"method":"voice/session/finalize","params":{
+            "session_id":session.session_id,"context":{"workspace_id":workspace_id,"thread_id":thread_id,"turn_id":turn_id}
+        }});
+        let expected_startup_key = if terminal == "runtime_error" {
+            None
+        } else {
+            Some(turn_id.to_owned())
+        };
+        let request = &finalize;
+        assert_eq!(
+            pioneer_observability::turn_startup::request_key(&request["params"]),
+            expected_startup_key
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            // An unrelated caller key must not override request-derived
+            // context or leak into the absent-context case.
+            pioneer_observability::turn_startup::scope(
+                Some("unrelated-ingress-context".to_owned()),
                 processor
                     .clone()
-                    .process_owned_request(context, cancel.to_string())
-                    .await;
-                let _ = recv_error_by_id(&mut rx, late_cancel_id.as_str()).await;
-            } else {
-                assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
-                let after = crud
-                    .get_thread_history(thread_id, Some(64))
-                    .await
-                    .unwrap()
-                    .expect("cancel/disconnect must preserve voice target history");
-                assert_eq!(after.workspace_id, before.workspace_id);
-                assert_eq!(serde_json::to_value(&after.events).unwrap(), before_events);
-            }
-            while let Ok(message) = rx.try_recv() {
-                if let Message::Text(text) = message {
-                    let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
-                    assert_ne!(
-                        value.get("method").and_then(JsonValue::as_str),
-                        Some(events::VOICE_SESSION_RESULT),
-                        "no second/late terminal notification"
-                    );
-                }
+                    .process_owned_request(context.clone(), finalize.to_string()),
+            ),
+        )
+        .await
+        .expect("reader must return at ACK while transcriber remains pending");
+        let ack = recv_response_by_id(&mut rx, finalize_id.as_str()).await;
+        assert_eq!(ack.result["status"], json!("transcribing"));
+        let worker_startup_key = tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(worker_startup_key, expected_startup_key);
+        // Same owner repeated finalize is bounded/rejected; another connection
+        // cannot claim the authenticated owner's session (connection_id retained).
+        let mut repeated_finalize = finalize.clone();
+        repeated_finalize["id"] = json!(repeat_id);
+        processor
+            .clone()
+            .process_owned_request(context.clone(), repeated_finalize.to_string())
+            .await;
+        let _ = recv_error_by_id(&mut rx, repeat_id.as_str()).await;
+        let mut cancel = json!({"jsonrpc":"2.0","id":foreign_request_id,"method":"voice/session/cancel","params":{"session_id":session.session_id}});
+        processor
+            .clone()
+            .process_owned_request(foreign_context, cancel.to_string())
+            .await;
+        let _ = recv_error_by_id(&mut foreign_rx, foreign_request_id.as_str()).await;
+        assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
+        if action == "cancel" {
+            cancel["id"] = json!(cancel_id);
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                processor
+                    .clone()
+                    .process_owned_request(context.clone(), cancel.to_string()),
+            )
+            .await
+            .expect("same-connection cancel must complete BEFORE fake release");
+            let response = recv_response_by_id(&mut rx, cancel_id.as_str()).await;
+            assert_eq!(response.result["cancelled"], json!(true));
+            let event = recv_notification_by_method(&mut rx, events::VOICE_SESSION_RESULT).await;
+            let result: VoiceSessionResultNotification =
+                serde_json::from_value(event.params.unwrap()).unwrap();
+            assert_eq!(result.outcome, VoiceSessionOutcome::Cancelled);
+        } else if action == "disconnect" {
+            processor.connection_closed(connection_id).await;
+            assert!(!processor.voice_sessions.has_active_sessions().unwrap());
+            assert!(
+                processor
+                    .voice_session_buffers
+                    .take_session_audio(&session.session_id)
+                    .is_err()
+            );
+        }
+        release.release();
+        // Closing the tracker enables waiting for completion; it does
+        // not cancel the pipeline or forbid spawning by itself. Await exact worker completion, no sleeps.
+        processor.voice_finalizations.tasks.close();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            processor.voice_finalizations.tasks.wait(),
+        )
+        .await
+        .unwrap();
+        if action == "winner" {
+            let event = recv_notification_by_method(&mut rx, events::VOICE_SESSION_RESULT).await;
+            let result: VoiceSessionResultNotification =
+                serde_json::from_value(event.params.unwrap()).unwrap();
+            let expected = match terminal {
+                "transcript" => VoiceSessionOutcome::TurnStarted,
+                "no_speech" => VoiceSessionOutcome::NoSpeech,
+                _ => VoiceSessionOutcome::Failed,
+            };
+            assert_eq!(result.outcome, expected);
+            assert_eq!(
+                crud.get_turn(thread_id, turn_id).await.unwrap().is_some(),
+                terminal == "transcript"
+            );
+            cancel["id"] = json!(late_cancel_id);
+            processor
+                .clone()
+                .process_owned_request(context, cancel.to_string())
+                .await;
+            let _ = recv_error_by_id(&mut rx, late_cancel_id.as_str()).await;
+        } else {
+            assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
+            let after = crud
+                .get_thread_history(thread_id, Some(64))
+                .await
+                .unwrap()
+                .expect("cancel/disconnect must preserve voice target history");
+            assert_eq!(after.workspace_id, before.workspace_id);
+            assert_eq!(serde_json::to_value(&after.events).unwrap(), before_events);
+        }
+        while let Ok(message) = rx.try_recv() {
+            if let Message::Text(text) = message {
+                let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
+                assert_ne!(
+                    value.get("method").and_then(JsonValue::as_str),
+                    Some(events::VOICE_SESSION_RESULT),
+                    "no second/late terminal notification"
+                );
             }
         }
-    }
+    })
 }
 
 fn ready_gateway_voice_supervisor(
