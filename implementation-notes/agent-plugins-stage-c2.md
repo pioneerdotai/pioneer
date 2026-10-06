@@ -1,173 +1,168 @@
-# C2 provider inventory and native transport prerequisite
+# C2 — trusted plugin selection across existing providers
 
-Status: **READY_FOR_STAGE_C2_REVIEW — BLOCKER; C2 NOT_COMPLETE**.
-This delivery invokes the explicit missing reliable close/ACK exception in
-`stage-c2-implementation-prompt.md` §4. It does not claim working CLI plugin
-selection, coordinator acceptance, behavioral validation or permission for D/E.
-Dependent plugin CLI preparation/admission/continuations remain closed until the
-native ownership/stop contract below can be reviewed and completed.
+Status: **READY_FOR_STAGE_C2_REVIEW**. Implementation is submitted for source
+review; this is not coordinator acceptance, a behavioral pass, or permission for
+mobile/D or testing/E. The earlier transport-only/blocker delivery is superseded
+by this handoff; accepted stop prerequisite remains unchanged except the concrete
+Turn-to-instance integration described below.
 
 ## Snapshot
 
 - Branch: `feature/agent-plugins-simple`.
-- Worktree and cwd for commands below:
+- Worktree / command cwd:
   `/Users/alexander/Code/pioneer/pioneer/.worktrees/agent-plugins-simple`.
-- Baseline: `80af78634261ccc48d0cd75b3261bb6359f0a905`, initially clean.
-- Code HEAD: `f435854b9db4f026d637558b42b95238c7b1b157`. Delivery adds only this handoff; final HEAD is
+- Baseline: `707c3d5f7ed5228a7370ccc0a7b5e7f76b35d528`, initially clean.
+- Projection/startup commit: `a3cd4f246e5e23c4d1cd1ee25f7773d92ff0cf21`.
+- Final code HEAD: `9bc094a13edbaa5cce4ef4c16f000b6097b8e08f`.
+- Delivery HEAD is the documentation commit containing this handoff:
   `git log -1 --format=%H -- implementation-notes/agent-plugins-stage-c2.md`.
-- Main, archive branches/worktrees and mobile were not modified; no merge,
-  reset/clean, push, deployment, app/provider/fixture/migration execution.
+  Its exact hash is also returned in the delivery response. Code working tree was
+  clean before this documentation edit; final status is checked after commit.
 
-Read applicable repository AGENTS, current proposal v2, B rereview, native stop
-final review, full C1 review plus accepted C1 rereview, and A/B/C1/C1-stop handoffs.
-No desktop UI changed; no new tables, installers, OAuth, native client/FFI
-dependencies, plugin coordinator, jobs/leases or generation management added.
+Read repository AGENTS, proposal v2, complete C2 prompt/resume, partial review,
+stop review/rereview and accepted B/C1 material. No UI/mobile, new table, installer,
+OAuth engine, native client dependency or operation framework. Main, stopped
+implementation branches and archive untouched; no reset/clean/merge/rebase/push,
+deployment or app/provider/fixture/migration execution. Hooks disabled for commits.
 
-## Delivered native helper
+## Entrypoint → remaining baseline gap → local adaptation → regression source
 
-`cli-agent-runtime/src/codex.rs` extends the **existing** `CodexJsonlRpcOwner`:
-`abort_and_join_result(&mut self)` joins its actual reader, RPC dispatcher and
-ordered-ingress workers. Handles are awaited by reference and removed only after
-join; cancellation retains the unfinished handle. A consumed panic is sticky,
-other workers still drain, and a retry cannot turn an empty vector into success
-after a failed join. Expected abort cancellation is accepted only after actual
-join. Existing best-effort `shutdown`/`abort_and_join` and detached constructors
-retain their APIs. New owned capacity/budget constructor calls the same existing
-worker factory and passes the same configured limits and native event budget.
+Paths are under `crates/gateway/src`; source coverage is **NOT_RUN / NOT_COMPILED**.
 
-`gateway/src/cli_runtime/codex_session.rs` uses that owned constructor in the real
-persistent factory. Explicit initialize failure joins the transport after the
-existing best-effort process cleanup (not a new startup stop proof). A published
-session retains the owner behind its native mutex;
-normal close waits for process termination/stderr, then joins the transport,
-then removes the overlay. Transport failure prevents overlay cleanup. Isolation,
-attestation, launch spec, MCP config/projection, permissions and OAuth unchanged.
-This is **transport** completion, not complete provider/tools/MCP stop proof.
-There is no DB capacity or registry lock held across the new joins.
-
-## Concrete blocker and smallest remaining native contracts
-
-1. `cli_runtime/manager.rs::{start_and_publish_locked,close_session,
-   close_session_instance,close_all}`: factory spawn/handshake precedes publication;
-   cancellation during factory startup drops local process/tasks without retained
-   wait evidence. Close removes the cached owner **before** the native await and
-   calls `after_session_close` even on error. Timeout/cancellation loses inventory;
-   a subsequent `false` close is only absence. `remove_if_generation` releases on
-   event EOF without process/tool join. Existing exact `CliSessionInstanceId` and
-   per-key start lock already exist: extend these seams to publish native cleanup
-   ownership at spawn before handshake awaits; retain a closing owner in the same
-   manager until result-returning drain completes, with failed/cancelled close
-   blocking reuse/replacement. Do not derive proof from EOF/terminal DB status.
-2. `claude_session.rs::ClaudeStreamClient::{spawn_reader,new}` detaches the reader
-   and OrderedEventIngress worker; `ClaudeCLIAgentRuntimeSession::close` waits only
-   for process/stderr before deleting its managed root. Retain these exact workers
-   and join through the existing session close, using `spawn_owned` already offered
-   by runtime-events. Pending request senders and ingress publication must finish
-   or fail, with cancellation retaining handles, before deleting projections.
-3. Both `*RequiredMcpBridge::fail_closed` replace their state with Failed, abort and
-   **drop** the server JoinHandle. Supervisor revoke returns a bool and suppresses
-   cleanup errors. `mcp/server.rs::run` already drains facade/call JoinSet on normal
-   termination; aborting it skips that awaited path. Extend its existing handle to
-   request normal shutdown, retain and join that actual server, propagate drain
-   errors, then revoke. Native installation stop alone does not join the facade's
-   nested Gateway calls. Reuse those existing handles, not a second executor.
-4. `cli_runtime/handlers.rs::interrupt_and_close_cli_runtime_binding` returns `()`
-   and logs interrupt/close errors; it captures a handle but finally closes by
-   logical key, so a replacement can be targeted. Use the captured instance for
-   the result-returning stop seam. Detached event/request pumps also need their
-   existing instance's publication/request completion evidence. Accepted startup,
-   recovery and closing instances must all be in lifecycle inventory before a
-   plugin mutation can report stop success.
-
-These are observed source contracts, not hypothetical platform limitations.
-The helper above repairs the Codex transport portion only. Enabling plugin CLI
-selection now would permit file swap after lost startup/close ownership. The
-existing rejection and graph CLI-binding failure are deliberately retained under
-the task's §4 exception; they are **unresolved C2 work**, not supported behavior.
-
-## Existing entrypoints → gap → next minimal change → source coverage
-
-Paths below are relative to `crates/gateway/src` unless a crate is named.
-“Pending” means NOT_IMPLEMENTED / regression NOT_WRITTEN in this delivery.
-
-| Existing entrypoint | Current behavior/gap and next change | Source regression |
+| Entrypoint | Gap closed / existing operation reused | Source coverage |
 | --- | --- | --- |
-| `message/turn_handlers.rs::normalize_turn_skill_capabilities`, native prepare/start | API trusted parent expansion, prepared snapshot, presentation parent, tool-capable provider check and final parent admission exist. Reuse them; do not trust public child IDs/labels. | Existing B/C1 sources NOT_RUN; unchanged |
-| `message/agent_runtime.rs` durable TurnSkillsResolved; `crud/src/plugins.rs::ready_plugin_selection` | API ready uses committed native bindings and resolver IDs; parent/ownership revalidated in writer, empty allowed. CLI needs this same transition after its actual native binding writes. | Existing B missing binding/exclusion sources NOT_RUN; CLI pending |
-| `message/artifact_tools.rs`, `mcp_service.rs` late dispatch | Existing `plugin_turn_child_available` gates API read_skill/MCP on ready snapshot and current parent. Preserve compact catalog/full text read_skill. | Existing B/C1 NOT_RUN; unchanged |
-| `message/turn_handlers.rs::turn_start_cli_runtime` | Explicit parent rejection before normalization. After stop prerequisites, expand server-side, retain parent presentation, prepare snapshot and ready actual bindings, hold parent admission through native publication. | Pending |
-| `turn_handlers.rs::prepare_cli_runtime_combined_preflight`; `cli_runtime/skills.rs` | Native resolver/dependencies/trust and real materializer/receipts exist. Authored-name destination collides; only member folder copied. Extend that builder/copier for opaque owned aliases/full contained context. | Existing standalone NOT_RUN; plugin aliases/assets pending |
-| `cli_runtime/{continuation,manager}.rs` | Typed launch/reuse identity, existing exact instance and start locks exist. No retained startup/close proof. Extend those native contracts and share accepted parent admission. | New transport sources NOT_RUN; manager pending |
-| `cli_runtime/{claude_session,codex_session}.rs` | Controlled launch/attestation exist; Claude workers and both nested bridges lack awaited completion. Codex transport now owned/joined; other stop seams above pending. | Three new native unit sources NOT_RUN; full close pending |
-| `cli_runtime/mcp/{server,supervisor,coordinator,recovery}.rs`; `claude_mcp.rs`, `codex_mcp.rs` | Existing frozen MCP projections, activation/generation checks, invoker and facade. Reuse actual native bindings; no unmanaged package/OAuth. Normal server drain exists but fail_closed discards its handle. | Existing facade sources NOT_RUN; strict lifecycle drain pending |
-| `turn_handlers.rs::{restore_cli_runtime_launch_spec,start_cli_runtime_recovery_attempt}`; `resilience/recovery.rs` CLI branch | Restores durable authority/cwd/projection and provider binding. API recovery takes parent guard; CLI routing precedes that API guard. Add exact parent/revision gate and native inventory before CLI acquire/resume/publication. | Pending |
-| `cli_runtime/{turn_binding,turn_recovery}.rs` | Pre/post-start attempt bindings and bounded readiness recovery scanner exist; they are not process ACKs. Keep persistence, add snapshot/admission at actual provider boundary. | Existing binding/recovery NOT_RUN; plugin pending |
-| `cli_runtime/thread_binding.rs`; `turn_handlers.rs` resume/retry/fork/history bridges | Exact provider-session/fork/context receipts exist; skill restore checks native receipt/hash. Fresh parent gates/revision must precede continuation; old pending native requests cannot grant new revision. | Pending |
-| `cli_runtime/handlers.rs` steer/fork/request respond | Real steer/fork reuse existing sessions and authority. Add same parent guard/current snapshot and captured-instance stop; management-only native sessions stay isolated. | Pending |
-| `cli_runtime/handlers.rs::cli_runtime_review_start` | Already rejects managed runtime review; existing concrete endpoint limitation, preserve error. | Existing behavior unchanged |
-| `message/task_handlers.rs`; `turn_handlers.rs::prepare_task_cli_runtime_turn` and detached task branch | Task admission normalizes capabilities; prepared CLI task delegates to the same CLI start. Detached parent plugins are explicitly rejected. Preserve parent in persisted launch/presentation and normalize again at each actual start, after stop prerequisites. | Pending |
-| `message/agent_runtime.rs::select_native_graph_owners`; `message/plugins.rs::stop_plugin_execution` | Actual native API drain/MCP stop precede mutation, CLI binding explicitly fails. Extend existing inventory/drain to captured CLI instances; no bool/DB terminal status as stop proof. | Existing API stop NOT_RUN; CLI pending |
-| `cli_runtime/{instruction_projection,input_mapping}.rs` | Frozen elevated instructions and text/file mapping exist. Keep native instructions; owned Skills use genuine native invocation items, not text-tool emulation or selectable child chips. | Unchanged; plugin continuation pending |
+| `message/turn_handlers.rs`, API start | Kept one Gateway normalizer, native admission/resolver/catalog/read_skill. Moved prepared snapshot after durable Turn creation: its repository requires that row. Failure blocks the admitted Turn. | Existing B/C1; new ready/binding regression |
+| Same file, ordinary Claude/Codex start | Removed blanket plugin rejection; parent envelope goes through internal ThreadManager expansion, native preflight, real copier/receipts, native bindings and ready transition. Root Agent launch expands before native-grant validation; public child grants remain rejected. | `ordinary_owned_cli_start_uses_native_skill_and_ready_parent_for_both_providers`, both plain and exact Agent launches |
+| `cli_runtime/skills.rs`; `claude_session.rs` | Authored-name/member-only copy replaced only for owned components by stable aliases and full contained context. Same native installer/copier, receipt locks, hashes/modes and attestation. | Alias, full context/assets/override/receipt and Claude manifest sources below |
+| `cli_runtime/manager.rs`, startup/reuse | Ready selection and context hashes participate in existing launch-spec equality. Selection is in existing Starting entry before factory await. Changed revision/context uses existing close/restart. | Startup/revision/replacement source below |
+| `turn_handlers.rs` shared prepare/restore; native thread binding/history bridges | Retry/edit/history/resume use canonical parent presentation and pinned revision. Restored frozen bindings must be ready/current, receipts must match exact parent/alias/hash. | Ready/binding regression; owned receipt restore cases; existing history/standalone sources |
+| `cli_runtime/handlers.rs`, steer/fork | Parent guard and exact current instance checked before supported native calls. Management-only session remains isolated. Existing provider restrictions retained. | Shared guard/manager sources; existing continuation sources |
+| Same file, pending request response | Before durable acceptance/native response, require current ready Turn selection and hold parent guard. Old pending tools cannot authorize a changed revision. | Ready/disable source; existing pending-response sources |
+| `turn_handlers.rs::start_cli_runtime_recovery_attempt`; observation-gap reconciliation | Guard before restore/factory/native work; restore existing MCP facade/projection and verified skill receipts; register actual Turn owner before provider work. | Ready/current-authority and manager startup sources; existing recovery sources |
+| Detached Composer Tasks and `message/task_handlers.rs::task_create` | Preserve parent in actor contract/presentation; freeze native grants through Gateway expansion before ordinary admission. Client-owned grants cannot be adopted as expansion. | Task pinning/forgery/ceiling source |
+| `task_agent_executor.rs`, initial/revision/reviewer/restore | Re-normalize pinned parents against durable native ceiling. API starts take existing parent guard; CLI starts delegate to shared preparation. Internal admission retains parent envelope, executes native leaves. Standalone SkillPack uses original native admission branch. | Task ceiling/ready source; existing Composer SkillPack/native Task sources |
+| `agent_action_tools.rs` StartAgent/outbox; `task_tools/mod.rs` immediate inheritance | Inherit trusted source-Turn parent selection, cap leaves to requested/frozen grants, never implicitly widen access. Existing atomic graph/action outbox JSON carries server snapshot for crash repair; no second store/dispatcher. | Task ceiling/current-authority source; existing action/outbox sources |
+| `message/plugins.rs::stop_plugin_execution`; `agent_runtime.rs` graph/fallback stop | Capture exact existing CLI owners, await accepted stop helper with common deadline, require inventory empty before existing native MCP shutdown/file mutation. Graph uses actual Turn ownership rather than cancelling replacement by logical key. | New owner/replacement source plus accepted strict stop/cancel/failure sources |
 
-## Asset/alias and mixed-package source trace (not a runtime result)
+No client-generated expansion is trusted. Bundled children stay existing native
+records; public parent presentation/chip, standalone lists and API compact skill
+contract remain as accepted in B/C1. Unselected plugin implicit filtering, native
+policy/trust/dependencies, approved tools/commands, nono and isolation are reused.
 
-API baseline: one parent → authoritative eligible native IDs → native bindings /
-ready → compact catalog + read_skill and existing MCP invoker. Ordinary bundled
-skill context is `parent/package/skills/<member>` with siblings available in that
-package; `skill_source` uses the entire actual native uploaded installation without
-fallback. Standalone keeps native definition/folder. All use native policy/trust.
-Parent gate/revision, graph drain and actual MCP stop precede update/disable/remove;
-stale continuation requires reselection. These accepted source paths were not run.
+## Exact source → projection → native invocation
 
-Actual **standalone** Codex path: `build_cli_runtime_skill_install_plans` currently
-builds `sanitize_name(authored_name)` → configured native home `skills/<name>` →
-real `replace_external_runtime_skill` + receipt/folder hash →
-`prepend_codex_installed_skill_items` sends native `Skill {name,path: .../SKILL.md}`.
-Actual **standalone** Claude path: same native materialization →
-`options.selected_skills` → `materialize_claude_selected_skill_plugins` creates
-`selected-skill-plugins/pioneer-selected-skill-<index>/skills/<name>` and exact
-generated manifest → strict `--plugin-dir` on that managed projection only.
+For each eligible owned Skill, stable alias is
+`pioneer-plugin-<hex(SHA256(parent length + parent ID + native SkillId))[0..48]>`.
+Authored names and installed SKILL bytes are unchanged; same authored names in
+several parents/standalone do not share aliases. A standalone deliberately using
+the opaque alias alongside that owned skill fails collision rather than overwrite.
 
-The current alias builders are `build_cli_runtime_skill_install_plans` and the
-Claude managed plugin-name loop above; neither yet derives parent/SkillId aliases.
-No opaque alias is claimed delivered. For both CLIs, ordinary mixed-plugin paths
-stop at the explicit parent rejection; stdio/OAuth HTTP therefore do not get a CLI
-plugin snapshot/facade. A native override would copy its whole native tree under
-the existing copier, while ordinary bundled folder-only copy loses sibling paths.
-The next materializer change must export verified **full package** context under
-the controlled destination and separately register only selected members, with
-stable parent/SkillId aliases in generated projections only. Retain containment,
-denied diagnostics, modes/hash, exact receipts and existing native invocations;
-never rewrite installed SKILL or export unselected plugins as implicit capabilities.
-Mixed/override/standalone CLI lifecycle source trace remains incomplete until stop,
-alias/context, ready and continuation gates are connected. No runtime claims.
+Ordinary bundled source is the **whole** `parent.package_path`; ownership member
+path must equal `skills/<key>` and native definition path must resolve to that
+contained member. `skill_source` override selects **whole native installation
+context**, without package fallback. Both use the existing native copier and full
+folder receipt/hash/modes. Optional receipt fields identify parent and selected
+relative member; standalone legacy v1 conversion/v2 semantics remain supported.
 
-## Actual checks and regression status
+- Codex: context copied under configured native home
+  `.pioneer-selected-contexts/<alias>`, outside auto-discovered `skills/`.
+  Existing `prepend_codex_installed_skill_items` sends genuine native
+  `Skill { name: alias, path: context/skills/<key>/SKILL.md }`; native override sends
+  `context/SKILL.md`. Existing controlled overlay/attestation keeps plugin/app
+  features disabled; no unmanaged native plugin is registered.
+- Claude: same materialization becomes `options.selected_skills`; existing
+  controlled managed plugin wrapper copies the full verified tree below
+  `<managed selected plugin>/context`. Generated manifest selects exactly
+  `./context/skills/<key>` (override `./context`). Only that wrapper is passed to
+  existing strict `--plugin-dir`; sibling hooks/commands/skills and original
+  package manifest remain nested context, not auto-registered root components.
+  Standalone retains its old selected-skill wrapper/layout.
+- Mixed MCP: Gateway expansion supplies existing native server IDs to the same
+  combined preflight, `ResolvedMcpTurnProjection`, committed MCP bindings,
+  CLIAgentRuntime MCP launch projection/activation and existing facade/invoker.
+  Stdio/HTTP configuration and OAuth remain native operations accepted in A/C1.
+  Facade availability, permission decisions and restored frozen projection stay
+  authoritative; no tools are emulated from Skill text.
 
-| Command (cwd above) | Actual exit / evidence |
+These are source traces, not native-provider runtime evidence.
+
+## Ready, admission, lifecycle and recovery
+
+Prepared metadata is written only after durable Turn creation. CLI materializes
+all required files before the existing TurnSkillsResolved handler commits native
+skill bindings and authorization, then calls existing `ready_plugin_selection`.
+That short writer transition rechecks candidate ownership, parent revision/state
+and committed native bindings; projection/ready failure prevents provider start.
+No filesystem/hash/process/network/join/notification occurs under DB capacity.
+Request/background scoped stores and existing repository transactions are reused.
+
+Sorted existing parent guards cover CLI preparation through factory/native-start
+ACK and provider/recovery/continuation enqueue. Snapshot current workspace,
+revision, enabled, installed and no-pending state is checked; frozen owned native
+bindings absent from ready selection and mismatched receipt ownership fail closed.
+Historical chip or receipt alone is not authorization. Stale revision is not
+silently refreshed. Tasks retain native grant ceiling even when parent expands
+more broadly; an empty allowed expansion still presents one parent.
+
+Concrete integration gap: a Skills-only durable CLI binding has logical session
+key, not process identity. Existing actual session owner now retains a bounded
+set of admitted Turn IDs (65,536, overload requires close/retry). Graph stop
+matches key **and** that set, capturing exact instance, not a replacement.
+Terminal DB rows do not release old callbacks' ownership. Registration happens
+before provider Turn/thread work; unresolved pending ownership fails closed.
+This is metadata in the existing owner, not another registry or durable machinery.
+
+Disable/native edit/update/remove first close parent gate using existing C1
+mutation path, drain graph/exact CLI owners (including Starting/Closing inventory)
+and native MCP facade/session work, then mutate package/projection. Assets-only
+refresh also stops existing parent CLI owners before overwriting shared projection.
+Unknown/publication race/timeout/cancel/drain error leaves repairable gate closed;
+accepted retained-owner strict stop implementation supplies retry/join evidence.
+Old captured owner cannot cancel replacement. Queued Tasks/outbox/recovery recheck
+old selection before launch and cannot reopen a changed gate.
+
+Existing managed review/compaction restrictions and provider-specific unsupported
+fork/steer remain. Codex controlled overlay and Claude sandbox/permission modes
+are unchanged. Pure bounded spool decoding limitation documented by accepted
+stop reviews remains; no claim of arbitrary descendant-process completion.
+No unresolved C2 implementation blocker identified by source tracing; real
+provider behavior, test types and platform effects remain unverified.
+
+## Actual checks
+
+All commands used cwd above. Production checks only:
+`CARGO_INCREMENTAL=0 cargo check -p pioneer-gateway --lib > target/<log> 2>&1`.
+Intermediate checks below ran against evolving dirty baseline `707c3d5f` and do
+not validate later edits; only delivery check covers final production bytes.
+
+| Log under `target/` | Actual exit |
 | --- | --- |
-| `CARGO_INCREMENTAL=0 cargo check -p pioneer-gateway --lib`, initial dirty baseline | **101**, `target/plugin-c2-native-transport-check.log`; unqualified Result/error macro in the new helper, corrected |
-| Same command, final source bytes | **0**, 4m39s, `target/plugin-c2-native-transport-check-2.log`; includes native CLI runtime library |
-| `rustfmt --edition 2024 --config skip_children=true --check crates/cli-agent-runtime/src/codex.rs crates/gateway/src/cli_runtime/codex_session.rs` | **0**; both files also formatted |
-| `git diff --check`; `git diff --check 80af78634261ccc48d0cd75b3261bb6359f0a905 HEAD` at code HEAD | **0 / 0** |
+| `plugin-c2-resume-context-check.log` | 0, 14m58s |
+| `plugin-c2-resume-integration-check.log` | 101, E0658 (`&str.as_str()`); corrected |
+| `plugin-c2-resume-provider-check.log` | 0, 12m17s |
+| `plugin-c2-resume-final-check.log` | 0, 4m20s |
+| `plugin-c2-resume-task-admission-check.log` | 0, 2m10s |
+| `plugin-c2-resume-final-source-check.log` | 0, 4m05s; receipt/coverage edits followed, intermediate |
+| `plugin-c2-resume-delivery-check.log` | **0**, 2m10s; production bytes exactly final code HEAD `9bc094a1` |
 
-Compilation/formatting ran on dirty baseline `80af7863`; final production/test
-source bytes are exactly those subsequently committed at code HEAD `f435854b`.
-Only this handoff was untracked after that commit. Final delivery working tree
-is checked after its documentation commit. Compiler notice: existing unused
-`set_mcp_policy`. No protocol/generated contracts changed; schema/native artifact
-generation was not needed or run. These are compilation/format results, not
-provider behavior or conformance evidence. Commit hooks disabled.
+Final `rustfmt --edition 2024 --config skip_children=true --check` on the 15
+changed source files other than the existing large `message/tests.rs`: **exit 0**.
+That existing harness only adds a four-line module declaration; its full source
+and new module were parsed without file writes by
+`rustfmt --edition 2024 --config skip_children=false --emit stdout crates/gateway/src/message/tests.rs > /dev/null`: **exit 0**.
+`git diff --check` and `git diff --check 707c3d5f HEAD`: **exit 0**.
+Production compiler notice: existing unused `set_mcp_policy`. No public/generated
+contract changed; schema/bindings/native generation not needed or performed.
 
-New source tests in `cli-agent-runtime/src/codex.rs`:
-`persistent_owned_transport_retains_capacities_and_closes_pending_rpc` (in-memory
-transport closes pending request/channels and rejects late request),
-`transport_join_cancellation_retains_pending_handle_and_consumed_panic` (actual
-delayed task plus panic, cancelled waiter, other-task drain and sticky retry),
-`old_transport_close_does_not_stop_replacement_transport` (independent native
-transport remains usable). Native transport unit level, no provider/process fixture.
-All own tests **NOT_RUN**; all own test targets **NOT_COMPILED**. Their types and
-behavior have not been validated. Scoped rustfmt parses test source only.
-Historical external test compilation remains **UNKNOWN_EXTERNAL_ACTIVITY**, not
-this task's command/evidence. No application, provider, fixture, migration,
-functional/smoke/device/browser run; no mobile or test stage begun.
+New regression sources: `skills.rs::{owned_aliases_distinguish_authored_names_and_standalone_destinations,
+owned_context_receipts_cover_package_siblings_native_override_and_assets_only_updates}`
+(includes exact-parent receipt recovery rejection),
+`claude_session.rs::owned_claude_manifests_select_exact_member_with_full_context_and_no_native_autoload`,
+`manager.rs::owned_selection_is_visible_before_factory_await_and_revision_change_restarts`,
+and `message/plugin_c2_tests.rs` Task server pinning/forgery/ceiling, prepared/ready
+binding/disable/partial-selection rejection, and ordinary/exact-Agent CLI starts
+for both providers. Existing standalone/SkillPack, outbox, recovery and accepted
+stop sources retained. All own tests **NOT_RUN**, test targets **NOT_COMPILED**;
+rustfmt is source parsing, not type checking. Historical external activity stays
+**UNKNOWN_EXTERNAL_ACTIVITY** separately. No app, fixture, provider/process,
+functional/smoke/device/browser or migration execution. Mobile and E not started.
