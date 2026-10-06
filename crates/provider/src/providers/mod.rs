@@ -5,12 +5,14 @@ mod compatible;
 pub(crate) mod copilot;
 pub(crate) mod deepseek;
 mod echo;
+pub mod embedding;
 pub(crate) mod gemini;
 pub(crate) mod glm;
 mod local;
 pub(crate) mod ollama;
 pub(crate) mod openai;
 pub(crate) mod openrouter;
+pub(crate) mod retired;
 pub(crate) mod telnyx;
 
 pub use anthropic::AnthropicProvider;
@@ -34,3 +36,6 @@ pub use telnyx::TelnyxProvider;
 
 #[cfg(test)]
 mod usage_tests;
+
+#[cfg(test)]
+mod streaming_tests;

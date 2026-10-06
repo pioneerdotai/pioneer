@@ -3561,6 +3561,7 @@ impl ClaudeStreamClient {
             .get("is_error")
             .and_then(JsonValue::as_bool)
             .unwrap_or(false);
+        let completed = pioneer_cli_agent_runtime::claude::session_result_completed(&value);
         let interrupted = matches!(
             value.get("subtype").and_then(JsonValue::as_str),
             Some("interrupted" | "cancelled" | "canceled")
@@ -3595,7 +3596,11 @@ impl ClaudeStreamClient {
                 text: Some(result.to_owned()),
                 summary: Vec::new(),
                 content: Vec::new(),
-                phase: RuntimeAgentMessagePhase::FinalAnswer,
+                phase: if completed {
+                    RuntimeAgentMessagePhase::FinalAnswer
+                } else {
+                    RuntimeAgentMessagePhase::Commentary
+                },
                 metadata: None,
                 native_item_redacted: None,
                 native: Some(native_event("result/final_text", value.clone())),
@@ -3626,15 +3631,23 @@ impl ClaudeStreamClient {
                 reason: claude_result_error_message(&value),
                 native: Some(native_event("result/interrupted", value)),
             }));
-        } else if is_error {
+        } else if !completed {
             events.push(RuntimeEvent::TurnFailed(RuntimeTurnFailed {
                 native_thread_id: Some(native_thread_id),
                 native_turn_id: Some(native_turn_id.clone()),
-                message: claude_result_error_message(&value),
-                code: value
-                    .get("subtype")
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_owned),
+                message: if is_error {
+                    claude_result_error_message(&value)
+                } else {
+                    "Claude session did not affirm a successful terminal result".to_owned()
+                },
+                code: if is_error {
+                    value
+                        .get("subtype")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_owned)
+                } else {
+                    Some("invalid_terminal_result".to_owned())
+                },
                 native: Some(native_event("result/error", value)),
             }));
         } else {

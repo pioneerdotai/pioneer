@@ -8957,6 +8957,22 @@ impl MessageProcessor {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn cleanup_completed_cli_task_fixture(&self, turn_id: &str) {
+        let binding = self
+            .crud_store
+            .get_cli_runtime_turn_binding(turn_id)
+            .await
+            .unwrap()
+            .expect("completed CLI fixture must have a native binding");
+        self.cleanup_cli_runtime_terminal_turn_status(
+            &binding,
+            TurnStatus::Completed,
+            "completed CLI task fixture",
+        )
+        .await;
+    }
+
     pub(super) async fn cleanup_cli_runtime_terminal_turn_status(
         &self,
         binding: &pioneer_crud::CliRuntimeTurnBindingRecord,

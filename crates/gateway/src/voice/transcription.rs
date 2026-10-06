@@ -192,6 +192,21 @@ impl std::fmt::Display for VoiceTranscriptionError {
 
 impl std::error::Error for VoiceTranscriptionError {}
 
+#[cfg(test)]
+pub(crate) type TestVoiceSpeechTranscriber =
+    Arc<dyn Fn(&PreparedSpeechBuffer) -> Result<String, VoiceTranscriptionError> + Send + Sync>;
+#[cfg(test)]
+pub(crate) struct TestSpeechTranscriber(pub(crate) TestVoiceSpeechTranscriber);
+#[cfg(test)]
+impl VoiceSpeechTranscriber for TestSpeechTranscriber {
+    fn transcribe_speech(
+        &self,
+        buffer: &PreparedSpeechBuffer,
+    ) -> Result<String, VoiceTranscriptionError> {
+        (self.0)(buffer)
+    }
+}
+
 pub(crate) trait VoiceSpeechTranscriber: Send {
     fn transcribe_speech(
         &self,

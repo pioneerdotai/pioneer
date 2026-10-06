@@ -12,6 +12,7 @@ test-support = ["dep:tokio"]
 [dependencies]
 pioneer-compaction.workspace = true
 anyhow.workspace = true
+futures-util.workspace = true
 pioneer-entity.workspace = true
 pioneer-hooks.workspace = true
 pioneer-protocol.workspace = true
@@ -27,5 +28,6 @@ uuid = { workspace = true, features = ["v4"] }
 tokio = { workspace = true, optional = true, features = ["sync", "time"] }
 
 [dev-dependencies]
+tempfile.workspace = true
 pioneer-migration.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

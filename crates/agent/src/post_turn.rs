@@ -75,6 +75,63 @@ pub(crate) fn prepare_dispatch_effect(
     )
 }
 
+pub(crate) fn capture_durable_post_turn_snapshot(
+    runtime: &HookRuntime,
+) -> Result<serde_json::Value, NativeTerminalEffectPreparationFailure> {
+    let subscriptions = runtime
+        .subscriptions()
+        .subscriptions_for_phase(HookPhase::TurnPostTurn)
+        .map_err(|_| NativeTerminalEffectPreparationFailure::SubscriptionSnapshotUnavailable)?;
+    let snapshot = DurablePostTurnHookRuntimeSnapshot::capture(runtime, subscriptions)
+        .map_err(|_| NativeTerminalEffectPreparationFailure::HandlerSnapshotUnavailable)?;
+    serde_json::to_value(snapshot)
+        .map_err(|_| NativeTerminalEffectPreparationFailure::SnapshotSerializationFailed)
+}
+
+pub(crate) fn prepare_interrupted_dispatch_effect(
+    turn_id: &str,
+    snapshot: Option<&Result<serde_json::Value, NativeTerminalEffectPreparationFailure>>,
+    dispatch: AgentTurnPostTurnHookDispatch,
+) -> NativeTerminalEffectSpec {
+    let gate = if dispatch.awaits_task_result_acceptance() {
+        NativeTerminalEffectGate::AcceptedTaskResult
+    } else {
+        NativeTerminalEffectGate::TerminalCommit
+    };
+    let payload = (|| {
+        let runtime_snapshot = snapshot
+            .ok_or(NativeTerminalEffectPreparationFailure::HandlerSnapshotUnavailable)?
+            .clone()?;
+        let request = serde_json::to_value(
+            dispatch
+                .into_durable_phase_request()
+                .map_err(|_| NativeTerminalEffectPreparationFailure::InvalidHookRequest)?,
+        )
+        .map_err(|_| NativeTerminalEffectPreparationFailure::InvalidHookRequest)?;
+        let payload = NativeTerminalEffectPayload::PostTurnHook {
+            request,
+            runtime_snapshot,
+        };
+        if serde_json::to_vec(&payload)
+            .map_err(|_| NativeTerminalEffectPreparationFailure::PayloadSerializationFailed)?
+            .len()
+            > 255 * 1024
+        {
+            return Err(NativeTerminalEffectPreparationFailure::PayloadTooLarge);
+        }
+        Ok(payload)
+    })();
+    NativeTerminalEffectSpec {
+        effect_id: format!("{turn_id}:terminal-effect:post-turn"),
+        effect_kind: NativeTerminalEffectKind::PostTurnHook,
+        gate,
+        payload: payload.unwrap_or_else(|failure| {
+            NativeTerminalEffectPayload::PostTurnHookPreparationFailed { failure }
+        }),
+        max_attempts: 8,
+    }
+}
+
 fn prepare_effect(
     turn_id: &str,
     runtime: &HookRuntime,
@@ -204,4 +261,73 @@ impl PostTurnHookRuntime {
             effects: vec![effect],
         }))
     }
+}
+
+/// Fill only cancellation-specific bounded text. Handler/subscription descriptions,
+/// acceptance gates and the cleanup adapter contract belong to the originating turn.
+pub fn prepare_native_cancellation(
+    mut preparation: NativeTerminalEffectPreparation,
+    reason: &str,
+) -> Result<NativeTerminalEffectPreparation, String> {
+    for effect in &mut preparation.effects {
+        match &mut effect.payload {
+            NativeTerminalEffectPayload::PostTurnHook { request, .. } => {
+                let mut phase_request: HookPhaseRequest =
+                    serde_json::from_value(request.clone())
+                        .map_err(|_| "invalid immutable cancellation hook request".to_owned())?;
+                let pioneer_hooks::HookInputPayload::TurnPostTurn(input) =
+                    &mut phase_request.input.payload
+                else {
+                    return Err("immutable cancellation hook has wrong input kind".to_owned());
+                };
+                if input.status != pioneer_hooks::TurnPostTurnStatus::Interrupted {
+                    return Err("immutable cancellation hook has wrong terminal status".to_owned());
+                }
+                input.error = Some(pioneer_hooks::HookTextPreview::from_text(
+                    reason,
+                    input.limits.error_preview_max_chars,
+                ));
+                *request = serde_json::to_value(phase_request)
+                    .map_err(|_| "invalid immutable cancellation hook serialization".to_owned())?;
+            }
+            NativeTerminalEffectPayload::AttachedTaskCleanup {
+                reason: cleanup_reason,
+                ..
+            } => {
+                *cleanup_reason = format!("parent turn cancelled: {reason}")
+                    .chars()
+                    .take(4_096)
+                    .collect();
+            }
+            NativeTerminalEffectPayload::PostTurnHookPreparationFailed { .. } => {}
+        }
+        if matches!(
+            effect.payload,
+            NativeTerminalEffectPayload::PostTurnHook { .. }
+        ) && serde_json::to_vec(&effect.payload)
+            .map_err(|_| "invalid immutable cancellation payload serialization".to_owned())?
+            .len()
+            > 255 * 1024
+        {
+            return Err(
+                "immutable cancellation hook payload exceeds durable byte limit".to_owned(),
+            );
+        }
+    }
+    Ok(preparation)
+}
+
+/// Choose the cancellation namespace once, before initial durable registration.
+/// Controller/recovery use the stored IDs; ordinary terminal plans keep theirs.
+pub(crate) fn identify_native_cancellation(
+    mut preparation: NativeTerminalEffectPreparation,
+) -> NativeTerminalEffectPreparation {
+    for effect in &mut preparation.effects {
+        let suffix = match effect.effect_kind {
+            NativeTerminalEffectKind::PostTurnHook => "post-turn",
+            NativeTerminalEffectKind::AttachedTaskCleanup => "attached-task-cleanup",
+        };
+        effect.effect_id = format!("{}:cancellation-effect:{suffix}", preparation.turn_id);
+    }
+    preparation
 }

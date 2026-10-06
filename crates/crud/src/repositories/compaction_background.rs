@@ -2,12 +2,9 @@
 use anyhow::{Result, ensure};
 use pioneer_entity::{
     compaction_context, compaction_execution_stop, compaction_history_check, compaction_operation,
-    compaction_runner_state, compaction_turn_creation, thread, turn, turn_cli_runtime_binding,
-    turn_item,
+    compaction_turn_creation, thread, turn, turn_cli_runtime_binding,
 };
-use sea_orm::sea_query::{
-    Alias, BinOper, Expr, ExprTrait, Func, JoinType, OnConflict, Order, Query,
-};
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, JoinType, OnConflict, Order, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
     QuerySelect,
@@ -30,17 +27,6 @@ pub struct CompletedHistoryCheck {
     pub outcome: Option<String>,
     pub managed: i64,
 }
-#[derive(Debug, Clone, FromQueryResult)]
-pub struct CompactionLifecycleRecovery {
-    pub id: String,
-    pub owner: String,
-    pub workspace_id: String,
-    pub thread_id: String,
-    pub turn_id: String,
-    pub status: String,
-    pub cancelled: bool,
-}
-
 pub(crate) async fn compaction_enqueue_native_history_check<C: ConnectionTrait>(
     db: &C,
     workspace: &str,
@@ -137,189 +123,6 @@ pub(crate) async fn compaction_enqueue_native_history_check<C: ConnectionTrait>(
     }
     Ok(())
 }
-/// Reconcile lost terminal publications and abandoned deadline/Stop states
-/// using bounded metadata. This scanner never admits a service generation.
-pub(crate) async fn compaction_lifecycle_recovery<C: ConnectionTrait>(
-    db: &C,
-    now_ms: u64,
-    after: &str,
-) -> Result<Vec<CompactionLifecycleRecovery>> {
-    compaction_operation::Entity::find()
-        .select_only()
-        .join(
-            JoinType::InnerJoin,
-            compaction_operation::Entity::belongs_to(compaction_context::Entity)
-                .from(compaction_operation::Column::Owner)
-                .to(compaction_context::Column::Owner)
-                .into(),
-        )
-        .join(
-            JoinType::InnerJoin,
-            compaction_operation::Entity::belongs_to(turn::Entity)
-                .from(compaction_operation::Column::ExecutionTurn)
-                .to(turn::Column::Id)
-                .on_condition(|_, _| {
-                    sea_orm::Condition::all().add(
-                        Expr::col((turn::Entity, turn::Column::ThreadId)).eq(Expr::col((
-                            compaction_context::Entity,
-                            compaction_context::Column::ThreadId,
-                        ))),
-                    )
-                })
-                .into(),
-        )
-        .expr(Expr::col((
-            compaction_operation::Entity,
-            compaction_operation::Column::Id,
-        )))
-        .expr(Expr::col((
-            compaction_operation::Entity,
-            compaction_operation::Column::Owner,
-        )))
-        .expr(Expr::col((
-            compaction_context::Entity,
-            compaction_context::Column::WorkspaceId,
-        )))
-        .expr(Expr::col((
-            compaction_context::Entity,
-            compaction_context::Column::ThreadId,
-        )))
-        .expr_as(
-            Expr::col((
-                compaction_operation::Entity,
-                compaction_operation::Column::ExecutionTurn,
-            )),
-            "turn_id",
-        )
-        .expr(Expr::col((
-            compaction_operation::Entity,
-            compaction_operation::Column::Status,
-        )))
-        .expr_as(
-            Expr::col((turn::Entity, turn::Column::Status))
-                .is_in(["interrupted", "cancelled"])
-                .or(Expr::exists(
-                    Query::select()
-                        .expr(Expr::val(1_i64))
-                        .from_as(compaction_execution_stop::Entity, "stop")
-                        .and_where(
-                            Expr::col(("stop", compaction_execution_stop::Column::Owner))
-                                .eq(Expr::col((
-                                    compaction_operation::Entity,
-                                    compaction_operation::Column::Owner,
-                                )))
-                                .and(
-                                    Expr::col(("stop", compaction_execution_stop::Column::TurnId))
-                                        .eq(Expr::col((turn::Entity, turn::Column::Id))),
-                                ),
-                        )
-                        .to_owned(),
-                )),
-            "cancelled",
-        )
-        .filter(
-            Expr::col((
-                compaction_operation::Entity,
-                compaction_operation::Column::Id,
-            ))
-            .gt(Expr::Value(after.into()))
-            .and(
-                Expr::col((
-                    compaction_operation::Entity,
-                    compaction_operation::Column::Status,
-                ))
-                .eq(Expr::val("running"))
-                .and(
-                    Expr::col((
-                        compaction_operation::Entity,
-                        compaction_operation::Column::DeadlineMs,
-                    ))
-                    .lte(Expr::Value(i64::try_from(now_ms)?.into()))
-                    .or(Expr::col((turn::Entity, turn::Column::Status))
-                        .is_in(["interrupted", "cancelled"]))
-                    .or(Expr::exists(
-                        Query::select()
-                            .expr(Expr::val(1_i64))
-                            .from_as(compaction_execution_stop::Entity, "stop")
-                            .and_where(
-                                Expr::col(("stop", compaction_execution_stop::Column::Owner))
-                                    .eq(Expr::col((
-                                        compaction_operation::Entity,
-                                        compaction_operation::Column::Owner,
-                                    )))
-                                    .and(
-                                        Expr::col((
-                                            "stop",
-                                            compaction_execution_stop::Column::TurnId,
-                                        ))
-                                        .eq(Expr::col((turn::Entity, turn::Column::Id))),
-                                    ),
-                            )
-                            .to_owned(),
-                    )),
-                )
-                .or(Expr::col((
-                    compaction_operation::Entity,
-                    compaction_operation::Column::Status,
-                ))
-                .ne(Expr::val("running"))
-                .and(Expr::exists(
-                    Query::select()
-                        .expr(Expr::val(1_i64))
-                        .from_as(compaction_runner_state::Entity, "r")
-                        .and_where(
-                            Expr::col(("r", compaction_runner_state::Column::OperationId)).eq(
-                                Expr::col((
-                                    compaction_operation::Entity,
-                                    compaction_operation::Column::Id,
-                                )),
-                            ),
-                        )
-                        .to_owned(),
-                ))
-                .and(
-                    Expr::exists(
-                        Query::select()
-                            .expr(Expr::val(1_i64))
-                            .from_as(turn_item::Entity, "item")
-                            .and_where(
-                                Expr::col(("item", turn_item::Column::TurnId))
-                                    .eq(Expr::col((turn::Entity, turn::Column::Id)))
-                                    .and(Expr::col(("item", turn_item::Column::ItemId)).eq(
-                                        Expr::val("compaction:").binary(
-                                            BinOper::Custom("||"),
-                                            Expr::col((
-                                                compaction_operation::Entity,
-                                                compaction_operation::Column::Id,
-                                            )),
-                                        ),
-                                    ))
-                                    .and(
-                                        Expr::expr(Func::cust(Alias::new("json_extract")).args([
-                                            Expr::col(("item", turn_item::Column::Payload)),
-                                            Expr::val("$.details.status"),
-                                        ]))
-                                        .is_in([
-                                            "completed",
-                                            "failed",
-                                            "cancelled",
-                                        ]),
-                                    ),
-                            )
-                            .to_owned(),
-                    )
-                    .not(),
-                )),
-            ),
-        )
-        .order_by_asc(compaction_operation::Column::Id)
-        .limit(16)
-        .into_model::<CompactionLifecycleRecovery>()
-        .all(db)
-        .await
-        .map_err(Into::into)
-}
-
 /// A newer execution invalidates an optional older check. Inspect one
 /// locator at a time rather than bulk-updating a thread's retained history.
 pub(crate) async fn compaction_history_check_is_current<C: ConnectionTrait>(

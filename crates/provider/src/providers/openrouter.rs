@@ -1,3 +1,6 @@
+#[cfg(test)]
+use super::embedding::ordered_vectors;
+use super::embedding::validate_input;
 use crate::failure::ProviderStreamIncomplete;
 use crate::{
     attachments::{
@@ -6,7 +9,7 @@ use crate::{
     },
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
     tools::parse::parse_tool_calls,
-    tools::stream::{IncrementalLineDecoder, sse_data},
+    tools::stream::IncrementalSseDecoder,
     types::{
         ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, InputContentType,
         InputTypeSupport, ProviderCapabilities, ProviderInputCapabilities, ProviderReplayState,
@@ -225,16 +228,7 @@ struct ApiEmbeddingRequest {
     encoding_format: &'static str,
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiEmbeddingResponse {
-    data: Vec<ApiEmbeddingData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApiEmbeddingData {
-    embedding: Vec<f32>,
-    index: usize,
-}
+type ApiEmbeddingResponse = super::embedding::IndexedEmbeddingResponse;
 
 // ── SSE streaming response types ────────────────────────────────────────────
 
@@ -578,6 +572,10 @@ struct ModelsListResponse {
 #[derive(Debug, Deserialize)]
 struct OpenRouterModelEntry {
     id: String,
+    // Retain malformed marker lists as unknown rather than rejecting discovery
+    // or interpreting partial lists as a trustworthy negative.
+    #[serde(default)]
+    supported_parameters: serde_json::Value,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -1033,6 +1031,278 @@ impl OpenRouterProvider {
     }
 }
 
+// The same decoder is used by HTTP transport and in-memory regression fixtures.
+impl OpenRouterProvider {
+    #[cfg(test)]
+    pub(super) fn decode_stream(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
+        Self::decode_stream_with_diagnostics(byte_stream, None, Default::default()).stream
+    }
+
+    fn decode_stream_with_diagnostics(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+        request_id: Option<String>,
+        diagnostics: crate::ProviderStreamDiagnostics,
+    ) -> crate::ProviderStream {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
+
+        let stream_diagnostics = diagnostics.clone();
+        tokio::spawn(async move {
+            let mut decoder = IncrementalSseDecoder::default();
+            let mut tool_call_accumulator = StreamToolCallAccumulator::default();
+            let mut terminal_reason = None;
+            let mut generation_id = request_id;
+            let mut reasoning_details = Vec::new();
+
+            tokio::pin!(byte_stream);
+
+            while let Some(result) = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = byte_stream.next() => result,
+            } {
+                let bytes = match result {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        if tx
+                            .send(Err(OpenRouterFailure::stream_transport(
+                                e,
+                                generation_id.clone(),
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        return;
+                    }
+                };
+
+                let lines = match decoder.push(bytes.as_ref()) {
+                    Ok(lines) => lines,
+                    Err(error) => {
+                        if tx
+                            .send(Err(OpenRouterFailure::stream_transport(
+                                error,
+                                generation_id.clone(),
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        return;
+                    }
+                };
+                for frame in lines {
+                    let data = frame.data.as_str();
+
+                    if data.trim() == "[DONE]" {
+                        let terminal = terminal_reason
+                            .take()
+                            .map(StreamChunk::final_chunk_with)
+                            .ok_or_else(|| {
+                                anyhow::Error::from(
+                                    ProviderStreamIncomplete::DoneWithoutFinishReason,
+                                )
+                            });
+                        let _ = tx
+                            .send(terminal.map_err(|error| {
+                                OpenRouterFailure::stream_transport(error, generation_id.clone())
+                            }))
+                            .await;
+                        return;
+                    }
+
+                    match serde_json::from_str::<StreamResponse>(data) {
+                        Ok(mut resp) => {
+                            if let Some(id) = resp
+                                .id
+                                .clone()
+                                .filter(|id| ProviderRequestId::try_from(id.clone()).is_ok())
+                            {
+                                stream_diagnostics.set_request_id(
+                                    ProviderRequestId::try_from(id.clone()).expect("validated ID"),
+                                );
+                                generation_id = Some(id);
+                            }
+                            if terminal_reason.is_some()
+                                && resp.choices.iter().any(|choice| choice.delta.has_payload())
+                            {
+                                let _ = tx
+                                    .send(Err(OpenRouterFailure::stream_transport(
+                                        anyhow!("provider sent payload after finish_reason"),
+                                        generation_id.clone(),
+                                    )))
+                                    .await;
+                                return;
+                            }
+                            if let Some(usage) = resp.usage {
+                                if tx
+                                    .send(Ok(StreamChunk::usage(TokenUsage {
+                                        input_tokens: usage.prompt_tokens,
+                                        output_tokens: usage.completion_tokens,
+                                    })))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            if let Some(error) = resp.error.take().or_else(|| {
+                                resp.choices
+                                    .iter_mut()
+                                    .find_map(|choice| choice.error.take())
+                            }) {
+                                if tx
+                                    .send(Err(OpenRouterFailure::stream(
+                                        error,
+                                        generation_id.clone(),
+                                    )
+                                    .into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                return;
+                            }
+                            for choice in resp.choices {
+                                if terminal_reason.is_some() {
+                                    if choice.finish_reason.as_deref().is_some_and(|reason| {
+                                        Some(ProviderTermination::from_openai_reason(reason))
+                                            != terminal_reason
+                                    }) {
+                                        let _ = tx.send(Err(OpenRouterFailure::stream_transport(
+                                            anyhow!("provider changed finish_reason after completion"),
+                                            generation_id.clone(),
+                                        ))).await;
+                                        return;
+                                    }
+                                    if choice.delta.has_payload() {
+                                        let _ = tx
+                                            .send(Err(OpenRouterFailure::stream_transport(
+                                                anyhow!(
+                                                    "provider sent payload after finish_reason"
+                                                ),
+                                                generation_id.clone(),
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                if let Some(details) = choice.delta.reasoning_details {
+                                    reasoning_details.extend(details);
+                                }
+                                if let Some(rc) =
+                                    choice.delta.reasoning_content.or(choice.delta.reasoning)
+                                {
+                                    if !rc.is_empty() {
+                                        if tx.send(Ok(StreamChunk::reasoning(rc))).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                if let Some(content) = choice.delta.content {
+                                    if !content.is_empty() {
+                                        if tx.send(Ok(StreamChunk::delta(content))).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                if let Some(tool_calls) = choice.delta.tool_calls {
+                                    tool_call_accumulator.ingest(tool_calls);
+                                }
+                                if let Some(function_call) = choice.delta.function_call {
+                                    tool_call_accumulator.ingest(vec![StreamToolCallDelta {
+                                        index: Some(0),
+                                        id: None,
+                                        function: Some(function_call),
+                                        name: None,
+                                        arguments: None,
+                                    }]);
+                                }
+                                if let Some(reason) = choice.finish_reason {
+                                    let termination =
+                                        ProviderTermination::from_openai_reason(&reason);
+                                    if let Some(state) = OpenRouterProvider::reasoning_details_state(
+                                        std::mem::take(&mut reasoning_details),
+                                    ) {
+                                        if tx
+                                            .send(Ok(StreamChunk::provider_replay_state(state)))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    let tool_calls = match tool_call_accumulator.take_tool_calls() {
+                                        Ok(calls) => calls,
+                                        Err(error) => {
+                                            if tx
+                                                .send(Err(OpenRouterFailure::stream_transport(
+                                                    error,
+                                                    generation_id.clone(),
+                                                )))
+                                                .await
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
+                                            return;
+                                        }
+                                    };
+                                    if !tool_calls.is_empty() {
+                                        if tx
+                                            .send(Ok(StreamChunk::tool_calls(tool_calls)))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    terminal_reason = Some(termination);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            if tx
+                                .send(Err(OpenRouterFailure::stream_transport(
+                                    anyhow!("malformed OpenRouter SSE frame"),
+                                    generation_id.clone(),
+                                )))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let terminal = match decoder.finish() {
+                Err(error) => Err(error),
+                Ok(_) => Err(ProviderStreamIncomplete::EofWithoutTerminalMarker.into()),
+            };
+            let _ = tx
+                .send(terminal.map_err(|error| {
+                    OpenRouterFailure::stream_transport(error, generation_id.clone())
+                }))
+                .await;
+        });
+
+        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        crate::ProviderStream {
+            stream: Box::pin(chunk_stream),
+            diagnostics,
+        }
+    }
+}
+
 #[async_trait]
 impl crate::traits::Provider for OpenRouterProvider {
     fn classify_failure(
@@ -1094,13 +1364,15 @@ impl crate::traits::Provider for OpenRouterProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider_async(
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let rendered_messages = Self::convert_messages(&prepared)?;
         let reasoning = Self::reasoning_options(request.reasoning);
@@ -1228,13 +1500,15 @@ impl crate::traits::Provider for OpenRouterProvider {
         &self,
         request: ChatRequest,
     ) -> Result<crate::ProviderStream> {
-        let prepared = prepare_messages_for_provider_async(
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let rendered_messages = Self::convert_messages(&prepared)?;
         let reasoning = Self::reasoning_options(request.reasoning);
@@ -1275,268 +1549,17 @@ impl crate::traits::Provider for OpenRouterProvider {
         {
             diagnostics.set_request_id(id);
         }
-        let stream_diagnostics = diagnostics.clone();
         let byte_stream = crate::http::bounded_response_stream(
             response,
             crate::types::ProviderResponseLimits::default().max_transport_bytes,
             "provider_stream",
         );
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
-
-        tokio::spawn(async move {
-            let mut decoder = IncrementalLineDecoder::default();
-            let mut tool_call_accumulator = StreamToolCallAccumulator::default();
-            let mut terminal_reason = None;
-            let mut generation_id = request_id;
-            let mut reasoning_details = Vec::new();
-
-            tokio::pin!(byte_stream);
-
-            while let Some(result) = tokio::select! {
-                biased;
-                _ = tx.closed() => return,
-                result = byte_stream.next() => result,
-            } {
-                let bytes = match result {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        if tx
-                            .send(Err(OpenRouterFailure::stream_transport(
-                                e,
-                                generation_id.clone(),
-                            )))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        return;
-                    }
-                };
-
-                let lines = match decoder.push(bytes.as_ref()) {
-                    Ok(lines) => lines,
-                    Err(error) => {
-                        if tx
-                            .send(Err(OpenRouterFailure::stream_transport(
-                                error,
-                                generation_id.clone(),
-                            )))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        return;
-                    }
-                };
-                for line in lines {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    let Some(data) = sse_data(line) else {
-                        continue;
-                    };
-
-                    if data.trim() == "[DONE]" {
-                        let terminal = terminal_reason
-                            .take()
-                            .map(StreamChunk::final_chunk_with)
-                            .ok_or_else(|| {
-                                anyhow::Error::from(
-                                    ProviderStreamIncomplete::DoneWithoutFinishReason,
-                                )
-                            });
-                        let _ = tx
-                            .send(terminal.map_err(|error| {
-                                OpenRouterFailure::stream_transport(error, generation_id.clone())
-                            }))
-                            .await;
-                        return;
-                    }
-
-                    match serde_json::from_str::<StreamResponse>(data) {
-                        Ok(mut resp) => {
-                            if let Some(id) = resp
-                                .id
-                                .clone()
-                                .filter(|id| ProviderRequestId::try_from(id.clone()).is_ok())
-                            {
-                                stream_diagnostics.set_request_id(
-                                    ProviderRequestId::try_from(id.clone()).expect("validated ID"),
-                                );
-                                generation_id = Some(id);
-                            }
-                            if terminal_reason.is_some()
-                                && resp.choices.iter().any(|choice| choice.delta.has_payload())
-                            {
-                                let _ = tx
-                                    .send(Err(OpenRouterFailure::stream_transport(
-                                        anyhow!("provider sent payload after finish_reason"),
-                                        generation_id.clone(),
-                                    )))
-                                    .await;
-                                return;
-                            }
-                            if let Some(usage) = resp.usage {
-                                if tx
-                                    .send(Ok(StreamChunk::usage(TokenUsage {
-                                        input_tokens: usage.prompt_tokens,
-                                        output_tokens: usage.completion_tokens,
-                                    })))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            if let Some(error) = resp.error.take().or_else(|| {
-                                resp.choices
-                                    .iter_mut()
-                                    .find_map(|choice| choice.error.take())
-                            }) {
-                                if tx
-                                    .send(Err(OpenRouterFailure::stream(
-                                        error,
-                                        generation_id.clone(),
-                                    )
-                                    .into()))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                return;
-                            }
-                            for choice in resp.choices {
-                                if terminal_reason.is_some() {
-                                    if choice.delta.has_payload() {
-                                        let _ = tx
-                                            .send(Err(OpenRouterFailure::stream_transport(
-                                                anyhow!(
-                                                    "provider sent payload after finish_reason"
-                                                ),
-                                                generation_id.clone(),
-                                            )))
-                                            .await;
-                                        return;
-                                    }
-                                    continue;
-                                }
-                                if let Some(details) = choice.delta.reasoning_details {
-                                    reasoning_details.extend(details);
-                                }
-                                if let Some(rc) =
-                                    choice.delta.reasoning_content.or(choice.delta.reasoning)
-                                {
-                                    if !rc.is_empty() {
-                                        if tx.send(Ok(StreamChunk::reasoning(rc))).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                                if let Some(content) = choice.delta.content {
-                                    if !content.is_empty() {
-                                        if tx.send(Ok(StreamChunk::delta(content))).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                                if let Some(tool_calls) = choice.delta.tool_calls {
-                                    tool_call_accumulator.ingest(tool_calls);
-                                }
-                                if let Some(function_call) = choice.delta.function_call {
-                                    tool_call_accumulator.ingest(vec![StreamToolCallDelta {
-                                        index: Some(0),
-                                        id: None,
-                                        function: Some(function_call),
-                                        name: None,
-                                        arguments: None,
-                                    }]);
-                                }
-                                if let Some(reason) = choice.finish_reason {
-                                    let termination =
-                                        ProviderTermination::from_openai_reason(&reason);
-                                    if let Some(state) = OpenRouterProvider::reasoning_details_state(
-                                        std::mem::take(&mut reasoning_details),
-                                    ) {
-                                        if tx
-                                            .send(Ok(StreamChunk::provider_replay_state(state)))
-                                            .await
-                                            .is_err()
-                                        {
-                                            return;
-                                        }
-                                    }
-                                    let tool_calls = match tool_call_accumulator.take_tool_calls() {
-                                        Ok(calls) => calls,
-                                        Err(error) => {
-                                            if tx
-                                                .send(Err(OpenRouterFailure::stream_transport(
-                                                    error,
-                                                    generation_id.clone(),
-                                                )))
-                                                .await
-                                                .is_err()
-                                            {
-                                                return;
-                                            }
-                                            return;
-                                        }
-                                    };
-                                    if !tool_calls.is_empty() {
-                                        if tx
-                                            .send(Ok(StreamChunk::tool_calls(tool_calls)))
-                                            .await
-                                            .is_err()
-                                        {
-                                            return;
-                                        }
-                                    }
-                                    terminal_reason = Some(termination);
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            if tx
-                                .send(Err(OpenRouterFailure::stream_transport(
-                                    anyhow!("malformed OpenRouter SSE frame"),
-                                    generation_id.clone(),
-                                )))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                            return;
-                        }
-                    }
-                }
-            }
-
-            let terminal = match decoder.finish() {
-                Err(error) => Err(error),
-                Ok(_) => terminal_reason
-                    .map(StreamChunk::final_chunk_with)
-                    .ok_or_else(|| {
-                        anyhow::Error::from(ProviderStreamIncomplete::EofWithoutTerminalMarker)
-                    }),
-            };
-            let _ = tx
-                .send(terminal.map_err(|error| {
-                    OpenRouterFailure::stream_transport(error, generation_id.clone())
-                }))
-                .await;
-        });
-
-        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(crate::ProviderStream {
-            stream: Box::pin(chunk_stream),
+        Ok(Self::decode_stream_with_diagnostics(
+            byte_stream,
+            request_id,
             diagnostics,
-        })
+        ))
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -1561,6 +1584,15 @@ impl crate::traits::Provider for OpenRouterProvider {
     }
 
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+        validate_input(&request.model, &request.input)?;
+        super::embedding::EmbeddingBatchLimits::for_model(
+            "openrouter",
+            &request.model,
+            None,
+            None,
+            None,
+        )?
+        .validate_request(&request.input)?;
         let expected_count = request.input.len();
         let api_request = ApiEmbeddingRequest {
             model: request.model,
@@ -1582,25 +1614,13 @@ impl crate::traits::Provider for OpenRouterProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let mut data = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
+        let response = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
             response,
             Default::default(),
             "provider_response",
         )
-        .await?
-        .data;
-        data.sort_by_key(|item| item.index);
-        if data.len() != expected_count {
-            return Err(anyhow!(
-                "OpenRouter embedding response returned {} embeddings for {} inputs",
-                data.len(),
-                expected_count
-            ));
-        }
-
-        Ok(EmbeddingResponse {
-            embeddings: data.into_iter().map(|item| item.embedding).collect(),
-        })
+        .await?;
+        response.into_response(expected_count)
     }
 }
 
@@ -1618,7 +1638,13 @@ fn provider_model_from_openrouter_model_entry(m: OpenRouterModelEntry) -> Provid
         }
     });
     let reasoning = m.reasoning.and_then(openrouter_reasoning_capabilities);
-    let mut capabilities = ProviderModelCapabilities::default();
+    let mut capabilities = ProviderModelCapabilities {
+        tool_calling: crate::catalog::tool_support_from_marker_list(
+            &m.supported_parameters,
+            "tools",
+        ),
+        ..Default::default()
+    };
     if let Some(reasoning) = reasoning {
         capabilities.thinking = reasoning.supported;
         capabilities.reasoning = Some(reasoning);
@@ -1643,6 +1669,18 @@ fn provider_model_from_openrouter_model_entry(m: OpenRouterModelEntry) -> Provid
         family: None,
         lifecycle_status: None,
     }
+}
+
+// Test fixtures cross the same native response and normalizer boundary as
+// list_model_entries -> list_models; no precomputed capability is injected.
+#[cfg(test)]
+pub(crate) fn models_from_native_discovery_fixture(json: &str) -> Vec<ProviderModelInfo> {
+    let response: ModelsListResponse = serde_json::from_str(json).expect("native models response");
+    response
+        .data
+        .into_iter()
+        .map(provider_model_from_openrouter_model_entry)
+        .collect()
 }
 
 fn openrouter_embedding_model_from_openrouter_model_entry(
@@ -1700,8 +1738,81 @@ fn openrouter_reasoning_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn g09_direct_embedding_adapter_rejects_invalid_batch_before_network() {
+        let provider = OpenRouterProvider::new("unused-fixture-key");
+        for model in [
+            "openai/text-embedding-3-small",
+            "openai/text-embedding-3-large",
+        ] {
+            let error = provider
+                .embed(EmbeddingRequest::new(model, vec!["short".to_owned(); 2048]))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("budget"));
+            let error = provider
+                .embed(EmbeddingRequest::new(model, vec![" a".repeat(8193)]))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("token budget"));
+        }
+        assert!(
+            provider
+                .embed(EmbeddingRequest::new(
+                    "vendor/unknown",
+                    vec!["a".into(), "b".into()]
+                ))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("budget")
+        );
+    }
+
+    #[test]
+    fn embedding_wire_contract_has_actual_endpoint_model_input_encoding_and_usage() {
+        let provider = OpenRouterProvider::new("fixture-key");
+        assert_eq!(
+            provider.embeddings_url(),
+            "https://openrouter.ai/api/v1/embeddings"
+        );
+        let input = vec!["first".to_owned(), "second".to_owned()];
+        let body = ApiEmbeddingRequest {
+            model: "openai/text-embedding-3-small".to_owned(),
+            input: input.clone(),
+            encoding_format: "float",
+        };
+        assert_eq!(
+            serde_json::to_value(body).unwrap(),
+            serde_json::json!({
+                "model": "openai/text-embedding-3-small", "input": input, "encoding_format": "float"
+            })
+        );
+        let response: ApiEmbeddingResponse = serde_json::from_value(serde_json::json!({
+            "data": [{"index":1,"embedding":[2.0]},{"index":0,"embedding":[1.0]}],
+            "usage": {"prompt_tokens":7,"total_tokens":7}
+        }))
+        .unwrap();
+        assert_eq!(
+            ordered_vectors(response.data, 2).unwrap(),
+            vec![vec![1.0], vec![2.0]]
+        );
+        let usage: crate::types::TokenUsage = response.usage.unwrap().into();
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(0));
+        for bad in [serde_json::json!(-1), serde_json::json!(0.5)] {
+            assert!(
+                serde_json::from_value::<ApiEmbeddingResponse>(serde_json::json!({
+                    "data":[{"index":bad,"embedding":[1.0]}]
+                }))
+                .is_err()
+            );
+        }
+    }
     use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
     use crate::providers::OpenAiCompatibleProvider;
+    use crate::tools::stream::IncrementalLineDecoder;
     use crate::traits::Provider;
     use crate::types::{
         AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart,
@@ -1742,6 +1853,29 @@ mod tests {
         openrouter_embedding_model_from_openrouter_model_entry(
             response.data.into_iter().next().expect("fixture model"),
         )
+    }
+
+    #[test]
+    fn native_supported_parameters_preserves_tri_state() {
+        for (field, expected) in [
+            (r#", "supported_parameters": ["tools"]"#, Some(true)),
+            (
+                r#", "supported_parameters": ["temperature", "tools"]"#,
+                Some(true),
+            ),
+            (r#", "supported_parameters": ["tool_choice"]"#, Some(false)),
+            (r#", "supported_parameters": []"#, Some(false)),
+            ("", None),
+            (r#", "supported_parameters": null"#, None),
+            (r#", "supported_parameters": "tools""#, None),
+            (r#", "supported_parameters": {}"#, None),
+            (r#", "supported_parameters": [42]"#, None),
+            (r#", "supported_parameters": ["tools", null]"#, None),
+        ] {
+            let json = format!(r#"{{"data":[{{"id":"custom-model"{field}}}]}}"#);
+            let model = models_from_native_discovery_fixture(&json).remove(0);
+            assert_eq!(model.capabilities.tool_calling, expected, "{field}");
+        }
     }
 
     #[test]
@@ -2611,5 +2745,106 @@ mod tests {
         let caps = provider.capabilities();
         assert!(caps.streaming);
         assert!(caps.vision);
+    }
+}
+
+#[cfg(test)]
+mod wire_contract_tests {
+    use super::*;
+    type WireProvider = OpenRouterProvider;
+    fn wire_provider() -> WireProvider {
+        WireProvider::new("fixture")
+    }
+    include!("wire_tests/chat.rs");
+}
+
+#[cfg(test)]
+mod merged_stream_boundary_tests {
+    use super::*;
+    use crate::Provider;
+    use futures_util::stream;
+
+    fn decode(wire: &str) -> crate::ProviderStream {
+        let diagnostics = crate::ProviderStreamDiagnostics::default();
+        diagnostics.set_request_id(ProviderRequestId::try_from("gen-header".to_owned()).unwrap());
+        let bytes = wire
+            .as_bytes()
+            .iter()
+            .map(|byte| Ok(bytes::Bytes::copy_from_slice(&[*byte])))
+            .collect::<Vec<_>>();
+        OpenRouterProvider::decode_stream_with_diagnostics(
+            Box::pin(stream::iter(bytes)),
+            Some("gen-header".into()),
+            diagnostics,
+        )
+    }
+
+    #[tokio::test]
+    async fn framed_stream_keeps_body_request_id_and_late_terminal_usage() {
+        let wire = "data: {\"id\":\"gen-body\",\ndata: \"choices\":[{\"delta\":{\"content\":\"🌍\"},\"finish_reason\":\"stop\"}]}\n\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":6}}\n\n\
+                    data: [DONE]\n\n";
+        let response = decode(wire);
+        let chunks = response
+            .stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            response.diagnostics.request_id(),
+            Some(ProviderRequestId::try_from("gen-body".to_owned()).unwrap())
+        );
+        assert_eq!(
+            chunks.iter().map(|c| c.delta.as_str()).collect::<String>(),
+            "🌍"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.usage.as_ref().is_some_and(|u| u.output_tokens == Some(6)))
+        );
+        assert_eq!(
+            chunks.last().unwrap().termination,
+            Some(ProviderTermination::Complete)
+        );
+    }
+
+    #[tokio::test]
+    async fn late_native_errors_and_missing_done_keep_safe_request_facts() {
+        let prefix = "data: {\"id\":\"gen-body\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+        for native_error in [false, true] {
+            let suffix = if native_error {
+                "data: {\"choices\":[{\"delta\":{},\"error\":{\"code\":503,\"message\":\"private payload\",\"metadata\":{\"error_type\":\"provider_unavailable\"}}}]}\n\ndata: [DONE]\n\n"
+            } else {
+                ""
+            };
+            let response = decode(&(prefix.to_owned() + suffix));
+            let chunks = response.stream.collect::<Vec<_>>().await;
+            assert!(!chunks.iter().any(|c| c.as_ref().is_ok_and(|c| c.is_final)));
+            let error = chunks.iter().find_map(|c| c.as_ref().err()).unwrap();
+            let facts = OpenRouterProvider::new("fixture")
+                .classify_failure(error)
+                .unwrap();
+            assert_eq!(facts.request_id, response.diagnostics.request_id());
+            assert_eq!(
+                facts.request_id,
+                Some(ProviderRequestId::try_from("gen-body".to_owned()).unwrap())
+            );
+            if native_error {
+                assert_eq!(
+                    facts.class,
+                    pioneer_protocol::ProviderFailureClass::Provider5xx
+                );
+                assert_eq!(
+                    facts.error_reason,
+                    ProviderErrorReason::from_openrouter_code("provider_unavailable")
+                );
+                assert!(!format!("{error:#?}").contains("private"));
+            } else {
+                assert!(crate::failure::provider_stream_incomplete(error).is_some());
+            }
+        }
     }
 }

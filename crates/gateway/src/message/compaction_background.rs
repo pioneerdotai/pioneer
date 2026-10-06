@@ -146,7 +146,10 @@ impl MessageProcessor {
         if !self.agent_manager.has_context_controller().await {
             return Ok(());
         }
-        self.reconcile_compaction_lifecycle().await?;
+        let lifecycle_result = self.reconcile_compaction_lifecycle().await;
+        if lifecycle_result.is_err() {
+            warn!("compaction lifecycle maintenance deferred after storage failure");
+        }
         let store = self.crud_store.with_maintenance_access();
         let finished = {
             let mut jobs = self.completed_history_checks.lock().await;
@@ -255,72 +258,160 @@ impl MessageProcessor {
                 },
             );
         }
-        Ok(())
+        lifecycle_result
+    }
+    fn defer_compaction_lifecycle(&self) {
+        // Local scheduling only: when storage cannot persist a deferral, durable
+        // backoff is unproven. Preserve the debt and let the common poll proceed.
+        *self
+            .compaction_lifecycle_not_before
+            .write()
+            .expect("lifecycle schedule lock") =
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(5));
     }
     async fn reconcile_compaction_lifecycle(&self) -> anyhow::Result<()> {
-        use crate::compaction::CompactionObserver;
+        use futures_util::FutureExt;
+        use pioneer_crud::compaction::CompactionLifecycleStorageError;
+        if self
+            .compaction_lifecycle_not_before
+            .read()
+            .expect("lifecycle schedule lock")
+            .is_some_and(|due| tokio::time::Instant::now() < due)
+        {
+            return Ok(());
+        }
+        let mut storage_error = None;
         let processor = Arc::new(self.scoped_with_database_class(SqliteWriteClass::Maintenance));
         let store = &processor.crud_store;
-        let after = self
-            .compaction_recovery_cursor
-            .read()
-            .map_err(|_| anyhow::anyhow!("recovery cursor unavailable"))?
-            .clone();
-        let rows = store
-            .compaction_lifecycle_recovery(SystemCompactionClock::default().now_ms(), &after)
-            .await?;
-        *self
-            .compaction_recovery_cursor
-            .write()
-            .map_err(|_| anyhow::anyhow!("recovery cursor unavailable"))? =
-            rows.last().map(|row| row.id.clone()).unwrap_or_default();
-        for row in rows {
-            // Advance even if a row fails. A poison record cannot starve the
-            // remainder; the cursor wraps and permits a later bounded retry.
-            let result = async {
-                let token = CancellationToken::new();
-                let Some(_lease) = processor
-                    .compaction_coordinator
-                    .acquire(
-                        &row.workspace_id,
-                        &row.thread_id,
-                        crate::compaction::ContextWorkPriority::Background,
-                        &token,
-                    )
-                    .await?
-                else {
-                    return Ok::<_, anyhow::Error>(());
-                };
-                if row.status == "running" {
-                    let (status, outcome) = if row.cancelled {
-                        ("cancelled", "cancelled")
-                    } else {
-                        ("failed", "deadline")
-                    };
-                    store.compaction_finish(&row.id, status, outcome).await?;
+        let clock = || i64::try_from(SystemCompactionClock::default().now_ms()).unwrap_or(i64::MAX);
+        // One shared input budget: 4 seed + 4 scope + 8 pending. Neither an
+        // outer lock-race retry nor per-row repair can rediscover this batch.
+        for seed in [true, false] {
+            let result =
+                std::panic::AssertUnwindSafe(store.compaction_expand_lifecycle_scope(seed, &clock))
+                    .catch_unwind()
+                    .await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error))
+                    if error
+                        .downcast_ref::<CompactionLifecycleStorageError>()
+                        .is_some() =>
+                {
+                    warn!("compaction lifecycle scope bookkeeping unavailable");
+                    self.defer_compaction_lifecycle();
+                    storage_error.get_or_insert(error);
                 }
-                if let Some(state) = store.compaction_reconcile_runner_state(&row.id).await? {
-                    let hub = Arc::new(pioneer_runtime_events::ExecutionEventHub::new());
-                    let observer = crate::compaction::HubCompactionObserver {
-                        hub: hub.clone(),
-                        processor: Arc::downgrade(&processor),
-                        lifecycle_store: store.as_ref().clone(),
-                        workspace: row.workspace_id,
-                        thread: row.thread_id,
-                        turn: row.turn_id,
-                    };
-                    let result = observer.terminal(&row.id, &state).await;
-                    hub.shutdown_progress().await;
-                    result?;
-                }
-                Ok::<_, anyhow::Error>(())
-            }
-            .await;
-            if result.is_err() {
-                warn!("failed to reconcile compaction lifecycle record");
+                _ => warn!("failed to expand compaction lifecycle scope"),
             }
         }
-        Ok(())
+        let rows = match store.compaction_due_lifecycle(clock()).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!("compaction lifecycle discovery unavailable");
+                self.defer_compaction_lifecycle();
+                storage_error.get_or_insert(error);
+                Vec::new()
+            }
+        };
+        for row in rows {
+            let result = std::panic::AssertUnwindSafe(async {
+                let Some(claim) = store.compaction_claim_lifecycle(&row, &clock).await? else {
+                    return Ok(());
+                };
+                let Some(prepared) = store.compaction_prepare_lifecycle(&claim, clock()).await?
+                else {
+                    return Ok(());
+                };
+                let token = CancellationToken::new();
+                let scope = prepared
+                    .scope()
+                    .map(|(w, t, u)| (w.to_owned(), t.to_owned(), u.to_owned()));
+                let _lease = if let Some((workspace, thread, _)) = &scope {
+                    let Some(lease) = processor
+                        .compaction_coordinator
+                        .acquire(
+                            workspace,
+                            thread,
+                            crate::compaction::ContextWorkPriority::Background,
+                            &token,
+                        )
+                        .await?
+                    else {
+                        return Ok(());
+                    };
+                    Some(lease)
+                } else {
+                    None
+                };
+                let event = if prepared.needs_publication() {
+                    let (workspace, thread, turn) = scope
+                        .ok_or_else(|| anyhow::anyhow!("compaction lifecycle scope missing"))?;
+                    let item = crate::compaction::HubCompactionObserver::item(
+                        prepared.operation_id(),
+                        prepared
+                            .state()
+                            .ok_or_else(|| anyhow::anyhow!("compaction runner missing"))?,
+                        true,
+                    );
+                    Some(AgentDurableEvent::ItemCompleted {
+                        notification: pioneer_protocol::ItemCompletedNotification {
+                            workspace_id: workspace,
+                            thread_id: thread,
+                            turn_id: turn,
+                            item,
+                        },
+                    })
+                } else {
+                    None
+                };
+                let canonical = event.as_ref().map(|event| match event {
+                    AgentDurableEvent::ItemCompleted { notification } => {
+                        pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification.clone())
+                    }
+                    _ => unreachable!(),
+                });
+                if store
+                    .compaction_repair_lifecycle(
+                        prepared,
+                        canonical,
+                        chrono::Utc::now().timestamp(),
+                    )
+                    .await?
+                {
+                    if let Some(event) = event {
+                        let thread = match &event {
+                            AgentDurableEvent::ItemCompleted { notification } => {
+                                notification.thread_id.clone()
+                            }
+                            _ => unreachable!(),
+                        };
+                        processor.kick_native_turn_event_deliveries();
+                        processor
+                            .agent_manager
+                            .publish_committed(&thread, event)
+                            .await;
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .catch_unwind()
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error))
+                    if error
+                        .downcast_ref::<CompactionLifecycleStorageError>()
+                        .is_some() =>
+                {
+                    warn!("compaction lifecycle candidate bookkeeping unavailable");
+                    self.defer_compaction_lifecycle();
+                    storage_error.get_or_insert(error);
+                }
+                _ => warn!("failed to reconcile compaction lifecycle record"),
+            }
+        }
+        storage_error.map_or(Ok(()), Err)
     }
     async fn run_completed_history_check(
         self: &Arc<Self>,

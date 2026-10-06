@@ -224,38 +224,67 @@ pub(super) async fn run_agent_loop(
     let mut last_turn_observation: Option<(String, super::ExecutionTurnObservation)> = None;
     let mut next_turn_run_id: u64 = 1;
 
-    macro_rules! commit_or_stop {
-        ($event:expr $(,)?) => {
-            if !publish_loop_durable_event(
-                event_hub.as_ref(),
-                $event,
-                active_turn_control
-                    .as_ref()
-                    .map(TurnExecutionControl::cancellation_token),
-            )
-            .await
-            {
-                error!(
-                    thread_id = %thread_id,
-                    "stopping agent loop after durable event commit was exhausted"
-                );
-                return;
+    macro_rules! handle_loop_commit {
+        ($outcome:expr) => {
+            let outcome = $outcome;
+            let outcome = if outcome == LoopDurableCommitOutcome::CooperativeCancellation
+                && active_turn_id.as_deref().is_some_and(|turn_id|
+                    active_turn_control.as_ref().is_some_and(|control| control.has_durable_cancellation(turn_id))) {
+                LoopDurableCommitOutcome::SupersededByDurableInterruption
+            } else { outcome };
+            match outcome {
+                LoopDurableCommitOutcome::Committed => {}
+                LoopDurableCommitOutcome::SupersededByDurableInterruption => {
+                    if let Some(control) = active_turn_control.as_ref() { control.cancel_all_attempts(); }
+                    if let Some(task) = active_turn_task.take() {
+                        wait_for_turn_task_shutdown(task.into_join_handle()).await;
+                    }
+                    if let Some(turn_id) = active_turn_id.clone() {
+                        record_turn_observation!(turn_id, super::ExecutionTurnObservation {
+                            status: super::ExecutionTurnStatus::Interrupted,
+                            message: None,
+                        });
+                    }
+                    clear_active_turn_control!();
+                    active_turn_request = None;
+                    active_recovery = None;
+                    last_turn_request = None;
+                    last_runtime_snapshot = None;
+                    continue;
+                }
+                LoopDurableCommitOutcome::CooperativeCancellation => {
+                    // Cooperative process control alone is not a durable result.
+                    debug!(thread_id = %thread_id, "stopping agent loop after cooperative commit cancellation");
+                    return;
+                }
+                LoopDurableCommitOutcome::PermanentRejection { .. } => {
+                    // The publisher emitted the one ERROR for this refusal.
+                    debug!(thread_id = %thread_id, "stopping agent loop after permanent durable event rejection");
+                    return;
+                }
             }
         };
     }
 
-    // A terminal boundary must finish even after cooperative cancellation was
-    // signalled.  Cancellation fences provider/tool work; it must not cancel
-    // the durable terminal commit or its atomically activated obligations.
+    macro_rules! commit_or_stop {
+        ($event:expr $(,)?) => {
+            handle_loop_commit!(
+                publish_loop_durable_event(
+                    event_hub.as_ref(),
+                    $event,
+                    active_turn_control
+                        .as_ref()
+                        .map(TurnExecutionControl::cancellation_token)
+                )
+                .await
+            );
+        };
+    }
+
+    // Cooperative cancellation must not cancel a terminal commit.
     macro_rules! commit_terminal_or_stop {
         ($event:expr $(,)?) => {
-            if !publish_loop_durable_event(event_hub.as_ref(), $event, None).await {
-                error!(
-                    thread_id = %thread_id,
-                    "stopping agent loop after terminal durable event commit was exhausted"
-                );
-                return;
-            }
+            handle_loop_commit!(publish_loop_durable_event(event_hub.as_ref(), $event, None).await);
         };
     }
 
@@ -445,6 +474,9 @@ pub(super) async fn run_agent_loop(
                     continue;
                 }
 
+                let run_id = next_turn_run_id;
+                next_turn_run_id = next_turn_run_id.saturating_add(1);
+
                 active_turn_id = Some(turn_id.clone());
                 active_turn_request = Some(turn_request.clone());
                 last_turn_request = Some(turn_request.clone());
@@ -453,9 +485,6 @@ pub(super) async fn run_agent_loop(
                 active_recovery = None;
                 last_turn_observation = None;
                 let task_recovery = None;
-
-                let run_id = next_turn_run_id;
-                next_turn_run_id = next_turn_run_id.saturating_add(1);
 
                 let turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
                 active_turn_control = Some(turn_control.clone());
@@ -1043,27 +1072,56 @@ pub(super) async fn run_agent_loop(
                 let runtime_snapshot = active_runtime_snapshot.clone();
                 let recovery = active_recovery.clone();
                 let reason_for_dispatch = reason.clone();
-                let interrupted_dispatch = synthesize_post_turn_failure_dispatch(
-                    workspace_id.as_str(),
-                    thread_id.as_str(),
-                    turn_id.as_str(),
-                    turn_request_snapshot.as_ref(),
-                    TurnPostTurnStatus::Interrupted,
-                    reason_for_dispatch.clone(),
-                );
-                prepare_terminal_effects_or_stop!(
-                    turn_id,
-                    active_turn_run_id.unwrap_or(0),
-                    runtime_snapshot.as_ref(),
-                    interrupted_dispatch,
-                    Some(format!("parent turn cancelled: {reason_for_dispatch}")),
-                );
-                commit_terminal_or_stop!(AgentDurableEvent::TurnInterrupted {
-                    thread_id: thread_id.clone(),
-                    turn_id: turn_id.clone(),
-                    reason,
-                    recovery,
-                },);
+                let durable_cancellation = active_turn_control
+                    .as_ref()
+                    .is_some_and(|control| control.has_durable_cancellation(&turn_id));
+                if !durable_cancellation {
+                    // A direct caller may cancel during the initial registration
+                    // ACK. Finish registration from the captured turn context;
+                    // no cancellation token is treated as a durable receipt.
+                    let Some(snapshot) = runtime_snapshot.as_ref() else {
+                        error!(
+                            commit_error_code = "cancellation_context_missing",
+                            event_kind = "turn_interrupted",
+                            "native cancellation lost its immutable runtime context"
+                        );
+                        return;
+                    };
+                    let context_dispatch = synthesize_post_turn_failure_dispatch(
+                        &workspace_id,
+                        &thread_id,
+                        &turn_id,
+                        turn_request_snapshot.as_ref(),
+                        TurnPostTurnStatus::Interrupted,
+                        String::new(),
+                    );
+                    let preparation = crate::post_turn::identify_native_cancellation(
+                        terminal_effect_preparation(
+                            &workspace_id,
+                            &thread_id,
+                            &turn_id,
+                            active_turn_run_id.unwrap_or(0),
+                            snapshot,
+                            context_dispatch,
+                            Some(String::new()),
+                        ),
+                    );
+                    commit_terminal_or_stop!(
+                        AgentDurableEvent::NativeCancellationContextPrepared {
+                            preparation,
+                            initial_turn: recovery.is_none()
+                                && turn_request_snapshot
+                                    .as_ref()
+                                    .is_some_and(|r| r.execution_window_index == 1),
+                        }
+                    );
+                    commit_terminal_or_stop!(AgentDurableEvent::TurnInterrupted {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        reason,
+                        recovery,
+                    },);
+                }
                 record_turn_observation!(
                     turn_id,
                     super::ExecutionTurnObservation {
@@ -1074,6 +1132,8 @@ pub(super) async fn run_agent_loop(
                 clear_active_turn_control!();
                 active_turn_request = None;
                 active_recovery = None;
+                last_turn_request = None;
+                last_runtime_snapshot = None;
             }
             AgentCommand::ObserveTurn { turn_id, ack } => {
                 let observation = if active_turn_id.as_deref() == Some(turn_id.as_str()) {
@@ -1465,6 +1525,13 @@ pub(super) async fn run_agent_loop(
 
                 let _ = ack.send(Ok(()));
             }
+            AgentCommand::DurableStartRejected { turn_id, run_id } => {
+                if active_turn_id.as_deref() == Some(&turn_id) && active_turn_run_id == Some(run_id)
+                {
+                    // Registration emitted the single safe ERROR. No provider ran.
+                    return;
+                }
+            }
             AgentCommand::Shutdown => {
                 if let Some(control) = active_turn_control.as_ref() {
                     control.cancel_all_attempts();
@@ -1497,6 +1564,57 @@ fn spawn_turn_task(
     let owner = turn_control.completion.clone();
     let panic_owner = owner.clone();
     let handle = tokio::spawn(turn_flow_future(async move {
+        // Admission ACK remains process control; provider/tool work cannot begin
+        // until its immutable cancellation description has a durable ACK.
+        let initial_turn = recovery.is_none() && turn_request.execution_window_index == 1;
+        let cancellation_dispatch = if initial_turn {
+            synthesize_post_turn_failure_dispatch(
+                &workspace_id,
+                &thread_id,
+                &turn_request.turn_id,
+                Some(&turn_request),
+                TurnPostTurnStatus::Interrupted,
+                String::new(),
+            )
+        } else {
+            None
+        };
+        let mut cancellation_context =
+            crate::post_turn::identify_native_cancellation(terminal_effect_preparation(
+                &workspace_id,
+                &thread_id,
+                &turn_request.turn_id,
+                run_id,
+                &runtime_snapshot,
+                cancellation_dispatch,
+                Some(String::new()),
+            ));
+        if !initial_turn {
+            cancellation_context.effects.clear();
+        }
+        match publish_loop_durable_event(
+            &event_hub,
+            AgentDurableEvent::NativeCancellationContextPrepared {
+                preparation: cancellation_context,
+                initial_turn,
+            },
+            Some(turn_control.cancellation_token()),
+        )
+        .await
+        {
+            LoopDurableCommitOutcome::Committed => {}
+            LoopDurableCommitOutcome::PermanentRejection { .. } => {
+                let _ = command_tx
+                    .send(AgentCommand::DurableStartRejected {
+                        turn_id: turn_request.turn_id.clone(),
+                        run_id,
+                    })
+                    .await;
+                return;
+            }
+            _ => return,
+        }
+
         let NativeTurnRuntimeSnapshot {
             context_controller,
             generation: _,
@@ -1509,6 +1627,7 @@ fn spawn_turn_task(
             hook_runtime,
             tool_bundle_artifacts,
             post_turn_hook_dispatch_policy: _,
+            interrupted_hook_snapshot: _,
             permission_approval_broker,
         } = runtime_snapshot;
         let missing_context_recovery = turn_request.execution_options.context_overflow_recovery
@@ -1832,11 +1951,61 @@ async fn execute_turn_flow(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopDurableCommitOutcome {
+    Committed,
+    CooperativeCancellation,
+    SupersededByDurableInterruption,
+    PermanentRejection { code: &'static str, attempt: u32 },
+}
+
+fn loop_durable_event_kind(event: &AgentDurableEvent) -> &'static str {
+    match event {
+        AgentDurableEvent::ToolOutputRecorded { .. } => "tool_output_recorded",
+        AgentDurableEvent::PromptManifestCompiled { .. } => "prompt_manifest_compiled",
+        AgentDurableEvent::TurnSkillsResolved { .. } => "turn_skills_resolved",
+        AgentDurableEvent::TurnCapabilitiesResolved { .. } => "turn_capabilities_resolved",
+        AgentDurableEvent::SkillAuditEvents { .. } => "skill_audit_events",
+        AgentDurableEvent::TurnPermissionAudit { .. } => "turn_permission_audit",
+        AgentDurableEvent::TurnLlmContextAppended { .. } => "turn_llm_context_appended",
+        AgentDurableEvent::TurnProviderHistoryAppended { .. } => "turn_provider_history_appended",
+        AgentDurableEvent::ItemStarted { .. } => "item_started",
+        AgentDurableEvent::ItemCompleted { .. } => "item_completed",
+        AgentDurableEvent::TurnFinalizationPrepared { .. } => "turn_finalization_prepared",
+        AgentDurableEvent::ItemToolRetryScheduled { .. } => "item_tool_retry_scheduled",
+        AgentDurableEvent::ItemToolRetryResolved { .. } => "item_tool_retry_resolved",
+        AgentDurableEvent::ItemToolRetryExhausted { .. } => "item_tool_retry_exhausted",
+        AgentDurableEvent::TurnToolLoopBudgetExceeded { .. } => "turn_tool_loop_budget_exceeded",
+        AgentDurableEvent::TurnExecutionWindowStarted { .. } => "turn_execution_window_started",
+        AgentDurableEvent::TurnExecutionWindowExhausted { .. } => "turn_execution_window_exhausted",
+        AgentDurableEvent::TurnExecutionWindowCheckpointed { .. } => {
+            "turn_execution_window_checkpointed"
+        }
+        AgentDurableEvent::TurnExecutionWindowContinued { .. } => "turn_execution_window_continued",
+        AgentDurableEvent::TurnExecutionWindowBlocked { .. } => "turn_execution_window_blocked",
+        AgentDurableEvent::ProviderFailureDetected { .. } => "provider_failure_detected",
+        AgentDurableEvent::RecoveryAttemptSucceeded { .. } => "recovery_attempt_succeeded",
+        AgentDurableEvent::NativeCancellationContextPrepared { .. } => {
+            "native_cancellation_context_prepared"
+        }
+        AgentDurableEvent::NativeTerminalEffectsPrepared { .. } => {
+            "native_terminal_effects_prepared"
+        }
+        AgentDurableEvent::TurnCompleted { .. } => "turn_completed",
+        AgentDurableEvent::TurnFailed { .. } => "turn_failed",
+        AgentDurableEvent::TurnBlocked { .. } => "turn_blocked",
+        AgentDurableEvent::TurnInterrupted { .. } => "turn_interrupted",
+        AgentDurableEvent::TaskEvent { .. } => "task_event",
+        AgentDurableEvent::ThreadLineageCreated { .. } => "thread_lineage_created",
+    }
+}
+
 async fn publish_loop_durable_event(
     event_hub: &AgentEventHub,
     event: AgentDurableEvent,
     cancellation: Option<CancellationToken>,
-) -> bool {
+) -> LoopDurableCommitOutcome {
+    let event_kind = loop_durable_event_kind(&event);
     const COMMIT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
     let mut attempt = 0_u32;
     loop {
@@ -1847,24 +2016,32 @@ async fn publish_loop_durable_event(
         );
         let result = if let Some(cancellation) = cancellation.as_ref() {
             tokio::select! {
-                _ = cancellation.cancelled() => return false,
+                _ = cancellation.cancelled() => return LoopDurableCommitOutcome::CooperativeCancellation,
                 result = commit => result,
             }
         } else {
             commit.await
         };
         match result {
-            Ok(Ok(())) => return true,
+            Ok(Ok(())) => return LoopDurableCommitOutcome::Committed,
+            Ok(Err(pioneer_runtime_events::ExecutionEventHubError::CommitRejected(rejection)))
+                if rejection.kind() == pioneer_runtime_events::DurableCommitRejectionKind::SupersededByDurableInterruption =>
+            {
+                return LoopDurableCommitOutcome::SupersededByDurableInterruption;
+            }
             Ok(Err(pioneer_runtime_events::ExecutionEventHubError::CommitRejected(rejection)))
                 if !rejection.is_retryable() =>
             {
                 error!(
                     attempt,
                     commit_error_code = rejection.code(),
-                    error = %rejection,
+                    event_kind,
                     "durable agent-loop event was permanently rejected"
                 );
-                return false;
+                return LoopDurableCommitOutcome::PermanentRejection {
+                    code: rejection.code(),
+                    attempt,
+                };
             }
             Ok(Err(error)) => {
                 // One error event identifies one continuous outage period;
@@ -1910,7 +2087,7 @@ async fn publish_loop_durable_event(
             .min(30_000);
         if let Some(cancellation) = cancellation.as_ref() {
             tokio::select! {
-                _ = cancellation.cancelled() => return false,
+                _ = cancellation.cancelled() => return LoopDurableCommitOutcome::CooperativeCancellation,
                 _ = sleep(Duration::from_millis(delay_ms)) => {}
             }
         } else {
@@ -1974,14 +2151,22 @@ fn terminal_effect_preparation(
             .post_turn_hook_dispatch_policy
             .should_dispatch(dispatch.status())
     {
-        effects.push(crate::post_turn::prepare_dispatch_effect(
-            turn_id,
-            runtime_snapshot
-                .hook_runtime
-                .as_ref()
-                .expect("checked hook runtime"),
-            dispatch,
-        ));
+        effects.push(if dispatch.status() == TurnPostTurnStatus::Interrupted {
+            crate::post_turn::prepare_interrupted_dispatch_effect(
+                turn_id,
+                runtime_snapshot.interrupted_hook_snapshot.as_deref(),
+                dispatch,
+            )
+        } else {
+            crate::post_turn::prepare_dispatch_effect(
+                turn_id,
+                runtime_snapshot
+                    .hook_runtime
+                    .as_ref()
+                    .expect("checked hook runtime"),
+                dispatch,
+            )
+        });
     }
 
     if runtime_snapshot.task_tool_provider.is_some()
@@ -2067,7 +2252,7 @@ fn turn_request_user_text(input: &[UserInput]) -> String {
 mod tests {
     use super::{
         ExecutionWindowTotalBudgetBlockKind, ExecutionWindowTotalBudgetDecision,
-        TurnExecutionUsageCounters, decide_execution_window_total_budget,
+        LoopDurableCommitOutcome, TurnExecutionUsageCounters, decide_execution_window_total_budget,
         publish_loop_durable_event,
     };
     use pioneer_protocol::AgentDurableEvent;
@@ -2100,11 +2285,15 @@ mod tests {
             "durable event no longer has execution authority",
         )));
 
-        assert!(
-            !timeout(Duration::from_secs(1), publisher)
+        assert_eq!(
+            timeout(Duration::from_secs(1), publisher)
                 .await
                 .expect("permanent rejection should stop immediately")
-                .expect("publisher task")
+                .expect("publisher task"),
+            LoopDurableCommitOutcome::PermanentRejection {
+                code: "execution_fenced",
+                attempt: 1
+            }
         );
     }
 
@@ -2130,12 +2319,121 @@ mod tests {
             .expect("retry attempt");
         receiver.acknowledge_last(Ok(()));
 
-        assert!(
+        assert_eq!(
             timeout(Duration::from_secs(1), publisher)
                 .await
                 .expect("retry should finish")
-                .expect("publisher task")
+                .expect("publisher task"),
+            LoopDurableCommitOutcome::Committed
         );
+    }
+
+    #[tokio::test]
+    async fn cooperative_cancellation_is_not_a_durable_ack() {
+        let hub = ExecutionEventHub::with_capacity(4, 4);
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        assert_eq!(
+            publish_loop_durable_event(&hub, completed_event("cancelled"), Some(token)).await,
+            LoopDurableCommitOutcome::CooperativeCancellation
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_supersession_is_distinct_from_permanent_rejection() {
+        let hub = Arc::new(ExecutionEventHub::with_capacity(4, 4));
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        let publisher = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                publish_loop_durable_event(&hub, completed_event("superseded"), None).await
+            })
+        };
+        receiver.recv().await.unwrap();
+        receiver.acknowledge_last(Err(
+            DurableCommitRejection::superseded_by_durable_interruption(),
+        ));
+        assert_eq!(
+            publisher.await.unwrap(),
+            LoopDurableCommitOutcome::SupersededByDurableInterruption
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_preserves_event_and_retries_until_ack() {
+        let hub = Arc::new(ExecutionEventHub::with_capacity(4, 4));
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        let publisher = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                publish_loop_durable_event(&hub, completed_event("timeout"), None).await
+            })
+        };
+        let first = receiver.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let second = receiver.recv().await.unwrap();
+        assert_eq!(first, second);
+        receiver.acknowledge_last(Ok(()));
+        assert_eq!(
+            publisher.await.unwrap(),
+            LoopDurableCommitOutcome::Committed
+        );
+    }
+
+    #[test]
+    fn real_sentry_mapper_captures_one_safe_rejection_and_no_supersession() {
+        use tracing_subscriber::prelude::*;
+        const CANARY: &str = "private-user-payload-canary";
+        // Keep two independent dispatchers alive: tracing-core's single-dispatch
+        // fast path computes new callsite interest from the registering thread's
+        // default. Parallel publisher tests have no default subscriber and can
+        // otherwise cache Interest::never for our shared ERROR callsite. Neither
+        // dispatcher is installed globally; only this thread uses the Sentry one.
+        let interest_guard = tracing::Dispatch::new(tracing_subscriber::registry());
+        let events = sentry::test::with_captured_events(|| {
+            let subscriber = tracing::Dispatch::new(
+                tracing_subscriber::registry().with(pioneer_observability::sentry_tracing_layer()),
+            );
+            tracing::dispatcher::with_default(&subscriber, || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        for rejection in [
+                            DurableCommitRejection::superseded_by_durable_interruption(),
+                            DurableCommitRejection::permanent(
+                                "execution_fenced",
+                                "execution ownership was rejected",
+                            ),
+                            DurableCommitRejection::permanent(
+                                "native_preparation_rejected",
+                                "immutable preparation conflicts",
+                            ),
+                        ] {
+                            let hub = ExecutionEventHub::with_capacity(4, 4);
+                            let mut receiver = hub.take_durable_receiver().await.unwrap();
+                            let publish =
+                                publish_loop_durable_event(&hub, completed_event(CANARY), None);
+                            let acknowledge = async {
+                                receiver.recv().await.unwrap();
+                                receiver.acknowledge_last(Err(rejection));
+                            };
+                            let _ = tokio::join!(publish, acknowledge);
+                        }
+                    });
+            });
+        });
+        drop(interest_guard);
+        assert_eq!(events.len(), 2);
+        for event in events {
+            assert_eq!(event.level, sentry::Level::Error);
+            let encoded = serde_json::to_string(&event).unwrap();
+            assert!(!encoded.contains(CANARY));
+            assert!(encoded.contains("commit_error_code"));
+            assert!(encoded.contains("event_kind"));
+            assert!(!encoded.contains("exhausted"));
+        }
     }
 
     fn total_budget(

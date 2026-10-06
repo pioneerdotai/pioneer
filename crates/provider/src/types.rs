@@ -836,6 +836,8 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     pub tools: Option<Vec<ToolDefinition>>,
     pub tool_choice: Option<ToolChoice>,
+    /// true permits multiple calls (it does not require them); false requires
+    /// at most one call per response and must be enforced or rejected locally.
     pub parallel_tool_calls: Option<bool>,
     pub reasoning: Option<ReasoningConfig>,
     pub compiled_prompt: Option<CompiledPromptPayload>,
@@ -859,6 +861,7 @@ impl EmbeddingRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddingResponse {
     pub embeddings: Vec<Vec<f32>>,
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1006,7 +1009,7 @@ impl ProviderTermination {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TokenUsage {
     /// Full effective input, including cache reads/writes exactly once.
     /// None means unreported, never zero by implication.

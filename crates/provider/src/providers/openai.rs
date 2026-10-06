@@ -1,3 +1,6 @@
+#[cfg(test)]
+use super::embedding::ordered_vectors;
+use super::embedding::validate_input;
 use crate::{
     attachments::{
         AttachmentOperationError, AttachmentPipelineConfig, AttachmentTransportKind,
@@ -9,7 +12,7 @@ use crate::{
     reasoning_registry,
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
     tools::parse::parse_tool_calls,
-    tools::stream::{IncrementalLineDecoder, sse_data},
+    tools::stream::IncrementalSseDecoder,
     types::{
         ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, InputContentType,
         InputTypeSupport, ProviderCapabilities, ProviderFailureClassification,
@@ -36,8 +39,9 @@ use pioneer_protocol::{
 pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 
 #[derive(Clone, Copy)]
-struct OpenAiEmbeddingModelDefinition {
-    id: &'static str,
+pub(super) struct OpenAiEmbeddingModelDefinition {
+    pub(super) id: &'static str,
+    pub(super) dimension: usize,
     name: &'static str,
     description: &'static str,
 }
@@ -45,20 +49,29 @@ struct OpenAiEmbeddingModelDefinition {
 const OPENAI_EMBEDDING_MODELS: &[OpenAiEmbeddingModelDefinition] = &[
     OpenAiEmbeddingModelDefinition {
         id: "text-embedding-3-small",
+        dimension: 1536,
         name: "Text Embedding 3 Small",
         description: "1536-dimensional embedding model optimized for cost and latency.",
     },
     OpenAiEmbeddingModelDefinition {
         id: "text-embedding-3-large",
+        dimension: 3072,
         name: "Text Embedding 3 Large",
         description: "3072-dimensional embedding model optimized for higher retrieval quality.",
     },
     OpenAiEmbeddingModelDefinition {
         id: "text-embedding-ada-002",
+        dimension: 1536,
         name: "Text Embedding Ada 002",
         description: "Legacy 1536-dimensional embedding model.",
     },
 ];
+
+pub(super) fn embedding_model_definition(
+    id: &str,
+) -> Option<&'static OpenAiEmbeddingModelDefinition> {
+    OPENAI_EMBEDDING_MODELS.iter().find(|model| model.id == id)
+}
 
 pub struct OpenAiProvider {
     api_key: String,
@@ -240,16 +253,7 @@ struct ApiEmbeddingRequest {
     encoding_format: &'static str,
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiEmbeddingResponse {
-    data: Vec<ApiEmbeddingData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApiEmbeddingData {
-    embedding: Vec<f32>,
-    index: usize,
-}
+type ApiEmbeddingResponse = super::embedding::IndexedEmbeddingResponse;
 
 // ── SSE streaming response types ────────────────────────────────────────────
 
@@ -943,6 +947,198 @@ fn reasoning_effort_for_openai_request(reasoning: Option<ReasoningConfig>) -> Op
     }
 }
 
+// The same decoder is used by HTTP transport and in-memory regression fixtures.
+impl OpenAiProvider {
+    pub(super) fn decode_stream(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
+
+        tokio::spawn(async move {
+            let mut decoder = IncrementalSseDecoder::default();
+            let mut tool_call_accumulator = StreamToolCallAccumulator::default();
+            let mut terminal_reason = None;
+
+            tokio::pin!(byte_stream);
+
+            while let Some(result) = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = byte_stream.next() => result,
+            } {
+                let bytes = match result {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        if tx.send(Err(anyhow!(e))).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+
+                let lines = match decoder.push(bytes.as_ref()) {
+                    Ok(lines) => lines,
+                    Err(error) => {
+                        if tx.send(Err(error)).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+                for frame in lines {
+                    let data = frame.data.as_str();
+
+                    if data.trim() == "[DONE]" {
+                        let terminal = terminal_reason
+                            .take()
+                            .map(StreamChunk::final_chunk_with)
+                            .ok_or_else(|| {
+                                crate::failure::ProviderStreamIncomplete::DoneWithoutFinishReason
+                                    .into()
+                            });
+                        let _ = tx.send(terminal).await;
+                        return;
+                    }
+
+                    match serde_json::from_str::<StreamResponse>(data) {
+                        Ok(resp) => {
+                            if terminal_reason.is_some()
+                                && resp.choices.iter().any(|choice| choice.delta.has_payload())
+                            {
+                                let _ = tx
+                                    .send(Err(anyhow!("provider sent payload after finish_reason")))
+                                    .await;
+                                return;
+                            }
+                            if let Some(usage) = resp.usage {
+                                if tx
+                                    .send(Ok(StreamChunk::usage(TokenUsage {
+                                        input_tokens: usage.prompt_tokens,
+                                        output_tokens: usage.completion_tokens,
+                                    })))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            if let Some(error) = resp.error {
+                                let status = error
+                                    .code
+                                    .as_ref()
+                                    .and_then(serde_json::Value::as_u64)
+                                    .and_then(|code| u16::try_from(code).ok());
+                                let outcome = crate::failure::native_chat_stream_error(
+                                    &error.description(),
+                                    status,
+                                );
+                                let _ = tx.send(Err(outcome)).await;
+                                return;
+                            }
+                            for choice in resp.choices {
+                                if terminal_reason.is_some() {
+                                    if choice.finish_reason.as_deref().is_some_and(|reason| {
+                                        Some(ProviderTermination::from_openai_reason(reason))
+                                            != terminal_reason
+                                    }) {
+                                        let _ = tx
+                                            .send(Err(anyhow!(
+                                                "provider changed finish_reason after completion"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    if choice.delta.has_payload() {
+                                        let _ = tx
+                                            .send(Err(anyhow!(
+                                                "provider sent payload after finish_reason"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                if let Some(rc) =
+                                    choice.delta.reasoning_content.or(choice.delta.reasoning)
+                                {
+                                    if !rc.is_empty() {
+                                        if tx.send(Ok(StreamChunk::reasoning(rc))).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                if let Some(content) = choice.delta.content {
+                                    if !content.is_empty() {
+                                        if tx.send(Ok(StreamChunk::delta(content))).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                if let Some(tool_calls) = choice.delta.tool_calls {
+                                    tool_call_accumulator.ingest(tool_calls);
+                                }
+                                if let Some(function_call) = choice.delta.function_call {
+                                    tool_call_accumulator.ingest(vec![StreamToolCallDelta {
+                                        index: Some(0),
+                                        id: None,
+                                        function: Some(function_call),
+                                        name: None,
+                                        arguments: None,
+                                    }]);
+                                }
+                                if let Some(reason) = choice.finish_reason {
+                                    let termination =
+                                        ProviderTermination::from_openai_reason(reason.as_str());
+                                    let tool_calls = match tool_call_accumulator.take_tool_calls() {
+                                        Ok(calls) => calls,
+                                        Err(error) => {
+                                            if tx.send(Err(error)).await.is_err() {
+                                                return;
+                                            }
+                                            return;
+                                        }
+                                    };
+                                    if !tool_calls.is_empty() {
+                                        if tx
+                                            .send(Ok(StreamChunk::tool_calls(tool_calls)))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    // Usage may arrive in a later empty-choices frame.
+                                    terminal_reason = Some(termination);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            if tx
+                                .send(Err(anyhow!("malformed OpenAI SSE frame")))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+            let terminal = match decoder.finish() {
+                Err(error) => Err(error),
+                Ok(_) => {
+                    Err(crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into())
+                }
+            };
+            let _ = tx.send(terminal).await;
+        });
+
+        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Box::pin(chunk_stream)
+    }
+}
+
 #[async_trait]
 impl crate::traits::Provider for OpenAiProvider {
     fn name(&self) -> &str {
@@ -979,16 +1175,19 @@ impl crate::traits::Provider for OpenAiProvider {
         error
             .downcast_ref::<OpenAiFileUploadError>()
             .map(|upload| upload.classification.clone())
+            .or_else(|| crate::failure::classify_stream_error(error))
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider_async(
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let prepared = self
             .materialize_upload_references(request.model.as_str(), prepared)
@@ -1072,13 +1271,15 @@ impl crate::traits::Provider for OpenAiProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let prepared = prepare_messages_for_provider_async(
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let prepared = self
             .materialize_upload_references(request.model.as_str(), prepared)
@@ -1118,184 +1319,7 @@ impl crate::traits::Provider for OpenAiProvider {
             "provider_stream",
         );
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
-
-        tokio::spawn(async move {
-            let mut decoder = IncrementalLineDecoder::default();
-            let mut tool_call_accumulator = StreamToolCallAccumulator::default();
-            let mut terminal_reason = None;
-
-            tokio::pin!(byte_stream);
-
-            while let Some(result) = tokio::select! {
-                biased;
-                _ = tx.closed() => return,
-                result = byte_stream.next() => result,
-            } {
-                let bytes = match result {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        if tx.send(Err(anyhow!(e))).await.is_err() {
-                            return;
-                        }
-                        return;
-                    }
-                };
-
-                let lines = match decoder.push(bytes.as_ref()) {
-                    Ok(lines) => lines,
-                    Err(error) => {
-                        if tx.send(Err(error)).await.is_err() {
-                            return;
-                        }
-                        return;
-                    }
-                };
-                for line in lines {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let Some(data) = sse_data(line) else {
-                        continue;
-                    };
-
-                    if data.trim() == "[DONE]" {
-                        let terminal = terminal_reason
-                            .take()
-                            .map(StreamChunk::final_chunk_with)
-                            .ok_or_else(|| {
-                                anyhow!("provider stream ended without a finish_reason")
-                            });
-                        let _ = tx.send(terminal).await;
-                        return;
-                    }
-
-                    match serde_json::from_str::<StreamResponse>(data) {
-                        Ok(resp) => {
-                            if terminal_reason.is_some()
-                                && resp.choices.iter().any(|choice| choice.delta.has_payload())
-                            {
-                                let _ = tx
-                                    .send(Err(anyhow!("provider sent payload after finish_reason")))
-                                    .await;
-                                return;
-                            }
-                            if let Some(usage) = resp.usage {
-                                if tx
-                                    .send(Ok(StreamChunk::usage(TokenUsage {
-                                        input_tokens: usage.prompt_tokens,
-                                        output_tokens: usage.completion_tokens,
-                                    })))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            if let Some(error) = resp.error {
-                                if tx
-                                    .send(Err(anyhow!(
-                                        "OpenAI stream error: {}",
-                                        error.description()
-                                    )))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                return;
-                            }
-                            for choice in resp.choices {
-                                if terminal_reason.is_some() {
-                                    if choice.delta.has_payload() {
-                                        let _ = tx
-                                            .send(Err(anyhow!(
-                                                "provider sent payload after finish_reason"
-                                            )))
-                                            .await;
-                                        return;
-                                    }
-                                    continue;
-                                }
-                                if let Some(rc) =
-                                    choice.delta.reasoning_content.or(choice.delta.reasoning)
-                                {
-                                    if !rc.is_empty() {
-                                        if tx.send(Ok(StreamChunk::reasoning(rc))).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                                if let Some(content) = choice.delta.content {
-                                    if !content.is_empty() {
-                                        if tx.send(Ok(StreamChunk::delta(content))).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                                if let Some(tool_calls) = choice.delta.tool_calls {
-                                    tool_call_accumulator.ingest(tool_calls);
-                                }
-                                if let Some(function_call) = choice.delta.function_call {
-                                    tool_call_accumulator.ingest(vec![StreamToolCallDelta {
-                                        index: Some(0),
-                                        id: None,
-                                        function: Some(function_call),
-                                        name: None,
-                                        arguments: None,
-                                    }]);
-                                }
-                                if let Some(reason) = choice.finish_reason {
-                                    let termination =
-                                        ProviderTermination::from_openai_reason(reason.as_str());
-                                    let tool_calls = match tool_call_accumulator.take_tool_calls() {
-                                        Ok(calls) => calls,
-                                        Err(error) => {
-                                            if tx.send(Err(error)).await.is_err() {
-                                                return;
-                                            }
-                                            return;
-                                        }
-                                    };
-                                    if !tool_calls.is_empty() {
-                                        if tx
-                                            .send(Ok(StreamChunk::tool_calls(tool_calls)))
-                                            .await
-                                            .is_err()
-                                        {
-                                            return;
-                                        }
-                                    }
-                                    // Usage may arrive in a later empty-choices frame.
-                                    terminal_reason = Some(termination);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            if tx
-                                .send(Err(anyhow!("malformed OpenAI SSE frame: {e}")))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                            return;
-                        }
-                    }
-                }
-            }
-            let terminal = match decoder.finish() {
-                Err(error) => Err(error),
-                Ok(_) => terminal_reason
-                    .map(StreamChunk::final_chunk_with)
-                    .ok_or_else(|| anyhow!("provider stream ended before a terminal marker")),
-            };
-            let _ = tx.send(terminal).await;
-        });
-
-        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(Box::pin(chunk_stream))
+        Ok(Self::decode_stream(byte_stream))
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -1338,6 +1362,15 @@ impl crate::traits::Provider for OpenAiProvider {
     }
 
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+        validate_input(&request.model, &request.input)?;
+        super::embedding::EmbeddingBatchLimits::for_model(
+            "openai",
+            &request.model,
+            None,
+            None,
+            None,
+        )?
+        .validate_request(&request.input)?;
         let expected_count = request.input.len();
         let api_request = ApiEmbeddingRequest {
             model: request.model,
@@ -1358,25 +1391,13 @@ impl crate::traits::Provider for OpenAiProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let mut data = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
+        let response = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
             response,
             Default::default(),
             "provider_response",
         )
-        .await?
-        .data;
-        data.sort_by_key(|item| item.index);
-        if data.len() != expected_count {
-            return Err(anyhow!(
-                "OpenAI embedding response returned {} embeddings for {} inputs",
-                data.len(),
-                expected_count
-            ));
-        }
-
-        Ok(EmbeddingResponse {
-            embeddings: data.into_iter().map(|item| item.embedding).collect(),
-        })
+        .await?;
+        response.into_response(expected_count)
     }
 }
 
@@ -1425,6 +1446,68 @@ fn openai_embedding_model_info(model: &OpenAiEmbeddingModelDefinition) -> Provid
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn g09_direct_embedding_adapter_rejects_invalid_batch_before_network() {
+        let provider = OpenAiProvider::new("unused-fixture-key");
+        for model in [
+            "text-embedding-3-small",
+            "text-embedding-3-large",
+            "text-embedding-ada-002",
+        ] {
+            let error = provider
+                .embed(EmbeddingRequest::new(model, vec!["short".to_owned(); 2048]))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("budget"));
+            let error = provider
+                .embed(EmbeddingRequest::new(model, vec![" a".repeat(8193)]))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("token budget"));
+        }
+    }
+
+    #[test]
+    fn embedding_wire_contract_has_actual_endpoint_model_input_encoding_and_usage() {
+        let provider = OpenAiProvider::new("fixture-key");
+        assert_eq!(
+            provider.embeddings_url(),
+            "https://api.openai.com/v1/embeddings"
+        );
+        let input = vec!["first".to_owned(), "second".to_owned()];
+        let body = ApiEmbeddingRequest {
+            model: "text-embedding-3-small".to_owned(),
+            input: input.clone(),
+            encoding_format: "float",
+        };
+        assert_eq!(
+            serde_json::to_value(body).unwrap(),
+            serde_json::json!({
+                "model": "text-embedding-3-small", "input": input, "encoding_format": "float"
+            })
+        );
+        let response: ApiEmbeddingResponse = serde_json::from_value(serde_json::json!({
+            "data": [{"index":1,"embedding":[2.0]},{"index":0,"embedding":[1.0]}],
+            "usage": {"prompt_tokens":7,"total_tokens":7}
+        }))
+        .unwrap();
+        assert_eq!(
+            ordered_vectors(response.data, 2).unwrap(),
+            vec![vec![1.0], vec![2.0]]
+        );
+        let usage: crate::types::TokenUsage = response.usage.unwrap().into();
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(0));
+        for bad in [serde_json::json!(-1), serde_json::json!(0.5)] {
+            assert!(
+                serde_json::from_value::<ApiEmbeddingResponse>(serde_json::json!({
+                    "data":[{"index":bad,"embedding":[1.0]}]
+                }))
+                .is_err()
+            );
+        }
+    }
     use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
     use crate::traits::Provider;
     use crate::types::{
@@ -1869,4 +1952,14 @@ mod tests {
         assert!(caps.streaming);
         assert!(caps.vision);
     }
+}
+
+#[cfg(test)]
+mod wire_contract_tests {
+    use super::*;
+    type WireProvider = OpenAiProvider;
+    fn wire_provider() -> WireProvider {
+        WireProvider::new("fixture")
+    }
+    include!("wire_tests/chat.rs");
 }

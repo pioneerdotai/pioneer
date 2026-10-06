@@ -402,6 +402,18 @@ where
         pioneer_observability::turn_startup::current_key(),
         future,
     );
+    // Test-local reporting scopes must follow the same owned request tasks as
+    // the admission path. This does not install a global subscriber or change
+    // production reporting; it only preserves the fixture's local capture.
+    #[cfg(test)]
+    let future = {
+        use sentry::SentryFutureExt;
+        use tracing::instrument::WithSubscriber;
+        let dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
+        future
+            .with_subscriber(dispatch)
+            .bind_hub(sentry::Hub::current())
+    };
     AbortOnDropMessageTask::new(tokio::spawn(future))
         .join()
         .await
@@ -553,11 +565,25 @@ pub struct MessageProcessor {
     invitation_gateway_base_url: Arc<pioneer_protocol::GatewayBaseUrl>,
     summary_config: Arc<summary::SummaryConfig>,
     compaction_settings: Arc<StdRwLock<pioneer_compaction::CompactionSettings>>,
-    compaction_recovery_cursor: Arc<StdRwLock<String>>,
     completed_history_checks: Arc<Mutex<HashMap<(String, String), compaction_background::OwnedHistoryCheck>>>,
+    compaction_lifecycle_not_before: Arc<StdRwLock<Option<tokio::time::Instant>>>,
     #[cfg(test)]
     completed_history_preparation_barrier:
         Arc<compaction_background::CompletedHistoryPreparationBarrier>,
+    #[cfg(test)]
+    task_history_preparation_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
+    #[cfg(test)]
+    task_cli_terminal_preparation_finished: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    task_cli_admission_failure: Arc<std::sync::Mutex<Option<turn_handlers::TurnStartFailure>>>,
+    #[cfg(test)]
+    task_cli_preparation_attempts: Arc<AtomicU64>,
+    #[cfg(test)]
+    task_cli_history_revalidation_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
+    #[cfg(test)]
+    task_cli_readiness_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
+    #[cfg(test)]
+    task_output_capture_failures: Arc<std::sync::Mutex<HashMap<String, anyhow::Error>>>,
     pub(crate) compaction_coordinator: Arc<crate::compaction::ContextCompactionCoordinator>,
     cli_history_shutdown: tokio_util::sync::CancellationToken,
     #[cfg(test)]
@@ -572,6 +598,10 @@ pub struct MessageProcessor {
     predispatch_cli_turn_read_failures: Arc<Mutex<HashSet<String>>>,
     #[cfg(test)]
     claude_boundary_write_failures: Arc<Mutex<HashSet<String>>>,
+    #[cfg(test)]
+    native_cancellation_finish_barrier: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    #[cfg(test)]
+    native_cancellation_materialization_failure: Arc<Mutex<Option<sea_orm::DbErr>>>,
     workspace_compaction_settings: Arc<StdRwLock<std::collections::BTreeMap<String, crate::settings::WorkspaceCompactionSettings>>>,
     agent_listener_tasks: Arc<Mutex<HashMap<String, AgentListenerTask>>>,
     agent_listener_generation: Arc<AtomicU64>,
@@ -657,6 +687,9 @@ pub struct MessageProcessor {
     voice_input_supervisor: Option<Arc<VoiceInputSupervisor>>,
     self_improvement_supervisor: Option<Arc<crate::self_improvement::supervisor::SelfImprovementSupervisor>>,
     gateway_settings_update_lock: Arc<Mutex<()>>,
+    pub(crate) voice_finalizations: crate::voice::finalization::VoiceFinalizations,
+    #[cfg(test)]
+    pub(crate) voice_test_transcriber: Option<crate::voice::transcription::TestVoiceSpeechTranscriber>,
     pub(crate) voice_sessions: GatewayVoiceSessionStore,
     pub(crate) voice_session_buffers: GatewayVoiceSessionBufferStore,
 }
@@ -1147,10 +1180,24 @@ impl MessageProcessor {
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
             ),
-            compaction_recovery_cursor: Arc::new(StdRwLock::new(String::new())),
             completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
+            compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
             #[cfg(test)]
             completed_history_preparation_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            task_history_preparation_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_terminal_preparation_finished: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            task_cli_admission_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_preparation_attempts: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            task_cli_history_revalidation_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_readiness_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_output_capture_failures: Arc::new(std::sync::Mutex::new(HashMap::new())),
             compaction_coordinator: Arc::new(
                 crate::compaction::ContextCompactionCoordinator::default(),
             ),
@@ -1167,6 +1214,10 @@ impl MessageProcessor {
             predispatch_cli_turn_read_failures: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             claude_boundary_write_failures: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            native_cancellation_finish_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            native_cancellation_materialization_failure: Arc::new(Mutex::new(None)),
             workspace_compaction_settings: Arc::new(StdRwLock::new(
                 std::collections::BTreeMap::new(),
             )),
@@ -1268,6 +1319,9 @@ impl MessageProcessor {
             voice_input_supervisor: None,
             self_improvement_supervisor: None,
             gateway_settings_update_lock: Arc::new(Mutex::new(())),
+            voice_finalizations: Default::default(),
+            #[cfg(test)]
+            voice_test_transcriber: None,
             voice_sessions: GatewayVoiceSessionStore::default(),
             voice_session_buffers: GatewayVoiceSessionBufferStore::default(),
         }
@@ -1517,6 +1571,13 @@ impl MessageProcessor {
                 );
             }
         }
+    }
+
+    /// Close ingress slots, suppress unclaimed outcomes, and drain the bounded
+    /// workers before database shutdown. Native calls retain ownership to completion.
+    pub async fn shutdown_voice_finalizations(&self) {
+        self.voice_finalizations.close();
+        self.voice_finalizations.tasks.wait().await;
     }
 
     pub async fn shutdown_mcp_service(&self) {
@@ -2314,7 +2375,7 @@ impl MessageProcessor {
                 let now = now_timestamp_secs();
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
-                    retry_transient_storage_access(|| this.reconcile_terminal_task_child_turns(64)),
+                    this.reconcile_terminal_task_child_turns_with_retry(64),
                 )
                 .await
                 {
@@ -2323,10 +2384,7 @@ impl MessageProcessor {
                         "reconciled terminal child Turns with their TaskRun aggregates"
                     ),
                     Ok(_) => {}
-                    Err(error) => error!(
-                        error = %format!("{error:#}"),
-                        "task child terminal reconciler failed"
-                    ),
+                    Err(error) => tasks::report_task_child_reconciliation_error(error),
                 }
 
                 let result = crate::database::attribution::scope_database_workload_result(
@@ -2362,7 +2420,7 @@ impl MessageProcessor {
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
-                    retry_transient_storage_access(|| this.process_due_task_deliveries(now, 64)),
+                    this.process_due_task_deliveries(now, 64),
                 )
                 .await
                 {
@@ -2868,19 +2926,39 @@ impl MessageProcessor {
                     continue;
                 }
 
-                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    retry_transient_storage_access(|| {
-                        agent_action_tools::process_due_agent_action_outbox(&this, 64)
-                    }),
+                    // One input quantum. Report errors/back off only after all
+                    // independent known-committed rows have had their dispatch.
+                    agent_action_tools::process_due_agent_action_outbox(&this, 64),
                 )
                 .await
                 {
-                    record_resilience_worker_poll_error(
-                        "agent domain agent action outbox",
-                        &error,
-                        &mut transient_storage_poll_failed,
-                    );
+                    Ok(batch) => {
+                        if !batch.errors.is_empty() {
+                            tracing::warn!(
+                                delivered = batch.delivered,
+                                candidate_failures = batch.errors.len(),
+                                "agent action outbox quantum made partial progress"
+                            );
+                            transient_storage_poll_failed = true;
+                            for error in batch.errors {
+                                record_resilience_worker_poll_error(
+                                    "agent domain agent action outbox",
+                                    &error,
+                                    &mut transient_storage_poll_failed,
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        transient_storage_poll_failed = true;
+                        record_resilience_worker_poll_error(
+                            "agent domain agent action outbox",
+                            &error,
+                            &mut transient_storage_poll_failed,
+                        );
+                    }
                 }
                 if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
                     continue;
@@ -4568,10 +4646,24 @@ impl MessageProcessor {
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
             ),
-            compaction_recovery_cursor: Arc::new(StdRwLock::new(String::new())),
             completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
+            compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
             #[cfg(test)]
             completed_history_preparation_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            task_history_preparation_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_terminal_preparation_finished: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            task_cli_admission_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_preparation_attempts: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            task_cli_history_revalidation_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_readiness_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_output_capture_failures: Arc::new(std::sync::Mutex::new(HashMap::new())),
             compaction_coordinator: Arc::new(
                 crate::compaction::ContextCompactionCoordinator::default(),
             ),
@@ -4588,6 +4680,10 @@ impl MessageProcessor {
             predispatch_cli_turn_read_failures: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             claude_boundary_write_failures: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            native_cancellation_finish_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            native_cancellation_materialization_failure: Arc::new(Mutex::new(None)),
             workspace_compaction_settings: Arc::new(StdRwLock::new(
                 std::collections::BTreeMap::new(),
             )),
@@ -4681,6 +4777,9 @@ impl MessageProcessor {
             voice_input_supervisor: None,
             self_improvement_supervisor: None,
             gateway_settings_update_lock: Arc::new(Mutex::new(())),
+            voice_finalizations: Default::default(),
+            #[cfg(test)]
+            voice_test_transcriber: None,
             voice_sessions: GatewayVoiceSessionStore::default(),
             voice_session_buffers: GatewayVoiceSessionBufferStore::default(),
         }

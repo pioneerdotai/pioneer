@@ -5,7 +5,7 @@ use crate::{
     },
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
     tools::parse::parse_tool_calls,
-    tools::stream::{IncrementalLineDecoder, sse_data},
+    tools::stream::IncrementalSseDecoder,
     types::{
         ChatRequest, ChatResponse, InputContentType, ProviderCapabilities,
         ProviderInputCapabilities, ProviderTermination, ProviderTimeoutPolicy, Role, StreamChunk,
@@ -24,8 +24,12 @@ use serde::{Deserialize, Serialize};
 use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
+pub(crate) const GLOBAL_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
+pub(crate) const CN_CODING_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
+pub(crate) const GLOBAL_CODING_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 
 pub struct GlmProvider {
+    profile: &'static str,
     api_key: String,
     base_url: String,
     timeout_policy: ProviderTimeoutPolicy,
@@ -331,11 +335,17 @@ impl GlmProvider {
         timeout_policy: ProviderTimeoutPolicy,
     ) -> Self {
         Self {
+            profile: "glm",
             api_key: api_key.into(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
         }
+    }
+
+    pub(crate) fn with_profile(mut self, profile: &'static str) -> Self {
+        self.profile = profile;
+        self
     }
 
     fn audio_format_from_mime(mime: &str) -> String {
@@ -544,10 +554,206 @@ impl GlmProvider {
     }
 }
 
+// The same decoder is used by HTTP transport and in-memory regression fixtures.
+impl GlmProvider {
+    pub(super) fn decode_stream(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
+
+        tokio::spawn(async move {
+            let mut decoder = IncrementalSseDecoder::default();
+            let mut tool_call_accumulator = StreamToolCallAccumulator::default();
+            let mut terminal_reason = None;
+
+            tokio::pin!(byte_stream);
+
+            while let Some(result) = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = byte_stream.next() => result,
+            } {
+                let bytes = match result {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        if tx.send(Err(anyhow!(e))).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+
+                let lines = match decoder.push(bytes.as_ref()) {
+                    Ok(lines) => lines,
+                    Err(error) => {
+                        if tx.send(Err(error)).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+                for frame in lines {
+                    let data = frame.data.as_str();
+
+                    if data.trim() == "[DONE]" {
+                        let terminal = terminal_reason
+                            .take()
+                            .map(StreamChunk::final_chunk_with)
+                            .ok_or_else(|| {
+                                crate::failure::ProviderStreamIncomplete::DoneWithoutFinishReason
+                                    .into()
+                            });
+                        let _ = tx.send(terminal).await;
+                        return;
+                    }
+
+                    match serde_json::from_str::<StreamResponse>(data) {
+                        Ok(resp) => {
+                            if terminal_reason.is_some()
+                                && resp.choices.iter().any(|choice| choice.delta.has_payload())
+                            {
+                                let _ = tx
+                                    .send(Err(anyhow!("provider sent payload after finish_reason")))
+                                    .await;
+                                return;
+                            }
+                            if let Some(usage) = resp.usage {
+                                if tx
+                                    .send(Ok(StreamChunk::usage(TokenUsage {
+                                        input_tokens: usage.prompt_tokens,
+                                        output_tokens: usage.completion_tokens,
+                                    })))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            if let Some(error) = resp.error {
+                                let status = error
+                                    .code
+                                    .as_ref()
+                                    .and_then(serde_json::Value::as_u64)
+                                    .and_then(|code| u16::try_from(code).ok());
+                                let outcome = crate::failure::native_chat_stream_error(
+                                    &error.description(),
+                                    status,
+                                );
+                                let _ = tx.send(Err(outcome)).await;
+                                return;
+                            }
+                            for choice in resp.choices {
+                                if terminal_reason.is_some() {
+                                    if choice.finish_reason.as_deref().is_some_and(|reason| {
+                                        Some(ProviderTermination::from_openai_reason(reason))
+                                            != terminal_reason
+                                    }) {
+                                        let _ = tx
+                                            .send(Err(anyhow!(
+                                                "provider changed finish_reason after completion"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    if choice.delta.has_payload() {
+                                        let _ = tx
+                                            .send(Err(anyhow!(
+                                                "provider sent payload after finish_reason"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                if let Some(reasoning) =
+                                    choice.delta.reasoning_content.or(choice.delta.reasoning)
+                                {
+                                    if !reasoning.is_empty() {
+                                        if tx
+                                            .send(Ok(StreamChunk::reasoning(reasoning)))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                                if let Some(content) = choice.delta.content {
+                                    if !content.is_empty() {
+                                        if tx.send(Ok(StreamChunk::delta(content))).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                if let Some(tool_calls) = choice.delta.tool_calls {
+                                    tool_call_accumulator.ingest(tool_calls);
+                                }
+                                if let Some(function_call) = choice.delta.function_call {
+                                    tool_call_accumulator.ingest(vec![StreamToolCallDelta {
+                                        index: Some(0),
+                                        id: None,
+                                        function: Some(function_call),
+                                        name: None,
+                                        arguments: None,
+                                    }]);
+                                }
+                                if let Some(reason) = choice.finish_reason {
+                                    let termination =
+                                        ProviderTermination::from_openai_reason(&reason);
+                                    let tool_calls = match tool_call_accumulator.take_tool_calls() {
+                                        Ok(calls) => calls,
+                                        Err(error) => {
+                                            if tx.send(Err(error)).await.is_err() {
+                                                return;
+                                            }
+                                            return;
+                                        }
+                                    };
+                                    if !tool_calls.is_empty() {
+                                        if tx
+                                            .send(Ok(StreamChunk::tool_calls(tool_calls)))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    terminal_reason = Some(termination);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            if tx
+                                .send(Err(anyhow!("malformed GLM SSE frame")))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let terminal = match decoder.finish() {
+                Err(error) => Err(error),
+                Ok(_) => {
+                    Err(crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into())
+                }
+            };
+            let _ = tx.send(terminal).await;
+        });
+
+        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Box::pin(chunk_stream)
+    }
+}
+
 #[async_trait]
 impl crate::traits::Provider for GlmProvider {
     fn name(&self) -> &str {
-        "glm"
+        self.profile
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -562,13 +768,15 @@ impl crate::traits::Provider for GlmProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider_async(
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let api_request = ApiChatRequest {
             model: request.model,
@@ -645,13 +853,15 @@ impl crate::traits::Provider for GlmProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let prepared = prepare_messages_for_provider_async(
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let api_request = ApiChatRequest {
             model: request.model,
@@ -685,186 +895,7 @@ impl crate::traits::Provider for GlmProvider {
             "provider_stream",
         );
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
-
-        tokio::spawn(async move {
-            let mut decoder = IncrementalLineDecoder::default();
-            let mut tool_call_accumulator = StreamToolCallAccumulator::default();
-            let mut terminal_reason = None;
-
-            tokio::pin!(byte_stream);
-
-            while let Some(result) = tokio::select! {
-                biased;
-                _ = tx.closed() => return,
-                result = byte_stream.next() => result,
-            } {
-                let bytes = match result {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        if tx.send(Err(anyhow!(e))).await.is_err() {
-                            return;
-                        }
-                        return;
-                    }
-                };
-
-                let lines = match decoder.push(bytes.as_ref()) {
-                    Ok(lines) => lines,
-                    Err(error) => {
-                        if tx.send(Err(error)).await.is_err() {
-                            return;
-                        }
-                        return;
-                    }
-                };
-                for line in lines {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    let Some(data) = sse_data(line) else {
-                        continue;
-                    };
-
-                    if data.trim() == "[DONE]" {
-                        let terminal = terminal_reason
-                            .take()
-                            .map(StreamChunk::final_chunk_with)
-                            .ok_or_else(|| {
-                                anyhow!("provider stream ended without a finish_reason")
-                            });
-                        let _ = tx.send(terminal).await;
-                        return;
-                    }
-
-                    match serde_json::from_str::<StreamResponse>(data) {
-                        Ok(resp) => {
-                            if terminal_reason.is_some()
-                                && resp.choices.iter().any(|choice| choice.delta.has_payload())
-                            {
-                                let _ = tx
-                                    .send(Err(anyhow!("provider sent payload after finish_reason")))
-                                    .await;
-                                return;
-                            }
-                            if let Some(usage) = resp.usage {
-                                if tx
-                                    .send(Ok(StreamChunk::usage(TokenUsage {
-                                        input_tokens: usage.prompt_tokens,
-                                        output_tokens: usage.completion_tokens,
-                                    })))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            if let Some(error) = resp.error {
-                                if tx
-                                    .send(Err(anyhow!("GLM stream error: {}", error.description())))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                return;
-                            }
-                            for choice in resp.choices {
-                                if terminal_reason.is_some() {
-                                    if choice.delta.has_payload() {
-                                        let _ = tx
-                                            .send(Err(anyhow!(
-                                                "provider sent payload after finish_reason"
-                                            )))
-                                            .await;
-                                        return;
-                                    }
-                                    continue;
-                                }
-                                if let Some(reasoning) =
-                                    choice.delta.reasoning_content.or(choice.delta.reasoning)
-                                {
-                                    if !reasoning.is_empty() {
-                                        if tx
-                                            .send(Ok(StreamChunk::reasoning(reasoning)))
-                                            .await
-                                            .is_err()
-                                        {
-                                            return;
-                                        }
-                                    }
-                                }
-                                if let Some(content) = choice.delta.content {
-                                    if !content.is_empty() {
-                                        if tx.send(Ok(StreamChunk::delta(content))).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                                if let Some(tool_calls) = choice.delta.tool_calls {
-                                    tool_call_accumulator.ingest(tool_calls);
-                                }
-                                if let Some(function_call) = choice.delta.function_call {
-                                    tool_call_accumulator.ingest(vec![StreamToolCallDelta {
-                                        index: Some(0),
-                                        id: None,
-                                        function: Some(function_call),
-                                        name: None,
-                                        arguments: None,
-                                    }]);
-                                }
-                                if let Some(reason) = choice.finish_reason {
-                                    let termination =
-                                        ProviderTermination::from_openai_reason(&reason);
-                                    let tool_calls = match tool_call_accumulator.take_tool_calls() {
-                                        Ok(calls) => calls,
-                                        Err(error) => {
-                                            if tx.send(Err(error)).await.is_err() {
-                                                return;
-                                            }
-                                            return;
-                                        }
-                                    };
-                                    if !tool_calls.is_empty() {
-                                        if tx
-                                            .send(Ok(StreamChunk::tool_calls(tool_calls)))
-                                            .await
-                                            .is_err()
-                                        {
-                                            return;
-                                        }
-                                    }
-                                    terminal_reason = Some(termination);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            if tx
-                                .send(Err(anyhow!("malformed GLM SSE frame: {e}")))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                            return;
-                        }
-                    }
-                }
-            }
-
-            let terminal = match decoder.finish() {
-                Err(error) => Err(error),
-                Ok(_) => terminal_reason
-                    .map(StreamChunk::final_chunk_with)
-                    .ok_or_else(|| anyhow!("provider stream ended before a terminal marker")),
-            };
-            let _ = tx.send(terminal).await;
-        });
-
-        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(Box::pin(chunk_stream))
+        Ok(Self::decode_stream(byte_stream))
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -895,8 +926,8 @@ impl crate::traits::Provider for GlmProvider {
                 name: None,
                 description: None,
                 created: m.created,
-                provider: "glm".to_owned(),
-                owned_by: m.owned_by.or(Some("zhipu".to_owned())),
+                provider: self.name().to_owned(),
+                owned_by: m.owned_by,
                 limits: ProviderModelLimits::default(),
                 capabilities: ProviderModelCapabilities::default(),
                 transcription: None,
@@ -920,6 +951,33 @@ mod tests {
     use crate::attachments::prepare_messages_for_provider;
     use crate::traits::Provider;
     use crate::types::ChatMessage;
+
+    #[test]
+    fn region_product_defaults_and_override_keep_profile_identity() {
+        for (name, base) in [
+            ("glm", DEFAULT_BASE_URL),
+            ("zai", GLOBAL_BASE_URL),
+            ("glm-coding", CN_CODING_BASE_URL),
+            ("zai-coding", GLOBAL_CODING_BASE_URL),
+        ] {
+            let provider =
+                GlmProvider::with_base_url("dummy-key", format!("{base}/")).with_profile(name);
+            assert_eq!(provider.name(), name);
+            assert_eq!(
+                provider.chat_completions_url(),
+                format!("{base}/chat/completions")
+            );
+            assert_eq!(provider.models_url(), format!("{base}/models"));
+            let custom =
+                GlmProvider::with_base_url("dummy-key", "https://example.test/team/coding/")
+                    .with_profile(name);
+            assert_eq!(custom.name(), name);
+            assert_eq!(
+                custom.chat_completions_url(),
+                "https://example.test/team/coding/chat/completions"
+            );
+        }
+    }
 
     #[test]
     fn creates_with_api_key() {
@@ -998,4 +1056,14 @@ mod tests {
         assert!(caps.streaming);
         assert!(!caps.vision);
     }
+}
+
+#[cfg(test)]
+mod wire_contract_tests {
+    use super::*;
+    type WireProvider = GlmProvider;
+    fn wire_provider() -> WireProvider {
+        WireProvider::new("fixture")
+    }
+    include!("wire_tests/chat.rs");
 }

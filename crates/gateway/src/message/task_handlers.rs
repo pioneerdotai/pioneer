@@ -20,6 +20,46 @@ fn task_authorization_unavailable(
     crate::authorization::AuthorizationExternalError::Unavailable.response(request_id)
 }
 
+// Shared Task completion also serves revision. Preserve its reporting ownership
+// before the generic RPC path can format the internal source chain.
+fn task_revision_error_response(
+    request_id: RequestId,
+    mut error: anyhow::Error,
+) -> JsonRpcErrorResponse {
+    if let Some(failure) = error.downcast_mut::<pioneer_tasks::TaskStartFailure>() {
+        // Completion supplies a public error; retain a safe fallback for typed
+        // preparation errors that reach this boundary before completion.
+        if failure.public_error().is_none() {
+            let mut public_error = crate::public_error::build_public_error(
+                pioneer_protocol::PublicErrorCode::Internal,
+                pioneer_protocol::PublicErrorStage::Admission,
+            );
+            if let Some(correlation) = &failure.descriptor().correlation_id {
+                public_error.correlation_id = correlation.clone();
+            }
+            let placeholder = pioneer_tasks::TaskStartFailure::new(
+                failure.descriptor().stage,
+                failure.descriptor().cause,
+            );
+            *failure = std::mem::replace(failure, placeholder).with_public_error(public_error);
+        }
+        failure.report_in_place();
+        return crate::public_error::rpc_error_from_public_error(
+            Some(request_id),
+            INVALID_REQUEST_CODE,
+            failure
+                .public_error()
+                .expect("checked public error")
+                .clone(),
+        );
+    }
+    task_public_error(
+        Some(request_id),
+        pioneer_protocol::PublicErrorStage::Persistence,
+        format!("failed to revise task result: {error:#}"),
+    )
+}
+
 fn task_public_error(
     request_id: Option<RequestId>,
     stage: pioneer_protocol::PublicErrorStage,
@@ -1563,11 +1603,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    task_public_error(
-                        Some(request_id),
-                        pioneer_protocol::PublicErrorStage::Persistence,
-                        format!("failed to revise task result: {error:#}"),
-                    ),
+                    task_revision_error_response(request_id, error),
                 )
                 .await;
             }
@@ -2011,5 +2047,83 @@ impl MessageProcessor {
                 );
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod task_revision_failure_tests {
+    use super::*;
+    use pioneer_tasks::{TaskStartCause, TaskStartFailure, TaskStartStage};
+
+    #[test]
+    fn revision_rpc_reports_unreported_typed_errors_once_and_keeps_projection() {
+        for (cause, code, expected_events) in [
+            (
+                TaskStartCause::Unclassified,
+                pioneer_protocol::PublicErrorCode::Internal,
+                1,
+            ),
+            (
+                TaskStartCause::Policy,
+                pioneer_protocol::PublicErrorCode::PolicyDenied,
+                0,
+            ),
+            (
+                TaskStartCause::Validation,
+                pioneer_protocol::PublicErrorCode::InvalidInput,
+                0,
+            ),
+        ] {
+            for already_reported in [false, true] {
+                let ((response, public), events) =
+                    crate::public_error::test_support::capture_events(|| {
+                        let public = crate::public_error::build_public_error(
+                            code,
+                            pioneer_protocol::PublicErrorStage::Admission,
+                        );
+                        let failure = TaskStartFailure::new(TaskStartStage::CliAdmission, cause)
+                            .with_public_error(public.clone());
+                        let failure = if already_reported {
+                            failure.report()
+                        } else {
+                            failure
+                        };
+                        let request_id = RequestId::new("R".repeat(21)).unwrap();
+                        let response = task_revision_error_response(
+                            request_id.clone(),
+                            anyhow::Error::new(failure).context("PRIVATE_REVISION_CONTEXT"),
+                        );
+                        assert_eq!(response.id, Some(request_id));
+                        (response, public)
+                    });
+                assert_eq!(events.len(), expected_events);
+                assert_eq!(response.error.message, public.message);
+                assert_eq!(
+                    response.error.data.unwrap()["public_error"],
+                    serde_json::to_value(&public).unwrap()
+                );
+                assert!(
+                    !serde_json::to_string(&events)
+                        .unwrap()
+                        .contains("PRIVATE_REVISION_CONTEXT")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn independent_revision_failure_retains_its_own_error_diagnostic() {
+        let (_, events) = crate::public_error::test_support::capture_events(|| {
+            task_revision_error_response(
+                RequestId::new("R".repeat(21)).unwrap(),
+                anyhow::anyhow!("independent revision persistence failure"),
+            );
+        });
+        assert_eq!(events.len(), 1);
+        assert!(
+            serde_json::to_string(&events)
+                .unwrap()
+                .contains("independent revision persistence failure")
+        );
     }
 }

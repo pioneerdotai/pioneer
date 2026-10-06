@@ -2,10 +2,11 @@ use crate::attachments::{
     PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes,
     ensure_no_unrendered_attachments, prepare_messages_for_provider_async,
 };
+
 #[cfg(test)]
 use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
 use crate::reasoning_registry;
-use crate::tools::stream::{IncrementalLineDecoder, sse_data};
+use crate::tools::stream::IncrementalSseDecoder;
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
     ProviderInputCapabilities, ProviderReplayState, ProviderTermination, ProviderTimeoutPolicy,
@@ -52,7 +53,13 @@ struct ApiGenerateRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ApiContent {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_string",
+        skip_serializing_if = "String::is_empty"
+    )]
     role: String,
+    #[serde(default)]
     parts: Vec<ApiPart>,
 }
 
@@ -62,6 +69,7 @@ struct ApiSystemInstruction {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ApiPart {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<String>,
@@ -81,6 +89,7 @@ struct ApiPart {
         rename = "thoughtSignature",
         skip_serializing_if = "Option::is_none"
     )]
+    // REST bytes fields are base64 strings; retain the opaque representation.
     thought_signature: Option<String>,
 }
 
@@ -94,6 +103,11 @@ struct ApiInlineData {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiFileData {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_string",
+        skip_serializing_if = "String::is_empty"
+    )]
     mime_type: String,
     file_uri: String,
 }
@@ -104,6 +118,10 @@ struct ApiFunctionCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     name: String,
+    #[serde(
+        default = "empty_json_object",
+        deserialize_with = "deserialize_function_arguments"
+    )]
     args: serde_json::Value,
 }
 
@@ -173,6 +191,29 @@ struct ApiGenerateResponse {
     candidates: Vec<ApiCandidate>,
     #[serde(default)]
     usage_metadata: Option<ApiUsageMetadata>,
+    #[serde(default)]
+    error: Option<GeminiStreamError>,
+    #[serde(default)]
+    prompt_feedback: Option<ApiPromptFeedback>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiPromptFeedback {
+    #[serde(default)]
+    block_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiStreamError {
+    #[serde(default)]
+    code: Option<u16>,
+}
+
+impl GeminiStreamError {
+    fn outcome(&self) -> anyhow::Error {
+        crate::failure::NativeStreamStatusError::new("Gemini", self.code).into()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -319,6 +360,9 @@ impl GeminiProvider {
         request: &ChatRequest,
         prepared: &PreparedProviderMessages,
     ) -> Result<ApiGenerateRequest> {
+        let request = crate::tools::policy::prepare_request("gemini", request.clone())?;
+        let mut prepared = prepared.clone();
+        crate::tools::policy::prepare_history("gemini", &mut prepared.messages)?;
         let mut system_parts: Vec<ApiPart> = Vec::new();
         let mut contents: Vec<ApiContent> = Vec::new();
 
@@ -346,11 +390,14 @@ impl GeminiProvider {
 
                     if msg.role == Role::Tool {
                         let name = msg.name.clone().unwrap_or_else(|| "tool".to_owned());
+                        // FunctionResponse.response is a protobuf Struct, not an
+                        // arbitrary JSON value. Preserve scalar/array results inside it.
                         let response_payload =
-                            serde_json::from_str::<serde_json::Value>(msg.content.as_str())
-                                .unwrap_or_else(
-                                    |_| serde_json::json!({ "content": msg.content.clone() }),
-                                );
+                            match serde_json::from_str::<serde_json::Value>(msg.content.as_str()) {
+                                Ok(value) if value.is_object() => value,
+                                Ok(value) => serde_json::json!({ "content": value }),
+                                Err(_) => serde_json::json!({ "content": msg.content }),
+                            };
                         parts.push(ApiPart {
                             text: None,
                             inline_data: None,
@@ -417,7 +464,7 @@ impl GeminiProvider {
                                 function_call: Some(ApiFunctionCall {
                                     id: Some(call.id.clone()),
                                     name: call.name.clone(),
-                                    args: parse_json_or_string(call.arguments.as_str()),
+                                    args: parse_function_arguments(call.arguments.as_str())?,
                                 }),
                                 function_response: None,
                                 thought_signature: function_call_signatures
@@ -602,6 +649,13 @@ impl GeminiProvider {
     }
 
     fn extract_tool_calls(response: &ApiGenerateResponse) -> Vec<ProviderToolCall> {
+        Self::extract_tool_calls_with_offset(response, 0)
+    }
+
+    fn extract_tool_calls_with_offset(
+        response: &ApiGenerateResponse,
+        offset: usize,
+    ) -> Vec<ProviderToolCall> {
         let parts = match response
             .candidates
             .first()
@@ -620,7 +674,7 @@ impl GeminiProvider {
                 id: call
                     .id
                     .clone()
-                    .unwrap_or_else(|| format!("call_{}", index + 1)),
+                    .unwrap_or_else(|| format!("call_{}", offset + index + 1)),
                 name: call.name.clone(),
                 arguments: serde_json::to_string(&call.args).unwrap_or_else(|_| "{}".to_owned()),
             })
@@ -664,9 +718,220 @@ impl GeminiProvider {
     }
 }
 
-fn parse_json_or_string(raw: &str) -> serde_json::Value {
-    serde_json::from_str::<serde_json::Value>(raw)
-        .unwrap_or_else(|_| serde_json::Value::String(raw.to_owned()))
+fn deserialize_optional_string<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn empty_json_object() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+fn deserialize_function_arguments<'de, D>(
+    deserializer: D,
+) -> std::result::Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let arguments =
+        Option::<serde_json::Value>::deserialize(deserializer)?.unwrap_or_else(empty_json_object);
+    if !arguments.is_object() {
+        return Err(serde::de::Error::custom(
+            "Gemini functionCall args must be a JSON object",
+        ));
+    }
+    Ok(arguments)
+}
+
+fn parse_function_arguments(raw: &str) -> Result<serde_json::Value> {
+    let arguments: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|_| anyhow!("Gemini functionCall args must be a JSON object"))?;
+    if !arguments.is_object() {
+        return Err(anyhow!("Gemini functionCall args must be a JSON object"));
+    }
+    Ok(arguments)
+}
+
+// The same decoder is used by HTTP transport and in-memory regression fixtures.
+impl GeminiProvider {
+    pub(super) fn decode_stream(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
+
+        tokio::spawn(async move {
+            let mut decoder = IncrementalSseDecoder::default();
+            let mut last_tool_calls: Vec<ProviderToolCall> = Vec::new();
+            let mut terminal_reason = None;
+            let mut native_terminal_reason: Option<String> = None;
+            let mut tool_call_count = 0;
+            let mut provider_replay_state = None;
+
+            tokio::pin!(byte_stream);
+
+            while let Some(result) = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = byte_stream.next() => result,
+            } {
+                let bytes = match result {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        if tx.send(Err(anyhow!(e))).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+
+                let lines = match decoder.push(bytes.as_ref()) {
+                    Ok(lines) => lines,
+                    Err(error) => {
+                        if tx.send(Err(error)).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+                for frame in lines {
+                    let data = frame.data.as_str();
+
+                    match serde_json::from_str::<ApiGenerateResponse>(data) {
+                        Ok(resp) => {
+                            if let Some(error) = &resp.error {
+                                let _ = tx.send(Err(error.outcome())).await;
+                                return;
+                            }
+                            if resp
+                                .prompt_feedback
+                                .as_ref()
+                                .is_some_and(|feedback| feedback.block_reason.is_some())
+                            {
+                                let _ = tx
+                                    .send(Err(crate::failure::NativeStreamStatusError::new(
+                                        "Gemini blocked prompt",
+                                        None,
+                                    )
+                                    .into()))
+                                    .await;
+                                return;
+                            }
+                            if terminal_reason.is_some()
+                                && resp.candidates.iter().any(|candidate| {
+                                    candidate
+                                        .content
+                                        .as_ref()
+                                        .is_some_and(|content| !content.parts.is_empty())
+                                })
+                            {
+                                let _ = tx
+                                    .send(Err(anyhow!("Gemini sent content after finishReason")))
+                                    .await;
+                                return;
+                            }
+
+                            if let Some(usage) = Self::extract_usage(&resp) {
+                                if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
+                                    return;
+                                }
+                            }
+                            if let Some(state) = Self::extract_provider_replay_state(&resp) {
+                                provider_replay_state = Some(state);
+                            }
+                            if let Some(reasoning) = Self::extract_reasoning(&resp) {
+                                if !reasoning.is_empty() {
+                                    if tx
+                                        .send(Ok(StreamChunk::reasoning(reasoning)))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                            if let Some(text) = Self::extract_text(&resp) {
+                                if !text.is_empty() {
+                                    if tx.send(Ok(StreamChunk::delta(text))).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            let tool_calls =
+                                Self::extract_tool_calls_with_offset(&resp, tool_call_count);
+                            tool_call_count += tool_calls.len();
+                            if !tool_calls.is_empty() && tool_calls != last_tool_calls {
+                                last_tool_calls = tool_calls.clone();
+                                if tx
+                                    .send(Ok(StreamChunk::tool_calls(tool_calls)))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            if let Some(reason) = resp
+                                .candidates
+                                .first()
+                                .and_then(|candidate| candidate.finish_reason.as_deref())
+                            {
+                                if native_terminal_reason
+                                    .as_deref()
+                                    .is_some_and(|previous| previous != reason)
+                                {
+                                    let _ = tx
+                                        .send(Err(anyhow!("contradictory Gemini finish reason")))
+                                        .await;
+                                    return;
+                                }
+                                native_terminal_reason = Some(reason.to_owned());
+                                if let Some(state) = provider_replay_state.take() {
+                                    if tx
+                                        .send(Ok(StreamChunk::provider_replay_state(state)))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                let mut termination =
+                                    ProviderTermination::from_openai_reason(reason);
+                                if termination == ProviderTermination::Complete
+                                    && !last_tool_calls.is_empty()
+                                {
+                                    termination = ProviderTermination::ToolCalls;
+                                }
+                                terminal_reason = Some(termination);
+                            }
+                        }
+                        Err(_) => {
+                            if tx
+                                .send(Err(anyhow!("malformed Gemini SSE frame")))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let terminal = decoder.finish().and_then(|_| {
+                terminal_reason
+                    .map(StreamChunk::final_chunk_with)
+                    .ok_or_else(|| {
+                        crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into()
+                    })
+            });
+            let _ = tx.send(terminal).await;
+        });
+
+        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Box::pin(chunk_stream)
+    }
 }
 
 #[async_trait]
@@ -693,6 +958,7 @@ impl crate::traits::Provider for GeminiProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
         let model = request.model.clone();
         let prepared = prepare_messages_for_provider_async(
             self.name(),
@@ -761,6 +1027,7 @@ impl crate::traits::Provider for GeminiProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
         let model = request.model.clone();
         let prepared = prepare_messages_for_provider_async(
             self.name(),
@@ -791,144 +1058,7 @@ impl crate::traits::Provider for GeminiProvider {
             "provider_stream",
         );
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
-
-        tokio::spawn(async move {
-            let mut decoder = IncrementalLineDecoder::default();
-            let mut last_tool_calls: Vec<ProviderToolCall> = Vec::new();
-            let mut provider_replay_state = None;
-
-            tokio::pin!(byte_stream);
-
-            while let Some(result) = tokio::select! {
-                biased;
-                _ = tx.closed() => return,
-                result = byte_stream.next() => result,
-            } {
-                let bytes = match result {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        if tx.send(Err(anyhow!(e))).await.is_err() {
-                            return;
-                        }
-                        return;
-                    }
-                };
-
-                let lines = match decoder.push(bytes.as_ref()) {
-                    Ok(lines) => lines,
-                    Err(error) => {
-                        if tx.send(Err(error)).await.is_err() {
-                            return;
-                        }
-                        return;
-                    }
-                };
-                for line in lines {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    let Some(data) = sse_data(line) else {
-                        continue;
-                    };
-
-                    match serde_json::from_str::<ApiGenerateResponse>(data) {
-                        Ok(resp) => {
-                            if let Some(usage) = Self::extract_usage(&resp) {
-                                if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
-                                    return;
-                                }
-                            }
-                            if let Some(state) = Self::extract_provider_replay_state(&resp) {
-                                provider_replay_state = Some(state);
-                            }
-                            if let Some(reasoning) = Self::extract_reasoning(&resp) {
-                                if !reasoning.is_empty() {
-                                    if tx
-                                        .send(Ok(StreamChunk::reasoning(reasoning)))
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
-                                }
-                            }
-                            if let Some(text) = Self::extract_text(&resp) {
-                                if !text.is_empty() {
-                                    if tx.send(Ok(StreamChunk::delta(text))).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                            let tool_calls = Self::extract_tool_calls(&resp);
-                            if !tool_calls.is_empty() && tool_calls != last_tool_calls {
-                                last_tool_calls = tool_calls.clone();
-                                if tx
-                                    .send(Ok(StreamChunk::tool_calls(tool_calls)))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            if let Some(reason) = resp
-                                .candidates
-                                .first()
-                                .and_then(|candidate| candidate.finish_reason.as_deref())
-                            {
-                                if let Some(state) = provider_replay_state.take() {
-                                    if tx
-                                        .send(Ok(StreamChunk::provider_replay_state(state)))
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
-                                }
-                                let mut termination =
-                                    ProviderTermination::from_openai_reason(reason);
-                                if termination == ProviderTermination::Complete
-                                    && !last_tool_calls.is_empty()
-                                {
-                                    termination = ProviderTermination::ToolCalls;
-                                }
-                                if tx
-                                    .send(Ok(StreamChunk::final_chunk_with(termination)))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                return;
-                            }
-                        }
-                        Err(e) => {
-                            if tx
-                                .send(Err(anyhow!("malformed Gemini SSE frame: {e}")))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                            return;
-                        }
-                    }
-                }
-            }
-
-            let error = decoder
-                .finish()
-                .err()
-                .unwrap_or_else(|| anyhow!("Gemini stream ended before finishReason"));
-            if tx.send(Err(error)).await.is_err() {
-                return;
-            }
-        });
-
-        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(Box::pin(chunk_stream))
+        Ok(Self::decode_stream(byte_stream))
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -1044,6 +1174,34 @@ fn canonical_gemini_thinking_level(level: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_modes_and_parallel_limit_use_native_config_or_error() {
+        for (choice, expected) in [
+            (ToolChoice::Auto, "AUTO"),
+            (ToolChoice::None, "NONE"),
+            (ToolChoice::Required, "ANY"),
+            (
+                ToolChoice::Tool {
+                    name: "lookup".into(),
+                },
+                "ANY",
+            ),
+        ] {
+            let mut request = crate::tools::policy::test_request();
+            request.tool_choice = Some(choice);
+            let wire = GeminiProvider::build_request_result(&request).unwrap();
+            assert_eq!(
+                wire.tool_config.unwrap().function_calling_config.mode,
+                expected
+            );
+        }
+        let mut request = crate::tools::policy::test_request();
+        request.parallel_tool_calls = Some(false);
+        assert!(GeminiProvider::build_request_result(&request).is_err());
+        request.parallel_tool_calls = Some(true);
+        assert!(GeminiProvider::build_request_result(&request).is_ok());
+    }
+
     #[test]
     fn usage_prompt_includes_cached_content_once() {
         let response: super::ApiGenerateResponse = serde_json::from_value(serde_json::json!({
@@ -1189,7 +1347,11 @@ mod tests {
         );
         let request = ChatRequest {
             model: "gemini-3-flash-preview".to_owned(),
-            messages: vec![message],
+            messages: vec![
+                message,
+                ChatMessage::tool_result("call_1", "first", "{}"),
+                ChatMessage::tool_result("call_2", "second", "{}"),
+            ],
             temperature: None,
             max_tokens: None,
             tools: None,
@@ -1212,6 +1374,11 @@ mod tests {
             Some("opaque-signature")
         );
         assert!(rendered.contents[0].parts[1].thought_signature.is_none());
+        for (content, id) in rendered.contents[1..].iter().zip(["call_1", "call_2"]) {
+            let result = content.parts[0].function_response.as_ref().unwrap();
+            assert_eq!(result.id.as_deref(), Some(id));
+            assert!(content.parts[0].thought_signature.is_none());
+        }
     }
 
     #[test]
@@ -1621,3 +1788,43 @@ mod tests {
         assert_eq!(api_req.contents[1].role, "model");
     }
 }
+
+#[cfg(test)]
+mod stream_call_identity_tests {
+    use super::*;
+    #[test]
+    fn full_native_function_parts_get_round_local_ids_across_events() {
+        // Construct the native struct so this identity test is independent of
+        // the JSON casing correction owned by remediation group 2.
+        let response = ApiGenerateResponse {
+            candidates: vec![ApiCandidate {
+                finish_reason: None,
+                content: Some(ApiContent {
+                    role: "model".into(),
+                    parts: vec![ApiPart {
+                        text: None,
+                        inline_data: None,
+                        file_data: None,
+                        thought: None,
+                        function_response: None,
+                        thought_signature: None,
+                        function_call: Some(ApiFunctionCall {
+                            id: None,
+                            name: "read".into(),
+                            args: serde_json::json!({"path":"x"}),
+                        }),
+                    }],
+                }),
+            }],
+            usage_metadata: None,
+            error: None,
+            prompt_feedback: None,
+        };
+        let first = GeminiProvider::extract_tool_calls_with_offset(&response, 0);
+        let next = GeminiProvider::extract_tool_calls_with_offset(&response, 1);
+        assert_ne!(first[0].id, next[0].id);
+    }
+}
+#[cfg(test)]
+#[path = "wire_tests/gemini.rs"]
+mod wire_contract_tests;

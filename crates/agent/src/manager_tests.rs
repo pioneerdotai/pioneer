@@ -3928,6 +3928,7 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
         | AgentDurableEvent::TurnExecutionWindowBlocked { .. }
         | AgentDurableEvent::TurnProviderHistoryAppended { .. }
         | AgentDurableEvent::TurnPermissionAudit { .. }
+        | AgentDurableEvent::NativeCancellationContextPrepared { .. }
         | AgentDurableEvent::NativeTerminalEffectsPrepared { .. } => None,
         AgentDurableEvent::ProviderFailureDetected {
             thread_id,
@@ -16229,3 +16230,258 @@ async fn compaction_boundary_prepares_each_follow_up_before_provider() {
 
 #[path = "manager_tests_stop_admission.rs"]
 mod stop_admission;
+
+#[tokio::test(start_paused = true)]
+async fn durable_gateway_cancellation_cleans_actor_and_allows_next_turn_without_preparation() {
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "pending",
+        Arc::new(PendingProvider),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let thread = "thread_durable_cancel";
+    let workspace = "workspace_durable_cancel";
+    let turn = "turn_durable_cancel";
+    manager.ensure_thread(thread, workspace).await.unwrap();
+    let mut receiver = manager.take_durable_receiver(thread).await.unwrap();
+    let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
+    let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let listener = {
+        let observed = observed.clone();
+        tokio::spawn(async move {
+            let mut registered_tx = Some(registered_tx);
+            while let Some(event) = receiver.recv().await {
+                if matches!(&event, AgentDurableEvent::NativeCancellationContextPrepared { preparation, .. } if preparation.turn_id == turn)
+                    && let Some(tx) = registered_tx.take()
+                {
+                    tx.send(()).unwrap();
+                }
+                observed.lock().await.push(event);
+                receiver.acknowledge_last(Ok(()));
+            }
+        })
+    };
+    manager
+        .start_test_turn_with_default_profile(
+            thread,
+            turn,
+            ThreadMode::Chat,
+            "openai/gpt-4o",
+            "pending",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "original request".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    registered_rx.await.unwrap();
+    let generation = manager.turn_owner_generation(thread, turn).await.unwrap();
+    let receipt = pioneer_protocol::NativeDurableCancellationReceipt {
+        workspace_id: workspace.to_owned(),
+        thread_id: thread.to_owned(),
+        turn_id: turn.to_owned(),
+        execution_owner_id: "test-owner".to_owned(),
+        canonical_event_id: "test-canonical-cancellation".to_owned(),
+    };
+    assert!(
+        manager
+            .observe_durable_cancellation(receipt.clone(), generation + 1)
+            .await
+            .is_err()
+    );
+    let mut wrong_workspace = receipt.clone();
+    wrong_workspace.workspace_id = "different-workspace".to_owned();
+    assert!(
+        manager
+            .observe_durable_cancellation(wrong_workspace, generation)
+            .await
+            .is_err()
+    );
+    manager
+        .observe_durable_cancellation(receipt, generation)
+        .await
+        .unwrap();
+    manager.cancel_turn(thread, turn, "cancel").await.unwrap();
+    // This observation uses the mailbox as a barrier after CancelTurn cleanup.
+    let sender = manager
+        .state
+        .read()
+        .await
+        .threads
+        .get(thread)
+        .unwrap()
+        .command_tx
+        .clone();
+    let (ack, response) = tokio::sync::oneshot::channel();
+    sender
+        .send(AgentCommand::ObserveTurn {
+            turn_id: turn.to_owned(),
+            ack,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        response.await.unwrap().unwrap().unwrap().status,
+        ExecutionTurnStatus::Interrupted
+    );
+    assert!(!observed.lock().await.iter().any(|event| matches!(event,
+        AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } if preparation.turn_id == turn)));
+    manager
+        .start_test_turn_with_default_profile(
+            thread,
+            "turn_after_durable_cancel",
+            ThreadMode::Chat,
+            "openai/gpt-4o",
+            "pending",
+            HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    manager.remove_thread(thread).await;
+    listener.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_context_freezes_interrupted_policy_request_handlers_and_cleanup_contract() {
+    for enabled in [false, true] {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = Arc::new(ProviderRegistry::with_provider(
+            "pending",
+            Arc::new(PendingProvider),
+        ));
+        let manager = AgentManager::new(registry, test_tool_loop_config());
+        manager
+            .set_hook_runtime(Some(recording_hook_runtime_for_phase(
+                calls.clone(),
+                HookPhase::TurnPostTurn,
+                HookAwaitPolicy::Blocking,
+                HookFailurePolicy::BestEffort,
+            )))
+            .await;
+        manager
+            .set_post_turn_hook_dispatch_policy(AgentPostTurnHookDispatchPolicy {
+                on_interrupted: enabled,
+                ..AgentPostTurnHookDispatchPolicy::default()
+            })
+            .await;
+        manager
+            .set_task_tool_provider(Some(Arc::new(StaticTaskToolProvider {
+                bundle: ToolExtensionBundle::default(),
+                runtime_contract: "original-cleanup-contract",
+            })))
+            .await;
+        let first_snapshot = manager.runtime_dependencies.snapshot().await;
+        let second_snapshot = manager.runtime_dependencies.snapshot().await;
+        if enabled {
+            assert!(Arc::ptr_eq(
+                first_snapshot.interrupted_hook_snapshot.as_ref().unwrap(),
+                second_snapshot.interrupted_hook_snapshot.as_ref().unwrap()
+            ));
+        }
+        let thread = "thread_frozen_cancel";
+        let turn = "turn_frozen_cancel";
+        let workspace = "workspace_frozen_cancel";
+        manager.ensure_thread(thread, workspace).await.unwrap();
+        let mut receiver = manager.take_durable_receiver(thread).await.unwrap();
+        manager
+            .start_test_turn_with_default_profile(
+                thread,
+                turn,
+                ThreadMode::Agent,
+                "test-model",
+                "pending",
+                HashMap::new(),
+                vec![UserInput::Text {
+                    text: "original-user-input".to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let AgentDurableEvent::NativeCancellationContextPrepared { preparation, .. } =
+            receiver.recv().await.unwrap()
+        else {
+            panic!("provider work must begin with immutable cancellation registration");
+        };
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "registration cannot run hooks"
+        );
+        manager.set_hook_runtime(None).await;
+        manager
+            .set_post_turn_hook_dispatch_policy(AgentPostTurnHookDispatchPolicy::default())
+            .await;
+        manager
+            .set_task_tool_provider(Some(Arc::new(StaticTaskToolProvider {
+                bundle: ToolExtensionBundle::default(),
+                runtime_contract: "replacement-cleanup-contract",
+            })))
+            .await;
+        let preparation =
+            crate::post_turn::prepare_native_cancellation(preparation, "cancel reason").unwrap();
+        if enabled {
+            let mut oversized = preparation.clone();
+            for effect in &mut oversized.effects {
+                if let pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                    runtime_snapshot,
+                    ..
+                } = &mut effect.payload
+                {
+                    *runtime_snapshot = serde_json::json!("x".repeat(255 * 1024));
+                }
+            }
+            assert!(
+                crate::post_turn::prepare_native_cancellation(oversized, "cancel reason").is_err()
+            );
+        }
+        assert_eq!(preparation.effects.len(), if enabled { 2 } else { 1 });
+        for effect in &preparation.effects {
+            let suffix = match effect.effect_kind {
+                pioneer_protocol::NativeTerminalEffectKind::PostTurnHook => "post-turn",
+                pioneer_protocol::NativeTerminalEffectKind::AttachedTaskCleanup => {
+                    "attached-task-cleanup"
+                }
+            };
+            assert_eq!(
+                effect.effect_id,
+                format!("{turn}:cancellation-effect:{suffix}")
+            );
+            match &effect.payload {
+                pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
+                    runtime_contract,
+                    ..
+                } => assert_eq!(runtime_contract, "original-cleanup-contract"),
+                pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook { request, .. } => {
+                    let request: pioneer_hooks::HookPhaseRequest =
+                        serde_json::from_value(request.clone()).unwrap();
+                    let HookInputPayload::TurnPostTurn(input) = request.input.payload else {
+                        panic!("post-turn input");
+                    };
+                    assert_eq!(input.status, pioneer_hooks::TurnPostTurnStatus::Interrupted);
+                    assert_eq!(input.user_text.unwrap().text, "original-user-input");
+                    manager
+                        .execute_terminal_effect(
+                            &effect.effect_id,
+                            "durable-test-claim",
+                            preparation.runtime_generation,
+                            workspace,
+                            thread,
+                            turn,
+                            effect.payload.clone(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                _ => panic!("valid snapshots should produce executable descriptions"),
+            }
+        }
+        assert_eq!(calls.lock().unwrap().len(), usize::from(enabled));
+        receiver.acknowledge_last(Ok(()));
+        manager.remove_thread(thread).await;
+    }
+}

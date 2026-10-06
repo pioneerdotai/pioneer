@@ -118,6 +118,20 @@ pub(crate) struct GatewayVoiceSessionStore {
 }
 
 impl GatewayVoiceSessionStore {
+    /// Finalize and cancel race for this single terminal claim. A cancelled or
+    /// disconnected session cannot publish a late inference result.
+    pub(crate) fn claim_finalized_authenticated_session(
+        &self,
+        session_id: &str,
+        owner: &AuthenticatedTransferOwner,
+    ) -> Result<bool, GatewayVoiceSessionError> {
+        match self.remove_authenticated_session(session_id, owner) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind == GatewayVoiceSessionErrorKind::UnknownSession => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn has_active_sessions(&self) -> Result<bool, GatewayVoiceSessionError> {
         Ok(!self.lock_sessions()?.is_empty())
     }
@@ -518,6 +532,56 @@ mod tests {
             .expect("auth session id"),
             connection_id,
         }
+    }
+
+    #[test]
+    fn cancelled_transcription_cannot_claim_late_success_error_or_no_speech() {
+        let owner = authenticated_owner(7, 'P', 'S');
+        for _outcome in ["transcript", "no_speech", "runtime_error"] {
+            let store = GatewayVoiceSessionStore::default();
+            store
+                .create_authenticated_session(
+                    "voice",
+                    owner.clone(),
+                    test_context(),
+                    target_format(),
+                )
+                .unwrap();
+            store
+                .mark_finalizing_authenticated("voice", &owner)
+                .unwrap();
+            store
+                .mark_transcribing_authenticated("voice", &owner)
+                .unwrap();
+            store.remove_authenticated_session("voice", &owner).unwrap(); // cancel during native work
+            assert!(
+                !store
+                    .claim_finalized_authenticated_session("voice", &owner)
+                    .unwrap()
+            );
+        }
+        let store = GatewayVoiceSessionStore::default();
+        store
+            .create_authenticated_session("voice", owner.clone(), test_context(), target_format())
+            .unwrap();
+        let foreign = authenticated_owner(8, 'P', 'S');
+        assert_eq!(
+            store
+                .claim_finalized_authenticated_session("voice", &foreign)
+                .unwrap_err()
+                .kind,
+            GatewayVoiceSessionErrorKind::OwnershipMismatch
+        );
+        assert!(
+            store
+                .claim_finalized_authenticated_session("voice", &owner)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .claim_finalized_authenticated_session("voice", &owner)
+                .unwrap()
+        );
     }
 
     #[test]

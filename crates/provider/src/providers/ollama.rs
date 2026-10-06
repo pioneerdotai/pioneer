@@ -50,6 +50,10 @@ struct OllamaMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     images: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OllamaToolCall>>,
 }
 
@@ -77,6 +81,7 @@ struct OllamaToolCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OllamaToolFunctionCall {
     name: String,
+    #[serde(deserialize_with = "deserialize_tool_arguments")]
     arguments: serde_json::Value,
 }
 
@@ -101,7 +106,7 @@ struct OllamaChatResponse {
     eval_count: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct OllamaResponseMessage {
     #[serde(default)]
     content: Option<String>,
@@ -144,7 +149,10 @@ struct OllamaModelDetails {
 
 #[derive(Debug, Deserialize)]
 struct OllamaStreamChunk {
+    #[serde(default)]
     message: OllamaResponseMessage,
+    #[serde(default)]
+    error: Option<String>,
     #[serde(default)]
     done: bool,
     #[serde(default)]
@@ -184,11 +192,10 @@ impl OllamaProvider {
     }
 
     fn convert_messages(prepared: &PreparedProviderMessages) -> Result<Vec<OllamaMessage>> {
-        prepared
-            .messages
-            .iter()
-            .enumerate()
-            .map(|(message_index, m)| {
+        crate::tools::policy::ordered_tool_results(&prepared.messages)
+            .into_iter()
+            .map(|message_index| {
+                let m = &prepared.messages[message_index];
                 let mut images = Vec::new();
                 for attachment in prepared.attachments_for_message(message_index) {
                     match attachment.kind {
@@ -219,23 +226,31 @@ impl OllamaProvider {
                         .then(|| m.reasoning_content.clone())
                         .flatten(),
                     images: (!images.is_empty()).then_some(images),
-                    tool_calls: m.tool_calls.as_ref().map(|tool_calls| {
-                        tool_calls
-                            .iter()
-                            .map(|call| OllamaToolCall {
-                                id: Some(call.id.clone()),
-                                function: OllamaToolFunctionCall {
-                                    name: call.name.clone(),
-                                    arguments: serde_json::from_str::<serde_json::Value>(
-                                        call.arguments.as_str(),
-                                    )
-                                    .unwrap_or_else(|_| {
-                                        serde_json::Value::String(call.arguments.clone())
-                                    }),
-                                },
-                            })
-                            .collect()
-                    }),
+                    tool_name: (m.role == Role::Tool).then(|| m.name.clone()).flatten(),
+                    // Native Message.ToolCallID is optional; preserve an existing result ID.
+                    tool_call_id: (m.role == Role::Tool)
+                        .then(|| m.tool_call_id.clone())
+                        .flatten(),
+                    tool_calls: m
+                        .tool_calls
+                        .as_ref()
+                        .map(|tool_calls| {
+                            tool_calls
+                                .iter()
+                                .map(|call| {
+                                    Ok(OllamaToolCall {
+                                        id: Some(call.id.clone()),
+                                        function: OllamaToolFunctionCall {
+                                            name: call.name.clone(),
+                                            arguments: parse_tool_arguments(
+                                                call.arguments.as_str(),
+                                            )?,
+                                        },
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>()
+                        })
+                        .transpose()?,
                 })
             })
             .collect::<Result<Vec<_>>>()
@@ -256,14 +271,22 @@ impl OllamaProvider {
     }
 
     fn convert_tool_calls(tool_calls: Vec<OllamaToolCall>) -> Vec<ProviderToolCall> {
+        Self::convert_tool_calls_with_offset(tool_calls, 0)
+    }
+
+    fn convert_tool_calls_with_offset(
+        tool_calls: Vec<OllamaToolCall>,
+        offset: usize,
+    ) -> Vec<ProviderToolCall> {
         tool_calls
             .into_iter()
             .enumerate()
             .map(|(index, call)| ProviderToolCall {
-                id: call.id.unwrap_or_else(|| format!("call_{}", index + 1)),
+                id: call
+                    .id
+                    .unwrap_or_else(|| format!("call_{}", offset + index + 1)),
                 name: call.function.name,
-                arguments: serde_json::to_string(&call.function.arguments)
-                    .unwrap_or_else(|_| "{}".to_owned()),
+                arguments: call.function.arguments.to_string(),
             })
             .collect()
     }
@@ -303,6 +326,33 @@ impl OllamaProvider {
     }
 }
 
+// Native ToolCallFunctionArguments is map-backed, unlike Chat's string arguments.
+fn require_tool_arguments(arguments: serde_json::Value) -> Result<serde_json::Value> {
+    if !arguments.is_object() {
+        return Err(anyhow!("Ollama function arguments must be a JSON object"));
+    }
+    Ok(arguments)
+}
+
+fn parse_tool_arguments(raw: &str) -> Result<serde_json::Value> {
+    let arguments = serde_json::from_str(raw).map_err(|_| {
+        anyhow!("Ollama function arguments must be valid JSON containing an object")
+    })?;
+    require_tool_arguments(arguments)
+}
+
+// Shared by ordinary JSON and each native NDJSON response message. Missing args
+// remain a missing required field; explicit null is not normalized into {}.
+fn deserialize_tool_arguments<'de, D>(
+    deserializer: D,
+) -> std::result::Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let arguments = serde_json::Value::deserialize(deserializer)?;
+    require_tool_arguments(arguments).map_err(serde::de::Error::custom)
+}
+
 /// Normalize the base URL by stripping trailing `/api` and trailing `/`.
 fn normalize_base_url(mut url: String) -> String {
     // Strip trailing slashes first
@@ -320,65 +370,12 @@ fn normalize_base_url(mut url: String) -> String {
     url
 }
 
-#[async_trait]
-impl crate::traits::Provider for OllamaProvider {
-    fn name(&self) -> &str {
-        "ollama"
-    }
-
-    fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities {
-            streaming: true,
-            vision: true,
-            tool_calling: true,
-            embeddings: false,
-            transcription: false,
-            input_types: ProviderInputCapabilities {
-                text: true,
-                file: InputTypeSupport::disabled(),
-                image: InputTypeSupport::native_inline_only(),
-                audio: InputTypeSupport::disabled(),
-                video: InputTypeSupport::disabled(),
-            },
+// The same decoder is used by HTTP transport and in-memory regression fixtures.
+impl OllamaProvider {
+    fn normalize_chat_response(api_response: OllamaChatResponse) -> Result<ChatResponse> {
+        if !api_response.done {
+            return Err(crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into());
         }
-    }
-
-    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider_async(
-            self.name(),
-            request.model.as_str(),
-            &self.capabilities(),
-            request.rendered_messages_with_compiled_prompt().as_slice(),
-        )
-        .await?;
-        ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let options = Self::build_options(&request);
-        let api_request = OllamaChatRequest {
-            model: request.model,
-            messages: Self::convert_messages(&prepared)?,
-            stream: false,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            options,
-        };
-
-        let request_builder = self.client.post(self.chat_url()).json(&api_request);
-        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
-        }
-
-        let api_response: OllamaChatResponse = crate::http::read_response_json_bounded(
-            response,
-            Default::default(),
-            "provider_response",
-        )
-        .await?;
         let usage = match (api_response.prompt_eval_count, api_response.eval_count) {
             (None, None) => None,
             (input, output) => Some(TokenUsage {
@@ -390,19 +387,20 @@ impl crate::traits::Provider for OllamaProvider {
         let reasoning_content = api_response.message.thinking.filter(|t| !t.is_empty());
         let tool_calls =
             Self::convert_tool_calls(api_response.message.tool_calls.unwrap_or_default());
-        let termination = api_response
+        let mut termination = api_response
             .done_reason
             .as_deref()
             .map(ProviderTermination::from_openai_reason)
             .unwrap_or_else(|| {
-                if !api_response.done {
-                    ProviderTermination::Unknown("missing_done_marker".to_owned())
-                } else if tool_calls.is_empty() {
+                if tool_calls.is_empty() {
                     ProviderTermination::Complete
                 } else {
                     ProviderTermination::ToolCalls
                 }
             });
+        if !tool_calls.is_empty() && termination == ProviderTermination::Complete {
+            termination = ProviderTermination::ToolCalls;
+        }
         let text = api_response.message.content.unwrap_or_default();
 
         if text.is_empty()
@@ -422,44 +420,14 @@ impl crate::traits::Provider for OllamaProvider {
         })
     }
 
-    async fn stream_chat(
-        &self,
-        request: ChatRequest,
-    ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let prepared = prepare_messages_for_provider_async(
-            self.name(),
-            request.model.as_str(),
-            &self.capabilities(),
-            request.rendered_messages_with_compiled_prompt().as_slice(),
-        )
-        .await?;
-        ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let options = Self::build_options(&request);
-        let api_request = OllamaChatRequest {
-            model: request.model,
-            messages: Self::convert_messages(&prepared)?,
-            stream: true,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            options,
-        };
+    #[cfg(test)]
+    pub(super) fn decode_chat_fixture(value: serde_json::Value) -> Result<ChatResponse> {
+        Self::normalize_chat_response(serde_json::from_value(value)?)
+    }
 
-        let request_builder = self.client.post(self.chat_url()).json(&api_request);
-        let response =
-            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
-
-        if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
-        }
-
-        let byte_stream = crate::http::bounded_response_stream(
-            response,
-            crate::types::ProviderResponseLimits::default().max_transport_bytes,
-            "provider_stream",
-        );
-
+    pub(super) fn decode_stream(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
         tokio::spawn(async move {
@@ -468,6 +436,7 @@ impl crate::traits::Provider for OllamaProvider {
             let mut decoder = IncrementalLineDecoder::default();
             let mut emitted_tool_call_keys = HashSet::new();
             let mut saw_tool_calls = false;
+            let mut tool_call_count = 0;
 
             tokio::pin!(byte_stream);
 
@@ -504,6 +473,16 @@ impl crate::traits::Provider for OllamaProvider {
 
                     match serde_json::from_str::<OllamaStreamChunk>(&line) {
                         Ok(chunk) => {
+                            if chunk.error.is_some() {
+                                let _ = tx
+                                    .send(Err(crate::failure::NativeStreamStatusError::new(
+                                        "Ollama", None,
+                                    )
+                                    .into()))
+                                    .await;
+                                return;
+                            }
+
                             let OllamaResponseMessage {
                                 content,
                                 thinking,
@@ -511,7 +490,12 @@ impl crate::traits::Provider for OllamaProvider {
                             } = chunk.message;
 
                             if let Some(tool_calls) = tool_calls {
-                                let converted = Self::convert_tool_calls(tool_calls);
+                                let count = tool_calls.len();
+                                let converted = Self::convert_tool_calls_with_offset(
+                                    tool_calls,
+                                    tool_call_count,
+                                );
+                                tool_call_count += count;
                                 let mut new_calls = Vec::new();
                                 for call in converted {
                                     let key =
@@ -531,31 +515,6 @@ impl crate::traits::Provider for OllamaProvider {
                                     }
                                 }
                             }
-                            if chunk.done {
-                                let termination = chunk
-                                    .done_reason
-                                    .as_deref()
-                                    .map(ProviderTermination::from_openai_reason)
-                                    .unwrap_or_else(|| {
-                                        if saw_tool_calls {
-                                            ProviderTermination::ToolCalls
-                                        } else {
-                                            ProviderTermination::Complete
-                                        }
-                                    });
-                                if tx
-                                    .send(Ok(StreamChunk::final_chunk_with(termination)
-                                        .with_usage(Some(TokenUsage {
-                                            input_tokens: chunk.prompt_eval_count,
-                                            output_tokens: chunk.eval_count,
-                                        }))))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                return;
-                            }
                             if let Some(thinking) = thinking {
                                 if !thinking.is_empty() {
                                     if tx.send(Ok(StreamChunk::reasoning(thinking))).await.is_err()
@@ -571,10 +530,38 @@ impl crate::traits::Provider for OllamaProvider {
                                     }
                                 }
                             }
+                            if chunk.done {
+                                let mut termination = chunk
+                                    .done_reason
+                                    .as_deref()
+                                    .map(ProviderTermination::from_openai_reason)
+                                    .unwrap_or_else(|| {
+                                        if saw_tool_calls {
+                                            ProviderTermination::ToolCalls
+                                        } else {
+                                            ProviderTermination::Complete
+                                        }
+                                    });
+                                if saw_tool_calls && termination == ProviderTermination::Complete {
+                                    termination = ProviderTermination::ToolCalls;
+                                }
+                                if tx
+                                    .send(Ok(StreamChunk::final_chunk_with(termination)
+                                        .with_usage(Some(TokenUsage {
+                                            input_tokens: chunk.prompt_eval_count,
+                                            output_tokens: chunk.eval_count,
+                                        }))))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                return;
+                            }
                         }
-                        Err(e) => {
+                        Err(_) => {
                             if tx
-                                .send(Err(anyhow!("malformed Ollama NDJSON frame: {e}")))
+                                .send(Err(anyhow!("malformed Ollama NDJSON frame")))
                                 .await
                                 .is_err()
                             {
@@ -586,17 +573,124 @@ impl crate::traits::Provider for OllamaProvider {
                 }
             }
 
-            let error = decoder
-                .finish()
-                .err()
-                .unwrap_or_else(|| anyhow!("Ollama stream ended before done=true"));
+            let error = decoder.finish().err().unwrap_or_else(|| {
+                crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into()
+            });
             if tx.send(Err(error)).await.is_err() {
                 return;
             }
         });
 
         let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(Box::pin(chunk_stream))
+        Box::pin(chunk_stream)
+    }
+}
+
+#[async_trait]
+impl crate::traits::Provider for OllamaProvider {
+    fn name(&self) -> &str {
+        "ollama"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: true,
+            vision: true,
+            tool_calling: true,
+            embeddings: false,
+            transcription: false,
+            input_types: ProviderInputCapabilities {
+                text: true,
+                file: InputTypeSupport::disabled(),
+                image: InputTypeSupport::native_inline_only(),
+                audio: InputTypeSupport::disabled(),
+                video: InputTypeSupport::disabled(),
+            },
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
+            self.name(),
+            request.model.as_str(),
+            &self.capabilities(),
+            request.rendered_messages_with_compiled_prompt().as_slice(),
+        )
+        .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
+        ensure_no_unrendered_attachments(self.name(), &prepared)?;
+        let options = Self::build_options(&request);
+        let api_request = OllamaChatRequest {
+            model: request.model,
+            messages: Self::convert_messages(&prepared)?,
+            stream: false,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            options,
+        };
+
+        let request_builder = self.client.post(self.chat_url()).json(&api_request);
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(Self::api_error(response).await);
+        }
+
+        let api_response: OllamaChatResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
+        Self::normalize_chat_response(api_response)
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
+            self.name(),
+            request.model.as_str(),
+            &self.capabilities(),
+            request.rendered_messages_with_compiled_prompt().as_slice(),
+        )
+        .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
+        ensure_no_unrendered_attachments(self.name(), &prepared)?;
+        let options = Self::build_options(&request);
+        let api_request = OllamaChatRequest {
+            model: request.model,
+            messages: Self::convert_messages(&prepared)?,
+            stream: true,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            options,
+        };
+
+        let request_builder = self.client.post(self.chat_url()).json(&api_request);
+        let response =
+            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
+
+        if !response.status().is_success() {
+            return Err(Self::api_error(response).await);
+        }
+
+        let byte_stream = crate::http::bounded_response_stream(
+            response,
+            crate::types::ProviderResponseLimits::default().max_transport_bytes,
+            "provider_stream",
+        );
+
+        Ok(Self::decode_stream(byte_stream))
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -652,7 +746,7 @@ impl crate::traits::Provider for OllamaProvider {
                     limits: ProviderModelLimits::default(),
                     capabilities: ProviderModelCapabilities {
                         streaming: Some(true),
-                        tool_calling: Some(true),
+                        tool_calling: None,
                         ..ProviderModelCapabilities::default()
                     },
                     transcription: None,
@@ -677,6 +771,46 @@ mod tests {
     use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
     use crate::traits::Provider;
     use crate::types::{ChatMessage, ProviderReplayState};
+
+    #[test]
+    fn legacy_name_order_projection_preserves_canonical_ids() {
+        let provider = OllamaProvider::new();
+        let mut assistant = crate::ChatMessage::assistant("");
+        assistant.tool_calls = Some(vec![
+            ProviderToolCall {
+                id: "first".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            },
+            ProviderToolCall {
+                id: "second".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            },
+        ]);
+        let messages = vec![
+            assistant,
+            crate::ChatMessage::tool_result("second", "lookup", "second-result"),
+            crate::ChatMessage::tool_result("first", "lookup", "first-result"),
+        ];
+        let mut prepared = crate::attachments::prepare_messages_for_provider(
+            "ollama",
+            &provider.capabilities(),
+            &messages,
+        )
+        .unwrap();
+        crate::tools::policy::prepare_history("ollama", &mut prepared.messages).unwrap();
+        let wire = OllamaProvider::convert_messages(&prepared).unwrap();
+        assert_eq!(wire[1].content.as_deref(), Some("first-result"));
+        assert_eq!(wire[2].content.as_deref(), Some("second-result"));
+        assert_eq!(wire[1].tool_call_id.as_deref(), Some("first"));
+        assert_eq!(wire[2].tool_call_id.as_deref(), Some("second"));
+        assert_eq!(
+            serde_json::to_value(&wire[1]).unwrap()["tool_name"],
+            "lookup"
+        );
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("second"));
+    }
 
     #[test]
     fn active_foreign_replay_is_rejected_before_ollama_serializer_can_ignore_it() {
@@ -786,6 +920,8 @@ mod tests {
                 content: Some("Hello".into()),
                 thinking: None,
                 images: None,
+                tool_name: None,
+                tool_call_id: None,
                 tool_calls: None,
             }],
             stream: false,
@@ -808,6 +944,8 @@ mod tests {
                 content: Some("Hello".into()),
                 thinking: None,
                 images: None,
+                tool_name: None,
+                tool_call_id: None,
                 tool_calls: None,
             }],
             stream: false,
@@ -910,3 +1048,7 @@ mod tests {
         assert!(caps.vision);
     }
 }
+
+#[cfg(test)]
+#[path = "wire_tests/ollama.rs"]
+mod wire_contract_tests;
