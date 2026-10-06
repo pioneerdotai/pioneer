@@ -1,0 +1,80 @@
+{
+  "evidence": "Synthetic arrays only; no installed Nomic/GTE graph was found. Producer pooling is conditional on the exported output. These fixtures do not certify any export.",
+  "token_output": {
+    "shape": [
+      1,
+      3,
+      2
+    ],
+    "values": [
+      1.0,
+      3.0,
+      5.0,
+      7.0,
+      100.0,
+      100.0
+    ],
+    "attention_mask": [
+      1,
+      1,
+      0
+    ],
+    "cls": [
+      1.0,
+      3.0
+    ],
+    "masked_mean": [
+      3.0,
+      5.0
+    ],
+    "pinned_memvid_first_dims": [
+      1.0,
+      3.0
+    ]
+  },
+  "pooled_output": {
+    "shape": [
+      1,
+      2
+    ],
+    "values": [
+      3.0,
+      5.0
+    ],
+    "expected_without_token_pooling": [
+      3.0,
+      5.0
+    ]
+  },
+  "invalid_outputs": [
+    {
+      "shape": [
+        1,
+        3,
+        1
+      ],
+      "reason": "hidden size differs from configured dims=2"
+    },
+    {
+      "shape": [
+        2,
+        2
+      ],
+      "reason": "single-input call received batch=2"
+    },
+    {
+      "shape": [
+        1,
+        0,
+        2
+      ],
+      "reason": "empty token output"
+    }
+  ],
+  "models": {
+    "bge-small-en-v1.5": "producer CLS + L2; actual first output graph unavailable",
+    "bge-base-en-v1.5": "producer CLS + L2; actual first output graph unavailable",
+    "nomic-embed-text-v1.5": "producer masked mean (+ conditional Matryoshka layer norm), L2; exact export output unavailable",
+    "gte-large": "producer masked mean, optional L2; exact export output unavailable"
+  }
+}
