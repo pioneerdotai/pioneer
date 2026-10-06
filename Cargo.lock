@@ -9723,6 +9723,7 @@ dependencies = [
  "url",
  "uuid",
  "zeroize",
+ "zstd 0.14.0",
 ]
 
 [[package]]
