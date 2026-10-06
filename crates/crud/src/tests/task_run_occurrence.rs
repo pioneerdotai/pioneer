@@ -13,6 +13,19 @@ use sea_orm::sea_query::{ExprTrait, Query};
 const NOW: i64 = 4_000_000_000;
 const MIGRATION: &str = "m20261002_000001_task_run_occurrence_reconcile";
 
+fn tracker_rollback_steps() -> u32 {
+    // Later migrations must be removed before this tracker, rather than
+    // assuming that the parent tracker is the final registered migration.
+    (Migrator::migrations()
+        .iter()
+        .rev()
+        .position(|migration| migration.name() == MIGRATION)
+        .expect("parent tracker migration is registered")
+        + 1)
+    .try_into()
+    .unwrap()
+}
+
 async fn row(store: &CrudStore, id: &str) -> Option<pending::Model> {
     pending::Entity::find_by_id(id.to_owned())
         .one(&store.connection)
@@ -65,15 +78,6 @@ async fn turn_status(store: &CrudStore, id: &str, status: &str) {
         .exec(&store.connection)
         .await
         .unwrap();
-}
-
-fn tracker_rollback_steps() -> u32 {
-    let migrations = Migrator::migrations();
-    let target = migrations
-        .iter()
-        .position(|m| m.name() == MIGRATION)
-        .expect("parent tracker must remain registered");
-    (migrations.len() - target) as u32
 }
 
 #[tokio::test]

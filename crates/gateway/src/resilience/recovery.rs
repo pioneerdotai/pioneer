@@ -1678,71 +1678,6 @@ impl RecoveryCoordinator {
                 .await?;
         }
 
-        // Compatibility for pre-migration Turns is deliberately restricted to
-        // positive native evidence: the legacy query requires a durable native
-        // runtime snapshot and excludes every Turn with a control-plane row.
-        for turn in self.crud_store.list_in_progress_native_turns(limit).await? {
-            if self
-                .open_recovery_for_turn(turn.turn_id.as_str())
-                .await?
-                .is_some()
-            {
-                continue;
-            }
-
-            if self
-                .crud_store
-                .get_turn_liveness(turn.turn_id.as_str())
-                .await?
-                .is_some_and(|liveness| {
-                    !liveness.last_activity_kind.starts_with("runtime/")
-                        && now_unix.saturating_sub(liveness.last_activity_at_unix)
-                            <= RECOVERY_PROGRESS_STALE_SECS
-                })
-            {
-                continue;
-            }
-
-            let has_snapshot = self
-                .crud_store
-                .get_turn_runtime_snapshot(turn.turn_id.as_str())
-                .await?
-                .is_some();
-            let policy = self
-                .policy_registry
-                .policy_for_item_type(TurnItemType::Reasoning);
-            let action = if has_snapshot {
-                RecoveryAction::RestartTurn
-            } else {
-                RecoveryAction::BlockResumable
-            };
-            let reason = if has_snapshot {
-                "native Turn was orphaned by a restart; resuming from its durable runtime snapshot"
-                    .to_owned()
-            } else {
-                "native Turn was orphaned by a restart without a durable runtime snapshot; preserving it as resumable blocked work"
-                    .to_owned()
-            };
-            let orphan_turn_id = turn.turn_id.clone();
-            let _ = self
-                .enqueue_runtime_failure_job(
-                    &RuntimeFailureCandidate {
-                        turn_id: orphan_turn_id.clone(),
-                        item_id: format!("orphan:{orphan_turn_id}"),
-                        item_type: TurnItemType::Reasoning,
-                        trigger: RecoveryTrigger::RuntimeFailure,
-                        action,
-                        reason,
-                        base_backoff_secs: policy.base_backoff_secs,
-                        max_attempts: if has_snapshot { policy.max_attempts } else { 0 },
-                        max_wall_clock_secs: policy.max_wall_clock_secs,
-                        no_progress_limit: policy.no_progress_limit,
-                        metadata: ToolMetadata::empty(),
-                    },
-                    now_unix,
-                )
-                .await?;
-        }
         Ok(())
     }
 
@@ -6216,6 +6151,142 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("cli_runtime"))
         );
+    }
+
+    #[tokio::test]
+    async fn owned_recovering_execution_retries_job_creation_after_claim_crash() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let now = 1_700_000_200;
+        for (suffix, kind) in [
+            ("native", TurnExecutorKind::NativeAgent),
+            ("api", TurnExecutorKind::ApiProvider),
+        ] {
+            let workspace_id = format!("ws_claim_crash_{suffix}");
+            let thread_id = format!("thr_claim_crash_{suffix}");
+            let turn_id = format!("turn_claim_crash_{suffix}");
+            materialize_turn_with_tool_item(
+                &crud_store,
+                &workspace_id,
+                &thread_id,
+                &turn_id,
+                &format!("item_claim_crash_{suffix}"),
+                None,
+            )
+            .await;
+            persist_test_runtime_snapshot(&crud_store, &workspace_id, &thread_id, &turn_id).await;
+            insert_test_turn_execution(
+                &crud_store,
+                &workspace_id,
+                &thread_id,
+                &turn_id,
+                "replaced-owner",
+                kind,
+                now - 1,
+            )
+            .await;
+            let previous = crud_store
+                .get_turn_execution(&turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let claimed = crud_store
+                .claim_expired_turn_execution(
+                    &previous,
+                    coordinator.turn_execution_owner_id.as_ref(),
+                    now,
+                    now + 45,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(claimed.owner_generation, 2);
+            assert_eq!(claimed.status, TurnExecutionStatus::Recovering);
+            assert!(
+                coordinator
+                    .open_recovery_for_turn(&turn_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                !crud_store
+                    .mark_turn_execution_running_owned(
+                        &turn_id,
+                        "replaced-owner",
+                        now + 1,
+                        now + 46,
+                    )
+                    .await
+                    .unwrap(),
+                "the replaced owner must remain fenced"
+            );
+            assert!(
+                crud_store
+                    .claim_expired_turn_execution(&previous, "competing-owner", now + 1, now + 46,)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a stale candidate cannot claim again"
+            );
+
+            // Model loss of the job-creation step after a durable CAS. This
+            // fresh handle has no process-local record of the claimed row.
+            let restarted =
+                CrudStore::new(crud_store.database_connection()).with_maintenance_access();
+            assert!(
+                restarted
+                    .list_expired_foreign_turn_executions(
+                        coordinator.turn_execution_owner_id.as_ref(),
+                        now + 1,
+                        64,
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                restarted
+                    .list_owned_recovering_turn_executions(
+                        coordinator.turn_execution_owner_id.as_ref(),
+                        64,
+                    )
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|row| row == &claimed)
+            );
+            coordinator
+                .reconcile_orphan_turn_executions(now + 1, 64)
+                .await
+                .unwrap();
+            let job = coordinator
+                .open_recovery_for_turn(&turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.action, RecoveryAction::RestartTurn);
+            coordinator
+                .reconcile_orphan_turn_executions(now + 2, 64)
+                .await
+                .unwrap();
+            assert_eq!(
+                coordinator
+                    .open_recovery_for_turn(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                job.id
+            );
+            assert_eq!(
+                crud_store
+                    .get_turn_execution(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                claimed
+            );
+        }
     }
 
     #[tokio::test]
@@ -10758,6 +10829,16 @@ mod tests {
             None,
         )
         .await;
+        insert_test_turn_execution(
+            &crud_store,
+            workspace_id,
+            thread_id,
+            turn_id,
+            "previous-blocked-owner",
+            TurnExecutorKind::NativeAgent,
+            1_700_000_045,
+        )
+        .await;
         crud_store
             .update_turn_status(
                 thread_id,
@@ -10808,6 +10889,18 @@ mod tests {
             .expect("blocked turn resume should succeed")
             .expect("blocked recovery job should resume");
 
+        let receipt = crud_store
+            .get_turn_execution(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receipt.owner_id.as_str(),
+            coordinator.turn_execution_owner_id.as_ref()
+        );
+        assert_eq!(receipt.owner_generation, 2);
+        assert_eq!(receipt.status, TurnExecutionStatus::Starting);
+        assert!(receipt.completed_at.is_none());
         assert_eq!(resumed.id, job.id);
         assert_eq!(resumed.status, RecoveryJobStatus::Pending);
         assert_eq!(resumed.action, RecoveryAction::RestartTurn);

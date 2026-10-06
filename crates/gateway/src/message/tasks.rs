@@ -12,6 +12,81 @@ use pioneer_protocol::{
 };
 use serde_json::json;
 
+/// Batch ownership is local to terminal-child reconciliation. Only descriptors
+/// enter this aggregate; TaskStartFailure's private source never does.
+#[derive(Debug, Default)]
+pub(super) struct TaskChildReconciliationFailures {
+    reported: Vec<pioneer_tasks::TaskStartFailureDescriptor>,
+    independent: Vec<String>,
+}
+
+impl TaskChildReconciliationFailures {
+    fn push(&mut self, thread_id: &str, turn_id: &str, mut error: anyhow::Error) {
+        if let Some(failure) = error.downcast_mut::<pioneer_tasks::TaskStartFailure>() {
+            failure.report_in_place();
+            self.reported.push(failure.descriptor().clone());
+        } else {
+            // Preserve the former independent-error diagnostic and retry input.
+            self.independent
+                .push(format!("{thread_id}/{turn_id}: {error:#}"));
+        }
+    }
+
+    pub(super) fn retry_transient_storage_access(&self) -> bool {
+        !self.independent.is_empty()
+            && is_anyhow_sqlite_transient_access(&anyhow::anyhow!(self.independent.join("; ")))
+    }
+
+    pub(super) fn report_worker_failure(&self) {
+        if !self.independent.is_empty() {
+            error!(
+                error = %self.independent.join("; "),
+                "task child terminal reconciler failed"
+            );
+        }
+    }
+}
+
+impl std::fmt::Display for TaskChildReconciliationFailures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "terminal task child reconciliation failed: reported={:?}",
+            self.reported
+        )?;
+        if !self.independent.is_empty() {
+            write!(f, "; {}", self.independent.join("; "))?;
+        }
+        Ok(())
+    }
+}
+
+// Deliberately no source: private typed causes must not become a worker chain.
+impl std::error::Error for TaskChildReconciliationFailures {}
+
+pub(super) fn retry_task_child_reconciliation_error(error: &anyhow::Error) -> bool {
+    if error
+        .downcast_ref::<pioneer_tasks::TaskStartFailure>()
+        .is_some()
+    {
+        return false;
+    }
+    if let Some(batch) = error.downcast_ref::<TaskChildReconciliationFailures>() {
+        return batch.retry_transient_storage_access();
+    }
+    is_anyhow_sqlite_transient_access(error)
+}
+
+pub(super) fn report_task_child_reconciliation_error(mut error: anyhow::Error) {
+    if let Some(batch) = error.downcast_ref::<TaskChildReconciliationFailures>() {
+        batch.report_worker_failure();
+    } else if let Some(failure) = error.downcast_mut::<pioneer_tasks::TaskStartFailure>() {
+        failure.report_in_place();
+    } else {
+        error!(error = %format!("{error:#}"), "task child terminal reconciler failed");
+    }
+}
+
 /// Partial progress survives candidate errors. Only an allowlisted diagnostic
 /// classification of first_error reaches reporting; no IDs or raw errors.
 #[derive(Default)]
@@ -72,13 +147,26 @@ struct TaskTimelineChangedTarget {
 }
 
 impl MessageProcessor {
+    pub(super) async fn reconcile_terminal_task_child_turns_with_retry(
+        &self,
+        limit: u64,
+    ) -> Result<usize> {
+        retry_with_backoff(
+            || self.reconcile_terminal_task_child_turns(limit),
+            retry_task_child_reconciliation_error,
+            DEFAULT_LOCK_RETRY_ATTEMPTS,
+            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+        )
+        .await
+    }
+
     pub(super) async fn reconcile_terminal_task_child_turns(&self, limit: u64) -> Result<usize> {
         let turns = self
             .crud_store
             .list_unreconciled_terminal_task_child_turns(limit)
             .await?;
         let mut reconciled = 0usize;
-        let mut errors = Vec::new();
+        let mut errors = TaskChildReconciliationFailures::default();
         for turn in turns {
             let result = match turn.status {
                 TurnStatus::Completed => {
@@ -153,16 +241,11 @@ impl MessageProcessor {
                     reconciled = reconciled.saturating_add(1);
                 }
                 Ok(false) => {}
-                Err(error) => {
-                    errors.push(format!("{}/{}: {error:#}", turn.thread_id, turn.turn_id))
-                }
+                Err(error) => errors.push(&turn.thread_id, &turn.turn_id, error),
             }
         }
-        if !errors.is_empty() {
-            bail!(
-                "terminal task child reconciliation failed: {}",
-                errors.join("; ")
-            );
+        if !errors.reported.is_empty() || !errors.independent.is_empty() {
+            return Err(anyhow::Error::new(errors));
         }
         Ok(reconciled)
     }
@@ -1389,5 +1472,54 @@ async fn task_delivery_child_lineage(
             );
             (None, None)
         }
+    }
+}
+
+#[cfg(test)]
+mod task_child_failure_tests {
+    use super::*;
+    use pioneer_tasks::{TaskStartCause, TaskStartFailure, TaskStartStage};
+
+    #[test]
+    fn aggregate_owns_only_safe_reported_descriptors_and_preserves_independent_retry_input() {
+        let (_, events) = crate::public_error::test_support::capture_events(|| {
+            let mut batch = TaskChildReconciliationFailures::default();
+            // A typed expected refusal cannot be reclassified from the Context.
+            batch.push(
+                "PRIVATE_THREAD",
+                "PRIVATE_TURN",
+                anyhow::Error::new(
+                    TaskStartFailure::new(TaskStartStage::CliAdmission, TaskStartCause::Policy)
+                        .with_correlation_id("existing-correlation".to_owned()),
+                )
+                .context("PRIVATE_SQL_PATH_HISTORY_SECRET unable to open database file"),
+            );
+            assert!(!batch.retry_transient_storage_access());
+            let display = format!("{batch}");
+            let debug = format!("{batch:?}");
+            assert!(!display.contains("PRIVATE_"));
+            assert!(!debug.contains("PRIVATE_"));
+            assert!(std::error::Error::source(&batch).is_none());
+            assert_eq!(
+                batch.reported[0].correlation_id.as_deref(),
+                Some("existing-correlation")
+            );
+            batch.report_worker_failure();
+            // The independent legacy storage failure still drives its former
+            // predicate and retains a separate worker ERROR in a mixed batch.
+            batch.push(
+                "independent-thread",
+                "independent-turn",
+                anyhow::anyhow!("unable to open database file"),
+            );
+            assert!(batch.retry_transient_storage_access());
+            batch.report_worker_failure();
+        });
+        assert_eq!(
+            events.len(),
+            1,
+            "only the independent failure creates ERROR"
+        );
+        assert!(!serde_json::to_string(&events).unwrap().contains("PRIVATE_"));
     }
 }

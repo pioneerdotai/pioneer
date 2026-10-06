@@ -552,11 +552,25 @@ pub struct MessageProcessor {
     invitation_gateway_base_url: Arc<pioneer_protocol::GatewayBaseUrl>,
     summary_config: Arc<summary::SummaryConfig>,
     compaction_settings: Arc<StdRwLock<pioneer_compaction::CompactionSettings>>,
-    compaction_recovery_cursor: Arc<StdRwLock<String>>,
     completed_history_checks: Arc<Mutex<HashMap<(String, String), compaction_background::OwnedHistoryCheck>>>,
+    compaction_lifecycle_not_before: Arc<StdRwLock<Option<tokio::time::Instant>>>,
     #[cfg(test)]
     completed_history_preparation_barrier:
         Arc<compaction_background::CompletedHistoryPreparationBarrier>,
+    #[cfg(test)]
+    task_history_preparation_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
+    #[cfg(test)]
+    task_cli_terminal_preparation_finished: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    task_cli_admission_failure: Arc<std::sync::Mutex<Option<turn_handlers::TurnStartFailure>>>,
+    #[cfg(test)]
+    task_cli_preparation_attempts: Arc<AtomicU64>,
+    #[cfg(test)]
+    task_cli_history_revalidation_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
+    #[cfg(test)]
+    task_cli_readiness_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
+    #[cfg(test)]
+    task_output_capture_failures: Arc<std::sync::Mutex<HashMap<String, anyhow::Error>>>,
     pub(crate) compaction_coordinator: Arc<crate::compaction::ContextCompactionCoordinator>,
     cli_history_shutdown: tokio_util::sync::CancellationToken,
     #[cfg(test)]
@@ -1153,10 +1167,24 @@ impl MessageProcessor {
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
             ),
-            compaction_recovery_cursor: Arc::new(StdRwLock::new(String::new())),
             completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
+            compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
             #[cfg(test)]
             completed_history_preparation_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            task_history_preparation_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_terminal_preparation_finished: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            task_cli_admission_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_preparation_attempts: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            task_cli_history_revalidation_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_readiness_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_output_capture_failures: Arc::new(std::sync::Mutex::new(HashMap::new())),
             compaction_coordinator: Arc::new(
                 crate::compaction::ContextCompactionCoordinator::default(),
             ),
@@ -2319,7 +2347,7 @@ impl MessageProcessor {
                 let now = now_timestamp_secs();
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
-                    retry_transient_storage_access(|| this.reconcile_terminal_task_child_turns(64)),
+                    this.reconcile_terminal_task_child_turns_with_retry(64),
                 )
                 .await
                 {
@@ -2328,10 +2356,7 @@ impl MessageProcessor {
                         "reconciled terminal child Turns with their TaskRun aggregates"
                     ),
                     Ok(_) => {}
-                    Err(error) => error!(
-                        error = %format!("{error:#}"),
-                        "task child terminal reconciler failed"
-                    ),
+                    Err(error) => tasks::report_task_child_reconciliation_error(error),
                 }
 
                 let result = crate::database::attribution::scope_database_workload_result(
@@ -4639,10 +4664,24 @@ impl MessageProcessor {
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
             ),
-            compaction_recovery_cursor: Arc::new(StdRwLock::new(String::new())),
             completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
+            compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
             #[cfg(test)]
             completed_history_preparation_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            task_history_preparation_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_terminal_preparation_finished: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            task_cli_admission_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_preparation_attempts: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            task_cli_history_revalidation_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_readiness_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_output_capture_failures: Arc::new(std::sync::Mutex::new(HashMap::new())),
             compaction_coordinator: Arc::new(
                 crate::compaction::ContextCompactionCoordinator::default(),
             ),

@@ -15,6 +15,13 @@
     "supports_base_url_override": {
       "type": "boolean",
       "default": false
+    },
+    "retirement_reason": {
+      "description": "Terminal product lifecycle diagnostic; old clients can ignore it.",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [
