@@ -2,6 +2,7 @@ use crate::{repositories, turn_event_was_appended_before_error};
 use anyhow::Result;
 use pioneer_protocol::TurnBlockedNotification;
 use sea_orm::ActiveModelTrait;
+use sea_orm::sea_query::ExprTrait;
 
 const OWNER: &str = "native-cancellation-owner";
 const NOW: i64 = 1_700_000_100;
