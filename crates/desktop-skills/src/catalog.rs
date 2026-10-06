@@ -691,6 +691,9 @@ mod tests {
         let upload = view.read_with(cx, |view, _| view.upload.clone());
         let publication = |revision, sent_bytes, state| {
             Some(Arc::new(SkillUploadPublication {
+                plugin_preview: None,
+                plugin_result: None,
+                plugin_update_preview: None,
                 operation_id: 7,
                 generation: 7,
                 revision,
