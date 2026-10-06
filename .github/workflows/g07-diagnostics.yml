@@ -13,7 +13,7 @@ jobs:
   lint-test-build:
     name: ci-${{ matrix.os }}-${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 45
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       CARGO_BUILD_JOBS: 2
@@ -40,6 +40,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-${{ matrix.target }}
+          cache-on-failure: true
 
       - name: rustfmt-check
         if: matrix.os == 'ubuntu-latest'
@@ -72,6 +73,10 @@ jobs:
             libgl1-mesa-dev
           multiarch="$(gcc -print-multiarch)"
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
+
+      - name: compile-focused-gateway-regressions
+        shell: bash
+        run: cargo test --locked -p pioneer-gateway --no-run
 
       - name: focused-gateway-regressions
         shell: bash
