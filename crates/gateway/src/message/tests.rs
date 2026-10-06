@@ -17,7 +17,7 @@ mod task_capsule;
 mod reconciliation_workers;
 
 use super::{
-    AuthenticatedTransferOwner, CLIRuntimeMachineRequestKey, MessageProcessor,
+    AuthenticatedTransferOwner, CLIRuntimeMachineRequestKey, MessageFuture, MessageProcessor,
     ProgressItemRegistry, ResilienceWorkerFailureImpact, message_future, now_timestamp_secs,
     record_resilience_worker_error, record_resilience_worker_poll_error,
 };
