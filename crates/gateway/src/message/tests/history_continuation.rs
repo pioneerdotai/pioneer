@@ -541,14 +541,24 @@ async fn durable_final_case(
             fingerprint: "g05-final-plan".into(),
         },
     };
+    // Source projection authority belongs to the admitted execution turn,
+    // exactly as in production admission; an owner-only operation cannot bind it.
     store
-        .compaction_admit(&workspace, thread, &operation)
+        .compaction_admit_for_turn(&workspace, thread, &operation, Some(turn))
         .await
         .unwrap();
     store
         .compaction_bind_source_projection(&operation.id, &descriptor)
         .await
         .unwrap();
+    assert_eq!(
+        store
+            .compaction_bound_source_projection(&operation.id)
+            .await
+            .unwrap(),
+        Some(descriptor.clone()),
+        "checkpoint must use the exact frozen projection bound to its execution"
+    );
     store
         .compaction_prepare_runner(&operation.id, &ModelBudget::new(None, None, None), 1, 0)
         .await
