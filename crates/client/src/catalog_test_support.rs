@@ -44,6 +44,27 @@ pub fn client() -> Arc<ClientCore> {
     core
 }
 
+/// Replace only synthetic origin identity; copied native catalogs and permission
+/// remain available, so origin rejection cannot rely on missing child IDs.
+pub fn switch_connection(core: &ClientCore, connection: u64) {
+    let scope = ClientScope::Administration { workspace_id: None };
+    let snapshot = core.snapshot(&scope).unwrap();
+    let mut identity = (*snapshot
+        .snapshot()
+        .payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>()
+        .unwrap())
+    .clone();
+    identity.connection_generation += 1;
+    identity.connection_id = Some(connection);
+    core.publish(
+        &ClientMutationAuthority { _private: () },
+        scope,
+        crate::threads::registry::revisions(snapshot.revisions().scoped().get() + 1),
+        Arc::new(identity),
+        vec![],
+    );
+}
+
 /// A current principal for direct/native-boundary profile replay; no transport.
 pub fn settings_client() -> Arc<ClientCore> {
     let core = client();

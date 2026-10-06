@@ -129,11 +129,33 @@ impl ClientCore {
         .and_then(|p| p.snapshot().payload())
     }
     pub fn mcp_intent(&self, workspace: &str, intent: McpIntent) -> anyhow::Result<u64> {
+        self.mcp_intent_admit(workspace, intent, None)
+    }
+    /// Plugin delegation shares native validation, queueing and completion. It
+    /// must never recapture a Gateway selected after the originating read.
+    pub(crate) fn mcp_intent_bound(
+        &self,
+        workspace: &str,
+        intent: McpIntent,
+        epoch: (u64, u64, Option<u64>),
+    ) -> anyhow::Result<u64> {
+        self.mcp_intent_admit(workspace, intent, Some(epoch))
+    }
+    fn mcp_intent_admit(
+        &self,
+        workspace: &str,
+        intent: McpIntent,
+        expected_epoch: Option<(u64, u64, Option<u64>)>,
+    ) -> anyhow::Result<u64> {
         anyhow::ensure!(
             self.capability_management_allowed(workspace),
             "capability_access_denied"
         );
-        let epoch = self.provider_runtime_epoch();
+        let epoch = expected_epoch.unwrap_or_else(|| self.provider_runtime_epoch());
+        anyhow::ensure!(
+            expected_epoch.is_none() || self.provider_runtime_epoch() == epoch,
+            "connection_changed"
+        );
         anyhow::ensure!(epoch.2.is_some(), "gateway_not_connected");
         let (target, name, scope_kind) = match &intent {
             McpIntent::RetryAuthorizationBrowser { server_id }
@@ -186,6 +208,10 @@ impl ClientCore {
                 .get(&(workspace.into(), target.clone()))
                 .is_some_and(|p| p.state == McpActionState::Pending),
             "mcp_action_pending"
+        );
+        anyhow::ensure!(
+            expected_epoch.is_none() || self.provider_runtime_epoch() == epoch,
+            "connection_changed"
         );
         owner.next = owner
             .next
@@ -521,7 +547,11 @@ impl ClientCore {
                                     core.mcp_action_current(&work),
                                     "connection_changed"
                                 );
-                                core.retry_mcp_oauth_browser(&work.workspace, &work.target)
+                                core.retry_mcp_oauth_browser_bound(
+                                    &work.workspace,
+                                    &work.target,
+                                    work.epoch,
+                                )
                             }),
                         McpIntent::SignIn { .. }
                         | McpIntent::Disconnect { .. }
@@ -637,6 +667,73 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(2);
         core.mcp_controller.lock().unwrap().sender = Some(sender);
         (core, receiver)
+    }
+    // NOT_RUN / NOT_COMPILED. No provider, browser or MCP fixture is launched.
+    #[test]
+    fn plugin_native_admission_never_recaptures_replacement_with_copied_ids() {
+        for intent in [
+            McpIntent::Configure {
+                config_json: r#"{"mcpServers":{"a":{"command":"fake"}}}"#.into(),
+            },
+            McpIntent::Policy {
+                server_id: "a".into(),
+                enabled: false,
+                allow_implicit_invocation: false,
+            },
+            McpIntent::Restart {
+                server_id: "a".into(),
+            },
+            McpIntent::Remove {
+                server_id: "a".into(),
+            },
+            McpIntent::SignIn {
+                server_id: "a".into(),
+            },
+            McpIntent::Disconnect {
+                server_id: "a".into(),
+            },
+            McpIntent::CancelAuthorization {
+                server_id: "a".into(),
+                flow_id: "copied-flow".into(),
+            },
+            McpIntent::RetryAuthorizationBrowser {
+                server_id: "a".into(),
+            },
+        ] {
+            let (core, receiver) = fixture();
+            let origin = core.provider_runtime_epoch();
+            let pause = Arc::new(std::sync::Barrier::new(2));
+            let resume = Arc::new(std::sync::Barrier::new(2));
+            let worker_core = core.clone();
+            let worker_pause = pause.clone();
+            let worker_resume = resume.clone();
+            let worker_intent = intent.clone();
+            let worker = std::thread::spawn(move || {
+                worker_pause.wait();
+                worker_resume.wait();
+                worker_core.mcp_intent_bound("workspace", worker_intent, origin)
+            });
+            pause.wait();
+            crate::catalog_test_support::switch_connection(&core, 8);
+            resume.wait();
+            assert_eq!(
+                worker.join().unwrap().unwrap_err().to_string(),
+                "connection_changed"
+            );
+            assert!(receiver.try_recv().is_err());
+            assert!(
+                core.mcp_catalog_snapshot("workspace").unwrap().servers()[0]
+                    .policy
+                    .enabled
+            );
+            let admitted = core.provider_runtime_epoch();
+            core.mcp_intent_bound("workspace", intent, admitted)
+                .unwrap();
+            let work = receiver.try_recv().unwrap();
+            crate::catalog_test_support::switch_connection(&core, 9);
+            assert_eq!(work.epoch, admitted);
+            assert!(!core.mcp_action_current(&work));
+        }
     }
     struct UnavailableListener;
     impl super::super::oauth::McpOAuthShell for UnavailableListener {

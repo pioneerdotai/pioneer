@@ -60,8 +60,16 @@ pub enum OAuthBrowserEffectResult {
 /// Short launch admission; retirement never waits for an OS browser launcher.
 /// A launch admitted before retirement cannot be recalled by the OS.
 #[derive(Clone, Default)]
-pub struct OAuthBrowserAdmission(Arc<AtomicU8>);
+pub struct OAuthBrowserAdmission(Arc<AtomicU8>, Option<u64>);
 impl OAuthBrowserAdmission {
+    fn for_origin(connection: Option<u64>) -> Self {
+        Self(Arc::default(), connection)
+    }
+    /// Immutable flow origin for OS dismissal. Mobile uses it with the native
+    /// Cancel relay; desktop shell adapters can adopt the same bound relay.
+    pub fn origin_connection(&self) -> Option<u64> {
+        self.1
+    }
     pub fn claim(&self) -> bool {
         self.0
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
@@ -185,7 +193,15 @@ impl ClientCore {
         &self,
         event: &OAuthPresentation,
     ) -> Arc<dyn Fn() -> bool + Send + Sync> {
-        let connection = self.provider_runtime_epoch().2;
+        self.mcp_oauth_cancel_relay_bound(event, self.provider_runtime_epoch().2)
+    }
+    /// Same native Cancel operation with the admitted browser flow's origin.
+    /// Mobile consumes this; desktop OS dismissal adapters can migrate here.
+    pub fn mcp_oauth_cancel_relay_bound(
+        &self,
+        event: &OAuthPresentation,
+        connection: Option<u64>,
+    ) -> Arc<dyn Fn() -> bool + Send + Sync> {
         let sender = self.transport_runtime().ws_command_sender();
         let event = event.clone();
         Arc::new(move || {
@@ -213,9 +229,18 @@ impl ClientCore {
         workspace: &str,
         server: &str,
     ) -> anyhow::Result<()> {
+        self.retry_mcp_oauth_browser_bound(workspace, server, self.provider_runtime_epoch())
+    }
+    pub(crate) fn retry_mcp_oauth_browser_bound(
+        &self,
+        workspace: &str,
+        server: &str,
+        epoch: (u64, u64, Option<u64>),
+    ) -> anyhow::Result<()> {
         let key = (workspace.to_owned(), server.to_owned());
-        let (shell, event, admission, epoch) = {
+        let (shell, event, admission) = {
             let owner = self.mcp_oauth.lock().expect("MCP OAuth owner poisoned");
+            anyhow::ensure!(self.provider_runtime_epoch() == epoch, "connection_changed");
             let shell = owner
                 .shell
                 .clone()
@@ -233,12 +258,7 @@ impl ClientCore {
                 .as_ref()
                 .and_then(|flow| owner.flows.get(flow))
                 .ok_or_else(|| anyhow::anyhow!("oauth_flow_unavailable"))?;
-            (
-                shell,
-                event.clone(),
-                admission.clone(),
-                self.provider_runtime_epoch(),
-            )
+            (shell, event.clone(), admission.clone())
         };
         self.schedule_mcp_browser_effect(shell, event, admission, epoch, None)
     }
@@ -280,7 +300,11 @@ impl ClientCore {
             .name("client-mcp-oauth-browser".into())
             .spawn(move || {
                 let effect = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    if !admission.is_current() {
+                    if !admission.is_current()
+                        || !weak
+                            .upgrade()
+                            .is_some_and(|core| core.provider_runtime_epoch() == epoch)
+                    {
                         return OAuthBrowserEffectResult::CallbackUnavailable;
                     }
                     match relay {
@@ -649,7 +673,8 @@ impl ClientCore {
         if owner.flows.contains_key(&flow) {
             return true;
         }
-        let admission = OAuthBrowserAdmission::default();
+        let epoch = self.provider_runtime_epoch();
+        let admission = OAuthBrowserAdmission::for_origin(epoch.2);
         owner.flows.insert(
             flow.clone(),
             (
@@ -657,7 +682,6 @@ impl ClientCore {
                 admission.clone(),
             ),
         );
-        let epoch = self.provider_runtime_epoch();
         let sender = self.transport_runtime().ws_command_sender();
         let event_for_callback = event.clone();
         drop(owner);
@@ -1162,6 +1186,46 @@ mod tests {
                 .authorization_url
                 .is_some()
         );
+        core.stop_mcp_oauth();
+    }
+    // NOT_RUN / NOT_COMPILED. The retained presentation/flow deliberately
+    // survives synthetic identity replacement. A stale retry opens no shell and
+    // schedules no callback, even when the new Gateway copied the same flow ID.
+    #[test]
+    fn queued_retry_keeps_its_origin_at_browser_admission() {
+        let core = crate::catalog_test_support::client();
+        let shell = Arc::new(Shell::default());
+        core.set_mcp_oauth_shell(shell.clone());
+        let presentation = event(McpOAuthState::AwaitingCallback);
+        let origin = core.provider_runtime_epoch();
+        {
+            let mut owner = core.mcp_oauth.lock().unwrap();
+            owner
+                .presentations
+                .insert(("workspace".into(), "server".into()), (presentation, true));
+            owner.flows.insert(
+                "flow".into(),
+                (
+                    std::time::Instant::now() + std::time::Duration::from_secs(60),
+                    OAuthBrowserAdmission::for_origin(origin.2),
+                ),
+            );
+        }
+        crate::catalog_test_support::switch_connection(&core, 8);
+        assert_eq!(
+            core.mcp_oauth.lock().unwrap().flows["flow"]
+                .1
+                .origin_connection(),
+            origin.2
+        );
+        assert_eq!(
+            core.retry_mcp_oauth_browser_bound("workspace", "server", origin)
+                .unwrap_err()
+                .to_string(),
+            "connection_changed"
+        );
+        assert!(core.mcp_oauth.lock().unwrap().workers.is_empty());
+        assert_eq!(shell.open.load(Ordering::SeqCst), 0);
         core.stop_mcp_oauth();
     }
     #[test]

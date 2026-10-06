@@ -80,6 +80,7 @@ pub struct PluginOAuthPresentation {
 struct Work {
     workspace: String,
     generation: u64,
+    plugin_id: Option<String>,
     epoch: (u64, u64, Option<u64>),
     intent: PluginIntent,
 }
@@ -205,6 +206,7 @@ impl ClientCore {
         let work = Work {
             workspace: workspace.into(),
             generation: p.generation,
+            plugin_id: p.plugin_id.clone(),
             epoch,
             intent,
         };
@@ -231,6 +233,32 @@ impl ClientCore {
                 .publications
                 .get(&work.workspace)
                 .is_some_and(|p| p.generation == work.generation && p.busy)
+    }
+    fn plugin_work_parent(&self, work: &Work) -> Option<Option<String>> {
+        self.plugin_work_current(work)
+            .then(|| work.plugin_id.clone())
+    }
+    // Only bounded native admission runs under this short guard: no RPC, wait,
+    // filesystem or browser effect. Close/reopen cannot replace the parent before
+    // enqueue. Once admitted, native work owns its original epoch independently.
+    fn admit_plugin_child(
+        &self,
+        work: &Work,
+        admit: impl FnOnce() -> anyhow::Result<u64>,
+    ) -> anyhow::Result<u64> {
+        let owner = self.plugins_controller.lock().expect("plugins poisoned");
+        anyhow::ensure!(
+            !self.is_stopped()
+                && self.provider_runtime_epoch() == work.epoch
+                && owner
+                    .publications
+                    .get(&work.workspace)
+                    .is_some_and(|p| p.generation == work.generation
+                        && p.busy
+                        && p.plugin_id == work.plugin_id),
+            "plugin_catalog_stale"
+        );
+        admit()
     }
     pub(crate) fn refresh_plugin_publication(&self, workspace: &str) {
         self.refresh_composer_plugins(workspace);
@@ -303,7 +331,7 @@ impl ClientCore {
             let result=(||->anyhow::Result<PluginPublication>{
                 let connection=work.epoch.2.ok_or_else(||anyhow::anyhow!("gateway_not_connected"))?;
                 let bound=core.transport_runtime().ws_command_sender().requests_for_connection(connection);
-                let id=core.plugins_controller.lock().expect("plugins poisoned").publications[&work.workspace].plugin_id.clone();
+                let id=core.plugin_work_parent(&work).ok_or_else(||anyhow::anyhow!("plugin_catalog_stale"))?;
                 match &work.intent {
                     PluginIntent::SetEnabled{plugin_id,expected_revision,enabled}=>{crate::transport::ws::command_sender::plugins_set_enabled(&bound,PluginsSetEnabledParams{workspace_id:work.workspace.clone(),plugin_id:plugin_id.clone(),expected_revision:*expected_revision,enabled:*enabled})?;},
                     PluginIntent::Mutate{plugin_id,expected_revision,intent}=>{crate::transport::ws::command_sender::plugins_mutate(&bound,PluginsMutateParams{workspace_id:work.workspace.clone(),plugin_id:plugin_id.clone(),expected_revision:*expected_revision,intent:intent.clone()})?;},
@@ -351,22 +379,22 @@ impl ClientCore {
                     match &work.intent {
                         PluginIntent::RemoveSkill{skill_id}=>{
                             anyhow::ensure!(p.skills.iter().any(|s|&s.skill_id==skill_id),"plugin_child_unavailable");
-                            core.skills_intent(&work.workspace,crate::skills::operations::SkillsIntent::Remove{skill_id:skill_id.clone()})?;
+                            core.admit_plugin_child(&work,||core.skills_intent_bound(&work.workspace,crate::skills::operations::SkillsIntent::Remove{skill_id:skill_id.clone()},work.epoch))?;
                         },
                         PluginIntent::ConfigureMcp{server_id,body}=>{
                             let server=p.mcp.iter().find(|s|&s.id==server_id).ok_or_else(||anyhow::anyhow!("plugin_child_unavailable"))?;
                             let config_json=crate::mcp::actions::owned_server_config_for_submit(body,&server.name).ok_or_else(||anyhow::anyhow!("mcp_config_invalid"))?;
-                            core.mcp_intent(&work.workspace,crate::mcp::operations::McpIntent::Configure{config_json})?;
+                            core.admit_plugin_child(&work,||core.mcp_intent_bound(&work.workspace,crate::mcp::operations::McpIntent::Configure{config_json},work.epoch))?;
                         },
                         PluginIntent::Skill{skill_id,enabled,allow_implicit_invocation}=>{
                             anyhow::ensure!(p.skills.iter().any(|s|&s.skill_id==skill_id),"plugin_child_unavailable");
-                            core.skills_intent(&work.workspace,crate::skills::operations::SkillsIntent::Policy{skill_id:skill_id.clone(),enabled:*enabled,allow_implicit_invocation:*allow_implicit_invocation})?;
+                            core.admit_plugin_child(&work,||core.skills_intent_bound(&work.workspace,crate::skills::operations::SkillsIntent::Policy{skill_id:skill_id.clone(),enabled:*enabled,allow_implicit_invocation:*allow_implicit_invocation},work.epoch))?;
                         },
                         PluginIntent::Mcp{intent}=>{
                             use crate::mcp::operations::McpIntent::*;
                             let server_id=match intent{SignIn{server_id}|Disconnect{server_id}|CancelAuthorization{server_id,..}|RetryAuthorizationBrowser{server_id}|Policy{server_id,..}|Restart{server_id}|Remove{server_id}=>server_id,Configure{..}=>anyhow::bail!("plugin_child_configure_forbidden")};
                             anyhow::ensure!(p.mcp.iter().any(|s|&s.id==server_id),"plugin_child_unavailable");
-                            core.mcp_intent(&work.workspace,intent.clone())?;
+                            core.admit_plugin_child(&work,||core.mcp_intent_bound(&work.workspace,intent.clone(),work.epoch))?;
                         },_=>{}
                     }
                 } else { anyhow::ensure!(!matches!(work.intent,PluginIntent::Skill{..}|PluginIntent::Mcp{..}|PluginIntent::RemoveSkill{..}|PluginIntent::ConfigureMcp{..}),"plugin_child_unavailable"); }
@@ -448,6 +476,81 @@ mod tests {
         assert_ne!(old.generation, new.generation);
         assert!(!core.plugin_work_current(&old));
         assert!(core.plugin_work_current(&new));
+    }
+    // NOT_RUN / NOT_COMPILED. Exercise the worker's actual pre-RPC boundary,
+    // with a deterministic pause after its first check. No RPC/fixture is run.
+    #[test]
+    fn paused_worker_discards_close_stop_and_reopen_then_handles_next_work() {
+        for (stop, reopen_before_resume) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let core = crate::catalog_test_support::client();
+            let (sender, receiver) = mpsc::sync_channel(4);
+            let (discarded_tx, discarded_rx) = mpsc::channel();
+            core.plugins_controller.lock().unwrap().sender = Some(sender.clone());
+            core.plugin_intent(
+                "workspace",
+                PluginIntent::Observe {
+                    plugin_id: Some("old".into()),
+                },
+            );
+            let old = receiver.recv().unwrap();
+            let pause = Arc::new(std::sync::Barrier::new(2));
+            let resume = Arc::new(std::sync::Barrier::new(2));
+            let worker_core = core.clone();
+            let worker_pause = pause.clone();
+            let worker_resume = resume.clone();
+            let worker = std::thread::spawn(move || {
+                assert!(worker_core.plugin_work_current(&old));
+                worker_pause.wait();
+                worker_resume.wait();
+                assert_eq!(old.plugin_id.as_deref(), Some("old"));
+                assert!(worker_core.plugin_work_parent(&old).is_none());
+                assert!(
+                    worker_core
+                        .admit_plugin_child(&old, || panic!("stale child admitted"))
+                        .is_err()
+                );
+                discarded_tx.send(()).unwrap();
+                let next = receiver.recv().unwrap();
+                assert_eq!(
+                    worker_core.plugin_work_parent(&next),
+                    Some(Some("new".into()))
+                );
+            });
+            pause.wait();
+            if stop {
+                core.plugins_controller.lock().unwrap().stop();
+            } else {
+                core.plugin_intent("workspace", PluginIntent::Close);
+            }
+            assert!(
+                core.plugins_controller
+                    .lock()
+                    .unwrap()
+                    .publications
+                    .is_empty()
+            );
+            core.plugins_controller.lock().unwrap().sender = Some(sender);
+            let reopen = || {
+                core.plugin_intent(
+                    "workspace",
+                    PluginIntent::Observe {
+                        plugin_id: Some("new".into()),
+                    },
+                )
+            };
+            if reopen_before_resume {
+                reopen();
+            }
+            resume.wait();
+            discarded_rx.recv().unwrap();
+            if !reopen_before_resume {
+                reopen();
+            }
+            worker.join().unwrap();
+            assert!(core.plugins_controller.lock().is_ok());
+        }
     }
     #[test]
     fn foreign_connection_cannot_close_or_change_current_projection() {

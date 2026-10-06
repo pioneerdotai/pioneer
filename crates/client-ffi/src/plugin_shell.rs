@@ -257,7 +257,7 @@ impl McpOAuthShell for NativeOAuthShell {
         let Some(core) = self.core.upgrade() else {
             return OAuthBrowserEffectResult::CallbackUnavailable;
         };
-        let cancel = core.mcp_oauth_cancel_relay(event);
+        let cancel = core.mcp_oauth_cancel_relay_bound(event, admission.origin_connection());
         drop(core);
         let (tx, rx) = mpsc::sync_channel(1);
         let expires = Instant::now() + Duration::from_secs(600);

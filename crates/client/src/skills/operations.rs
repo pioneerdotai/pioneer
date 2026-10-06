@@ -174,12 +174,34 @@ impl ClientCore {
         })
         .and_then(|p| p.snapshot().payload())
     }
-    pub fn skills_intent(&self, workspace: &str, mut intent: SkillsIntent) -> anyhow::Result<u64> {
+    pub fn skills_intent(&self, workspace: &str, intent: SkillsIntent) -> anyhow::Result<u64> {
+        self.skills_intent_admit(workspace, intent, None)
+    }
+    /// Plugin delegation shares native validation, queueing and completion. It
+    /// must never recapture a Gateway selected after the originating read.
+    pub(crate) fn skills_intent_bound(
+        &self,
+        workspace: &str,
+        intent: SkillsIntent,
+        epoch: (u64, u64, Option<u64>),
+    ) -> anyhow::Result<u64> {
+        self.skills_intent_admit(workspace, intent, Some(epoch))
+    }
+    fn skills_intent_admit(
+        &self,
+        workspace: &str,
+        mut intent: SkillsIntent,
+        expected_epoch: Option<(u64, u64, Option<u64>)>,
+    ) -> anyhow::Result<u64> {
         anyhow::ensure!(
             self.capability_management_allowed(workspace),
             "capability_access_denied"
         );
-        let epoch = self.provider_runtime_epoch();
+        let epoch = expected_epoch.unwrap_or_else(|| self.provider_runtime_epoch());
+        anyhow::ensure!(
+            expected_epoch.is_none() || self.provider_runtime_epoch() == epoch,
+            "connection_changed"
+        );
         anyhow::ensure!(epoch.2.is_some(), "gateway_not_connected");
         let catalog = self
             .skills_catalog_snapshot(workspace)
@@ -246,6 +268,10 @@ impl ClientCore {
                 .get(&(workspace.into(), target.clone()))
                 .is_some_and(|p| p.state == SkillsActionState::Pending),
             "skill_action_pending"
+        );
+        anyhow::ensure!(
+            expected_epoch.is_none() || self.provider_runtime_epoch() == epoch,
+            "connection_changed"
         );
         owner.next = owner
             .next
@@ -859,6 +885,58 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(4);
         core.skills_controller.lock().unwrap().sender = Some(sender);
         (core, receiver)
+    }
+    // NOT_RUN / NOT_COMPILED. Pause at delegation with copied native IDs.
+    #[test]
+    fn plugin_skill_admission_rejects_replacement_and_queued_work_keeps_origin() {
+        for intent in [
+            SkillsIntent::Policy {
+                skill_id: skill('A').skill_id,
+                enabled: false,
+                allow_implicit_invocation: false,
+            },
+            SkillsIntent::Remove {
+                skill_id: skill('A').skill_id,
+            },
+        ] {
+            let (core, receiver) = fixture();
+            let origin = core.provider_runtime_epoch();
+            let pause = Arc::new(std::sync::Barrier::new(2));
+            let resume = Arc::new(std::sync::Barrier::new(2));
+            let worker_core = core.clone();
+            let worker_pause = pause.clone();
+            let worker_resume = resume.clone();
+            let worker_intent = intent.clone();
+            let worker = std::thread::spawn(move || {
+                worker_pause.wait();
+                worker_resume.wait();
+                worker_core.skills_intent_bound("workspace", worker_intent, origin)
+            });
+            pause.wait();
+            crate::catalog_test_support::switch_connection(&core, 8);
+            resume.wait();
+            assert_eq!(
+                worker.join().unwrap().unwrap_err().to_string(),
+                "connection_changed"
+            );
+            assert!(receiver.try_recv().is_err());
+            assert!(
+                core.skills_catalog_snapshot("workspace").unwrap().catalog[0]
+                    .policy
+                    .enabled
+            );
+            // Same native operation, accepted on its own current origin; then a
+            // second replacement before send cannot retarget the queued action.
+            let admitted = core.provider_runtime_epoch();
+            core.skills_intent_bound("workspace", intent, admitted)
+                .unwrap();
+            let Work::Action(action) = receiver.try_recv().unwrap() else {
+                panic!()
+            };
+            crate::catalog_test_support::switch_connection(&core, 9);
+            assert_eq!(action.epoch, admitted);
+            assert!(!core.skills_action_current(&action));
+        }
     }
     #[test]
     fn skill_policy_remove_failure_retry_and_access_fence_share_one_controller() {

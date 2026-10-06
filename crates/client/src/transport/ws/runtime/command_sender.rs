@@ -1244,6 +1244,48 @@ mod connection_generation_tests {
         assert_eq!(core.route_gateway_event(&settings), None);
     }
 
+    // NOT_RUN / NOT_COMPILED. Raw queue only; no transport worker/network.
+    #[test]
+    fn bound_native_request_does_not_recapture_route_changed_before_send() {
+        use crate::rpc::JsonRpcRequestTransport;
+        let (command_tx, mut queue) = unbounded_channel();
+        let sender = GatewayWsCommandSender {
+            command_tx,
+            next_connection_id: Arc::new(AtomicU64::new(8)),
+            session_access: Arc::new(Mutex::new(None)),
+            connection_generations: Arc::default(),
+            test_requests: Arc::default(),
+        };
+        sender.connection_generations.lock().unwrap().active = Some(7);
+        let bound = sender.requests_for_connection(7);
+        // Models replacement after native work's last current check. Every
+        // mutation and OAuth callback uses this same bound Request transport.
+        sender.connection_generations.lock().unwrap().active = Some(8);
+        for method in [
+            "mcp/install",
+            "mcp/policy/set",
+            "skills/policy/set",
+            "mcp/oauth",
+        ] {
+            let (response_tx, _) = mpsc::channel();
+            bound
+                .send_json_rpc_request("request".into(), method.into(), response_tx)
+                .unwrap();
+            let GatewayWsCommand::Request {
+                expected_connection,
+                ..
+            } = queue.try_recv().unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(expected_connection, Some(7));
+            assert_ne!(
+                expected_connection,
+                sender.connection_generations.lock().unwrap().active
+            );
+        }
+    }
+
     #[test]
     fn stale_retirement_preserves_new_active_and_pending_connections() {
         let client = GatewayWsClient::new();
