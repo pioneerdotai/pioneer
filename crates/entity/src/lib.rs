@@ -124,6 +124,7 @@ pub mod task_agent_spec;
 pub mod task_delivery;
 pub mod task_delivery_attempt;
 pub mod task_delivery_authority;
+pub mod task_delivery_recovery_retry;
 pub mod task_dependency;
 pub mod task_event;
 pub mod task_event_fanout_cursor;

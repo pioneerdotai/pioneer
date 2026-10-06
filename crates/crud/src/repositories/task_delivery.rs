@@ -734,24 +734,6 @@ pub async fn list_due_deliveries<C: ConnectionTrait>(
         .context("failed to list due task deliveries")
 }
 
-pub async fn list_stuck_deliveries<C: ConnectionTrait>(
-    db: &C,
-    before: DateTimeWithTimeZone,
-    limit: u64,
-) -> Result<Vec<task_delivery::Model>> {
-    if limit == 0 || limit > MAX_DELIVERY_LIST_LIMIT {
-        bail!("stuck Task delivery batch exceeds its bounded limit");
-    }
-    task_delivery::Entity::find()
-        .filter(task_delivery::Column::Status.eq("delivering"))
-        .filter(task_delivery::Column::UpdatedAt.lte(before))
-        .order_by_asc(task_delivery::Column::UpdatedAt)
-        .limit(limit)
-        .all(db)
-        .await
-        .context("failed to list stuck task deliveries")
-}
-
 pub async fn list_deliveries_scoped<C: ConnectionTrait>(
     db: &C,
     params: &TaskDeliveriesParams,

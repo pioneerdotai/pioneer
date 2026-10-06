@@ -2402,7 +2402,7 @@ impl MessageProcessor {
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
-                    retry_transient_storage_access(|| this.process_due_task_deliveries(now, 64)),
+                    this.process_due_task_deliveries(now, 64),
                 )
                 .await
                 {

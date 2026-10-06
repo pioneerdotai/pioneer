@@ -302,7 +302,7 @@ async fn delivery_recovery_discovery_loses_to_cancellation_without_counting_it()
     let before = snapshot(&runtime, &queued).await;
     let mut subscription = subscribe(&runtime, &queued.task_id);
     release.notify_one();
-    assert_eq!(operation.await.unwrap().unwrap(), 0);
+    assert_eq!(operation.await.unwrap().unwrap().recovered, 0);
     assert_eq!(snapshot(&runtime, &queued).await, before);
     assert_no_wake(&mut subscription).await;
 }
@@ -333,7 +333,7 @@ async fn delivery_recovery_discovery_loses_to_success_and_retains_receipt() {
     let before = snapshot(&runtime, &queued).await;
     let mut subscription = subscribe(&runtime, &queued.task_id);
     release.notify_one();
-    assert_eq!(operation.await.unwrap().unwrap(), 0);
+    assert_eq!(operation.await.unwrap().unwrap().recovered, 0);
     assert_eq!(snapshot(&runtime, &queued).await, before);
     assert_eq!(before.attempts[0].http_status, Some(204));
     assert_eq!(
@@ -596,14 +596,16 @@ async fn delivery_ordinary_retry_budget_exhaustion_and_recovery_remain_exact() {
         service
             .recover_stuck_deliveries(DELIVERY_TIME + 362, 10)
             .await
-            .unwrap(),
+            .unwrap()
+            .recovered,
         1
     );
     assert_eq!(
         service
             .recover_stuck_deliveries(DELIVERY_TIME + 362, 10)
             .await
-            .unwrap(),
+            .unwrap()
+            .recovered,
         0
     );
     let recovered = snapshot(&runtime, &queued).await;
@@ -978,7 +980,7 @@ async fn delivery_recovery_rechecks_stuck_cutoff_inside_writer() {
     let before = snapshot(&runtime, &queued).await;
     let mut subscription = subscribe(&runtime, &queued.task_id);
     release.notify_one();
-    assert_eq!(operation.await.unwrap().unwrap(), 0);
+    assert_eq!(operation.await.unwrap().unwrap().recovered, 0);
     assert_eq!(snapshot(&runtime, &queued).await, before);
     assert_no_wake(&mut subscription).await;
 }
@@ -1007,7 +1009,7 @@ async fn delivery_recovery_old_discovery_cannot_recover_the_next_attempt() {
     let before = snapshot(&runtime, &queued).await;
     let mut subscription = subscribe(&runtime, &queued.task_id);
     release.notify_one();
-    assert_eq!(operation.await.unwrap().unwrap(), 0);
+    assert_eq!(operation.await.unwrap().unwrap().recovered, 0);
     assert_eq!(snapshot(&runtime, &queued).await, before);
     assert_no_wake(&mut subscription).await;
 }
@@ -1022,7 +1024,14 @@ async fn delivery_recovery_exhausts_the_existing_budget_without_increasing_it() 
         assert_eq!(delivery.attempt_count, number);
         assert_eq!(attempt.attempt_number, number);
         now += 301;
-        assert_eq!(service.recover_stuck_deliveries(now, 10).await.unwrap(), 1);
+        assert_eq!(
+            service
+                .recover_stuck_deliveries(now, 10)
+                .await
+                .unwrap()
+                .recovered,
+            1
+        );
     }
     let final_state = snapshot(&runtime, &queued).await;
     assert_eq!(final_state.deliveries[0].status, TaskDeliveryStatus::Failed);
@@ -1039,7 +1048,8 @@ async fn delivery_recovery_exhausts_the_existing_budget_without_increasing_it() 
         service
             .recover_stuck_deliveries(now + 301, 10)
             .await
-            .unwrap(),
+            .unwrap()
+            .recovered,
         0
     );
     assert_eq!(snapshot(&runtime, &queued).await, final_state);
@@ -1251,4 +1261,1085 @@ async fn delivery_ordinary_success_is_terminal_and_duplicate_results_preserve_al
     ));
     assert_eq!(snapshot(&runtime, &queued).await, before);
     assert_no_wake(&mut subscription).await;
+}
+
+async fn recovery_snapshot(
+    runtime: &TaskRuntime,
+    id: &str,
+) -> pioneer_crud::DeliveryRecoverySnapshot {
+    runtime
+        .service()
+        .store()
+        .with_maintenance_access()
+        .task_delivery_recovery_snapshot(id)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+async fn recovery_defer(
+    runtime: &TaskRuntime,
+    source: &pioneer_crud::DeliveryRecoverySnapshot,
+    now: i64,
+) -> bool {
+    runtime
+        .service()
+        .store()
+        .with_maintenance_access()
+        .defer_task_delivery_recovery(source, &|| now)
+        .await
+        .unwrap()
+}
+
+async fn delete_exact_attempt(runtime: &TaskRuntime, attempt: &TaskDeliveryAttempt) {
+    runtime
+        .service()
+        .store()
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "DELETE FROM task_delivery_attempt WHERE id=?",
+            [attempt.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn recovery_missing_first_attempt_does_not_abort_or_change_domain_schedule() {
+    let (runtime, poison) = delivery_fixture().await;
+    let (_, missing) = started(&runtime, &poison.id, DELIVERY_TIME).await;
+    delete_exact_attempt(&runtime, &missing).await;
+    let healthy = queue_delivery(&runtime).await;
+    started(&runtime, &healthy.id, DELIVERY_TIME + 1).await;
+    let before = recovery_snapshot(&runtime, &poison.id).await.delivery;
+    assert_eq!(
+        runtime
+            .background_control_service()
+            .recover_stuck_deliveries(DELIVERY_TIME + 301, 64)
+            .await
+            .unwrap()
+            .recovered,
+        1
+    );
+    let after = recovery_snapshot(&runtime, &poison.id).await;
+    assert_eq!(after.delivery, before);
+    assert!(
+        after.attempt.is_none(),
+        "must not manufacture an exact attempt"
+    );
+    let retry = after.retry.unwrap();
+    assert!(retry.expected_attempt_id.is_none());
+    assert_eq!(retry.expected_attempt_count, 1);
+    assert_eq!(retry.next_probe_at, DELIVERY_TIME + 306);
+    assert_eq!(retry.attempts, 1);
+    assert_eq!(
+        runtime
+            .service()
+            .store()
+            .get_task_delivery(&healthy.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskDeliveryStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn recovery_error_delay_survives_restart_and_due_source_duplicate_is_processed_once() {
+    let (runtime, poison) = delivery_fixture().await;
+    let (_, attempt) = started(&runtime, &poison.id, DELIVERY_TIME).await;
+    delete_exact_attempt(&runtime, &attempt).await;
+    let source = recovery_snapshot(&runtime, &poison.id).await;
+    assert!(recovery_defer(&runtime, &source, DELIVERY_TIME + 301).await);
+    let initial = recovery_snapshot(&runtime, &poison.id).await;
+    let restarted = TaskRuntime::new(runtime.service().store());
+    assert_eq!(
+        restarted
+            .background_control_service()
+            .recover_stuck_deliveries(DELIVERY_TIME + 302, 64)
+            .await
+            .unwrap()
+            .recovered,
+        0
+    );
+    assert_eq!(
+        recovery_snapshot(&runtime, &poison.id).await.retry,
+        initial.retry
+    );
+    assert_eq!(
+        restarted
+            .background_control_service()
+            .recover_stuck_deliveries(DELIVERY_TIME + 306, 64)
+            .await
+            .unwrap()
+            .recovered,
+        0
+    );
+    let retry = recovery_snapshot(&runtime, &poison.id).await.retry.unwrap();
+    assert_eq!(
+        retry.attempts, 2,
+        "source/due duplicate consumes inputs but receives only one handler"
+    );
+    assert_eq!(retry.next_probe_at, DELIVERY_TIME + 316);
+    assert_ne!(
+        Some(retry.retry_token),
+        initial.retry.map(|r| r.retry_token)
+    );
+}
+
+#[tokio::test]
+async fn recovery_raw_pages_pass_more_than_64_delayed_inputs_with_timestamp_ties() {
+    let (runtime, queued) = delivery_fixture().await;
+    let store = runtime.service().store().with_maintenance_access();
+    // Discovery-only fixtures: keep the real task/run FK facts, but do not
+    // pretend these cloned deliveries possess domain authority or attempts.
+    let template = recovery_snapshot(&runtime, &queued.id).await.delivery;
+    for number in 0..130 {
+        let mut row: pioneer_entity::task_delivery::ActiveModel = template.clone().into();
+        row.id = Set(format!("recovery_input_{number:03}"));
+        row.delivery_key = Set(format!("recovery_input_key_{number:03}"));
+        row.status = Set("delivering".to_owned());
+        row.attempt_count = Set(1);
+        row.next_attempt_at = Set(None);
+        pioneer_entity::task_delivery::Entity::insert(row)
+            .exec(&store.database_connection())
+            .await
+            .unwrap();
+        let source = recovery_snapshot(&runtime, &format!("recovery_input_{number:03}")).await;
+        assert!(recovery_defer(&runtime, &source, DELIVERY_TIME + 1_000).await);
+    }
+    let mut cursor = None;
+    let mut ids = std::collections::BTreeSet::new();
+    for count in [64, 64, 2] {
+        let page = store
+            .task_delivery_recovery_page(DELIVERY_TIME + 300, cursor.as_ref(), 64)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.len(),
+            count,
+            "delayed rows must consume the raw input budget"
+        );
+        for row in &page {
+            assert!(ids.insert(row.id.clone()));
+        }
+        cursor = page.last().cloned();
+    }
+    assert_eq!(ids.len(), 130);
+    assert!(
+        store
+            .task_delivery_recovery_page(DELIVERY_TIME + 300, cursor.as_ref(), 64)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let healthy = queue_delivery(&runtime).await;
+    started(&runtime, &healthy.id, DELIVERY_TIME + 1).await;
+    let service = runtime.background_control_service();
+    assert_eq!(
+        service
+            .recover_stuck_deliveries(DELIVERY_TIME + 301, 64)
+            .await
+            .unwrap()
+            .recovered,
+        0
+    );
+    assert_eq!(
+        service
+            .recover_stuck_deliveries(DELIVERY_TIME + 301, 64)
+            .await
+            .unwrap()
+            .recovered,
+        0
+    );
+    assert_eq!(
+        service
+            .recover_stuck_deliveries(DELIVERY_TIME + 301, 64)
+            .await
+            .unwrap()
+            .recovered,
+        1,
+        "raw cursor must pass the delayed prefix and reach healthy current work"
+    );
+}
+
+#[tokio::test]
+async fn recovery_fair_source_retry_mix_leaves_each_source_some_budget() {
+    let (runtime, poison) = delivery_fixture().await;
+    let (_, missing) = started(&runtime, &poison.id, DELIVERY_TIME).await;
+    delete_exact_attempt(&runtime, &missing).await;
+    let source = recovery_snapshot(&runtime, &poison.id).await;
+    assert!(recovery_defer(&runtime, &source, DELIVERY_TIME + 301).await);
+    let healthy = queue_delivery(&runtime).await;
+    started(&runtime, &healthy.id, DELIVERY_TIME + 1).await;
+    // One due retry and one raw source input. Duplicate poison still spends
+    // that source input; advancing the cursor lets healthy progress next time.
+    let service = runtime.background_control_service();
+    assert_eq!(
+        service
+            .recover_stuck_deliveries(DELIVERY_TIME + 306, 2)
+            .await
+            .unwrap()
+            .recovered,
+        0
+    );
+    assert_eq!(
+        service
+            .recover_stuck_deliveries(DELIVERY_TIME + 306, 2)
+            .await
+            .unwrap()
+            .recovered,
+        1
+    );
+    assert_eq!(
+        recovery_snapshot(&runtime, &poison.id)
+            .await
+            .retry
+            .unwrap()
+            .attempts,
+        2
+    );
+}
+
+#[tokio::test]
+async fn recovery_retry_fences_same_timestamp_attempt_replacement_and_stale_token() {
+    let (runtime, queued) = delivery_fixture().await;
+    let (_, attempt) = started(&runtime, &queued.id, DELIVERY_TIME).await;
+    let original = recovery_snapshot(&runtime, &queued.id).await;
+    assert!(recovery_defer(&runtime, &original, DELIVERY_TIME + 301).await);
+    let first_retry = recovery_snapshot(&runtime, &queued.id).await;
+    sql(
+        &runtime,
+        "UPDATE task_delivery SET updated_at=updated_at, max_attempts=max_attempts",
+    )
+    .await;
+    sql(&runtime, "UPDATE task_delivery_attempt SET status=status").await;
+    assert_eq!(
+        recovery_snapshot(&runtime, &queued.id).await.retry,
+        first_retry.retry,
+        "same-value writes preserve delay"
+    );
+    assert!(
+        !recovery_defer(&runtime, &original, DELIVERY_TIME + 400).await,
+        "an absence snapshot cannot overwrite a retry inserted later"
+    );
+    runtime
+        .service()
+        .store()
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "UPDATE task_delivery_attempt SET id=? WHERE id=?",
+            [
+                "replacement_exact_attempt".into(),
+                attempt.id.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    let replacement = recovery_snapshot(&runtime, &queued.id).await;
+    assert_eq!(
+        replacement.delivery.updated_at,
+        original.delivery.updated_at
+    );
+    assert_eq!(
+        replacement.delivery.attempt_count,
+        original.delivery.attempt_count
+    );
+    assert!(replacement.retry.is_none());
+    assert!(!recovery_defer(&runtime, &first_retry, DELIVERY_TIME + 400).await);
+    assert!(recovery_defer(&runtime, &replacement, DELIVERY_TIME + 306).await);
+    let new_retry = recovery_snapshot(&runtime, &queued.id).await.retry.unwrap();
+    assert_eq!(
+        new_retry.expected_attempt_id.as_deref(),
+        Some("replacement_exact_attempt")
+    );
+    assert_ne!(
+        new_retry.retry_token,
+        first_retry.retry.unwrap().retry_token
+    );
+    assert!(!recovery_defer(&runtime, &replacement, DELIVERY_TIME + 500).await);
+    assert_eq!(
+        recovery_snapshot(&runtime, &queued.id).await.retry.unwrap(),
+        new_retry
+    );
+}
+
+#[tokio::test]
+async fn recovery_verified_absence_is_invalidated_by_exact_attempt_insert() {
+    let (runtime, queued) = delivery_fixture().await;
+    let (_, attempt) = started(&runtime, &queued.id, DELIVERY_TIME).await;
+    let raw = recovery_snapshot(&runtime, &queued.id)
+        .await
+        .attempt
+        .unwrap();
+    delete_exact_attempt(&runtime, &attempt).await;
+    let absent = recovery_snapshot(&runtime, &queued.id).await;
+    assert!(recovery_defer(&runtime, &absent, DELIVERY_TIME + 301).await);
+    pioneer_entity::task_delivery_attempt::Entity::insert(
+        pioneer_entity::task_delivery_attempt::ActiveModel::from(raw),
+    )
+    .exec(&runtime.service().store().database_connection())
+    .await
+    .unwrap();
+    assert!(
+        recovery_snapshot(&runtime, &queued.id)
+            .await
+            .retry
+            .is_none()
+    );
+    assert!(!recovery_defer(&runtime, &absent, DELIVERY_TIME + 302).await);
+}
+
+#[tokio::test]
+async fn recovery_delivery_delete_reinsert_does_not_reuse_retry_token() {
+    let (runtime, queued) = delivery_fixture().await;
+    started(&runtime, &queued.id, DELIVERY_TIME).await;
+    let source = recovery_snapshot(&runtime, &queued.id).await;
+    assert!(recovery_defer(&runtime, &source, DELIVERY_TIME + 301).await);
+    let old = recovery_snapshot(&runtime, &queued.id).await;
+    runtime
+        .service()
+        .store()
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "DELETE FROM task_delivery WHERE id=?",
+            [queued.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    pioneer_entity::task_delivery::Entity::insert(
+        pioneer_entity::task_delivery::ActiveModel::from(source.delivery),
+    )
+    .exec(&runtime.service().store().database_connection())
+    .await
+    .unwrap();
+    let recreated = recovery_snapshot(&runtime, &queued.id).await;
+    assert!(recreated.retry.is_none());
+    assert!(recovery_defer(&runtime, &recreated, DELIVERY_TIME + 302).await);
+    let new_retry = recovery_snapshot(&runtime, &queued.id).await.retry.unwrap();
+    assert_ne!(
+        new_retry.retry_token,
+        old.retry.as_ref().unwrap().retry_token
+    );
+    assert!(!recovery_defer(&runtime, &old, DELIVERY_TIME + 600).await);
+    assert_eq!(
+        recovery_snapshot(&runtime, &queued.id).await.retry.unwrap(),
+        new_retry
+    );
+}
+
+#[tokio::test]
+async fn recovery_panic_isolated_from_healthy_rows_and_persisted_as_error_retry() {
+    let (runtime, poison) = delivery_fixture().await;
+    started(&runtime, &poison.id, DELIVERY_TIME).await;
+    let healthy = queue_delivery(&runtime).await;
+    started(&runtime, &healthy.id, DELIVERY_TIME + 1).await;
+    let (entered, release) = gate(&runtime, CommitKind::RecoveryPanic);
+    let service = runtime.background_control_service();
+    let operation = tokio::spawn(async move {
+        service
+            .recover_stuck_deliveries(DELIVERY_TIME + 301, 64)
+            .await
+    });
+    reached(&entered).await;
+    release.notify_one();
+    assert_eq!(operation.await.unwrap().unwrap().recovered, 1);
+    let poison_state = recovery_snapshot(&runtime, &poison.id).await;
+    assert_eq!(poison_state.delivery.status, "delivering");
+    assert_eq!(poison_state.retry.unwrap().attempts, 1);
+    assert_eq!(
+        runtime
+            .service()
+            .store()
+            .get_task_delivery(&healthy.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskDeliveryStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn recovery_attempt_write_failure_rolls_back_event_delivery_and_retry_cleanup() {
+    let (runtime, queued) = delivery_fixture().await;
+    started(&runtime, &queued.id, DELIVERY_TIME).await;
+    let source = recovery_snapshot(&runtime, &queued.id).await;
+    assert!(recovery_defer(&runtime, &source, DELIVERY_TIME + 301).await);
+    let before = snapshot(&runtime, &queued).await;
+    sql(&runtime, "CREATE TRIGGER reject_recovery_attempt BEFORE UPDATE ON task_delivery_attempt BEGIN SELECT RAISE(ABORT,'test recovery rollback'); END").await;
+    let mut subscription = subscribe(&runtime, &queued.task_id);
+    assert_eq!(
+        runtime
+            .background_control_service()
+            .recover_stuck_deliveries(DELIVERY_TIME + 306, 64)
+            .await
+            .unwrap()
+            .recovered,
+        0
+    );
+    assert_eq!(snapshot(&runtime, &queued).await, before);
+    assert_no_wake(&mut subscription).await;
+    let retry = recovery_snapshot(&runtime, &queued.id).await.retry.unwrap();
+    assert_eq!(retry.attempts, 2);
+    assert_eq!(retry.next_probe_at, DELIVERY_TIME + 316);
+    sql(&runtime, "DROP TRIGGER reject_recovery_attempt").await;
+    assert_eq!(
+        runtime
+            .background_control_service()
+            .recover_stuck_deliveries(DELIVERY_TIME + 316, 64)
+            .await
+            .unwrap()
+            .recovered,
+        1
+    );
+    assert!(
+        recovery_snapshot(&runtime, &queued.id)
+            .await
+            .retry
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn recovery_large_terminal_history_has_empty_active_range() {
+    let (runtime, queued) = delivery_fixture().await;
+    let store = runtime.service().store().with_maintenance_access();
+    let template = recovery_snapshot(&runtime, &queued.id).await.delivery;
+    for number in 0..1_000 {
+        let mut row: pioneer_entity::task_delivery::ActiveModel = template.clone().into();
+        row.id = Set(format!("terminal_history_{number}"));
+        row.delivery_key = Set(format!("terminal_history_key_{number}"));
+        row.status = Set("cancelled".to_owned());
+        row.next_attempt_at = Set(None);
+        pioneer_entity::task_delivery::Entity::insert(row)
+            .exec(&store.database_connection())
+            .await
+            .unwrap();
+    }
+    assert!(
+        store
+            .task_delivery_recovery_page(DELIVERY_TIME + 300, None, 64)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        runtime
+            .background_control_service()
+            .recover_stuck_deliveries(DELIVERY_TIME + 301, 64)
+            .await
+            .unwrap()
+            .recovered,
+        0
+    );
+    assert!(
+        store
+            .due_task_delivery_recovery_retries(i64::MAX, 64)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+async fn physical_recovery_fixture() -> (
+    TaskRuntime,
+    TaskDelivery,
+    Arc<DeliveryRoutingObserver>,
+    tempfile::TempDir,
+) {
+    use sea_orm::ConnectOptions;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("recovery.sqlite");
+    let mut writer_options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
+    writer_options.max_connections(1);
+    let writer = Database::connect(writer_options).await.unwrap();
+    Migrator::up(&writer, None).await.unwrap();
+    writer
+        .execute_unprepared("PRAGMA journal_mode=WAL")
+        .await
+        .unwrap();
+    seed_task_test_workspace(&writer).await;
+    let mut reader_options =
+        ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
+    reader_options
+        .max_connections(2)
+        .map_sqlx_sqlite_opts(|options| {
+            options
+                .read_only(true)
+                .create_if_missing(false)
+                .pragma("query_only", "ON")
+        });
+    let reader = Database::connect(reader_options).await.unwrap();
+    let observer = Arc::new(DeliveryRoutingObserver::default());
+    let database = pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(
+        reader,
+        pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        observer.clone(),
+    );
+    database.validate_reader().await.unwrap();
+    let runtime = TaskRuntime::new(Arc::new(CrudStore::new(database)));
+    let queued = queue_delivery(&runtime).await;
+    (runtime, queued, observer, directory)
+}
+
+#[tokio::test]
+async fn recovery_retry_writes_are_maintenance_and_domain_commit_keeps_critical_scope() {
+    let (runtime, queued, observer, _directory) = physical_recovery_fixture().await;
+    started(&runtime, &queued.id, DELIVERY_TIME).await;
+    let source = recovery_snapshot(&runtime, &queued.id).await;
+    observer.clear();
+    assert!(recovery_defer(&runtime, &source, DELIVERY_TIME + 301).await);
+    let classes = observer
+        .writes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(classes, [pioneer_sqlite::SqliteWriteClass::Maintenance]);
+    observer.clear();
+    assert_eq!(
+        runtime
+            .background_control_service()
+            .recover_stuck_deliveries(DELIVERY_TIME + 306, 64)
+            .await
+            .unwrap()
+            .recovered,
+        1
+    );
+    let classes = observer
+        .writes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        classes,
+        [pioneer_sqlite::SqliteWriteClass::Critical],
+        "event+attempt+delivery+retry cleanup share one writer transaction"
+    );
+    let reads = observer.reads.lock().unwrap();
+    assert!(reads.iter().any(|e| matches!(
+        e,
+        pioneer_sqlite::SqliteReadEvent::OperationFinished {
+            class: pioneer_sqlite::SqliteReadClass::Maintenance,
+            ..
+        }
+    )));
+    assert!(!reads.iter().any(|e| matches!(
+        e,
+        pioneer_sqlite::SqliteReadEvent::OperationFinished {
+            class: pioneer_sqlite::SqliteReadClass::Interactive,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn recovery_cancellation_aborts_queued_error_delay_and_releases_capacity() {
+    let (runtime, queued, observer, _directory) = physical_recovery_fixture().await;
+    let (_, missing) = started(&runtime, &queued.id, DELIVERY_TIME).await;
+    delete_exact_attempt(&runtime, &missing).await;
+    let before = recovery_snapshot(&runtime, &queued.id).await;
+    let blocker = runtime
+        .service()
+        .store()
+        .database_connection()
+        .begin()
+        .await
+        .unwrap();
+    observer.clear();
+    observer.watch_queue.store(true, Ordering::SeqCst);
+    let service = runtime.background_control_service();
+    let operation = tokio::spawn(async move {
+        service
+            .recover_stuck_deliveries(DELIVERY_TIME + 301, 64)
+            .await
+    });
+    reached(&observer.queued).await;
+    operation.abort();
+    assert!(operation.await.unwrap_err().is_cancelled());
+    reached(&observer.cancelled).await;
+    blocker.rollback().await.unwrap();
+    let after = recovery_snapshot(&runtime, &queued.id).await;
+    assert_eq!(after.delivery, before.delivery);
+    assert!(
+        after.retry.is_none(),
+        "no uncommitted delay is claimed durable"
+    );
+    let queues = observer
+        .writes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            pioneer_sqlite::SqliteWriteEvent::Cancelled { class, queue, .. } => {
+                Some((*class, *queue))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(queues.contains(&(
+        pioneer_sqlite::SqliteWriteClass::Maintenance,
+        pioneer_sqlite::SqliteWriteQueueSnapshot::default()
+    )));
+    timeout(
+        Duration::from_secs(5),
+        runtime
+            .background_control_service()
+            .recover_stuck_deliveries(DELIVERY_TIME + 302, 64),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+}
+
+fn pause_recovery_clock() -> tokio::task::JoinHandle<()> {
+    tokio::time::pause();
+    // SQLx waits on an external SQLite thread. Keep virtual time from advancing
+    // automatically while it runs; tests advance it explicitly at boundaries.
+    tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    })
+}
+
+async fn reject_retry_for(runtime: &TaskRuntime, delivery_id: &str) {
+    // SQLite trigger DDL cannot bind parameters. Fixture IDs are quoted here.
+    let id = delivery_id.replace('\'', "''");
+    for event in ["INSERT", "UPDATE"] {
+        sql(runtime, &format!("CREATE TRIGGER reject_recovery_retry_{event} BEFORE {event} ON task_delivery_recovery_retry WHEN NEW.delivery_id='{id}' BEGIN SELECT RAISE(ABORT,'test row-local bookkeeping failure'); END")).await;
+    }
+}
+
+#[tokio::test]
+async fn recovery_local_retry_insert_failure_first_source_candidate_still_repairs_next() {
+    let (runtime, poison) = delivery_fixture().await;
+    let (_, missing) = started(&runtime, &poison.id, DELIVERY_TIME).await;
+    delete_exact_attempt(&runtime, &missing).await;
+    let healthy = queue_delivery(&runtime).await;
+    started(&runtime, &healthy.id, DELIVERY_TIME + 1).await;
+    reject_retry_for(&runtime, &poison.id).await;
+    let report = runtime
+        .background_control_service()
+        .recover_stuck_deliveries(DELIVERY_TIME + 301, 64)
+        .await
+        .unwrap();
+    assert_eq!(
+        report,
+        crate::TaskDeliveryRecoveryResult {
+            selected: 2,
+            recovered: 1,
+            failed: 1,
+            undurable: 1,
+            cooling_down: true,
+        }
+    );
+    assert_eq!(
+        recovery_snapshot(&runtime, &healthy.id)
+            .await
+            .delivery
+            .status,
+        "pending"
+    );
+    let failed = recovery_snapshot(&runtime, &poison.id).await;
+    assert!(failed.retry.is_none());
+    assert!(failed.attempt.is_none());
+    assert_eq!(failed.delivery.status, "delivering");
+}
+
+#[tokio::test]
+async fn recovery_failed_bookkeeping_preserves_healthy_rows_and_uses_quantum_cooldown() {
+    let (runtime, poison, observer, _directory) = physical_recovery_fixture().await;
+    let before = queue_delivery(&runtime).await;
+    started(&runtime, &before.id, DELIVERY_TIME).await;
+    let (_, missing) = started(&runtime, &poison.id, DELIVERY_TIME + 1).await;
+    delete_exact_attempt(&runtime, &missing).await;
+    let after = queue_delivery(&runtime).await;
+    started(&runtime, &after.id, DELIVERY_TIME + 2).await;
+    reject_retry_for(&runtime, &poison.id).await;
+    let service = runtime.background_control_service();
+    let clock_guard = pause_recovery_clock();
+    let report = service
+        .recover_stuck_deliveries(DELIVERY_TIME + 302, 64)
+        .await
+        .unwrap();
+    assert_eq!(
+        report,
+        crate::TaskDeliveryRecoveryResult {
+            selected: 3,
+            recovered: 2,
+            failed: 1,
+            undurable: 1,
+            cooling_down: true,
+        }
+    );
+    for healthy in [&before, &after] {
+        let source = recovery_snapshot(&runtime, &healthy.id).await;
+        assert_eq!(source.delivery.status, "pending");
+        assert_eq!(source.attempt.unwrap().status, "failed");
+    }
+    let source = recovery_snapshot(&runtime, &poison.id).await;
+    assert!(source.retry.is_none(), "failed bookkeeping is not durable");
+    assert!(source.attempt.is_none());
+    assert_eq!(source.delivery.status, "delivering");
+    observer.clear();
+    let skipped = service
+        .recover_stuck_deliveries(DELIVERY_TIME + 303, 64)
+        .await
+        .unwrap();
+    assert_eq!(skipped.selected, 0);
+    assert!(
+        skipped.cooling_down,
+        "partial success must preserve cooldown"
+    );
+    assert!(observer.reads.lock().unwrap().is_empty());
+    assert!(observer.writes.lock().unwrap().is_empty());
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let again = service
+        .recover_stuck_deliveries(DELIVERY_TIME + 307, 64)
+        .await
+        .unwrap();
+    assert_eq!((again.selected, again.failed, again.undurable), (1, 1, 1));
+    assert!(again.cooling_down);
+    // Permanent A-only rejection remains visible; next quantum gets 10s.
+    observer.clear();
+    tokio::time::advance(Duration::from_secs(9)).await;
+    assert_eq!(
+        service
+            .recover_stuck_deliveries(DELIVERY_TIME + 316, 64)
+            .await
+            .unwrap()
+            .selected,
+        0
+    );
+    assert!(observer.reads.lock().unwrap().is_empty());
+    clock_guard.abort();
+    tokio::time::resume();
+}
+
+#[tokio::test]
+async fn recovery_multiple_local_snapshot_errors_use_one_cooldown_and_do_not_infer_attempt_absence()
+{
+    let (runtime, poison) = delivery_fixture().await;
+    let (_, attempt) = started(&runtime, &poison.id, DELIVERY_TIME).await;
+    let another = queue_delivery(&runtime).await;
+    started(&runtime, &another.id, DELIVERY_TIME + 1).await;
+    let healthy = queue_delivery(&runtime).await;
+    started(&runtime, &healthy.id, DELIVERY_TIME + 2).await;
+    // SQLite dynamic typing permits a row-local decode error. Raw discovery
+    // reads only id/updated_at and therefore still selects the healthy row.
+    for id in [&poison.id, &another.id] {
+        runtime
+            .service()
+            .store()
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "UPDATE task_delivery SET attempt_count=? WHERE id=?",
+                ["invalid integer".into(), id.clone().into()],
+            ))
+            .await
+            .unwrap();
+    }
+    let service = runtime.background_control_service();
+    let clock_guard = pause_recovery_clock();
+    let report = service
+        .recover_stuck_deliveries(DELIVERY_TIME + 302, 64)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            report.selected,
+            report.recovered,
+            report.failed,
+            report.undurable
+        ),
+        (3, 1, 2, 2)
+    );
+    assert!(report.cooling_down);
+    assert_eq!(
+        recovery_snapshot(&runtime, &healthy.id)
+            .await
+            .delivery
+            .status,
+        "pending"
+    );
+    for id in [&poison.id, &another.id] {
+        runtime
+            .service()
+            .store()
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "UPDATE task_delivery SET attempt_count=? WHERE id=?",
+                [1_i64.into(), id.clone().into()],
+            ))
+            .await
+            .unwrap();
+        let source = recovery_snapshot(&runtime, id).await;
+        assert!(
+            source.retry.is_none(),
+            "no unfenced retry with fabricated absence"
+        );
+        assert!(source.attempt.is_some());
+    }
+    assert_eq!(
+        recovery_snapshot(&runtime, &poison.id)
+            .await
+            .attempt
+            .unwrap()
+            .id,
+        attempt.id
+    );
+    assert_eq!(
+        service
+            .recover_stuck_deliveries(DELIVERY_TIME + 303, 64)
+            .await
+            .unwrap()
+            .selected,
+        0
+    );
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert_eq!(
+        service
+            .recover_stuck_deliveries(DELIVERY_TIME + 307, 64)
+            .await
+            .unwrap()
+            .recovered,
+        2,
+        "two erroneous rows must not increase cooldown twice in one quantum"
+    );
+    clock_guard.abort();
+    tokio::time::resume();
+}
+
+#[tokio::test]
+async fn recovery_due_retry_local_failure_preserves_source_quota() {
+    let (runtime, poison) = delivery_fixture().await;
+    let (_, missing) = started(&runtime, &poison.id, DELIVERY_TIME).await;
+    delete_exact_attempt(&runtime, &missing).await;
+    let source = recovery_snapshot(&runtime, &poison.id).await;
+    assert!(recovery_defer(&runtime, &source, DELIVERY_TIME + 301).await);
+    let original_retry = recovery_snapshot(&runtime, &poison.id).await.retry;
+    let healthy = queue_delivery(&runtime).await;
+    started(&runtime, &healthy.id, DELIVERY_TIME + 1).await;
+    reject_retry_for(&runtime, &poison.id).await;
+    let service = runtime.background_control_service();
+    // Move source fairness cursor past A so the source quota selects B.
+    assert_eq!(
+        service
+            .recover_stuck_deliveries(DELIVERY_TIME + 301, 1)
+            .await
+            .unwrap()
+            .selected,
+        1
+    );
+    let report = service
+        .recover_stuck_deliveries(DELIVERY_TIME + 306, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            report.selected,
+            report.recovered,
+            report.failed,
+            report.undurable
+        ),
+        (2, 1, 1, 1)
+    );
+    assert!(report.cooling_down);
+    let retained = recovery_snapshot(&runtime, &poison.id).await;
+    assert_eq!(retained.retry, original_retry);
+    assert_eq!(retained.retry.unwrap().attempts, 1);
+    assert_eq!(
+        recovery_snapshot(&runtime, &healthy.id)
+            .await
+            .delivery
+            .status,
+        "pending"
+    );
+}
+
+#[tokio::test]
+async fn recovery_database_unavailable_reports_discovery_error_and_limits_future_quanta() {
+    let (runtime, _, observer, _directory) = physical_recovery_fixture().await;
+    runtime
+        .service()
+        .store()
+        .database_connection()
+        .clone()
+        .close()
+        .await
+        .unwrap();
+    let service = runtime.background_control_service();
+    assert!(
+        service
+            .recover_stuck_deliveries(DELIVERY_TIME + 301, 64)
+            .await
+            .is_err(),
+        "closed physical pools must not be reported as a successful empty quantum"
+    );
+    observer.clear();
+    let report = service
+        .recover_stuck_deliveries(DELIVERY_TIME + 302, 64)
+        .await
+        .unwrap();
+    assert_eq!(report.selected, 0);
+    assert!(report.cooling_down);
+    assert!(observer.reads.lock().unwrap().is_empty());
+    assert!(observer.writes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn runtime_start_survives_row_local_recovery_bookkeeping_failure() {
+    let (runtime, poison) = delivery_fixture().await;
+    let (_, missing) = started(&runtime, &poison.id, DELIVERY_TIME).await;
+    delete_exact_attempt(&runtime, &missing).await;
+    reject_retry_for(&runtime, &poison.id).await;
+    let stale_at = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() - 301, 0)
+        .unwrap()
+        .fixed_offset();
+    runtime
+        .service()
+        .store()
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "UPDATE task_delivery SET created_at=?,updated_at=? WHERE id=?",
+            [stale_at.into(), stale_at.into(), poison.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    runtime
+        .start()
+        .await
+        .expect("local recovery failure must not abort startup");
+    let report = runtime
+        .maintenance_service()
+        .recover_stuck_deliveries(chrono::Utc::now().timestamp(), 64)
+        .await
+        .unwrap();
+    assert!(
+        report.cooling_down,
+        "startup actually encountered the local undurable failure"
+    );
+    assert_eq!(report.selected, 0);
+    assert!(
+        recovery_snapshot(&runtime, &poison.id)
+            .await
+            .retry
+            .is_none()
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn recovery_error_delay_uses_clock_after_writer_admission() {
+    use std::sync::atomic::AtomicI64;
+    let (runtime, queued, observer, _directory) = physical_recovery_fixture().await;
+    started(&runtime, &queued.id, DELIVERY_TIME).await;
+    let source = recovery_snapshot(&runtime, &queued.id).await;
+    let blocker = runtime
+        .service()
+        .store()
+        .database_connection()
+        .begin()
+        .await
+        .unwrap();
+    observer.clear();
+    observer.watch_queue.store(true, Ordering::SeqCst);
+    let clock = Arc::new(AtomicI64::new(DELIVERY_TIME + 301));
+    let task_clock = clock.clone();
+    let store = runtime.service().store().with_maintenance_access();
+    let operation = tokio::spawn(async move {
+        store
+            .defer_task_delivery_recovery(&source, &|| task_clock.load(Ordering::SeqCst))
+            .await
+    });
+    reached(&observer.queued).await;
+    clock.store(DELIVERY_TIME + 401, Ordering::SeqCst);
+    blocker.rollback().await.unwrap();
+    assert!(operation.await.unwrap().unwrap());
+    assert_eq!(
+        recovery_snapshot(&runtime, &queued.id)
+            .await
+            .retry
+            .unwrap()
+            .next_probe_at,
+        DELIVERY_TIME + 406
+    );
+}
+
+#[tokio::test]
+async fn recovery_stale_retry_snapshot_cannot_apply_event_or_delay_new_retry() {
+    let (runtime, queued) = delivery_fixture().await;
+    started(&runtime, &queued.id, DELIVERY_TIME).await;
+    let old_source = recovery_snapshot(&runtime, &queued.id).await;
+    let old_event = old_source.failure_event(DELIVERY_TIME + 301).unwrap();
+    assert!(recovery_defer(&runtime, &old_source, DELIVERY_TIME + 301).await);
+    let first_retry = recovery_snapshot(&runtime, &queued.id).await;
+    assert!(recovery_defer(&runtime, &first_retry, DELIVERY_TIME + 306).await);
+    let second_retry = recovery_snapshot(&runtime, &queued.id).await;
+    assert_eq!(second_retry.delivery, first_retry.delivery);
+    assert_ne!(
+        second_retry.retry.as_ref().unwrap().retry_token,
+        first_retry.retry.as_ref().unwrap().retry_token
+    );
+    let before = snapshot(&runtime, &queued).await;
+    let current_retry = recovery_snapshot(&runtime, &queued.id).await.retry;
+    let outcome = runtime
+        .service()
+        .store()
+        .with_maintenance_reads_and_critical_writes()
+        .recover_task_delivery(
+            old_event,
+            &first_retry,
+            DELIVERY_TIME + 1,
+            DELIVERY_TIME + 301,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, Outcome::Superseded));
+    assert_eq!(snapshot(&runtime, &queued).await, before);
+    assert!(!recovery_defer(&runtime, &old_source, DELIVERY_TIME + 700).await);
+    assert!(!recovery_defer(&runtime, &first_retry, DELIVERY_TIME + 700).await);
+    assert_eq!(
+        recovery_snapshot(&runtime, &queued.id).await.retry,
+        current_retry
+    );
+}
+
+#[tokio::test]
+async fn recovery_cancel_during_failure_deferral_wins_without_new_retry() {
+    let (runtime, queued) = delivery_fixture().await;
+    started(&runtime, &queued.id, DELIVERY_TIME).await;
+    let source = recovery_snapshot(&runtime, &queued.id).await;
+    let (entered, release) = gate(&runtime, CommitKind::RecoveryRetry);
+    let store = runtime.service().store().with_maintenance_access();
+    let operation = tokio::spawn(async move {
+        store
+            .defer_task_delivery_recovery(&source, &|| DELIVERY_TIME + 301)
+            .await
+    });
+    reached(&entered).await;
+    cancel(&runtime, &queued.task_id).await;
+    release.notify_one();
+    assert!(!operation.await.unwrap().unwrap());
+    let cancelled = recovery_snapshot(&runtime, &queued.id).await;
+    assert_eq!(cancelled.delivery.status, "cancelled");
+    assert!(cancelled.retry.is_none());
 }

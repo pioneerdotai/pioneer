@@ -722,6 +722,10 @@ async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_obj
         .await
         .unwrap();
     assert!(indexes.is_empty());
+    let migrations = Migrator::migrations();
+    let target = migrations.iter().find(|m| m.name() == MIGRATION).unwrap();
+    assert_eq!(target.name(), MIGRATION);
+    assert_eq!(target.use_transaction(), Some(true));
     assert!(
         !Migrator::get_applied_migrations(&store.connection)
             .await

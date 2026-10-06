@@ -311,10 +311,16 @@ impl MessageProcessor {
 
     pub(super) async fn process_due_task_deliveries(&self, now: i64, limit: u64) -> Result<()> {
         let task_service = self.task_runtime.background_control_service();
-        task_service
+        if task_service
             .recover_stuck_deliveries(now, limit)
             .await
-            .map_err(|error| anyhow!("{error:#}"))?;
+            .is_err()
+        {
+            warn!(
+                failure_class = "task_delivery_recovery_gateway_discovery_failed",
+                "delivery recovery unavailable; continuing independent due deliveries"
+            );
+        }
         let deliveries = self.crud_store.list_due_task_deliveries(now, limit).await?;
         for delivery in deliveries {
             let pioneer_crud::TaskDeliveryTransitionOutcome::Applied((delivery, attempt)) =
