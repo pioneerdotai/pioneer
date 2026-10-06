@@ -12985,11 +12985,14 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
         )
         .await;
     let _first_response = recv_response_by_id(&mut rx, first_request_id.as_str()).await;
-    let first_status = wait_for_turn_status(
-        processor.crud_store.clone(),
-        thread.thread.id.as_str(),
-        first_turn_id,
-        TurnStatus::Completed,
+    let first_status = drain_test_notifications_while(
+        &mut rx,
+        wait_for_turn_status(
+            processor.crud_store.clone(),
+            thread.thread.id.as_str(),
+            first_turn_id,
+            TurnStatus::Completed,
+        ),
     )
     .await;
     let first_persisted = processor
@@ -13026,11 +13029,14 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
         .await;
     let _second_response = recv_response_by_id(&mut rx, second_request_id.as_str()).await;
     assert_eq!(
-        wait_for_turn_status(
-            processor.crud_store.clone(),
-            thread.thread.id.as_str(),
-            second_turn_id,
-            TurnStatus::Completed,
+        drain_test_notifications_while(
+            &mut rx,
+            wait_for_turn_status(
+                processor.crud_store.clone(),
+                thread.thread.id.as_str(),
+                second_turn_id,
+                TurnStatus::Completed,
+            )
         )
         .await,
         TurnStatus::Completed,
@@ -13148,11 +13154,14 @@ async fn followup_history_rejects_unavailable_accepted_artifact_before_provider(
         )
         .await;
     let _first_response = recv_response_by_id(&mut rx, first_request_id.as_str()).await;
-    let first_status = wait_for_turn_status(
-        processor.crud_store.clone(),
-        thread.thread.id.as_str(),
-        first_turn_id,
-        TurnStatus::Completed,
+    let first_status = drain_test_notifications_while(
+        &mut rx,
+        wait_for_turn_status(
+            processor.crud_store.clone(),
+            thread.thread.id.as_str(),
+            first_turn_id,
+            TurnStatus::Completed,
+        ),
     )
     .await;
     let first_persisted = processor
@@ -13194,11 +13203,14 @@ async fn followup_history_rejects_unavailable_accepted_artifact_before_provider(
         )
         .await;
     let _second_response = recv_response_by_id(&mut rx, second_request_id.as_str()).await;
-    let second_status = wait_for_turn_status(
-        processor.crud_store.clone(),
-        thread.thread.id.as_str(),
-        second_turn_id,
-        TurnStatus::Blocked,
+    let second_status = drain_test_notifications_while(
+        &mut rx,
+        wait_for_turn_status(
+            processor.crud_store.clone(),
+            thread.thread.id.as_str(),
+            second_turn_id,
+            TurnStatus::Blocked,
+        ),
     )
     .await;
     let failed = processor
@@ -31188,10 +31200,13 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
     )
     .await;
     assert!(
-        wait_for_prompt_parity_request_count(
-            provider.as_ref(),
-            PromptParityRequestKind::PostTurnExtractor,
-            2,
+        drain_test_notifications_while(
+            &mut harness.rx,
+            wait_for_prompt_parity_request_count(
+                provider.as_ref(),
+                PromptParityRequestKind::PostTurnExtractor,
+                2,
+            )
         )
         .await,
         "both seed turns should finish post-turn extraction before comparison"
@@ -31209,10 +31224,13 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
         exact_user_text,
     )
     .await;
-    if !wait_for_prompt_parity_request_count(
-        provider.as_ref(),
-        PromptParityRequestKind::PostTurnExtractor,
-        1,
+    if !drain_test_notifications_while(
+        &mut harness.rx,
+        wait_for_prompt_parity_request_count(
+            provider.as_ref(),
+            PromptParityRequestKind::PostTurnExtractor,
+            1,
+        ),
     )
     .await
     {
@@ -31275,10 +31293,13 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
     let task = create_task_for_test(&harness.processor, params)
         .await
         .expect("detached prompt parity task should start");
-    let task_status = wait_for_task_status(
-        harness.crud_store.clone(),
-        task.task.id.as_str(),
-        TaskStatus::Completed,
+    let task_status = drain_test_notifications_while(
+        &mut harness.rx,
+        wait_for_task_status(
+            harness.crud_store.clone(),
+            task.task.id.as_str(),
+            TaskStatus::Completed,
+        ),
     )
     .await;
     if task_status != TaskStatus::Completed {
@@ -31293,10 +31314,13 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
             failed.task.error, failed.runs
         );
     }
-    if !wait_for_prompt_parity_request_count(
-        provider.as_ref(),
-        PromptParityRequestKind::PostTurnExtractor,
-        1,
+    if !drain_test_notifications_while(
+        &mut harness.rx,
+        wait_for_prompt_parity_request_count(
+            provider.as_ref(),
+            PromptParityRequestKind::PostTurnExtractor,
+            1,
+        ),
     )
     .await
     {
@@ -31470,10 +31494,13 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
     )
     .await;
     assert!(
-        wait_for_prompt_parity_request_count(
-            provider.as_ref(),
-            PromptParityRequestKind::PostTurnExtractor,
-            2,
+        drain_test_notifications_while(
+            &mut harness.rx,
+            wait_for_prompt_parity_request_count(
+                provider.as_ref(),
+                PromptParityRequestKind::PostTurnExtractor,
+                2,
+            )
         )
         .await,
         "both full-parity seed turns should finish post-turn extraction"
@@ -31571,10 +31598,13 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         )];
     direct_launch.agent_launch = Some(exact_agent_launch.clone());
     run_memory_e2e_turn_with_params(&mut harness, &direct_launch).await;
-    if !wait_for_prompt_parity_request_count(
-        provider.as_ref(),
-        PromptParityRequestKind::PostTurnExtractor,
-        1,
+    if !drain_test_notifications_while(
+        &mut harness.rx,
+        wait_for_prompt_parity_request_count(
+            provider.as_ref(),
+            PromptParityRequestKind::PostTurnExtractor,
+            1,
+        ),
     )
     .await
     {
@@ -31681,10 +31711,13 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
     let task = create_task_for_test(&harness.processor, params)
         .await
         .expect("full prompt parity task should start");
-    let task_status = wait_for_task_status(
-        harness.crud_store.clone(),
-        task.task.id.as_str(),
-        TaskStatus::Completed,
+    let task_status = drain_test_notifications_while(
+        &mut harness.rx,
+        wait_for_task_status(
+            harness.crud_store.clone(),
+            task.task.id.as_str(),
+            TaskStatus::Completed,
+        ),
     )
     .await;
     if task_status != TaskStatus::Completed {
@@ -31750,10 +31783,13 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
             }),
         "the detached child must not inherit the direct Turn's private artifact-output root"
     );
-    if !wait_for_prompt_parity_request_count(
-        provider.as_ref(),
-        PromptParityRequestKind::PostTurnExtractor,
-        1,
+    if !drain_test_notifications_while(
+        &mut harness.rx,
+        wait_for_prompt_parity_request_count(
+            provider.as_ref(),
+            PromptParityRequestKind::PostTurnExtractor,
+            1,
+        ),
     )
     .await
     {
@@ -71352,6 +71388,25 @@ async fn wait_for_run_status(
         .expect("task run query should succeed")
         .expect("task run should exist")
         .status
+}
+
+/// Keep client notification backpressure out of waits for durable background work.
+/// Call only after receiving the RPC response; the caller still checks the result.
+async fn drain_test_notifications_while<T>(
+    rx: &mut mpsc::Receiver<Message>,
+    completion: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::pin!(completion);
+    loop {
+        tokio::select! {
+            result = &mut completion => return result,
+            notification = rx.recv() => {
+                if notification.is_none() {
+                    return completion.await;
+                }
+            }
+        }
+    }
 }
 
 async fn wait_for_turn_status(

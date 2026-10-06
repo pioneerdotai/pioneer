@@ -1643,7 +1643,7 @@ impl McpOAuthService {
         // admission before releasing the refresh lease or performing any await.
         // A cancellation that won remains recorded until the exchange drains.
         // Read the injectable wall clock outside admission as well: observing
-        // time never owns the decision lock. Recheck both clocks inside it.
+        // time never owns the decision lock. Check monotonic time inside it.
         let observed_wall_time = self.inner.options.clock.now();
         let mut decision = {
             let mut active = entry
@@ -1655,7 +1655,7 @@ impl McpOAuthService {
                 .and_then(|flow| flow.terminal_decision)
                 .unwrap_or_else(|| {
                     if tokio::time::Instant::now() >= deadline
-                        || observed_wall_time.max(self.inner.options.clock.now()) >= wall_deadline
+                        || observed_wall_time >= wall_deadline
                     {
                         OAuthState::TimedOut
                     } else if entry.cancellation.is_cancelled() {
@@ -2048,6 +2048,8 @@ impl McpOAuthService {
             event.state,
             OAuthState::Preparing | OAuthState::AwaitingCallback | OAuthState::Exchanging
         ) {
+            // The injectable clock may block; it must not own Cancel admission.
+            let observed_wall_time = self.inner.options.clock.now();
             let active = entry
                 .active_flow
                 .lock()
@@ -2058,7 +2060,7 @@ impl McpOAuthService {
                         && event.client_id == Some(flow.client)
                         && flow.terminal_decision.is_none()
                         && flow.deadline > tokio::time::Instant::now()
-                        && flow.wall_deadline > self.inner.options.clock.now()
+                        && flow.wall_deadline > observed_wall_time
                         && (event.state != OAuthState::AwaitingCallback
                             || (flow.callback_ready && !flow.callback_accepted))
                 });
@@ -2174,6 +2176,7 @@ impl McpOAuthService {
             .get(id)
             .cloned()
             .ok_or_else(|| McpRuntimeError::failed("OAuth flow unavailable"))?;
+        let observed_wall_time = self.inner.options.clock.now();
         let (workspace, terminal_state) = {
             let mut active = entry
                 .active_flow
@@ -2191,7 +2194,7 @@ impl McpOAuthService {
                 return Err(McpRuntimeError::failed("OAuth operation already completed"));
             }
             let terminal_state = if tokio::time::Instant::now() >= active.deadline
-                || self.inner.options.clock.now() >= active.wall_deadline
+                || observed_wall_time >= active.wall_deadline
             {
                 OAuthState::TimedOut
             } else {
