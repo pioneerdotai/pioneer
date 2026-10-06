@@ -7489,8 +7489,7 @@ impl MessageProcessor {
             pioneer_crud::load_agent_execution(&database, execution_id.as_str()).await?
         else {
             if let Some(deadline) = completion_deadline {
-                self.agent_manager
-                    .cancel_turn_and_wait(thread_id, turn.id.as_str(), reason, deadline)
+                self.stop_graph_turn_without_root(thread_id, turn, reason, deadline)
                     .await?;
             }
             return Ok(false);
@@ -7499,8 +7498,7 @@ impl MessageProcessor {
             || execution.parent_execution_id.is_some()
         {
             if let Some(deadline) = completion_deadline {
-                self.agent_manager
-                    .cancel_turn_and_wait(thread_id, turn.id.as_str(), reason, deadline)
+                self.stop_graph_turn_without_root(thread_id, turn, reason, deadline)
                     .await?;
             }
             return Ok(false);
@@ -7523,6 +7521,73 @@ impl MessageProcessor {
                 .await?
         };
 
+        let mut cli_turns = std::collections::BTreeSet::new();
+        let mut cli_owners = Vec::new();
+        let mut cli_keys = std::collections::HashSet::new();
+        if completion_deadline.is_some() {
+            let mut turns = targets
+                .iter()
+                .filter_map(|target| {
+                    Some((
+                        target.thread_id.clone()?,
+                        target.turn_id.clone()?,
+                        target.turn_pending,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            turns.push((
+                thread_id.to_owned(),
+                turn.id.clone(),
+                turn.status == pioneer_protocol::TurnStatus::InProgress,
+            ));
+            for (thread, turn_id, pending) in turns {
+                if let Some(binding) = self
+                    .crud_store
+                    .get_cli_runtime_turn_binding(&turn_id)
+                    .await?
+                {
+                    anyhow::ensure!(
+                        binding.thread_id == thread
+                            && binding.workspace_id == execution.workspace_id,
+                        "CLI graph binding scope changed"
+                    );
+                    cli_turns.insert((thread, turn_id.clone()));
+                    let key = crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
+                        binding.workspace_id,
+                        binding.runtime_id,
+                        binding.continuation_thread_id,
+                    )?;
+                    cli_keys.insert(key.clone());
+                    let manager = self
+                        .cli_runtime_manager
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("CLI graph owner inventory unavailable"))?;
+                    let owners = manager
+                        .stop_inventory(&execution.workspace_id)
+                        .into_iter()
+                        .filter(|owner| owner.instance().key() == &key && owner.owns_turn(&turn_id))
+                        .collect::<Vec<_>>();
+                    anyhow::ensure!(
+                        !pending || !owners.is_empty(),
+                        "pending CLI graph owner is unknown"
+                    );
+                    for owner in owners {
+                        if !cli_owners.iter().any(
+                            |known: &crate::cli_runtime::manager::CliSessionStopOwner| {
+                                known.instance() == owner.instance()
+                            },
+                        ) {
+                            cli_owners.push(owner);
+                        }
+                    }
+                }
+            }
+        }
+        let api_targets = targets
+            .iter()
+            .filter(|target| !target.has_cli_binding)
+            .cloned()
+            .collect::<Vec<_>>();
         let (native_owners, native_threads, captured_runs) = if completion_deadline.is_some() {
             let mut threads = targets
                 .iter()
@@ -7543,11 +7608,12 @@ impl MessageProcessor {
                 .cloned()
                 .collect::<std::collections::HashSet<_>>();
             let owners = select_native_graph_owners(
-                &targets,
+                &api_targets,
                 owners,
                 thread_id,
                 turn.id.as_str(),
-                matches!(turn.status, pioneer_protocol::TurnStatus::InProgress),
+                matches!(turn.status, pioneer_protocol::TurnStatus::InProgress)
+                    && !cli_turns.contains(&(thread_id.to_owned(), turn.id.clone())),
             )?;
             (owners, threads, captured_runs)
         } else {
@@ -7606,6 +7672,11 @@ impl MessageProcessor {
         }
 
         if let Some(deadline) = completion_deadline {
+            if let Some(manager) = &self.cli_runtime_manager {
+                for owner in &cli_owners {
+                    manager.stop_and_wait(owner, deadline).await?;
+                }
+            }
             // Every captured run is awaited; execution IDs cannot overwrite
             // multiple revisions, recovery runs or outstanding predecessors.
             for owner in &native_owners {
@@ -7616,10 +7687,15 @@ impl MessageProcessor {
             }
         }
 
-        let selected_turns = native_owners
+        let mut selected_turns = native_owners
             .iter()
             .map(|owner| (owner.thread_id(), owner.turn_id()))
             .collect::<std::collections::BTreeSet<_>>();
+        selected_turns.extend(
+            cli_turns
+                .iter()
+                .map(|(thread, turn)| (thread.as_str(), turn.as_str())),
+        );
         for target in targets {
             if target.execution_id == execution.id {
                 continue;
@@ -7671,8 +7747,69 @@ impl MessageProcessor {
                 .capture_native_stop_owners(&native_threads, 65_536)
                 .await?;
             validate_native_graph_stop_snapshot(&captured_runs, &remaining)?;
+            if let Some(manager) = &self.cli_runtime_manager {
+                anyhow::ensure!(
+                    !manager
+                        .stop_inventory(&execution.workspace_id)
+                        .iter()
+                        .any(|owner| cli_keys.contains(owner.instance().key())),
+                    "CLI graph publication changed during stop; retry required"
+                );
+            }
         }
         Ok(true)
+    }
+
+    async fn stop_graph_turn_without_root(
+        &self,
+        thread: &str,
+        turn: &pioneer_protocol::Turn,
+        reason: &str,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<()> {
+        if let Some(binding) = self
+            .crud_store
+            .get_cli_runtime_turn_binding(&turn.id)
+            .await?
+        {
+            anyhow::ensure!(
+                binding.thread_id == thread,
+                "CLI fallback binding scope changed"
+            );
+            let manager = self
+                .cli_runtime_manager
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("CLI stop inventory unavailable"))?;
+            let key = crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
+                binding.workspace_id.clone(),
+                binding.runtime_id,
+                binding.continuation_thread_id,
+            )?;
+            let owners = manager
+                .stop_inventory(&binding.workspace_id)
+                .into_iter()
+                .filter(|owner| owner.instance().key() == &key && owner.owns_turn(&turn.id))
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                turn.status != pioneer_protocol::TurnStatus::InProgress || !owners.is_empty(),
+                "pending CLI fallback owner unknown"
+            );
+            for owner in &owners {
+                manager.stop_and_wait(owner, deadline).await?;
+            }
+            anyhow::ensure!(
+                !manager
+                    .stop_inventory(&binding.workspace_id)
+                    .iter()
+                    .any(|owner| owner.instance().key() == &key),
+                "CLI fallback publication changed during stop"
+            );
+            return Ok(());
+        }
+        self.agent_manager
+            .cancel_turn_and_wait(thread, &turn.id, reason, deadline)
+            .await?;
+        Ok(())
     }
 
     pub(super) async fn await_native_graph_owner(

@@ -1247,6 +1247,24 @@ impl MessageProcessor {
                     return;
                 }
             };
+            let _plugin_launch = match self
+                .acquire_cli_instance_plugin_guards(handle.instance())
+                .await
+            {
+                Ok(guards) => guards,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        cli_runtime_public_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("CLI plugin continuation admission failed: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
             let fork = match handle
                 .session()
                 .fork_thread(CLIAgentRuntimeThreadForkRequest {
@@ -1719,6 +1737,24 @@ impl MessageProcessor {
                 )
                 .await;
                 return;
+            };
+            let _plugin_launch = match self
+                .acquire_cli_instance_plugin_guards(handle.instance())
+                .await
+            {
+                Ok(guards) => guards,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        cli_runtime_public_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("CLI plugin continuation admission failed: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
             };
             let steer = match handle
                 .session()
@@ -2580,6 +2616,39 @@ impl MessageProcessor {
             }
         };
 
+        let _plugin_launch = if let Some(turn) = pending.turn_id.as_deref() {
+            match async {
+                let guards = self
+                    .acquire_plugin_launch_guards(&pending.workspace_id, turn)
+                    .await?;
+                super::super::message::plugins::validate_cli_plugin_selection(
+                    self.crud_store.as_ref(),
+                    &pending.workspace_id,
+                    turn,
+                )
+                .await?;
+                anyhow::Ok(guards)
+            }
+            .await
+            {
+                Ok(guards) => guards,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        cli_runtime_public_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("CLI plugin interaction authority changed: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    interaction_service.zeroize_resolution(&mut resolution);
+                    return;
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let contains_secret = validated_interaction.contains_secret_answer(&resolution);
         let durable_resolution =
             interaction_service.durable_resolution(&resolution, contains_secret);
@@ -6014,6 +6083,17 @@ impl MessageProcessor {
         binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
         recovery: pioneer_protocol::RecoveryAttemptContext,
     ) -> CLIRuntimeObservationGapReconciliation {
+        let _plugin_launch = match self
+            .acquire_plugin_launch_guards(binding.workspace_id.as_str(), binding.turn_id.as_str())
+            .await
+        {
+            Ok(guards) => guards,
+            Err(error) => {
+                return CLIRuntimeObservationGapReconciliation::InvalidBinding {
+                    diagnostic: format!("CLI reconciliation plugin admission failed: {error:#}"),
+                };
+            }
+        };
         let native_turn_id = match binding.native_turn_id.as_deref() {
             Some(native_turn_id) if !native_turn_id.trim().is_empty() => native_turn_id,
             _ => {
@@ -6060,6 +6140,11 @@ impl MessageProcessor {
                 };
             }
         };
+        if let Err(error) = manager.admit_turn_owner(handle.instance(), &binding.turn_id) {
+            return CLIRuntimeObservationGapReconciliation::InvalidBinding {
+                diagnostic: format!("CLI reconciliation owner unavailable: {error:#}"),
+            };
+        }
         self.ensure_cli_runtime_session_event_pumps(
             handle.instance(),
             handle.session(),

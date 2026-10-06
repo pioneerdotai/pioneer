@@ -78560,3 +78560,7 @@ async fn plugin_mutation_and_final_native_start_share_the_parent_admission_barri
 // C1-01 source regressions only: NOT_RUN / NOT_COMPILED.
 #[path = "tests_plugin_source.rs"]
 mod plugin_source_tests;
+
+// C2 sources are kept separate from the existing large harness. NOT_RUN / NOT_COMPILED.
+#[path = "plugin_c2_tests.rs"]
+mod plugin_c2_tests;
