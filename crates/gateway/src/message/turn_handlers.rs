@@ -11661,6 +11661,14 @@ mod tests {
                     models[key][id] = entry;
                     provenance[key][id] = provenance[key][template].clone();
                 }
+                // Saved profiles can explicitly veto off too (Opus 5 has
+                // off:null). A documented optional mode only fills missing
+                // metadata; it cannot override that catalog denial.
+                let catalog_off_veto = models[key][id]["reasoning"] == false
+                    || models[key][id]
+                        .get("thinkingLevelMap")
+                        .and_then(|map| map.get("off"))
+                        .is_some_and(serde_json::Value::is_null);
                 let catalog =
                     ModelCatalog::parse(&models.to_string(), &provenance.to_string()).unwrap();
                 let mut model = reasoning_test_model(None);
@@ -11678,8 +11686,7 @@ mod tests {
                 let rows = pioneer_client::providers::presentation::reasoning_effort_rows_for_model(
                     &model, None,
                 );
-                let off_allowed =
-                    optional && !matches!(kind, "catalog-veto" | "native-veto" | "capability-veto");
+                let off_allowed = optional && !catalog_off_veto && kind != "native-veto";
                 assert_eq!(
                     rows.iter().any(|r| r.effort == "none"),
                     off_allowed,
