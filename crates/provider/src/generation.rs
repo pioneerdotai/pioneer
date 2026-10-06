@@ -1098,9 +1098,10 @@ fn anthropic_fields_with_model(
         )
     })?;
     let off = selected_off(request.reasoning);
-    if off && model.is_some_and(|m| !m.reasoning) {
-        return Ok(fields);
-    }
+    ensure!(
+        !off || model.is_none_or(|m| m.reasoning),
+        "catalog reasoning capability conflicts with explicit Claude off"
+    );
     ensure!(
         off || model.is_none_or(|m| m.reasoning),
         "catalog model does not support effort controls"

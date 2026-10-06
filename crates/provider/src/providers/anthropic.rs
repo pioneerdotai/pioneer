@@ -1662,6 +1662,103 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn explicit_off_cannot_be_omitted_by_negative_claude_catalog() {
+        for id in ["claude-sonnet-5", "claude-opus-5"] {
+            for reasoning in [false, true] {
+                for off_map in [
+                    serde_json::json!({}),
+                    serde_json::json!({"off":"none"}),
+                    serde_json::json!({"off":null}),
+                ] {
+                    for native_case in ["absent", "unknown", "veto"] {
+                        let mut entry = serde_json::json!({"id":id});
+                        if native_case != "absent" {
+                            entry["capabilities"] = serde_json::json!({"thinking":{"supported":null,"types":{"disabled":{"supported":if native_case == "veto" { serde_json::json!(false) } else { serde_json::Value::Null }}}}});
+                        }
+                        let parsed = provider_model_from_anthropic_model_entry(
+                            serde_json::from_value(entry).unwrap(),
+                        );
+                        let native = parsed
+                            .capabilities
+                            .reasoning
+                            .as_ref()
+                            .unwrap()
+                            .native
+                            .clone();
+                        let catalog = crate::generation::test_catalog_model(
+                            "anthropic",
+                            id,
+                            "claude-opus-4-6",
+                            serde_json::json!({"reasoning":reasoning,"thinkingLevelMap":off_map}),
+                        );
+                        let mut models = vec![parsed];
+                        catalog.enrich("anthropic", &mut models);
+                        let allowed = reasoning
+                            && off_map.get("off") != Some(&serde_json::Value::Null)
+                            && native_case != "veto";
+                        assert_eq!(
+                            models[0]
+                                .capabilities
+                                .reasoning
+                                .as_ref()
+                                .unwrap()
+                                .effort_options
+                                .iter()
+                                .any(|e| e == "none"),
+                            allowed
+                        );
+                        for setting in [
+                            None,
+                            Some(ReasoningConfig::Disabled),
+                            Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                        ] {
+                            let mut request = crate::generation::test_request(id);
+                            request.reasoning = setting;
+                            for stream in [false, true] {
+                                let result = crate::generation::with_native_reasoning(
+                                    "anthropic",
+                                    true,
+                                    [(id.into(), native.clone())].into_iter().collect(),
+                                    async {
+                                        AnthropicProvider::build_chat_request_with_catalog(
+                                            &request,
+                                            None,
+                                            vec![],
+                                            stream,
+                                            Some(&catalog),
+                                        )
+                                    },
+                                )
+                                .await;
+                                if setting.is_none() || allowed {
+                                    let body = serde_json::to_value(result.unwrap()).unwrap();
+                                    assert!(body.get("output_config").is_none());
+                                    if setting.is_none() {
+                                        assert!(body.get("thinking").is_none());
+                                    } else {
+                                        assert_eq!(body["thinking"]["type"], "disabled");
+                                    }
+                                    assert_eq!(body["max_tokens"], 1024);
+                                } else {
+                                    let error = result.unwrap_err().to_string();
+                                    assert!(
+                                        error.contains("explicit Claude off")
+                                            || error.contains(
+                                                "unsupported by the model's catalog thinking map"
+                                            )
+                                            || error.contains("denies disabled thinking"),
+                                        "{error}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn direct_opus_46_vocabulary_is_not_expanded_by_aws_platform_rules() {
         for effort in [ReasoningEffort::XHigh, ReasoningEffort::Max] {

@@ -1789,13 +1789,21 @@ pub(crate) fn preserve_native_reasoning(reasoning: &mut ProviderModelReasoningCa
             .filter(|e| native.get(&format!("effort.{e}")) == Some(&Some(true)))
             .map(|e| (*e).to_owned())
             .collect();
-        reasoning.supported = Some(native.iter().any(|(k, v)| {
+    } else if native.get("effort.enum") == Some(&Some(false)) {
+        reasoning.effort_options.clear();
+    }
+    // A missing/empty effort selector is not an aggregate reasoning denial.
+    // Positive effort or budget support can confirm reasoning; unknown fields
+    // retain the matching catalog fallback (or unknown in the raw parser).
+    // default_enabled/mandatory alone do not establish either capability.
+    if native.get("supports_token_budget") == Some(&Some(true))
+        || native.iter().any(|(k, v)| {
             k.starts_with("effort.")
                 && !matches!(k.as_str(), "effort.enum" | "effort.gateway")
                 && *v == Some(true)
-        }));
-    } else if native.get("effort.enum") == Some(&Some(false)) {
-        reasoning.effort_options.clear();
+        })
+    {
+        reasoning.supported = Some(true);
     }
     if let Some(supported) = native.get("reasoning.supported").copied().flatten() {
         reasoning.supported = Some(supported);

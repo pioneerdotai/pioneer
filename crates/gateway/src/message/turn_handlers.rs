@@ -11628,7 +11628,14 @@ mod tests {
                 false,
             ),
         ] {
-            for kind in ["saved", "missing", "partial", "catalog-veto", "native-veto"] {
+            for kind in [
+                "saved",
+                "missing",
+                "partial",
+                "catalog-veto",
+                "native-veto",
+                "capability-veto",
+            ] {
                 let mut models: serde_json::Value = serde_json::from_str(include_str!(
                     "../../../provider/tests/fixtures/catalog/models.json"
                 ))
@@ -11648,6 +11655,9 @@ mod tests {
                     } else {
                         serde_json::json!({"max":"max"})
                     };
+                    if kind == "capability-veto" {
+                        entry["reasoning"] = serde_json::json!(false);
+                    }
                     models[key][id] = entry;
                     provenance[key][id] = provenance[key][template].clone();
                 }
@@ -11668,7 +11678,8 @@ mod tests {
                 let rows = pioneer_client::providers::presentation::reasoning_effort_rows_for_model(
                     &model, None,
                 );
-                let off_allowed = optional && !matches!(kind, "catalog-veto" | "native-veto");
+                let off_allowed =
+                    optional && !matches!(kind, "catalog-veto" | "native-veto" | "capability-veto");
                 assert_eq!(
                     rows.iter().any(|r| r.effort == "none"),
                     off_allowed,

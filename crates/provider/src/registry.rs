@@ -1305,7 +1305,7 @@ mod tests {
             (
                 serde_json::json!({"supported_efforts":[], "default_enabled":false}),
                 vec![],
-                Some(false),
+                Some(true),
                 Some(false),
                 None,
                 None,
@@ -1459,6 +1459,152 @@ mod tests {
                     } else {
                         let error = result.unwrap_err().to_string();
                         assert!(error.contains("native OpenRouter"), "{error}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn router_budget_support_is_independent_of_effort_selection_and_catalog() {
+        use crate::{ReasoningConfig, ReasoningEffort};
+        let id = "openai/gpt-5.4";
+        for (enum_case, enum_value) in [
+            ("empty", serde_json::json!([])),
+            ("omitted", serde_json::Value::Null),
+            ("gateway", serde_json::Value::Null),
+            ("malformed", serde_json::json!([null])),
+        ] {
+            for budget in [
+                None,
+                Some(serde_json::Value::Null),
+                Some(serde_json::json!(false)),
+                Some(serde_json::json!(true)),
+            ] {
+                for catalog_support in [false, true] {
+                    for aggregate_negative in [false, true] {
+                        let mut metadata = serde_json::json!({"default_enabled":true,"default_effort":"high","mandatory":true});
+                        if enum_case != "omitted" {
+                            metadata["supported_efforts"] = enum_value.clone();
+                        }
+                        if let Some(budget) = &budget {
+                            metadata["supports_max_tokens"] = budget.clone();
+                        }
+                        if aggregate_negative {
+                            metadata["supported"] = serde_json::json!(false);
+                        }
+                        let catalog = Arc::new(crate::generation::test_catalog_model(
+                            "openrouter",
+                            id,
+                            id,
+                            serde_json::json!({"reasoning":catalog_support,"thinkingLevelMap":{"off":"none","low":"low","high":"high"}}),
+                        ));
+                        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+                        let authority = AuthorityBoundProvider {
+                            inner: Arc::new(RouterReasoningFixture {
+                                discovery:
+                                    serde_json::json!({"data":[{"id":id,"reasoning":metadata}]})
+                                        .to_string(),
+                                catalog: catalog.clone(),
+                                bodies: bodies.clone(),
+                            }),
+                            authority_fingerprint: ProviderAuthorityFingerprint(
+                                "router-budget-fixture".into(),
+                            ),
+                            revoked: Arc::new(AtomicBool::new(false)),
+                            redact_endpoint_errors: false,
+                            use_public_catalog: true,
+                            discovery_tools: RwLock::new(BTreeMap::new()),
+                            discovery_reasoning: RwLock::new(BTreeMap::new()),
+                        };
+                        let mut models = authority.inner.list_models().await.unwrap();
+                        let raw = models[0].capabilities.reasoning.as_ref().unwrap();
+                        let positive_budget =
+                            budget.as_ref().and_then(serde_json::Value::as_bool) == Some(true);
+                        let native_support = if aggregate_negative {
+                            Some(false)
+                        } else if positive_budget || enum_case == "gateway" {
+                            Some(true)
+                        } else {
+                            None
+                        };
+                        // Empty/omitted enums and default-on/mandatory by themselves
+                        // are not an aggregate negative (or an invented positive).
+                        assert_eq!(raw.supported, native_support);
+                        assert_eq!(
+                            raw.supports_token_budget,
+                            budget.as_ref().and_then(serde_json::Value::as_bool)
+                        );
+                        let native = raw.native.clone();
+                        authority.enrich_discovery(&catalog, &mut models);
+                        let effective = models[0].capabilities.reasoning.as_ref().unwrap();
+                        assert_eq!(effective.native, native);
+                        assert_eq!(
+                            effective.supported,
+                            native_support.or(Some(catalog_support))
+                        );
+                        assert_eq!(models[0].capabilities.thinking, Some(catalog_support));
+                        assert_eq!(
+                            effective.supports_token_budget,
+                            budget.as_ref().and_then(serde_json::Value::as_bool)
+                        );
+                        assert_eq!(effective.mandatory, Some(true));
+                        assert_eq!(effective.default_effort.as_deref(), Some("high"));
+                        assert_eq!(native.get("default_enabled"), Some(&Some(true)));
+                        assert_eq!(
+                            native.get("supports_token_budget").copied(),
+                            budget.as_ref().map(serde_json::Value::as_bool)
+                        );
+                        let effort_allowed = !aggregate_negative
+                            && (enum_case == "gateway"
+                                || enum_case == "malformed" && catalog_support);
+                        assert_eq!(
+                            effective.effort_options.iter().any(|e| e == "high"),
+                            effort_allowed
+                        );
+                        if matches!(enum_case, "empty" | "omitted") || aggregate_negative {
+                            assert!(effective.effort_options.is_empty());
+                        }
+                        for setting in [
+                            None,
+                            Some(ReasoningConfig::Disabled),
+                            Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                            Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+                        ] {
+                            let mut request = crate::generation::test_request(id);
+                            request.reasoning = setting;
+                            for stream in [false, true] {
+                                let result = if stream {
+                                    authority.stream_chat(request.clone()).await.map(|_| ())
+                                } else {
+                                    authority.chat(request.clone()).await.map(|_| ())
+                                };
+                                if setting.is_none()
+                                    || setting
+                                        == Some(ReasoningConfig::Effort(ReasoningEffort::High))
+                                        && effort_allowed
+                                {
+                                    result.unwrap();
+                                    let body = bodies.lock().unwrap().last().unwrap().clone();
+                                    assert_eq!(body["stream"], stream);
+                                    assert_eq!(body["max_tokens"], 1024);
+                                    if setting.is_none() {
+                                        assert!(body.get("reasoning").is_none());
+                                    } else {
+                                        assert_eq!(body["reasoning"]["effort"], "high");
+                                    }
+                                } else {
+                                    let error = result.unwrap_err().to_string();
+                                    assert!(
+                                        error.contains("native OpenRouter")
+                                            || error.contains(
+                                                "selected catalog model does not support reasoning"
+                                            ),
+                                        "{error}"
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
