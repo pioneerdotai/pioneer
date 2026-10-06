@@ -3957,7 +3957,14 @@ impl Provider for CaptureSummaryProvider {
                 limits: Default::default(),
                 capabilities: pioneer_protocol::ProviderModelCapabilities {
                     vision: Some(true),
-                    input_modalities: Some(vec!["text".into(), "image".into(), "pdf".into()]),
+                    // The catalog's o4-mini contract is text/image only. Keep
+                    // PDF on the synthetic model used for native CLI history;
+                    // discovery cannot widen a catalog-known negative.
+                    input_modalities: Some(if id == "test-model" {
+                        vec!["text".into(), "image".into(), "pdf".into()]
+                    } else {
+                        vec!["text".into(), "image".into()]
+                    }),
                     output_modalities: Some(vec!["text".into()]),
                     ..Default::default()
                 },
@@ -12647,15 +12654,24 @@ async fn discover_native_capture_models(
         .await
         .unwrap();
     assert_eq!(models.len(), 2);
-    assert!(models.iter().all(|model| {
-        model
+    for id in ["test-model", "o4-mini"] {
+        let model = models.iter().find(|model| model.id == id).unwrap();
+        let input = model
             .capabilities
             .input_modalities
             .as_ref()
-            .is_some_and(|input| {
-                input.iter().any(|kind| kind == "image") && input.iter().any(|kind| kind == "pdf")
-            })
-    }));
+            .expect("native capture model must retain explicit input capabilities");
+        assert!(input.iter().any(|kind| kind == "text"));
+        assert!(input.iter().any(|kind| kind == "image"));
+        assert_eq!(model.capabilities.vision, Some(true));
+        assert_eq!(
+            input
+                .iter()
+                .any(|kind| matches!(kind.as_str(), "pdf" | "file" | "document")),
+            id == "test-model",
+            "{id} must retain its own document contract after discovery"
+        );
+    }
 }
 
 async fn materialize_artifact_api_thread(
