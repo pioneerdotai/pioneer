@@ -14,10 +14,21 @@ async fn fixture(
     Turn,
     pioneer_protocol::NativeTerminalEffectPreparation,
 ) {
+    fixture_with_migrator::<Migrator>(suffix).await
+}
+
+async fn fixture_with_migrator<M: MigratorTrait>(
+    suffix: &str,
+) -> (
+    CrudStore,
+    Turn,
+    pioneer_protocol::NativeTerminalEffectPreparation,
+) {
     let ws = format!("ws_cancel_{suffix}");
     let thread = format!("thread_cancel_{suffix}");
     let id = format!("turn_cancel_{suffix}");
-    let (store, _, turn) = test_store_with_started_turn(&ws, &thread, &id).await;
+    let store = test_store_with_workspace_migrator::<M>(&ws).await;
+    let (store, _, turn) = start_test_turn(store, &ws, &thread, &id).await;
     let mut plan = cleanup_effect_preparation(&ws, &thread, &id, "original");
     plan.effects[0].effect_id = format!("{id}:cancellation-effect:attached-task-cleanup");
     store
@@ -1177,17 +1188,32 @@ fn cancellation_migration_name() -> String {
     names.into_iter().next().unwrap()
 }
 
-// Existing-main fixture: omit only the PR's new migration, keeping every main
-// migration in its production order. The upgrade below uses Migrator itself.
+// Use the production registry up to the schema under test. Later migrations
+// must not change which migration down(1) exercises.
 struct MainSchemaFixtureMigrator;
 
 impl MigratorTrait for MainSchemaFixtureMigrator {
     fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
-        Migrator::migrations()
-            .into_iter()
-            .filter(|migration| !migration.name().ends_with("_native_cancellation_context"))
-            .collect()
+        migrations_before(&cancellation_migration_name())
     }
+}
+
+struct CancellationSchemaFixtureMigrator;
+
+impl MigratorTrait for CancellationSchemaFixtureMigrator {
+    fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+        migrations_through(&cancellation_migration_name())
+    }
+}
+
+async fn cancellation_schema_started_turn(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> (CrudStore, Thread, Turn) {
+    let store =
+        test_store_with_workspace_migrator::<CancellationSchemaFixtureMigrator>(workspace_id).await;
+    start_test_turn(store, workspace_id, thread_id, turn_id).await
 }
 
 // Use the scoped writer transaction's SeaORM executor without exposing a pool.
@@ -1198,7 +1224,7 @@ async fn migrate_fixture(
     steps: Option<u32>,
     down: bool,
 ) -> std::result::Result<(), sea_orm::DbErr> {
-    migrate_with::<Migrator>(db, steps, down).await
+    migrate_with::<CancellationSchemaFixtureMigrator>(db, steps, down).await
 }
 
 async fn migrate_with<M: MigratorTrait>(
@@ -1663,18 +1689,24 @@ async fn native_cancellation_production_upgrade_and_latest_down() {
         "m20261004_000007_agent_action_outbox_ranges",
     ];
     let cancellation = cancellation_migration_name();
-    // Upgrade and down(1) must use the production registry's final migration.
+    // Upgrade and down(1) exercise the production registry through cancellation.
     assert_eq!(cancellation, "m20261005_000001_native_cancellation_context");
     assert_ne!(cancellation, OLD_NAME);
     assert!(cancellation.as_str() > *LATER_MAIN.last().unwrap());
-    assert_eq!(Migrator::migrations().last().unwrap().name(), cancellation);
+    assert_eq!(
+        CancellationSchemaFixtureMigrator::migrations()
+            .last()
+            .unwrap()
+            .name(),
+        cancellation
+    );
     let db = pioneer_sqlite::SqliteDatabase::from_single_connection(
         Database::connect("sqlite::memory:").await.unwrap(),
     );
     migrate_with::<MainSchemaFixtureMigrator>(&db, None, false)
         .await
         .unwrap();
-    let main_applied = Migrator::get_applied_migrations_read_only(&db)
+    let main_applied = CancellationSchemaFixtureMigrator::get_applied_migrations_read_only(&db)
         .await
         .unwrap()
         .into_iter()
@@ -1689,7 +1721,7 @@ async fn native_cancellation_production_upgrade_and_latest_down() {
             .any(|name| name == &cancellation || name == OLD_NAME)
     );
     assert_eq!(
-        Migrator::get_pending_migrations_read_only(&db)
+        CancellationSchemaFixtureMigrator::get_pending_migrations_read_only(&db)
             .await
             .unwrap()
             .into_iter()
@@ -1733,7 +1765,9 @@ async fn native_cancellation_production_upgrade_and_latest_down() {
             .unwrap(),
         7,
     );
-    migrate_with::<Migrator>(&db, None, false).await.unwrap();
+    migrate_with::<CancellationSchemaFixtureMigrator>(&db, None, false)
+        .await
+        .unwrap();
     assert_upgrade_schema(&db, true).await;
     historical.assert_preserved(&db).await;
     let stream = repositories::turn_event_projection_stream_state::find(&db, &historical.turn.id)
@@ -1753,7 +1787,7 @@ async fn native_cancellation_production_upgrade_and_latest_down() {
             .unwrap()
             .is_none()
     );
-    let updated = Migrator::get_applied_migrations_read_only(&db)
+    let updated = CancellationSchemaFixtureMigrator::get_applied_migrations_read_only(&db)
         .await
         .unwrap()
         .into_iter()
@@ -1773,10 +1807,12 @@ async fn native_cancellation_production_upgrade_and_latest_down() {
         7,
     );
 
-    migrate_with::<Migrator>(&db, None, false).await.unwrap();
+    migrate_with::<CancellationSchemaFixtureMigrator>(&db, None, false)
+        .await
+        .unwrap();
     historical.assert_preserved(&db).await;
     assert!(
-        Migrator::get_pending_migrations_read_only(&db)
+        CancellationSchemaFixtureMigrator::get_pending_migrations_read_only(&db)
             .await
             .unwrap()
             .is_empty()
@@ -1791,7 +1827,7 @@ async fn native_cancellation_production_upgrade_and_latest_down() {
         7,
     );
     assert_eq!(
-        Migrator::get_applied_migrations_read_only(&db)
+        CancellationSchemaFixtureMigrator::get_applied_migrations_read_only(&db)
             .await
             .unwrap()
             .into_iter()
@@ -1799,9 +1835,11 @@ async fn native_cancellation_production_upgrade_and_latest_down() {
             .collect::<Vec<_>>(),
         updated,
     );
-    migrate_with::<Migrator>(&db, Some(1), true).await.unwrap();
+    migrate_with::<CancellationSchemaFixtureMigrator>(&db, Some(1), true)
+        .await
+        .unwrap();
     assert_eq!(
-        Migrator::get_applied_migrations_read_only(&db)
+        CancellationSchemaFixtureMigrator::get_applied_migrations_read_only(&db)
             .await
             .unwrap()
             .into_iter()
@@ -1811,11 +1849,13 @@ async fn native_cancellation_production_upgrade_and_latest_down() {
     );
     assert_upgrade_schema(&db, false).await;
     historical.assert_preserved(&db).await;
-    migrate_with::<Migrator>(&db, None, false).await.unwrap();
+    migrate_with::<CancellationSchemaFixtureMigrator>(&db, None, false)
+        .await
+        .unwrap();
     assert_upgrade_schema(&db, true).await;
     historical.assert_preserved(&db).await;
     assert_eq!(
-        Migrator::get_applied_migrations_read_only(&db)
+        CancellationSchemaFixtureMigrator::get_applied_migrations_read_only(&db)
             .await
             .unwrap()
             .into_iter()
@@ -1944,26 +1984,36 @@ async fn native_cancellation_production_up_preserves_accepted_context_markers_an
 async fn native_cancellation_production_empty_down_and_reup_preserve_main_schema() {
     let cancellation = cancellation_migration_name();
     assert_ne!(cancellation, "m20261001_000001_native_cancellation_context");
-    assert_eq!(Migrator::migrations().last().unwrap().name(), cancellation);
+    assert_eq!(
+        CancellationSchemaFixtureMigrator::migrations()
+            .last()
+            .unwrap()
+            .name(),
+        cancellation
+    );
     let db = pioneer_sqlite::SqliteDatabase::from_single_connection(
         Database::connect("sqlite::memory:").await.unwrap(),
     );
     migrate_with::<MainSchemaFixtureMigrator>(&db, None, false)
         .await
         .unwrap();
-    let main_applied = Migrator::get_applied_migrations_read_only(&db)
+    let main_applied = CancellationSchemaFixtureMigrator::get_applied_migrations_read_only(&db)
         .await
         .unwrap()
         .into_iter()
         .map(|migration| migration.name().to_owned())
         .collect::<Vec<_>>();
     assert_upgrade_schema(&db, false).await;
-    migrate_with::<Migrator>(&db, None, false).await.unwrap();
+    migrate_with::<CancellationSchemaFixtureMigrator>(&db, None, false)
+        .await
+        .unwrap();
     assert_upgrade_schema(&db, true).await;
-    migrate_with::<Migrator>(&db, Some(1), true).await.unwrap();
+    migrate_with::<CancellationSchemaFixtureMigrator>(&db, Some(1), true)
+        .await
+        .unwrap();
     assert_upgrade_schema(&db, false).await;
     assert_eq!(
-        Migrator::get_applied_migrations_read_only(&db)
+        CancellationSchemaFixtureMigrator::get_applied_migrations_read_only(&db)
             .await
             .unwrap()
             .into_iter()
@@ -1972,7 +2022,7 @@ async fn native_cancellation_production_empty_down_and_reup_preserve_main_schema
         main_applied,
     );
     assert_eq!(
-        Migrator::get_pending_migrations_read_only(&db)
+        CancellationSchemaFixtureMigrator::get_pending_migrations_read_only(&db)
             .await
             .unwrap()
             .into_iter()
@@ -1980,12 +2030,14 @@ async fn native_cancellation_production_empty_down_and_reup_preserve_main_schema
             .collect::<Vec<_>>(),
         vec![cancellation.clone()],
     );
-    migrate_with::<Migrator>(&db, None, false).await.unwrap();
+    migrate_with::<CancellationSchemaFixtureMigrator>(&db, None, false)
+        .await
+        .unwrap();
     assert_upgrade_schema(&db, true).await;
     let mut expected = main_applied;
     expected.push(cancellation);
     assert_eq!(
-        Migrator::get_applied_migrations_read_only(&db)
+        CancellationSchemaFixtureMigrator::get_applied_migrations_read_only(&db)
             .await
             .unwrap()
             .into_iter()
@@ -2006,8 +2058,8 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
             Database::connect("sqlite::memory:").await.unwrap(),
         );
         // Apply the pre-change schema, optionally install the real logical view,
-        // then traverse the new migration. No migration runs in this work session.
-        migrate_fixture(&db, Some((Migrator::migrations().len() - 1) as u32), false)
+        // then traverse the cancellation migration.
+        migrate_with::<MainSchemaFixtureMigrator>(&db, None, false)
             .await
             .unwrap();
         let transaction = db.begin().await.unwrap();
@@ -2119,7 +2171,8 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
 
 #[tokio::test]
 async fn native_cancellation_migration_down_preserves_context_and_terminal_markers() {
-    let (store, turn, plan) = fixture("down_guard").await;
+    let (store, turn, plan) =
+        fixture_with_migrator::<CancellationSchemaFixtureMigrator>("down_guard").await;
     let original = pioneer_entity::native_cancellation_context::Entity::find_by_id(turn.id.clone())
         .one(&store.connection)
         .await
@@ -2293,9 +2346,12 @@ async fn native_cancellation_task_resume_clears_only_confirmed_blocked_and_rolls
 
 #[tokio::test]
 async fn native_cancellation_migration_down_rejects_marker_without_context() {
-    let (store, thread, mut turn) =
-        test_store_with_started_turn("ws_marker_down", "thread_marker_down", "turn_marker_down")
-            .await;
+    let (store, thread, mut turn) = cancellation_schema_started_turn(
+        "ws_marker_down",
+        "thread_marker_down",
+        "turn_marker_down",
+    )
+    .await;
     turn.status = TurnStatus::Completed;
     store
         .materialize_turn_events_atomically(
@@ -2345,7 +2401,7 @@ async fn native_cancellation_migration_down_rejects_marker_without_context() {
 #[tokio::test]
 async fn native_cancellation_migration_down_rejects_duplicate_effect_kinds_atomically() {
     use migration::SchemaManager;
-    let (store, thread, turn) = test_store_with_started_turn(
+    let (store, thread, turn) = cancellation_schema_started_turn(
         "ws_duplicate_down",
         "thread_duplicate_down",
         "turn_duplicate_down",
@@ -2386,12 +2442,13 @@ async fn native_cancellation_migration_down_rejects_duplicate_effect_kinds_atomi
         .await
         .unwrap()
     );
-    let applied_before = Migrator::get_applied_migrations_read_only(&store.connection)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|migration| migration.name().to_owned())
-        .collect::<Vec<_>>();
+    let applied_before =
+        CancellationSchemaFixtureMigrator::get_applied_migrations_read_only(&store.connection)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|migration| migration.name().to_owned())
+            .collect::<Vec<_>>();
 
     assert!(
         migrate_fixture(&store.connection, Some(1), true)
@@ -2408,7 +2465,7 @@ async fn native_cancellation_migration_down_rejects_duplicate_effect_kinds_atomi
         second_before
     );
     assert_eq!(
-        Migrator::get_applied_migrations_read_only(&store.connection)
+        CancellationSchemaFixtureMigrator::get_applied_migrations_read_only(&store.connection)
             .await
             .unwrap()
             .into_iter()
