@@ -14,6 +14,107 @@ async fn native_terminal_effect_kick_uses_background_database_scope() {
     assert_native_kick_database_scope(true).await;
 }
 
+#[tokio::test]
+async fn native_terminal_effect_kick_defers_coalesced_retry_after_storage_failure() {
+    // Observe the existing end-of-quantum warning, rather than assuming a
+    // fixed number of scheduler yields means the worker has started its sleep.
+    struct KickFailure(tokio::sync::mpsc::UnboundedSender<tokio::time::Instant>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for KickFailure {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let metadata = event.metadata();
+            if metadata.target() == "pioneer_gateway::message::agent_runtime"
+                && *metadata.level() == tracing::Level::WARN
+                && metadata.fields().field("dispatched_count").is_some()
+            {
+                let _ = self.0.send(tokio::time::Instant::now());
+            }
+        }
+    }
+
+    let (processor, _, _, _, _, _) = setup_workspace_message_processor().await;
+    processor
+        .crud_store
+        .database_connection()
+        .close()
+        .await
+        .unwrap();
+    let (failures, mut failures_rx) = tokio::sync::mpsc::unbounded_channel();
+    // This current-thread test also polls the spawned kick under this dispatch.
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(KickFailure(failures)),
+    );
+    tokio::time::pause();
+    processor.kick_native_terminal_effects();
+    let first_failure = timeout(Duration::from_secs(10), failures_rx.recv())
+        .await
+        .expect("first quantum must report its storage failure")
+        .unwrap();
+    assert!(
+        processor
+            .native_terminal_effect_kick_running
+            .load(Ordering::Acquire)
+    );
+    processor.kick_native_terminal_effects();
+    tokio::time::advance(Duration::from_secs(4)).await;
+    for _ in 0..128 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        processor
+            .native_terminal_effect_kick_pending
+            .load(Ordering::Acquire)
+    );
+    assert!(failures_rx.try_recv().is_err(), "no retry before the delay");
+    // Tokio's timer wheel rounds deadlines to milliseconds. Cross the exact
+    // five-second boundary by one tick, then await the second completed quantum.
+    tokio::time::advance(Duration::from_millis(1001)).await;
+    let second_failure = timeout(Duration::from_millis(100), failures_rx.recv())
+        .await
+        .expect("coalesced kick must retry after the delay")
+        .unwrap();
+    let elapsed = second_failure.duration_since(first_failure);
+    assert!(elapsed >= Duration::from_secs(5));
+    assert!(elapsed <= Duration::from_millis(5101));
+    assert!(
+        !processor
+            .native_terminal_effect_kick_pending
+            .load(Ordering::Acquire)
+    );
+    assert!(
+        processor
+            .native_terminal_effect_kick_running
+            .load(Ordering::Acquire)
+    );
+    tokio::time::advance(Duration::from_secs(4)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        processor
+            .native_terminal_effect_kick_running
+            .load(Ordering::Acquire)
+    );
+    tokio::time::advance(Duration::from_millis(1001)).await;
+    timeout(Duration::from_millis(100), async {
+        while processor
+            .native_terminal_effect_kick_running
+            .load(Ordering::Acquire)
+        {
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("kick must release running after the second delay");
+    assert!(
+        !processor
+            .native_terminal_effect_kick_running
+            .load(Ordering::Acquire)
+    );
+    assert!(failures_rx.try_recv().is_err(), "only two quanta may run");
+}
+
 async fn assert_native_kick_database_scope(terminal_effects: bool) {
     use pioneer_sqlite::{
         SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteClass, SqliteWriteEvent,
@@ -171,16 +272,22 @@ async fn assert_native_kick_database_scope(terminal_effects: bool) {
         }
     )));
     let writes = observer.writes.lock().unwrap().clone();
-    assert!(writes.iter().any(|event| matches!(
-        event,
-        SqliteWriteEvent::Acquired {
-            class: SqliteWriteClass::Critical,
-            ..
-        }
-    )));
-    assert!(writes.iter().all(|event| !matches!(event,
-        SqliteWriteEvent::Acquired { class, .. } if *class != SqliteWriteClass::Critical
-    )));
+    if terminal_effects {
+        // No probe/claim input: the removed global exhausted UPDATE must not
+        // acquire a writer merely to perform an empty terminal-effect sweep.
+        assert!(writes.is_empty());
+    } else {
+        assert!(writes.iter().any(|event| matches!(
+            event,
+            SqliteWriteEvent::Acquired {
+                class: SqliteWriteClass::Critical,
+                ..
+            }
+        )));
+        assert!(writes.iter().all(|event| !matches!(event,
+            SqliteWriteEvent::Acquired { class, .. } if *class != SqliteWriteClass::Critical
+        )));
+    }
     if !terminal_effects {
         let row = database
             .query_one_raw(Statement::from_string(

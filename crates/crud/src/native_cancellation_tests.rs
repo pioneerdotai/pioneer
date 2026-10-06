@@ -128,9 +128,11 @@ async fn native_cancellation_original_context_cleanup_and_lost_ack_replay() {
         if n.turn.error.as_deref() == Some("first accepted reason"))
     );
     let claims = restarted
-        .claim_due_native_terminal_effects(NOW + 2, 30, 2)
+        .claim_due_native_terminal_effects_at(NOW + 2, 30, 2)
         .await
         .unwrap();
+    assert!(!claims.storage_failed);
+    let claims = claims.records;
     assert_eq!(claims.len(), 1);
     assert_eq!(claims[0].payload, plan.effects[0].payload);
 }
@@ -910,10 +912,13 @@ async fn native_cancellation_blocked_lawful_resume_keeps_original_context_and_al
     assert_eq!(store.native_terminal_effect_stats().await.unwrap().ready, 2);
     // Claim old obligations and publish a real immutable handler checkpoint.
     // Cancellation must preserve even in-flight worker identity and lease state.
+    // Allow the ready status quota to include both obligations in this wave.
     let old_claims = store
-        .claim_due_native_terminal_effects(NOW, 30, 2)
+        .claim_due_native_terminal_effects_at(NOW, 30, 8)
         .await
         .unwrap();
+    assert!(!old_claims.storage_failed);
+    let old_claims = old_claims.records;
     assert_eq!(old_claims.len(), 2);
     for claim in &old_claims {
         if claim.effect_id.ends_with(":post-turn") {
@@ -1002,9 +1007,11 @@ async fn native_cancellation_blocked_lawful_resume_keeps_original_context_and_al
         assert_eq!(&effect_row(&store, &before.effect_id).await, before);
     }
     let cancellation_claims = store
-        .claim_due_native_terminal_effects(NOW + 2, 30, 2)
+        .claim_due_native_terminal_effects_at(NOW + 2, 30, 2)
         .await
         .unwrap();
+    assert!(!cancellation_claims.storage_failed);
+    let cancellation_claims = cancellation_claims.records;
     assert_eq!(cancellation_claims.len(), 2);
     assert!(
         cancellation_claims
@@ -1022,14 +1029,12 @@ async fn native_cancellation_blocked_lawful_resume_keeps_original_context_and_al
     for before in old_rows.iter().chain(&cancellation_rows) {
         assert_eq!(&effect_row(&restarted, &before.effect_id).await, before);
     }
-    assert_eq!(
-        restarted
-            .claim_due_native_terminal_effects(NOW + 3, 30, 2)
-            .await
-            .unwrap()
-            .len(),
-        0
-    );
+    let replay_claims = restarted
+        .claim_due_native_terminal_effects_at(NOW + 3, 30, 2)
+        .await
+        .unwrap();
+    assert!(!replay_claims.storage_failed);
+    assert_eq!(replay_claims.records.len(), 0);
     // Complete the old worker wave through its real claim-token fence. Changes
     // made by its own completion are legal; cancellation replay changes nothing.
     for claim in &old_claims {
@@ -1841,9 +1846,11 @@ async fn native_cancellation_production_up_preserves_accepted_context_markers_an
         .await
         .unwrap();
     let claims = store
-        .claim_due_native_terminal_effects(NOW + 2, 30, 2)
+        .claim_due_native_terminal_effects_at(NOW + 2, 30, 2)
         .await
         .unwrap();
+    assert!(!claims.storage_failed);
+    let claims = claims.records;
     assert_eq!(claims.len(), 1);
     assert_eq!(claims[0].effect_id, plan.effects[0].effect_id);
     let context = pioneer_entity::native_cancellation_context::Entity::find_by_id(turn.id.clone())

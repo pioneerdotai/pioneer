@@ -28,6 +28,7 @@ pub struct PreparedTaskEvent {
     payload_json: String,
     payload: TaskEventPayload,
     semantically_matching_existing: Option<SemanticallyMatchingExistingTaskEvent>,
+    pub(crate) gate_payloads: Option<super::native_terminal_effect_outbox::PreparedGatePayloads>,
     candidate_gate_resolution:
         Option<super::native_terminal_effect_outbox::PreparedCandidateGateResolution>,
     candidate_projection: Option<super::task_result_candidate::PreparedTaskResultCandidate>,
@@ -105,6 +106,7 @@ impl PreparedTaskEvent {
             payload_json,
             payload,
             semantically_matching_existing: None,
+            gate_payloads: None,
             candidate_gate_resolution: None,
             candidate_projection,
             review_projection,
@@ -185,6 +187,12 @@ impl PreparedTaskEvent {
         self
     }
 
+    pub(crate) fn candidate_projection(
+        &self,
+    ) -> Option<&super::task_result_candidate::PreparedTaskResultCandidate> {
+        self.candidate_projection.as_ref()
+    }
+
     pub(crate) fn with_candidate_projection(
         mut self,
         prepared: Option<super::task_result_candidate::PreparedTaskResultCandidate>,
@@ -251,6 +259,7 @@ pub async fn append_prepared_event<C: ConnectionTrait>(
         payload_json,
         payload,
         semantically_matching_existing,
+        gate_payloads: _,
         candidate_gate_resolution,
         candidate_projection,
         review_projection,
@@ -553,29 +562,77 @@ pub async fn list_event_task_ids<C: ConnectionTrait>(db: &C) -> Result<Vec<Strin
         .context("failed to query task event task ids")
 }
 
-pub async fn list_pending_fanout_task_ids<C: ConnectionTrait>(
-    db: &C,
-    after_task_id: Option<&str>,
-    limit: u64,
-) -> Result<Vec<String>> {
-    let mut query = task_event_fanout_cursor::Entity::find()
+pub(crate) fn fanout_metadata_query(
+    task_id: &str,
+    after: i64,
+    limit: usize,
+) -> sea_orm::Select<task_event::Entity> {
+    // Bundled SQLite 3.51.3 recognizes the direct column argument and sets
+    // OP_Column's OPFLAG_BYTELENARG. No CAST/content conversion before budget.
+    task_event::Entity::find()
         .select_only()
-        .column(task_event_fanout_cursor::Column::TaskId)
-        .filter(Expr::cust(
-            "EXISTS (SELECT 1 FROM task_event AS pending_event \
-             WHERE pending_event.task_id = task_event_fanout_cursor.task_id \
-             AND pending_event.sequence > task_event_fanout_cursor.last_sequence)",
-        ));
-    if let Some(after_task_id) = after_task_id {
-        query = query.filter(task_event_fanout_cursor::Column::TaskId.gt(after_task_id.to_owned()));
-    }
-    query
-        .order_by_asc(task_event_fanout_cursor::Column::TaskId)
-        .limit(std::cmp::max(limit, 1))
-        .into_tuple::<String>()
+        .columns([task_event::Column::Id, task_event::Column::Sequence])
+        .column_as(Expr::cust("octet_length(payload_json)"), "payload_bytes")
+        .filter(task_event::Column::TaskId.eq(task_id))
+        .filter(task_event::Column::Sequence.gt(after))
+        .order_by_asc(task_event::Column::Sequence)
+        .limit(limit.min(128) as u64)
+}
+
+/// First fetch IDs/sequence/byte lengths, then only an admissible prefix.
+/// Oversized immutable events are supported singly, with no new domain limit.
+pub(crate) async fn fanout_page<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+    after: i64,
+    limit: usize,
+    bytes_left: &mut usize,
+    allow_oversized: bool,
+) -> Result<super::task_event_fanout::TaskEventFanoutPage<task_event::Model>> {
+    let bytes = *bytes_left;
+    let metadata = fanout_metadata_query(task_id, after, limit)
+        .into_tuple::<(String, i64, i64)>()
         .all(db)
-        .await
-        .context("failed to query task event fanout backlog")
+        .await?;
+    use super::task_event_fanout::TaskEventFanoutPage;
+    let mut ids = Vec::new();
+    let mut used = 0usize;
+    for (id, _, length) in metadata {
+        let length = usize::try_from(length).context("invalid task event byte length")?;
+        if length > bytes.saturating_sub(used) {
+            if ids.is_empty()
+                && allow_oversized
+                && length > super::task_event_fanout::TASK_EVENT_FANOUT_BYTE_BUDGET
+            {
+                ids.push(id);
+                used = length;
+            }
+            if ids.is_empty() {
+                return Ok(TaskEventFanoutPage::BudgetDeferred);
+            }
+            break;
+        }
+        used = used.saturating_add(length);
+        ids.push(id);
+    }
+    if ids.is_empty() {
+        return Ok(TaskEventFanoutPage::Prefix {
+            events: Vec::new(),
+            bytes: 0,
+        });
+    }
+    // Charge before the full read: an error or unwind cannot reuse bytes
+    // whose payload may already have been fetched. No reader is held here.
+    *bytes_left = bytes_left.saturating_sub(used);
+    let rows = task_event::Entity::find()
+        .filter(task_event::Column::Id.is_in(ids))
+        .order_by_asc(task_event::Column::Sequence)
+        .all(db)
+        .await?;
+    Ok(TaskEventFanoutPage::Prefix {
+        events: rows,
+        bytes: used,
+    })
 }
 
 pub async fn find_fanout_cursor<C: ConnectionTrait>(db: &C, task_id: &str) -> Result<Option<i64>> {

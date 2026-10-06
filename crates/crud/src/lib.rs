@@ -10,10 +10,16 @@ mod repositories;
 pub use repositories::provider_usage::ProviderUsageObservation;
 mod task_delivery_lifecycle;
 mod task_delivery_recovery;
+mod task_event_context;
 pub use repositories::task_delivery_recovery::{
     DELIVERY_RECOVERY_BUDGET, DeliveryRecoveryCursor, DeliveryRecoverySnapshot,
 };
 mod task_events;
+pub use repositories::task_event_fanout::{
+    TASK_EVENT_FANOUT_BYTE_BUDGET, TASK_EVENT_FANOUT_EVENT_BUDGET, TASK_EVENT_FANOUT_TASK_BUDGET,
+    TaskEventFanoutClaim, TaskEventFanoutOutcome, TaskEventFanoutPage,
+};
+pub use task_event_context::{TaskAnchorAgent, TaskAnchorContext, TaskEventContext};
 mod task_occurrence;
 mod task_run_occurrence;
 pub use repositories::task_occurrence_reconcile::{
@@ -1047,6 +1053,13 @@ pub struct ClaimedNativeTerminalEffectRecord {
     pub claim_token: String,
     /// Captured from the durable marker for this fenced attempt.
     pub legacy_manifest_revalidation: bool,
+}
+
+/// Partial success must reach dispatch even when an independent row failed.
+#[derive(Debug, Default)]
+pub struct NativeTerminalEffectClaimOutcome {
+    pub records: Vec<ClaimedNativeTerminalEffectRecord>,
+    pub storage_failed: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -14218,12 +14231,97 @@ impl CrudStore {
         task_event::list_event_task_ids(&self.connection).await
     }
 
-    pub async fn list_pending_task_event_fanout_task_ids(
+    pub async fn due_task_event_fanout(
         &self,
-        after_task_id: Option<&str>,
+        now: i64,
         limit: u64,
-    ) -> Result<Vec<String>> {
-        task_event::list_pending_fanout_task_ids(&self.connection, after_task_id, limit).await
+    ) -> Result<Vec<pioneer_entity::task_event_fanout_pending::Model>> {
+        repositories::task_event_fanout::due(&self.with_maintenance_access().connection, now, limit)
+            .await
+    }
+    pub async fn has_pending_task_event_fanout(&self) -> Result<bool> {
+        repositories::task_event_fanout::has_pending(&self.with_maintenance_access().connection)
+            .await
+    }
+    pub async fn claim_task_event_fanout(
+        &self,
+        row: &pioneer_entity::task_event_fanout_pending::Model,
+        clock: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> Result<Option<TaskEventFanoutClaim>> {
+        repositories::task_event_fanout::claim(
+            &self.with_maintenance_access().connection,
+            row,
+            pioneer_protocol::generate_id(21),
+            clock,
+        )
+        .await
+    }
+    pub async fn renew_task_event_fanout(
+        &self,
+        claim: &TaskEventFanoutClaim,
+        clock: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> Result<bool> {
+        repositories::task_event_fanout::renew(
+            &self.with_maintenance_access().connection,
+            claim,
+            clock,
+        )
+        .await
+    }
+    pub async fn ack_task_event_fanout(
+        &self,
+        claim: &TaskEventFanoutClaim,
+        sequence: i64,
+        clock: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> Result<()> {
+        repositories::task_event_fanout::ack(&self.connection, claim, sequence, clock).await
+    }
+    pub async fn release_task_event_fanout(
+        &self,
+        claim: &TaskEventFanoutClaim,
+        outcome: TaskEventFanoutOutcome,
+        clock: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> Result<()> {
+        repositories::task_event_fanout::release(
+            &self.with_maintenance_access().connection,
+            claim,
+            outcome,
+            clock,
+        )
+        .await
+    }
+    pub async fn task_event_fanout_page(
+        &self,
+        task_id: &str,
+        after: i64,
+        limit: usize,
+        bytes_left: &mut usize,
+        allow_oversized: bool,
+    ) -> Result<TaskEventFanoutPage<Result<AppendedTaskEvent>>> {
+        let page = task_event::fanout_page(
+            &self.connection,
+            task_id,
+            after,
+            limit,
+            bytes_left,
+            allow_oversized,
+        )
+        .await?;
+        let TaskEventFanoutPage::Prefix {
+            events: rows,
+            bytes,
+        } = page
+        else {
+            return Ok(TaskEventFanoutPage::BudgetDeferred);
+        };
+        // All reader resources have been returned before JSON decoding.
+        let events = rows
+            .into_iter()
+            .map(|row| {
+                task_event::appended_task_event_from_model(row, TaskEventAppendStatus::Inserted)
+            })
+            .collect::<Vec<_>>();
+        Ok(TaskEventFanoutPage::Prefix { events, bytes })
     }
 
     pub async fn get_task_event_fanout_cursor(&self, task_id: &str) -> Result<Option<i64>> {
@@ -15160,11 +15258,15 @@ impl CrudStore {
                     let gate_resolution =
                         native_terminal_effect_outbox::prepare_gate_resolution_for_candidate(
                             &self.connection,
-                            candidate.id.as_str(),
+                            Some(native_terminal_effect_outbox::CandidateGateMetadata {
+                                id: candidate.id.clone(),
+                                status: candidate_status.to_owned(),
+                                updated_at: unix_to_datetime(candidate.updated_at),
+                            }),
                             candidate.thread_id.as_str(),
                             candidate.turn_id.as_str(),
-                            candidate_status.as_str(),
                             unix_to_datetime(candidate.updated_at),
+                            None,
                         )
                         .await?;
                     let transaction = self
@@ -15283,11 +15385,19 @@ impl CrudStore {
                 let gate_resolution =
                     native_terminal_effect_outbox::prepare_gate_resolution_for_candidate(
                         &self.connection,
-                        current.id.as_str(),
+                        Some(native_terminal_effect_outbox::CandidateGateMetadata {
+                            id: current.id.clone(),
+                            status: desired_status.clone(),
+                            updated_at: if current.status == desired_status {
+                                current.updated_at
+                            } else {
+                                unix_to_datetime(updated_at)
+                            },
+                        }),
                         current.thread_id.as_str(),
                         current.turn_id.as_str(),
-                        desired_status.as_str(),
                         unix_to_datetime(updated_at),
+                        None,
                     )
                     .await?;
                 let transaction = self
@@ -15305,7 +15415,13 @@ impl CrudStore {
                         updated_at,
                     )
                     .await?;
-                    if candidate.is_some() {
+                    if let Some(candidate) = candidate.as_ref() {
+                        // The gate locator was read before writer admission.
+                        if candidate.thread_id != current.thread_id
+                            || candidate.turn_id != current.turn_id
+                        {
+                            bail!("candidate gate locator changed before resolution");
+                        }
                         native_terminal_effect_outbox::apply_prepared_gate_resolution(
                             &transaction,
                             gate_resolution,
@@ -24509,53 +24625,155 @@ impl CrudStore {
         now_unix: i64,
         claim_lease_secs: u64,
         limit: u64,
-    ) -> Result<Vec<ClaimedNativeTerminalEffectRecord>> {
-        let limit = limit.min(100);
+    ) -> Result<NativeTerminalEffectClaimOutcome> {
+        self.claim_due_native_terminal_effects_with_clock(
+            now_unix,
+            claim_lease_secs,
+            limit,
+            &|| chrono::Utc::now().timestamp(),
+        )
+        .await
+    }
+
+    /// Deterministic clock for terminal-effect regression fixtures. Production
+    /// uses `claim_due_native_terminal_effects` and reads UTC after admission.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub async fn claim_due_native_terminal_effects_at(
+        &self,
+        now_unix: i64,
+        claim_lease_secs: u64,
+        limit: u64,
+    ) -> Result<NativeTerminalEffectClaimOutcome> {
+        self.claim_due_native_terminal_effects_with_clock(
+            now_unix,
+            claim_lease_secs,
+            limit,
+            &|| now_unix,
+        )
+        .await
+    }
+
+    async fn claim_due_native_terminal_effects_with_clock(
+        &self,
+        now_unix: i64,
+        claim_lease_secs: u64,
+        limit: u64,
+        clock: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> Result<NativeTerminalEffectClaimOutcome> {
+        let limit = limit.min(native_terminal_effect_outbox::EFFECT_INPUT_BUDGET);
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(NativeTerminalEffectClaimOutcome::default());
         }
-        self.run_serialized_write(|| async {
-            let now = unix_to_datetime(now_unix);
-            native_terminal_effect_outbox::reconcile_waiting_gates(&self.connection, now, limit)
-                .await?;
-            let claim_expires_at = unix_to_datetime(
-                now_unix.saturating_add(i64::try_from(claim_lease_secs.max(1)).unwrap_or(i64::MAX)),
-            );
-            let claimed = native_terminal_effect_outbox::claim_due(
-                &self.connection,
-                now,
-                claim_expires_at,
-                limit,
-                || generate_id(DB_ID_LEN),
+        let maintenance = self.with_maintenance_access();
+        // Two explicit input budgets: <=8 probes, then <=8 execution inputs.
+        // The same effect may become ready and claim in this second phase.
+        let mut storage_failed = false;
+        let probes = native_terminal_effect_outbox::discover_gate_probes(
+            &maintenance.connection,
+            now_unix,
+            limit,
+        )
+        .await;
+        let probes = match probes {
+            Ok(probes) => probes,
+            Err(_error) => {
+                storage_failed = true;
+                tracing::warn!("terminal-effect gate discovery failed");
+                Vec::new()
+            }
+        };
+        for row in probes {
+            let token = generate_id(DB_ID_LEN);
+            let reserved = match native_terminal_effect_outbox::reserve_gate_probe(
+                &maintenance.connection,
+                &row,
+                Some(token),
+                clock,
             )
-            .await?;
-            let mut valid = Vec::with_capacity(claimed.len());
-            for claimed in claimed {
-                let row = claimed.row;
-                let effect_id = row.effect_id.clone();
-                let decoded = (|| -> Result<ClaimedNativeTerminalEffectRecord> {
-                    if row.payload_json.len()
-                        > native_terminal_effect_outbox::MAX_EFFECT_PAYLOAD_BYTES
+            .await
+            {
+                Ok(Some(reserved)) => reserved,
+                Ok(None) => continue,
+                Err(_error) => {
+                    storage_failed = true;
+                    tracing::warn!("terminal-effect gate reservation failed");
+                    // No repeat reservation or preparation after ambiguous commit.
+                    if let Err(_error) = native_terminal_effect_outbox::defer_gate_probe(
+                        &maintenance.connection,
+                        &row,
+                        false, // no confirmed reservation: increment exactly once
+                        clock,
+                    )
+                    .await
                     {
-                        bail!("native terminal-effect payload exceeds its durable byte limit");
+                        tracing::warn!("terminal-effect gate failure deferral failed");
+                        storage_failed = true;
                     }
-                    if !native_terminal_effect_outbox::payload_integrity_matches(
-                        row.payload_json.as_str(),
-                        row.payload_sha256.as_str(),
-                        row.payload_identity_sha256.as_str(),
-                    ) {
-                        bail!("native terminal-effect payload identity mismatch");
-                    }
-                    let payload: pioneer_protocol::NativeTerminalEffectPayload =
-                        serde_json::from_str(row.payload_json.as_str())
-                            .context("native terminal-effect payload is invalid")?;
-                    if !native_terminal_effect_outbox::payload_matches_db_kind(
-                        row.effect_kind.as_str(),
-                        &payload,
-                    ) {
-                        bail!("native terminal-effect kind does not match its payload");
-                    }
-                    match (
+                    continue;
+                }
+            };
+            if let Err(_error) = native_terminal_effect_outbox::probe_waiting_gate(
+                &maintenance.connection,
+                &reserved,
+                clock,
+            )
+            .await
+            {
+                storage_failed = true;
+                tracing::warn!("terminal-effect gate probe failed");
+                // Conditional deferral never touches a resolved effect or a new token.
+                if let Err(_error) = native_terminal_effect_outbox::defer_gate_probe(
+                    &maintenance.connection,
+                    &reserved,
+                    true, // reservation already incremented the probe counter
+                    clock,
+                )
+                .await
+                {
+                    tracing::warn!("terminal-effect gate failure deferral failed");
+                    storage_failed = true;
+                }
+            }
+        }
+        // Never retry the whole quantum: commit unknown must not dispatch or
+        // rediscover another eight inputs. Claims commit before CPU validation.
+        let claimed = native_terminal_effect_outbox::claim_due(
+            &maintenance.connection,
+            unix_to_datetime(clock()),
+            claim_lease_secs,
+            limit,
+            || generate_id(DB_ID_LEN),
+            clock,
+        )
+        .await?;
+        storage_failed |= claimed.storage_failed;
+        let mut valid = Vec::with_capacity(claimed.claimed.len());
+        for claimed in claimed.claimed {
+            let row = claimed.row;
+            let effect_id = row.effect_id.clone();
+            let decoded = (|| -> Result<ClaimedNativeTerminalEffectRecord> {
+                if row.payload_json.len() > native_terminal_effect_outbox::MAX_EFFECT_PAYLOAD_BYTES
+                {
+                    bail!("native terminal-effect payload exceeds its durable byte limit");
+                }
+                if !native_terminal_effect_outbox::payload_integrity_matches(
+                    row.payload_json.as_str(),
+                    row.payload_sha256.as_str(),
+                    row.payload_identity_sha256.as_str(),
+                ) {
+                    bail!("native terminal-effect payload identity mismatch");
+                }
+                let payload: pioneer_protocol::NativeTerminalEffectPayload =
+                    serde_json::from_str(row.payload_json.as_str())
+                        .context("native terminal-effect payload is invalid")?;
+                if !native_terminal_effect_outbox::payload_matches_db_kind(
+                    row.effect_kind.as_str(),
+                    &payload,
+                ) {
+                    bail!("native terminal-effect kind does not match its payload");
+                }
+                match (
                         row.handler_checkpoint_json.as_deref(),
                         row.handler_checkpoint_sha256.as_deref(),
                     ) {
@@ -24570,85 +24788,100 @@ impl CrudStore {
                             return Err(HandlerCheckpointInvalid { class: "checkpoint_integrity" }.into());
                         }
                     }
-                    if !matches!(
-                        row.gate_kind.as_str(),
-                        "terminal_commit" | "accepted_task_result"
-                    ) {
-                        bail!("native terminal-effect gate is invalid");
-                    }
-                    if matches!(
-                        payload,
-                        pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup { .. }
-                    ) && row.gate_kind != "terminal_commit"
+                if !matches!(
+                    row.gate_kind.as_str(),
+                    "terminal_commit" | "accepted_task_result"
+                ) {
+                    bail!("native terminal-effect gate is invalid");
+                }
+                if matches!(
+                    payload,
+                    pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup { .. }
+                ) && row.gate_kind != "terminal_commit"
+                {
+                    bail!("attached-task cleanup has an invalid execution gate");
+                }
+                let runtime_generation = u64::try_from(row.runtime_generation)
+                    .context("native terminal-effect runtime generation is invalid")?;
+                if runtime_generation == 0 {
+                    bail!("native terminal-effect runtime generation is zero");
+                }
+                let attempt_count = u16::try_from(row.attempt_count)
+                    .context("native terminal-effect attempt count is invalid")?;
+                let max_attempts = u16::try_from(row.max_attempts)
+                    .context("native terminal-effect retry budget is invalid")?;
+                if attempt_count == 0
+                    || max_attempts == 0
+                    || max_attempts > native_terminal_effect_outbox::MAX_EFFECT_ATTEMPTS
+                    || attempt_count > max_attempts
+                {
+                    bail!("native terminal-effect retry state is invalid");
+                }
+                let legacy_manifest_revalidation = row.last_error_code.as_deref()
+                    == Some("memory.post_turn_extractor.legacy_manifest_revalidate");
+                Ok(ClaimedNativeTerminalEffectRecord {
+                    effect_id: row.effect_id,
+                    workspace_id: row.workspace_id,
+                    thread_id: row.thread_id,
+                    turn_id: row.turn_id,
+                    runtime_generation,
+                    payload,
+                    attempt_count,
+                    max_attempts,
+                    claim_token: claimed.claim_token.clone(),
+                    legacy_manifest_revalidation,
+                })
+            })();
+            match decoded {
+                Ok(record) => valid.push(record),
+                Err(error) => {
+                    // Claim validation serves every terminal-effect kind. Hook ownership
+                    // is established by the executor, not by this generic quarantine path.
+                    let code = "invalid_persisted_effect";
+                    let message = if let Some(invalid) =
+                        error.downcast_ref::<HandlerCheckpointInvalid>()
                     {
-                        bail!("attached-task cleanup has an invalid execution gate");
-                    }
-                    let runtime_generation = u64::try_from(row.runtime_generation)
-                        .context("native terminal-effect runtime generation is invalid")?;
-                    if runtime_generation == 0 {
-                        bail!("native terminal-effect runtime generation is zero");
-                    }
-                    let attempt_count = u16::try_from(row.attempt_count)
-                        .context("native terminal-effect attempt count is invalid")?;
-                    let max_attempts = u16::try_from(row.max_attempts)
-                        .context("native terminal-effect retry budget is invalid")?;
-                    if attempt_count == 0
-                        || max_attempts == 0
-                        || max_attempts > native_terminal_effect_outbox::MAX_EFFECT_ATTEMPTS
-                        || attempt_count > max_attempts
-                    {
-                        bail!("native terminal-effect retry state is invalid");
-                    }
-                    let legacy_manifest_revalidation = row.last_error_code.as_deref()
-                        == Some("memory.post_turn_extractor.legacy_manifest_revalidate");
-                    Ok(ClaimedNativeTerminalEffectRecord {
-                        effect_id: row.effect_id,
-                        workspace_id: row.workspace_id,
-                        thread_id: row.thread_id,
-                        turn_id: row.turn_id,
-                        runtime_generation,
-                        payload,
-                        attempt_count,
-                        max_attempts,
-                        claim_token: claimed.claim_token.clone(),
-                        legacy_manifest_revalidation,
-                    })
-                })();
-                match decoded {
-                    Ok(record) => valid.push(record),
-                    Err(error) => {
-                        // Claim validation serves every terminal-effect kind. Hook ownership
-                        // is established by the executor, not by this generic quarantine path.
-                        let code = "invalid_persisted_effect";
-                        let message = if let Some(invalid) = error.downcast_ref::<HandlerCheckpointInvalid>() {
-                            format!("persisted checkpoint failed integrity validation; failure_stage=checkpoint_integrity; failure_class={}", invalid.class)
-                        } else {
-                            "persisted native terminal-effect row failed schema validation".to_owned()
-                        };
-                        // One malformed durable row must not poison every
-                        // valid claim in the bounded batch. Quarantine it with
-                        // a typed, non-payload diagnostic under the same claim
-                        // fence, then continue processing healthy obligations.
-                        let quarantined = native_terminal_effect_outbox::mark_failed(
-                            &self.connection,
-                            effect_id.as_str(),
-                            claimed.claim_token.as_str(),
-                            code,
-                            &message,
-                            false,
-                            now,
-                            now,
+                        format!(
+                            "persisted checkpoint failed integrity validation; failure_stage=checkpoint_integrity; failure_class={}",
+                            invalid.class
                         )
-                        .await?;
-                        if !quarantined {
-                            bail!("malformed native terminal-effect row lost its quarantine claim");
+                    } else {
+                        "persisted native terminal-effect row failed schema validation".to_owned()
+                    };
+                    // One malformed durable row must not poison every
+                    // valid claim in the bounded batch. Quarantine it with
+                    // a typed, non-payload diagnostic under the same claim
+                    // fence, then continue processing healthy obligations.
+                    let quarantined = native_terminal_effect_outbox::mark_failed(
+                        &maintenance.connection,
+                        effect_id.as_str(),
+                        claimed.claim_token.as_str(),
+                        code,
+                        &message,
+                        false,
+                        unix_to_datetime(clock()),
+                        unix_to_datetime(clock()),
+                    )
+                    .await;
+                    match quarantined {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::warn!("malformed terminal effect lost its quarantine fence")
+                        }
+                        Err(_error) => {
+                            storage_failed = true;
+                            tracing::warn!(
+                                "failed to quarantine terminal effect; running lease retains recovery"
+                            );
                         }
                     }
                 }
             }
-            Ok(valid)
+        }
+        Ok(NativeTerminalEffectClaimOutcome {
+            records: valid,
+            storage_failed,
         })
-        .await
     }
 
     pub async fn requeue_retryable_unresolved_native_terminal_effects(
@@ -29492,78 +29725,155 @@ impl CrudStore {
                 "atomic Task event batch exceeds {MAX_ATOMIC_TASK_EVENT_BATCH_SIZE} events"
             );
         }
-        events
-            .into_iter()
-            .map(task_event::PreparedTaskEvent::prepare)
-            .collect()
+        let mut prepared = Vec::with_capacity(events.len());
+        let mut batch_turns = HashMap::<String, PreparedLegacyTaskRunTurn>::new();
+        for payload in events {
+            let mut legacy_candidate = None;
+            let mut legacy_review = None;
+            if let Some(turn) = projected_legacy_task_run_turn(&payload) {
+                if batch_turns
+                    .get(&turn.run_id)
+                    .is_none_or(|current| turn.order_key() >= current.order_key())
+                {
+                    batch_turns.insert(turn.run_id.clone(), turn);
+                }
+            }
+            let target = match &payload {
+                TaskEventPayload::TaskResultCandidateCreated { candidate }
+                | TaskEventPayload::TaskResultCandidateAccepted { candidate, .. }
+                | TaskEventPayload::TaskResultCandidateRejected { candidate, .. }
+                | TaskEventPayload::TaskResultCandidateCancelled { candidate, .. } => {
+                    Some((candidate.thread_id.clone(), candidate.turn_id.clone()))
+                }
+                TaskEventPayload::RunCompleted {
+                    task_id,
+                    run_id,
+                    result: Some(result),
+                    completed_at,
+                    ..
+                } => {
+                    let persisted =
+                        task_run_turn::find_latest_turn_by_run(&self.connection, run_id)
+                            .await?
+                            .map(PreparedLegacyTaskRunTurn::from_model);
+                    let latest = match (persisted, batch_turns.get(run_id)) {
+                        (Some(persisted), Some(batch))
+                            if batch.order_key() >= persisted.order_key() =>
+                        {
+                            Some(batch.clone())
+                        }
+                        (Some(persisted), _) => Some(persisted),
+                        (None, batch) => batch.cloned(),
+                    };
+                    if let Some(turn) = latest {
+                        let (candidate, review) = prepare_legacy_task_result(
+                            task_id,
+                            run_id,
+                            &turn,
+                            result,
+                            *completed_at,
+                        )?;
+                        legacy_candidate = Some(candidate);
+                        legacy_review = Some(review);
+                        Some((turn.thread_id, turn.turn_id))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let mut event = task_event::PreparedTaskEvent::prepare(payload)?;
+            if let Some(candidate) = legacy_candidate {
+                event = event.with_candidate_projection(Some(candidate));
+            }
+            if let Some(review) = legacy_review {
+                event = event.with_review_projection(Some(review));
+            }
+            if let Some((thread_id, turn_id)) = target {
+                event.gate_payloads = Some(
+                    native_terminal_effect_outbox::prepare_gate_payloads(
+                        &self.connection,
+                        &thread_id,
+                        &turn_id,
+                    )
+                    .await?,
+                );
+            }
+            prepared.push(event);
+        }
+        Ok(prepared)
     }
 
     async fn prepare_candidate_writes_for_task_event<C: ConnectionTrait>(
         &self,
         db: &C,
         event: &TaskEventPayload,
+        event_timestamp_secs: i64,
         batch_run_turn: Option<&PreparedLegacyTaskRunTurn>,
-    ) -> Result<(
-        Option<native_terminal_effect_outbox::PreparedCandidateGateResolution>,
-        Option<task_result_candidate::PreparedTaskResultCandidate>,
-        Option<task_result_review_event::PreparedTaskResultReviewEvent>,
-    )> {
-        let (target, legacy_candidate, legacy_review) = match event {
-            TaskEventPayload::TaskResultCandidateCreated { candidate } => (
-                Some((
-                    candidate.id.clone(),
-                    candidate.thread_id.clone(),
-                    candidate.turn_id.clone(),
-                    crate::convention::task_result_candidate_status_to_db(candidate.status)
-                        .to_owned(),
-                    candidate.updated_at,
-                )),
-                None,
-                None,
-            ),
-            TaskEventPayload::TaskResultCandidateAccepted { candidate, .. } => (
-                Some((
-                    candidate.id.clone(),
-                    candidate.thread_id.clone(),
-                    candidate.turn_id.clone(),
-                    "accepted".to_owned(),
+        payloads: Option<&native_terminal_effect_outbox::PreparedGatePayloads>,
+        legacy_candidate: Option<&task_result_candidate::PreparedTaskResultCandidate>,
+    ) -> Result<Option<native_terminal_effect_outbox::PreparedCandidateGateResolution>> {
+        let mut replace_candidate = true;
+        let target = match event {
+            TaskEventPayload::TaskResultCandidateCreated { candidate } => Some((
+                candidate.id.clone(),
+                candidate.thread_id.clone(),
+                candidate.turn_id.clone(),
+                crate::convention::task_result_candidate_status_to_db(candidate.status).to_owned(),
+                candidate.updated_at,
+                candidate.updated_at,
+            )),
+            TaskEventPayload::TaskResultCandidateAccepted { candidate, .. } => Some((
+                candidate.id.clone(),
+                candidate.thread_id.clone(),
+                candidate.turn_id.clone(),
+                "accepted".to_owned(),
+                candidate
+                    .updated_at
+                    .max(candidate.resolved_at.unwrap_or(event_timestamp_secs)),
+                if candidate.status == TaskResultCandidateStatus::Accepted {
+                    candidate.updated_at
+                } else {
                     candidate
                         .updated_at
-                        .max(candidate.resolved_at.unwrap_or(candidate.updated_at)),
-                )),
-                None,
-                None,
-            ),
-            TaskEventPayload::TaskResultCandidateRejected { candidate, .. } => (
-                Some((
-                    candidate.id.clone(),
-                    candidate.thread_id.clone(),
-                    candidate.turn_id.clone(),
-                    "rejected".to_owned(),
+                        .max(candidate.resolved_at.unwrap_or(event_timestamp_secs))
+                },
+            )),
+            TaskEventPayload::TaskResultCandidateRejected { candidate, .. } => Some((
+                candidate.id.clone(),
+                candidate.thread_id.clone(),
+                candidate.turn_id.clone(),
+                "rejected".to_owned(),
+                candidate
+                    .updated_at
+                    .max(candidate.resolved_at.unwrap_or(event_timestamp_secs)),
+                if candidate.status == TaskResultCandidateStatus::Rejected {
+                    candidate.updated_at
+                } else {
                     candidate
                         .updated_at
-                        .max(candidate.resolved_at.unwrap_or(candidate.updated_at)),
-                )),
-                None,
-                None,
-            ),
-            TaskEventPayload::TaskResultCandidateCancelled { candidate, .. } => (
-                Some((
-                    candidate.id.clone(),
-                    candidate.thread_id.clone(),
-                    candidate.turn_id.clone(),
-                    "cancelled".to_owned(),
+                        .max(candidate.resolved_at.unwrap_or(event_timestamp_secs))
+                },
+            )),
+            TaskEventPayload::TaskResultCandidateCancelled { candidate, .. } => Some((
+                candidate.id.clone(),
+                candidate.thread_id.clone(),
+                candidate.turn_id.clone(),
+                "cancelled".to_owned(),
+                candidate
+                    .updated_at
+                    .max(candidate.resolved_at.unwrap_or(event_timestamp_secs)),
+                if candidate.status == TaskResultCandidateStatus::Cancelled {
+                    candidate.updated_at
+                } else {
                     candidate
                         .updated_at
-                        .max(candidate.resolved_at.unwrap_or(candidate.updated_at)),
-                )),
-                None,
-                None,
-            ),
+                        .max(candidate.resolved_at.unwrap_or(event_timestamp_secs))
+                },
+            )),
             TaskEventPayload::RunCompleted {
-                task_id,
                 run_id,
-                result: Some(result),
+                result: Some(_),
                 completed_at,
                 ..
             } => {
@@ -29581,85 +29891,65 @@ impl CrudStore {
                     (Some(persisted), None) => persisted,
                     (None, Some(batch)) => batch,
                     (None, None) => {
-                        return Ok((None, None, None));
+                        if legacy_candidate.is_some() {
+                            bail!("legacy candidate parent disappeared after preparation");
+                        }
+                        return Ok(None);
                     }
                 };
                 if task_run_turn.run_id != *run_id {
-                    return Ok((None, None, None));
+                    if legacy_candidate.is_some() {
+                        bail!("legacy candidate parent disappeared after preparation");
+                    }
+                    return Ok(None);
                 }
-                let candidate_id = format!("trc_{run_id}");
-                let review_event_id = format!("trre_auto_{run_id}");
-                let candidate = task_result_candidate::prepare_candidate(
-                    task_result_candidate::NewTaskResultCandidate {
-                        id: candidate_id.clone(),
-                        task_id: task_id.clone(),
-                        run_id: run_id.clone(),
-                        task_run_turn_id: task_run_turn.id.clone(),
-                        thread_id: task_run_turn.thread_id.clone(),
-                        turn_id: task_run_turn.turn_id.clone(),
-                        round: u32::try_from(task_run_turn.round)
-                            .context("legacy task run turn round is out of range")?,
-                        status: TaskResultCandidateStatus::Accepted,
-                        result: Some(result.clone()),
-                        extraction_error: None,
-                        summary: result.summary.clone(),
-                        diagnostics: Vec::new(),
-                        final_review_event_id: Some(review_event_id.clone()),
-                        created_at: *completed_at,
-                        updated_at: *completed_at,
-                        resolved_at: Some(*completed_at),
-                    },
-                )?;
-                let review = task_result_review_event::prepare_review_event(
-                    task_result_review_event::NewTaskResultReviewEvent {
-                        id: review_event_id,
-                        candidate_id: candidate_id.clone(),
-                        task_id: task_id.clone(),
-                        run_id: run_id.clone(),
-                        task_run_turn_id: task_run_turn.id,
-                        reviewer_kind: TaskResultReviewerKind::RuntimeAuto,
-                        reviewer: pioneer_protocol::TaskResultReviewerRef::RuntimePolicy,
-                        reviewer_thread_id: None,
-                        reviewer_turn_id: None,
-                        reviewer_user_id: None,
-                        reviewer_agent_spec_id: None,
-                        event_kind: TaskResultReviewEventKind::SystemAuto,
-                        decision: TaskResultReviewDecision::Accept,
-                        feedback_text: None,
-                        feedback: None,
-                        confidence: None,
-                        supersedes_review_event_id: None,
-                        next_task_run_turn_id: None,
-                        created_at: *completed_at,
-                    },
-                )?;
-                (
-                    Some((
-                        candidate_id,
-                        task_run_turn.thread_id,
-                        task_run_turn.turn_id,
-                        "accepted".to_owned(),
-                        *completed_at,
-                    )),
-                    Some(candidate),
-                    Some(review),
-                )
+                let prepared = legacy_candidate
+                    .context("legacy candidate was not prepared before writer admission")?;
+                let expected = prepared.expected();
+                if expected.task_run_turn_id != task_run_turn.id
+                    || expected.thread_id != task_run_turn.thread_id
+                    || expected.turn_id != task_run_turn.turn_id
+                    || i64::from(expected.round) != task_run_turn.round
+                {
+                    bail!("legacy candidate parent changed after preparation");
+                }
+                // The existing projector skips synthetic creation if this run
+                // already has an accepted candidate. This predicts writes only;
+                // the gate itself always chooses latest terminal metadata.
+                replace_candidate =
+                    !task_result_candidate::has_accepted_candidate_by_run(db, run_id).await?;
+                Some((
+                    expected.id.clone(),
+                    task_run_turn.thread_id,
+                    task_run_turn.turn_id,
+                    "accepted".to_owned(),
+                    *completed_at,
+                    expected.updated_at,
+                ))
             }
-            _ => (None, None, None),
+            _ => None,
         };
-        let Some((candidate_id, thread_id, turn_id, status, resolved_at)) = target else {
-            return Ok((None, legacy_candidate, legacy_review));
+        let Some((candidate_id, thread_id, turn_id, status, resolved_at, candidate_updated_at)) =
+            target
+        else {
+            return Ok(None);
         };
         let gate_resolution = native_terminal_effect_outbox::prepare_gate_resolution_for_candidate(
             db,
-            candidate_id.as_str(),
+            replace_candidate.then_some(native_terminal_effect_outbox::CandidateGateMetadata {
+                id: candidate_id,
+                status,
+                updated_at: unix_to_datetime(candidate_updated_at),
+            }),
             thread_id.as_str(),
             turn_id.as_str(),
-            status.as_str(),
             unix_to_datetime(resolved_at),
+            Some(payloads.context(
+                "Task candidate gate payloads were not prepared before writer admission",
+            )?),
         )
         .await?;
-        Ok((Some(gate_resolution), legacy_candidate, legacy_review))
+        Ok(Some(gate_resolution))
     }
 
     async fn append_task_events_in_connection<C: ConnectionTrait + Sync>(
@@ -29738,25 +30028,22 @@ impl CrudStore {
                 }
             };
             let event = event.preflight_idempotency(db).await?;
-            let (gate_resolution, legacy_candidate, legacy_review) = self
+            let gate_resolution = self
                 .prepare_candidate_writes_for_task_event(
                     db,
                     event.payload(),
+                    event_timestamp_secs,
                     event
                         .payload()
                         .run_id()
                         .and_then(|run_id| batch_run_turns.get(run_id)),
+                    event.gate_payloads.as_ref(),
+                    event.candidate_projection(),
                 )
                 .await?;
-            let mut event = event
+            let event = event
                 .with_candidate_gate_resolution(gate_resolution)
                 .with_delivery_authority(delivery_authority);
-            if let Some(candidate) = legacy_candidate {
-                event = event.with_candidate_projection(Some(candidate));
-            }
-            if let Some(review) = legacy_review {
-                event = event.with_review_projection(Some(review));
-            }
             let mut appended_event =
                 task_event::append_prepared_event(db, event, created_at).await?;
 
@@ -29780,10 +30067,12 @@ impl CrudStore {
                     )
                     .await?;
                 }
+                // The pending floor selects new work. A zero cursor also keeps
+                // an earlier tracked event safe after cursor deletion in a batch.
                 task_event::initialize_fanout_cursor(
                     db,
                     appended_event.task_id.as_str(),
-                    appended_event.sequence.saturating_sub(1),
+                    0,
                     created_at,
                 )
                 .await
@@ -29853,6 +30142,64 @@ impl PreparedLegacyTaskRunTurn {
     const fn order_key(&self) -> (i64, i64) {
         (self.sequence, self.created_at)
     }
+}
+
+fn prepare_legacy_task_result(
+    task_id: &str,
+    run_id: &str,
+    task_run_turn: &PreparedLegacyTaskRunTurn,
+    result: &pioneer_protocol::TaskResult,
+    completed_at: i64,
+) -> Result<(
+    task_result_candidate::PreparedTaskResultCandidate,
+    task_result_review_event::PreparedTaskResultReviewEvent,
+)> {
+    let candidate_id = format!("trc_{run_id}");
+    let review_event_id = format!("trre_auto_{run_id}");
+    let candidate =
+        task_result_candidate::prepare_candidate(task_result_candidate::NewTaskResultCandidate {
+            id: candidate_id.clone(),
+            task_id: task_id.to_owned(),
+            run_id: run_id.to_owned(),
+            task_run_turn_id: task_run_turn.id.clone(),
+            thread_id: task_run_turn.thread_id.clone(),
+            turn_id: task_run_turn.turn_id.clone(),
+            round: u32::try_from(task_run_turn.round)
+                .context("legacy task run turn round is out of range")?,
+            status: TaskResultCandidateStatus::Accepted,
+            result: Some(result.clone()),
+            extraction_error: None,
+            summary: result.summary.clone(),
+            diagnostics: Vec::new(),
+            final_review_event_id: Some(review_event_id.clone()),
+            created_at: completed_at,
+            updated_at: completed_at,
+            resolved_at: Some(completed_at),
+        })?;
+    let review = task_result_review_event::prepare_review_event(
+        task_result_review_event::NewTaskResultReviewEvent {
+            id: review_event_id,
+            candidate_id: candidate_id.clone(),
+            task_id: task_id.to_owned(),
+            run_id: run_id.to_owned(),
+            task_run_turn_id: task_run_turn.id.clone(),
+            reviewer_kind: TaskResultReviewerKind::RuntimeAuto,
+            reviewer: pioneer_protocol::TaskResultReviewerRef::RuntimePolicy,
+            reviewer_thread_id: None,
+            reviewer_turn_id: None,
+            reviewer_user_id: None,
+            reviewer_agent_spec_id: None,
+            event_kind: TaskResultReviewEventKind::SystemAuto,
+            decision: TaskResultReviewDecision::Accept,
+            feedback_text: None,
+            feedback: None,
+            confidence: None,
+            supersedes_review_event_id: None,
+            next_task_run_turn_id: None,
+            created_at: completed_at,
+        },
+    )?;
+    Ok((candidate, review))
 }
 
 fn projected_legacy_task_run_turn(event: &TaskEventPayload) -> Option<PreparedLegacyTaskRunTurn> {
@@ -31364,6 +31711,8 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    #[path = "task_event_fanout.rs"]
+    mod fanout;
     #[path = "task_run_occurrence.rs"]
     mod occurrence_tracker;
     #[path = "task_occurrence_reconcile.rs"]
@@ -31989,6 +32338,9 @@ mod tests {
         assert_eq!(resumed[0].heartbeat_at, Some(timestamp + 5));
         assert_eq!(resumed[0].last_activity_at, Some(timestamp + 6));
     }
+
+    #[path = "native_terminal_effect_gates.rs"]
+    mod terminal_effect_gates;
 
     async fn test_store_with_started_turn(
         workspace_id: &str,
@@ -33923,9 +34275,10 @@ mod tests {
         );
 
         let first_claim = store
-            .claim_due_native_terminal_effects(1_700_000_103, 5, 10)
+            .claim_due_native_terminal_effects_at(1_700_000_103, 5, 10)
             .await
-            .expect("ready effect should claim");
+            .expect("ready effect should claim")
+            .records;
         assert_eq!(first_claim.len(), 1);
         assert_eq!(first_claim[0].attempt_count, 1);
 
@@ -33934,15 +34287,17 @@ mod tests {
         let restarted = CrudStore::new(store.database_connection());
         assert!(
             restarted
-                .claim_due_native_terminal_effects(1_700_000_106, 5, 10)
+                .claim_due_native_terminal_effects_at(1_700_000_106, 5, 10)
                 .await
                 .expect("unexpired claim lookup should succeed")
+                .records
                 .is_empty()
         );
         let reclaimed = restarted
-            .claim_due_native_terminal_effects(1_700_000_109, 5, 10)
+            .claim_due_native_terminal_effects_at(1_700_000_109, 5, 10)
             .await
-            .expect("expired claim should recover after restart");
+            .expect("expired claim should recover after restart")
+            .records;
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0].effect_id, effect_id);
         assert_eq!(reclaimed[0].attempt_count, 2);
@@ -33958,9 +34313,10 @@ mod tests {
         );
         assert!(
             restarted
-                .claim_due_native_terminal_effects(1_700_000_200, 5, 10)
+                .claim_due_native_terminal_effects_at(1_700_000_200, 5, 10)
                 .await
                 .expect("succeeded effect lookup should succeed")
+                .records
                 .is_empty(),
             "a succeeded obligation must never be claimed twice"
         );
@@ -34042,9 +34398,10 @@ mod tests {
             .await
             .expect("terminal commit should activate the post-turn effect");
         let first = store
-            .claim_due_native_terminal_effects(timestamp + 1, 10, 1)
+            .claim_due_native_terminal_effects_at(timestamp + 1, 10, 1)
             .await
             .expect("post-turn effect should claim")
+            .records
             .pop()
             .expect("post-turn claim");
         assert!(
@@ -34114,9 +34471,10 @@ mod tests {
                 .expect("retry transition should retain the checkpoint")
         );
         let second = store
-            .claim_due_native_terminal_effects(timestamp + 2, 10, 1)
+            .claim_due_native_terminal_effects_at(timestamp + 2, 10, 1)
             .await
             .expect("retry should claim")
+            .records
             .pop()
             .expect("retry claim");
         assert_eq!(
@@ -34206,9 +34564,10 @@ mod tests {
         );
         assert!(
             store
-                .claim_due_native_terminal_effects(timestamp + 2, 10, 10)
+                .claim_due_native_terminal_effects_at(timestamp + 2, 10, 10)
                 .await
                 .expect("failure claim scan should succeed")
+                .records
                 .is_empty(),
             "a preparation failure is diagnostic state, never an executable fake request"
         );
@@ -34267,16 +34626,19 @@ mod tests {
             "waiting_acceptance"
         );
 
-        native_terminal_effect_outbox::resolve_gate_for_candidate(
-            &store.connection,
-            "candidate_gated_prepare_failure",
+        let candidate = terminal_effect_gates::candidate_fixture(
+            &store,
             thread_id,
             turn_id,
-            "accepted",
-            unix_to_datetime(timestamp + 2),
+            "gated_failure",
+            TaskResultCandidateStatus::Accepted,
+            timestamp + 2,
         )
-        .await
-        .expect("authoritative acceptance should resolve the failure gate");
+        .await;
+        store
+            .upsert_task_result_candidate(candidate)
+            .await
+            .expect("authoritative acceptance should resolve the failure gate");
         let status = store
             .native_terminal_effect_status(effect_id.as_str())
             .await
@@ -34289,9 +34651,10 @@ mod tests {
         );
         assert!(
             store
-                .claim_due_native_terminal_effects(timestamp + 3, 10, 1)
+                .claim_due_native_terminal_effects_at(timestamp + 3, 10, 1)
                 .await
                 .expect("preparation failure scan should succeed")
+                .records
                 .is_empty(),
             "a typed preparation failure must never become executable work"
         );
@@ -34356,9 +34719,10 @@ mod tests {
             .expect("fault injection should corrupt exactly one immutable payload identity");
 
         let claims = store
-            .claim_due_native_terminal_effects(timestamp + 1, 10, 10)
+            .claim_due_native_terminal_effects_at(timestamp + 1, 10, 10)
             .await
-            .expect("malformed row should be isolated from valid claims");
+            .expect("malformed row should be isolated from valid claims")
+            .records;
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].effect_id, cleanup_effect_id);
         let malformed = store
@@ -34543,9 +34907,10 @@ mod tests {
             .expect("fault injection should corrupt the durable checkpoint hash");
 
         let healthy = store
-            .claim_due_native_terminal_effects(timestamp + 1, 10, 10)
+            .claim_due_native_terminal_effects_at(timestamp + 1, 10, 10)
             .await
-            .expect("corrupt checkpoint should be quarantined without poisoning its batch");
+            .expect("corrupt checkpoint should be quarantined without poisoning its batch")
+            .records;
         assert_eq!(
             healthy.len(),
             1,
@@ -34595,9 +34960,10 @@ mod tests {
         );
         assert!(
             store
-                .claim_due_native_terminal_effects(timestamp + 7200, 10, 10)
+                .claim_due_native_terminal_effects_at(timestamp + 7200, 10, 10)
                 .await
                 .unwrap()
+                .records
                 .is_empty()
         );
     }
@@ -34632,9 +34998,10 @@ mod tests {
             .expect("interrupted canonical terminal transaction should commit");
 
         let claim = store
-            .claim_due_native_terminal_effects(timestamp + 1, 10, 1)
+            .claim_due_native_terminal_effects_at(timestamp + 1, 10, 1)
             .await
             .expect("interrupted cleanup should become claimable")
+            .records
             .pop()
             .expect("interrupted cleanup claim");
         assert_eq!(claim.effect_id, effect_id);
@@ -34698,9 +35065,10 @@ mod tests {
             .expect("recovered Turn should commit successfully");
         assert!(
             store
-                .claim_due_native_terminal_effects(timestamp + 2, 10, 10)
+                .claim_due_native_terminal_effects_at(timestamp + 2, 10, 10)
                 .await
                 .expect("stale cleanup scan should succeed")
+                .records
                 .is_empty(),
             "successful recovery must not cancel attached tasks using the stale provider-failure plan"
         );
@@ -35303,9 +35671,10 @@ mod tests {
             .expect("terminal failure should activate cleanup obligation");
 
         let first = store
-            .claim_due_native_terminal_effects(timestamp + 1, 10, 1)
+            .claim_due_native_terminal_effects_at(timestamp + 1, 10, 1)
             .await
             .expect("first attempt should claim")
+            .records
             .pop()
             .expect("first attempt must exist");
         assert_eq!(first.attempt_count, 1);
@@ -35325,9 +35694,10 @@ mod tests {
         );
 
         let second = store
-            .claim_due_native_terminal_effects(timestamp + 2, 10, 1)
+            .claim_due_native_terminal_effects_at(timestamp + 2, 10, 1)
             .await
             .expect("second attempt should claim")
+            .records
             .pop()
             .expect("second attempt must exist");
         assert_eq!(second.attempt_count, 2);
@@ -35358,9 +35728,10 @@ mod tests {
         );
         assert!(
             store
-                .claim_due_native_terminal_effects(timestamp + 100, 10, 1)
+                .claim_due_native_terminal_effects_at(timestamp + 100, 10, 1)
                 .await
                 .expect("terminal status lookup should succeed")
+                .records
                 .is_empty(),
             "an unresolved obligation must not retry forever"
         );
@@ -35442,9 +35813,10 @@ mod tests {
             .expect("terminal commit should activate post-turn effect");
 
         let first = store
-            .claim_due_native_terminal_effects(timestamp + 1, 10, 1)
+            .claim_due_native_terminal_effects_at(timestamp + 1, 10, 1)
             .await
             .expect("first attempt should claim")
+            .records
             .pop()
             .expect("first attempt must exist");
         assert!(
@@ -35479,9 +35851,10 @@ mod tests {
             1
         );
         let reopened = store
-            .claim_due_native_terminal_effects(timestamp + 3_602, 10, 1)
+            .claim_due_native_terminal_effects_at(timestamp + 3_602, 10, 1)
             .await
             .expect("recovery scan should succeed")
+            .records
             .pop()
             .expect("recent transient post-turn failure should reopen");
         assert_eq!(reopened.effect_id, effect_id);
@@ -35693,9 +36066,10 @@ mod tests {
                 .expect("terminal commit should activate post-turn effect");
 
             let first = store
-                .claim_due_native_terminal_effects(timestamp + 1, 10, 1)
+                .claim_due_native_terminal_effects_at(timestamp + 1, 10, 1)
                 .await
                 .expect("first attempt should claim")
+                .records
                 .pop()
                 .expect("first attempt must exist");
             if checkpoint {
@@ -35748,9 +36122,10 @@ mod tests {
             if expected == 0 {
                 assert!(
                     store
-                        .claim_due_native_terminal_effects(timestamp + delay, 10, 1)
+                        .claim_due_native_terminal_effects_at(timestamp + delay, 10, 1)
                         .await
                         .unwrap()
+                        .records
                         .is_empty()
                 );
                 continue;
@@ -35765,9 +36140,10 @@ mod tests {
                 0
             );
             let reopened = store
-                .claim_due_native_terminal_effects(timestamp + delay, 10, 1)
+                .claim_due_native_terminal_effects_at(timestamp + delay, 10, 1)
                 .await
                 .unwrap()
+                .records
                 .pop()
                 .unwrap();
             assert_eq!(reopened.effect_id, effect_id);
@@ -36601,9 +36977,10 @@ mod tests {
         );
         assert!(applied.final_item.is_some());
         let cleanup = restarted
-            .claim_due_native_terminal_effects(1_700_000_004, 90, 10)
+            .claim_due_native_terminal_effects_at(1_700_000_004, 90, 10)
             .await
-            .expect("recovery terminal cleanup should activate atomically");
+            .expect("recovery terminal cleanup should activate atomically")
+            .records;
         assert_eq!(cleanup.len(), 1);
         assert_eq!(cleanup[0].runtime_generation, 77);
         assert!(matches!(
@@ -43417,9 +43794,12 @@ mod tests {
         );
         assert_eq!(
             store
-                .list_pending_task_event_fanout_task_ids(None, 256)
+                .due_task_event_fanout(i64::MAX, 64)
                 .await
-                .expect("durable fanout backlog should list"),
+                .expect("durable fanout backlog should list")
+                .into_iter()
+                .map(|row| row.task_id)
+                .collect::<Vec<_>>(),
             vec![task.id.clone()],
             "an unacknowledged terminal/progress event must remain discoverable without a wake"
         );
@@ -43437,7 +43817,7 @@ mod tests {
         );
         assert!(
             store
-                .list_pending_task_event_fanout_task_ids(None, 256)
+                .due_task_event_fanout(i64::MAX, 64)
                 .await
                 .expect("acknowledged fanout backlog should list")
                 .is_empty(),
@@ -43482,7 +43862,7 @@ mod tests {
                 .get_task_event_fanout_cursor(task.id.as_str())
                 .await
                 .expect("legacy task cursor should initialize atomically"),
-            Some(updated.sequence.saturating_sub(1)),
+            Some(0),
             "the first post-upgrade event must remain pending for fanout while older events stay skipped"
         );
         store
