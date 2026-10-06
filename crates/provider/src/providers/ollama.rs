@@ -100,6 +100,9 @@ struct OllamaShowResponse {
     // Modern servers expose supported controls. Older versions omit this;
     // omission must never be interpreted as support for false or an effort.
     thinking: Option<OllamaThinking>,
+    // /api/show also supplies the instance's explicit input capabilities.
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,13 +164,6 @@ struct OllamaModelDetails {
     quantization_level: Option<String>,
 }
 
-// Metadata only: /api/show capabilities are the instance's explicit model
-// contract (https://github.com/ollama/ollama/blob/main/docs/api.md).
-#[derive(Debug, Deserialize)]
-struct OllamaShowResponse {
-    #[serde(default)]
-    capabilities: Option<Vec<String>>,
-}
 fn apply_show_input(model: &mut ProviderModelInfo, response: OllamaShowResponse) {
     if let Some(capabilities) = response.capabilities {
         let vision = capabilities.iter().any(|v| v == "vision");
@@ -1255,6 +1251,54 @@ mod tests {
 #[cfg(test)]
 mod discovery_input_tests {
     use super::*;
+
+    #[test]
+    fn show_metadata_preserves_thinking_and_input_capabilities_together() {
+        let mut request = crate::generation::test_request("instance-model");
+        request.reasoning = Some(crate::types::ReasoningConfig::Disabled);
+        for capabilities in [
+            None,
+            Some(vec!["completion"]),
+            Some(vec!["completion", "vision"]),
+        ] {
+            for thinking in [None, Some(serde_json::json!({"values": [true, false]}))] {
+                let mut body = serde_json::json!({});
+                if let Some(capabilities) = &capabilities {
+                    body["capabilities"] = serde_json::json!(capabilities);
+                }
+                if let Some(thinking) = &thinking {
+                    body["thinking"] = thinking.clone();
+                }
+                let show: OllamaShowResponse = serde_json::from_value(body).unwrap();
+                let selected = OllamaProvider::resolve_think(&request, show.thinking.as_ref());
+                if thinking.is_some() {
+                    assert_eq!(selected.unwrap(), Some(serde_json::json!(false)));
+                } else {
+                    assert!(selected.is_err());
+                }
+                let mut model: ProviderModelInfo = serde_json::from_value(serde_json::json!({
+                    "id": "instance-model", "provider": "ollama", "limits": {}, "capabilities": {}
+                }))
+                .unwrap();
+                apply_show_input(&mut model, show);
+                let vision = capabilities
+                    .as_ref()
+                    .map(|values| values.contains(&"vision"));
+                assert_eq!(model.capabilities.vision, vision);
+                assert_eq!(
+                    model.capabilities.input_modalities,
+                    vision.map(|vision| {
+                        if vision {
+                            vec!["text".into(), "image".into()]
+                        } else {
+                            vec!["text".into()]
+                        }
+                    })
+                );
+            }
+        }
+    }
+
     #[test]
     fn show_missing_is_unknown_and_explicit_capabilities_are_instance_input_evidence() {
         let mut model:ProviderModelInfo=serde_json::from_value(serde_json::json!({"id":"instance-model","provider":"ollama","limits":{},"capabilities":{}})).unwrap();
