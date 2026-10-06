@@ -13,13 +13,17 @@ use sea_orm::sea_query::{ExprTrait, Query};
 const NOW: i64 = 4_000_000_000;
 const MIGRATION: &str = "m20261002_000001_task_run_occurrence_reconcile";
 
-fn migration_rollback_steps() -> u32 {
-    let migrations = Migrator::migrations();
-    let target = migrations
+fn tracker_rollback_steps() -> u32 {
+    // Later migrations must be removed before this tracker, rather than
+    // assuming that the parent tracker is the final registered migration.
+    (Migrator::migrations()
         .iter()
+        .rev()
         .position(|migration| migration.name() == MIGRATION)
-        .unwrap();
-    (migrations.len() - target) as u32
+        .expect("parent tracker migration is registered")
+        + 1)
+    .try_into()
+    .unwrap()
 }
 
 async fn row(store: &CrudStore, id: &str) -> Option<pending::Model> {
@@ -663,7 +667,7 @@ async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_obj
     let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     let maintenance = store.with_maintenance_access();
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(migration_rollback_steps()))
+    Migrator::down(&*tx, Some(tracker_rollback_steps()))
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -697,7 +701,7 @@ async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_obj
         1
     );
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(migration_rollback_steps()))
+    Migrator::down(&*tx, Some(tracker_rollback_steps()))
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -1532,7 +1536,7 @@ async fn migration_installation_and_completion_marker_rollback_together() {
         .await
         .with_maintenance_access();
     let tx = store.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(migration_rollback_steps()))
+    Migrator::down(&*tx, Some(tracker_rollback_steps()))
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -1667,7 +1671,7 @@ async fn recovery_completed_at_write_tracks_preinstall_run_without_history_disco
         .unwrap();
     let maintenance = store.with_maintenance_access();
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(migration_rollback_steps()))
+    Migrator::down(&*tx, Some(tracker_rollback_steps()))
         .await
         .unwrap();
     tx.commit().await.unwrap();

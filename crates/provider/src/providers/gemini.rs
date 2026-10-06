@@ -52,7 +52,13 @@ struct ApiGenerateRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ApiContent {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_string",
+        skip_serializing_if = "String::is_empty"
+    )]
     role: String,
+    #[serde(default)]
     parts: Vec<ApiPart>,
 }
 
@@ -62,6 +68,7 @@ struct ApiSystemInstruction {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ApiPart {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<String>,
@@ -81,6 +88,7 @@ struct ApiPart {
         rename = "thoughtSignature",
         skip_serializing_if = "Option::is_none"
     )]
+    // REST bytes fields are base64 strings; retain the opaque representation.
     thought_signature: Option<String>,
 }
 
@@ -94,6 +102,11 @@ struct ApiInlineData {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiFileData {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_string",
+        skip_serializing_if = "String::is_empty"
+    )]
     mime_type: String,
     file_uri: String,
 }
@@ -104,6 +117,10 @@ struct ApiFunctionCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     name: String,
+    #[serde(
+        default = "empty_json_object",
+        deserialize_with = "deserialize_function_arguments"
+    )]
     args: serde_json::Value,
 }
 
@@ -319,6 +336,9 @@ impl GeminiProvider {
         request: &ChatRequest,
         prepared: &PreparedProviderMessages,
     ) -> Result<ApiGenerateRequest> {
+        let request = crate::tools::policy::prepare_request("gemini", request.clone())?;
+        let mut prepared = prepared.clone();
+        crate::tools::policy::prepare_history("gemini", &mut prepared.messages)?;
         let mut system_parts: Vec<ApiPart> = Vec::new();
         let mut contents: Vec<ApiContent> = Vec::new();
 
@@ -346,11 +366,14 @@ impl GeminiProvider {
 
                     if msg.role == Role::Tool {
                         let name = msg.name.clone().unwrap_or_else(|| "tool".to_owned());
+                        // FunctionResponse.response is a protobuf Struct, not an
+                        // arbitrary JSON value. Preserve scalar/array results inside it.
                         let response_payload =
-                            serde_json::from_str::<serde_json::Value>(msg.content.as_str())
-                                .unwrap_or_else(
-                                    |_| serde_json::json!({ "content": msg.content.clone() }),
-                                );
+                            match serde_json::from_str::<serde_json::Value>(msg.content.as_str()) {
+                                Ok(value) if value.is_object() => value,
+                                Ok(value) => serde_json::json!({ "content": value }),
+                                Err(_) => serde_json::json!({ "content": msg.content }),
+                            };
                         parts.push(ApiPart {
                             text: None,
                             inline_data: None,
@@ -417,7 +440,7 @@ impl GeminiProvider {
                                 function_call: Some(ApiFunctionCall {
                                     id: Some(call.id.clone()),
                                     name: call.name.clone(),
-                                    args: parse_json_or_string(call.arguments.as_str()),
+                                    args: parse_function_arguments(call.arguments.as_str())?,
                                 }),
                                 function_response: None,
                                 thought_signature: function_call_signatures
@@ -664,9 +687,40 @@ impl GeminiProvider {
     }
 }
 
-fn parse_json_or_string(raw: &str) -> serde_json::Value {
-    serde_json::from_str::<serde_json::Value>(raw)
-        .unwrap_or_else(|_| serde_json::Value::String(raw.to_owned()))
+fn deserialize_optional_string<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn empty_json_object() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+fn deserialize_function_arguments<'de, D>(
+    deserializer: D,
+) -> std::result::Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let arguments =
+        Option::<serde_json::Value>::deserialize(deserializer)?.unwrap_or_else(empty_json_object);
+    if !arguments.is_object() {
+        return Err(serde::de::Error::custom(
+            "Gemini functionCall args must be a JSON object",
+        ));
+    }
+    Ok(arguments)
+}
+
+fn parse_function_arguments(raw: &str) -> Result<serde_json::Value> {
+    let arguments: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|_| anyhow!("Gemini functionCall args must be a JSON object"))?;
+    if !arguments.is_object() {
+        return Err(anyhow!("Gemini functionCall args must be a JSON object"));
+    }
+    Ok(arguments)
 }
 
 #[async_trait]
@@ -693,6 +747,7 @@ impl crate::traits::Provider for GeminiProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
         let model = request.model.clone();
         let prepared = prepare_messages_for_provider_async(
             self.name(),
@@ -761,6 +816,7 @@ impl crate::traits::Provider for GeminiProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
         let model = request.model.clone();
         let prepared = prepare_messages_for_provider_async(
             self.name(),
@@ -1045,6 +1101,34 @@ fn canonical_gemini_thinking_level(level: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn tool_modes_and_parallel_limit_use_native_config_or_error() {
+        for (choice, expected) in [
+            (ToolChoice::Auto, "AUTO"),
+            (ToolChoice::None, "NONE"),
+            (ToolChoice::Required, "ANY"),
+            (
+                ToolChoice::Tool {
+                    name: "lookup".into(),
+                },
+                "ANY",
+            ),
+        ] {
+            let mut request = crate::tools::policy::test_request();
+            request.tool_choice = Some(choice);
+            let wire = GeminiProvider::build_request_result(&request).unwrap();
+            assert_eq!(
+                wire.tool_config.unwrap().function_calling_config.mode,
+                expected
+            );
+        }
+        let mut request = crate::tools::policy::test_request();
+        request.parallel_tool_calls = Some(false);
+        assert!(GeminiProvider::build_request_result(&request).is_err());
+        request.parallel_tool_calls = Some(true);
+        assert!(GeminiProvider::build_request_result(&request).is_ok());
+    }
+
+    #[test]
     fn usage_prompt_includes_cached_content_once() {
         let response: super::ApiGenerateResponse = serde_json::from_value(serde_json::json!({
             "candidates":[], "usageMetadata": {"promptTokenCount":140,
@@ -1189,7 +1273,11 @@ mod tests {
         );
         let request = ChatRequest {
             model: "gemini-3-flash-preview".to_owned(),
-            messages: vec![message],
+            messages: vec![
+                message,
+                ChatMessage::tool_result("call_1", "first", "{}"),
+                ChatMessage::tool_result("call_2", "second", "{}"),
+            ],
             temperature: None,
             max_tokens: None,
             tools: None,
@@ -1212,6 +1300,11 @@ mod tests {
             Some("opaque-signature")
         );
         assert!(rendered.contents[0].parts[1].thought_signature.is_none());
+        for (content, id) in rendered.contents[1..].iter().zip(["call_1", "call_2"]) {
+            let result = content.parts[0].function_response.as_ref().unwrap();
+            assert_eq!(result.id.as_deref(), Some(id));
+            assert!(content.parts[0].thought_signature.is_none());
+        }
     }
 
     #[test]
@@ -1621,3 +1714,7 @@ mod tests {
         assert_eq!(api_req.contents[1].role, "model");
     }
 }
+
+#[cfg(test)]
+#[path = "wire_tests/gemini.rs"]
+mod wire_contract_tests;

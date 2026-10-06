@@ -279,8 +279,8 @@ pub async fn scan_terminal_task_occurrence_mismatches<C: ConnectionTrait>(
 }
 
 /// Completes an explicit diagnostic scan through bounded primary-key pages.
-/// Periodic maintenance must call `scan_terminal_task_occurrence_mismatches`
-/// once per quantum and retain its cursor instead of using this full scan.
+/// Used by the explicit runtime invariant scanner. Periodic maintenance uses
+/// persistent dirty locators and must never call this diagnostic scan.
 pub async fn list_terminal_task_occurrence_mismatches<C: ConnectionTrait>(
     db: &C,
     limit: u64,
@@ -396,12 +396,251 @@ async fn list_terminal_task_occurrence_mismatches_for_ids<C: ConnectionTrait>(
         .collect()
 }
 
+// Only predicate/CAS metadata. Background reconciliation never selects task
+// spec, result/error JSON, route/delivery payloads or execution history.
+#[derive(Clone, Debug, PartialEq, Eq, sea_orm::FromQueryResult)]
+pub(crate) struct OccurrenceMetadata {
+    pub occurrence_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub execution_generation: i64,
+    pub agent_execution_id: Option<String>,
+    pub work_graph_root_execution_id: Option<String>,
+    pub root_resource_scope_id: Option<String>,
+    pub status: String,
+    pub retry_attempt: i64,
+    pub action_idempotency_key: String,
+    pub updated_at: sea_orm::prelude::DateTimeWithTimeZone,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, sea_orm::FromQueryResult)]
+pub(crate) struct RunMetadata {
+    pub id: String,
+    pub task_id: String,
+    pub executor_kind: String,
+    pub status: String,
+    pub completed_at: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, sea_orm::FromQueryResult)]
+pub(crate) struct TaskMetadata {
+    pub id: String,
+    pub workspace_id: String,
+    pub executor_kind: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, sea_orm::FromQueryResult)]
+pub(crate) struct ExecutionMetadata {
+    pub id: String,
+    pub task_id: String,
+    pub task_run_id: String,
+    pub executor_kind: String,
+    pub status: String,
+    pub completed_at: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, sea_orm::FromQueryResult)]
+pub(crate) struct AgentMetadata {
+    pub id: String,
+    pub workspace_id: String,
+    pub parent_task_id: Option<String>,
+    pub execution_generation: i64,
+    pub status: String,
+    pub finished_at: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+    pub work_graph_root_execution_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalOccurrenceMetadata {
+    pub run: Option<RunMetadata>,
+    pub occurrence: Option<OccurrenceMetadata>,
+    pub execution: Option<ExecutionMetadata>,
+    pub task: Option<TaskMetadata>,
+    pub agent: Option<AgentMetadata>,
+}
+
+impl TerminalOccurrenceMetadata {
+    pub(crate) fn expected_status(&self) -> Option<TaskOccurrenceStatus> {
+        exact_terminal_occurrence_status(
+            self.task.as_ref()?,
+            self.run.as_ref()?,
+            self.execution.as_ref()?,
+            self.occurrence.as_ref()?,
+            self.agent.as_ref(),
+        )
+    }
+
+    pub(crate) fn is_mismatch(&self) -> bool {
+        self.expected_status().is_some_and(|status| {
+            self.occurrence.as_ref().is_some_and(|occurrence| {
+                occurrence.status != task_occurrence_status_to_db(&status)
+            })
+        })
+    }
+}
+
+pub(crate) async fn load_terminal_occurrence_metadata<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+) -> Result<TerminalOccurrenceMetadata> {
+    use pioneer_entity::{
+        agent_execution as agent, task, task_run as run, task_run_execution as execution,
+    };
+    use task_occurrence_contract as occurrence;
+    let run = run::Entity::find_by_id(run_id.to_owned())
+        .select_only()
+        .columns([
+            run::Column::Id,
+            run::Column::TaskId,
+            run::Column::ExecutorKind,
+            run::Column::Status,
+            run::Column::CompletedAt,
+        ])
+        .into_model::<RunMetadata>()
+        .one(db)
+        .await?;
+    let occurrence = occurrence::Entity::find()
+        .select_only()
+        .columns([
+            occurrence::Column::OccurrenceId,
+            occurrence::Column::TaskId,
+            occurrence::Column::RunId,
+            occurrence::Column::ExecutionGeneration,
+            occurrence::Column::AgentExecutionId,
+            occurrence::Column::WorkGraphRootExecutionId,
+            occurrence::Column::RootResourceScopeId,
+            occurrence::Column::Status,
+            occurrence::Column::RetryAttempt,
+            occurrence::Column::ActionIdempotencyKey,
+            occurrence::Column::UpdatedAt,
+        ])
+        .filter(occurrence::Column::RunId.eq(run_id.to_owned()))
+        .into_model::<OccurrenceMetadata>()
+        .one(db)
+        .await?;
+    let task = if let Some(run) = &run {
+        task::Entity::find_by_id(run.task_id.clone())
+            .select_only()
+            .columns([
+                task::Column::Id,
+                task::Column::WorkspaceId,
+                task::Column::ExecutorKind,
+            ])
+            .into_model::<TaskMetadata>()
+            .one(db)
+            .await?
+    } else {
+        None
+    };
+    let execution = execution::Entity::find()
+        .select_only()
+        .columns([
+            execution::Column::Id,
+            execution::Column::TaskId,
+            execution::Column::TaskRunId,
+            execution::Column::ExecutorKind,
+            execution::Column::Status,
+            execution::Column::CompletedAt,
+        ])
+        .filter(execution::Column::TaskRunId.eq(run_id.to_owned()))
+        .into_model::<ExecutionMetadata>()
+        .one(db)
+        .await?;
+    let agent = if let Some(execution) = &execution
+        && execution.executor_kind == "agent"
+    {
+        agent::Entity::find_by_id(execution.id.clone())
+            .select_only()
+            .columns([
+                agent::Column::Id,
+                agent::Column::WorkspaceId,
+                agent::Column::ParentTaskId,
+                agent::Column::ExecutionGeneration,
+                agent::Column::Status,
+                agent::Column::FinishedAt,
+                agent::Column::WorkGraphRootExecutionId,
+            ])
+            .into_model::<AgentMetadata>()
+            .one(db)
+            .await?
+    } else {
+        None
+    };
+    Ok(TerminalOccurrenceMetadata {
+        run,
+        occurrence,
+        execution,
+        task,
+        agent,
+    })
+}
+
+fn exact_terminal_occurrence_status(
+    task: &TaskMetadata,
+    run: &RunMetadata,
+    execution: &ExecutionMetadata,
+    occurrence: &OccurrenceMetadata,
+    agent_execution: Option<&AgentMetadata>,
+) -> Option<pioneer_protocol::TaskOccurrenceStatus> {
+    if task.id != run.task_id
+        || task.executor_kind != run.executor_kind
+        || occurrence.task_id != run.task_id
+        || occurrence.run_id != run.id
+        || execution.task_id != run.task_id
+        || execution.task_run_id != run.id
+        || execution.executor_kind != run.executor_kind
+        || run.completed_at.is_none()
+        || execution.completed_at.is_none()
+    {
+        return None;
+    }
+
+    let expected = match (run.status.as_str(), execution.status.as_str()) {
+        ("succeeded", "succeeded") => pioneer_protocol::TaskOccurrenceStatus::Delivered,
+        ("failed", "failed") | ("blocked", "blocked") | ("timed_out", "timed_out") => {
+            pioneer_protocol::TaskOccurrenceStatus::Failed
+        }
+        ("cancelled", "cancelled") => pioneer_protocol::TaskOccurrenceStatus::Cancelled,
+        _ => return None,
+    };
+
+    match execution.executor_kind.as_str() {
+        "agent" => {
+            let agent_execution = agent_execution?;
+            if occurrence.agent_execution_id.as_deref() != Some(execution.id.as_str())
+                || agent_execution.id != execution.id
+                || agent_execution.workspace_id != task.workspace_id
+                || agent_execution.parent_task_id.as_deref() != Some(run.task_id.as_str())
+                || occurrence.execution_generation != agent_execution.execution_generation
+                || agent_execution.status != execution.status
+                || agent_execution.finished_at.is_none()
+                || occurrence.work_graph_root_execution_id.as_deref()
+                    != Some(agent_execution.work_graph_root_execution_id.as_str())
+                || occurrence.root_resource_scope_id.as_deref()
+                    != Some(agent_execution.work_graph_root_execution_id.as_str())
+            {
+                return None;
+            }
+        }
+        "system" => {
+            if occurrence.agent_execution_id.is_some()
+                || occurrence.work_graph_root_execution_id.is_some()
+                || occurrence.root_resource_scope_id.is_some()
+            {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some(expected)
+}
+
 /// Explicit repair path for an occurrence whose exact terminal authorities
 /// were revalidated by the caller in the same transaction. The optimistic
 /// fence prevents a concurrent retry or actor rebinding from being repaired.
 pub(crate) async fn repair_terminal_task_occurrence_status<C: ConnectionTrait>(
     db: &C,
-    current: &task_occurrence_contract::Model,
+    current: &OccurrenceMetadata,
     expected_status: TaskOccurrenceStatus,
     now: i64,
 ) -> Result<bool> {

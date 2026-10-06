@@ -113,6 +113,13 @@ impl MessageProcessor {
         provider_configs
             .entry("local".to_owned())
             .or_insert((false, None, None));
+        if pioneer_provider::provider_definition("bedrock").is_some_and(|definition| {
+            pioneer_provider::provider_is_available(false, false, false, definition)
+        }) {
+            provider_configs
+                .entry("bedrock".to_owned())
+                .or_insert((false, None, None));
+        }
 
         let providers = provider_configs
             .into_iter()
@@ -181,6 +188,7 @@ impl MessageProcessor {
                 name: definition.name.to_owned(),
                 default_base_url: definition.default_base_url.map(str::to_owned),
                 supports_base_url_override: definition.supports_base_url_override,
+                retirement_reason: definition.retirement_reason().map(str::to_owned),
             })
             .collect();
         let result = ProviderListResponse {

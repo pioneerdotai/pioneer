@@ -50,6 +50,10 @@ struct OllamaMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     images: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OllamaToolCall>>,
 }
 
@@ -77,6 +81,7 @@ struct OllamaToolCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OllamaToolFunctionCall {
     name: String,
+    #[serde(deserialize_with = "deserialize_tool_arguments")]
     arguments: serde_json::Value,
 }
 
@@ -184,11 +189,10 @@ impl OllamaProvider {
     }
 
     fn convert_messages(prepared: &PreparedProviderMessages) -> Result<Vec<OllamaMessage>> {
-        prepared
-            .messages
-            .iter()
-            .enumerate()
-            .map(|(message_index, m)| {
+        crate::tools::policy::ordered_tool_results(&prepared.messages)
+            .into_iter()
+            .map(|message_index| {
+                let m = &prepared.messages[message_index];
                 let mut images = Vec::new();
                 for attachment in prepared.attachments_for_message(message_index) {
                     match attachment.kind {
@@ -219,23 +223,31 @@ impl OllamaProvider {
                         .then(|| m.reasoning_content.clone())
                         .flatten(),
                     images: (!images.is_empty()).then_some(images),
-                    tool_calls: m.tool_calls.as_ref().map(|tool_calls| {
-                        tool_calls
-                            .iter()
-                            .map(|call| OllamaToolCall {
-                                id: Some(call.id.clone()),
-                                function: OllamaToolFunctionCall {
-                                    name: call.name.clone(),
-                                    arguments: serde_json::from_str::<serde_json::Value>(
-                                        call.arguments.as_str(),
-                                    )
-                                    .unwrap_or_else(|_| {
-                                        serde_json::Value::String(call.arguments.clone())
-                                    }),
-                                },
-                            })
-                            .collect()
-                    }),
+                    tool_name: (m.role == Role::Tool).then(|| m.name.clone()).flatten(),
+                    // Native Message.ToolCallID is optional; preserve an existing result ID.
+                    tool_call_id: (m.role == Role::Tool)
+                        .then(|| m.tool_call_id.clone())
+                        .flatten(),
+                    tool_calls: m
+                        .tool_calls
+                        .as_ref()
+                        .map(|tool_calls| {
+                            tool_calls
+                                .iter()
+                                .map(|call| {
+                                    Ok(OllamaToolCall {
+                                        id: Some(call.id.clone()),
+                                        function: OllamaToolFunctionCall {
+                                            name: call.name.clone(),
+                                            arguments: parse_tool_arguments(
+                                                call.arguments.as_str(),
+                                            )?,
+                                        },
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>()
+                        })
+                        .transpose()?,
                 })
             })
             .collect::<Result<Vec<_>>>()
@@ -262,8 +274,7 @@ impl OllamaProvider {
             .map(|(index, call)| ProviderToolCall {
                 id: call.id.unwrap_or_else(|| format!("call_{}", index + 1)),
                 name: call.function.name,
-                arguments: serde_json::to_string(&call.function.arguments)
-                    .unwrap_or_else(|_| "{}".to_owned()),
+                arguments: call.function.arguments.to_string(),
             })
             .collect()
     }
@@ -301,6 +312,33 @@ impl OllamaProvider {
         };
         anyhow!("Ollama API error ({status}): {body}")
     }
+}
+
+// Native ToolCallFunctionArguments is map-backed, unlike Chat's string arguments.
+fn require_tool_arguments(arguments: serde_json::Value) -> Result<serde_json::Value> {
+    if !arguments.is_object() {
+        return Err(anyhow!("Ollama function arguments must be a JSON object"));
+    }
+    Ok(arguments)
+}
+
+fn parse_tool_arguments(raw: &str) -> Result<serde_json::Value> {
+    let arguments = serde_json::from_str(raw).map_err(|_| {
+        anyhow!("Ollama function arguments must be valid JSON containing an object")
+    })?;
+    require_tool_arguments(arguments)
+}
+
+// Shared by ordinary JSON and each native NDJSON response message. Missing args
+// remain a missing required field; explicit null is not normalized into {}.
+fn deserialize_tool_arguments<'de, D>(
+    deserializer: D,
+) -> std::result::Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let arguments = serde_json::Value::deserialize(deserializer)?;
+    require_tool_arguments(arguments).map_err(serde::de::Error::custom)
 }
 
 /// Normalize the base URL by stripping trailing `/api` and trailing `/`.
@@ -344,13 +382,15 @@ impl crate::traits::Provider for OllamaProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider_async(
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let options = Self::build_options(&request);
         let api_request = OllamaChatRequest {
@@ -426,13 +466,15 @@ impl crate::traits::Provider for OllamaProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let prepared = prepare_messages_for_provider_async(
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let options = Self::build_options(&request);
         let api_request = OllamaChatRequest {
@@ -652,7 +694,7 @@ impl crate::traits::Provider for OllamaProvider {
                     limits: ProviderModelLimits::default(),
                     capabilities: ProviderModelCapabilities {
                         streaming: Some(true),
-                        tool_calling: Some(true),
+                        tool_calling: None,
                         ..ProviderModelCapabilities::default()
                     },
                     transcription: None,
@@ -677,6 +719,46 @@ mod tests {
     use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
     use crate::traits::Provider;
     use crate::types::{ChatMessage, ProviderReplayState};
+
+    #[test]
+    fn legacy_name_order_projection_preserves_canonical_ids() {
+        let provider = OllamaProvider::new();
+        let mut assistant = crate::ChatMessage::assistant("");
+        assistant.tool_calls = Some(vec![
+            ProviderToolCall {
+                id: "first".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            },
+            ProviderToolCall {
+                id: "second".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            },
+        ]);
+        let messages = vec![
+            assistant,
+            crate::ChatMessage::tool_result("second", "lookup", "second-result"),
+            crate::ChatMessage::tool_result("first", "lookup", "first-result"),
+        ];
+        let mut prepared = crate::attachments::prepare_messages_for_provider(
+            "ollama",
+            &provider.capabilities(),
+            &messages,
+        )
+        .unwrap();
+        crate::tools::policy::prepare_history("ollama", &mut prepared.messages).unwrap();
+        let wire = OllamaProvider::convert_messages(&prepared).unwrap();
+        assert_eq!(wire[1].content.as_deref(), Some("first-result"));
+        assert_eq!(wire[2].content.as_deref(), Some("second-result"));
+        assert_eq!(wire[1].tool_call_id.as_deref(), Some("first"));
+        assert_eq!(wire[2].tool_call_id.as_deref(), Some("second"));
+        assert_eq!(
+            serde_json::to_value(&wire[1]).unwrap()["tool_name"],
+            "lookup"
+        );
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("second"));
+    }
 
     #[test]
     fn active_foreign_replay_is_rejected_before_ollama_serializer_can_ignore_it() {
@@ -786,6 +868,8 @@ mod tests {
                 content: Some("Hello".into()),
                 thinking: None,
                 images: None,
+                tool_name: None,
+                tool_call_id: None,
                 tool_calls: None,
             }],
             stream: false,
@@ -808,6 +892,8 @@ mod tests {
                 content: Some("Hello".into()),
                 thinking: None,
                 images: None,
+                tool_name: None,
+                tool_call_id: None,
                 tool_calls: None,
             }],
             stream: false,
@@ -910,3 +996,7 @@ mod tests {
         assert!(caps.vision);
     }
 }
+
+#[cfg(test)]
+#[path = "wire_tests/ollama.rs"]
+mod wire_contract_tests;

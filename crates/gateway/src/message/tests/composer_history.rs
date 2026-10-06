@@ -498,13 +498,19 @@ async fn check_composer_history_failure_stays_in_task_without_rejecting_parent()
                     .expect("admitted CLI child must remain durable")
                     .1;
                 assert_eq!(child.status, TurnStatus::Blocked);
-                assert_eq!(child.error.as_deref(), Some("task_turn_admission_failed"));
+                assert_eq!(child.error.as_deref(), Some("task_cli_preparation_failed"));
                 let blocked_run = store.get_task_run(&run_id).await.unwrap().unwrap();
                 let error = blocked_run
                     .error
                     .expect("blocked CLI TaskRun needs a reason");
-                assert_eq!(error.code, "child_turn_blocked");
-                assert_eq!(error.message, "child_turn_blocked");
+                assert_eq!(error.code, "task_history_preparation_storage_failed");
+                assert_eq!(error.class, pioneer_protocol::TaskErrorClass::Internal);
+                assert_eq!(error.message, "Task preparation or launch failed.");
+                assert!(
+                    !serde_json::to_string(&error)
+                        .unwrap()
+                        .contains("injected history preparation failure")
+                );
             } else {
                 timeout(Duration::from_secs(15), async {
                     loop {

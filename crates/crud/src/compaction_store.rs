@@ -1,11 +1,11 @@
 //! CrudStore facade; persistence operations live in repositories.
 use crate::compaction::{
     AcceptedTaskBasis, CanonicalFragment, CanonicalSource, CheckpointEdges, CheckpointMetadata,
-    CommitOutcome, CompactionLifecycleRecovery, CompletedHistoryCheck, DeliveredTaskOutputPage,
-    DeliveryCheckpointImportSource, FrozenImportRecord, HistoricalEventProjection,
-    HistoryCausalBoundary, HistoryReadFence, HistoryTurnBoundary, ManifestEntry, OperationRecord,
-    PagedSource, PreparedFrozenImport, RunnerPlanRecord, SourceAssertion, SourcePage,
-    TaskDeliveryOutputSnapshot, TaskInputCopyAlias, TaskOutputSnapshot,
+    CommitOutcome, CompletedHistoryCheck, DeliveredTaskOutputPage, DeliveryCheckpointImportSource,
+    FrozenImportRecord, HistoricalEventProjection, HistoryCausalBoundary, HistoryReadFence,
+    HistoryTurnBoundary, ManifestEntry, OperationRecord, PagedSource, PreparedFrozenImport,
+    RunnerPlanRecord, SourceAssertion, SourcePage, TaskDeliveryOutputSnapshot, TaskInputCopyAlias,
+    TaskOutputSnapshot,
 };
 use crate::{CanonicalTurnEventPayload, CrudStore, repositories};
 use anyhow::Result;
@@ -567,17 +567,53 @@ impl CrudStore {
         )
         .await
     }
-    /// Reconcile lost terminal publications and abandoned deadline/Stop states
-    /// using bounded metadata. This scanner never admits a service generation.
-    pub async fn compaction_lifecycle_recovery(
+    /// Bookkeeping has Maintenance reads and writes even on a request handle.
+    /// Call seed and ordinary scopes at most once each per shared quantum.
+    pub async fn compaction_expand_lifecycle_scope(
         &self,
-        now_ms: u64,
-        after: &str,
-    ) -> Result<Vec<CompactionLifecycleRecovery>> {
-        repositories::compaction::background::compaction_lifecycle_recovery(
-            &self.connection,
-            now_ms,
-            after,
+        seed: bool,
+        clock: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> Result<u64> {
+        let maintenance = self.with_maintenance_access();
+        repositories::compaction_lifecycle_pending::expand(&maintenance.connection, seed, clock)
+            .await
+    }
+    pub async fn compaction_due_lifecycle(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<crate::compaction::CompactionLifecycleCandidate>> {
+        let maintenance = self.with_maintenance_access();
+        repositories::compaction_lifecycle_pending::due(&maintenance.connection, now_ms).await
+    }
+    pub async fn compaction_claim_lifecycle(
+        &self,
+        candidate: &crate::compaction::CompactionLifecycleCandidate,
+        clock: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> Result<Option<crate::compaction::CompactionLifecycleClaim>> {
+        let maintenance = self.with_maintenance_access();
+        repositories::compaction_lifecycle_pending::claim(&maintenance.connection, candidate, clock)
+            .await
+    }
+    pub async fn compaction_prepare_lifecycle(
+        &self,
+        claim: &crate::compaction::CompactionLifecycleClaim,
+        now_ms: i64,
+    ) -> Result<Option<crate::compaction::PreparedCompactionLifecycle>> {
+        let maintenance = self.with_maintenance_access();
+        repositories::compaction::lifecycle::prepare_lifecycle(&maintenance, claim, now_ms).await
+    }
+    pub async fn compaction_repair_lifecycle(
+        &self,
+        prepared: crate::compaction::PreparedCompactionLifecycle,
+        event: Option<CanonicalTurnEventPayload>,
+        timestamp_secs: i64,
+    ) -> Result<bool> {
+        let maintenance = self.with_maintenance_access();
+        repositories::compaction::lifecycle::repair_lifecycle(
+            &maintenance,
+            prepared,
+            event,
+            timestamp_secs,
         )
         .await
     }

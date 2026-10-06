@@ -28,5 +28,6 @@ uuid = { workspace = true, features = ["v4"] }
 tokio = { workspace = true, optional = true, features = ["sync", "time"] }
 
 [dev-dependencies]
+tempfile.workspace = true
 pioneer-migration.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
