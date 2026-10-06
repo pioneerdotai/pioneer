@@ -1937,13 +1937,13 @@ mod tests {
             assert_eq!(usage.generation_id.as_deref(), Some("gen-private-header"));
             assert_eq!(usage.input_tokens, None);
         }
-        assert!(
-            error
-                .chain()
-                .filter(|cause| !cause.is::<pioneer_provider::usage::ObservedProviderUsage>())
-                .skip(1)
-                .all(|cause| cause.is::<pioneer_provider::failure::ProviderStreamIncomplete>())
-        );
+        // Anyhow wraps usage in a context whose standard Error type differs
+        // from the metadata type. Check the original adapter cause chain.
+        let mut source = pioneer_provider::usage::classification_source(&error).source();
+        while let Some(cause) = source {
+            assert!(cause.is::<pioneer_provider::failure::ProviderStreamIncomplete>());
+            source = cause.source();
+        }
         assert!(!error.chain().any(
             |cause| cause.is::<std::string::FromUtf8Error>() || cause.is::<serde_json::Error>()
         ));

@@ -1383,15 +1383,25 @@ pub(crate) fn load_test_catalog() {
     static READY: std::sync::Once = std::sync::Once::new();
     READY.call_once(|| {
         let directory = tempfile::tempdir().unwrap();
+        // The Pi comparison fixture retains legacy negative router prices.
+        // Restore a catalog generated from native source evidence instead.
+        let source: pioneer_provider::catalog::generator::SourceSnapshot =
+            serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../provider/tests/fixtures/catalog/sources.json"
+            )))
+            .unwrap();
+        let catalog = pioneer_provider::catalog::generator::generate(&source, true).unwrap();
         let saved = serde_json::json!({
             "version": 1,
-            "updated_at": "2026-09-12T00:00:00Z",
-            "catalog": {
-                "models": serde_json::from_str::<serde_json::Value>(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../provider/tests/fixtures/catalog/models.json"))).unwrap(),
-                "provenance": serde_json::from_str::<serde_json::Value>(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../provider/tests/fixtures/catalog/provenance.json"))).unwrap(),
-            }
+            "updated_at": source.captured_at,
+            "catalog": catalog,
         });
-        std::fs::write(directory.path().join("catalog.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
+        std::fs::write(
+            directory.path().join("catalog.json"),
+            serde_json::to_vec(&saved).unwrap(),
+        )
+        .unwrap();
         pioneer_provider::catalog::runtime::restore_cached_catalog(directory.path()).unwrap();
     });
 }

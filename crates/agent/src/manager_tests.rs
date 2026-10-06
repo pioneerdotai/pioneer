@@ -77,6 +77,7 @@ use tokio::time::{Duration, Instant, advance, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 fn test_tool_loop_config() -> ToolLoopConfig {
+    crate::chat::preflight::load_test_catalog();
     ToolLoopConfig {
         provider: pioneer_provider::ProviderTimeoutPolicy::default(),
         preflight: super::PreflightLoopConfig::default(),
