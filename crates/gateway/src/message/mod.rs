@@ -401,6 +401,18 @@ where
         pioneer_observability::turn_startup::current_key(),
         future,
     );
+    // Test-local reporting scopes must follow the same owned request tasks as
+    // the admission path. This does not install a global subscriber or change
+    // production reporting; it only preserves the fixture's local capture.
+    #[cfg(test)]
+    let future = {
+        use sentry::SentryFutureExt;
+        use tracing::instrument::WithSubscriber;
+        let dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
+        future
+            .with_subscriber(dispatch)
+            .bind_hub(sentry::Hub::current())
+    };
     AbortOnDropMessageTask::new(tokio::spawn(future))
         .join()
         .await
@@ -585,6 +597,10 @@ pub struct MessageProcessor {
     predispatch_cli_turn_read_failures: Arc<Mutex<HashSet<String>>>,
     #[cfg(test)]
     claude_boundary_write_failures: Arc<Mutex<HashSet<String>>>,
+    #[cfg(test)]
+    native_cancellation_finish_barrier: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    #[cfg(test)]
+    native_cancellation_materialization_failure: Arc<Mutex<Option<sea_orm::DbErr>>>,
     workspace_compaction_settings: Arc<StdRwLock<std::collections::BTreeMap<String, crate::settings::WorkspaceCompactionSettings>>>,
     agent_listener_tasks: Arc<Mutex<HashMap<String, AgentListenerTask>>>,
     agent_listener_generation: Arc<AtomicU64>,
@@ -669,6 +685,9 @@ pub struct MessageProcessor {
     voice_input_supervisor: Option<Arc<VoiceInputSupervisor>>,
     self_improvement_supervisor: Option<Arc<crate::self_improvement::supervisor::SelfImprovementSupervisor>>,
     gateway_settings_update_lock: Arc<Mutex<()>>,
+    pub(crate) voice_finalizations: crate::voice::finalization::VoiceFinalizations,
+    #[cfg(test)]
+    pub(crate) voice_test_transcriber: Option<crate::voice::transcription::TestVoiceSpeechTranscriber>,
     pub(crate) voice_sessions: GatewayVoiceSessionStore,
     pub(crate) voice_session_buffers: GatewayVoiceSessionBufferStore,
 }
@@ -1191,6 +1210,10 @@ impl MessageProcessor {
             predispatch_cli_turn_read_failures: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             claude_boundary_write_failures: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            native_cancellation_finish_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            native_cancellation_materialization_failure: Arc::new(Mutex::new(None)),
             workspace_compaction_settings: Arc::new(StdRwLock::new(
                 std::collections::BTreeMap::new(),
             )),
@@ -1291,6 +1314,9 @@ impl MessageProcessor {
             voice_input_supervisor: None,
             self_improvement_supervisor: None,
             gateway_settings_update_lock: Arc::new(Mutex::new(())),
+            voice_finalizations: Default::default(),
+            #[cfg(test)]
+            voice_test_transcriber: None,
             voice_sessions: GatewayVoiceSessionStore::default(),
             voice_session_buffers: GatewayVoiceSessionBufferStore::default(),
         }
@@ -1540,6 +1566,13 @@ impl MessageProcessor {
                 );
             }
         }
+    }
+
+    /// Close ingress slots, suppress unclaimed outcomes, and drain the bounded
+    /// workers before database shutdown. Native calls retain ownership to completion.
+    pub async fn shutdown_voice_finalizations(&self) {
+        self.voice_finalizations.close();
+        self.voice_finalizations.tasks.wait().await;
     }
 
     pub async fn shutdown_mcp_service(&self) {
@@ -2382,7 +2415,7 @@ impl MessageProcessor {
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
-                    retry_transient_storage_access(|| this.process_due_task_deliveries(now, 64)),
+                    this.process_due_task_deliveries(now, 64),
                 )
                 .await
                 {
@@ -4636,6 +4669,10 @@ impl MessageProcessor {
             predispatch_cli_turn_read_failures: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             claude_boundary_write_failures: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            native_cancellation_finish_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            native_cancellation_materialization_failure: Arc::new(Mutex::new(None)),
             workspace_compaction_settings: Arc::new(StdRwLock::new(
                 std::collections::BTreeMap::new(),
             )),
@@ -4728,6 +4765,9 @@ impl MessageProcessor {
             voice_input_supervisor: None,
             self_improvement_supervisor: None,
             gateway_settings_update_lock: Arc::new(Mutex::new(())),
+            voice_finalizations: Default::default(),
+            #[cfg(test)]
+            voice_test_transcriber: None,
             voice_sessions: GatewayVoiceSessionStore::default(),
             voice_session_buffers: GatewayVoiceSessionBufferStore::default(),
         }

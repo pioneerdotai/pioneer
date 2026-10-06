@@ -26,6 +26,24 @@ pub struct LocalEmbeddingModelInfo {
     pub default: bool,
 }
 
+impl LocalEmbeddingModelInfo {
+    /// Required retrieval task prefixes, taking precedence over optional search
+    /// instructions. Source: https://huggingface.co/nomic-ai/nomic-embed-text-v1.5
+    pub fn retrieval_prefix(&self, query: bool) -> Option<&'static str> {
+        (self.id == "nomic-embed-text-v1.5").then_some(if query {
+            "search_query: "
+        } else {
+            "search_document: "
+        })
+    }
+
+    /// Persisted preparation contract; absent for unchanged legacy pipelines.
+    pub fn preparation_version(&self) -> Option<&'static str> {
+        self.retrieval_prefix(false)
+            .map(|_| "nomic_retrieval_prefix_exact_tokenizer_v1")
+    }
+}
+
 pub const LOCAL_EMBEDDING_MODELS: &[LocalEmbeddingModelInfo] = &[
     LocalEmbeddingModelInfo {
         id: "bge-small-en-v1.5",
@@ -621,6 +639,33 @@ mod tests {
         "canary-1b-v2",
         "cohere-int8",
     ];
+
+    #[test]
+    fn auxiliary_embedding_catalog_identity_and_instruction_rules_are_exact() {
+        let expected = [
+            ("bge-small-en-v1.5", 384),
+            ("bge-base-en-v1.5", 768),
+            ("nomic-embed-text-v1.5", 768),
+            ("gte-large", 1024),
+        ];
+        assert_eq!(LOCAL_EMBEDDING_MODELS.len(), expected.len());
+        for (model, (id, dimension)) in LOCAL_EMBEDDING_MODELS.iter().zip(expected) {
+            assert_eq!(model.id, id);
+            assert_eq!(model.dimension, dimension);
+            assert_eq!(model.max_tokens, 512);
+            assert!(model.model_url.ends_with("/onnx/model.onnx"));
+            assert!(model.tokenizer_url.ends_with("/tokenizer.json"));
+            assert_eq!(
+                model.retrieval_prefix(false),
+                (id == "nomic-embed-text-v1.5").then_some("search_document: ")
+            );
+            assert_eq!(
+                model.retrieval_prefix(true),
+                (id == "nomic-embed-text-v1.5").then_some("search_query: ")
+            );
+        }
+        assert!(local_embedding_model_info("NOMIC-EMBED-TEXT-V1.5").is_none());
+    }
 
     #[test]
     fn local_transcription_catalog_has_exact_deterministic_model_order() {

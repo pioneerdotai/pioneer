@@ -60,6 +60,31 @@ mod tests {
     use pioneer_protocol::{VoiceAudioEncoding, VoiceAudioFormat};
 
     #[test]
+    fn auxiliary_asr_sample_rate_and_frame_contract_is_explicit() {
+        for rate in [8_000, 22_050, 44_100, 48_000] {
+            let mut format = target_format();
+            format.sample_rate_hz = rate;
+            assert!(matches!(
+                normalize_voice_pcm_chunk(format, &[0, 0]),
+                Err(VoiceAudioNormalizationError::UnsupportedFormat(_))
+            ));
+        }
+        let mut stereo = target_format();
+        stereo.channels = 2;
+        assert!(normalize_voice_pcm_chunk(stereo, &[0, 0, 0, 0]).is_err());
+        assert_eq!(
+            normalize_voice_pcm_chunk(target_format(), &[0]).unwrap_err(),
+            VoiceAudioNormalizationError::IncompletePcmSample
+        );
+        assert_eq!(
+            normalize_voice_pcm_chunk(target_format(), &[0, 64])
+                .unwrap()
+                .samples,
+            vec![0.5]
+        );
+    }
+
+    #[test]
     fn normalizes_pcm_s16le_to_f32_samples() {
         let normalized = normalize_voice_pcm_chunk(
             target_format(),

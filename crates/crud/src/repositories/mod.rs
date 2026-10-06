@@ -37,6 +37,7 @@ pub mod mcp_audit_event;
 pub mod mcp_server_catalog_snapshot;
 pub mod mcp_server_installation;
 pub(crate) mod membership;
+pub(crate) mod native_cancellation_context;
 pub(crate) mod native_event_cleanup;
 #[cfg(test)]
 pub(crate) mod native_event_cleanup_baseline;
@@ -65,6 +66,7 @@ pub mod task;
 pub mod task_actor_contract;
 pub mod task_agent_spec;
 pub mod task_delivery;
+pub(crate) mod task_delivery_recovery;
 pub mod task_dependency;
 pub mod task_event;
 pub(crate) mod task_execution_admission;
