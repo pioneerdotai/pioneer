@@ -967,7 +967,6 @@ struct PendingNativePermissionApprovalRequest {
 #[derive(Default)]
 struct TaskEventFanoutSummary {
     selected: usize,
-    bootstrap_inputs: usize,
     event_inputs: usize,
     emitted: usize,
     errors: usize,
@@ -3503,7 +3502,6 @@ impl MessageProcessor {
             .event_bus()
             .subscribe(pioneer_tasks::TaskEventFilter::default());
         *guard = Some(tokio::spawn(async move {
-            let mut bootstrap_complete = false;
             let mut bus_open = true;
             let mut periodic = interval(Duration::from_secs(5));
             periodic.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -3524,12 +3522,12 @@ impl MessageProcessor {
                 let result = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskEventFanout,
                     this.for_background_reconciliation()
-                        .task_event_fanout_quantum(&mut bootstrap_complete),
+                        .task_event_fanout_quantum(),
                 )
                 .await;
                 match result {
                     Ok(summary) => {
-                        debug!(selected=summary.selected,bootstrap_inputs=summary.bootstrap_inputs,event_inputs=summary.event_inputs,emitted=summary.emitted,errors=summary.errors,pending=?summary.pending,bootstrap_complete,"task fanout quantum completed");
+                        debug!(selected=summary.selected,event_inputs=summary.event_inputs,emitted=summary.emitted,errors=summary.errors,pending=?summary.pending,"task fanout quantum completed");
                         if summary.errors > 0 {
                             // Storage/claim failures cannot spin via a hot bus.
                             // Sleep owns no DB resources; cancellation aborts it.
@@ -3553,17 +3551,13 @@ impl MessageProcessor {
         }));
     }
 
-    async fn task_event_fanout_quantum(
-        &self,
-        bootstrap_complete: &mut bool,
-    ) -> anyhow::Result<TaskEventFanoutSummary> {
-        self.task_event_fanout_quantum_with_clock(bootstrap_complete, &now_timestamp_secs)
+    async fn task_event_fanout_quantum(&self) -> anyhow::Result<TaskEventFanoutSummary> {
+        self.task_event_fanout_quantum_with_clock(&now_timestamp_secs)
             .await
     }
 
     async fn task_event_fanout_quantum_with_clock(
         &self,
-        bootstrap_complete: &mut bool,
         clock: &(dyn Fn() -> i64 + Send + Sync),
     ) -> anyhow::Result<TaskEventFanoutSummary> {
         use pioneer_crud::{
@@ -3571,24 +3565,11 @@ impl MessageProcessor {
             TASK_EVENT_FANOUT_TASK_BUDGET,
         };
         let maintenance = self.crud_store.with_maintenance_access();
-        let bootstrap_rows = if *bootstrap_complete {
-            0
-        } else {
-            let (rows, complete) = maintenance
-                .bootstrap_task_event_fanout(TASK_EVENT_FANOUT_TASK_BUDGET / 2)
-                .await?;
-            *bootstrap_complete = complete;
-            rows
-        };
         let candidates = maintenance
-            .due_task_event_fanout(
-                clock(),
-                TASK_EVENT_FANOUT_TASK_BUDGET - bootstrap_rows as u64,
-            )
+            .due_task_event_fanout(clock(), TASK_EVENT_FANOUT_TASK_BUDGET)
             .await?;
         let mut summary = TaskEventFanoutSummary {
             selected: candidates.len(),
-            bootstrap_inputs: bootstrap_rows,
             ..Default::default()
         };
         let mut events_left = TASK_EVENT_FANOUT_EVENT_BUDGET;
@@ -3665,7 +3646,7 @@ impl MessageProcessor {
         }
         summary.event_inputs = TASK_EVENT_FANOUT_EVENT_BUDGET - events_left;
         summary.pending = match maintenance.has_pending_task_event_fanout().await {
-            Ok(pending) => Some(pending || !*bootstrap_complete),
+            Ok(pending) => Some(pending),
             Err(error) => {
                 summary.errors += 1;
                 warn!(
@@ -3700,6 +3681,9 @@ impl MessageProcessor {
                     claim.task_id
                 )
             })?;
+        // Pending owns the durable post-install interval. A legacy or reset
+        // cursor may lag behind it, but must never reopen pre-install history.
+        let after = after.max(claim.first_sequence - 1);
         let allow_oversized = *bytes_left == pioneer_crud::TASK_EVENT_FANOUT_BYTE_BUDGET;
         let page = maintenance
             .task_event_fanout_page(&claim.task_id, after, limit, bytes_left, allow_oversized)

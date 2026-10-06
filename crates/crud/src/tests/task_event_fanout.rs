@@ -74,13 +74,12 @@ async fn initial_append_precedes_task_projection_and_rollback_restores_frontier_
     events::append_prepared_event(&tx, prepared, unix_to_datetime(task.created_at))
         .await
         .unwrap();
-    assert!(
-        pending::Entity::find_by_id(task.id.clone())
-            .one(&tx)
-            .await
-            .unwrap()
-            .is_some()
-    );
+    let pending = pending::Entity::find_by_id(task.id.clone())
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((pending.first_sequence, pending.newest_sequence), (1, 1));
     assert!(
         pioneer_entity::task::Entity::find_by_id(task.id.clone())
             .one(&tx)
@@ -145,6 +144,7 @@ async fn append_during_emit_keeps_lane_and_allows_prefix_ack_without_stale_error
     assert!(refreshed.generation > claim.generation);
     assert_eq!(refreshed.claim_token.as_deref(), Some("holder"));
     assert_eq!(refreshed.due_at, claim.retry_at);
+    assert_eq!(refreshed.first_sequence, claim.first_sequence);
     assert!(
         queue::renew(&store.with_maintenance_access().connection, &claim, &|| {
             chrono::Utc::now().timestamp()
@@ -296,7 +296,7 @@ async fn healthy_prefixes_reset_retry_instead_of_exponentially_delaying_backlog(
 }
 
 #[tokio::test]
-async fn cursor_rewind_delete_late_initialization_and_task_delete_keep_source_coverage() {
+async fn cursor_reset_delete_recreate_only_reconcile_existing_new_work() {
     let store = store().await;
     let task = created(&store, "fanout_cursor").await;
     progress(&store, &task.id, "second").await;
@@ -311,33 +311,96 @@ async fn cursor_rewind_delete_late_initialization_and_task_delete_keep_source_co
         .exec(&store.connection)
         .await
         .unwrap();
-    let old = claim(&store, &task.id, "old", NOW).await;
+    assert!(
+        row(&store, &task.id).await.is_none(),
+        "reset alone does not queue history"
+    );
     cursor::Entity::delete_by_id(task.id.clone())
         .exec(&store.connection)
         .await
         .unwrap();
-    assert!(row(&store, &task.id).await.unwrap().generation > old.generation);
+    events::initialize_fanout_cursor(&store.connection, &task.id, 0, unix_to_datetime(NOW))
+        .await
+        .unwrap();
+    assert!(
+        row(&store, &task.id).await.is_none(),
+        "late cursor alone does not queue history"
+    );
+    let new = progress(&store, &task.id, "first newly tracked event").await;
+    let old = claim(&store, &task.id, "old", NOW).await;
+    assert_eq!(old.first_sequence, new.sequence);
+    cursor::Entity::delete_by_id(task.id.clone())
+        .exec(&store.connection)
+        .await
+        .unwrap();
+    let fenced = row(&store, &task.id).await.unwrap();
+    assert!(fenced.generation > old.generation);
+    assert_eq!(fenced.first_sequence, new.sequence);
+    assert!(fenced.claim_token.is_none());
+    assert_eq!(fenced.due_at, old.retry_at);
     queue::ack(
         &store
             .with_maintenance_reads_and_critical_writes()
             .connection,
         &old,
-        1,
-        &|| chrono::Utc::now().timestamp(),
+        new.sequence,
+        &|| NOW,
     )
     .await
     .unwrap();
     assert_eq!(
         store.get_task_event_fanout_cursor(&task.id).await.unwrap(),
-        None,
-        "no synthetic cursor after delete"
+        None
     );
-    let new = progress(&store, &task.id, "late initialized event").await;
+    let restored = claim(&store, &task.id, "restored", old.retry_at).await;
     assert_eq!(
         store.get_task_event_fanout_cursor(&task.id).await.unwrap(),
-        Some(new.sequence - 1)
+        Some(0)
     );
-    assert!(row(&store, &task.id).await.is_some());
+    assert_eq!(
+        row(&store, &task.id).await.unwrap().claim_token.as_deref(),
+        Some("restored")
+    );
+    store
+        .advance_task_event_fanout_cursor(&task.id, new.sequence - 1)
+        .await
+        .unwrap();
+    cursor::Entity::update_many()
+        .col_expr(cursor::Column::LastSequence, Expr::val(0_i64))
+        .filter(cursor::Column::TaskId.eq(task.id.clone()))
+        .exec(&store.connection)
+        .await
+        .unwrap();
+    let reset = row(&store, &task.id).await.unwrap();
+    assert_eq!(reset.first_sequence, new.sequence);
+    assert!(reset.generation > restored.generation);
+    assert!(reset.claim_token.is_none());
+    queue::release(
+        &store.with_maintenance_access().connection,
+        &restored,
+        TaskEventFanoutOutcome::Failed,
+        &|| NOW,
+    )
+    .await
+    .unwrap();
+    queue::release(
+        &store.with_maintenance_access().connection,
+        &restored,
+        TaskEventFanoutOutcome::BudgetDeferred,
+        &|| NOW,
+    )
+    .await
+    .unwrap();
+    assert_eq!(row(&store, &task.id).await.unwrap(), reset);
+    assert!(
+        !queue::renew(
+            &store.with_maintenance_access().connection,
+            &restored,
+            &|| NOW
+        )
+        .await
+        .unwrap()
+    );
     pioneer_entity::task::Entity::delete_by_id(task.id.clone())
         .exec(&store.connection)
         .await
@@ -408,137 +471,260 @@ async fn discovery_and_pages_are_bounded_with_oversized_supported_separately() {
     assert_eq!(page.len(), 128);
 }
 
-#[tokio::test]
-async fn bootstrap_fixed_bound_pages_restart_and_behind_cursor_changes_are_atomic() {
+// Historical fixtures are built before installing tracking, never by production initialization.
+async fn before_tracking() -> CrudStore {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     let before = Migrator::migrations()
         .iter()
         .position(|m| m.name() == MIGRATION)
         .unwrap();
     Migrator::up(&db, Some(before as u32)).await.unwrap();
-    let executor = pioneer_sqlite::SqliteWriteExecutor::new(db.clone());
-    let store = CrudStore::new(pioneer_sqlite::SqliteDatabase::from_executor(
-        db,
-        executor.clone(),
-    ));
-    for n in 0..70 {
-        let task = created(&store, &format!("bootstrap_{n:03}")).await;
-        if n % 2 == 0 {
-            store
-                .advance_task_event_fanout_cursor(&task.id, 1)
-                .await
-                .unwrap();
-        }
-    }
-    executor
-        .run_migrations::<Migrator>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
+    CrudStore::new(db)
+}
+async fn install_tracking(store: &CrudStore) {
+    let tx = store
+        .with_maintenance_access()
+        .connection
+        .begin()
         .await
         .unwrap();
-    assert!(!store.has_pending_task_event_fanout().await.unwrap());
-    assert_eq!(
-        store.bootstrap_task_event_fanout(32).await.unwrap(),
-        (32, false)
-    );
-    assert_eq!(
-        pending::Entity::find()
-            .all(&store.connection)
+    Migrator::up(&*tx, None).await.unwrap();
+    tx.commit().await.unwrap();
+}
+async fn old_history(store: &CrudStore, id: &str) -> Task {
+    let task = created(store, id).await;
+    for n in 2..=100 {
+        progress(store, id, &format!("old {n}")).await;
+    }
+    store
+        .advance_task_event_fanout_cursor(id, 90)
+        .await
+        .unwrap();
+    task
+}
+#[tokio::test]
+async fn installation_skips_history_and_new_insert_establishes_durable_floor() {
+    let store = before_tracking().await;
+    let task = old_history(&store, "old-task").await;
+    task_event::Entity::update_many()
+        .col_expr(
+            task_event::Column::PayloadJson,
+            Expr::val("界".repeat(BYTES)),
+        )
+        .filter(task_event::Column::TaskId.eq(task.id.clone()))
+        .filter(task_event::Column::Sequence.eq(91_i64))
+        .exec(&store.connection)
+        .await
+        .unwrap();
+    task_event::Entity::update_many()
+        .col_expr(task_event::Column::PayloadJson, Expr::val("{invalid"))
+        .filter(task_event::Column::TaskId.eq(task.id.clone()))
+        .filter(task_event::Column::Sequence.eq(100_i64))
+        .exec(&store.connection)
+        .await
+        .unwrap();
+    install_tracking(&store).await;
+    assert!(
+        store
+            .due_task_event_fanout(NOW, 64)
             .await
             .unwrap()
-            .len(),
-        16
+            .is_empty()
     );
-    let cp = read_model_repair::load_checkpoint(&store.connection, "task_event_fanout_frontier")
+    assert!(!store.has_pending_task_event_fanout().await.unwrap());
+    assert_eq!(
+        store.get_task_event_fanout_cursor(&task.id).await.unwrap(),
+        Some(90)
+    );
+    let duplicate = store
+        .append_task_event(
+            TaskEventPayload::TaskCreated { task: task.clone() },
+            task.created_at,
+        )
+        .await
+        .unwrap();
+    assert!(!duplicate.append_status.is_inserted());
+    assert!(row(&store, &task.id).await.is_none());
+    // Past timestamps are irrelevant: classification follows physical INSERT.
+    let first = store
+        .append_task_event(
+            TaskEventPayload::Progress {
+                task_id: task.id.clone(),
+                run_id: None,
+                message: "new with past date".into(),
+                details: None,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    let second = progress(&store, &task.id, "next").await;
+    assert_eq!((first.sequence, second.sequence), (101, 102));
+    let holder = claim(&store, &task.id, "cutover", NOW).await;
+    assert_eq!(holder.first_sequence, 101);
+    let after = store
+        .get_task_event_fanout_cursor(&task.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .max(holder.first_sequence - 1);
+    let mut bytes = BYTES;
+    let TaskEventFanoutPage::Prefix {
+        events: page,
+        bytes: used,
+    } = store
+        .task_event_fanout_page(&task.id, after, 128, &mut bytes, true)
+        .await
+        .unwrap()
+    else {
+        panic!("new prefix expected")
+    };
+    assert_eq!(
+        page.iter()
+            .map(|e| e.as_ref().unwrap().sequence)
+            .collect::<Vec<_>>(),
+        vec![101, 102]
+    );
+    assert!(used < BYTES);
+    for event in page {
+        queue::ack(
+            &store
+                .with_maintenance_reads_and_critical_writes()
+                .connection,
+            &holder,
+            event.unwrap().sequence,
+            &|| NOW,
+        )
+        .await
+        .unwrap();
+    }
+    assert!(row(&store, &task.id).await.is_none());
+    assert_eq!(
+        store.get_task_event_fanout_cursor(&task.id).await.unwrap(),
+        Some(102)
+    );
+    let next = progress(&store, &task.id, "next pending interval").await;
+    assert_eq!(
+        row(&store, &task.id).await.unwrap().first_sequence,
+        next.sequence
+    );
+}
+#[tokio::test]
+async fn atomic_new_batch_keeps_first_sequence_and_rollback_removes_tracking() {
+    let store = before_tracking().await;
+    let task = old_history(&store, "batch-old-task").await;
+    install_tracking(&store).await;
+    let prepared = ["first", "second"]
+        .into_iter()
+        .map(|message| {
+            events::PreparedTaskEvent::prepare(TaskEventPayload::Progress {
+                task_id: task.id.clone(),
+                run_id: None,
+                message: message.into(),
+                details: None,
+            })
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let tx = store.connection.begin().await.unwrap();
+    for event in prepared {
+        events::append_prepared_event(&tx, event, unix_to_datetime(1))
+            .await
+            .unwrap();
+    }
+    let work = pending::Entity::find_by_id(task.id.clone())
+        .one(&tx)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(cp.full_scan_cursor_id.as_deref(), Some("bootstrap_031"));
+    assert_eq!((work.first_sequence, work.newest_sequence), (101, 102));
+    tx.rollback().await.unwrap();
+    assert!(row(&store, &task.id).await.is_none());
     assert_eq!(
-        cp.full_scan_high_watermark_id.as_deref(),
-        Some("bootstrap_069")
-    );
-    // Install-before-bootstrap catches changes behind and above the fixed bound.
-    progress(&store, "bootstrap_000", "behind").await;
-    created(&store, "zz_above_bound").await;
-    let restarted = store.with_maintenance_access();
-    assert_eq!(
-        restarted.bootstrap_task_event_fanout(32).await.unwrap(),
-        (32, false)
-    );
-    assert_eq!(
-        restarted.bootstrap_task_event_fanout(32).await.unwrap(),
-        (6, true)
-    );
-    assert_eq!(
-        restarted.bootstrap_task_event_fanout(64).await.unwrap(),
-        (0, true)
-    );
-    assert!(row(&store, "bootstrap_000").await.is_some());
-    assert!(row(&store, "zz_above_bound").await.is_some());
-    assert!(
-        row(&store, "bootstrap_002").await.is_none(),
-        "ACKed history is never enqueued"
-    );
-    assert_eq!(
-        store
-            .get_task_event_fanout_cursor("bootstrap_001")
+        task_event::Entity::find()
+            .filter(task_event::Column::TaskId.eq(task.id.clone()))
+            .count(&store.connection)
             .await
             .unwrap(),
-        Some(0),
-        "metadata bootstrap does not emit/ACK"
+        100
     );
-}
-
-#[tokio::test]
-async fn bootstrap_interrupted_page_rolls_back_checkpoint_and_frontier_then_retries() {
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    let before = Migrator::migrations()
-        .iter()
-        .position(|m| m.name() == MIGRATION)
-        .unwrap();
-    Migrator::up(&db, Some(before as u32)).await.unwrap();
-    let executor = pioneer_sqlite::SqliteWriteExecutor::new(db.clone());
-    let store = CrudStore::new(pioneer_sqlite::SqliteDatabase::from_executor(
-        db,
-        executor.clone(),
-    ));
-    created(&store, "bootstrap_a").await;
-    created(&store, "bootstrap_b").await;
-    executor
-        .run_migrations::<Migrator>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
-        .await
-        .unwrap();
-    store.connection.execute_unprepared("CREATE TRIGGER fanout_bootstrap_fail BEFORE INSERT ON task_event_fanout_pending WHEN NEW.task_id='bootstrap_b' BEGIN SELECT RAISE(ABORT,'fixture'); END").await.unwrap();
-    assert!(store.bootstrap_task_event_fanout(64).await.is_err());
-    assert!(!store.has_pending_task_event_fanout().await.unwrap());
-    assert!(
-        read_model_repair::load_checkpoint(&store.connection, "task_event_fanout_frontier")
-            .await
-            .unwrap()
-            .is_none()
-    );
-    store
-        .connection
-        .execute_unprepared("DROP TRIGGER fanout_bootstrap_fail")
+    let committed = store
+        .append_task_events(
+            ["retry first", "retry second"]
+                .into_iter()
+                .map(|message| TaskEventPayload::Progress {
+                    task_id: task.id.clone(),
+                    run_id: None,
+                    message: message.into(),
+                    details: None,
+                })
+                .collect(),
+            1,
+        )
         .await
         .unwrap();
     assert_eq!(
-        store.bootstrap_task_event_fanout(64).await.unwrap(),
-        (2, true)
+        committed.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+        vec![101, 102]
     );
+    let work = row(&store, &task.id).await.unwrap();
+    assert_eq!((work.first_sequence, work.newest_sequence), (101, 102));
 }
-
 #[tokio::test]
-async fn empty_bootstrap_completion_and_generation_overflow_are_durable() {
+async fn late_cursor_creation_retains_first_tracked_event_and_claim_ownership() {
     let store = store().await;
+    let task = created(&store, "late-cursor").await;
+    progress(&store, &task.id, "second").await;
+    cursor::Entity::delete_by_id(task.id.clone())
+        .exec(&store.connection)
+        .await
+        .unwrap();
+    let holder = claim(&store, &task.id, "late", NOW).await;
+    assert_eq!(holder.first_sequence, 1);
     assert_eq!(
-        store.bootstrap_task_event_fanout(64).await.unwrap(),
-        (0, true)
+        store.get_task_event_fanout_cursor(&task.id).await.unwrap(),
+        Some(0)
     );
-    let task = created(&store, "fanout_after_empty").await;
     assert_eq!(
-        store.bootstrap_task_event_fanout(64).await.unwrap(),
-        (0, true)
+        row(&store, &task.id).await.unwrap().claim_token.as_deref(),
+        Some("late")
     );
+    assert!(
+        queue::renew(
+            &store.with_maintenance_access().connection,
+            &holder,
+            &|| NOW
+        )
+        .await
+        .unwrap()
+    );
+    queue::ack(
+        &store
+            .with_maintenance_reads_and_critical_writes()
+            .connection,
+        &holder,
+        1,
+        &|| NOW,
+    )
+    .await
+    .unwrap();
+    assert_eq!(row(&store, &task.id).await.unwrap().first_sequence, 1);
+    queue::ack(
+        &store
+            .with_maintenance_reads_and_critical_writes()
+            .connection,
+        &holder,
+        2,
+        &|| NOW,
+    )
+    .await
+    .unwrap();
+    assert!(row(&store, &task.id).await.is_none());
+}
+#[tokio::test]
+async fn generation_overflow_rolls_back_new_event_and_tracking() {
+    let store = store().await;
+    let task = created(&store, "fanout_overflow").await;
     let before = row(&store, &task.id).await.unwrap();
     sequence::Entity::update_many()
         .col_expr(sequence::Column::Generation, Expr::val(i64::MAX))
@@ -1298,12 +1484,6 @@ async fn fanout_partial_ddl_failure_rollback_reinstall_down_and_restart_preserve
         .unwrap()
         .unwrap();
     assert_eq!(applied.try_get::<i64>("", "n").unwrap(), 0);
-    assert!(
-        read_model_repair::load_checkpoint(&store.connection, "task_event_fanout_frontier")
-            .await
-            .unwrap()
-            .is_none()
-    );
     maintenance
         .connection
         .execute_unprepared("DROP INDEX idx_task_delivery_fanout_pending")
@@ -1312,28 +1492,13 @@ async fn fanout_partial_ddl_failure_rollback_reinstall_down_and_restart_preserve
     let tx = maintenance.connection.begin().await.unwrap();
     Migrator::up(&*tx, None).await.unwrap();
     tx.commit().await.unwrap();
-    assert_eq!(
-        store.bootstrap_task_event_fanout(64).await.unwrap(),
-        (0, true)
-    );
-    let complete =
-        read_model_repair::load_checkpoint(&store.connection, "task_event_fanout_frontier")
-            .await
-            .unwrap()
-            .unwrap();
+    assert!(!store.has_pending_task_event_fanout().await.unwrap());
     let task = created(&store, "reinstalled-tracking").await;
-    assert!(row(&store, &task.id).await.is_some());
+    assert_eq!(row(&store, &task.id).await.unwrap().first_sequence, 1);
     let restarted = CrudStore::new(store.connection.clone());
     assert_eq!(
-        restarted.bootstrap_task_event_fanout(64).await.unwrap(),
-        (0, true)
-    );
-    assert_eq!(
-        read_model_repair::load_checkpoint(&store.connection, "task_event_fanout_frontier")
-            .await
-            .unwrap()
-            .unwrap(),
-        complete
+        row(&restarted, &task.id).await.unwrap(),
+        row(&store, &task.id).await.unwrap()
     );
     let tx = maintenance.connection.begin().await.unwrap();
     Migrator::down(&*tx, Some(fanout_rollback_steps()))
@@ -1341,12 +1506,6 @@ async fn fanout_partial_ddl_failure_rollback_reinstall_down_and_restart_preserve
         .unwrap();
     tx.commit().await.unwrap();
     assert_eq!(named_schema_objects(&store).await, before);
-    assert!(
-        read_model_repair::load_checkpoint(&store.connection, "task_event_fanout_frontier")
-            .await
-            .unwrap()
-            .is_none()
-    );
     assert_eq!(
         read_model_repair::load_checkpoint(&store.connection, "unrelated-repair")
             .await
@@ -1358,43 +1517,104 @@ async fn fanout_partial_ddl_failure_rollback_reinstall_down_and_restart_preserve
     Migrator::up(&*tx, None).await.unwrap();
     tx.commit().await.unwrap();
     progress(&store, &task.id, "new append after reinstall").await;
-    assert!(row(&store, &task.id).await.is_some());
+    assert_eq!(row(&store, &task.id).await.unwrap().first_sequence, 2);
 }
 
 #[tokio::test]
-async fn completed_bootstrap_survives_physical_close_and_reopen() {
+async fn floor_survives_physical_restart_before_claim_after_claim_partial_ack_and_error() {
     let path = std::env::temp_dir().join(format!(
-        "pioneer-fanout-bootstrap-{}.sqlite",
+        "pioneer-fanout-floor-{}.sqlite",
         uuid::Uuid::new_v4()
     ));
     let store = disk_store(&path, Arc::new(Routes::default())).await;
-    assert_eq!(
-        store.bootstrap_task_event_fanout(64).await.unwrap(),
-        (0, true)
-    );
-    let checkpoint =
-        read_model_repair::load_checkpoint(&store.connection, "task_event_fanout_frontier")
+    let tx = store
+        .with_maintenance_access()
+        .connection
+        .begin()
+        .await
+        .unwrap();
+    Migrator::down(&*tx, Some(fanout_rollback_steps()))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    old_history(&store, "restart-old-task").await;
+    install_tracking(&store).await;
+    progress(&store, "restart-old-task", "101").await;
+    progress(&store, "restart-old-task", "102").await;
+    let mut store = store;
+    let mut now = NOW;
+    for phase in 0..4 {
+        assert_eq!(
+            row(&store, "restart-old-task")
+                .await
+                .unwrap()
+                .first_sequence,
+            101
+        );
+        if phase > 0 {
+            let holder = claim(&store, "restart-old-task", &format!("phase-{phase}"), now).await;
+            if phase == 2 {
+                queue::ack(
+                    &store
+                        .with_maintenance_reads_and_critical_writes()
+                        .connection,
+                    &holder,
+                    101,
+                    &|| now,
+                )
+                .await
+                .unwrap();
+                queue::release(
+                    &store.with_maintenance_access().connection,
+                    &holder,
+                    TaskEventFanoutOutcome::Delivered,
+                    &|| now,
+                )
+                .await
+                .unwrap();
+            } else if phase == 3 {
+                queue::release(
+                    &store.with_maintenance_access().connection,
+                    &holder,
+                    TaskEventFanoutOutcome::Failed,
+                    &|| now,
+                )
+                .await
+                .unwrap();
+            }
+            now = row(&store, "restart-old-task").await.unwrap().due_at;
+        }
+        let before = row(&store, "restart-old-task").await.unwrap();
+        store.connection.clone().close().await.unwrap();
+        drop(store);
+        store = disk_store(&path, Arc::new(Routes::default())).await;
+        assert_eq!(row(&store, "restart-old-task").await.unwrap(), before);
+        let after = store
+            .get_task_event_fanout_cursor("restart-old-task")
             .await
             .unwrap()
-            .unwrap();
-    created(&store, "post-completion-append").await;
+            .unwrap()
+            .max(before.first_sequence - 1);
+        let TaskEventFanoutPage::Prefix { events: page, .. } = store
+            .task_event_fanout_page("restart-old-task", after, 128, &mut { BYTES }, true)
+            .await
+            .unwrap()
+        else {
+            panic!("new prefix expected")
+        };
+        assert_eq!(
+            page.iter()
+                .map(|e| e.as_ref().unwrap().sequence)
+                .collect::<Vec<_>>(),
+            if phase >= 2 {
+                vec![102]
+            } else {
+                vec![101, 102]
+            }
+        );
+    }
     store.connection.clone().close().await.unwrap();
     drop(store);
-    let reopened = disk_store(&path, Arc::new(Routes::default())).await;
-    assert_eq!(
-        reopened.bootstrap_task_event_fanout(64).await.unwrap(),
-        (0, true)
-    );
-    assert_eq!(
-        read_model_repair::load_checkpoint(&reopened.connection, "task_event_fanout_frontier")
-            .await
-            .unwrap()
-            .unwrap(),
-        checkpoint
-    );
-    assert!(row(&reopened, "post-completion-append").await.is_some());
-    reopened.connection.clone().close().await.unwrap();
-    drop(reopened);
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));

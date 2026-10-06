@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub task_id: String,
+    pub first_sequence: i64,
     pub newest_sequence: i64,
     #[sea_orm(unique)]
     pub generation: i64,

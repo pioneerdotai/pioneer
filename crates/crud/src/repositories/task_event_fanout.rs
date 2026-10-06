@@ -1,22 +1,16 @@
 //! Durable frontier for the single Gateway dispatcher. No payloads in discovery.
-use super::read_model_repair as checkpoint;
-use anyhow::{Result, bail};
-use pioneer_entity::{
-    task_event, task_event_fanout_cursor as cursor, task_event_fanout_pending as pending,
-    task_event_fanout_sequence as sequence,
-};
+use anyhow::Result;
+use pioneer_entity::{task_event_fanout_cursor as cursor, task_event_fanout_pending as pending};
 use pioneer_sqlite::SqliteDatabase;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
     TransactionTrait,
 };
 
 pub const TASK_EVENT_FANOUT_TASK_BUDGET: u64 = 64;
 pub const TASK_EVENT_FANOUT_EVENT_BUDGET: usize = 128;
 pub const TASK_EVENT_FANOUT_BYTE_BUDGET: usize = 1024 * 1024;
-const REPAIR_KEY: &str = "task_event_fanout_frontier";
-const VERSION: i64 = 1;
 /// Raw repository rows and decoded CRUD events share the same page boundary.
 #[derive(Debug)]
 pub enum TaskEventFanoutPage<T> {
@@ -33,6 +27,7 @@ pub enum TaskEventFanoutOutcome {
 pub struct TaskEventFanoutClaim {
     pub task_id: String,
     pub generation: i64,
+    pub first_sequence: i64,
     pub token: String,
     pub retry_at: i64,
     prior_due_at: i64,
@@ -43,6 +38,7 @@ fn snapshot(row: &pending::Model) -> sea_orm::Condition {
     let c = sea_orm::Condition::all()
         .add(pending::Column::TaskId.eq(row.task_id.clone()))
         .add(pending::Column::Generation.eq(row.generation))
+        .add(pending::Column::FirstSequence.eq(row.first_sequence))
         .add(pending::Column::NewestSequence.eq(row.newest_sequence))
         .add(pending::Column::DueAt.eq(row.due_at))
         .add(pending::Column::Attempts.eq(row.attempts));
@@ -102,26 +98,43 @@ pub(crate) async fn claim(
     };
     let now = clock();
     let retry_at = now.saturating_add(delay);
-    let result = pending::Entity::update_many()
-        .col_expr(pending::Column::ClaimToken, Expr::val(token.clone()))
-        .col_expr(pending::Column::Attempts, Expr::val(attempts))
-        .col_expr(pending::Column::DueAt, Expr::val(retry_at))
-        .filter(snapshot(row))
-        .filter(pending::Column::DueAt.lte(now))
-        .exec(&tx)
-        .await;
+    let result = async {
+        let affected = pending::Entity::update_many()
+            .col_expr(pending::Column::ClaimToken, Expr::val(token.clone()))
+            .col_expr(pending::Column::Attempts, Expr::val(attempts))
+            .col_expr(pending::Column::DueAt, Expr::val(retry_at))
+            .filter(snapshot(row))
+            .filter(pending::Column::DueAt.lte(now))
+            .exec(&tx)
+            .await?
+            .rows_affected;
+        if affected == 1 {
+            // Only this selected Task; never derive a cursor from event history.
+            // INSERT reconciles completion but retains this new reservation.
+            super::task_event::initialize_fanout_cursor(
+                &tx,
+                &row.task_id,
+                0,
+                crate::util::unix_to_datetime(now),
+            )
+            .await?;
+        }
+        Ok::<_, anyhow::Error>(affected)
+    }
+    .await;
     let affected = match result {
-        Ok(r) => r.rows_affected,
+        Ok(affected) => affected,
         Err(e) => {
             let _ = tx.rollback().await;
             defer(db, row, attempts, delay, clock).await?;
-            return Err(e.into());
+            return Err(e);
         }
     };
     tx.commit().await?;
     Ok((affected == 1).then_some(TaskEventFanoutClaim {
         task_id: row.task_id.clone(),
         generation: row.generation,
+        first_sequence: row.first_sequence,
         token,
         retry_at,
         prior_due_at: row.due_at,
@@ -251,95 +264,4 @@ pub(crate) async fn release(
     update.exec(&tx).await?;
     tx.commit().await?;
     Ok(())
-}
-
-// Cursor PK pages, no mismatch filtering. Latest sequence is a point seek.
-// Enqueue and checkpoint advance share the Maintenance writer transaction.
-pub(crate) async fn bootstrap(db: &SqliteDatabase, limit: u64) -> Result<(usize, bool)> {
-    let tx = db.begin().await?;
-    let mut cp = checkpoint::load_checkpoint(&tx, REPAIR_KEY).await?;
-    if cp.is_none() {
-        let high = cursor::Entity::find()
-            .select_only()
-            .column(cursor::Column::TaskId)
-            .order_by_desc(cursor::Column::TaskId)
-            .limit(1)
-            .into_tuple::<String>()
-            .one(&tx)
-            .await?;
-        checkpoint::reset_full_scan(&tx, REPAIR_KEY, VERSION, high.as_deref()).await?;
-        cp = checkpoint::load_checkpoint(&tx, REPAIR_KEY).await?;
-    }
-    let cp = cp.expect("checkpoint inserted");
-    if cp.algorithm_version != VERSION {
-        bail!("unsupported task fanout bootstrap version");
-    }
-    if cp.full_scan_status == checkpoint::STATUS_COMPLETED {
-        tx.commit().await?;
-        return Ok((0, true));
-    }
-    let Some(high) = cp.full_scan_high_watermark_id else {
-        checkpoint::complete_full_scan(&tx, REPAIR_KEY, VERSION).await?;
-        tx.commit().await?;
-        return Ok((0, true));
-    };
-    let mut query = cursor::Entity::find().filter(cursor::Column::TaskId.lte(high.clone()));
-    if let Some(after) = cp.full_scan_cursor_id {
-        query = query.filter(cursor::Column::TaskId.gt(after));
-    }
-    let rows = query
-        .order_by_asc(cursor::Column::TaskId)
-        .limit(limit.min(64))
-        .all(&tx)
-        .await?;
-    for row in &rows {
-        let latest = task_event::Entity::find()
-            .select_only()
-            .column(task_event::Column::Sequence)
-            .filter(task_event::Column::TaskId.eq(row.task_id.clone()))
-            .order_by_desc(task_event::Column::Sequence)
-            .limit(1)
-            .into_tuple::<i64>()
-            .one(&tx)
-            .await?;
-        if let Some(latest) = latest.filter(|s| *s > row.last_sequence) {
-            // Already enqueued by a trigger: keep its holder and retry delay.
-            if pending::Entity::find_by_id(row.task_id.clone())
-                .one(&tx)
-                .await?
-                .is_none()
-            {
-                let generation = sequence::Entity::find_by_id(1_i64)
-                    .one(&tx)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("fanout sequence missing"))?
-                    .generation
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("fanout generation exhausted"))?;
-                sequence::Entity::update_many()
-                    .col_expr(sequence::Column::Generation, Expr::val(generation))
-                    .exec(&tx)
-                    .await?;
-                pending::Entity::insert(pending::ActiveModel {
-                    task_id: Set(row.task_id.clone()),
-                    newest_sequence: Set(latest),
-                    generation: Set(generation),
-                    due_at: Set(chrono::Utc::now().timestamp()),
-                    claim_token: Set(None),
-                    attempts: Set(0),
-                })
-                .exec(&tx)
-                .await?;
-            }
-        }
-    }
-    let completed =
-        rows.len() < (limit.min(64) as usize) || rows.last().is_some_and(|r| r.task_id == high);
-    if completed {
-        checkpoint::complete_full_scan(&tx, REPAIR_KEY, VERSION).await?;
-    } else if let Some(last) = rows.last() {
-        checkpoint::advance_full_scan_cursor(&tx, REPAIR_KEY, VERSION, &last.task_id).await?;
-    }
-    tx.commit().await?;
-    Ok((rows.len(), completed))
 }

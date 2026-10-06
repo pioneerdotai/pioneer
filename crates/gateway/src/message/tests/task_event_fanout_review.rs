@@ -68,7 +68,7 @@ async fn ack_created(processor: &MessageProcessor, id: &str) {
         .unwrap();
 }
 fn assert_budget(summary: &TaskEventFanoutSummary) {
-    assert!(summary.bootstrap_inputs + summary.selected <= 64);
+    assert!(summary.selected <= 64);
     assert!(summary.event_inputs <= 128);
     assert!(summary.emitted <= summary.event_inputs);
 }
@@ -105,13 +105,10 @@ async fn competing_small_events(large_size: usize, prior_attempts: i64, restart:
             .exec(&processor.crud_store.database_connection())
             .await
             .unwrap();
-        let mut complete = true;
         for attempt in 1..=prior_attempts {
             let failed = processor
                 .for_background_reconciliation()
-                .task_event_fanout_quantum_with_clock(&mut complete, &|| {
-                    clock.load(Ordering::SeqCst)
-                })
+                .task_event_fanout_quantum_with_clock(&|| clock.load(Ordering::SeqCst))
                 .await
                 .unwrap();
             assert_budget(&failed);
@@ -136,12 +133,9 @@ async fn competing_small_events(large_size: usize, prior_attempts: i64, restart:
     ready(&processor, "budget-A", NOW - 10, 0).await;
     ready(&processor, "budget-B", NOW - 9, prior_attempts).await;
     let original = pending_row(&processor, "budget-B").await;
-    let mut bootstrap_complete = false;
     let first = processor
         .for_background_reconciliation()
-        .task_event_fanout_quantum_with_clock(&mut bootstrap_complete, &|| {
-            clock.load(Ordering::SeqCst)
-        })
+        .task_event_fanout_quantum_with_clock(&|| clock.load(Ordering::SeqCst))
         .await
         .unwrap();
     assert_budget(&first);
@@ -169,7 +163,7 @@ async fn competing_small_events(large_size: usize, prior_attempts: i64, restart:
     ready(&processor, "budget-A", NOW + 5, 0).await;
     clock.store(NOW + 5, Ordering::SeqCst);
     let processor = if restart {
-        // Fresh dispatcher state, same durable frontier/checkpoint; no memory
+        // Fresh dispatcher state, same durable frontier; no memory
         // replay cursor or fairness flag carried across restart.
         processor_with_store(
             processor.workspace_manager.clone(),
@@ -178,12 +172,9 @@ async fn competing_small_events(large_size: usize, prior_attempts: i64, restart:
     } else {
         processor
     };
-    let mut restarted_bootstrap = !restart;
     let second = processor
         .for_background_reconciliation()
-        .task_event_fanout_quantum_with_clock(&mut restarted_bootstrap, &|| {
-            clock.load(Ordering::SeqCst)
-        })
+        .task_event_fanout_quantum_with_clock(&|| clock.load(Ordering::SeqCst))
         .await
         .unwrap();
     assert_budget(&second);
@@ -209,9 +200,7 @@ async fn competing_small_events(large_size: usize, prior_attempts: i64, restart:
         clock.store(NOW + tick * 5, Ordering::SeqCst);
         let summary = processor
             .for_background_reconciliation()
-            .task_event_fanout_quantum_with_clock(&mut restarted_bootstrap, &|| {
-                clock.load(Ordering::SeqCst)
-            })
+            .task_event_fanout_quantum_with_clock(&|| clock.load(Ordering::SeqCst))
             .await
             .unwrap();
         assert_budget(&summary);
@@ -274,24 +263,25 @@ async fn expired_budget_handler_cannot_change_replacement_holder_or_cursor_reset
         .await
         .unwrap();
     assert_eq!(pending_row(&processor, "holder-B").await, before);
-    // Actual dispatcher observes the missing initialization contract and
-    // records an error; no synthetic cursor or successful ACK is invented.
-    let mut complete = true;
+    // The selected dispatcher restores a zero cursor in its known claim
+    // commit, then emits and ACKs the first event above the saved floor.
     clock.store(NOW + 300, Ordering::SeqCst);
     let summary = processor
         .for_background_reconciliation()
-        .task_event_fanout_quantum_with_clock(&mut complete, &|| clock.load(Ordering::SeqCst))
+        .task_event_fanout_quantum_with_clock(&|| clock.load(Ordering::SeqCst))
         .await
         .unwrap();
     assert_budget(&summary);
-    assert_eq!(summary.errors, 1);
+    assert_eq!(summary.errors, 0);
+    assert_eq!(summary.emitted, 1);
+    assert_eq!(summary.pending, Some(false));
     assert_eq!(
         processor
             .crud_store
             .get_task_event_fanout_cursor("holder-B")
             .await
             .unwrap(),
-        None
+        Some(1)
     );
 }
 
@@ -375,10 +365,9 @@ async fn panic_candidate_lifecycle(mode: usize) {
     // bookkeeping (#5), or claim + two renewals + release (#7).
     observer.fail_released.store(mode, Ordering::SeqCst);
     let clock = AtomicI64::new(NOW);
-    let mut complete = true;
     let summary = processor
         .for_background_reconciliation()
-        .task_event_fanout_quantum_with_clock(&mut complete, &|| clock.load(Ordering::SeqCst))
+        .task_event_fanout_quantum_with_clock(&|| clock.load(Ordering::SeqCst))
         .await
         .unwrap();
     assert_budget(&summary);
@@ -468,7 +457,7 @@ async fn panic_candidate_lifecycle(mode: usize) {
         clock.store(NOW + 300, Ordering::SeqCst);
         let next = processor
             .for_background_reconciliation()
-            .task_event_fanout_quantum_with_clock(&mut complete, &|| clock.load(Ordering::SeqCst))
+            .task_event_fanout_quantum_with_clock(&|| clock.load(Ordering::SeqCst))
             .await
             .unwrap();
         assert_budget(&next);
@@ -531,11 +520,10 @@ async fn many_tasks_share_inputs_and_only_one_oversized_event_per_quantum() {
         fanout_test_append(&processor, &id, &payload).await;
         ready(&processor, &id, NOW - 70 + i, 0).await;
     }
-    let mut complete = true;
     for quantum in 0..2 {
         let summary = processor
             .for_background_reconciliation()
-            .task_event_fanout_quantum_with_clock(&mut complete, &|| clock.load(Ordering::SeqCst))
+            .task_event_fanout_quantum_with_clock(&|| clock.load(Ordering::SeqCst))
             .await
             .unwrap();
         assert_budget(&summary);
@@ -561,7 +549,7 @@ async fn many_tasks_share_inputs_and_only_one_oversized_event_per_quantum() {
     }
     let summary = processor
         .for_background_reconciliation()
-        .task_event_fanout_quantum_with_clock(&mut complete, &|| clock.load(Ordering::SeqCst))
+        .task_event_fanout_quantum_with_clock(&|| clock.load(Ordering::SeqCst))
         .await
         .unwrap();
     assert_budget(&summary);
@@ -570,10 +558,279 @@ async fn many_tasks_share_inputs_and_only_one_oversized_event_per_quantum() {
     assert_eq!(summary.event_inputs, 128);
     let last = processor
         .for_background_reconciliation()
-        .task_event_fanout_quantum_with_clock(&mut complete, &|| clock.load(Ordering::SeqCst))
+        .task_event_fanout_quantum_with_clock(&|| clock.load(Ordering::SeqCst))
         .await
         .unwrap();
     assert_budget(&last);
     assert_eq!(last.emitted, 4);
     assert_eq!(last.pending, Some(false));
+}
+
+#[tokio::test]
+async fn cutover_quantum_never_reads_history_and_only_delivers_post_install_events() {
+    use pioneer_entity::task_event_fanout_cursor as cursor;
+    use pioneer_sqlite::{SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteExecutor};
+    use sea_orm::{ConnectOptions, TransactionTrait};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("cutover.sqlite");
+    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
+    options.max_connections(1).sqlx_logging(false);
+    let writer = Database::connect(options).await.unwrap();
+    let (_, _, workspace) = setup_workspace_manager_with_connection(writer.clone()).await;
+    writer
+        .execute_unprepared("PRAGMA journal_mode=WAL")
+        .await
+        .unwrap();
+    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
+    options
+        .max_connections(2)
+        .sqlx_logging(false)
+        .map_sqlx_sqlite_opts(|o| {
+            o.read_only(true)
+                .create_if_missing(false)
+                .pragma("query_only", "ON")
+        });
+    let reader = Database::connect(options).await.unwrap();
+    let observed = Arc::new(NativeSchedulingObserver::default());
+    let database = SqliteDatabase::from_executor_with_read_observer(
+        reader,
+        SqliteWriteExecutor::with_observer(writer, observed.clone()),
+        observed.clone(),
+    );
+    let store = Arc::new(CrudStore::new(database.clone()));
+    let sessions = Arc::new(SessionManager::new());
+    let (tx, mut rx) = mpsc::channel(32);
+    let connection = register_authenticated_test_connection(&sessions, tx).await;
+    sessions
+        .set_connection_workspace(connection, Some(workspace.clone()))
+        .await;
+    let make_processor = || {
+        Arc::new(MessageProcessor::new(
+            Arc::new(ThreadManager::new("test-model", "openai")),
+            test_provider(),
+            sessions.clone(),
+            Arc::new(WorkspaceManager::new(database.clone())),
+            store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        ))
+    };
+    let processor = make_processor();
+    let migrations = Migrator::migrations();
+    let boundary = migrations
+        .iter()
+        .position(|m| m.name() == "m20261004_000008_task_event_fanout_pending")
+        .unwrap();
+    let tx = store
+        .with_maintenance_access()
+        .database_connection()
+        .begin()
+        .await
+        .unwrap();
+    Migrator::down(&*tx, Some((migrations.len() - boundary) as u32))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    create(&processor, &workspace, "cutover-old").await;
+    for _ in 2..=100 {
+        fanout_test_append(&processor, "cutover-old", "historical").await;
+    }
+    store
+        .advance_task_event_fanout_cursor("cutover-old", 90)
+        .await
+        .unwrap();
+    for n in 0..70 {
+        create(&processor, &workspace, &format!("old-{n}")).await;
+    }
+    // Excluding this page must happen before size admission and JSON decode.
+    task_event::Entity::update_many()
+        .col_expr(
+            task_event::Column::PayloadJson,
+            sea_orm::sea_query::Expr::val("界".repeat(BYTES)),
+        )
+        .filter(task_event::Column::TaskId.eq("cutover-old"))
+        .filter(task_event::Column::Sequence.eq(91_i64))
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+    task_event::Entity::update_many()
+        .col_expr(
+            task_event::Column::PayloadJson,
+            sea_orm::sea_query::Expr::val("{invalid"),
+        )
+        .filter(task_event::Column::TaskId.eq("cutover-old"))
+        .filter(task_event::Column::Sequence.eq(100_i64))
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+    let tx = store
+        .with_maintenance_access()
+        .database_connection()
+        .begin()
+        .await
+        .unwrap();
+    Migrator::up(&*tx, None).await.unwrap();
+    tx.commit().await.unwrap();
+    observed.reads.lock().unwrap().clear();
+    observed.writes.lock().unwrap().clear();
+    let empty = processor
+        .for_background_reconciliation()
+        .task_event_fanout_quantum_with_clock(&|| NOW)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            empty.selected,
+            empty.event_inputs,
+            empty.emitted,
+            empty.errors
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(empty.pending, Some(false));
+    assert!(observed.writes.lock().unwrap().is_empty());
+    let reads = observed
+        .reads
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            SqliteReadEvent::OperationFinished { class, .. } => Some(*class),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reads,
+        vec![SqliteReadClass::Maintenance; 2],
+        "only due pending and queue-state probes; no Task/cursor/event history reads"
+    );
+    assert!(rx.try_recv().is_err());
+    fanout_test_append(&processor, "cutover-old", "new 101").await;
+    fanout_test_append(&processor, "cutover-old", "new 102").await;
+    assert_eq!(
+        pending_row(&processor, "cutover-old").await.first_sequence,
+        101
+    );
+    let second = task_event::Entity::find()
+        .filter(task_event::Column::TaskId.eq("cutover-old"))
+        .filter(task_event::Column::Sequence.eq(102_i64))
+        .one(&store.database_connection())
+        .await
+        .unwrap()
+        .unwrap();
+    task_event::Entity::update_many()
+        .col_expr(
+            task_event::Column::PayloadJson,
+            sea_orm::sea_query::Expr::val("{invalid-new"),
+        )
+        .filter(task_event::Column::Id.eq(second.id.clone()))
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+    // Restart before claim, keeping only the durable floor and reservation state.
+    drop(processor);
+    let processor = make_processor();
+    let partial = processor
+        .for_background_reconciliation()
+        .task_event_fanout_quantum_with_clock(&|| NOW)
+        .await
+        .unwrap();
+    assert_budget(&partial);
+    assert_eq!((partial.emitted, partial.errors), (1, 1));
+    let notification = recv_notification_by_method(&mut rx, events::TASK_PROGRESS).await;
+    assert_eq!(notification.params.unwrap()["context"]["sequence"], 101);
+    assert_eq!(
+        store
+            .get_task_event_fanout_cursor("cutover-old")
+            .await
+            .unwrap(),
+        Some(101)
+    );
+    let retry = pending_row(&processor, "cutover-old").await;
+    assert_eq!(retry.first_sequence, 101);
+    assert!(retry.due_at > NOW);
+    drop(processor);
+    let processor = make_processor();
+    let waiting = processor
+        .for_background_reconciliation()
+        .task_event_fanout_quantum_with_clock(&|| NOW)
+        .await
+        .unwrap();
+    assert_eq!(waiting.selected, 0);
+    assert_eq!(waiting.pending, Some(true));
+    assert_eq!(pending_row(&processor, "cutover-old").await, retry);
+    task_event::Entity::update_many()
+        .col_expr(
+            task_event::Column::PayloadJson,
+            sea_orm::sea_query::Expr::val(second.payload_json),
+        )
+        .filter(task_event::Column::Id.eq(second.id))
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+    let delivered = processor
+        .for_background_reconciliation()
+        .task_event_fanout_quantum_with_clock(&|| retry.due_at)
+        .await
+        .unwrap();
+    assert_budget(&delivered);
+    assert_eq!((delivered.emitted, delivered.errors), (1, 0));
+    let notification = recv_notification_by_method(&mut rx, events::TASK_PROGRESS).await;
+    assert_eq!(notification.params.unwrap()["context"]["sequence"], 102);
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        store
+            .get_task_event_fanout_cursor("cutover-old")
+            .await
+            .unwrap(),
+        Some(102)
+    );
+    cursor::Entity::delete_by_id("cutover-old")
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+    let empty = processor
+        .for_background_reconciliation()
+        .task_event_fanout_quantum_with_clock(&|| NOW)
+        .await
+        .unwrap();
+    assert_eq!((empty.selected, empty.errors), (0, 0));
+    assert_eq!(empty.pending, Some(false));
+    // A new INSERT after cursor deletion retains its own floor and gets a zero
+    // cursor in the claim transaction, without reopening 1..102.
+    fanout_test_append(&processor, "cutover-old", "new 103").await;
+    cursor::Entity::delete_by_id("cutover-old")
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+    ready(&processor, "cutover-old", NOW, 0).await;
+    let delivered = processor
+        .for_background_reconciliation()
+        .task_event_fanout_quantum_with_clock(&|| NOW)
+        .await
+        .unwrap();
+    assert_eq!((delivered.emitted, delivered.errors), (1, 0));
+    let notification = recv_notification_by_method(&mut rx, events::TASK_PROGRESS).await;
+    assert_eq!(notification.params.unwrap()["context"]["sequence"], 103);
+    assert!(rx.try_recv().is_err());
+    // A new Task's first event also survives late cursor creation.
+    create(&processor, &workspace, "cutover-new").await;
+    fanout_test_append(&processor, "cutover-new", "second").await;
+    cursor::Entity::delete_by_id("cutover-new")
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+    ready(&processor, "cutover-new", NOW, 0).await;
+    let delivered = processor
+        .for_background_reconciliation()
+        .task_event_fanout_quantum_with_clock(&|| NOW)
+        .await
+        .unwrap();
+    assert_eq!((delivered.emitted, delivered.errors), (2, 0));
+    let created = recv_notification_by_method(&mut rx, events::TASK_CREATED).await;
+    assert_eq!(created.params.unwrap()["context"]["sequence"], 1);
+    let progress = recv_notification_by_method(&mut rx, events::TASK_PROGRESS).await;
+    assert_eq!(progress.params.unwrap()["context"]["sequence"], 2);
+    assert!(rx.try_recv().is_err());
 }

@@ -32103,10 +32103,9 @@ async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_hi
         Some(0)
     );
 
-    let mut bootstrap_complete = false;
     processor
         .for_background_reconciliation()
-        .task_event_fanout_quantum(&mut bootstrap_complete)
+        .task_event_fanout_quantum()
         .await
         .expect("initial fanout should succeed");
     assert_eq!(
@@ -32118,12 +32117,11 @@ async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_hi
     );
     while rx.try_recv().is_ok() {}
 
-    // A restarted dispatcher reloads the completed checkpoint. The durable
-    // cursor prevents history replay without a historic per-Task memory map.
-    bootstrap_complete = false;
+    // A restarted dispatcher uses only pending work; completed work has no
+    // pending row and requires no historic per-Task memory map.
     processor
         .for_background_reconciliation()
-        .task_event_fanout_quantum(&mut bootstrap_complete)
+        .task_event_fanout_quantum()
         .await
         .expect("post-restart fanout scan should succeed");
     assert!(
@@ -32146,7 +32144,7 @@ async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_hi
         .expect("task update should append a new event");
     processor
         .for_background_reconciliation()
-        .task_event_fanout_quantum(&mut bootstrap_complete)
+        .task_event_fanout_quantum()
         .await
         .expect("new post-restart event should fan out");
     let updated = recv_notification_by_method(&mut rx, events::TASK_UPDATED).await;
@@ -32168,14 +32166,14 @@ async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_hi
         .expect("durable cursor fixture should delete");
     let summary = processor
         .for_background_reconciliation()
-        .task_event_fanout_quantum(&mut bootstrap_complete)
+        .task_event_fanout_quantum()
         .await
         .unwrap();
     assert_eq!(
-        summary.errors, 1,
-        "missing cursor must remain an unresolved obligation"
+        summary.errors, 0,
+        "cursor deletion without pending must not discover historical events"
     );
-    assert_eq!(summary.pending, Some(true));
+    assert_eq!(summary.pending, Some(false));
     assert_eq!(
         crud_store
             .get_task_event_fanout_cursor(&task_id)
@@ -32186,7 +32184,7 @@ async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_hi
     );
     assert!(
         rx.try_recv().is_err(),
-        "an invariant failure must not replay historical task events"
+        "cursor deletion alone must not replay historical task events"
     );
 }
 
@@ -77744,14 +77742,12 @@ async fn fanout_quantum_shares_total_event_budget_and_leaves_large_backlogs_read
         }
     }
     // Source triggers already covered these new Tasks; exercise a full due budget.
-    let mut complete = true;
     let summary = processor
         .for_background_reconciliation()
-        .task_event_fanout_quantum(&mut complete)
+        .task_event_fanout_quantum()
         .await
         .unwrap();
     assert_eq!(summary.selected, 64);
-    assert_eq!(summary.bootstrap_inputs, 0);
     assert_eq!(summary.event_inputs, 128);
     assert_eq!(summary.emitted, 128);
     assert_eq!(summary.errors, 0);
@@ -77771,7 +77767,7 @@ async fn fanout_quantum_shares_total_event_budget_and_leaves_large_backlogs_read
     for _ in 0..10 {
         let summary = processor
             .for_background_reconciliation()
-            .task_event_fanout_quantum(&mut complete)
+            .task_event_fanout_quantum()
             .await
             .unwrap();
         assert!(summary.emitted <= 128);
@@ -77817,10 +77813,9 @@ async fn fanout_failure_n_preserves_prefix_and_allows_another_task_to_progress()
         .exec(&processor.crud_store.database_connection())
         .await
         .unwrap();
-    let mut complete = true;
     let summary = processor
         .for_background_reconciliation()
-        .task_event_fanout_quantum(&mut complete)
+        .task_event_fanout_quantum()
         .await
         .unwrap();
     assert_eq!(summary.errors, 1);
@@ -77844,7 +77839,7 @@ async fn fanout_failure_n_preserves_prefix_and_allows_another_task_to_progress()
     );
     let next = processor
         .for_background_reconciliation()
-        .task_event_fanout_quantum(&mut complete)
+        .task_event_fanout_quantum()
         .await
         .unwrap();
     assert_eq!(next.emitted, 0);

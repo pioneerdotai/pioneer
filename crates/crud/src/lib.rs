@@ -14208,13 +14208,6 @@ impl CrudStore {
         task_event::list_event_task_ids(&self.connection).await
     }
 
-    pub async fn bootstrap_task_event_fanout(&self, limit: u64) -> Result<(usize, bool)> {
-        repositories::task_event_fanout::bootstrap(
-            &self.with_maintenance_access().connection,
-            limit,
-        )
-        .await
-    }
     pub async fn due_task_event_fanout(
         &self,
         now: i64,
@@ -29632,10 +29625,12 @@ impl CrudStore {
                     )
                     .await?;
                 }
+                // The pending floor selects new work. A zero cursor also keeps
+                // an earlier tracked event safe after cursor deletion in a batch.
                 task_event::initialize_fanout_cursor(
                     db,
                     appended_event.task_id.as_str(),
-                    appended_event.sequence.saturating_sub(1),
+                    0,
                     created_at,
                 )
                 .await
@@ -43334,7 +43329,7 @@ mod tests {
                 .get_task_event_fanout_cursor(task.id.as_str())
                 .await
                 .expect("legacy task cursor should initialize atomically"),
-            Some(updated.sequence.saturating_sub(1)),
+            Some(0),
             "the first post-upgrade event must remain pending for fanout while older events stay skipped"
         );
         store

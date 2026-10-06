@@ -6,26 +6,17 @@ const PENDING: &str = "task_event_fanout_pending";
 const SEQUENCE: &str = "task_event_fanout_sequence";
 const PREFIX: &str = "task_event_fanout";
 
-// Latest is a unique (task_id, sequence) reverse seek, never an event scan.
-fn latest(id: &str) -> String {
-    format!("(SELECT sequence FROM task_event WHERE task_id={id} ORDER BY sequence DESC LIMIT 1)")
-}
-fn refresh(id: &str, cursor: &str, reset: bool, condition: &str) -> String {
-    let latest = latest(id);
-    let eligible = format!("({condition}) AND {latest}>({cursor})");
-    let holder = if reset { ",claim_token=NULL" } else { "" };
+// Cursor mutations fence existing work only. They never discover event history.
+fn fence(id: &str, condition: &str) -> String {
+    let eligible = format!("({condition}) AND EXISTS(SELECT 1 FROM {PENDING} WHERE task_id={id})");
     format!(
         r#"
         SELECT CASE WHEN {eligible} AND NOT EXISTS(SELECT 1 FROM {SEQUENCE}
             WHERE singleton=1 AND typeof(generation)='integer' AND generation<9223372036854775807)
             THEN RAISE(ABORT,'task fanout generation missing or exhausted') END;
         UPDATE {SEQUENCE} SET generation=generation+1 WHERE singleton=1 AND {eligible};
-        INSERT INTO {PENDING}(task_id,newest_sequence,generation,due_at,claim_token,attempts)
-            SELECT {id},{latest},generation,CAST(strftime('%s','now') AS INTEGER),NULL,0
-            FROM {SEQUENCE} WHERE singleton=1 AND {eligible}
-            ON CONFLICT(task_id) DO UPDATE SET
-                newest_sequence=max(newest_sequence,excluded.newest_sequence),
-                generation=excluded.generation{holder};
+        UPDATE {PENDING} SET generation=(SELECT generation FROM {SEQUENCE} WHERE singleton=1),
+            claim_token=NULL WHERE task_id={id} AND ({condition});
     "#
     )
 }
@@ -57,6 +48,9 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(PENDING)
                     .col(text("task_id").primary_key())
+                    .col(big_integer("first_sequence").check(Expr::cust(
+                        "typeof(first_sequence)='integer' AND first_sequence>0 AND first_sequence<=newest_sequence",
+                    )))
                     .col(big_integer("newest_sequence").check(Expr::cust(
                         "typeof(newest_sequence)='integer' AND newest_sequence>0",
                     )))
@@ -143,33 +137,33 @@ impl MigrationTrait for Migration {
         db.execute_unprepared(
             "CREATE INDEX idx_task_delivery_fanout_pending ON task_delivery(task_id,run_id,workspace_id,updated_at) WHERE status IN ('pending','delivering')",
         ).await?;
-        let append = refresh(
-            "NEW.task_id",
-            "COALESCE((SELECT last_sequence FROM task_event_fanout_cursor WHERE task_id=NEW.task_id),0)",
-            false,
-            "1",
+        // Source allocation is monotonic per Task, including within an atomic
+        // batch. The first physical INSERT establishes the floor; duplicates
+        // have no INSERT and appends retain the floor, holder and retry delay.
+        let append = format!(
+            r#"
+            SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM {SEQUENCE}
+                WHERE singleton=1 AND typeof(generation)='integer' AND generation<9223372036854775807)
+                THEN RAISE(ABORT,'task fanout generation missing or exhausted') END;
+            UPDATE {SEQUENCE} SET generation=generation+1 WHERE singleton=1;
+            INSERT INTO {PENDING}(task_id,first_sequence,newest_sequence,generation,due_at,claim_token,attempts)
+                SELECT NEW.task_id,NEW.sequence,NEW.sequence,generation,
+                    CAST(strftime('%s','now') AS INTEGER),NULL,0
+                FROM {SEQUENCE} WHERE singleton=1
+                ON CONFLICT(task_id) DO UPDATE SET
+                    newest_sequence=max(newest_sequence,excluded.newest_sequence),
+                    generation=excluded.generation;
+        "#
         );
-        let insert = refresh("NEW.task_id", "NEW.last_sequence", true, "1");
-        let reset = refresh(
+        let reset = fence(
             "NEW.task_id",
-            "NEW.last_sequence",
-            true,
-            "NEW.last_sequence<OLD.last_sequence OR NEW.task_id IS NOT OLD.task_id OR NOT EXISTS(SELECT 1 FROM task_event_fanout_pending WHERE task_id=NEW.task_id)",
+            "NEW.last_sequence<OLD.last_sequence OR NEW.task_id IS NOT OLD.task_id",
         );
-        // Ordinary monotonic ACK neither changes generation nor revokes the lane.
-        // Reinitialisation/deletion deliberately fences the old reservation.
-        let delete = refresh(
+        let delete = fence(
             "OLD.task_id",
-            "0",
-            true,
             "EXISTS(SELECT 1 FROM task WHERE id=OLD.task_id)",
         );
-        let moved = refresh(
-            "OLD.task_id",
-            "0",
-            true,
-            "OLD.task_id IS NOT NEW.task_id AND EXISTS(SELECT 1 FROM task WHERE id=OLD.task_id)",
-        );
+        let moved = fence("OLD.task_id", "OLD.task_id IS NOT NEW.task_id");
         for (name, timing, table, body) in [
             ("append", "AFTER INSERT", "task_event", append),
             (
@@ -177,7 +171,7 @@ impl MigrationTrait for Migration {
                 "AFTER INSERT",
                 "task_event_fanout_cursor",
                 format!(
-                    "DELETE FROM {PENDING} WHERE task_id=NEW.task_id AND newest_sequence<=NEW.last_sequence; {insert}"
+                    "DELETE FROM {PENDING} WHERE task_id=NEW.task_id AND newest_sequence<=NEW.last_sequence;"
                 ),
             ),
             (
@@ -208,8 +202,9 @@ impl MigrationTrait for Migration {
             ))
             .await?;
         }
-        // No history scan here. The separately versioned bounded bootstrap runs
-        // after installation and uses the existing durable repair checkpoint.
+        // Installation deliberately leaves pending empty. Cursor INSERT only
+        // reconciles completion: DELETE already fenced an old holder, and the
+        // selected claim may create its absent zero cursor in the same commit.
         Ok(())
     }
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -238,16 +233,6 @@ impl MigrationTrait for Migration {
             .get_connection()
             .execute_unprepared("DROP INDEX idx_task_delivery_fanout_pending")
             .await?;
-        let db = manager.get_connection();
-        db.execute_raw(
-            db.get_database_backend().build(
-                &Query::delete()
-                    .from_table("read_model_repair_checkpoint")
-                    .and_where(Expr::col("repair_key").eq("task_event_fanout_frontier"))
-                    .to_owned(),
-            ),
-        )
-        .await?;
         for table in [PENDING, SEQUENCE] {
             manager
                 .drop_table(Table::drop().table(table).to_owned())
