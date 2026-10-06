@@ -85,6 +85,7 @@ enum ApiMessageContentBlock {
     ToolUse {
         id: String,
         name: String,
+        #[serde(deserialize_with = "deserialize_tool_input")]
         input: serde_json::Value,
     },
     ToolResult {
@@ -117,9 +118,18 @@ struct AnthropicToolDefinition {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct AnthropicToolChoice {
+    #[serde(flatten)]
+    mode: AnthropicToolChoiceMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disable_parallel_tool_use: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum AnthropicToolChoice {
+enum AnthropicToolChoiceMode {
     Auto,
+    None,
     Any,
     Tool { name: String },
 }
@@ -386,7 +396,7 @@ impl AnthropicProvider {
                             content.push(ApiMessageContentBlock::ToolUse {
                                 id: call.id.clone(),
                                 name: call.name.clone(),
-                                input: parse_json_or_string(call.arguments.as_str()),
+                                input: parse_tool_input(call.arguments.as_str())?,
                             });
                         }
                     }
@@ -465,13 +475,23 @@ impl AnthropicProvider {
             .collect()
     }
 
-    fn convert_tool_choice(choice: ToolChoice) -> AnthropicToolChoice {
-        match choice {
-            ToolChoice::Auto => AnthropicToolChoice::Auto,
-            ToolChoice::None => AnthropicToolChoice::Auto,
-            ToolChoice::Required => AnthropicToolChoice::Any,
-            ToolChoice::Tool { name } => AnthropicToolChoice::Tool { name },
+    fn convert_tool_choice(
+        choice: Option<ToolChoice>,
+        parallel: Option<bool>,
+    ) -> Option<AnthropicToolChoice> {
+        if choice.is_none() && parallel.is_none() {
+            return None;
         }
+        let mode = match choice.unwrap_or(ToolChoice::Auto) {
+            ToolChoice::Auto => AnthropicToolChoiceMode::Auto,
+            ToolChoice::None => AnthropicToolChoiceMode::None,
+            ToolChoice::Required => AnthropicToolChoiceMode::Any,
+            ToolChoice::Tool { name } => AnthropicToolChoiceMode::Tool { name },
+        };
+        Some(AnthropicToolChoice {
+            mode,
+            disable_parallel_tool_use: parallel.map(|enabled| !enabled),
+        })
     }
 
     fn output_config(reasoning: Option<ReasoningConfig>) -> Option<AnthropicOutputConfig> {
@@ -491,120 +511,7 @@ impl AnthropicProvider {
         format!("{}/v1/models", self.base_url)
     }
 
-    async fn api_error(response: reqwest::Response) -> anyhow::Error {
-        let status = response.status();
-        let body = match crate::http::read_response_text_bounded(
-            response,
-            16 * 1024,
-            "provider_error_body",
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => return error,
-        };
-        anyhow!("Anthropic API error ({status}): {body}")
-    }
-}
-
-fn parse_json_or_string(raw: &str) -> serde_json::Value {
-    serde_json::from_str::<serde_json::Value>(raw)
-        .unwrap_or_else(|_| serde_json::Value::String(raw.to_owned()))
-}
-
-#[derive(Debug)]
-struct PendingToolUse {
-    id: String,
-    name: String,
-    arguments: String,
-    has_partial_json: bool,
-}
-
-impl PendingToolUse {
-    fn finalize(self) -> Result<ProviderToolCall> {
-        let value = serde_json::from_str::<serde_json::Value>(self.arguments.as_str())
-            .map_err(|error| anyhow!("Anthropic tool call contains invalid arguments: {error}"))?;
-        let arguments = serde_json::to_string(&value)?;
-
-        Ok(ProviderToolCall {
-            id: self.id,
-            name: self.name,
-            arguments,
-        })
-    }
-}
-
-#[async_trait]
-impl crate::traits::Provider for AnthropicProvider {
-    fn name(&self) -> &str {
-        "anthropic"
-    }
-
-    fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities {
-            streaming: true,
-            vision: true,
-            tool_calling: true,
-            embeddings: false,
-            transcription: false,
-            input_types: ProviderInputCapabilities {
-                text: true,
-                file: InputTypeSupport::native_inline_only(),
-                image: InputTypeSupport::native_inline_only(),
-                audio: InputTypeSupport::disabled(),
-                video: InputTypeSupport::disabled(),
-            },
-        }
-    }
-
-    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider_async(
-            self.name(),
-            request.model.as_str(),
-            &self.capabilities(),
-            request.rendered_messages_with_compiled_prompt().as_slice(),
-        )
-        .await?;
-        ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let (system, messages) = Self::prepare_messages(&prepared)?;
-
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages,
-            max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-            temperature: request.temperature,
-            system,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            output_config: Self::output_config(request.reasoning),
-            stream: false,
-        };
-
-        crate::attachments::validate_inline_payload("anthropic", &api_request)?;
-        let request_builder = self
-            .client
-            .post(self.messages_url())
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&api_request);
-        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
-        }
-
-        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
-            response,
-            Default::default(),
-            "provider_response",
-        )
-        .await?;
+    fn parse_response(api_response: ApiChatResponse) -> Result<ChatResponse> {
         let termination = api_response
             .stop_reason
             .as_deref()
@@ -642,13 +549,16 @@ impl crate::traits::Provider for AnthropicProvider {
                     }
                 }
                 "tool_use" => {
-                    if let (Some(id), Some(name), Some(input)) = (block.id, block.name, block.input)
-                    {
+                    // Native tool_use requires an object input, including for zero-arg tools.
+                    // Missing/null is not Gemini's protobuf default and must not hide a call.
+                    let input = require_tool_input(block.input.ok_or_else(|| {
+                        anyhow!("Anthropic tool_use input must be a JSON object")
+                    })?)?;
+                    if let (Some(id), Some(name)) = (block.id, block.name) {
                         tool_calls.push(ProviderToolCall {
                             id,
                             name,
-                            arguments: serde_json::to_string(&input)
-                                .unwrap_or_else(|_| "{}".to_owned()),
+                            arguments: serde_json::to_string(&input)?,
                         });
                     }
                 }
@@ -688,17 +598,103 @@ impl crate::traits::Provider for AnthropicProvider {
         })
     }
 
-    async fn stream_chat(
-        &self,
-        request: ChatRequest,
-    ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let prepared = prepare_messages_for_provider_async(
+    async fn api_error(response: reqwest::Response) -> anyhow::Error {
+        let status = response.status();
+        let body = match crate::http::read_response_text_bounded(
+            response,
+            16 * 1024,
+            "provider_error_body",
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => return error,
+        };
+        anyhow!("Anthropic API error ({status}): {body}")
+    }
+}
+
+// ToolUseBlockParam/ToolUseBlock.input is an object. Do not expose argument
+// contents or serde diagnostics in errors from this protocol boundary.
+fn require_tool_input(input: serde_json::Value) -> Result<serde_json::Value> {
+    if !input.is_object() {
+        return Err(anyhow!("Anthropic tool_use input must be a JSON object"));
+    }
+    Ok(input)
+}
+
+fn parse_tool_input(raw: &str) -> Result<serde_json::Value> {
+    let input = serde_json::from_str(raw)
+        .map_err(|_| anyhow!("Anthropic tool_use input must be valid JSON containing an object"))?;
+    require_tool_input(input)
+}
+
+// Replay blocks also enter the outgoing builder through deserialization.
+fn deserialize_tool_input<'de, D>(
+    deserializer: D,
+) -> std::result::Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let input = serde_json::Value::deserialize(deserializer)?;
+    require_tool_input(input).map_err(serde::de::Error::custom)
+}
+
+#[derive(Debug)]
+struct PendingToolUse {
+    id: String,
+    name: String,
+    arguments: String,
+    has_partial_json: bool,
+}
+
+impl PendingToolUse {
+    fn finalize(self) -> Result<ProviderToolCall> {
+        // Validate only the completed argument buffer, never partial_json fragments.
+        let value = parse_tool_input(self.arguments.as_str())?;
+        let arguments = serde_json::to_string(&value)?;
+
+        Ok(ProviderToolCall {
+            id: self.id,
+            name: self.name,
+            arguments,
+        })
+    }
+}
+
+#[async_trait]
+impl crate::traits::Provider for AnthropicProvider {
+    fn name(&self) -> &str {
+        "anthropic"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: true,
+            vision: true,
+            tool_calling: true,
+            embeddings: false,
+            transcription: false,
+            input_types: ProviderInputCapabilities {
+                text: true,
+                file: InputTypeSupport::native_inline_only(),
+                image: InputTypeSupport::native_inline_only(),
+                audio: InputTypeSupport::disabled(),
+                video: InputTypeSupport::disabled(),
+            },
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let (system, messages) = Self::prepare_messages(&prepared)?;
 
@@ -712,7 +708,69 @@ impl crate::traits::Provider for AnthropicProvider {
                 .tools
                 .as_ref()
                 .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
+            tool_choice: Self::convert_tool_choice(
+                request.tool_choice,
+                request.parallel_tool_calls,
+            ),
+            output_config: Self::output_config(request.reasoning),
+            stream: false,
+        };
+
+        crate::attachments::validate_inline_payload("anthropic", &api_request)?;
+        let request_builder = self
+            .client
+            .post(self.messages_url())
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(&api_request);
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(Self::api_error(response).await);
+        }
+
+        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
+        Self::parse_response(api_response)
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
+            self.name(),
+            request.model.as_str(),
+            &self.capabilities(),
+            request.rendered_messages_with_compiled_prompt().as_slice(),
+        )
+        .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
+        ensure_no_unrendered_attachments(self.name(), &prepared)?;
+        let (system, messages) = Self::prepare_messages(&prepared)?;
+
+        let api_request = ApiChatRequest {
+            model: request.model,
+            messages,
+            max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            temperature: request.temperature,
+            system,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: Self::convert_tool_choice(
+                request.tool_choice,
+                request.parallel_tool_calls,
+            ),
             output_config: Self::output_config(request.reasoning),
             stream: true,
         };
@@ -1101,6 +1159,42 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_tool_modes_and_parallel_control_are_nested() {
+        for parallel in [None, Some(true), Some(false)] {
+            for (choice, expected) in [
+                (ToolChoice::Auto, "auto"),
+                (ToolChoice::None, "none"),
+                (ToolChoice::Required, "any"),
+                (
+                    ToolChoice::Tool {
+                        name: "lookup".into(),
+                    },
+                    "tool",
+                ),
+            ] {
+                let value = serde_json::to_value(AnthropicProvider::convert_tool_choice(
+                    Some(choice),
+                    parallel,
+                ))
+                .unwrap();
+                assert_eq!(value["type"], expected);
+                if let Some(enabled) = parallel {
+                    assert_eq!(value["disable_parallel_tool_use"], !enabled);
+                } else {
+                    assert!(value.get("disable_parallel_tool_use").is_none());
+                }
+            }
+        }
+        let default_choice =
+            serde_json::to_value(AnthropicProvider::convert_tool_choice(None, Some(false)))
+                .unwrap();
+        assert_eq!(
+            default_choice,
+            serde_json::json!({"type":"auto","disable_parallel_tool_use":true})
+        );
+    }
+
     #[test]
     fn usage_normalization_requires_complete_separate_cache_counters() {
         let complete: super::ApiUsage = serde_json::from_value(serde_json::json!({
@@ -1730,3 +1824,7 @@ mod media_contract_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "wire_tests/anthropic.rs"]
+mod wire_contract_tests;

@@ -47,6 +47,7 @@ struct BedrockMessage {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct BedrockContentBlock {
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
@@ -177,9 +178,9 @@ struct BedrockResponseContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BedrockReasoningContent {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     reasoning_text: Option<BedrockReasoningText>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     redacted_content: Option<String>,
 }
 
@@ -304,23 +305,25 @@ fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8>
     hmac_sha256(&k_service, b"aws4_request")
 }
 
-/// Build an AWS SigV4 `Authorization` header value.
-///
-/// Returns `(authorization_header_value, amz_date)`.
-fn sign_request(
+/// The exact request used by the signer, separately inspectable from the
+/// transmitted URL. Keep this single construction path for all operations.
+fn canonical_request(
     method: &str,
     url: &Url,
     body: &[u8],
-    access_key_id: &str,
-    secret_access_key: &str,
     session_token: Option<&str>,
-    region: &str,
-    service: &str,
-    datetime: &str, // e.g. "20260319T120000Z"
-) -> String {
-    let date = &datetime[..8]; // "20260319"
+    datetime: &str,
+) -> (String, String) {
     let host = url.host_str().unwrap_or_default();
-    let path = url.path();
+    // AWS's non-S3 default signs a second URI encoding of the escaped path.
+    // Preserve separators while encoding the percent bytes in model IDs/ARNs.
+    // https://docs.rs/aws-sigv4/latest/aws_sigv4/http_request/enum.PercentEncodingMode.html
+    let path = url
+        .path()
+        .split('/')
+        .map(crate::definition::encode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/");
 
     // Canonical query string (empty for POST)
     let canonical_query = url.query().unwrap_or("");
@@ -350,7 +353,24 @@ fn sign_request(
     let canonical_request = format!(
         "{method}\n{path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
     );
+    (canonical_request, signed_headers)
+}
 
+/// Build an AWS SigV4 `Authorization` header value.
+fn sign_request(
+    method: &str,
+    url: &Url,
+    body: &[u8],
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: Option<&str>,
+    region: &str,
+    service: &str,
+    datetime: &str, // e.g. "20260319T120000Z"
+) -> String {
+    let date = &datetime[..8];
+    let (canonical_request, signed_headers) =
+        canonical_request(method, url, body, session_token, datetime);
     let scope = format!("{date}/{region}/{service}/aws4_request");
     let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
 
@@ -367,6 +387,74 @@ fn sign_request(
 // ── Implementation ─────────────────────────────────────────────────────────
 
 impl BedrockProvider {
+    pub(crate) fn environment_is_configured() -> bool {
+        let access = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default();
+        let secret = std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default();
+        let session = std::env::var("AWS_SESSION_TOKEN").ok();
+        Self::validate_connection_values(
+            &access,
+            &secret,
+            session.as_deref(),
+            &Self::environment_region(),
+        )
+        .is_ok()
+    }
+
+    fn validate_connection(&self) -> Result<()> {
+        Self::validate_connection_values(
+            &self.access_key_id,
+            &self.secret_access_key,
+            self.session_token.as_deref(),
+            &self.region,
+        )
+    }
+
+    fn validate_connection_values(
+        access: &str,
+        secret: &str,
+        session: Option<&str>,
+        region: &str,
+    ) -> Result<()> {
+        if access.trim().is_empty() || secret.trim().is_empty() {
+            anyhow::bail!(
+                "Bedrock SigV4 requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY; a single provider API key is insufficient"
+            );
+        }
+        if session.is_some_and(|token| token.trim().is_empty()) {
+            anyhow::bail!("AWS_SESSION_TOKEN must be nonempty when supplied");
+        }
+        // AWS Bedrock bindRegion uses Smithy's host-label validation. Retain
+        // this adapter's lowercase region contract; require one DNS label,
+        // 1..=63 ASCII bytes, with alphanumeric boundaries, not a region list.
+        // https://github.com/aws/smithy-go/blob/9b28af0b8afffb9debb149a07df6fc40edc6e529/endpoints/private/rulesfn/uri.go
+        // https://github.com/aws/smithy-go/blob/9b28af0b8afffb9debb149a07df6fc40edc6e529/transport/http/host.go
+        if !(1..=63).contains(&region.len())
+            || region.starts_with('-')
+            || region.ends_with('-')
+            || !region
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        {
+            anyhow::bail!(
+                "Bedrock requires an AWS region that is a lowercase DNS label (1-63 bytes, alphanumeric start/end)"
+            );
+        }
+        Ok(())
+    }
+
+    fn environment_region() -> String {
+        std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|_| "us-east-1".to_string())
+    }
+
+    fn dns_suffix(&self) -> &'static str {
+        if self.region.starts_with("cn-") {
+            "amazonaws.com.cn"
+        } else {
+            "amazonaws.com"
+        }
+    }
     pub fn new(
         access_key_id: impl Into<String>,
         secret_access_key: impl Into<String>,
@@ -442,31 +530,36 @@ impl BedrockProvider {
         let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
             .map_err(|_| anyhow!("AWS_SECRET_ACCESS_KEY environment variable not set"))?;
         let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
-        let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        let region = Self::environment_region();
 
-        Ok(Self {
+        let provider = Self {
             access_key_id,
             secret_access_key,
             session_token,
             region,
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
-        })
+        };
+        provider.validate_connection()?;
+        Ok(provider)
     }
 
     fn list_foundation_models_url(&self) -> String {
         format!(
-            "https://bedrock.{}.amazonaws.com/foundation-models",
-            self.region
+            "https://bedrock.{}.{}/foundation-models",
+            self.region,
+            self.dns_suffix()
         )
     }
 
     /// Build the Converse API endpoint URL for the given model ID.
     fn converse_url(&self, model_id: &str) -> String {
-        let encoded_model = model_id.replace('/', "%2F");
+        let encoded_model = crate::definition::encode_path_segment(model_id);
         format!(
-            "https://bedrock-runtime.{}.amazonaws.com/model/{}/converse",
-            self.region, encoded_model
+            "https://bedrock-runtime.{}.{}/model/{}/converse",
+            self.region,
+            self.dns_suffix(),
+            encoded_model
         )
     }
 
@@ -717,7 +810,10 @@ impl BedrockProvider {
     fn convert_tool_config(
         tools: &[ToolDefinition],
         choice: Option<ToolChoice>,
-    ) -> BedrockToolConfig {
+    ) -> Result<BedrockToolConfig> {
+        if matches!(choice, Some(ToolChoice::None)) {
+            anyhow::bail!("Bedrock None must omit toolConfig; it cannot become Auto");
+        }
         let tools = tools
             .iter()
             .map(|tool| BedrockToolEntry {
@@ -733,19 +829,22 @@ impl BedrockProvider {
 
         let tool_choice = choice.map(|choice| match choice {
             ToolChoice::Auto => serde_json::json!({ "auto": {} }),
-            ToolChoice::None => serde_json::json!({ "auto": {} }),
+            ToolChoice::None => serde_json::Value::Null, // rejected above
             ToolChoice::Required => serde_json::json!({ "any": {} }),
             ToolChoice::Tool { name } => serde_json::json!({ "tool": { "name": name } }),
         });
 
-        BedrockToolConfig { tools, tool_choice }
+        Ok(BedrockToolConfig { tools, tool_choice })
     }
 
     fn build_request(
         request: &ChatRequest,
         prepared: &PreparedProviderMessages,
     ) -> Result<BedrockRequest> {
-        let (messages, system) = Self::convert_messages(prepared)?;
+        let request = crate::tools::policy::prepare_request("bedrock", request.clone())?;
+        let mut prepared = prepared.clone();
+        crate::tools::policy::prepare_history("bedrock", &mut prepared.messages)?;
+        let (messages, system) = Self::convert_messages(&prepared)?;
 
         let inference_config = if request.temperature.is_some() || request.max_tokens.is_some() {
             Some(BedrockInferenceConfig {
@@ -763,7 +862,8 @@ impl BedrockProvider {
             tool_config: request
                 .tools
                 .as_ref()
-                .map(|tools| Self::convert_tool_config(tools, request.tool_choice.clone())),
+                .map(|tools| Self::convert_tool_config(tools, request.tool_choice.clone()))
+                .transpose()?,
             additional_model_request_fields: Self::additional_model_request_fields(
                 request.model.as_str(),
                 request.reasoning,
@@ -808,6 +908,74 @@ impl BedrockProvider {
         let (year, month, day, hour, minute, second) = unix_to_datetime(secs);
 
         format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
+    }
+
+    fn parse_response(api_response: BedrockResponse) -> Result<ChatResponse> {
+        let termination = api_response
+            .stop_reason
+            .as_deref()
+            .map(ProviderTermination::from_openai_reason)
+            .unwrap_or_else(|| ProviderTermination::Unknown("missing_stop_reason".to_owned()));
+
+        let usage = api_response.usage.map(|u| u.normalized());
+
+        let mut text_parts = Vec::new();
+        let mut reasoning_parts = Vec::new();
+        let mut tool_calls = Vec::new();
+        let mut replay_blocks = Vec::new();
+
+        for block in api_response.output.message.content {
+            if let Some(t) = block.text {
+                text_parts.push(t);
+            }
+            if let Some(rc) = block.reasoning_content {
+                if let Some(rt) = rc.reasoning_text.as_ref() {
+                    if !rt.text.is_empty() {
+                        reasoning_parts.push(rt.text.clone());
+                    }
+                }
+                replay_blocks.push(rc);
+            }
+            if let Some(tool_use) = block.tool_use {
+                tool_calls.push(ProviderToolCall {
+                    id: tool_use.tool_use_id,
+                    name: tool_use.name,
+                    arguments: serde_json::to_string(&tool_use.input)
+                        .unwrap_or_else(|_| "{}".to_owned()),
+                });
+            }
+        }
+
+        let text = text_parts.join("");
+        let reasoning_content = if reasoning_parts.is_empty() {
+            None
+        } else {
+            Some(reasoning_parts.join(""))
+        };
+        let provider_replay_state = if replay_blocks.is_empty() {
+            None
+        } else {
+            Some(ProviderReplayState::new(
+                "bedrock",
+                serde_json::json!({ "blocks": replay_blocks }),
+            ))
+        };
+
+        if text.is_empty()
+            && tool_calls.is_empty()
+            && reasoning_content.as_deref().unwrap_or_default().is_empty()
+        {
+            return Err(anyhow!("no response from Bedrock"));
+        }
+
+        Ok(ChatResponse {
+            text,
+            usage,
+            termination,
+            reasoning_content,
+            tool_calls,
+            provider_replay_state,
+        })
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
@@ -900,6 +1068,8 @@ impl crate::traits::Provider for BedrockProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        self.validate_connection()?;
         let prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
@@ -954,77 +1124,14 @@ impl crate::traits::Provider for BedrockProvider {
             "provider_response",
         )
         .await?;
-        let termination = api_response
-            .stop_reason
-            .as_deref()
-            .map(ProviderTermination::from_openai_reason)
-            .unwrap_or_else(|| ProviderTermination::Unknown("missing_stop_reason".to_owned()));
-
-        let usage = api_response.usage.map(|u| u.normalized());
-
-        let mut text_parts = Vec::new();
-        let mut reasoning_parts = Vec::new();
-        let mut tool_calls = Vec::new();
-        let mut replay_blocks = Vec::new();
-
-        for block in api_response.output.message.content {
-            if let Some(t) = block.text {
-                text_parts.push(t);
-            }
-            if let Some(rc) = block.reasoning_content {
-                if let Some(rt) = rc.reasoning_text.as_ref() {
-                    if !rt.text.is_empty() {
-                        reasoning_parts.push(rt.text.clone());
-                    }
-                }
-                replay_blocks.push(rc);
-            }
-            if let Some(tool_use) = block.tool_use {
-                tool_calls.push(ProviderToolCall {
-                    id: tool_use.tool_use_id,
-                    name: tool_use.name,
-                    arguments: serde_json::to_string(&tool_use.input)
-                        .unwrap_or_else(|_| "{}".to_owned()),
-                });
-            }
-        }
-
-        let text = text_parts.join("");
-        let reasoning_content = if reasoning_parts.is_empty() {
-            None
-        } else {
-            Some(reasoning_parts.join(""))
-        };
-        let provider_replay_state = if replay_blocks.is_empty() {
-            None
-        } else {
-            Some(ProviderReplayState::new(
-                "bedrock",
-                serde_json::json!({ "blocks": replay_blocks }),
-            ))
-        };
-
-        if text.is_empty()
-            && tool_calls.is_empty()
-            && reasoning_content.as_deref().unwrap_or_default().is_empty()
-        {
-            return Err(anyhow!("no response from Bedrock"));
-        }
-
-        Ok(ChatResponse {
-            text,
-            usage,
-            termination,
-            reasoning_content,
-            tool_calls,
-            provider_replay_state,
-        })
+        Self::parse_response(api_response)
     }
 
     async fn stream_chat(
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
         // Bedrock Converse streaming uses a different binary event-stream protocol.
         // Fall back to a single non-streaming call returned as one chunk.
         let response = self.chat(request).await?;
@@ -1051,6 +1158,7 @@ impl crate::traits::Provider for BedrockProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        self.validate_connection()?;
         let url_str = self.list_foundation_models_url();
         let url: Url = url_str.parse()?;
 
@@ -1144,7 +1252,59 @@ fn provider_model_from_bedrock_model_summary(m: BedrockModelSummary) -> Provider
 }
 
 #[cfg(test)]
+#[path = "bedrock_signing_tests.rs"]
+mod signing_tests;
+
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_modes_none_and_unsupported_limit_are_validated_before_converse() {
+        let provider = BedrockProvider::new("unused", "unused", "us-east-1");
+        for (choice, expected) in [
+            (ToolChoice::Auto, "auto"),
+            (ToolChoice::Required, "any"),
+            (
+                ToolChoice::Tool {
+                    name: "lookup".into(),
+                },
+                "tool",
+            ),
+        ] {
+            let mut request = crate::tools::policy::test_request();
+            request.model = "anthropic.claude-3-5-sonnet-20240620-v1:0".into();
+            request.tool_choice = Some(choice);
+            let prepared = prepare_messages_for_provider(
+                "bedrock",
+                &provider.capabilities(),
+                &request.messages,
+            )
+            .unwrap();
+            let wire = BedrockProvider::build_request(&request, &prepared).unwrap();
+            assert!(
+                wire.tool_config
+                    .unwrap()
+                    .tool_choice
+                    .unwrap()
+                    .get(expected)
+                    .is_some()
+            );
+        }
+        let mut request = crate::tools::policy::test_request();
+        request.tool_choice = Some(ToolChoice::None);
+        let prepared =
+            prepare_messages_for_provider("bedrock", &provider.capabilities(), &request.messages)
+                .unwrap();
+        assert!(
+            BedrockProvider::build_request(&request, &prepared)
+                .unwrap()
+                .tool_config
+                .is_none()
+        );
+        request.tool_choice = Some(ToolChoice::Auto);
+        request.parallel_tool_calls = Some(false);
+        assert!(BedrockProvider::build_request(&request, &prepared).is_err());
+    }
+
     #[test]
     fn usage_normalization_requires_complete_separate_cache_counters() {
         let complete: super::BedrockUsage = serde_json::from_value(serde_json::json!({
@@ -1173,6 +1333,198 @@ mod tests {
     fn bedrock_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    // Restore every AWS connection input even when an assertion panics, while
+    // holding the same lock as the pre-existing environment tests.
+    struct BedrockTestEnvironment {
+        saved: [(&'static str, Option<std::ffi::OsString>); 5],
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl BedrockTestEnvironment {
+        fn new() -> Self {
+            let lock = bedrock_env_lock()
+                .lock()
+                .expect("bedrock env lock poisoned");
+            let saved = [
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "AWS_REGION",
+                "AWS_DEFAULT_REGION",
+            ]
+            .map(|name| (name, std::env::var_os(name)));
+            Self { saved, _lock: lock }
+        }
+
+        fn set(&self, name: &str, value: Option<&str>) {
+            assert!(self.saved.iter().any(|(saved, _)| *saved == name));
+            // SAFETY: test-only AWS mutations are serialized by bedrock_env_lock.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    impl Drop for BedrockTestEnvironment {
+        fn drop(&mut self) {
+            // SAFETY: the environment lock remains held until restoration ends.
+            unsafe {
+                for (name, value) in &self.saved {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bedrock_region_requires_one_bounded_dns_label() {
+        for region in [
+            "",
+            "-",
+            "-us-east-1",
+            "us-east-1-",
+            "region.invalid",
+            "us_east_1",
+            &"a".repeat(64),
+        ] {
+            let error = BedrockProvider::validate_connection_values(
+                "dummy-access",
+                "dummy-secret",
+                Some("dummy-session"),
+                region,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("DNS label"));
+            assert!(!error.to_string().contains("dummy"));
+        }
+        // A label bound, not an allowlist of regions currently offered by AWS.
+        for region in [
+            "us-east-1",
+            "us-gov-west-1",
+            "cn-north-1",
+            "a",
+            &"a".repeat(63),
+        ] {
+            assert!(
+                BedrockProvider::validate_connection_values(
+                    "dummy-access",
+                    "dummy-secret",
+                    Some("dummy-session"),
+                    region,
+                )
+                .is_ok(),
+                "{region}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_bedrock_regions_fail_lifecycle_before_network() {
+        for region in [
+            "-",
+            "-us-east-1",
+            "us-east-1-",
+            "region.invalid",
+            &"a".repeat(64),
+        ] {
+            let provider = BedrockProvider::new("dummy-access", "dummy-secret", region);
+            let request = ChatRequest {
+                model: "model:0".into(),
+                messages: vec![ChatMessage::user("dummy")],
+                temperature: None,
+                max_tokens: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                compiled_prompt: None,
+            };
+            for error in [
+                provider.list_models().await.unwrap_err(),
+                provider.warmup().await.unwrap_err(),
+                provider.chat(request.clone()).await.unwrap_err(),
+            ] {
+                assert!(error.to_string().contains("DNS label"));
+            }
+            let error = match provider.stream_chat(request).await {
+                Err(error) => error,
+                Ok(_) => panic!("invalid region must fail before stream setup"),
+            };
+            assert!(error.to_string().contains("DNS label"));
+        }
+    }
+
+    #[test]
+    fn bedrock_region_environment_availability_and_validation_agree() {
+        let env = BedrockTestEnvironment::new();
+        env.set("AWS_ACCESS_KEY_ID", Some("dummy-access"));
+        env.set("AWS_SECRET_ACCESS_KEY", Some("dummy-secret"));
+        env.set("AWS_SESSION_TOKEN", Some("dummy-session"));
+        env.set("AWS_DEFAULT_REGION", Some("cn-north-1"));
+        let definition = crate::provider_definition("bedrock").unwrap();
+        for (region, valid) in [
+            ("-", false),
+            ("-us-east-1", false),
+            ("us-east-1-", false),
+            ("region.invalid", false),
+            (&"a".repeat(64), false),
+            ("us-east-1", true),
+            ("us-gov-west-1", true),
+            ("cn-north-1", true),
+        ] {
+            env.set("AWS_REGION", Some(region));
+            assert_eq!(
+                BedrockProvider::environment_is_configured(),
+                valid,
+                "{region}"
+            );
+            assert_eq!(
+                crate::provider_is_available(true, true, true, definition),
+                valid,
+                "{region}"
+            );
+            let provider = BedrockProvider::from_env();
+            assert_eq!(provider.is_ok(), valid, "{region}");
+            assert_eq!(
+                BedrockProvider::new("dummy-access", "dummy-secret", region)
+                    .validate_connection()
+                    .is_ok(),
+                valid
+            );
+            if let Ok(provider) = provider {
+                assert_eq!(
+                    provider.region, region,
+                    "AWS_REGION must outrank the fallback"
+                );
+                assert_eq!(provider.session_token.as_deref(), Some("dummy-session"));
+            }
+        }
+        env.set("AWS_REGION", None);
+        assert_eq!(BedrockProvider::from_env().unwrap().region, "cn-north-1");
+        env.set("AWS_DEFAULT_REGION", Some("-"));
+        assert!(!BedrockProvider::environment_is_configured());
+        assert!(!crate::provider_is_available(
+            false, false, false, definition
+        ));
+        assert!(BedrockProvider::from_env().is_err());
+        env.set("AWS_DEFAULT_REGION", None);
+        assert_eq!(BedrockProvider::from_env().unwrap().region, "us-east-1");
+        assert!(BedrockProvider::environment_is_configured());
+        env.set("AWS_SESSION_TOKEN", Some(""));
+        assert!(!BedrockProvider::environment_is_configured());
+        env.set("AWS_SESSION_TOKEN", None);
+        assert!(BedrockProvider::environment_is_configured());
+        env.set("AWS_SECRET_ACCESS_KEY", None);
+        assert!(!BedrockProvider::environment_is_configured());
+        assert!(!crate::provider_is_available(true, true, true, definition));
     }
 
     fn prepared_for(messages: &[ChatMessage]) -> crate::attachments::PreparedProviderMessages {
@@ -1314,6 +1666,61 @@ mod tests {
     }
 
     #[test]
+    fn sigv4_connection_requires_pair_and_nonempty_session_token() {
+        for provider in [
+            BedrockProvider::new("dummy-access", "", "us-east-1"),
+            BedrockProvider::new("", "dummy-secret", "us-east-1"),
+            BedrockProvider::new("dummy-access", "dummy-secret", "region.invalid"),
+            BedrockProvider::with_session_token("dummy-access", "dummy-secret", "us-east-1", ""),
+        ] {
+            assert!(provider.validate_connection().is_err());
+        }
+        let provider = BedrockProvider::with_session_token(
+            "dummy-access",
+            "dummy-secret",
+            "cn-north-1",
+            "dummy-session",
+        );
+        assert!(provider.validate_connection().is_ok());
+        assert_eq!(
+            provider.converse_url("arn:aws-cn:bedrock:cn-north-1::foundation-model/example~1"),
+            "https://bedrock-runtime.cn-north-1.amazonaws.com.cn/model/arn%3Aaws-cn%3Abedrock%3Acn-north-1%3A%3Afoundation-model%2Fexample~1/converse"
+        );
+        assert_eq!(
+            provider.list_foundation_models_url(),
+            "https://bedrock.cn-north-1.amazonaws.com.cn/foundation-models"
+        );
+        let url: Url = provider.converse_url("model:0").parse().unwrap();
+        let auth = sign_request(
+            "POST",
+            &url,
+            b"{}",
+            "dummy-access",
+            "dummy-secret",
+            Some("dummy-session"),
+            "cn-north-1",
+            SERVICE,
+            "20261001T120000Z",
+        );
+        assert!(auth.contains("Credential=dummy-access/20261001/cn-north-1/bedrock/aws4_request"));
+        assert!(auth.contains("SignedHeaders=content-type;host;x-amz-date;x-amz-security-token"));
+        let without_session = sign_request(
+            "POST",
+            &url,
+            b"{}",
+            "dummy-access",
+            "dummy-secret",
+            None,
+            "cn-north-1",
+            SERVICE,
+            "20261001T120000Z",
+        );
+        assert_ne!(auth, without_session);
+        assert!(!auth.contains("dummy-secret"));
+        assert!(!auth.contains("dummy-session"));
+    }
+
+    #[test]
     fn creates_with_session_token() {
         let provider = BedrockProvider::with_session_token("AKID", "SECRET", "eu-west-1", "TOKEN");
         assert_eq!(provider.access_key_id, "AKID");
@@ -1396,54 +1803,29 @@ mod tests {
 
     #[test]
     fn from_env_reads_variables() {
-        let _env_guard = bedrock_env_lock()
-            .lock()
-            .expect("bedrock env lock poisoned");
-        // Temporarily set env vars for test.
-        // SAFETY: test-only; these env vars are not used by other threads in tests.
-        unsafe {
-            std::env::set_var("AWS_ACCESS_KEY_ID", "env-akid");
-            std::env::set_var("AWS_SECRET_ACCESS_KEY", "env-secret");
-            std::env::set_var("AWS_SESSION_TOKEN", "env-token");
-            std::env::set_var("AWS_REGION", "ap-southeast-1");
-        }
-
+        let env = BedrockTestEnvironment::new();
+        env.set("AWS_ACCESS_KEY_ID", Some("env-akid"));
+        env.set("AWS_SECRET_ACCESS_KEY", Some("env-secret"));
+        env.set("AWS_SESSION_TOKEN", Some("env-token"));
+        env.set("AWS_REGION", Some("ap-southeast-1"));
         let provider = BedrockProvider::from_env().unwrap();
         assert_eq!(provider.access_key_id, "env-akid");
         assert_eq!(provider.secret_access_key, "env-secret");
         assert_eq!(provider.session_token.as_deref(), Some("env-token"));
         assert_eq!(provider.region, "ap-southeast-1");
-
-        // Clean up
-        unsafe {
-            std::env::remove_var("AWS_ACCESS_KEY_ID");
-            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-            std::env::remove_var("AWS_SESSION_TOKEN");
-            std::env::remove_var("AWS_REGION");
-        }
     }
 
     #[test]
     fn from_env_defaults_region() {
-        let _env_guard = bedrock_env_lock()
-            .lock()
-            .expect("bedrock env lock poisoned");
-        // SAFETY: test-only; these env vars are not used by other threads in tests.
-        unsafe {
-            std::env::set_var("AWS_ACCESS_KEY_ID", "akid");
-            std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
-            std::env::remove_var("AWS_SESSION_TOKEN");
-            std::env::remove_var("AWS_REGION");
-        }
-
+        let env = BedrockTestEnvironment::new();
+        env.set("AWS_ACCESS_KEY_ID", Some("akid"));
+        env.set("AWS_SECRET_ACCESS_KEY", Some("secret"));
+        env.set("AWS_SESSION_TOKEN", None);
+        env.set("AWS_REGION", None);
+        env.set("AWS_DEFAULT_REGION", None);
         let provider = BedrockProvider::from_env().unwrap();
         assert_eq!(provider.region, "us-east-1");
         assert!(provider.session_token.is_none());
-
-        unsafe {
-            std::env::remove_var("AWS_ACCESS_KEY_ID");
-            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-        }
     }
 
     #[test]
@@ -1466,7 +1848,7 @@ mod tests {
         let url = provider.converse_url("anthropic.claude-3-sonnet-20240229-v1:0");
         assert_eq!(
             url,
-            "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-sonnet-20240229-v1:0/converse"
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-sonnet-20240229-v1%3A0/converse"
         );
     }
 
@@ -2313,3 +2695,7 @@ mod confirmed_duration_wire_regressions {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "wire_tests/bedrock.rs"]
+mod wire_contract_tests;

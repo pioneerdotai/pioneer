@@ -976,6 +976,7 @@ pub enum AgentControlError {
     TurnAlreadyRunning,
     AttemptNotRunning,
     ExecutionWindowContinuationBlocked {
+        stop_reason: Option<pioneer_protocol::RecoveryStopReason>,
         reason: String,
     },
     MailboxEnqueueTimeout {
@@ -1016,7 +1017,7 @@ impl Display for AgentControlError {
             Self::TurnMismatch => write!(f, "active turn does not match the requested turn"),
             Self::TurnAlreadyRunning => write!(f, "thread already has an active turn"),
             Self::AttemptNotRunning => write!(f, "turn item attempt is not running"),
-            Self::ExecutionWindowContinuationBlocked { reason } => write!(f, "{reason}"),
+            Self::ExecutionWindowContinuationBlocked { reason, .. } => write!(f, "{reason}"),
             Self::MailboxEnqueueTimeout {
                 operation,
                 actor_generation,

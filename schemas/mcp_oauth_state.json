@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "McpOAuthState",
+  "type": "string",
+  "enum": [
+    "idle",
+    "preparing",
+    "awaiting_callback",
+    "exchanging",
+    "resolving",
+    "retired",
+    "cleanup_required",
+    "authorized",
+    "auth_required",
+    "insufficient_scope",
+    "denied",
+    "cancelled",
+    "timed_out",
+    "failed"
+  ]
+}

@@ -1278,6 +1278,10 @@ impl crate::rpc::JsonRpcRequestTransport for ConnectionRequestTransport {
         payload: String,
         response_tx: crate::rpc::JsonRpcResponseSender,
     ) -> std::result::Result<(), String> {
+        #[cfg(test)]
+        if let Some(transport) = self.sender.test_requests.lock().unwrap().clone() {
+            return transport.send_json_rpc_request(request_id, payload, response_tx);
+        }
         self.sender
             .command_tx
             .send(GatewayWsCommand::Request {

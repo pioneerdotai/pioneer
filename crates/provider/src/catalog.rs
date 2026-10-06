@@ -6,6 +6,8 @@ pub use input::InputCapabilityState;
 pub(crate) use input::effective_input_model;
 pub mod generator;
 pub mod runtime;
+#[cfg(test)]
+pub(crate) mod tool_tests;
 use std::{
     collections::BTreeMap,
     sync::{Arc, OnceLock, RwLock},
@@ -14,6 +16,15 @@ use std::{
 use pioneer_protocol::ProviderModelInfo;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// An explicit all-string marker list is evidence; absent/null/malformed is unknown.
+/// Shared by periodic sources and authority-native model discovery.
+pub(crate) fn tool_support_from_marker_list(value: &Value, marker: &str) -> Option<bool> {
+    value
+        .as_array()
+        .filter(|values| values.iter().all(Value::is_string))
+        .map(|values| values.iter().any(|value| value == marker))
+}
 
 pub const UNKNOWN_CONTEXT_WINDOW: u64 = 128_000;
 
@@ -58,6 +69,9 @@ struct ModelOrigins {
     /// Pioneer supplement: Pi keeps only the combined window/output in Model.
     #[serde(default)]
     input_limit: Option<InputLimit>,
+    /// Source capability, independent of brand and of token limit fallbacks.
+    #[serde(default)]
+    tool_calling: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -75,16 +89,67 @@ pub struct CatalogLimits {
     pub max_input: Option<u64>,
 }
 
+pub type ToolCapabilities = BTreeMap<String, BTreeMap<String, bool>>;
+
+/// Registry aliases identify a provider; catalog aliases identify its source.
+/// Regional/coding-plan source authorities are deliberately not collapsed.
+pub(crate) fn catalog_provider(provider: &str) -> String {
+    let canonical = crate::provider_definition(provider);
+    let provider = canonical.as_ref().map_or(provider, |d| d.name);
+    match provider {
+        "gemini" => "google",
+        "bedrock" => "amazon-bedrock",
+        "copilot" => "github-copilot",
+        "zai" => "zai-standard",
+        "zai-coding" => "zai",
+        "glm-coding" => "zai-coding-cn",
+        "zhipuai" => "glm",
+        "zhipuai-coding-plan" => "zai-coding-cn",
+        "azure-openai" => "azure-openai-responses",
+        other => other,
+    }
+    .to_owned()
+}
+
 pub struct ModelCatalog {
     models: BTreeMap<String, BTreeMap<String, CatalogModel>>,
     origins: BTreeMap<String, BTreeMap<String, ModelOrigins>>,
+    tool_capabilities: Option<ToolCapabilities>,
 }
 
 impl ModelCatalog {
+    pub fn tool_support(&self, provider: &str, id: &str) -> Option<bool> {
+        let provider = catalog_provider(provider);
+        let model = self.models.get(&provider).and_then(|models| models.get(id));
+        let explicit = model.and_then(|m| m.metadata.get("toolCalling")?.as_bool());
+        if let Some(capabilities) = &self.tool_capabilities {
+            return merge_tool_support(
+                explicit,
+                capabilities.get(&provider).and_then(|m| m.get(id)).copied(),
+            );
+        }
+        // Older snapshots have only optional per-model provenance. New source
+        // supplements are independent of tool-capable list membership/routing.
+        merge_tool_support(
+            explicit,
+            self.origins
+                .get(&provider)
+                .and_then(|m| m.get(id))
+                .and_then(|o| o.tool_calling),
+        )
+    }
     pub fn parse(models: &str, origins: &str) -> anyhow::Result<Self> {
+        Self::parse_with_capabilities(models, origins, None)
+    }
+    pub fn parse_with_capabilities(
+        models: &str,
+        origins: &str,
+        tool_capabilities: Option<ToolCapabilities>,
+    ) -> anyhow::Result<Self> {
         let catalog = Self {
             models: serde_json::from_str(models)?,
             origins: serde_json::from_str(origins)?,
+            tool_capabilities,
         };
         anyhow::ensure!(!catalog.models.is_empty(), "empty model catalog");
         for (provider, models) in &catalog.models {
@@ -118,17 +183,8 @@ impl ModelCatalog {
     }
 
     pub fn model(&self, provider: &str, id: &str) -> Option<&CatalogModel> {
-        let provider = crate::definition::provider_definition(provider)
-            .map(|d| d.name)
-            .unwrap_or(provider);
-        let provider = match provider {
-            "gemini" => "google",
-            "bedrock" => "amazon-bedrock",
-            "copilot" => "github-copilot",
-            "azure_openai" | "azure-openai" => "azure-openai-responses",
-            other => other,
-        };
-        self.models.get(provider)?.get(id)
+        let provider = catalog_provider(provider);
+        self.models.get(&provider)?.get(id)
     }
 
     pub fn limits(&self, provider: &str, id: &str) -> CatalogLimits {
@@ -162,10 +218,24 @@ impl ModelCatalog {
     /// or inventing a measured provider limit for a synthetic fallback.
     /// User overrides are applied by the workspace resolver after discovery.
     pub fn enrich(&self, provider: &str, models: &mut [ProviderModelInfo]) {
+        self.enrich_for_tool_scope(provider, models, true);
+    }
+
+    pub(crate) fn enrich_for_tool_scope(
+        &self,
+        provider: &str,
+        models: &mut [ProviderModelInfo],
+        use_tool_sources: bool,
+    ) {
         for model in models {
             if let Some(input) = &model.capabilities.input_modalities {
                 model.capabilities.vision =
                     Some(input.iter().any(|v| v.eq_ignore_ascii_case("image")));
+            }
+            if use_tool_sources {
+                let source = self.tool_support(provider, &model.id);
+                model.capabilities.tool_calling =
+                    merge_tool_support(model.capabilities.tool_calling, source);
             }
             let Some(entry) = self.model(provider, &model.id) else {
                 continue;
@@ -184,7 +254,6 @@ impl ModelCatalog {
                 model.name = Some(entry.name.clone());
             }
             model.capabilities.thinking.get_or_insert(entry.reasoning);
-            model.capabilities.tool_calling.get_or_insert(true);
             let effective = effective_input_model(provider, &model.id, Some(entry), Some(model))
                 .expect("catalog model");
             let input = model
@@ -241,6 +310,16 @@ impl ModelCatalog {
     }
 }
 
+/// Explicit negatives from discovery or metadata/source veto permission.
+/// Otherwise discovery wins, then catalog; missing remains unknown.
+pub(crate) fn merge_tool_support(discovery: Option<bool>, catalog: Option<bool>) -> Option<bool> {
+    if discovery == Some(false) || catalog == Some(false) {
+        Some(false)
+    } else {
+        discovery.or(catalog)
+    }
+}
+
 #[derive(Default)]
 struct CatalogStore(RwLock<Option<Arc<ModelCatalog>>>);
 impl CatalogStore {
@@ -272,6 +351,21 @@ pub fn model_catalog() -> anyhow::Result<Arc<ModelCatalog>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_support_is_model_specific_and_unknown_is_preserved() {
+        let mut models: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/catalog/models.json")).unwrap();
+        let mut origins: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/catalog/provenance.json"))
+                .unwrap();
+        models["openai"]["gpt-5.4"]["toolCalling"] = Value::Bool(false);
+        origins["openai"]["gpt-5.4"]["toolCalling"] = Value::Bool(true);
+        let catalog = ModelCatalog::parse(&models.to_string(), &origins.to_string()).unwrap();
+        assert_eq!(catalog.tool_support("openai", "gpt-5.4"), Some(false));
+        assert_eq!(catalog.tool_support("openai", "unknown"), None);
+        assert_eq!(catalog.tool_support("openai", "gpt-5-nano"), None);
+    }
 
     fn fixture_catalog() -> ModelCatalog {
         ModelCatalog::parse(

@@ -9,6 +9,46 @@ use crate::types::{InputTypeSupport, ProviderInputCapabilities, ProviderTimeoutP
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 
+/// Environment-backed connection inputs participate in cached authority identity.
+/// Hash values directly; never retain or print AWS credentials/session tokens.
+pub(crate) fn hash_connection_environment(digest: &mut Sha256, provider: &str) {
+    hash_connection_values(digest, provider, |name| std::env::var(name).ok());
+}
+
+fn hash_connection_values(
+    digest: &mut Sha256,
+    provider: &str,
+    resolve: impl Fn(&str) -> Option<String>,
+) {
+    let names: &[&str] = match provider_definition(provider).map(|d| d.name) {
+        Some("bedrock") => &[
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+        ],
+        Some("azure-openai") => &[
+            "AZURE_OPENAI_RESOURCE",
+            "AZURE_OPENAI_DEPLOYMENT",
+            "AZURE_OPENAI_API_VERSION",
+        ],
+        _ => &[],
+    };
+    for name in names {
+        digest.update([0]);
+        digest.update(name.as_bytes());
+        digest.update([0]);
+        match resolve(name) {
+            Some(value) => {
+                digest.update([1]);
+                digest.update(value.as_bytes());
+            }
+            None => digest.update([0]),
+        }
+    }
+}
+
 pub fn create_provider(provider_name: &str, api_key: &str) -> Result<Box<dyn Provider>> {
     create_provider_with_timeout_policy(provider_name, api_key, ProviderTimeoutPolicy::default())
 }
@@ -37,6 +77,7 @@ pub fn create_provider_with_timeout_policy_and_proxy(
     digest.update(api_key.as_bytes());
     digest.update([0]);
     digest.update(proxy_url.unwrap_or("<direct>").as_bytes());
+    hash_connection_environment(&mut digest, provider_name);
     let authority_fingerprint = hex::encode(digest.finalize());
     create_provider_with_timeout_policy_and_proxy_and_authority(
         provider_name,
@@ -96,6 +137,12 @@ fn create_provider_with_timeout_policy_inner(
 ) -> Result<Box<dyn Provider>> {
     let definition =
         provider_definition(provider_name).ok_or_else(|| anyhow::anyhow!("unknown provider"))?;
+    if let Some(reason) = definition.retirement_reason() {
+        return Ok(Box::new(crate::providers::retired::RetiredProvider::new(
+            definition.name,
+            reason,
+        )));
+    }
     let endpoint = base_url.or(definition.default_base_url);
     let compat = |api_key: &str| {
         let effective_base_url = endpoint.expect("compatible provider endpoint definition");
@@ -175,18 +222,20 @@ fn create_provider_with_timeout_policy_inner(
             endpoint.expect("Copilot endpoint definition"),
             timeout_policy,
         ))),
-        "bedrock" => Ok(Box::new(
-            BedrockProvider::from_env_with_timeout_policy(timeout_policy).unwrap_or_else(|_| {
-                BedrockProvider::with_timeout_policy(api_key, "", "us-east-1", timeout_policy)
-            }),
-        )),
+        // A single generic API key is not an AWS SigV4 credential pair.
+        "bedrock" => Ok(Box::new(BedrockProvider::from_env_with_timeout_policy(
+            timeout_policy,
+        )?)),
 
         // ── GLM / Zhipu ─────────────────────────────────────────────────
-        "glm" => Ok(Box::new(GlmProvider::with_base_url_and_timeout_policy(
-            api_key,
-            endpoint.expect("GLM endpoint definition"),
-            timeout_policy,
-        ))),
+        "glm" | "zai" | "glm-coding" | "zai-coding" => Ok(Box::new(
+            GlmProvider::with_base_url_and_timeout_policy(
+                api_key,
+                endpoint.expect("GLM endpoint definition"),
+                timeout_policy,
+            )
+            .with_profile(definition.name),
+        )),
 
         // ── Azure OpenAI ────────────────────────────────────────────────
         "azure-openai" => {
@@ -195,6 +244,7 @@ fn create_provider_with_timeout_policy_inner(
             // configuration for the rest.
             let resource = std::env::var("AZURE_OPENAI_RESOURCE").unwrap_or_default();
             let deployment = std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or_default();
+            let version = std::env::var("AZURE_OPENAI_API_VERSION").ok();
             if let Some(base_url) = base_url {
                 Ok(Box::new(
                     AzureOpenAiProvider::with_base_url_and_timeout_policy(
@@ -203,15 +253,19 @@ fn create_provider_with_timeout_policy_inner(
                         deployment,
                         base_url,
                         timeout_policy,
-                    ),
+                    )
+                    .with_version_override(version.as_deref()),
                 ))
             } else {
-                Ok(Box::new(AzureOpenAiProvider::with_timeout_policy(
-                    api_key,
-                    resource,
-                    deployment,
-                    timeout_policy,
-                )))
+                Ok(Box::new(
+                    AzureOpenAiProvider::with_timeout_policy(
+                        api_key,
+                        resource,
+                        deployment,
+                        timeout_policy,
+                    )
+                    .with_version_override(version.as_deref()),
+                ))
             }
         }
 
@@ -249,6 +303,56 @@ mod tests {
     use crate::attachments::prepare_messages_for_provider;
     use crate::types::{AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart};
     use base64::Engine;
+
+    #[test]
+    fn connection_configuration_changes_cached_authority_without_retaining_secrets() {
+        let fingerprint = |provider: &str, changed: &str, value: &str| {
+            let mut digest = Sha256::new();
+            hash_connection_values(&mut digest, provider, |name| {
+                Some(
+                    if name == changed {
+                        value
+                    } else {
+                        "dummy-baseline"
+                    }
+                    .to_owned(),
+                )
+            });
+            hex::encode(digest.finalize())
+        };
+        for (provider, fields) in [
+            (
+                "bedrock",
+                vec![
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "AWS_SESSION_TOKEN",
+                    "AWS_REGION",
+                    "AWS_DEFAULT_REGION",
+                ],
+            ),
+            (
+                "azure",
+                vec![
+                    "AZURE_OPENAI_RESOURCE",
+                    "AZURE_OPENAI_DEPLOYMENT",
+                    "AZURE_OPENAI_API_VERSION",
+                ],
+            ),
+        ] {
+            let baseline = fingerprint(provider, "", "");
+            for field in fields {
+                let changed = fingerprint(provider, field, "dummy-rotated");
+                assert_ne!(changed, baseline, "{provider}/{field}");
+                assert_eq!(changed.len(), 64);
+                assert!(!changed.contains("dummy"));
+            }
+        }
+        assert_eq!(
+            fingerprint("openai", "AWS_SESSION_TOKEN", "dummy-rotated"),
+            fingerprint("openai", "", "")
+        );
+    }
 
     #[test]
     fn creates_openrouter_provider() {
@@ -354,8 +458,6 @@ mod tests {
             "telnyx",
             "copilot",
             "github-copilot",
-            "bedrock",
-            "aws-bedrock",
             "glm",
             "zhipu",
             "bigmodel",
@@ -542,7 +644,6 @@ mod tests {
             "venice",
             "cerebras",
             "sambanova",
-            "hyperbolic",
             "deepinfra",
             "deep-infra",
             "huggingface",
@@ -565,9 +666,6 @@ mod tests {
             "stepfun",
             "step",
             "baichuan",
-            "yi",
-            "01ai",
-            "lingyiwanwu",
             "hunyuan",
             "tencent",
             "ovhcloud",
@@ -706,7 +804,7 @@ mod tests {
             ),
             (
                 "azure-openai",
-                "/gateway/api/openai/models?api-version=2024-08-01-preview",
+                "/gateway/api/openai/v1/models",
                 r#"{"data":[{"id":"fixture"}]}"#,
             ),
         ] {
@@ -775,6 +873,9 @@ mod tests {
         for name in [
             "ollama",
             "glm",
+            "zai",
+            "glm-coding",
+            "zai-coding",
             "deepseek",
             "gemini",
             "telnyx",
@@ -896,7 +997,7 @@ mod tests {
             let expected_path = match name {
                 "ollama" => "/secret-gateway/api/chat".to_owned(),
                 "gemini" => "/secret-gateway/api/models/fixture:generateContent?key=key".to_owned(),
-                "azure-openai" => "/secret-gateway/api/openai/deployments/fixture-deployment/chat/completions?api-version=2024-08-01-preview".to_owned(),
+                "azure-openai" => "/secret-gateway/api/openai/v1/chat/completions".to_owned(),
                 _ => "/secret-gateway/api/chat/completions".to_owned(),
             };
             let expected_stream_path = if name == "gemini" {
@@ -914,6 +1015,10 @@ mod tests {
                 let lower = requests[index].to_ascii_lowercase();
                 if name == "azure-openai" {
                     assert!(lower.contains("api-key: key\r\n"), "{name}");
+                    assert!(
+                        requests[index].contains("\"model\":\"fixture-deployment\""),
+                        "Azure v1 requires deployment in body"
+                    );
                 } else if !matches!(name, "ollama" | "gemini") {
                     assert!(lower.contains("authorization: bearer key\r\n"), "{name}");
                 } else {

@@ -13,6 +13,11 @@ pub use pioneer_protocol::ReasoningEffort;
 /// conservative provider-neutral classifier in the agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderFailureClassification {
+    /// Retains the registry's network fallback after the unsafe source is dropped.
+    /// Internal transport fact, never serialized into public diagnostics.
+    pub is_network_error: bool,
+    pub error_reason: Option<pioneer_protocol::ProviderErrorReason>,
+    pub request_id: Option<pioneer_protocol::ProviderRequestId>,
     pub class: ProviderFailureClass,
     pub http_status: Option<u16>,
     pub provider_code: Option<String>,
@@ -22,10 +27,54 @@ pub struct ProviderFailureClassification {
 impl ProviderFailureClassification {
     pub fn new(class: ProviderFailureClass) -> Self {
         Self {
+            is_network_error: false,
+            error_reason: None,
+            request_id: None,
             class,
             http_status: None,
             provider_code: None,
             retry_after_ms: None,
+        }
+    }
+}
+
+/// Request-owned diagnostic facts, independent of payload chunks and progress.
+/// Each streaming request gets a fresh handle; providers must never reuse it.
+#[derive(Clone, Debug, Default)]
+pub struct ProviderStreamDiagnostics {
+    request_id: std::sync::Arc<std::sync::RwLock<Option<pioneer_protocol::ProviderRequestId>>>,
+}
+
+impl ProviderStreamDiagnostics {
+    pub fn request_id(&self) -> Option<pioneer_protocol::ProviderRequestId> {
+        self.request_id
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn set_request_id(&self, id: pioneer_protocol::ProviderRequestId) {
+        *self
+            .request_id
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(id);
+    }
+}
+
+/// A provider stream and its request-owned facts, consumed by agent deadlines.
+/// Facts do not produce chunks or reset the first/inter-chunk deadline.
+pub struct ProviderStream {
+    pub stream: futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>,
+    pub diagnostics: ProviderStreamDiagnostics,
+}
+
+impl ProviderStream {
+    pub fn new(
+        stream: futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>,
+    ) -> Self {
+        Self {
+            stream,
+            diagnostics: ProviderStreamDiagnostics::default(),
         }
     }
 }
@@ -787,6 +836,8 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     pub tools: Option<Vec<ToolDefinition>>,
     pub tool_choice: Option<ToolChoice>,
+    /// true permits multiple calls (it does not require them); false requires
+    /// at most one call per response and must be enforced or rejected locally.
     pub parallel_tool_calls: Option<bool>,
     pub reasoning: Option<ReasoningConfig>,
     pub compiled_prompt: Option<CompiledPromptPayload>,

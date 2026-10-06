@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "McpActionPublication",
+  "type": "object",
+  "properties": {
+    "field_error": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/McpInstallFieldError"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "kind": {
+      "$ref": "#/$defs/McpActionKind"
+    },
+    "operation_id": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "state": {
+      "$ref": "#/$defs/McpActionState"
+    }
+  },
+  "required": [
+    "operation_id",
+    "revision",
+    "state",
+    "kind"
+  ],
+  "$defs": {
+    "McpActionKind": {
+      "type": "string",
+      "enum": [
+        "retry_authorization_browser",
+        "sign_in",
+        "disconnect",
+        "cancel_authorization",
+        "policy",
+        "restart",
+        "remove",
+        "configure"
+      ]
+    },
+    "McpActionState": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "succeeded",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "McpDiagnosticLevel": {
+      "type": "string",
+      "enum": [
+        "error",
+        "warning"
+      ]
+    },
+    "McpInstallFieldError": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ValidationIssues": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/McpInstallFieldIssue"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ValidationIssues"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Failure": {
+              "type": "object",
+              "properties": {
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "message"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Failure"
+          ]
+        }
+      ]
+    },
+    "McpInstallFieldIssue": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ServerValidationError": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ServerValidationError"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Diagnostic": {
+              "type": "object",
+              "properties": {
+                "field_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "level": {
+                  "$ref": "#/$defs/McpDiagnosticLevel"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "level",
+                "message"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Diagnostic"
+          ]
+        }
+      ]
+    }
+  }
+}

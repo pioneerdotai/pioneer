@@ -57,6 +57,20 @@ pub(super) fn models_dev(data: &Value, nvidia: &Value, strict: bool) -> Result<V
             "openai-completions",
             "https://api.groq.com/openai/v1",
         ),
+        // Keep standard API metadata separate from the coding subscription
+        // sources below. Source data remains the owner of limits and pricing.
+        (
+            "zai",
+            "zai-standard",
+            "openai-completions",
+            "https://api.z.ai/api/paas/v4",
+        ),
+        (
+            "zhipuai",
+            "glm",
+            "openai-completions",
+            "https://open.bigmodel.cn/api/paas/v4",
+        ),
         (
             "cerebras",
             "cerebras",
@@ -647,10 +661,12 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         }
         // Never refill entries intentionally filtered by specialized routing
         // (notably NVIDIA's live model list and provider-specific exclusions).
-        if specialized.iter().any(|route| {
-            crate::definition::provider_definition(route)
-                .map_or(*route == provider, |d| d.name == provider)
-        }) {
+        if specialized.contains(crate::catalog::catalog_provider(provider).as_str())
+            || specialized.iter().any(|route| {
+                crate::definition::provider_definition(route)
+                    .map_or(*route == provider, |d| d.name == provider)
+            })
+        {
             continue;
         }
         let Some(url) = definition.default_base_url else {
@@ -726,6 +742,8 @@ pub(super) fn openrouter(data: &Value) -> Vec<Candidate> {
                 (4096, 4096),
             );
             c.model["name"] = m["name"].clone();
+            // This source's candidates were filtered by supported_parameters.
+            c.tool_calling = Some(has(&m["supported_parameters"], "tools"));
             c.model["reasoning"] = json!(has(&m["supported_parameters"], "reasoning"));
             // Explicit arrays preserve audio/video/file. Legacy modality strings
             // describe the same contract; absent metadata stays unknown.
@@ -792,6 +810,7 @@ pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
                 (4096, 4096),
             );
             c.model["reasoning"] = json!(has(&m["tags"], "reasoning"));
+            c.tool_calling = Some(has(&m["tags"], "tool-use"));
             c.model["input"] = m["input_modalities"].as_array().map(|v| json!(v))
                 .unwrap_or_else(|| if has(&m["tags"], "vision") {json!(["text", "image"])} else {json!([])});
             c.model["inputOrigin"] = json!({"kind":if m["input_modalities"].is_array(){"source"}else if has(&m["tags"], "vision"){"partial"}else{"fallback"},"expression":"vercel.input_modalities or positive vision tag"});
@@ -812,4 +831,58 @@ pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
             c
         })
         .collect()
+}
+
+/// Capability-only supplement collected before tool-capable list filtering.
+/// No limits/pricing/routes are generated for negative or unknown entries.
+/// Dedicated endpoint listings override models.dev only with explicit evidence.
+pub(super) fn tool_capabilities(snapshot: &SourceSnapshot) -> super::super::ToolCapabilities {
+    let mut result = super::super::ToolCapabilities::new();
+    for (provider, data) in snapshot.sources[SOURCE_URLS[0]]
+        .body
+        .as_object()
+        .into_iter()
+        .flatten()
+    {
+        let provider = super::super::catalog_provider(provider);
+        for (id, model) in data["models"].as_object().into_iter().flatten() {
+            if let Some(supported) = model["tool_call"].as_bool() {
+                result
+                    .entry(provider.clone())
+                    .or_default()
+                    .insert(id.clone(), supported);
+            }
+        }
+    }
+    for (url, provider, field, marker) in [
+        (
+            SOURCE_URLS[1],
+            "openrouter",
+            "supported_parameters",
+            "tools",
+        ),
+        (SOURCE_URLS[2], "vercel-ai-gateway", "tags", "tool-use"),
+    ] {
+        for model in snapshot.sources[url].body["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = model["id"].as_str().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            // Missing/null/malformed metadata is unknown, an explicit valid
+            // list without the capability is negative (including an empty list).
+            let Some(supported) =
+                crate::catalog::tool_support_from_marker_list(&model[field], marker)
+            else {
+                continue;
+            };
+            result
+                .entry(provider.into())
+                .or_default()
+                .insert(id.into(), supported);
+        }
+    }
+    result
 }

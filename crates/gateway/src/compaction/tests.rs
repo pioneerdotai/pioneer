@@ -1671,6 +1671,9 @@ impl Provider for ProviderFixture {
     }
     fn classify_failure(&self, _: &anyhow::Error) -> Option<ProviderFailureClassification> {
         Some(ProviderFailureClassification {
+            is_network_error: false,
+            error_reason: None,
+            request_id: None,
             class: ProviderFailureClass::RateLimit,
             http_status: Some(429),
             provider_code: None,
@@ -18321,14 +18324,6 @@ async fn old_thread_summary_is_ignored_with_available_originals() {
 
 #[tokio::test]
 async fn stopped_compaction_item_is_cancelled_with_the_same_lifecycle_identity() {
-    let observer = HubCompactionObserver {
-        hub: Arc::new(ExecutionEventHub::new()),
-        processor: std::sync::Weak::new(),
-        lifecycle_store: CrudStore::new(Database::connect("sqlite::memory:").await.unwrap()),
-        workspace: "ws".into(),
-        thread: "thread".into(),
-        turn: "turn".into(),
-    };
     let mut state = RunnerState::new(
         900000,
         &ModelBudget::new(Some(128000), None, Some(16384)),
@@ -18336,11 +18331,11 @@ async fn stopped_compaction_item_is_cancelled_with_the_same_lifecycle_identity()
         None,
     )
     .unwrap();
-    let started = observer.item("operation", &state, false);
+    let started = HubCompactionObserver::item("operation", &state, false);
     state.phase = RunnerPhase::Failed {
         kind: FailureKind::Cancelled,
     };
-    let cancelled = observer.item("operation", &state, true);
+    let cancelled = HubCompactionObserver::item("operation", &state, true);
     for (item, expected) in [(started, "started"), (cancelled, "cancelled")] {
         let pioneer_protocol::TurnItem::SystemEvent {
             id,

@@ -41,6 +41,8 @@ pub(crate) struct CatalogInput {
     pub mcp_details_loading: bool,
     pub mcp_error: Option<String>,
     pub pending: std::collections::HashSet<String>,
+    pub oauth:
+        std::collections::BTreeMap<String, (pioneer_client::mcp::oauth::OAuthPresentation, bool)>,
 }
 impl CatalogInput {
     fn selected(&self) -> Option<&McpListItem> {
@@ -54,6 +56,7 @@ impl CatalogInput {
     }
     fn same_screen(&self, other: &Self) -> bool {
         self.same_parent(other)
+            && self.oauth == other.oauth
             && if matches!(
                 self.navigation_input.destination(),
                 SemanticDestination::Mcp { server_id: Some(_) }
@@ -75,6 +78,8 @@ impl CatalogInput {
     }
     fn same_sidebar(&self, other: &Self) -> bool {
         self.same_parent(other)
+            && self.oauth == other.oauth
+            && self.mcp_server_details == other.mcp_server_details
             && self.selected() == other.selected()
             && self.mcp_loading == other.mcp_loading
             && self.is_mcp_pending(pioneer_client::mcp::list::MCP_INSTALL_PENDING_KEY)
@@ -98,6 +103,7 @@ impl CatalogInput {
             mcp_details_loading: false,
             mcp_error: None,
             pending: Default::default(),
+            oauth: Default::default(),
         }
     }
     pub fn principal_presentation_capabilities(&self) -> PrincipalPresentationCapabilities {
@@ -308,6 +314,9 @@ impl McpCatalogView {
                     .then(|| t!("mcp.error.load_servers_failed", error = "").to_string());
             }
             for server in &next.mcp_servers {
+                if let Some(oauth) = self.client.mcp_oauth_presentation(&workspace, &server.id) {
+                    next.oauth.insert(server.id.clone(), oauth);
+                }
                 let scope = ClientScope::McpAction {
                     workspace_id: workspace.clone(),
                     target: server.id.clone(),
@@ -318,6 +327,17 @@ impl McpCatalogView {
                         next.pending.insert(server.id.clone());
                     } else if action.state == McpActionState::Failed {
                         next.mcp_error = Some(match action.kind {
+                            McpActionKind::RetryAuthorizationBrowser
+                            | McpActionKind::SignIn
+                            | McpActionKind::Disconnect
+                            | McpActionKind::CancelAuthorization => {
+                                let code = match action.field_error.as_ref() {
+                                    Some(pioneer_client::mcp::actions::McpInstallFieldError::Failure { message }) => Some(message.as_str()),
+                                    _ => None,
+                                };
+                                code.and_then(crate::oauth::preparation_error_label)
+                                    .unwrap_or_else(|| t!("mcp.oauth.failed").to_string())
+                            }
                             McpActionKind::Policy => {
                                 t!("mcp.error.policy_update_failed", error = "").to_string()
                             }
@@ -433,6 +453,44 @@ mod tests {
     use pioneer_client::navigation::NavigationIntent;
     use pioneer_desktop_foundation::{ClientBindingRegistration, ClientPublicationSink};
     use std::{cell::Cell, rc::Rc, sync::Weak};
+    #[test]
+    fn oauth_and_details_changes_refresh_sidebar_without_catalog_changes() {
+        let core = pioneer_client::core::ClientCore::new();
+        let original = super::CatalogInput::empty(&core);
+        let mut next = original.clone();
+        next.oauth.insert(
+            "server".into(),
+            (
+                pioneer_client::mcp::oauth::OAuthPresentation {
+                    workspace_id: "workspace".into(),
+                    server_id: "server".into(),
+                    name: "server".into(),
+                    scope_kind: pioneer_client::mcp::actions::mcp_server_restart_params(
+                        "workspace",
+                        "server",
+                    )
+                    .scope_kind,
+                    flow_id: None,
+                    state: pioneer_client::mcp::types::McpOAuthState::AuthRequired,
+                    authorization_url: None,
+                    diagnostic: None,
+                },
+                false,
+            ),
+        );
+        assert!(!original.same_sidebar(&next));
+        assert!(next.same_sidebar(&next.clone()));
+        let previous = next.clone();
+        next.oauth.get_mut("server").unwrap().0.state =
+            pioneer_client::mcp::types::McpOAuthState::Authorized;
+        assert!(!previous.same_sidebar(&next));
+        let previous = next.clone();
+        next.mcp_server_details = Some(pioneer_client::catalog_test_support::mcp_detail("server"));
+        assert!(!previous.same_sidebar(&next));
+        let previous = next.clone();
+        next.oauth.remove("server");
+        assert!(!previous.same_sidebar(&next));
+    }
     struct Registrar;
     impl ClientBindingRegistrar for Registrar {
         fn register(

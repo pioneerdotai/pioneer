@@ -173,7 +173,7 @@ pub(super) async fn run_admitted_connection(
     }
 }
 
-async fn run_normal_connection(
+pub(crate) async fn run_normal_connection(
     ws: WebSocket,
     config: AppConfig,
     principal: Arc<AuthenticatedSessionPrincipal>,

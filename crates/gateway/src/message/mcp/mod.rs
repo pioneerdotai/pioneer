@@ -21,6 +21,7 @@ const MCP_ERROR_INTERNAL: &str = "mcp.internal_error";
 mod details;
 mod install;
 mod list;
+mod oauth;
 mod policy;
 mod restart;
 mod uninstall;

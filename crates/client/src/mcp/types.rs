@@ -8,3 +8,5 @@ pub use pioneer_protocol::{
 };
 
 pub use pioneer_protocol::McpDiagnosticLevel;
+
+pub use pioneer_protocol::{McpOAuthState, McpTransportSummary};
