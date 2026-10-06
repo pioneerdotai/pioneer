@@ -865,7 +865,7 @@ async fn import_one_configured_package(
     }
 }
 
-fn row_metadata_matches(
+pub(crate) fn row_metadata_matches(
     row: &SkillInstallationRecord,
     metadata: &PreparedSkillStorageMetadata,
 ) -> bool {
@@ -884,42 +884,43 @@ async fn find_row_for_import_source(
     source_path: &Path,
     source_ref: &str,
 ) -> Result<Option<SkillInstallationRecord>> {
-    let rows = crud_store.list_skill_installations().await?;
-    let mut provenance_matches = rows
-        .iter()
-        .filter(|row| {
-            row.source_kind == source_kind
-                && row.scope_key == scope_key
-                && row.source_ref == source_ref
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if provenance_matches.len() > 1 {
-        bail!("multiple skill rows share exact import provenance `{source_ref}`");
+    let mut after = None;
+    let mut provenance_match = None;
+    let mut path_match = None;
+    let mut path_ambiguous = false;
+    loop {
+        let page = crud_store
+            .list_skill_installations_scope_page(source_kind, scope_key, after.as_deref(), 64)
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        after = page.last().map(|row| row.skill_id.to_string());
+        for row in page {
+            if row.source_ref == source_ref {
+                if provenance_match.replace(row.clone()).is_some() {
+                    bail!("multiple skill rows share exact import provenance `{source_ref}`");
+                }
+            }
+            if normalize_absolute_path(Path::new(&row.install_path))
+                .ok()
+                .as_deref()
+                == Some(source_path)
+            {
+                path_ambiguous |= path_match.replace(row).is_some();
+            }
+        }
     }
-    if let Some(row) = provenance_matches.pop() {
+    if let Some(row) = provenance_match {
         return Ok(Some(row));
     }
-
-    let mut path_matches = Vec::new();
-    for row in rows {
-        if row.source_kind != source_kind || row.scope_key != scope_key {
-            continue;
-        }
-        let Ok(install_path) = normalize_absolute_path(Path::new(row.install_path.as_str())) else {
-            continue;
-        };
-        if install_path == source_path {
-            path_matches.push(row);
-        }
-    }
-    if path_matches.len() > 1 {
+    if path_ambiguous {
         bail!(
             "multiple skill rows share exact configured source path `{}`",
             source_path.display()
         );
     }
-    Ok(path_matches.pop())
+    Ok(path_match)
 }
 
 async fn allocate_import_skill_id(
@@ -1002,7 +1003,7 @@ pub(crate) fn import_source_ref(path: &Path) -> Result<String> {
     Ok(format!("{IMPORT_PATH_PREFIX}{path}"))
 }
 
-fn trust_level_value(level: &SkillTrustLevel) -> &'static str {
+pub(crate) fn trust_level_value(level: &SkillTrustLevel) -> &'static str {
     match level {
         SkillTrustLevel::Internal => "internal",
         SkillTrustLevel::Verified => "verified",
@@ -1160,6 +1161,127 @@ fn publish_candidate_files(
             candidate.destination.display()
         )
     })
+}
+
+/// Native reconciliation uses the existing installer lock, metadata/lock-file
+/// rules and row fence. Replacing a tree is two same-filesystem renames; recursive
+/// cleanup is returned to the watcher's bounded FS cursor, outside the lock.
+pub(crate) async fn publish_watched_candidate(
+    crud_store: &CrudStore,
+    skills_write_lock: &Arc<Mutex<()>>,
+    candidate: SkillStorageRelocationCandidate,
+    snapshot: pioneer_crud::SkillReconciliationSnapshot,
+    workspace: Option<pioneer_entity::workspace::Model>,
+    stage: Option<PathBuf>,
+    stop: tokio_util::sync::CancellationToken,
+    still_current: impl Fn() -> bool + Send + Sync,
+    track_garbage: impl Fn(PathBuf) -> Result<()>,
+) -> Result<SkillStorageRelocationOutcome> {
+    let _lock = tokio::select! {
+        biased;
+        _ = stop.cancelled() => bail!("skills watcher stopped"),
+        lock = skills_write_lock.lock() => lock,
+    };
+    if !still_current() {
+        return Ok(SkillStorageRelocationOutcome::Stale);
+    }
+    validate_candidate_paths(&candidate, stage.is_none())?;
+    verify_source_revision(&candidate)?;
+    if let Some(stage) = &stage {
+        verify_copied_revision(&candidate, stage)?;
+    }
+    let renamed = stage.is_none() && candidate.source_path != candidate.destination;
+    let mut backup = None;
+    if (stage.is_some() || renamed) && fs::symlink_metadata(&candidate.destination).is_ok() {
+        let path = candidate.destination.with_file_name(format!(
+            ".pioneer-relocation-{}",
+            pioneer_protocol::generate_id(21)
+        ));
+        if fs::symlink_metadata(&path).is_ok() {
+            bail!("skill backup path collision");
+        }
+        track_garbage(path.clone())?;
+        fs::rename(&candidate.destination, &path)?;
+        backup = Some(path);
+    }
+    let published = if let Some(stage) = &stage {
+        fs::rename(stage, &candidate.destination)
+    } else if renamed {
+        fs::rename(&candidate.source_path, &candidate.destination)
+    } else {
+        Ok(())
+    };
+    if let Err(error) = published {
+        if let Some(backup) = &backup {
+            let _ = fs::rename(backup, &candidate.destination);
+        }
+        return Err(error.into());
+    }
+    let rollback_files = || {
+        if let Some(stage) = &stage {
+            let _ = fs::rename(&candidate.destination, stage);
+        } else if renamed {
+            rollback_managed_leaf_rename(&candidate);
+        }
+        if let Some(backup) = &backup {
+            let _ = fs::rename(backup, &candidate.destination);
+        }
+    };
+    let now = crate::message::now_timestamp_secs();
+    let previous_lock = match write_candidate_lock_entry(&candidate, now) {
+        Ok(previous) => previous,
+        Err(error) => {
+            rollback_files();
+            return Err(error);
+        }
+    };
+    let patch = candidate_database_patch(&candidate);
+    let switched = tokio::select! {
+        biased;
+        _ = stop.cancelled() => bail!("skills publication commit status unknown after cancellation"),
+        result = crud_store.reconcile_skill_installation(&snapshot, &patch, now, workspace.as_ref(), &still_current) => result,
+    };
+    match switched {
+        Ok(true) => {}
+        Ok(false) => {
+            restore_candidate_lock_entry(&candidate, previous_lock.as_ref());
+            rollback_files();
+            return Ok(SkillStorageRelocationOutcome::Stale);
+        }
+        // A failed commit may have taken effect. Do not perform an unfenced
+        // rollback/repair or another claim in this quantum; retry reads fresh facts.
+        Err(error) => return Err(error),
+    }
+    let mut old_paths = Vec::new();
+    if candidate.remove_managed_source_after_switch
+        && candidate.source_path != candidate.destination
+    {
+        old_paths.push(candidate.source_path.clone());
+    }
+    if let Some(path) = candidate.managed_path_to_remove_after_switch {
+        old_paths.push(path);
+    }
+    for path in old_paths {
+        if path != candidate.destination
+            && path_is_existing_descendant(&candidate.install_root, &path)
+        {
+            let garbage = path.with_file_name(format!(
+                ".pioneer-relocation-{}",
+                pioneer_protocol::generate_id(21)
+            ));
+            if fs::symlink_metadata(&garbage).is_err() {
+                if track_garbage(garbage.clone()).is_err() {
+                    warn!("managed skill source cleanup could not be tracked");
+                    continue;
+                }
+                if fs::rename(&path, &garbage).is_err() {
+                    warn!("managed skill source cleanup deferred");
+                }
+            }
+        }
+    }
+    drop(_lock);
+    Ok(SkillStorageRelocationOutcome::Switched)
 }
 
 fn candidate_database_patch(candidate: &SkillStorageRelocationCandidate) -> SkillInstallationPatch {

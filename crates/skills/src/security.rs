@@ -1,7 +1,6 @@
 use crate::contract::SkillTrustLevel;
 use crate::runtime::SkillRuntimeToolKind;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -71,111 +70,137 @@ pub fn scan_skill_directory(
     skill_dir: &Path,
     max_file_bytes: usize,
 ) -> SecurityScanReport {
-    let mut findings = Vec::new();
+    let mut scan = SkillDirectoryScan::new(source_root, skill_dir, max_file_bytes);
+    while !scan.step(64) {}
+    scan.report()
+}
 
-    let Some(root_canonical) = canonicalize_optional(source_root) else {
-        findings.push(block_finding(
-            "path.root_missing",
-            "source root cannot be canonicalized",
-            Some(source_root),
-        ));
-        return SecurityScanReport {
-            decision: SecurityDecision::Block,
-            findings,
-        };
-    };
+/// Retains directory iterators between quanta, including directories with only
+/// irrelevant entries. A technical quantum never truncates the skill package.
+pub(crate) struct SkillDirectoryScan {
+    root: Option<PathBuf>,
+    directories: Vec<fs::ReadDir>,
+    findings: Vec<SecurityFinding>,
+    decision: SecurityDecision,
+    max_file_bytes: usize,
+}
 
-    let Some(skill_canonical) = canonicalize_optional(skill_dir) else {
-        findings.push(block_finding(
-            "path.skill_missing",
-            "skill directory cannot be canonicalized",
-            Some(skill_dir),
-        ));
-        return SecurityScanReport {
-            decision: SecurityDecision::Block,
-            findings,
+impl SkillDirectoryScan {
+    pub(crate) fn new(source_root: &Path, skill_dir: &Path, max_file_bytes: usize) -> Self {
+        let root = canonicalize_optional(source_root);
+        let skill = canonicalize_optional(skill_dir);
+        let mut scan = Self {
+            root,
+            directories: Vec::new(),
+            findings: Vec::new(),
+            decision: SecurityDecision::Allow,
+            max_file_bytes,
         };
-    };
-
-    if !is_within(root_canonical.as_path(), skill_canonical.as_path()) {
-        findings.push(block_finding(
-            "path.containment",
-            "skill directory is outside configured source root",
-            Some(skill_dir),
-        ));
-        return SecurityScanReport {
-            decision: SecurityDecision::Block,
-            findings,
-        };
+        match (&scan.root, skill) {
+            (None, _) => scan.record(block_finding(
+                "path.root_missing",
+                "source root cannot be canonicalized",
+                Some(source_root),
+            )),
+            (_, None) => scan.record(block_finding(
+                "path.skill_missing",
+                "skill directory cannot be canonicalized",
+                Some(skill_dir),
+            )),
+            (Some(root), Some(skill)) if !is_within(root, &skill) => scan.record(block_finding(
+                "path.containment",
+                "skill directory is outside configured source root",
+                Some(skill_dir),
+            )),
+            (_, Some(skill)) => {
+                if let Ok(entries) = fs::read_dir(skill) {
+                    scan.directories.push(entries);
+                }
+            }
+        }
+        scan
     }
 
-    let mut queue = VecDeque::new();
-    queue.push_back(skill_canonical);
+    fn record(&mut self, finding: SecurityFinding) {
+        if finding.severity == "block" {
+            self.decision = SecurityDecision::Block;
+        } else if finding.severity == "warn" && self.decision == SecurityDecision::Allow {
+            self.decision = SecurityDecision::Warn;
+        }
+        self.findings.push(finding);
+    }
 
-    while let Some(current) = queue.pop_front() {
-        let Ok(entries) = fs::read_dir(current.as_path()) else {
-            continue;
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(metadata) = fs::symlink_metadata(path.as_path()) else {
+    pub(crate) fn step(&mut self, entries_budget: usize) -> bool {
+        for _ in 0..entries_budget {
+            let Some(entries) = self.directories.last_mut() else {
+                return true;
+            };
+            let Some(entry) = entries.next() else {
+                self.directories.pop();
                 continue;
             };
-
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let path = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
             if metadata.file_type().is_symlink() {
-                match fs::canonicalize(path.as_path()) {
-                    Ok(target_canonical)
-                        if is_within(root_canonical.as_path(), target_canonical.as_path()) =>
+                let finding = match fs::canonicalize(&path) {
+                    Ok(target)
+                        if self
+                            .root
+                            .as_ref()
+                            .is_some_and(|root| is_within(root, &target)) =>
                     {
-                        findings.push(warn_finding(
+                        warn_finding(
                             "path.symlink_present",
                             "skill contains symlink; kept under root containment",
-                            Some(path.as_path()),
-                        ));
+                            Some(&path),
+                        )
                     }
-                    Ok(_) => findings.push(block_finding(
+                    Ok(_) => block_finding(
                         "path.symlink_escape",
                         "symlink resolves outside configured source root",
-                        Some(path.as_path()),
-                    )),
-                    Err(_) => findings.push(block_finding(
+                        Some(&path),
+                    ),
+                    Err(_) => block_finding(
                         "path.symlink_broken",
                         "symlink target cannot be resolved",
-                        Some(path.as_path()),
-                    )),
+                        Some(&path),
+                    ),
+                };
+                self.record(finding);
+            } else if metadata.is_dir() {
+                if let Ok(entries) = fs::read_dir(&path) {
+                    self.directories.push(entries);
                 }
-                continue;
-            }
-
-            if metadata.is_dir() {
-                queue.push_back(path);
-                continue;
-            }
-
-            if metadata.is_file() {
-                if metadata.len() > max_file_bytes as u64 {
-                    findings.push(block_finding(
+            } else if metadata.is_file() {
+                if metadata.len() > self.max_file_bytes as u64 {
+                    self.record(block_finding(
                         "file.size_limit",
-                        format!("file exceeds max size of {max_file_bytes} bytes"),
-                        Some(path.as_path()),
+                        format!("file exceeds max size of {} bytes", self.max_file_bytes),
+                        Some(&path),
                     ));
                 }
-
-                if has_suspicious_executable_suffix(path.as_path()) {
-                    findings.push(warn_finding(
+                if has_suspicious_executable_suffix(&path) {
+                    self.record(warn_finding(
                         "file.suspicious_executable",
                         "skill contains executable/script-like file extension",
-                        Some(path.as_path()),
+                        Some(&path),
                     ));
                 }
             }
         }
+        self.directories.is_empty()
     }
 
-    SecurityScanReport {
-        decision: summarize_decision(findings.as_slice()),
-        findings,
+    pub(crate) fn report(self) -> SecurityScanReport {
+        SecurityScanReport {
+            decision: self.decision,
+            findings: self.findings,
+        }
     }
 }
 

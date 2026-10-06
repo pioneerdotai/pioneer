@@ -2073,6 +2073,23 @@ pub struct SkillInstallationRecord {
     pub pack_member_key: Option<String>,
 }
 
+/// Exact row facts captured before filesystem preparation, including subsecond
+/// timestamps. Ordinary foreground records retain their existing wire shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillReconciliationSnapshot {
+    pub record: SkillInstallationRecord,
+    model: pioneer_entity::skill_installation::Model,
+}
+
+impl SkillReconciliationSnapshot {
+    fn from_model(model: pioneer_entity::skill_installation::Model) -> Result<Self> {
+        Ok(Self {
+            record: skill_installation_record_from_model(model.clone())?,
+            model,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SkillInstallationPatch {
     pub owner: Option<Option<String>>,
@@ -2273,6 +2290,29 @@ fn validate_skill_pack_child_diff(
         }
     }
     Ok(())
+}
+
+async fn revalidate_skill_source_workspace<C: ConnectionTrait>(
+    db: &C,
+    record: &SkillInstallationRecord,
+    expected: Option<&pioneer_entity::workspace::Model>,
+) -> Result<bool> {
+    if record.source_kind == "system" {
+        return Ok(record.scope_key == "system" && expected.is_none());
+    }
+    if !matches!(record.source_kind.as_str(), "user" | "registry") {
+        return Ok(false);
+    }
+    let Some(expected) = expected else {
+        return Ok(false);
+    };
+    if !expected.is_active || expected.id != record.scope_key {
+        return Ok(false);
+    }
+    let current = pioneer_entity::workspace::Entity::find_by_id(record.scope_key.clone())
+        .one(db)
+        .await?;
+    Ok(current.as_ref() == Some(expected))
 }
 
 #[derive(Clone)]
@@ -18507,9 +18547,47 @@ impl CrudStore {
         patch: &SkillInstallationPatch,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
+        self.update_skill_installation_guarded(skill_id, patch, event_timestamp_secs, None)
+            .await
+    }
+
+    /// Reconciliation validates the row used for FS preparation, not a later reread.
+    pub async fn reconcile_skill_installation(
+        &self,
+        expected: &SkillReconciliationSnapshot,
+        patch: &SkillInstallationPatch,
+        now: i64,
+        workspace: Option<&pioneer_entity::workspace::Model>,
+        still_current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<bool> {
+        // The public view cannot substitute scope/metadata for the exact facts
+        // captured by this snapshot. Validate it before acquiring DB capacity.
+        if skill_installation_record_from_model(expected.model.clone())? != expected.record {
+            bail!("prepared skill snapshot view changed");
+        }
+        self.update_skill_installation_guarded(
+            &expected.record.skill_id,
+            patch,
+            now,
+            Some((expected, workspace, still_current)),
+        )
+        .await
+    }
+
+    async fn update_skill_installation_guarded(
+        &self,
+        skill_id: &SkillId,
+        patch: &SkillInstallationPatch,
+        event_timestamp_secs: i64,
+        expected: Option<(
+            &SkillReconciliationSnapshot,
+            Option<&pioneer_entity::workspace::Model>,
+            &(dyn Fn() -> bool + Send + Sync),
+        )>,
+    ) -> Result<bool> {
         let fence = prepare_generic_skill_update_fence(&self.connection, skill_id, patch).await?;
         let now = unix_to_datetime(event_timestamp_secs);
-        self.run_serialized_write(|| {
+        let operation = || {
             let fence = fence.clone();
             async move {
                 let transaction = self
@@ -18522,6 +18600,37 @@ impl CrudStore {
                         .await?
                     {
                         return Ok(false);
+                    }
+                    if let Some((expected, workspace, still_current)) = expected {
+                        if !still_current() {
+                            return Ok(false);
+                        }
+                        let current =
+                            skill_installation::find_skill_installation(&transaction, skill_id)
+                                .await?;
+                        if current.as_ref() != Some(&expected.model) {
+                            return Ok(false);
+                        }
+                        if !revalidate_skill_source_workspace(
+                            &transaction,
+                            &expected.record,
+                            workspace,
+                        )
+                        .await?
+                        {
+                            return Ok(false);
+                        }
+                        if patch
+                            .source_kind
+                            .as_ref()
+                            .is_some_and(|kind| kind != &expected.record.source_kind)
+                            || patch
+                                .scope_key
+                                .as_ref()
+                                .is_some_and(|scope| scope != &expected.record.scope_key)
+                        {
+                            bail!("reconciliation cannot change skill source scope");
+                        }
                     }
                     skill_installation::update_skill_installation(
                         &transaction,
@@ -18546,8 +18655,15 @@ impl CrudStore {
                     }
                 }
             }
-        })
-        .await
+        };
+        // A reconciliation commit error can be ambiguous. Its owning root
+        // retains backoff and rereads facts in a later quantum, never retrying
+        // this prepared mutation under an unknown commit outcome.
+        if expected.is_some() {
+            operation().await
+        } else {
+            self.run_serialized_write(operation).await
+        }
     }
 
     pub async fn update_skill_lifecycle(
@@ -18706,6 +18822,93 @@ impl CrudStore {
             .await?
             .map(skill_installation_record_from_model)
             .transpose()
+    }
+
+    pub async fn list_active_workspace_page(
+        &self,
+        after: Option<&str>,
+    ) -> Result<Vec<pioneer_entity::workspace::Model>> {
+        repositories::membership::list_active_workspace_page(&self.connection, after).await
+    }
+
+    /// Pending import registration is fenced by the same Workspace snapshot as
+    /// its later projection. System imports have no Workspace owner.
+    pub async fn register_skill_import_pending(
+        &self,
+        record: &SkillInstallationRecord,
+        workspace: Option<&pioneer_entity::workspace::Model>,
+        now: i64,
+    ) -> Result<Option<SkillReconciliationSnapshot>> {
+        if record.pack_id.is_some() || record.pack_member_key.is_some() {
+            bail!("pack members must be inserted through a pack transaction");
+        }
+        let created_at = unix_to_datetime(now);
+        let prepared =
+            skill_installation::prepare_skill_installation(record, created_at, created_at);
+        async {
+            let transaction = self.connection.begin().await?;
+            if !revalidate_skill_source_workspace(&transaction, record, workspace).await? {
+                transaction.rollback().await?;
+                return Ok(None);
+            }
+            if skill_installation::has_skill_import_provenance(&transaction, record).await? {
+                transaction.rollback().await?;
+                return Ok(None);
+            }
+            skill_installation::insert_prepared_skill_installations(
+                &transaction,
+                std::slice::from_ref(&prepared),
+            )
+            .await?;
+            let snapshot =
+                skill_installation::find_skill_installation(&transaction, &record.skill_id)
+                    .await?
+                    .map(SkillReconciliationSnapshot::from_model)
+                    .transpose()?;
+            transaction.commit().await?;
+            Ok(snapshot)
+        }
+        .await
+    }
+
+    pub async fn list_skill_reconciliation_page(
+        &self,
+        source_kind: &str,
+        scope_key: &str,
+        after: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<SkillReconciliationSnapshot>> {
+        skill_installation::list_skill_installations_scope_page(
+            &self.connection,
+            source_kind,
+            scope_key,
+            after,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(SkillReconciliationSnapshot::from_model)
+        .collect()
+    }
+
+    pub async fn list_skill_installations_scope_page(
+        &self,
+        source_kind: &str,
+        scope_key: &str,
+        after: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<SkillInstallationRecord>> {
+        skill_installation::list_skill_installations_scope_page(
+            &self.connection,
+            source_kind,
+            scope_key,
+            after,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(skill_installation_record_from_model)
+        .collect()
     }
 
     pub async fn list_skill_installations(&self) -> Result<Vec<SkillInstallationRecord>> {

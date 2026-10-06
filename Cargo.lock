@@ -9657,6 +9657,7 @@ name = "pioneer-gateway"
 version = "0.56.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -9674,6 +9675,7 @@ dependencies = [
  "markdown",
  "memvid-core",
  "mime_guess",
+ "notify 8.2.0",
  "pioneer-agent",
  "pioneer-artifacts",
  "pioneer-cli-agent-runtime",

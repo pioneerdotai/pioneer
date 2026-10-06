@@ -27,11 +27,9 @@ use pioneer_skills::{
 };
 use serde_json::json;
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, interval};
+use tokio::time::Duration;
 use tracing::warn;
 
 const WORKSPACE_ID_TOKEN: &str = "{workspaceId}";
@@ -50,7 +48,6 @@ const SKILLS_ERROR_UPLOAD_SIZE_LIMIT: &str = "skills.upload.size_limit";
 const SKILLS_ERROR_UPLOAD_DIGEST_MISMATCH: &str = "skills.upload.digest_mismatch";
 const SKILLS_ERROR_UPLOAD_INVALID_ARCHIVE: &str = "skills.upload.invalid_archive";
 const SKILLS_ERROR_INTERNAL: &str = "skills.internal_error";
-const SKILLS_WATCH_DEBOUNCE_MS: u64 = 1_500;
 
 #[derive(Clone)]
 pub(crate) struct SkillsRuntimeContext {
@@ -77,7 +74,7 @@ mod lifecycle;
 mod policy;
 mod storage_relocation;
 mod upload;
-mod watcher;
+pub(super) mod watcher;
 pub(crate) mod workspace;
 
 pub(in crate::message) use upload::SKILL_UPLOAD_CHUNK_FRAME_MAGIC;
@@ -473,56 +470,5 @@ pub(crate) fn resolve_root_path(raw: &str, workspace_id: &str) -> PathBuf {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(candidate)
-    }
-}
-
-fn hash_skill_roots(roots: &[PathBuf]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    for root in roots {
-        root.display().to_string().hash(&mut hasher);
-        hash_skill_root(root.as_path(), &mut hasher);
-    }
-    hasher.finish()
-}
-
-fn hash_skill_root(root: &Path, hasher: &mut DefaultHasher) {
-    let Ok(metadata) = std::fs::symlink_metadata(root) else {
-        "missing".hash(hasher);
-        return;
-    };
-    metadata.is_dir().hash(hasher);
-    if !metadata.is_dir() {
-        return;
-    }
-
-    let mut queue = vec![root.to_path_buf()];
-    while let Some(current) = queue.pop() {
-        let Ok(entries) = std::fs::read_dir(current.as_path()) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(meta) = std::fs::symlink_metadata(path.as_path()) else {
-                continue;
-            };
-            if meta.file_type().is_symlink() {
-                continue;
-            }
-            if meta.is_dir() {
-                queue.push(path);
-                continue;
-            }
-            if !meta.is_file() {
-                continue;
-            }
-            path.display().to_string().hash(hasher);
-            meta.len().hash(hasher);
-            if let Ok(modified) = meta.modified()
-                && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
-            {
-                duration.as_secs().hash(hasher);
-                duration.subsec_nanos().hash(hasher);
-            }
-        }
     }
 }

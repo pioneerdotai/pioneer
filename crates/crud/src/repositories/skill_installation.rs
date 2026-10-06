@@ -3,7 +3,9 @@ use pioneer_entity::skill_installation;
 use pioneer_protocol::{SkillId, SkillPackId};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+};
 
 const SKILL_INSTALLATION_WRITE_BATCH_SIZE: usize = 32;
 
@@ -185,6 +187,42 @@ pub async fn list_skill_installations<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to query skill installations")
+}
+
+pub(crate) async fn has_skill_import_provenance<C: ConnectionTrait>(
+    db: &C,
+    record: &crate::SkillInstallationRecord,
+) -> Result<bool> {
+    Ok(!skill_installation::Entity::find()
+        .filter(skill_installation::Column::SourceKind.eq(record.source_kind.clone()))
+        .filter(skill_installation::Column::ScopeKey.eq(record.scope_key.clone()))
+        .filter(skill_installation::Column::SourceRef.eq(record.source_ref.clone()))
+        .limit(1)
+        .all(db)
+        .await?
+        .is_empty())
+}
+
+/// Background discovery must never fetch unrelated source scopes.
+pub async fn list_skill_installations_scope_page<C: ConnectionTrait>(
+    db: &C,
+    source_kind: &str,
+    scope_key: &str,
+    after: Option<&str>,
+    limit: u64,
+) -> Result<Vec<skill_installation::Model>> {
+    let mut query = skill_installation::Entity::find()
+        .filter(skill_installation::Column::SourceKind.eq(source_kind.to_owned()))
+        .filter(skill_installation::Column::ScopeKey.eq(scope_key.to_owned()));
+    if let Some(after) = after {
+        query = query.filter(skill_installation::Column::Id.gt(after.to_owned()));
+    }
+    query
+        .order_by_asc(skill_installation::Column::Id)
+        .limit(limit.min(64))
+        .all(db)
+        .await
+        .context("failed to page scoped skill installations")
 }
 
 pub async fn list_skill_installations_for_pack<C: ConnectionTrait>(

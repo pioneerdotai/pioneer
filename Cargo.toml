@@ -95,6 +95,10 @@ pioneer-tools = { path = "crates/tools" }
 pioneer-sqlite = { path = "crates/sqlite" }
 pioneer-promt = { path = "crates/promt" }
 
+# Native skills directory notifications (FSEvents on macOS).
+notify = { version = "=8.2.0", default-features = true }
+async-stream = "0.3"
+
 # Error handling
 anyhow = "1"
 

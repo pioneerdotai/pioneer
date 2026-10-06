@@ -7,7 +7,7 @@ use crate::provenance::{
     SkillLockEntry, SkillsLock, find_lock_entry, read_skills_lock, remove_lock_entry,
     upsert_lock_entry, write_skills_lock_atomic,
 };
-use crate::security::{SkillSecurityPolicy, ensure_install_path_contained, scan_skill_directory};
+use crate::security::{SkillSecurityPolicy, ensure_install_path_contained};
 use anyhow::{Context, Result, bail};
 use pioneer_protocol::SkillId;
 use std::collections::VecDeque;
@@ -654,18 +654,64 @@ fn removal_failpoint(name: &str, index: usize) -> Result<()> {
 pub fn prepare_materialized_skill(
     request: PrepareMaterializedSkillRequest,
 ) -> Result<PreparedMaterializedSkill> {
+    let mut preparation = MaterializedSkillPreparation::new(request);
+    loop {
+        if let Some(prepared) = preparation.step(64)? {
+            return Ok(prepared);
+        }
+    }
+}
+
+/// Owned preparation for the native watcher. The request and its security scan
+/// stay together so a caller cannot substitute a report from another package.
+pub struct MaterializedSkillPreparation {
+    request: Option<PrepareMaterializedSkillRequest>,
+    scan: Option<crate::security::SkillDirectoryScan>,
+}
+
+impl MaterializedSkillPreparation {
+    pub fn new(request: PrepareMaterializedSkillRequest) -> Self {
+        let source_root = request
+            .materialized_source_path
+            .parent()
+            .unwrap_or(&request.materialized_source_path);
+        let scan = crate::security::SkillDirectoryScan::new(
+            source_root,
+            &request.materialized_source_path,
+            request.policy.security.max_install_file_bytes.max(1),
+        );
+        Self {
+            request: Some(request),
+            scan: Some(scan),
+        }
+    }
+
+    pub fn step(&mut self, entries_budget: usize) -> Result<Option<PreparedMaterializedSkill>> {
+        let scan = self
+            .scan
+            .as_mut()
+            .context("skill preparation already completed")?;
+        if !scan.step(entries_budget.min(64)) {
+            return Ok(None);
+        }
+        let report = self.scan.take().expect("scan exists").report();
+        finish_materialized_skill_preparation(self.request.take().expect("request exists"), report)
+            .map(Some)
+    }
+}
+
+fn finish_materialized_skill_preparation(
+    request: PrepareMaterializedSkillRequest,
+    security_report: crate::security::SecurityScanReport,
+) -> Result<PreparedMaterializedSkill> {
     let source_root = request
         .materialized_source_path
         .parent()
-        .unwrap_or(request.materialized_source_path.as_path())
+        .unwrap_or(&request.materialized_source_path)
         .to_path_buf();
-
-    let security_report = scan_skill_directory(
-        source_root.as_path(),
-        request.materialized_source_path.as_path(),
-        request.policy.security.max_install_file_bytes.max(1),
-    );
-    if security_report.has_blocking_findings() {
+    // This report belongs to the incremental scan above; its decision is
+    // accumulated per quantum rather than walking all findings again.
+    if security_report.decision == crate::security::SecurityDecision::Block {
         bail!("install blocked by security scan findings");
     }
 

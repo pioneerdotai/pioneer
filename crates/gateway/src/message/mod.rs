@@ -620,7 +620,7 @@ pub struct MessageProcessor {
     resilience_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     hook_recovery_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     task_event_listener_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
-    skills_watcher_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
+    skills_watcher_worker: Arc<Mutex<Option<skills::watcher::SkillsWatcherWorker>>>,
     tool_loop_config: ToolLoopConfig,
     memory_loop_config: Arc<StdRwLock<MemoryLoopConfig>>,
     thread_episodic_runtime_config: Arc<StdRwLock<ThreadEpisodicRuntimeConfig>>,
