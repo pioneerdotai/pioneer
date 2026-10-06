@@ -2651,3 +2651,58 @@ mod tests {
         assert_eq!(model.supports_reasoning, Some(true));
     }
 }
+
+/// A session result must affirm success. Pinned session transcripts may omit
+/// stop_reason, unlike the separately versioned ClaudeService print contract.
+/// When present, a truncated/error/unknown reason cannot affirm completion.
+/// https://code.claude.com/docs/en/headless#stream-responses
+pub fn session_result_completed(value: &serde_json::Value) -> bool {
+    if value["type"] != "result" || value["subtype"] != "success" || value["is_error"] != false {
+        return false;
+    }
+    match value.get("stop_reason") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(reason) => matches!(reason.as_str(), Some("end_turn" | "stop_sequence")),
+    }
+}
+
+#[cfg(test)]
+mod terminal_result_tests {
+    use super::session_result_completed;
+    use serde_json::json;
+    #[test]
+    fn session_success_requires_affirmative_fields_and_no_known_truncation() {
+        let success = json!({"type":"result","subtype":"success","is_error":false});
+        assert!(session_result_completed(&success));
+        for flag in [json!(true), json!(null), json!("false")] {
+            let mut invalid = success.clone();
+            invalid["is_error"] = flag;
+            assert!(!session_result_completed(&invalid));
+        }
+        for field in ["subtype", "is_error"] {
+            let mut missing = success.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(!session_result_completed(&missing));
+        }
+        for subtype in [
+            "error_max_turns",
+            "error_during_execution",
+            "interrupted",
+            "future",
+        ] {
+            let mut value = success.clone();
+            value["subtype"] = json!(subtype);
+            assert!(!session_result_completed(&value));
+        }
+        for reason in ["max_tokens", "tool_use", "refusal", "pause_turn", "future"] {
+            let mut value = success.clone();
+            value["stop_reason"] = json!(reason);
+            assert!(!session_result_completed(&value));
+        }
+        for reason in [json!(null), json!("end_turn"), json!("stop_sequence")] {
+            let mut value = success.clone();
+            value["stop_reason"] = reason;
+            assert!(session_result_completed(&value));
+        }
+    }
+}

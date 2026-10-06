@@ -1,3 +1,5 @@
+data: {"type": "message_start"}
+
 data: {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}}
 
 data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "first"}}

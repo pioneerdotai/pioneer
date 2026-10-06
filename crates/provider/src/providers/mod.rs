@@ -38,3 +38,6 @@ mod usage_tests;
 
 #[cfg(test)]
 mod history_test_support;
+
+#[cfg(test)]
+mod streaming_tests;

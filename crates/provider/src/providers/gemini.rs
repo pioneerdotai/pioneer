@@ -2,10 +2,11 @@ use crate::attachments::{
     PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes,
     ensure_no_unrendered_attachments, prepare_messages_for_provider_async,
 };
+
 #[cfg(test)]
 use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
 use crate::reasoning_registry;
-use crate::tools::stream::{IncrementalLineDecoder, sse_data};
+use crate::tools::stream::IncrementalSseDecoder;
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
     ProviderInputCapabilities, ProviderReplayState, ProviderTermination, ProviderTimeoutPolicy,
@@ -201,6 +202,29 @@ struct ApiGenerateResponse {
     candidates: Vec<ApiCandidate>,
     #[serde(default)]
     usage_metadata: Option<ApiUsageMetadata>,
+    #[serde(default)]
+    error: Option<GeminiStreamError>,
+    #[serde(default)]
+    prompt_feedback: Option<ApiPromptFeedback>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiPromptFeedback {
+    #[serde(default)]
+    block_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiStreamError {
+    #[serde(default)]
+    code: Option<u16>,
+}
+
+impl GeminiStreamError {
+    fn outcome(&self) -> anyhow::Error {
+        crate::failure::NativeStreamStatusError::new("Gemini", self.code).into()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -737,6 +761,13 @@ impl GeminiProvider {
     }
 
     fn extract_tool_calls(response: &ApiGenerateResponse) -> Vec<ProviderToolCall> {
+        Self::extract_tool_calls_with_offset(response, 0)
+    }
+
+    fn extract_tool_calls_with_offset(
+        response: &ApiGenerateResponse,
+        offset: usize,
+    ) -> Vec<ProviderToolCall> {
         let parts = match response
             .candidates
             .first()
@@ -747,10 +778,10 @@ impl GeminiProvider {
             None => return Vec::new(),
         };
 
-        Self::tool_calls_from_parts(parts)
+        Self::tool_calls_from_parts(parts, offset)
     }
 
-    fn tool_calls_from_parts(parts: &[ApiPart]) -> Vec<ProviderToolCall> {
+    fn tool_calls_from_parts(parts: &[ApiPart], offset: usize) -> Vec<ProviderToolCall> {
         parts
             .iter()
             .filter_map(|part| part.function_call.as_ref())
@@ -759,7 +790,7 @@ impl GeminiProvider {
                 id: call
                     .id
                     .clone()
-                    .unwrap_or_else(|| format!("call_{}", index + 1)),
+                    .unwrap_or_else(|| format!("call_{}", offset + index + 1)),
                 name: call.name.clone(),
                 arguments: serde_json::to_string(&call.args).unwrap_or_else(|_| "{}".to_owned()),
             })
@@ -836,6 +867,192 @@ fn parse_function_arguments(raw: &str) -> Result<serde_json::Value> {
         return Err(anyhow!("Gemini functionCall args must be a JSON object"));
     }
     Ok(arguments)
+}
+
+// The same decoder is used by HTTP transport and in-memory regression fixtures.
+impl GeminiProvider {
+    pub(super) fn decode_stream(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
+
+        tokio::spawn(async move {
+            let mut decoder = IncrementalSseDecoder::default();
+            let mut last_tool_calls: Vec<ProviderToolCall> = Vec::new();
+            let mut terminal_reason = None;
+            let mut native_terminal_reason: Option<String> = None;
+            let mut tool_call_count = 0;
+            let mut replay_parts: Vec<ApiPart> = Vec::new();
+
+            tokio::pin!(byte_stream);
+
+            while let Some(result) = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = byte_stream.next() => result,
+            } {
+                let bytes = match result {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        if tx.send(Err(anyhow!(e))).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+
+                let lines = match decoder.push(bytes.as_ref()) {
+                    Ok(lines) => lines,
+                    Err(error) => {
+                        if tx.send(Err(error)).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+                for frame in lines {
+                    let data = frame.data.as_str();
+
+                    match serde_json::from_str::<ApiGenerateResponse>(data) {
+                        Ok(mut resp) => {
+                            if let Some(error) = &resp.error {
+                                let _ = tx.send(Err(error.outcome())).await;
+                                return;
+                            }
+                            if resp
+                                .prompt_feedback
+                                .as_ref()
+                                .is_some_and(|feedback| feedback.block_reason.is_some())
+                            {
+                                let _ = tx
+                                    .send(Err(crate::failure::NativeStreamStatusError::new(
+                                        "Gemini blocked prompt",
+                                        None,
+                                    )
+                                    .into()))
+                                    .await;
+                                return;
+                            }
+                            if terminal_reason.is_some()
+                                && resp.candidates.iter().any(|candidate| {
+                                    candidate
+                                        .content
+                                        .as_ref()
+                                        .is_some_and(|content| !content.parts.is_empty())
+                                })
+                            {
+                                let _ = tx
+                                    .send(Err(anyhow!("Gemini sent content after finishReason")))
+                                    .await;
+                                return;
+                            }
+
+                            if let Some(usage) = Self::extract_usage(&resp) {
+                                if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
+                                    return;
+                                }
+                            }
+                            if let Some(reasoning) = Self::extract_reasoning(&resp) {
+                                if !reasoning.is_empty() {
+                                    if tx
+                                        .send(Ok(StreamChunk::reasoning(reasoning)))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                            if let Some(text) = Self::extract_text(&resp) {
+                                if !text.is_empty() {
+                                    if tx.send(Ok(StreamChunk::delta(text))).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            let tool_calls =
+                                Self::extract_tool_calls_with_offset(&resp, tool_call_count);
+                            tool_call_count += tool_calls.len();
+                            if !tool_calls.is_empty() && tool_calls != last_tool_calls {
+                                last_tool_calls = tool_calls.clone();
+                                if tx
+                                    .send(Ok(StreamChunk::tool_calls(tool_calls)))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            if let Some(content) = resp
+                                .candidates
+                                .first_mut()
+                                .and_then(|candidate| candidate.content.as_mut())
+                            {
+                                // Stream parts are ordered deltas, including signatures on
+                                // non-tool parts and empty text. Preserve every round part.
+                                replay_parts.append(&mut content.parts);
+                            }
+                            if let Some(reason) = resp
+                                .candidates
+                                .first()
+                                .and_then(|candidate| candidate.finish_reason.as_deref())
+                            {
+                                if native_terminal_reason
+                                    .as_deref()
+                                    .is_some_and(|previous| previous != reason)
+                                {
+                                    let _ = tx
+                                        .send(Err(anyhow!("contradictory Gemini finish reason")))
+                                        .await;
+                                    return;
+                                }
+                                native_terminal_reason = Some(reason.to_owned());
+                                let mut termination =
+                                    ProviderTermination::from_openai_reason(reason);
+                                if termination == ProviderTermination::Complete
+                                    && tool_call_count > 0
+                                {
+                                    termination = ProviderTermination::ToolCalls;
+                                }
+                                terminal_reason = Some(termination);
+                            }
+                        }
+                        Err(_) => {
+                            if tx
+                                .send(Err(anyhow!("malformed Gemini SSE frame")))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let terminal = decoder.finish().and_then(|_| {
+                terminal_reason
+                    .map(StreamChunk::final_chunk_with)
+                    .ok_or_else(|| {
+                        crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into()
+                    })
+            });
+            if terminal.is_ok()
+                && let Some(state) = Self::replay_state_from_parts(&replay_parts)
+                && tx
+                    .send(Ok(StreamChunk::provider_replay_state(state)))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+            let _ = tx.send(terminal).await;
+        });
+
+        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Box::pin(chunk_stream)
+    }
 }
 
 #[async_trait]
@@ -962,147 +1179,7 @@ impl crate::traits::Provider for GeminiProvider {
             "provider_stream",
         );
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
-
-        tokio::spawn(async move {
-            let mut decoder = IncrementalLineDecoder::default();
-            let mut replay_parts: Vec<ApiPart> = Vec::new();
-
-            tokio::pin!(byte_stream);
-
-            while let Some(result) = tokio::select! {
-                biased;
-                _ = tx.closed() => return,
-                result = byte_stream.next() => result,
-            } {
-                let bytes = match result {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        if tx.send(Err(anyhow!(e))).await.is_err() {
-                            return;
-                        }
-                        return;
-                    }
-                };
-
-                let lines = match decoder.push(bytes.as_ref()) {
-                    Ok(lines) => lines,
-                    Err(error) => {
-                        if tx.send(Err(error)).await.is_err() {
-                            return;
-                        }
-                        return;
-                    }
-                };
-                for line in lines {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    let Some(data) = sse_data(line) else {
-                        continue;
-                    };
-
-                    match serde_json::from_str::<ApiGenerateResponse>(data) {
-                        Ok(mut resp) => {
-                            if let Some(usage) = Self::extract_usage(&resp) {
-                                if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
-                                    return;
-                                }
-                            }
-                            if let Some(reasoning) = Self::extract_reasoning(&resp) {
-                                if !reasoning.is_empty() {
-                                    if tx
-                                        .send(Ok(StreamChunk::reasoning(reasoning)))
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
-                                }
-                            }
-                            if let Some(text) = Self::extract_text(&resp) {
-                                if !text.is_empty() {
-                                    if tx.send(Ok(StreamChunk::delta(text))).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                            if let Some(content) = resp
-                                .candidates
-                                .first_mut()
-                                .and_then(|candidate| candidate.content.as_mut())
-                            {
-                                // SSE contents are deltas, not replacement snapshots. Keep
-                                // signed and unsigned parts separate, including empty text.
-                                replay_parts.append(&mut content.parts);
-                            }
-                            if let Some(reason) = resp
-                                .candidates
-                                .first()
-                                .and_then(|candidate| candidate.finish_reason.as_deref())
-                            {
-                                let tool_calls = Self::tool_calls_from_parts(&replay_parts);
-                                if !tool_calls.is_empty()
-                                    && tx
-                                        .send(Ok(StreamChunk::tool_calls(tool_calls.clone())))
-                                        .await
-                                        .is_err()
-                                {
-                                    return;
-                                }
-                                if let Some(state) = Self::replay_state_from_parts(&replay_parts) {
-                                    if tx
-                                        .send(Ok(StreamChunk::provider_replay_state(state)))
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
-                                }
-                                let mut termination =
-                                    ProviderTermination::from_openai_reason(reason);
-                                if termination == ProviderTermination::Complete
-                                    && !tool_calls.is_empty()
-                                {
-                                    termination = ProviderTermination::ToolCalls;
-                                }
-                                if tx
-                                    .send(Ok(StreamChunk::final_chunk_with(termination)))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                return;
-                            }
-                        }
-                        Err(e) => {
-                            if tx
-                                .send(Err(anyhow!("malformed Gemini SSE frame: {e}")))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                            return;
-                        }
-                    }
-                }
-            }
-
-            let error = decoder
-                .finish()
-                .err()
-                .unwrap_or_else(|| anyhow!("Gemini stream ended before finishReason"));
-            if tx.send(Err(error)).await.is_err() {
-                return;
-            }
-        });
-
-        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(Box::pin(chunk_stream))
+        Ok(Self::decode_stream(byte_stream))
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -1279,22 +1356,42 @@ mod tests {
                 "../../tests/fixtures/history/gemini-parallel.sse"
             ))
             .await;
-            let provider =
-                GeminiProvider::with_base_url_and_timeout_policy("key", base, Default::default());
+            let provider = crate::ProviderRegistry::with_provider(
+                "gemini",
+                std::sync::Arc::new(GeminiProvider::with_base_url_and_timeout_policy(
+                    "key",
+                    base,
+                    Default::default(),
+                )),
+            )
+            .get_or_create("gemini")
+            .unwrap();
             let mut stream = provider
                 .stream_chat(request(history.clone()))
                 .await
                 .unwrap();
             let mut calls = Vec::new();
             let mut state = None;
+            let mut final_count = 0;
+            let mut output_tokens = None;
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.unwrap();
+                final_count += usize::from(chunk.is_final);
+                if let Some(usage) = chunk.usage {
+                    output_tokens = usage.output_tokens;
+                }
                 calls.extend(chunk.tool_calls);
                 if chunk.provider_replay_state.is_some() {
                     state = chunk.provider_replay_state;
                 }
             }
             server.await.unwrap();
+            assert_eq!(final_count, 1);
+            assert_eq!(
+                output_tokens,
+                Some(9),
+                "usage after finishReason must be consumed"
+            );
             assert_eq!(
                 calls
                     .iter()
@@ -1953,6 +2050,42 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod stream_call_identity_tests {
+    use super::*;
+    #[test]
+    fn full_native_function_parts_get_round_local_ids_across_events() {
+        // Construct the native struct so this identity test is independent of
+        // the JSON casing correction owned by remediation group 2.
+        let response = ApiGenerateResponse {
+            candidates: vec![ApiCandidate {
+                finish_reason: None,
+                content: Some(ApiContent {
+                    role: "model".into(),
+                    parts: vec![ApiPart {
+                        text: None,
+                        inline_data: None,
+                        file_data: None,
+                        thought: None,
+                        function_response: None,
+                        thought_signature: None,
+                        function_call: Some(ApiFunctionCall {
+                            id: None,
+                            name: "read".into(),
+                            args: serde_json::json!({"path":"x"}),
+                        }),
+                    }],
+                }),
+            }],
+            usage_metadata: None,
+            error: None,
+            prompt_feedback: None,
+        };
+        let first = GeminiProvider::extract_tool_calls_with_offset(&response, 0);
+        let next = GeminiProvider::extract_tool_calls_with_offset(&response, 1);
+        assert_ne!(first[0].id, next[0].id);
+    }
+}
 #[cfg(test)]
 #[path = "wire_tests/gemini.rs"]
 mod wire_contract_tests;

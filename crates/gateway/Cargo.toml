@@ -65,6 +65,7 @@ tiktoken-rs.workspace = true
 flate2.workspace = true
 tar.workspace = true
 sha2.workspace = true
+zstd.workspace = true
 subtle.workspace = true
 hex.workspace = true
 hmac.workspace = true

@@ -13,6 +13,7 @@ mod m20261001_000001_delivery_authority_spec_indexes;
 mod m20261002_000001_task_run_occurrence_reconcile;
 mod m20261004_000001_task_occurrence_reconcile;
 mod m20261004_000004_compaction_lifecycle_pending;
+mod m20261004_000007_agent_action_outbox_ranges;
 pub use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
@@ -162,6 +163,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261002_000001_task_run_occurrence_reconcile::Migration),
             Box::new(m20261004_000001_task_occurrence_reconcile::Migration),
             Box::new(m20261004_000004_compaction_lifecycle_pending::Migration),
+            Box::new(m20261004_000007_agent_action_outbox_ranges::Migration),
         ]
     }
 }

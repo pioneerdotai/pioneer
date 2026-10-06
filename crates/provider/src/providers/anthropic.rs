@@ -3,7 +3,7 @@ use crate::attachments::{
     ensure_no_unrendered_attachments, prepare_messages_for_provider_async,
 };
 use crate::reasoning_registry;
-use crate::tools::stream::{IncrementalLineDecoder, sse_data};
+use crate::tools::stream::IncrementalSseDecoder;
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
     ProviderInputCapabilities, ProviderReplayState, ProviderTermination, ProviderTimeoutPolicy,
@@ -217,6 +217,14 @@ struct StreamEvent {
     /// Present on `content_block_start` events — carries the block type.
     #[serde(default)]
     content_block: Option<StreamContentBlock>,
+    #[serde(default)]
+    error: Option<StreamNativeError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamNativeError {
+    #[serde(default, rename = "type")]
+    error_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,6 +235,8 @@ struct StreamMessage {
 
 #[derive(Debug, Deserialize)]
 struct StreamDelta {
+    #[serde(default, rename = "type")]
+    delta_type: Option<String>,
     #[serde(default)]
     stop_reason: Option<String>,
     #[serde(default)]
@@ -247,6 +257,8 @@ struct StreamDelta {
 struct StreamContentBlock {
     #[serde(rename = "type")]
     block_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -724,128 +736,40 @@ impl PendingToolUse {
     }
 }
 
-#[async_trait]
-impl crate::traits::Provider for AnthropicProvider {
-    fn name(&self) -> &str {
-        "anthropic"
+struct StreamReplayContext {
+    model: String,
+    authority: String,
+    unverified_relay: bool,
+    prefix_body: serde_json::Value,
+}
+
+// The same decoder is used by HTTP transport and in-memory regression fixtures.
+impl AnthropicProvider {
+    #[cfg(test)]
+    pub(super) fn decode_stream(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
+        Self::decode_stream_with_replay(byte_stream, None)
     }
 
-    fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities {
-            streaming: true,
-            vision: true,
-            tool_calling: true,
-            embeddings: false,
-            transcription: false,
-            input_types: ProviderInputCapabilities {
-                text: true,
-                file: InputTypeSupport::native_inline_only(),
-                image: InputTypeSupport::native_inline_only(),
-                audio: InputTypeSupport::disabled(),
-                video: InputTypeSupport::disabled(),
-            },
-        }
-    }
-
-    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let request = crate::tools::policy::prepare_request(self.name(), request)?;
-        let mut prepared = prepare_messages_for_provider_async(
-            self.name(),
-            request.model.as_str(),
-            &self.capabilities(),
-            request.rendered_messages_with_compiled_prompt().as_slice(),
-        )
-        .await?;
-        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
-        ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = self.build_native_request(&request, &prepared, false)?;
-        let prefix_body = serde_json::to_value(&api_request)?;
-
-        let request_builder = self
-            .client
-            .post(self.messages_url())
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&api_request);
-        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
-        }
-
-        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
-            response,
-            Default::default(),
-            "provider_response",
-        )
-        .await?;
-        let mut response = Self::parse_response(api_response)?;
-        if let Some(state) = response.provider_replay_state.as_mut() {
-            if self.base_url != BASE_URL
-                && crate::continuation::retention(state) != crate::continuation::Retention::Ordinary
-            {
-                state.payload["api_profile"] = serde_json::json!("unverified-relay");
-            }
-            crate::continuation::bind_prefix(
-                state,
-                &request.model,
-                &self.replay_authority,
-                &prefix_body,
-            )?;
-        }
-        Ok(response)
-    }
-
-    async fn stream_chat(
-        &self,
-        request: ChatRequest,
-    ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let request = crate::tools::policy::prepare_request(self.name(), request)?;
-        let mut prepared = prepare_messages_for_provider_async(
-            self.name(),
-            request.model.as_str(),
-            &self.capabilities(),
-            request.rendered_messages_with_compiled_prompt().as_slice(),
-        )
-        .await?;
-        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
-        ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = self.build_native_request(&request, &prepared, true)?;
-        let prefix_body = serde_json::to_value(&api_request)?;
-
-        let request_builder = self
-            .client
-            .post(self.messages_url())
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&api_request);
-        let response =
-            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
-
-        if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
-        }
-
-        let byte_stream = crate::http::bounded_response_stream(
-            response,
-            crate::types::ProviderResponseLimits::default().max_transport_bytes,
-            "provider_stream",
-        );
-
+    fn decode_stream_with_replay(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+        replay_context: Option<StreamReplayContext>,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
-        let replay_authority = self.replay_authority.clone();
-        let unverified_relay = self.base_url != BASE_URL;
-        let replay_model = request.model.clone();
         tokio::spawn(async move {
-            use std::collections::{BTreeMap, HashSet};
+            use std::collections::{BTreeMap, HashMap, HashSet};
 
-            let mut decoder = IncrementalLineDecoder::default();
+            let mut decoder = IncrementalSseDecoder::default();
             let mut termination = None;
+            let mut native_terminal_reason: Option<String> = None;
+            // Ordinary Messages profile: no opt-in server-side fallback phases.
+            let mut message_delta_started = false;
+            let mut used_blocks = HashSet::new();
+            let mut block_types = HashMap::new();
+            let mut message_started = false;
+            let mut active_blocks = HashSet::new();
             let mut thinking_blocks = HashSet::new();
             let mut replay_blocks: BTreeMap<usize, serde_json::Value> = BTreeMap::new();
             let mut pending_tool_uses: BTreeMap<usize, PendingToolUse> = BTreeMap::new();
@@ -876,18 +800,152 @@ impl crate::traits::Provider for AnthropicProvider {
                         return;
                     }
                 };
-                for line in lines {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    let Some(data) = sse_data(line) else {
-                        continue;
-                    };
+                for frame in lines {
+                    let data = frame.data.as_str();
 
                     match serde_json::from_str::<StreamEvent>(data) {
                         Ok(event) => {
+                            if event.event_type == "error"
+                                || frame.event.as_deref() == Some("error")
+                            {
+                                let error = crate::failure::AnthropicStreamError::from_type(
+                                    event
+                                        .error
+                                        .as_ref()
+                                        .and_then(|error| error.error_type.as_deref()),
+                                );
+                                let _ = tx.send(Err(error.into())).await;
+                                return;
+                            }
+
+                            if event.event_type == "message_start" {
+                                if message_started {
+                                    let _ = tx
+                                        .send(Err(anyhow!("duplicate Anthropic message_start")))
+                                        .await;
+                                    return;
+                                }
+                                message_started = true;
+                            }
+                            if matches!(
+                                event.event_type.as_str(),
+                                "content_block_start"
+                                    | "content_block_delta"
+                                    | "content_block_stop"
+                            ) {
+                                let Some(index) = event.index else {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "Anthropic block event is missing its index"
+                                        )))
+                                        .await;
+                                    return;
+                                };
+                                let valid = message_started
+                                    && !message_delta_started
+                                    && match event.event_type.as_str() {
+                                        "content_block_start" => {
+                                            used_blocks.insert(index) && active_blocks.insert(index)
+                                        }
+                                        "content_block_stop" => active_blocks.remove(&index),
+                                        _ => active_blocks.contains(&index),
+                                    };
+                                if !valid {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "invalid Anthropic content block lifecycle"
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                            }
+                            if event.event_type == "content_block_start" {
+                                let Some(block) = event.content_block.as_ref() else {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "Anthropic block start is missing its payload"
+                                        )))
+                                        .await;
+                                    return;
+                                };
+                                if block.block_type == "tool_use"
+                                    && (block.id.as_deref().is_none_or(str::is_empty)
+                                        || block.name.as_deref().is_none_or(str::is_empty)
+                                        || block.input.is_none())
+                                {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "incomplete Anthropic tool block identity or input"
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                                block_types.insert(event.index.unwrap(), block.block_type.clone());
+                            }
+                            if event.event_type == "content_block_delta" {
+                                let Some(delta) = event.delta.as_ref() else {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "Anthropic block delta is missing its payload"
+                                        )))
+                                        .await;
+                                    return;
+                                };
+                                let block_type =
+                                    block_types.get(&event.index.unwrap()).map(String::as_str);
+                                if delta.delta_type.is_none() {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "Anthropic block delta is missing its type"
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                                let expected = match delta.delta_type.as_deref() {
+                                    Some("text_delta") => Some("text"),
+                                    Some("input_json_delta") => Some("tool_use"),
+                                    Some("thinking_delta" | "signature_delta") => Some("thinking"),
+                                    _ => None,
+                                };
+                                if !matches!(
+                                    block_type,
+                                    Some("text" | "tool_use" | "thinking" | "redacted_thinking")
+                                ) {
+                                    continue;
+                                }
+                                let missing_payload = match delta.delta_type.as_deref() {
+                                    Some("text_delta") => delta.text.is_none(),
+                                    Some("input_json_delta") => delta.partial_json.is_none(),
+                                    Some("thinking_delta") => delta.thinking.is_none(),
+                                    Some("signature_delta") => delta.signature.is_none(),
+                                    _ => false,
+                                };
+                                if missing_payload || (expected.is_some() && expected != block_type)
+                                {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "Anthropic delta contradicts its block type"
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                                // Future delta types are ignored rather than interpreted as executable data.
+                                if expected.is_none() {
+                                    continue;
+                                }
+                            }
+                            if event.event_type == "message_delta" {
+                                if !message_started
+                                    || !active_blocks.is_empty()
+                                    || event.delta.is_none()
+                                {
+                                    let _ = tx
+                                        .send(Err(anyhow!("invalid Anthropic message delta phase")))
+                                        .await;
+                                    return;
+                                }
+                                message_delta_started = true;
+                            }
                             for usage in event
                                 .message
                                 .as_ref()
@@ -904,6 +962,14 @@ impl crate::traits::Provider for AnthropicProvider {
                                 }
                             }
                             if event.event_type == "message_stop" {
+                                if !message_started
+                                    || !message_delta_started
+                                    || !active_blocks.is_empty()
+                                {
+                                    let _ = tx.send(Err(crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into())).await;
+                                    return;
+                                }
+
                                 let remaining_calls = std::mem::take(&mut pending_tool_uses)
                                     .into_iter()
                                     .map(|(index, call)| {
@@ -938,21 +1004,25 @@ impl crate::traits::Provider for AnthropicProvider {
                                         "anthropic",
                                         serde_json::json!({ "schema_version": 2, "blocks": blocks }),
                                     );
-                                    if unverified_relay
-                                        && crate::continuation::retention(&state)
-                                            != crate::continuation::Retention::Ordinary
-                                    {
-                                        state.payload["api_profile"] =
-                                            serde_json::json!("unverified-relay");
-                                    }
-                                    if let Err(error) = crate::continuation::bind_prefix(
-                                        &mut state,
-                                        &replay_model,
-                                        &replay_authority,
-                                        &prefix_body,
-                                    ) {
-                                        let _ = tx.send(Err(error)).await;
-                                        return;
+                                    // Decoder-only fixtures have no request prefix authority.
+                                    // HTTP always supplies the exact body and adapter instance.
+                                    if let Some(context) = &replay_context {
+                                        if context.unverified_relay
+                                            && crate::continuation::retention(&state)
+                                                != crate::continuation::Retention::Ordinary
+                                        {
+                                            state.payload["api_profile"] =
+                                                serde_json::json!("unverified-relay");
+                                        }
+                                        if let Err(error) = crate::continuation::bind_prefix(
+                                            &mut state,
+                                            &context.model,
+                                            &context.authority,
+                                            &context.prefix_body,
+                                        ) {
+                                            let _ = tx.send(Err(error)).await;
+                                            return;
+                                        }
                                     }
                                     if tx
                                         .send(Ok(StreamChunk::provider_replay_state(state)))
@@ -982,6 +1052,18 @@ impl crate::traits::Provider for AnthropicProvider {
                                 if let Some(reason) =
                                     event.delta.and_then(|delta| delta.stop_reason)
                                 {
+                                    if native_terminal_reason
+                                        .as_deref()
+                                        .is_some_and(|previous| previous != reason)
+                                    {
+                                        let _ = tx
+                                            .send(Err(anyhow!(
+                                                "contradictory Anthropic stop reason"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    native_terminal_reason = Some(reason.clone());
                                     termination =
                                         Some(ProviderTermination::from_openai_reason(&reason));
                                 }
@@ -997,7 +1079,35 @@ impl crate::traits::Provider for AnthropicProvider {
                                             .expect("native block serializes"),
                                     );
                                     match block.block_type.as_str() {
+                                        "text" => {
+                                            if let Some(text) =
+                                                block.text.as_ref().filter(|text| !text.is_empty())
+                                            {
+                                                if tx
+                                                    .send(Ok(StreamChunk::delta(text.clone())))
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    return;
+                                                }
+                                            }
+                                        }
                                         "thinking" => {
+                                            if let Some(thinking) = block
+                                                .thinking
+                                                .as_ref()
+                                                .filter(|thinking| !thinking.is_empty())
+                                            {
+                                                if tx
+                                                    .send(Ok(StreamChunk::reasoning(
+                                                        thinking.clone(),
+                                                    )))
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    return;
+                                                }
+                                            }
                                             thinking_blocks.insert(index);
                                         }
                                         "redacted_thinking" => {
@@ -1113,9 +1223,9 @@ impl crate::traits::Provider for AnthropicProvider {
                                 }
                             }
                         }
-                        Err(e) => {
+                        Err(_) => {
                             if tx
-                                .send(Err(anyhow!("malformed Anthropic SSE frame: {e}")))
+                                .send(Err(anyhow!("malformed Anthropic SSE frame")))
                                 .await
                                 .is_err()
                             {
@@ -1127,17 +1237,140 @@ impl crate::traits::Provider for AnthropicProvider {
                 }
             }
 
-            let error = decoder
-                .finish()
-                .err()
-                .unwrap_or_else(|| anyhow!("Anthropic stream ended before message_stop"));
+            let error = decoder.finish().err().unwrap_or_else(|| {
+                crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into()
+            });
             if tx.send(Err(error)).await.is_err() {
                 return;
             }
         });
 
         let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(Box::pin(chunk_stream))
+        Box::pin(chunk_stream)
+    }
+}
+
+#[async_trait]
+impl crate::traits::Provider for AnthropicProvider {
+    fn name(&self) -> &str {
+        "anthropic"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: true,
+            vision: true,
+            tool_calling: true,
+            embeddings: false,
+            transcription: false,
+            input_types: ProviderInputCapabilities {
+                text: true,
+                file: InputTypeSupport::native_inline_only(),
+                image: InputTypeSupport::native_inline_only(),
+                audio: InputTypeSupport::disabled(),
+                video: InputTypeSupport::disabled(),
+            },
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
+            self.name(),
+            request.model.as_str(),
+            &self.capabilities(),
+            request.rendered_messages_with_compiled_prompt().as_slice(),
+        )
+        .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
+        ensure_no_unrendered_attachments(self.name(), &prepared)?;
+        let api_request = self.build_native_request(&request, &prepared, false)?;
+        let prefix_body = serde_json::to_value(&api_request)?;
+
+        let request_builder = self
+            .client
+            .post(self.messages_url())
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(&api_request);
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(Self::api_error(response).await);
+        }
+
+        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
+        let mut response = Self::parse_response(api_response)?;
+        if let Some(state) = response.provider_replay_state.as_mut() {
+            if self.base_url != BASE_URL
+                && crate::continuation::retention(state) != crate::continuation::Retention::Ordinary
+            {
+                state.payload["api_profile"] = serde_json::json!("unverified-relay");
+            }
+            crate::continuation::bind_prefix(
+                state,
+                &request.model,
+                &self.replay_authority,
+                &prefix_body,
+            )?;
+        }
+        Ok(response)
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
+            self.name(),
+            request.model.as_str(),
+            &self.capabilities(),
+            request.rendered_messages_with_compiled_prompt().as_slice(),
+        )
+        .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
+        ensure_no_unrendered_attachments(self.name(), &prepared)?;
+        let api_request = self.build_native_request(&request, &prepared, true)?;
+        let prefix_body = serde_json::to_value(&api_request)?;
+
+        let request_builder = self
+            .client
+            .post(self.messages_url())
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(&api_request);
+        let response =
+            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
+
+        if !response.status().is_success() {
+            return Err(Self::api_error(response).await);
+        }
+
+        let byte_stream = crate::http::bounded_response_stream(
+            response,
+            crate::types::ProviderResponseLimits::default().max_transport_bytes,
+            "provider_stream",
+        );
+
+        Ok(Self::decode_stream_with_replay(
+            byte_stream,
+            Some(StreamReplayContext {
+                model: request.model.clone(),
+                authority: self.replay_authority.clone(),
+                unverified_relay: self.base_url != BASE_URL,
+                prefix_body,
+            }),
+        ))
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -1415,8 +1648,16 @@ mod tests {
             "../../tests/fixtures/history/anthropic-interleaved.sse"
         ))
         .await;
-        let provider =
-            AnthropicProvider::with_base_url_and_timeout_policy("key", base, Default::default());
+        let provider = crate::ProviderRegistry::with_provider(
+            "anthropic",
+            std::sync::Arc::new(AnthropicProvider::with_base_url_and_timeout_policy(
+                "key",
+                base,
+                Default::default(),
+            )),
+        )
+        .get_or_create("anthropic")
+        .unwrap();
         let mut stream = provider
             .stream_chat(request(vec![ChatMessage::user("start")]))
             .await
@@ -1449,6 +1690,83 @@ mod tests {
                 {"type":"tool_use","id":"b","name":"second","input":{}}
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn shared_stream_decoder_binds_ordered_blocks_to_actual_outbound_prefix() {
+        use super::super::history_test_support::request;
+        use futures_util::stream;
+
+        let provider = AnthropicProvider::new("test-key");
+        let mut req = request(vec![
+            ChatMessage::system("rules"),
+            ChatMessage::user("start"),
+        ]);
+        req.model = "claude-sonnet-5-5".into();
+        let prepared = prepare_messages_for_provider_model(
+            provider.name(),
+            &req.model,
+            &provider.capabilities(),
+            &req.messages,
+        )
+        .unwrap();
+        let sent = serde_json::to_value(
+            provider
+                .build_native_request(&req, &prepared, true)
+                .unwrap(),
+        )
+        .unwrap();
+        let input = include_str!("../../tests/fixtures/history/anthropic-interleaved.sse");
+        let bytes = input
+            .as_bytes()
+            .iter()
+            .map(|byte| Ok(bytes::Bytes::copy_from_slice(&[*byte])))
+            .collect::<Vec<_>>();
+        let chunks = AnthropicProvider::decode_stream_with_replay(
+            Box::pin(stream::iter(bytes)),
+            Some(StreamReplayContext {
+                model: req.model.clone(),
+                authority: provider.replay_authority.clone(),
+                unverified_relay: false,
+                prefix_body: sent.clone(),
+            }),
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+        assert_eq!(
+            chunks.last().unwrap().termination,
+            Some(ProviderTermination::ToolCalls)
+        );
+        let state = chunks
+            .into_iter()
+            .find_map(|chunk| chunk.provider_replay_state)
+            .unwrap();
+        assert_eq!(state.payload["blocks"][0]["signature"], "signed-1");
+        assert_eq!(state.payload["blocks"][2]["text"], "between");
+        assert_eq!(state.payload["blocks"][3]["data"], "opaque-redacted");
+        let state: ProviderReplayState =
+            serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+        let mut next = sent;
+        next["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "role":"assistant", "content":state.payload["blocks"]
+            }));
+        let validate = |body: &serde_json::Value| {
+            crate::continuation::validate_prefix(
+                body,
+                std::iter::once((1, state.clone())),
+                &req.model,
+                &provider.replay_authority,
+            )
+        };
+        assert!(validate(&next).is_ok());
+        next["system"] = serde_json::json!("changed rules");
+        assert!(validate(&next).is_err());
     }
 
     #[test]

@@ -4,4 +4,6 @@ data: {"candidates": [{"content": {"role": "model", "parts": [{"functionCall": {
 
 data: {"candidates": [{"finishReason": "STOP"}]}
 
+data: {"usageMetadata": {"promptTokenCount": 4, "candidatesTokenCount": 9}}
+
 : fixture-end
