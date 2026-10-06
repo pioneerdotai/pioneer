@@ -364,8 +364,10 @@ pub(super) fn native_duration(bytes: &[u8], mime: &str) -> Result<NativeDuration
         mime,
         "video/mp4" | "audio/mp4" | "video/quicktime" | "audio/x-m4a"
     ) {
+        let edits = super::mp4_timing::identity_edits(bytes)?;
         let context =
             mp4parse::read_mp4(&mut Cursor::new(bytes)).context("MP4 timing is unavailable")?;
+        super::mp4_timing::validate_edits(&edits, &context)?;
         let mut duration = NativeDuration::ZERO;
         for track in &context.tracks {
             // Existing MP4 track spans are zero-origin bounds. An explicit
@@ -388,6 +390,16 @@ pub(super) fn native_duration(bytes: &[u8], mime: &str) -> Result<NativeDuration
         }
         ensure!(duration.numer > 0, "MP4 duration is unavailable");
         return Ok(duration);
+    }
+    // These demuxers may populate Some(duration) from sampled byte lengths.
+    // A raw complete frame scan establishes counts without estimated end trims.
+    if matches!(mime, "audio/mpeg" | "audio/mp3") {
+        let (samples, rate) = super::audio_timing::mp3_samples(bytes)?;
+        return Ok(NativeDuration::new(u128::from(samples), u128::from(rate)));
+    }
+    if mime == "audio/aac" {
+        let (samples, rate) = super::audio_timing::adts_samples(bytes)?;
+        return Ok(NativeDuration::new(u128::from(samples), u128::from(rate)));
     }
     use symphonia::core::{
         formats::{FormatOptions, probe::Hint},
@@ -1007,7 +1019,140 @@ mod mp4_timeline_boundary_regressions {
             native_duration(&bytes, "video/mp4")
                 .unwrap_err()
                 .to_string()
-                .contains("MP4 offset/loop timeline")
+                .contains("MP4 nonidentity edit timeline")
+        );
+    }
+}
+
+#[cfg(test)]
+mod confirmed_duration_regressions {
+    use super::*;
+    use crate::attachments::media_fixtures::{Mp4Edit, encoded_audio_mp4, vbr_adts, vbr_mp3};
+    #[test]
+    fn elementary_vbr_counts_are_independent_of_initial_bitrate_estimate() {
+        // 100 MPEG1 frames *1152 samples /48000Hz =2400ms.
+        let mp3 = native_duration(&vbr_mp3(100), "audio/mpeg").unwrap();
+        assert_eq!(mp3.ceil(1000).unwrap(), 2400);
+        assert!(mp3.within_millis(2400).unwrap());
+        assert!(!mp3.within_millis(2399).unwrap());
+        assert!(
+            !native_duration(&vbr_mp3(101), "audio/mpeg")
+                .unwrap()
+                .within_millis(2400)
+                .unwrap()
+        );
+        // 441 ADTS single raw blocks *1024 /44100Hz =10240ms.
+        let aac = native_duration(&vbr_adts(441), "audio/aac").unwrap();
+        assert_eq!(aac.ceil(1000).unwrap(), 10240);
+        assert!(aac.within_millis(10240).unwrap());
+        assert!(!aac.within_millis(10239).unwrap());
+        assert!(
+            !native_duration(&vbr_adts(442), "audio/aac")
+                .unwrap()
+                .within_millis(10240)
+                .unwrap()
+        );
+        for (mime, mut bytes) in [("audio/mpeg", vbr_mp3(100)), ("audio/aac", vbr_adts(441))] {
+            bytes.pop();
+            assert!(native_duration(&bytes, mime).is_err());
+        }
+        let mut changed = vbr_mp3(100);
+        changed[960 * 20 + 2] = 0x10; // 44.1kHz instead of48kHz
+        assert!(native_duration(&changed, "audio/mpeg").is_err());
+        let mut multiple = vbr_adts(441);
+        multiple[6] |= 1;
+        assert!(native_duration(&multiple, "audio/aac").is_err());
+        assert!(native_duration(b"\xff\xf1", "audio/aac").is_err());
+        assert!(native_duration(b"ID3", "audio/mpeg").is_err());
+        let xing = crate::attachments::media_fixtures::xing_mp3(100, 100);
+        assert_eq!(duration_millis(&xing, "audio/mpeg").unwrap(), 2400);
+        assert!(
+            native_duration(
+                &crate::attachments::media_fixtures::xing_mp3(100, 99),
+                "audio/mpeg"
+            )
+            .is_err()
+        );
+        let mut bad_trim = crate::attachments::regression::mp3().to_vec();
+        // Pinned Lavc encoder string starts at0xb9. Mutating it invalidates tag
+        // CRC while retaining media/frame layout; no bytes are decoded here.
+        bad_trim[0xb9 + 5] ^= 1;
+        assert!(native_duration(&bad_trim, "audio/mpeg").is_err());
+        // The existing Xing/LAME pinned fixture exercises count/CRC/priming
+        // proof separately, never an estimate-derived expected bound.
+        assert!(native_duration(crate::attachments::regression::mp3(), "audio/mpeg").is_ok());
+    }
+    #[test]
+    fn full_mp4_edit_table_requires_exact_single_identity_in_both_scales() {
+        // Valid encoded AAC container; movie scale1000 and media scale44100.
+        let no_edit = encoded_audio_mp4(None);
+        assert_eq!(duration_millis(&no_edit, "audio/mp4").unwrap(), 10240);
+        let identity = encoded_audio_mp4(Some(&[Mp4Edit {
+            duration: 10240,
+            start: 0,
+            rate: 0x10000,
+        }]));
+        assert_eq!(duration_millis(&identity, "audio/mp4").unwrap(), 10240);
+        for edits in [
+            vec![
+                Mp4Edit {
+                    duration: 1000,
+                    start: 0,
+                    rate: 0x10000
+                };
+                2
+            ],
+            vec![Mp4Edit {
+                duration: 1000,
+                start: 44100,
+                rate: 0x10000,
+            }],
+            vec![Mp4Edit {
+                duration: 10240,
+                start: 0,
+                rate: 0x20000,
+            }],
+            vec![Mp4Edit {
+                duration: 451584,
+                start: 0,
+                rate: 0x10000,
+            }], // raw ticks are not movie ticks
+        ] {
+            assert!(native_duration(&encoded_audio_mp4(Some(&edits)), "audio/mp4").is_err());
+        }
+        // Exact reviewer metadata-only counterexample, distinct from encoded
+        // admission fixtures: MDHD1s, movie1000Hz, two 1s positive edits, flags0.
+        fn atom(id: &[u8], data: &[u8]) -> Vec<u8> {
+            [((data.len() + 8) as u32).to_be_bytes().as_slice(), id, data].concat()
+        }
+        let mdia = super::tests::mp4(1000)[16..].to_vec();
+        let mut elst = vec![0; 4];
+        elst.extend(2u32.to_be_bytes());
+        for _ in 0..2 {
+            elst.extend(1000u32.to_be_bytes());
+            elst.extend(0i32.to_be_bytes());
+            elst.extend(0x10000i32.to_be_bytes());
+        }
+        let mut mvhd = vec![0; 12];
+        mvhd.extend(1000u32.to_be_bytes());
+        mvhd.extend(2000u32.to_be_bytes());
+        mvhd.resize(100, 0);
+        let bytes = atom(
+            b"moov",
+            &[
+                atom(b"mvhd", &mvhd),
+                atom(
+                    b"trak",
+                    &[mdia, atom(b"edts", &atom(b"elst", &elst))].concat(),
+                ),
+            ]
+            .concat(),
+        );
+        assert!(
+            native_duration(&bytes, "video/mp4")
+                .unwrap_err()
+                .to_string()
+                .contains("nonidentity edit timeline")
         );
     }
 }

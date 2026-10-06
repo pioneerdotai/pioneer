@@ -126,3 +126,222 @@ pub(crate) fn webm_timeline(audio: bool, video: bool, doc: &str, timing: TimingF
     ]
     .concat()
 }
+
+/// Layer III silence: main_data_begin=0, granule/channel lengths=0, no
+/// reservoir or gapless tags. MPEG1/48kHz mono, each frame has 1152 samples.
+/// First 20 frames are 320kbps/960 bytes, remaining are 32kbps/96 bytes.
+/// The expected count comes from the caller, not a bitrate estimator.
+pub(crate) fn vbr_mp3(frames: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for n in 0..frames {
+        let long = n < 20;
+        out.extend([0xff, 0xfb, if long { 0xe4 } else { 0x14 }, 0xc0]);
+        out.resize(out.len() + if long { 956 } else { 92 }, 0);
+    }
+    out
+}
+
+fn aac_frames() -> (Vec<u8>, Vec<u8>) {
+    let source = include_bytes!("../../tests/fixtures/capabilities/opencode-bip-bop-04.aac");
+    fn take(bytes: &[u8]) -> &[u8] {
+        assert_eq!(&bytes[..3], &[0xff, 0xf1, 0x50]); // AAC-LC, 44100Hz, unprotected
+        assert_eq!(bytes[3] >> 6, 1); // mono
+        assert_eq!(bytes[6] & 3, 0); // one raw block
+        let len = (usize::from(bytes[3] & 3) << 11)
+            | (usize::from(bytes[4]) << 3)
+            | usize::from(bytes[5] >> 5);
+        &bytes[..len]
+    }
+    let a = take(source);
+    let b = take(&source[a.len()..]);
+    assert_ne!(a.len(), b.len());
+    if a.len() > b.len() {
+        (a.to_vec(), b.to_vec())
+    } else {
+        (b.to_vec(), a.to_vec())
+    }
+}
+/// Reuses unchanged valid AAC-LC encoded payloads from the pinned reference;
+/// header rate/channel/frame configuration stays unchanged. No codec runs.
+pub(crate) fn vbr_adts(frames: usize) -> Vec<u8> {
+    let (long, short) = aac_frames();
+    (0..frames)
+        .flat_map(|n| if n < 20 { long.clone() } else { short.clone() })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Mp4Edit {
+    pub duration: u32,
+    pub start: i32,
+    pub rate: i32,
+}
+fn atom(id: &[u8], data: &[u8]) -> Vec<u8> {
+    [((data.len() + 8) as u32).to_be_bytes().as_slice(), id, data].concat()
+}
+fn elst(edits: &[Mp4Edit]) -> Vec<u8> {
+    let mut data = vec![0; 4];
+    data.extend((edits.len() as u32).to_be_bytes());
+    for e in edits {
+        data.extend(e.duration.to_be_bytes());
+        data.extend(e.start.to_be_bytes());
+        data.extend(e.rate.to_be_bytes());
+    }
+    atom(b"edts", &atom(b"elst", &data))
+}
+/// Rebuild metadata only; move new moov to EOF and replace original with an
+/// equally sized free box. All original mdat offsets/sample payloads stay valid.
+fn edit_movie(source: &[u8], edits: Option<&[Mp4Edit]>) -> Vec<u8> {
+    use super::mp4_timing::atoms;
+    let mut budget = 100_000;
+    let mut out = Vec::new();
+    let mut new_movie = Vec::new();
+    for top in atoms(source, &mut budget).unwrap() {
+        if top.id != b"moov" {
+            out.extend(atom(top.id, top.data));
+            continue;
+        }
+        out.extend(atom(b"free", top.data));
+        for field in atoms(top.data, &mut budget).unwrap() {
+            if field.id == b"trak" {
+                let mut track = Vec::new();
+                for t in atoms(field.data, &mut budget).unwrap() {
+                    track.extend(atom(if t.id == b"edts" { b"free" } else { t.id }, t.data));
+                }
+                if let Some(edits) = edits {
+                    track.extend(elst(edits));
+                }
+                new_movie.extend(atom(b"trak", &track));
+            } else if field.id == b"mvhd" && edits.is_some() {
+                let mut data = field.data.to_vec();
+                assert_eq!(data[0], 0);
+                data[12..16].copy_from_slice(&1000u32.to_be_bytes());
+                data[16..20].copy_from_slice(
+                    &edits
+                        .unwrap()
+                        .iter()
+                        .map(|e| e.duration)
+                        .sum::<u32>()
+                        .to_be_bytes(),
+                );
+                new_movie.extend(atom(field.id, &data));
+            } else {
+                new_movie.extend(atom(field.id, field.data));
+            }
+        }
+    }
+    assert_eq!(
+        out.len(),
+        source.len(),
+        "fixture requires unchanged original box header extents"
+    );
+    out.extend(atom(b"moov", &new_movie));
+    out
+}
+pub(crate) fn encoded_video_mp4(edits: Option<&[Mp4Edit]>) -> Vec<u8> {
+    edit_movie(
+        include_bytes!("../../tests/fixtures/capabilities/opencode-tabs.mp4"),
+        edits,
+    )
+}
+/// Encoded audio-only ISO BMFF: 441 valid AAC-LC mono samples from the pinned
+/// asset. 441*1024 /44100 =10.24 seconds independently; MDHD and STTS agree.
+pub(crate) fn encoded_audio_mp4(edits: Option<&[Mp4Edit]>) -> Vec<u8> {
+    let (packet, _) = aac_frames();
+    let payload = &packet[7..];
+    let count = 441u32;
+    let ftyp = atom(b"ftyp", b"isom\0\0\0\0isommp42");
+    let mdat = atom(b"mdat", &payload.repeat(count as usize));
+    let mut mvhd = vec![0; 12];
+    mvhd.extend(1000u32.to_be_bytes());
+    mvhd.extend(10240u32.to_be_bytes());
+    mvhd.extend(0x10000u32.to_be_bytes());
+    mvhd.extend(0x100u16.to_be_bytes());
+    mvhd.extend([0; 10]);
+    let matrix = [0x10000u32, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000]
+        .into_iter()
+        .flat_map(u32::to_be_bytes)
+        .collect::<Vec<_>>();
+    mvhd.extend(&matrix);
+    mvhd.extend([0; 24]);
+    mvhd.extend(2u32.to_be_bytes());
+    let mut tkhd = vec![0, 0, 0, 3];
+    tkhd.extend([0; 8]);
+    tkhd.extend(1u32.to_be_bytes());
+    tkhd.extend([0; 4]);
+    tkhd.extend(10240u32.to_be_bytes());
+    tkhd.extend([0; 12]);
+    tkhd.extend(0x100u16.to_be_bytes());
+    tkhd.extend([0; 2]);
+    tkhd.extend(&matrix);
+    tkhd.extend([0; 8]);
+    let mut mdhd = vec![0; 12];
+    mdhd.extend(44100u32.to_be_bytes());
+    mdhd.extend((count * 1024).to_be_bytes());
+    mdhd.extend([0; 4]);
+    let mut hdlr = vec![0; 8];
+    hdlr.extend(b"soun");
+    hdlr.extend([0; 12]);
+    hdlr.extend(b"Audio\0");
+    let mut entry = vec![0; 6];
+    entry.extend(1u16.to_be_bytes());
+    entry.extend([0; 8]);
+    entry.extend(1u16.to_be_bytes());
+    entry.extend(16u16.to_be_bytes());
+    entry.extend([0; 4]);
+    entry.extend((44100u32 << 16).to_be_bytes());
+    let esds = [
+        0, 0, 0, 0, 3, 25, 0, 1, 0, 4, 17, 0x40, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 2, 0x12,
+        0x08, 6, 1, 2,
+    ];
+    entry.extend(atom(b"esds", &esds));
+    let full = |words: &[u32]| {
+        words
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect::<Vec<_>>()
+    };
+    let stsd = atom(b"stsd", &[full(&[0, 1]), atom(b"mp4a", &entry)].concat());
+    let stbl = atom(
+        b"stbl",
+        &[
+            stsd,
+            atom(b"stts", &full(&[0, 1, count, 1024])),
+            atom(b"stsc", &full(&[0, 1, 1, count, 1])),
+            atom(b"stsz", &full(&[0, payload.len() as u32, count])),
+            atom(b"stco", &full(&[0, 1, (ftyp.len() + 8) as u32])),
+        ]
+        .concat(),
+    );
+    let dref = atom(
+        b"dref",
+        &[full(&[0, 1]), atom(b"url ", &[0, 0, 0, 1])].concat(),
+    );
+    let minf = atom(
+        b"minf",
+        &[atom(b"smhd", &[0; 8]), atom(b"dinf", &dref), stbl].concat(),
+    );
+    let mdia = atom(
+        b"mdia",
+        &[atom(b"mdhd", &mdhd), atom(b"hdlr", &hdlr), minf].concat(),
+    );
+    let track = atom(b"trak", &[atom(b"tkhd", &tkhd), mdia].concat());
+    let movie = atom(b"moov", &[atom(b"mvhd", &mvhd), track].concat());
+    let raw = [ftyp, mdat, movie].concat();
+    if edits.is_some() {
+        edit_movie(&raw, edits)
+    } else {
+        raw
+    }
+}
+
+/// Full zero-extension Xing frame followed by raw valid silence frames.
+/// No implicit guessed priming/padding; the caller supplies header counter.
+pub(crate) fn xing_mp3(frames: usize, declared: u32) -> Vec<u8> {
+    let mut header = vbr_mp3(1);
+    header[21..25].copy_from_slice(b"Xing");
+    header[25..29].copy_from_slice(&1u32.to_be_bytes());
+    header[29..33].copy_from_slice(&declared.to_be_bytes());
+    header.extend(vbr_mp3(frames));
+    header
+}

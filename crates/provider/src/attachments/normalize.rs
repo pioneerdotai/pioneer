@@ -1,7 +1,7 @@
 use crate::attachments::errors::AttachmentPipelineError;
 use crate::attachments::types::AttachmentNormalizationPolicy;
 use crate::types::InputContentType;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mime_guess::get_mime_extensions_str;
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -60,6 +60,12 @@ pub fn reconcile_mime(
     let actual = if sniffed == "video/webm" {
         super::webm::actual_mime(data)?
     } else if sniffed == "video/mp4" {
+        // Reject unproved edit structures before the dependency allocates a
+        // full table which its public Track projection subsequently discards.
+        // Duration/identity cross-scale proof remains in native_duration.
+        super::mp4_timing::identity_edits(data).context(super::MediaInputRejection(
+            "MP4 edit/fragment timeline is unsupported or unproven",
+        ))?;
         let context = mp4parse::read_mp4(&mut std::io::Cursor::new(data))?;
         if context
             .tracks

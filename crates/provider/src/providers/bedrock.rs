@@ -2256,3 +2256,60 @@ mod container_timeline_wire_regressions {
         }
     }
 }
+
+#[cfg(test)]
+mod confirmed_duration_wire_regressions {
+    use super::*;
+    use crate::{Provider, attachments::regression as fixture};
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn confirmed_elementary_audio_and_no_edit_mp4_keep_native_bytes_in_both_modes() {
+        let provider = BedrockProvider::new("unused", "unused", "us-east-1");
+        for (kind, mime, bytes) in fixture::confirmed_wire_inputs("bedrock") {
+            let state = Arc::new(fixture::state("bedrock", "media", serde_json::json!({})));
+            let budget = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(fixture::request(
+                    "media",
+                    vec![fixture::part(kind, mime, &bytes)],
+                )),
+            )
+            .await
+            .unwrap();
+            for _stream in [false, true] {
+                let replay = fixture::scoped(
+                    state.clone(),
+                    provider.prepare_input_budget(budget.request.clone()),
+                )
+                .await
+                .unwrap();
+                let prepared = fixture::scoped(
+                    state.clone(),
+                    crate::attachments::prepare_messages_for_provider_async(
+                        "bedrock",
+                        "media",
+                        &provider.capabilities(),
+                        &replay.request.messages,
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(prepared.attachments[0].kind, kind);
+                assert_eq!(prepared.attachments[0].mime_type, mime);
+                let wire = serde_json::to_value(
+                    BedrockProvider::build_request(&replay.request, &prepared).unwrap(),
+                )
+                .unwrap();
+                let union = if kind == InputContentType::Video {
+                    "video"
+                } else {
+                    "audio"
+                };
+                assert_eq!(
+                    wire["messages"][0]["content"][1][union]["source"]["bytes"],
+                    BASE64.encode(&bytes)
+                );
+            }
+        }
+    }
+}

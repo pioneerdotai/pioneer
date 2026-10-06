@@ -1,10 +1,12 @@
 pub(crate) mod admission;
+mod audio_timing;
 mod budget;
 mod contracts;
 mod errors;
 pub(crate) mod input_estimate;
 #[cfg(test)]
 pub(crate) mod media_fixtures;
+mod mp4_timing;
 mod normalize;
 mod observability;
 mod plan;

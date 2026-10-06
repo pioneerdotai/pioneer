@@ -1932,3 +1932,60 @@ mod media_contract_tests {
         assert!(OpenAiProvider::audio_format_from_mime("audio/flac").is_err());
     }
 }
+
+#[cfg(test)]
+mod confirmed_duration_wire_regressions {
+    use super::*;
+    use crate::{Provider, attachments::regression as fixture};
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn confirmed_mp3_budget_native_projection_and_replay_keep_bytes() {
+        let provider = OpenAiProvider::new("unused");
+        for (kind, mime, bytes) in fixture::confirmed_wire_inputs("openai") {
+            let state = Arc::new(fixture::state(
+                "openai",
+                "media",
+                serde_json::json!({"audio":{"maxDurationMillis":2400}}),
+            ));
+            let budget = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(fixture::request(
+                    "media",
+                    vec![fixture::part(kind, mime, &bytes)],
+                )),
+            )
+            .await
+            .unwrap();
+            for _stream in [false, true] {
+                // Both Chat routes use this actual native message projection.
+                let replay = fixture::scoped(
+                    state.clone(),
+                    provider.prepare_input_budget(budget.request.clone()),
+                )
+                .await
+                .unwrap();
+                let prepared = fixture::scoped(
+                    state.clone(),
+                    prepare_messages_for_provider_async(
+                        "openai",
+                        "media",
+                        &provider.capabilities(),
+                        &replay.request.messages,
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(prepared.attachments[0].kind, kind);
+                assert_eq!(prepared.attachments[0].mime_type, mime);
+                let wire =
+                    serde_json::to_value(OpenAiProvider::convert_messages(&prepared).unwrap())
+                        .unwrap();
+                assert_eq!(wire[0]["content"][1]["input_audio"]["format"], "mp3");
+                assert_eq!(
+                    wire[0]["content"][1]["input_audio"]["data"],
+                    BASE64.encode(&bytes)
+                );
+            }
+        }
+    }
+}

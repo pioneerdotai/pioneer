@@ -1156,3 +1156,311 @@ async fn container_timeline_limits_and_end_overflow_reject_before_native_project
         }
     }
 }
+
+#[tokio::test]
+async fn confirmed_elementary_audio_limits_and_mp4_edit_admission() {
+    use super::media_fixtures::{Mp4Edit, encoded_audio_mp4, encoded_video_mp4, vbr_adts, vbr_mp3};
+    use crate::Provider;
+    for name in ["openai", "bedrock", "gemini", "openrouter"] {
+        let provider: Arc<dyn Provider> = match name {
+            "openai" => Arc::new(crate::providers::OpenAiProvider::new("unused")),
+            "bedrock" => Arc::new(crate::providers::BedrockProvider::new(
+                "unused",
+                "unused",
+                "us-east-1",
+            )),
+            "gemini" => Arc::new(crate::providers::GeminiProvider::new("unused")),
+            _ => Arc::new(crate::providers::OpenRouterProvider::new("unused")),
+        };
+        let mut cases = vec![
+            (
+                InputContentType::Audio,
+                "audio/mpeg",
+                vbr_mp3(100),
+                2400,
+                true,
+            ),
+            (
+                InputContentType::Audio,
+                "audio/mpeg",
+                vbr_mp3(100),
+                2399,
+                false,
+            ),
+            (
+                InputContentType::Audio,
+                "audio/mpeg",
+                vbr_mp3(101),
+                2400,
+                false,
+            ),
+        ];
+        if name != "openai" {
+            cases.extend([
+                (
+                    InputContentType::Audio,
+                    "audio/aac",
+                    vbr_adts(441),
+                    10240,
+                    true,
+                ),
+                (
+                    InputContentType::Audio,
+                    "audio/aac",
+                    vbr_adts(441),
+                    10239,
+                    false,
+                ),
+                (
+                    InputContentType::Audio,
+                    "audio/aac",
+                    vbr_adts(442),
+                    10240,
+                    false,
+                ),
+                (
+                    InputContentType::Audio,
+                    "audio/mp4",
+                    encoded_audio_mp4(None),
+                    10240,
+                    true,
+                ),
+                (
+                    InputContentType::Audio,
+                    "audio/mp4",
+                    encoded_audio_mp4(Some(&[Mp4Edit {
+                        duration: 10240,
+                        start: 0,
+                        rate: 0x10000,
+                    }])),
+                    10240,
+                    true,
+                ),
+                (
+                    InputContentType::Audio,
+                    "audio/mp4",
+                    encoded_audio_mp4(None),
+                    10239,
+                    false,
+                ),
+            ]);
+            for edits in [
+                vec![
+                    Mp4Edit {
+                        duration: 1000,
+                        start: 0,
+                        rate: 0x10000
+                    };
+                    2
+                ],
+                vec![Mp4Edit {
+                    duration: 1000,
+                    start: 500,
+                    rate: 0x10000,
+                }],
+                vec![Mp4Edit {
+                    duration: 1000,
+                    start: 0,
+                    rate: 0x20000,
+                }],
+            ] {
+                cases.push((
+                    InputContentType::Audio,
+                    "audio/mp4",
+                    encoded_audio_mp4(Some(&edits)),
+                    1000,
+                    false,
+                ));
+                cases.push((
+                    InputContentType::Video,
+                    "video/mp4",
+                    encoded_video_mp4(Some(&edits)),
+                    1000,
+                    false,
+                ));
+            }
+        } else {
+            // The timing prerequisite must not enable OpenAI MP4 or AAC Chat.
+            cases.push((
+                InputContentType::Audio,
+                "audio/mp4",
+                encoded_audio_mp4(None),
+                10240,
+                false,
+            ));
+            cases.push((
+                InputContentType::Audio,
+                "audio/aac",
+                vbr_adts(441),
+                10240,
+                false,
+            ));
+        }
+        for (kind, mime, bytes, limit, allowed) in cases {
+            let key = if kind == InputContentType::Audio {
+                "audio"
+            } else {
+                "video"
+            };
+            let s = Arc::new(state(
+                name,
+                "media",
+                json!({key:{"maxDurationMillis":limit}}),
+            ));
+            let req = request("media", vec![part(kind, mime, &bytes)]);
+            let budget = scoped(s.clone(), provider.prepare_input_budget(req.clone())).await;
+            assert_eq!(budget.is_ok(), allowed, "{name} {mime} {limit}");
+            let admission = scoped(
+                s.clone(),
+                super::prepare_messages_for_provider_async(
+                    name,
+                    "media",
+                    &provider.capabilities(),
+                    &req.messages,
+                ),
+            )
+            .await;
+            assert_eq!(admission.is_ok(), allowed);
+            if let Err(error) = admission {
+                assert!(
+                    error
+                        .chain()
+                        .any(|e| e.downcast_ref::<super::MediaInputRejection>().is_some())
+                );
+                assert!(!error.to_string().contains(&STANDARD.encode(&bytes)));
+            }
+            if let Ok(budget) = budget {
+                let replay = scoped(s, provider.prepare_input_budget(budget.request))
+                    .await
+                    .unwrap();
+                assert_eq!(replay.media.len(), 1);
+            }
+        }
+        let mut bad_crc = mp3().to_vec();
+        bad_crc[0xb9 + 5] ^= 1;
+        for bytes in [super::media_fixtures::xing_mp3(100, 99), bad_crc] {
+            let req = request(
+                "media",
+                vec![part(InputContentType::Audio, "audio/mpeg", &bytes)],
+            );
+            let s = Arc::new(state(name, "media", json!({})));
+            assert!(
+                scoped(s.clone(), provider.prepare_input_budget(req.clone()))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                scoped(
+                    s,
+                    super::prepare_messages_for_provider_async(
+                        name,
+                        "media",
+                        &provider.capabilities(),
+                        &req.messages
+                    )
+                )
+                .await
+                .is_err()
+            );
+        }
+        for mime in ["audio/mpeg", "audio/aac"] {
+            if mime == "audio/aac" && name == "openai" {
+                continue;
+            }
+            let mut truncated = if mime == "audio/mpeg" {
+                vbr_mp3(100)
+            } else {
+                vbr_adts(441)
+            };
+            truncated.pop();
+            let req = request(
+                "media",
+                vec![part(InputContentType::Audio, mime, &truncated)],
+            );
+            assert!(
+                scoped(
+                    Arc::new(state(name, "media", json!({}))),
+                    provider.prepare_input_budget(req)
+                )
+                .await
+                .is_err()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_aggregate_uses_confirmed_vbr_frames_not_bitrate_estimates() {
+    use super::media_fixtures::{vbr_adts, vbr_mp3};
+    use crate::Provider;
+    let provider = crate::providers::GeminiProvider::new("unused");
+    // 34187.36 + 2.4 + 10.24 =34200 seconds exactly, independently.
+    // 34187.36*100 is an integral PCM sample count at 100Hz.
+    for (mp3_frames, allowed) in [(100, true), (101, false)] {
+        let req = request(
+            "media",
+            vec![
+                part(
+                    InputContentType::Audio,
+                    "audio/wav",
+                    &wav_frames(3_418_736, 100),
+                ),
+                part(InputContentType::Audio, "audio/mpeg", &vbr_mp3(mp3_frames)),
+                part(InputContentType::Audio, "audio/aac", &vbr_adts(441)),
+            ],
+        );
+        let s = Arc::new(state("gemini", "media", json!({})));
+        assert_eq!(
+            scoped(s.clone(), provider.prepare_input_budget(req.clone()))
+                .await
+                .is_ok(),
+            allowed
+        );
+        assert_eq!(
+            scoped(
+                s,
+                super::prepare_messages_for_provider_async(
+                    "gemini",
+                    "media",
+                    &provider.capabilities(),
+                    &req.messages
+                )
+            )
+            .await
+            .is_ok(),
+            allowed
+        );
+    }
+}
+
+pub(crate) fn confirmed_wire_inputs(
+    provider: &str,
+) -> Vec<(InputContentType, &'static str, Vec<u8>)> {
+    use super::media_fixtures::{encoded_audio_mp4, encoded_video_mp4, vbr_adts, vbr_mp3};
+    let mut cases = vec![(InputContentType::Audio, "audio/mpeg", vbr_mp3(100))];
+    if provider != "openai" {
+        cases.extend([
+            (InputContentType::Audio, "audio/aac", vbr_adts(441)),
+            (
+                InputContentType::Audio,
+                "audio/mp4",
+                encoded_audio_mp4(None),
+            ),
+            (
+                InputContentType::Audio,
+                "audio/mp4",
+                encoded_audio_mp4(Some(&[super::media_fixtures::Mp4Edit {
+                    duration: 10240,
+                    start: 0,
+                    rate: 0x10000,
+                }])),
+            ),
+            (
+                InputContentType::Video,
+                "video/mp4",
+                encoded_video_mp4(None),
+            ),
+        ]);
+    }
+    cases
+}

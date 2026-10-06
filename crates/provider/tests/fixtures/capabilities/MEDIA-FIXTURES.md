@@ -24,3 +24,15 @@ packets. No fixture construction, parsing, playback or transcoding was executed.
 `bedrock-claude-source.json` is the existing pinned models.dev direct Claude row;
 `bedrock-summary.json` and `openrouter-models.json` are schema-shaped native
 discovery fixtures, not live responses or a new model registry.
+
+Round 5: `opencode-bip-bop-04.aac` copies unchanged
+`packages/ui/src/assets/audio/bip-bop-04.aac` at the same pinned OpenCode revision
+and MIT license. Future-only Rust fixtures reuse two complete, unchanged AAC-LC
+ADTS frames at 44100Hz/mono with different lengths; the constructed stream has a
+caller-known count. Future Layer III silence frames use zero side/main data,
+MPEG1/48000Hz/mono and known 1152 samples per frame, with 20 long then short
+frames and no Xing/Info/VBRI. No frame construction/decoding/parser ran here.
+Future MP4 fixtures keep the pinned video sample bytes/offsets while relocating
+edited moov metadata; audio MP4 wraps unchanged AAC payload in explicit sample
+and timing tables (441*1024/44100=10.24s). These are written fixtures, pending
+execution; metadata-only edit fixtures are separate and do not prove API use.
