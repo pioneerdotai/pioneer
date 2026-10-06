@@ -635,6 +635,12 @@ impl PreparedVoiceEngineInput {
                 "local voice engine received an empty prepared speech buffer",
             ));
         }
+        if samples.iter().any(|sample| !sample.is_finite()) {
+            return Err(transcription_error(
+                VoiceTranscriptionErrorKind::UnsupportedAudioFormat,
+                "local voice engine received non-finite audio samples",
+            ));
+        }
 
         Ok(Self {
             #[cfg(test)]
@@ -681,6 +687,49 @@ mod tests {
     use super::super::vad::VoiceSpeechSegment;
     use super::*;
     use pioneer_config::AppConfig;
+
+    #[test]
+    fn auxiliary_asr_params_match_pinned_sdk_buffered_transcription_defaults() {
+        let whisper = whisper_inference_params();
+        assert_eq!(whisper.language, None); // SDK auto detection
+        assert!(!whisper.translate);
+        let canary = canary_params();
+        assert_eq!(canary.language, None); // SDK resolves None to en, not auto
+        assert_eq!(canary.target_language, None); // SDK uses source, no translation
+        assert!(canary.use_pnc && canary.use_itn);
+        assert_eq!(
+            canary.max_sequence_length,
+            CanaryParams::default().max_sequence_length
+        );
+        let cohere = cohere_params();
+        assert_eq!(cohere.language, None); // SDK resolves None to en
+        assert!(!cohere.translate); // this ONNX export ignores translate=true
+        assert_eq!(cohere.max_new_tokens, None);
+        let sense_voice = sense_voice_params();
+        assert_eq!(sense_voice.language, None); // SDK resolves None to auto
+        assert_eq!(sense_voice.use_itn, Some(true));
+        assert_eq!(ParakeetParams::default().language, None);
+        assert_eq!(MoonshineParams::default().language, None);
+        assert_eq!(MoonshineStreamingParams::default().language, None);
+        assert_eq!(GigaAMParams::default().language, None);
+    }
+
+    #[test]
+    fn auxiliary_asr_prepared_audio_rejects_nonfinite_before_native_calls() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let buffer = PreparedSpeechBuffer {
+                sample_rate_hz: 16_000,
+                total_samples: 1,
+                segments: vec![segment(&[value])],
+            };
+            assert_eq!(
+                PreparedVoiceEngineInput::from_buffer(&buffer)
+                    .unwrap_err()
+                    .kind,
+                VoiceTranscriptionErrorKind::UnsupportedAudioFormat
+            );
+        }
+    }
 
     #[test]
     fn voice_runtime_audio_adaptation_flattens_segments_as_target_mono_input() {

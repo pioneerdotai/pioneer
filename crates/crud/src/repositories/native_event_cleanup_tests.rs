@@ -9,10 +9,8 @@ use pioneer_sqlite::{
     SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass, SqliteWriteEvent,
     SqliteWriteExecutor, SqliteWriteObserver, sqlite_read_only_connection_url,
 };
-use sea_orm::sea_query::SqliteQueryBuilder;
-use sea_orm::{
-    ActiveModelTrait, ConnectOptions, Database, DatabaseBackend, EntityTrait, Set, Statement,
-};
+use sea_orm::sea_query::{Query, SqliteQueryBuilder};
+use sea_orm::{ConnectOptions, Database, DatabaseBackend, Statement};
 use std::{
     path::PathBuf,
     sync::{
@@ -188,6 +186,12 @@ impl Fixture {
             .try_get_by_index(0)?)
     }
     async fn turn(&self, id: &str, completed: bool) -> Result<()> {
+        self.turn_in_schema(id, completed, false).await
+    }
+    async fn historical_completed_turn(&self, id: &str) -> Result<()> {
+        self.turn_in_schema(id, true, true).await
+    }
+    async fn turn_in_schema(&self, id: &str, completed: bool, historical: bool) -> Result<()> {
         let thread = Thread {
             workspace_id: "ws-cleanup".into(),
             id: "thread-cleanup".into(),
@@ -223,6 +227,112 @@ impl Fixture {
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
+        if historical {
+            // Seed the already-projected release-era result using only columns
+            // installed at the cleanup migration boundary. Today's materializer
+            // requires later terminal-marker columns and cannot run on this schema.
+            turn.status = TurnStatus::Completed;
+            let notification = TurnCompletedNotification {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn,
+            };
+            let payload = serde_json::to_string(&crate::CanonicalTurnEventPayload::TurnCompleted(
+                notification,
+            ))?;
+            let event_id = format!("historical-{id}");
+            let at = chrono::DateTime::from_timestamp(NOW, 0)
+                .unwrap()
+                .fixed_offset();
+            let statements = [
+                Query::insert()
+                    .into_table("thread")
+                    .columns([
+                        "id",
+                        "workspace_id",
+                        "preview",
+                        "mode",
+                        "model",
+                        "model_provider",
+                        "status",
+                    ])
+                    .values_panic([
+                        thread.id.clone().into(),
+                        thread.workspace_id.into(),
+                        "".into(),
+                        "agent".into(),
+                        thread.model.into(),
+                        thread.model_provider.into(),
+                        "active".into(),
+                    ])
+                    .on_conflict(OnConflict::column("id").do_nothing().to_owned())
+                    .to_owned(),
+                Query::insert()
+                    .into_table("turn")
+                    .columns(["id", "thread_id", "status"])
+                    .values_panic([id.into(), thread.id.clone().into(), "completed".into()])
+                    .to_owned(),
+                Query::insert()
+                    .into_table("turn_event")
+                    .columns([
+                        "id",
+                        "thread_id",
+                        "turn_id",
+                        "sequence",
+                        "event_type",
+                        "payload",
+                        "created_at",
+                    ])
+                    .values_panic([
+                        event_id.clone().into(),
+                        thread.id.clone().into(),
+                        id.into(),
+                        1_i64.into(),
+                        "turn/completed".into(),
+                        payload.into(),
+                        at.into(),
+                    ])
+                    .to_owned(),
+                Query::insert()
+                    .into_table("turn_event_projection_state")
+                    .columns([
+                        "event_id",
+                        "thread_id",
+                        "turn_id",
+                        "sequence",
+                        "status",
+                        "next_run_at",
+                        "projected_at",
+                    ])
+                    .values_panic([
+                        event_id.into(),
+                        thread.id.clone().into(),
+                        id.into(),
+                        1_i64.into(),
+                        "projected".into(),
+                        at.into(),
+                        at.into(),
+                    ])
+                    .to_owned(),
+                Query::insert()
+                    .into_table("turn_event_projection_stream_state")
+                    .columns([
+                        "turn_id",
+                        "thread_id",
+                        "status",
+                        "projected_through_sequence",
+                    ])
+                    .values_panic([id.into(), thread.id.into(), "healthy".into(), 1_i64.into()])
+                    .to_owned(),
+            ];
+            let statements = statements.map(|statement| DatabaseBackend::Sqlite.build(&statement));
+            let transaction = self.db.begin().await?;
+            for statement in statements {
+                transaction.execute_raw(statement).await?;
+            }
+            transaction.commit().await?;
+            return self.bind(id, "codex", "completed").await;
+        }
         self.store
             .materialize_turn_start(
                 &thread,
@@ -247,57 +357,6 @@ impl Fixture {
         }
         self.bind(id, "codex", if completed { "completed" } else { "running" })
             .await
-    }
-    async fn historical_completed_turn(&self, id: &str) -> Result<()> {
-        // Seed the release-boundary schema without invoking today's projector,
-        // which requires outbox columns added by later migrations.
-        let at = chrono::DateTime::from_timestamp(NOW, 0)
-            .unwrap()
-            .fixed_offset();
-        pioneer_entity::thread::Entity::insert(pioneer_entity::thread::ActiveModel {
-            id: Set("thread-cleanup".into()),
-            workspace_id: Set("ws-cleanup".into()),
-            preview: Set(String::new()),
-            mode: Set("agent".into()),
-            model: Set("gpt-5.4".into()),
-            model_provider: Set("openai".into()),
-            status: Set("active".into()),
-            created_at: Set(at),
-            updated_at: Set(at),
-            ..Default::default()
-        })
-        .on_conflict(
-            sea_orm::sea_query::OnConflict::column(pioneer_entity::thread::Column::Id)
-                .do_nothing()
-                .to_owned(),
-        )
-        .exec_without_returning(&self.db)
-        .await?;
-        pioneer_entity::turn::ActiveModel {
-            id: Set(id.into()),
-            thread_id: Set("thread-cleanup".into()),
-            status: Set("completed".into()),
-            created_at: Set(at),
-            updated_at: Set(at),
-            ..Default::default()
-        }
-        .insert(&self.db)
-        .await?;
-        // The snapshot includes a successfully projected start and completion.
-        // A terminal Turn alone is not sufficient for native event cleanup.
-        pioneer_entity::turn_event_projection_stream_state::ActiveModel {
-            turn_id: Set(id.into()),
-            thread_id: Set("thread-cleanup".into()),
-            status: Set("healthy".into()),
-            projected_through_sequence: Set(2),
-            receipts_compacted_through_sequence: Set(0),
-            created_at: Set(at),
-            updated_at: Set(at),
-            ..Default::default()
-        }
-        .insert(&self.db)
-        .await?;
-        self.bind(id, "codex", "completed").await
     }
     async fn bind(&self, id: &str, runtime: &str, status: &str) -> Result<()> {
         let at = chrono::DateTime::from_timestamp(NOW, 0)
