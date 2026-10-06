@@ -1024,7 +1024,7 @@ mod tests {
     fn materialized_size_cannot_bypass_catalog_limit_with_missing_declared_size() {
         let mut file = attachment("audio/wav");
         file.source = AttachmentDataSource::Bytes {
-            base64_data: STANDARD.encode([0u8; 5]),
+            base64_data: STANDARD.encode(super::super::regression::wav()),
         };
         let prepared = super::super::prepare_messages_for_provider(
             "mock",
@@ -1047,11 +1047,15 @@ mod tests {
     }
     #[test]
     fn duration_constraint_uses_media_timing_and_fails_closed_on_unknown_encoding() {
+        let mut audio = attachment("audio/wav");
+        audio.source = AttachmentDataSource::Bytes {
+            base64_data: STANDARD.encode(super::super::regression::wav()),
+        };
         let prepared = super::super::prepare_messages_for_provider(
             "mock",
             &ceiling(),
             &[ChatMessage::user_parts(vec![MessageContentPart::audio(
-                attachment("audio/wav"),
+                audio,
             )])],
         )
         .unwrap();
@@ -1060,7 +1064,22 @@ mod tests {
             "inputConstraints".into(),
             json!({"audio":{"maxDurationMillis":1000}}),
         );
+        assert!(validate_materialized_constraints(&entry, &prepared.attachments[0]).is_ok());
+        entry.metadata.insert(
+            "inputConstraints".into(),
+            json!({"audio":{"maxDurationMillis":999}}),
+        );
         assert!(validate_materialized_constraints(&entry, &prepared.attachments[0]).is_err());
+        assert!(
+            super::super::prepare_messages_for_provider(
+                "mock",
+                &ceiling(),
+                &[ChatMessage::user_parts(vec![MessageContentPart::audio(
+                    attachment("audio/wav")
+                )])],
+            )
+            .is_err()
+        );
         entry.metadata.insert(
             "inputConstraints".into(),
             json!({"audio":{"maxBytes":"untrusted"}}),

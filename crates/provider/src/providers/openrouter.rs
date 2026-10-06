@@ -2769,8 +2769,16 @@ mod encoded_audio_regressions {
         for (mime, bytes, format) in [
             ("audio/wav", fixture::wav(), "wav"),
             (" AUDIO/X-WAV ", fixture::wav(), "wav"),
-            ("audio/mpeg", fixture::mp3().to_vec(), "mp3"),
-            ("audio/mp3", fixture::mp3().to_vec(), "mp3"),
+            (
+                "audio/mpeg",
+                crate::attachments::media_fixtures::vbr_mp3(100),
+                "mp3",
+            ),
+            (
+                "audio/mp3",
+                crate::attachments::media_fixtures::vbr_mp3(100),
+                "mp3",
+            ),
         ] {
             let state = Arc::new(fixture::state("openrouter", "media", serde_json::json!({})));
             let req = fixture::request(

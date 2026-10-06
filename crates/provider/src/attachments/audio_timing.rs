@@ -338,8 +338,10 @@ mod ancillary_classification_regressions {
         for bytes in rejected_mp3_tag_candidates() {
             assert!(mp3_samples(&bytes).is_err());
         }
-        // Existing Lavc count/CRC trim proof remains exercised separately.
-        assert!(mp3_samples(crate::attachments::regression::mp3()).is_ok());
+        // A pinned encoded asset is not sufficient tag-CRC proof. The source-
+        // backed Lavc/Lavf positives live in encoder_trim_domain_regressions.
+        let unproven = mp3_samples(crate::attachments::regression::mp3()).unwrap_err();
+        assert!(unproven.to_string().contains("CRC"));
         let mut crc = crate::attachments::regression::mp3().to_vec();
         crc[0xb9 + 5] ^= 1;
         assert!(mp3_samples(&crc).is_err());

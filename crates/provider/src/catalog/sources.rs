@@ -17,7 +17,11 @@ fn constrained_compat() -> Value {
     json!({"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false,"maxTokensField":"max_tokens","supportsStrictMode":false,"supportsLongCacheRetention":false})
 }
 
-pub(super) fn models_dev(data: &Value, nvidia: &Value, strict: bool) -> Result<Vec<Candidate>> {
+pub(super) fn models_dev(
+    data: &Value,
+    nvidia: &Value,
+    strict: bool,
+) -> Result<(Vec<Candidate>, BTreeSet<&'static str>)> {
     let mut result = Vec::new();
     let mut specialized = BTreeSet::new();
     let specs = [
@@ -638,6 +642,17 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
             );
         }
     }
+    Ok((result, specialized))
+}
+
+/// Supplemental registered brands have lower precedence than specialized
+/// routes and existing explicit corrections, even when a route emits zero rows.
+pub(super) fn registered_supplements(
+    data: &Value,
+    specialized: &BTreeSet<&str>,
+    existing: &[Candidate],
+) -> Vec<Candidate> {
+    let mut result: Vec<Candidate> = Vec::new();
     // Extend the existing dynamic source path to registered compatible brands.
     // Specialized transforms above retain precedence. Missing named data does
     // not inherit the modalities of a similarly named upstream model.
@@ -652,6 +667,9 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
                 | "copilot"
                 | "azure-openai"
                 | "ollama"
+                // The native /models route below owns this gateway's identities
+                // and filters. models.dev must not refill rejected native rows.
+                | "openrouter"
                 | "local"
                 | "telnyx"
                 | "glm"
@@ -699,6 +717,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
                 || m["status"] == "deprecated"
                 || result
                     .iter()
+                    .chain(existing.iter())
                     .any(|c| c.provider() == provider && c.id() == id)
             {
                 continue;
@@ -713,7 +732,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
             ));
         }
     }
-    Ok(result)
+    result
 }
 
 pub(super) fn openrouter(data: &Value) -> Vec<Candidate> {

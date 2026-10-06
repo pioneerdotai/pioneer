@@ -67,8 +67,10 @@ pub(crate) fn wav_frames(frames: u32, rate: u32) -> Vec<u8> {
 pub(crate) fn mp3() -> &'static [u8] {
     include_bytes!("../../tests/fixtures/capabilities/opencode-yup-06.mp3")
 }
-pub(crate) fn video() -> &'static [u8] {
-    include_bytes!("../../tests/fixtures/capabilities/opencode-tabs.mp4")
+pub(crate) fn video() -> Vec<u8> {
+    // Keep the encoded samples and their offsets, but use the independently
+    // covered no-edit timeline instead of the pinned asset's nonidentity edits.
+    super::media_fixtures::encoded_video_mp4(None)
 }
 pub(crate) fn part(kind: InputContentType, mime: &str, bytes: &[u8]) -> MessageContentPart {
     let a = MessageAttachment {
@@ -125,6 +127,11 @@ pub(crate) fn state(provider: &str, model: &str, constraints: Value) -> Admissio
     };
     if !models[key][model].is_null() {
         models[key][model]["inputConstraints"] = constraints;
+    }
+    if provider == "openai" && model == "media" {
+        // These fixtures exercise the admitted Chat audio profile. The source
+        // fixture's Responses membership does not establish Chat audio support.
+        models[key][model]["api"] = json!("openai-completions");
     }
     let c = crate::catalog::ModelCatalog::parse(
         &serde_json::to_string(&models).unwrap(),
@@ -608,8 +615,18 @@ async fn count_and_duration_boundary_constraints_are_native_admission_not_token_
         );
     }
     for (declared, actual, strict, accepted) in [
-        ("audio/wav", mp3().to_vec(), false, true),
-        ("audio/wav", mp3().to_vec(), true, false),
+        (
+            "audio/wav",
+            super::media_fixtures::vbr_mp3(100),
+            false,
+            true,
+        ),
+        (
+            "audio/wav",
+            super::media_fixtures::vbr_mp3(100),
+            true,
+            false,
+        ),
         ("audio/mp3", wav(), false, true),
         ("audio/mp3", wav(), true, false),
     ] {
@@ -771,7 +788,11 @@ async fn effective_audio_mime_restriction_rejects_actual_mp3_despite_wav_declara
                 &caps,
                 request(
                     "media",
-                    vec![part(InputContentType::Audio, "audio/wav", mp3())]
+                    vec![part(
+                        InputContentType::Audio,
+                        "audio/wav",
+                        &super::media_fixtures::vbr_mp3(100)
+                    )]
                 )
             )
         )

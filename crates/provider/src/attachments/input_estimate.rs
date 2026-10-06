@@ -738,6 +738,7 @@ mod tests {
             ChatMessage, InputTypeSupport, MessageAttachment, ProviderCapabilities,
             ProviderInputCapabilities,
         };
+        use std::sync::Arc;
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("image.png");
         let bytes = png(512, 512);
@@ -774,9 +775,20 @@ mod tests {
             reasoning: None,
             compiled_prompt: None,
         };
-        let prepared = super::super::runtime::with_async_authority_scope(
-            "fixture-media-authority".into(),
-            prepare("openai", &caps, request),
+        let catalog = Arc::new(
+            crate::catalog::ModelCatalog::parse(
+                include_str!("../../tests/fixtures/catalog/models.json"),
+                include_str!("../../tests/fixtures/catalog/provenance.json"),
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(super::super::admission::AdmissionState::for_test(catalog));
+        let prepared = super::super::admission::scope(
+            state.clone(),
+            super::super::runtime::with_async_authority_scope(
+                "fixture-media-authority".into(),
+                prepare("openai", &caps, request),
+            ),
         )
         .await
         .unwrap();
@@ -790,13 +802,16 @@ mod tests {
             panic!("unpinned image")
         };
         assert_eq!(STANDARD.decode(base64_data).unwrap(), bytes);
-        let next = super::super::runtime::with_async_authority_scope(
-            "fixture-media-authority".into(),
-            super::super::prepare_messages_for_provider_async(
-                "openai",
-                prepared.request.model.as_str(),
-                &caps,
-                &prepared.request.messages,
+        let next = super::super::admission::scope(
+            state,
+            super::super::runtime::with_async_authority_scope(
+                "fixture-media-authority".into(),
+                super::super::prepare_messages_for_provider_async(
+                    "openai",
+                    prepared.request.model.as_str(),
+                    &caps,
+                    &prepared.request.messages,
+                ),
             ),
         )
         .await
@@ -1078,9 +1093,11 @@ mod confirmed_duration_regressions {
         // CRC while retaining media/frame layout; no bytes are decoded here.
         bad_trim[0xb9 + 5] ^= 1;
         assert!(native_duration(&bad_trim, "audio/mpeg").is_err());
-        // The existing Xing/LAME pinned fixture exercises count/CRC/priming
-        // proof separately, never an estimate-derived expected bound.
-        assert!(native_duration(crate::attachments::regression::mp3(), "audio/mpeg").is_ok());
+        // The pinned codec asset has an unproven tag CRC; hard timing must
+        // reject it. Supported CRC/count/trim domains have independent fixtures.
+        let unproven =
+            native_duration(crate::attachments::regression::mp3(), "audio/mpeg").unwrap_err();
+        assert!(unproven.to_string().contains("CRC"));
     }
     #[test]
     fn full_mp4_edit_table_requires_exact_single_identity_in_both_scales() {

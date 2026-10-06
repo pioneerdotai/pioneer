@@ -259,7 +259,7 @@ fn base(
 /// in the saved fixture. First source wins identity collisions, as in Pi.
 pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCatalog> {
     snapshot.validate()?;
-    let mut candidates = sources::models_dev(
+    let (mut candidates, specialized) = sources::models_dev(
         &snapshot.sources[SOURCE_URLS[0]].body,
         &snapshot.sources[SOURCE_URLS[3]].body,
         strict,
@@ -272,6 +272,12 @@ pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCata
                 && m.id() == "gpt-5.3-codex-spark")
     });
     overrides::apply(&mut candidates)?;
+    let supplements = sources::registered_supplements(
+        &snapshot.sources[SOURCE_URLS[0]].body,
+        &specialized,
+        &candidates,
+    );
+    candidates.extend(supplements);
     for model in &mut candidates {
         compatibility::apply(model);
     }
@@ -659,6 +665,12 @@ mod media_propagation_tests {
         let data = &mut snapshot.sources.get_mut(SOURCE_URLS[0]).unwrap().body;
         data["volcengine"]["models"]["fixture-media"] = source.clone();
         data["novita-ai"]["models"]["fixture-media"] = source.clone();
+        data["novita-ai"]["api"] = json!(
+            crate::definition::provider_definition("novita")
+                .unwrap()
+                .default_base_url
+                .unwrap()
+        );
         snapshot.sources.get_mut(SOURCE_URLS[0]).unwrap().body["groq"]["models"]["fixture-unknown"] =
             json!({"tool_call":true});
         snapshot.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"].as_array_mut().unwrap().push(json!({"id":"fixture/media","name":"media fixture","supported_parameters":["tools"],"architecture":{"input_modalities":input,"output_modalities":["text","audio"]}}));
@@ -752,6 +764,83 @@ mod partial_source_tests {
 #[cfg(test)]
 mod specialized_zero_regressions {
     use super::*;
+    #[test]
+    fn native_openrouter_route_owns_filters_and_conflicting_model_metadata() {
+        for strict in [false, true] {
+            let mut s: SourceSnapshot =
+                serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                    .unwrap();
+            let conflicting = json!({"tool_call":true,"modalities":{"input":["image"]},"limit":{"context":999,"output":999}});
+            s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["openrouter"]["models"]["fixture/native-negative"] =
+                conflicting.clone();
+            s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["openrouter"]["models"]["fixture/native-positive"] =
+                conflicting;
+            s.sources.get_mut(SOURCE_URLS[1]).unwrap().body = json!({"data":[
+                {"id":"fixture/native-negative","supported_parameters":[],"architecture":{"input_modalities":["text"]}},
+                {"id":"fixture/native-positive","supported_parameters":["tools"],"architecture":{"input_modalities":["text"]},"context_length":64000,"top_provider":{"max_completion_tokens":4000}}
+            ]});
+            let generated = generate(&s, strict).unwrap();
+            assert!(
+                generated.models["openrouter"]
+                    .get("fixture/native-negative")
+                    .is_none()
+            );
+            let native = &generated.models["openrouter"]["fixture/native-positive"];
+            assert_eq!(native["input"], json!(["text"]));
+            assert_eq!(native["contextWindow"], 64000);
+            assert_eq!(native["maxTokens"], 4000);
+            s.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
+                .as_array_mut()
+                .unwrap()
+                .pop();
+            let zero = generate(&s, strict).unwrap();
+            assert!(zero.models.get("openrouter").is_none_or(|models| {
+                models.get("fixture/native-negative").is_none()
+                    && models.get("fixture/native-positive").is_none()
+            }));
+        }
+    }
+
+    #[test]
+    fn registered_supplements_preserve_existing_explicit_priority_and_refresh_new_ids() {
+        let mut s: SourceSnapshot =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                .unwrap();
+        let reference: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json")).unwrap();
+        let changed = json!({"tool_call":true,"name":"dynamic","modalities":{"input":["text"]},"cost":{"input":99,"output":99},"limit":{"context":64000,"output":4000}});
+        s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["deepseek"]["models"]["deepseek-v4-flash"] =
+            changed.clone();
+        s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["deepseek"]["models"]["fixture-dynamic"] =
+            changed;
+        let generated = generate(&s, true).unwrap();
+        let known = &generated.models["deepseek"]["deepseek-v4-flash"];
+        for field in ["contextWindow", "maxTokens", "cost"] {
+            assert_eq!(
+                known[field],
+                reference["deepseek"]["deepseek-v4-flash"][field]
+            );
+        }
+        assert_eq!(
+            generated.provenance["deepseek"]["deepseek-v4-flash"]["contextWindow"]["kind"],
+            "override"
+        );
+        let dynamic = &generated.models["deepseek"]["fixture-dynamic"];
+        assert_eq!(dynamic["contextWindow"], 64000);
+        assert_eq!(dynamic["maxTokens"], 4000);
+        assert_eq!(dynamic["cost"]["input"], 99);
+        assert_eq!(
+            generated.provenance["deepseek"]["fixture-dynamic"]["contextWindow"]["kind"],
+            "source"
+        );
+        s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["deepseek"]["models"]["fixture-dynamic"]
+            ["limit"]["context"] = json!(96000);
+        assert_eq!(
+            generate(&s, true).unwrap().models["deepseek"]["fixture-dynamic"]["contextWindow"],
+            96000
+        );
+    }
+
     #[test]
     fn nvidia_zero_eligible_never_refills_from_generic_source() {
         for strict in [false, true] {

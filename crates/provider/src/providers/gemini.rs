@@ -1865,7 +1865,7 @@ mod async_media_admission_regressions {
                 ),
                 fixture::part(InputContentType::File, "application/pdf", &fixture::pdf(1)),
                 fixture::part(InputContentType::Audio, "audio/wav", &fixture::wav()),
-                fixture::part(InputContentType::Video, "video/mp4", fixture::video()),
+                fixture::part(InputContentType::Video, "video/mp4", &fixture::video()),
             ],
         );
         let budget = fixture::scoped(state.clone(), provider.prepare_input_budget(req))

@@ -2391,10 +2391,14 @@ mod summary_document_regressions {
         .unwrap();
         let id = "anthropic.claude-sonnet-4-6";
         let row = serde_json::json!({"id":id,"name":source["name"],"provider":"amazon-bedrock","api":"bedrock-converse-stream","baseUrl":"https://bedrock-runtime.us-east-1.amazonaws.com","contextWindow":source["limit"]["context"],"maxTokens":source["limit"]["output"],"reasoning":false,"input":source["modalities"]["input"],"cost":{},"inputOrigin":{"kind":"source","expression":"pinned models.dev raw row"},"sourceMetadata":source});
+        let origins = serde_json::json!({"amazon-bedrock":{id:{
+            "contextWindow":{"kind":"source","expression":"models.dev.limit.context"},
+            "maxTokens":{"kind":"source","expression":"models.dev.limit.output"}
+        }}});
         let catalog = Arc::new(
             crate::catalog::ModelCatalog::parse(
                 &serde_json::json!({"amazon-bedrock":{id:row}}).to_string(),
-                include_str!("../../tests/fixtures/capabilities/provenance.json"),
+                &origins.to_string(),
             )
             .unwrap(),
         );

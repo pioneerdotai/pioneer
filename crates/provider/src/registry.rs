@@ -3044,13 +3044,40 @@ mod tests {
             let provider = registry
                 .get_or_create_for_workspace("upload-workspace", "openai")
                 .unwrap();
+            // Keep the actual registry-created adapter, endpoint authority and
+            // redaction wrapper. Give only this test authority a known PDF
+            // model so upload errors are reached after real PDF admission.
+            drop(provider);
+            let provider = {
+                let mut cache = registry.cache.write().unwrap();
+                let entry = cache
+                    .entries
+                    .values_mut()
+                    .find(|entry| entry.provider.name() == "openai")
+                    .unwrap();
+                let wrapper = Arc::get_mut(&mut entry.provider).unwrap();
+                wrapper.input_admission = Arc::new(crate::attachments::regression::state(
+                    "openai",
+                    "media",
+                    serde_json::json!({}),
+                ));
+                entry.provider.clone()
+            };
             let mut request = chat_request();
+            request.model = "media".into();
             // The normal planner uploads files at or above its default threshold.
-            let bytes = vec![b'x'; 512 * 1024];
+            let mut pdf =
+                lopdf::Document::load_mem(&crate::attachments::regression::pdf(1)).unwrap();
+            pdf.add_object(lopdf::Stream::new(
+                lopdf::dictionary! {},
+                vec![b'x'; 512 * 1024],
+            ));
+            let mut bytes = Vec::new();
+            pdf.save_to(&mut bytes).unwrap();
             request.messages = vec![crate::ChatMessage::user_parts(vec![
                 crate::MessageContentPart::file(crate::MessageAttachment {
-                    mime_type: "application/octet-stream".into(),
-                    name: Some("payload.bin".into()),
+                    mime_type: "application/pdf".into(),
+                    name: Some("payload.pdf".into()),
                     size_bytes: Some(bytes.len() as u64),
                     sha256: None,
                     source: crate::AttachmentDataSource::Bytes {

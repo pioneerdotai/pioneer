@@ -200,7 +200,10 @@ pub async fn prepare_messages_for_provider_async(
                     &capabilities,
                     messages.as_slice(),
                     &config,
-                )?;
+                )
+                .context(MediaInputRejection(
+                    "media input could not be materialized under the selected attachment policy",
+                ))?;
                 if let Some(entry) = entry.as_ref() {
                     for attachment in &prepared.attachments {
                         contracts::validate_materialized_constraints(entry, attachment).context(
@@ -603,7 +606,11 @@ mod tests {
                     size_bytes: None,
                     sha256: None,
                     source: AttachmentDataSource::Bytes {
-                        base64_data: BASE64.encode([1u8, 2, 3, 4]),
+                        base64_data: BASE64.encode(super::regression::image(
+                            image::ImageFormat::Png,
+                            1,
+                            1,
+                        )),
                     },
                     artifact: None,
                 }),
@@ -670,7 +677,7 @@ mod tests {
             size_bytes: None,
             sha256: None,
             source: AttachmentDataSource::Bytes {
-                base64_data: BASE64.encode([1u8, 2, 3]),
+                base64_data: BASE64.encode(super::regression::image(image::ImageFormat::Png, 1, 1)),
             },
             artifact: None,
         })]);
@@ -685,9 +692,10 @@ mod tests {
 
     #[test]
     fn budget_limits_are_enforced() {
+        let png = super::regression::image(image::ImageFormat::Png, 1, 1);
         let config = AttachmentPipelineConfig {
-            max_bytes_per_attachment: 4,
-            max_total_bytes_per_request: 6,
+            max_bytes_per_attachment: png.len(),
+            max_total_bytes_per_request: 2 * png.len() - 1,
             max_attachments_per_request: 2,
             upload_preferred_min_bytes: 1024,
             ..AttachmentPipelineConfig::default()
@@ -699,7 +707,7 @@ mod tests {
             size_bytes: None,
             sha256: None,
             source: AttachmentDataSource::Bytes {
-                base64_data: BASE64.encode([1u8, 2, 3, 4]),
+                base64_data: BASE64.encode(&png),
             },
             artifact: None,
         });
@@ -709,7 +717,7 @@ mod tests {
             size_bytes: None,
             sha256: None,
             source: AttachmentDataSource::Bytes {
-                base64_data: BASE64.encode([5u8, 6, 7]),
+                base64_data: BASE64.encode(&png),
             },
             artifact: None,
         });
