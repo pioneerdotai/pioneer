@@ -339,9 +339,15 @@ async fn panic_candidate_lifecycle(mode: usize) {
     let (directory, manager, store, workspace) =
         setup_pooled_file_workspace_manager_with_observer(Some(observer.clone())).await;
     let processor = processor_with_store(manager, store);
-    for id in ["panic-A", "panic-B", "panic-C"] {
+    // Append refreshes B's generation. Distinct due times keep A/B/C order
+    // independent of that tie-breaker, so the fault targets B's intended phase.
+    for (id, due) in [
+        ("panic-A", NOW - 3),
+        ("panic-B", NOW - 2),
+        ("panic-C", NOW - 1),
+    ] {
         create(&processor, &workspace, id).await;
-        ready(&processor, id, NOW - 1, 0).await;
+        ready(&processor, id, due, 0).await;
     }
     if mode == 5 {
         // B's reservation update fails; its separate failure bookkeeping is
@@ -351,6 +357,18 @@ async fn panic_candidate_lifecycle(mode: usize) {
     if mode == 7 {
         fanout_test_append(&processor, "panic-B", "second confirmed prefix event").await;
     }
+    assert_eq!(
+        processor
+            .crud_store
+            .due_task_event_fanout(NOW, 64)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.task_id)
+            .collect::<Vec<_>>(),
+        vec!["panic-A", "panic-B", "panic-C"],
+        "fixture must keep B between A and C after append refreshes generation"
+    );
     observer.maintenance_acquires.store(0, Ordering::SeqCst);
     observer.events.lock().unwrap().clear();
     // A: claim, renewal, release. B: claim (#4), or failed-claim
