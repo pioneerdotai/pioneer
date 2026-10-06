@@ -5,7 +5,12 @@ acceptance and behavioral validation are pending. **C2 NOT_COMPLETE**. CLI plugi
 selection/aliases/continuations, graph CLI integration, mobile and testing remain
 closed. The previous `agent-plugins-stage-c2.md` provider inventory is preserved.
 
-## Snapshot
+This handoff now includes the C2S-01/02 correction over reviewed delivery
+`3e3d99ce2d10969d6b57ebd78c80b79dba7adfdc`; see the final section for its
+current code/delivery and check evidence. The original snapshot and checks below
+are retained as historical evidence, not acceptance of that reviewed delivery.
+
+## Original prerequisite snapshot (historical)
 
 - Branch: `feature/agent-plugins-simple`.
 - Worktree / command cwd:
@@ -208,3 +213,100 @@ selection snapshot/aliases/assets/ready/continuation/task/recovery gates and str
 CLI inventory into the existing graph stop. Explicit CLI plugin rejection,
 detached-plugin rejection and graph CLI-binding failure are preserved; these are
 pending C2 work, not completed plugin support. Stop here for coordinator review.
+
+## C2S-01 / C2S-02 review correction
+
+Status: **READY_FOR_C2_STOP_REVIEW**, pending repeated coordinator review;
+**C2 NOT_COMPLETE**. This iteration fixes only the two local findings. The
+original review was CHANGES_REQUESTED, not acceptance of the historical claims
+above about legacy Drop and deadlines before key-lock acquisition.
+
+- Base/reviewed delivery: `3e3d99ce2d10969d6b57ebd78c80b79dba7adfdc`, initially
+  clean, same branch/worktree/cwd as above; applicable root AGENTS read.
+- Code HEAD: `19120effd32bd0d11dd5bfac6bd6eccb51ed5d0a`.
+- Delivery HEAD: the documentation commit returned by
+  `git log -1 --format=%H -- implementation-notes/agent-plugins-stage-c2-stop.md`;
+  final response supplies its hash. Final delivery worktree: clean, verified
+  after the documentation commit. At code commit only this handoff was dirty.
+
+**C2S-01:** `mcp/supervisor.rs:882` transfers the actual legacy transport
+connection into the existing best-effort Drop task, which now calls the same
+`terminate` → `retire_connection` → `revoke_session` operations. Retirement
+returns the socket to its exact existing supervisor entry **before** revoke;
+the strict TransportOwned guard is unchanged. Retirement (`:855`) additionally
+validates the bound grant/connection identity. A failed retirement neither
+revokes another owner nor recursively schedules another Drop. Standalone/probe
+best-effort runtime limitations remain. No cleanup service or new ownership
+registry is introduced.
+
+`mcp/server.rs` builder contracts are unchanged: facade validation still happens
+before setting defer_cleanup, so validation failure in either build branch now
+uses the repaired legacy Drop. Successfully built owned facades still defer
+cleanup until actual normal server/facade/call completion and connection
+retirement; active owned transports still reject strict revoke.
+
+**C2S-02:** `manager.rs:852` initiates begin_close on the **captured** owner before
+the caller's deadline/key-lock await. Cancellation-driven startup receives its
+signal while it still holds the key lock. The same order applies to
+close_session_instance (`:1041`) and cutoff requested close (`:893`); close(key)
+continues to capture once and delegate. Cutoff close captures only an eligible
+owner before await, then revalidates the same identity and cutoff under the key
+lock; it cannot switch to a late replacement. Ineligible/newer owners are untouched.
+
+Native drain and release still serialize under the existing logical key lock;
+begin_close retains the actual cleanup handle in the same owner. Deadline or
+cancelled waiter before lock acquisition leaves admission closed and the actual
+cleanup discoverable. A late factory result cannot publish Ready. Captured old
+stop never requests stop on a replacement. Existing callback self-stop returns
+pending/error before waiting for its own join or key lock. Startup, idle TTL
+revalidation, EOF/shutdown, sticky panic, exact release and native cleanup
+structure remain unchanged. No DB, wire/schema or generated contract change.
+
+**Actual non-test checks:** commands used the worktree/cwd above, baseline
+`3e3d99ce` with only these three Rust source files dirty; final code commit
+contains the checked production bytes. A final test-only source ordering edit
+was formatted while compilation ran; test bodies were never compiled.
+
+| Command / evidence | Actual result |
+| --- | --- |
+| Initial `CARGO_INCREMENTAL=0 cargo check -p pioneer-gateway --lib > target/plugin-c2-stop-fix-check.log 2>&1` attempt | exit 1 from shell redirection: local target directory absent; Cargo did not start |
+| `mkdir -p target` | exit 0; local ignored evidence directory created |
+| Same direct production cargo command; `target/plugin-c2-stop-fix-check.log` | exit 0, 17m21s; final production source bytes at `19120eff`; only existing unused `set_mcp_policy` warning |
+| `rustfmt --edition 2024 --config skip_children=true` on the three changed Rust files | exit 0 |
+| Same scoped rustfmt with `--check`, and `git diff --check` | exit 0 / 0 on final Rust sources |
+| `git diff --check 3e3d99ce2d10969d6b57ebd78c80b79dba7adfdc HEAD` | exit 0 at code HEAD and final delivery |
+
+No wrapper/test hooks used; commits disable hooks via `core.hooksPath=/dev/null`.
+Prior compilation evidence above is preserved separately and does not validate
+this iteration. Historical log paths record the prior delivery; target was absent
+at this iteration's start, so those prior logs were not reverified here. No
+test/app/helper/provider/device/functional execution occurred.
+Concurrent cargo/rustc processes were observed by executable name only; their
+commands/targets were not inspected and their results are not this check's evidence.
+
+**Regression sources — NOT_RUN / NOT_COMPILED:**
+
+- `mcp/server.rs:525`: actual dropped legacy transport, validation failure in
+  both legacy and owned builders before defer_cleanup, active owned strict
+  refusal and normal server join followed by strict cleanup. Checks actual
+  grant/directory release and preservation of a prepared replacement. The helper
+  exists only in source and was not executed; prior delayed-call normal-drain
+  source is retained.
+- `manager.rs:1930`: cancellation-driven startup stopped by strict captured API,
+  close_instance and eligible cutoff close before the factory releases the key.
+- `manager.rs:1990`: deadline and explicitly cancelled stop waiter while startup
+  still holds that lock; checks Closing, rejected admission, retained inventory,
+  no Ready after late factory return and actual one-time cleanup on repeat.
+- `manager.rs:2061`: callback self-stop and same-key reentrant acquisition return
+  errors without self-join; independent captured wait obtains completion.
+- Existing captured-predecessor/replacement and cutoff/restart regression sources
+  remain; source checks are not a behavioral pass or test type-check claim.
+
+No unresolved local source finding identified for C2S-01/02; review and behavioral
+validation remain pending. All original unjoined anonymous spool decoder,
+uncooperative invocation, panic/host/platform limitations above remain, including
+Claude's bounded anonymous spool decoder. Legacy Drop without a live runtime
+remains best effort. Full C2 enablement/aliases/assets/continuations/task/recovery
+and graph CLI stop integration, D/mobile and E/review-authorized tests remain
+closed. Historical external activity stays **UNKNOWN_EXTERNAL_ACTIVITY**, separate
+from this iteration's **NOT_RUN / NOT_COMPILED**. Stop for repeated review.
