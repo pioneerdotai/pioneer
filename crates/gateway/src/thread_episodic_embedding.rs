@@ -2722,12 +2722,16 @@ mod tests {
         let text = "large query context ".repeat(100);
         let prepared = prepare_embedding_input(text.as_str(), 96, true)
             .expect("oversized query should be chunkable");
-        assert!(prepared.chunks.len() > 1);
+        assert!(prepared.chunks.len() > 2);
         let fake = Arc::new(FakeRemoteProvider::with_responses(
             "openrouter",
-            vec![Err(anyhow::anyhow!(
-                "error decoding response body: missing field `data`"
-            ))],
+            vec![
+                Ok(embedding_response(vec![vec![3.0, 4.0]])),
+                Err(anyhow::anyhow!(
+                    "error decoding response body: missing field `data`"
+                )),
+                Ok(embedding_response(vec![vec![3.0, 4.0]])),
+            ],
         ));
         let provider = RemoteEmbeddingProvider::openrouter_with_max_input_tokens(
             "vendor/custom-embed",
@@ -2746,11 +2750,15 @@ mod tests {
         assert!(error.is_retryable());
         assert!(error.message.contains(CHUNKED_EMBEDDING_INPUT_ERROR_MARKER));
         let requests = fake.requests();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].input.len() > 1);
-        assert!(requests[0].input.iter().all(|input| input.starts_with(
-            "Instruct: Given the user's current message in an ongoing personal assistant conversation"
-        )));
+        // Custom Router profiles send one decorated chunk per request. A later
+        // failure must retain chunked-input classification and stop the plan.
+        assert_eq!(requests.len(), 2);
+        for (request, chunk) in requests.iter().zip(&prepared.chunks) {
+            assert_eq!(request.input, vec![chunk.clone()]);
+            assert!(request.input[0].starts_with(
+                "Instruct: Given the user's current message in an ongoing personal assistant conversation"
+            ));
+        }
     }
 
     #[test]

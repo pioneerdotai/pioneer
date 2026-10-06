@@ -13842,6 +13842,24 @@ async fn g09_owned_voice_ingress_cancel_disconnect_and_terminal_branches() {
                 thread_id,
             )
             .await;
+            let start_id = generate_test_request_id("voice", "start");
+            let finalize_id = generate_test_request_id("voice", "finalize");
+            let repeat_id = generate_test_request_id("voice", "repeat");
+            let foreign_request_id = generate_test_request_id("voice", "foreign");
+            let cancel_id = generate_test_request_id("voice", "cancel");
+            let late_cancel_id = generate_test_request_id("voice", "latecancel");
+            // Exercise business ingress with protocol-valid IDs; malformed IDs
+            // are rejected before the owned worker or session handler can run.
+            for id in [
+                &start_id,
+                &finalize_id,
+                &repeat_id,
+                &foreign_request_id,
+                &cancel_id,
+                &late_cancel_id,
+            ] {
+                pioneer_protocol::RequestId::new(id.as_str()).expect("valid voice RPC fixture ID");
+            }
             let session = start_test_voice_session(
                 &processor,
                 connection_id,
@@ -13849,7 +13867,7 @@ async fn g09_owned_voice_ingress_cancel_disconnect_and_terminal_branches() {
                 &workspace_id,
                 &thread.thread.id,
                 turn_id,
-                "g09start",
+                start_id.as_str(),
             )
             .await;
             processor
@@ -13866,15 +13884,15 @@ async fn g09_owned_voice_ingress_cancel_disconnect_and_terminal_branches() {
                 .unwrap()
                 .expect("voice target history must exist");
             let before_events = serde_json::to_value(&before.events).unwrap();
-            let finalize=json!({"jsonrpc":"2.0","id":"g09finalize","method":"voice/session/finalize","params":{
+            let finalize = json!({"jsonrpc":"2.0","id":finalize_id,"method":"voice/session/finalize","params":{
                 "session_id":session.session_id,"context":{"workspace_id":workspace_id,"thread_id":thread_id,"turn_id":turn_id}
-            }}).to_string();
+            }});
             let expected_startup_key = if terminal == "runtime_error" {
                 None
             } else {
                 Some(turn_id.to_owned())
             };
-            let request: JsonValue = serde_json::from_str(&finalize).unwrap();
+            let request = &finalize;
             assert_eq!(
                 pioneer_observability::turn_startup::request_key(&request["params"]),
                 expected_startup_key
@@ -13887,12 +13905,12 @@ async fn g09_owned_voice_ingress_cancel_disconnect_and_terminal_branches() {
                     Some("unrelated-ingress-context".to_owned()),
                     processor
                         .clone()
-                        .process_owned_request(context.clone(), finalize.clone()),
+                        .process_owned_request(context.clone(), finalize.to_string()),
                 ),
             )
             .await
             .expect("reader must return at ACK while transcriber remains pending");
-            let ack = recv_response_by_id(&mut rx, "g09finalize").await;
+            let ack = recv_response_by_id(&mut rx, finalize_id.as_str()).await;
             assert_eq!(ack.result["status"], json!("transcribing"));
             let worker_startup_key = tokio::time::timeout(Duration::from_secs(5), entered_rx)
                 .await
@@ -13901,32 +13919,31 @@ async fn g09_owned_voice_ingress_cancel_disconnect_and_terminal_branches() {
             assert_eq!(worker_startup_key, expected_startup_key);
             // Same owner repeated finalize is bounded/rejected; another connection
             // cannot claim the authenticated owner's session (connection_id retained).
+            let mut repeated_finalize = finalize.clone();
+            repeated_finalize["id"] = json!(repeat_id);
             processor
                 .clone()
-                .process_owned_request(
-                    context.clone(),
-                    finalize.replace("g09finalize", "g09repeat"),
-                )
+                .process_owned_request(context.clone(), repeated_finalize.to_string())
                 .await;
-            let _ = recv_error_by_id(&mut rx, "g09repeat").await;
-            let cancel=json!({"jsonrpc":"2.0","id":"g09foreign","method":"voice/session/cancel","params":{"session_id":session.session_id}}).to_string();
+            let _ = recv_error_by_id(&mut rx, repeat_id.as_str()).await;
+            let mut cancel = json!({"jsonrpc":"2.0","id":foreign_request_id,"method":"voice/session/cancel","params":{"session_id":session.session_id}});
             processor
                 .clone()
-                .process_owned_request(foreign_context, cancel.clone())
+                .process_owned_request(foreign_context, cancel.to_string())
                 .await;
-            let _ = recv_error_by_id(&mut foreign_rx, "g09foreign").await;
+            let _ = recv_error_by_id(&mut foreign_rx, foreign_request_id.as_str()).await;
             assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
             if action == "cancel" {
+                cancel["id"] = json!(cancel_id);
                 tokio::time::timeout(
                     Duration::from_secs(5),
-                    processor.clone().process_owned_request(
-                        context.clone(),
-                        cancel.replace("g09foreign", "g09cancel"),
-                    ),
+                    processor
+                        .clone()
+                        .process_owned_request(context.clone(), cancel.to_string()),
                 )
                 .await
                 .expect("same-connection cancel must complete BEFORE fake release");
-                let response = recv_response_by_id(&mut rx, "g09cancel").await;
+                let response = recv_response_by_id(&mut rx, cancel_id.as_str()).await;
                 assert_eq!(response.result["cancelled"], json!(true));
                 let event =
                     recv_notification_by_method(&mut rx, events::VOICE_SESSION_RESULT).await;
@@ -13968,11 +13985,12 @@ async fn g09_owned_voice_ingress_cancel_disconnect_and_terminal_branches() {
                     crud.get_turn(thread_id, turn_id).await.unwrap().is_some(),
                     terminal == "transcript"
                 );
+                cancel["id"] = json!(late_cancel_id);
                 processor
                     .clone()
-                    .process_owned_request(context, cancel.replace("g09foreign", "g09latecancel"))
+                    .process_owned_request(context, cancel.to_string())
                     .await;
-                let _ = recv_error_by_id(&mut rx, "g09latecancel").await;
+                let _ = recv_error_by_id(&mut rx, late_cancel_id.as_str()).await;
             } else {
                 assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
                 let after = crud
@@ -14408,12 +14426,19 @@ async fn collaborative_voice_composer_admits_detached_task() {
         0,
         "collaborative voice must not dispatch an agent turn in the parent thread"
     );
-    let (_, parent_turn) = crud_store
-        .get_turn(parent_thread_id, turn_id)
-        .await
-        .expect("parent voice message turn lookup should succeed")
-        .expect("parent voice message turn should exist");
-    assert_eq!(parent_turn.status, TurnStatus::Completed);
+    // TurnStarted is published after task creation, before the owned finalize
+    // worker durably completes the parent turn. Wait for that lifecycle boundary.
+    assert_eq!(
+        wait_for_turn_status(
+            crud_store.clone(),
+            parent_thread_id,
+            turn_id,
+            TurnStatus::Completed,
+        )
+        .await,
+        TurnStatus::Completed,
+        "collaborative voice parent must complete after detached task creation"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
