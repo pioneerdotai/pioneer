@@ -768,7 +768,7 @@ impl CliMcpBridgeSupervisor {
     }
 
     #[cfg(test)]
-    async fn state(
+    pub(super) async fn state(
         &self,
         process_instance: &CliSessionInstanceId,
     ) -> Option<CliMcpBridgeSessionState> {

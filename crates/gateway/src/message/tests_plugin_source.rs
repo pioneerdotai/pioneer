@@ -265,10 +265,13 @@ async fn owned_source_context_keeps_native_override_and_bundled_siblings_separat
         );
         let read = &plan.read_skill_index[&format!("skill:{}", child.skill_id)];
         assert!(read.body.contains("uploaded body"));
-        assert_eq!(Path::new(read.package_asset_root().unwrap()), &uploaded);
+        assert_eq!(
+            Path::new(read.source.package_asset_root().unwrap()),
+            &uploaded
+        );
         assert_eq!(
             std::fs::read_to_string(
-                Path::new(read.package_asset_root().unwrap()).join("scripts/helper")
+                Path::new(read.source.package_asset_root().unwrap()).join("scripts/helper")
             )
             .unwrap(),
             "uploaded script"

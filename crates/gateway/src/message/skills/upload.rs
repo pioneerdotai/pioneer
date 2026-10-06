@@ -2501,7 +2501,7 @@ mod tests {
     enum TestEntryKind {
         Dir,
         File(&'static [u8]),
-        Symlink(&'static str),
+        Symlink(String),
         Hardlink(&'static str),
         Special,
     }
@@ -2521,10 +2521,10 @@ mod tests {
             }
         }
 
-        fn symlink(path: &'static str, target: &'static str) -> Self {
+        fn symlink(path: &'static str, target: &str) -> Self {
             Self {
                 path,
-                kind: TestEntryKind::Symlink(target),
+                kind: TestEntryKind::Symlink(target.to_owned()),
             }
         }
 

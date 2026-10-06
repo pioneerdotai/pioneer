@@ -145,7 +145,7 @@ mod tests {
             created_at: Set(now),
             updated_at: Set(now),
         })
-        .exec(store.database_connection())
+        .exec(&store.database_connection())
         .await
         .unwrap();
         let id = "P".repeat(21);

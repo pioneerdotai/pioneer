@@ -488,10 +488,9 @@ mod tests {
             1,
         )
         .unwrap();
-        let descriptor = pioneer_cli_agent_runtime::claude::materialize_claude_mcp_config(
+        let descriptor = pioneer_cli_agent_runtime::claude::materialize_claude_empty_mcp_config(
             temporary.path().join("managed").as_path(),
             identity,
-            pioneer_cli_agent_runtime::claude::ClaudeManagedMcpLaunchMode::Empty,
         )
         .unwrap();
         let root = descriptor.session_root_path.clone();

@@ -117,24 +117,25 @@ use pioneer_protocol::{
     ItemToolRetryScheduledNotification, ItemUpdatedNotification, JsonRpcErrorResponse,
     JsonRpcNotification, JsonRpcResponse, METHOD_NOT_FOUND_CODE, McpChangedAction,
     McpChangedNotification, McpInstallResponse, McpInstallResultStatus, McpInstallStatus,
-    McpListResponse, McpPolicySetResponse, McpRuntimeState, McpScopeKind, McpServerDetailsResponse,
-    McpServerStatus, McpSourceKind, McpTurnBindingSummary, McpUninstallResponse, MemoryActor,
-    MemoryActorKind, MemoryCandidateDecision, MemoryCandidateStatus, MemoryCandidatesDecideParams,
-    MemoryCandidatesDecideResponse, MemoryCandidatesListParams, MemoryCandidatesListResponse,
-    MemoryCategory, MemoryChangeKind, MemoryChangedNotification, MemoryForgetParams,
-    MemoryForgetResponse, MemoryForgetTarget, MemoryForgottenNotification, MemoryGetParams,
-    MemoryGetResponse, MemoryListParams, MemoryListResponse, MemoryRememberParams,
-    MemoryRememberResponse, MemoryScope, MemoryScopeKind, MemorySearchParams, MemorySearchResponse,
-    MemorySensitivity, PersistedActorRef, PrincipalId, PromptManifest, PromptManifestDiagnostic,
-    PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
-    PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
-    PromptManifestProfile, ProviderConfigureParams, ProviderConfigureResponse,
-    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderFailureClass,
-    ProviderFailureDetails, ProviderFailureStage, ProviderListModelsParams,
-    ProviderListModelsResponse, ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams,
-    ProviderSetApiKeyResponse, ProviderTransportKind, PublicError, PublicErrorCode,
-    PublicErrorStage, PublicTaskAgendaResponse, PublicTaskDeliveriesResponse, RecoveryAction,
-    RecoveryJobStatus, RecoveryTrigger, RoleKey, SandboxMode, SkillArchiveFormat,
+    McpListResponse, McpPolicySetParams, McpPolicySetResponse, McpRuntimeState, McpScopeKind,
+    McpServerDetailsResponse, McpServerStatus, McpSourceKind, McpTurnBindingSummary,
+    McpUninstallResponse, MemoryActor, MemoryActorKind, MemoryCandidateDecision,
+    MemoryCandidateStatus, MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse,
+    MemoryCandidatesListParams, MemoryCandidatesListResponse, MemoryCategory, MemoryChangeKind,
+    MemoryChangedNotification, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget,
+    MemoryForgottenNotification, MemoryGetParams, MemoryGetResponse, MemoryListParams,
+    MemoryListResponse, MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeKind,
+    MemorySearchParams, MemorySearchResponse, MemorySensitivity, PersistedActorRef, PrincipalId,
+    PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
+    PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookSource,
+    PromptManifestHookSourceEntry, PromptManifestHookTruncation, PromptManifestProfile,
+    ProviderConfigureParams, ProviderConfigureResponse, ProviderDeleteApiKeyParams,
+    ProviderDeleteApiKeyResponse, ProviderFailureClass, ProviderFailureDetails,
+    ProviderFailureStage, ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams,
+    ProviderListResponse, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
+    ProviderTransportKind, PublicError, PublicErrorCode, PublicErrorStage,
+    PublicTaskAgendaResponse, PublicTaskDeliveriesResponse, RecoveryAction, RecoveryJobStatus,
+    RecoveryTrigger, RequestId, RoleKey, SandboxMode, SkillArchiveFormat,
     SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse, SkillsChangedNotification,
     SkillsHealthResponse, SkillsInstallResponse, SkillsPackInstallResponse,
     SkillsPackUninstallResponse, SkillsPackUpdateResponse, SkillsPolicySetResponse,
@@ -169,7 +170,8 @@ use pioneer_protocol::{
     UserMessageAttachment, VoiceAudioFormat, VoiceErrorKind, VoiceSessionOutcome,
     VoiceSessionResultNotification, VoiceSessionStartContext, VoiceStatus, WorkspaceChangeKind,
     WorkspaceChangedNotification, WorkspaceCreateResponse, WorkspaceDefaultResponse,
-    WorkspaceListResponse, WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
+    WorkspaceListResponse, WorkspaceSelectResponse, WorkspaceUpdateResponse,
+    constants::{events, methods},
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -68203,7 +68205,7 @@ async fn mcp_list_empty_then_install_stdio_persists_redacts_and_notifies() {
     let direct = processor
         .set_mcp_policy(
             &context,
-            RequestId::new("mcp_policy_direct001").expect("request id"),
+            RequestId::new(generate_test_request_id("mcp_policy", "direct")).expect("request id"),
             McpPolicySetParams {
                 workspace_id: workspace_id.clone(),
                 name: "resend".into(),
@@ -79033,7 +79035,7 @@ async fn captured_descendant_stop_deadline_is_propagated_and_same_owner_can_retr
             text: "done".into(),
         }),
     ));
-    let processor = MessageProcessor::new(
+    let processor = Arc::new(MessageProcessor::new(
         Arc::new(ThreadManager::new("test-model", "delayed")),
         provider,
         sessions,
@@ -79042,7 +79044,7 @@ async fn captured_descendant_stop_deadline_is_propagated_and_same_owner_can_retr
         test_gateway_secrets(),
         test_summary_config(),
         test_tool_loop_config(),
-    );
+    ));
     start_thread_and_turn(
         &processor,
         connection,
@@ -79099,7 +79101,7 @@ async fn graph_snapshot_matches_revision_runs_and_rejects_foreign_or_unknown() {
             text: "done".into(),
         }),
     ));
-    let processor = MessageProcessor::new(
+    let processor = Arc::new(MessageProcessor::new(
         Arc::new(ThreadManager::new("test-model", "delayed")),
         provider,
         sessions,
@@ -79108,7 +79110,7 @@ async fn graph_snapshot_matches_revision_runs_and_rejects_foreign_or_unknown() {
         test_gateway_secrets(),
         test_summary_config(),
         test_tool_loop_config(),
-    );
+    ));
     for (thread, turn) in [("graph-initial", "initial"), ("graph-revision", "revision")] {
         start_thread_and_turn(
             &processor, connection, &mut rx, &workspace, thread, turn, "Chat", "delayed",
@@ -79307,7 +79309,7 @@ async fn persisted_interrupted_turn_cannot_hide_accepted_direct_checkpoint_start
             text: "done".into(),
         }),
     ));
-    let processor = MessageProcessor::new(
+    let processor = Arc::new(MessageProcessor::new(
         Arc::new(ThreadManager::new("test-model", "delayed")),
         provider,
         sessions,
@@ -79316,7 +79318,7 @@ async fn persisted_interrupted_turn_cannot_hide_accepted_direct_checkpoint_start
         test_gateway_secrets(),
         test_summary_config(),
         test_tool_loop_config(),
-    );
+    ));
     let thread = "checkpoint-admission";
     let turn = "checkpoint-turn";
     start_thread_and_turn(
