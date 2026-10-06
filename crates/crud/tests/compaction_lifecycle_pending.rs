@@ -22,6 +22,20 @@ use std::{
 const TRACKING: &str = "m20261004_000004_compaction_lifecycle_pending";
 const NOW: i64 = 2_000_000_000_000;
 
+// Exercise this migration's schema without applying later irreversible changes.
+struct LifecycleFixtureMigrator;
+impl MigratorTrait for LifecycleFixtureMigrator {
+    fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+        let mut migrations = Migrator::migrations();
+        let target = migrations
+            .iter()
+            .position(|migration| migration.name() == TRACKING)
+            .expect("lifecycle migration remains registered");
+        migrations.truncate(target + 1);
+        migrations
+    }
+}
+
 struct TestFile(PathBuf);
 impl Drop for TestFile {
     fn drop(&mut self) {
@@ -1752,7 +1766,7 @@ async fn lifecycle_migration_partial_ddl_rollback_retry_and_down_up_trust_termin
     .unwrap();
     assert!(
         writer
-            .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+            .run_migrations::<LifecycleFixtureMigrator>(SqliteWriteClass::Maintenance, None)
             .await
             .is_err()
     );
@@ -1762,26 +1776,20 @@ async fn lifecycle_migration_partial_ddl_rollback_retry_and_down_up_trust_termin
         .await
         .unwrap();
     writer
-        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+        .run_migrations::<LifecycleFixtureMigrator>(SqliteWriteClass::Maintenance, None)
         .await
         .unwrap();
     assert_eq!(scalar(&store, "SELECT count(*) n FROM seaql_migrations WHERE version='m20261004_000004_compaction_lifecycle_pending'").await, 1);
     expand_all(&store, NOW).await;
     assert!(row(&store, "old-terminal").await.is_none());
     assert!(row(&store, "old-running").await.is_some());
-    let migrations = Migrator::migrations();
-    let target = migrations
-        .iter()
-        .position(|m| m.name() == TRACKING)
-        .unwrap();
-    let suffix = u32::try_from(migrations.len() - target).unwrap();
     let tx = db.begin().await.unwrap();
-    Migrator::down(&*tx, Some(suffix)).await.unwrap();
+    LifecycleFixtureMigrator::down(&*tx, Some(1)).await.unwrap();
     tx.commit().await.unwrap();
     assert_eq!(scalar(&store, "SELECT count(*) n FROM sqlite_master WHERE name LIKE 'compaction_lifecycle_%' OR name LIKE 'idx_compaction_lifecycle_%'").await, 0);
     assert_eq!(scalar(&store, "SELECT count(*) n FROM seaql_migrations WHERE version='m20261004_000004_compaction_lifecycle_pending'").await, 0);
     writer
-        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+        .run_migrations::<LifecycleFixtureMigrator>(SqliteWriteClass::Maintenance, None)
         .await
         .unwrap();
     expand_all(&store, NOW).await;

@@ -48080,6 +48080,56 @@ async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unbound_native_listener_owns_processor_until_abort() {
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = Box::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        Arc::new(SessionManager::new()),
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    assert!(processor.task_agent_executor.processor_weak().is_err());
+    // This fixture-only field is held exclusively by processor instances.
+    let owner_state = Arc::downgrade(&processor.native_cancellation_materialization_failure);
+    let agent_manager = processor.agent_manager.clone();
+    let thread_id = "unbound-listener-owner";
+    processor
+        .agent_manager
+        .ensure_thread(thread_id, &workspace_id)
+        .await
+        .unwrap();
+    processor
+        .ensure_agent_listener_task(thread_id)
+        .await
+        .unwrap();
+    let listener = processor
+        .agent_listener_tasks
+        .lock()
+        .await
+        .remove(thread_id)
+        .unwrap();
+    drop(processor);
+    assert!(
+        owner_state.upgrade().is_some(),
+        "the spawned listener must own its processor after the fixture is dropped"
+    );
+    listener.handle.abort();
+    let stopped = tokio::time::timeout(Duration::from_secs(2), listener.handle)
+        .await
+        .unwrap();
+    assert!(stopped.unwrap_err().is_cancelled());
+    assert!(
+        owner_state.upgrade().is_none(),
+        "joining the aborted listener must release its owned processor"
+    );
+    agent_manager.remove_thread(thread_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
     let (tx, _rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
@@ -55154,13 +55204,12 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 cleanup_calls.lock().unwrap().len(),
                 if resume_direct { 2 } else { 1 }
             );
-            assert_eq!(
-                processor
-                    .process_due_native_terminal_effects(chrono::Utc::now().timestamp(), 8)
-                    .await
-                    .unwrap(),
-                0
-            );
+            let replay_dispatch = processor
+                .process_due_native_terminal_effects(chrono::Utc::now().timestamp(), 8)
+                .await
+                .unwrap();
+            assert!(!replay_dispatch.storage_failed);
+            assert_eq!(replay_dispatch.count, 0);
         } else {
             assert_eq!(
                 crud_store_for_assert
@@ -55196,14 +55245,12 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
         }
         let restarted = pioneer_crud::CrudStore::new(crud_store_for_assert.database_connection());
         let now = now_timestamp_secs();
-        assert_eq!(
-            restarted
-                .claim_due_native_terminal_effects(now, 30, 2)
-                .await
-                .unwrap()
-                .len(),
-            0
-        );
+        let replay_claims = restarted
+            .claim_due_native_terminal_effects_at(now, 30, 2)
+            .await
+            .unwrap();
+        assert!(!replay_claims.storage_failed);
+        assert_eq!(replay_claims.records.len(), 0);
         for before in &preserved_blocked_rows {
             let after = pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(
                 before.effect_id.clone(),
@@ -68894,8 +68941,14 @@ async fn setup_pooled_file_workspace_manager_with_observer(
 async fn setup_workspace_manager_with_connection(
     connection: sea_orm::DatabaseConnection,
 ) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
+    setup_workspace_manager_with_connection_migrator::<Migrator>(connection).await
+}
+
+async fn setup_workspace_manager_with_connection_migrator<M: MigratorTrait>(
+    connection: sea_orm::DatabaseConnection,
+) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
     crate::compaction::load_test_catalog();
-    Migrator::up(&connection, None)
+    M::up(&connection, None)
         .await
         .expect("migrations must succeed");
     bootstrap(&connection)

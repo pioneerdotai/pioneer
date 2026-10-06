@@ -22,6 +22,12 @@ const TITLE_JOB_MAX_ATTEMPTS: u32 = 3;
 const TITLE_JOB_BASE_BACKOFF_MS: u64 = 200;
 const TITLE_JOB_MAX_JITTER_MS: u64 = 250;
 
+#[derive(Debug)]
+pub(super) struct NativeTerminalEffectDispatchOutcome {
+    pub count: u64,
+    pub storage_failed: bool,
+}
+
 fn hook_error_metadata_text<'a>(
     error: &'a pioneer_hooks::HookRunErrorSummary,
     key: &str,
@@ -821,7 +827,9 @@ impl MessageProcessor {
     pub(super) async fn ensure_agent_listener_task(&self, thread_id: &str) -> Result<()> {
         let this = self.task_agent_executor.processor_weak().ok();
         #[cfg(test)]
-        let raw_this = (!this.is_some()).then_some(self as *const MessageProcessor as usize);
+        // Unbound fixtures can move or drop their processor while this task runs.
+        // Own a clone rather than borrowing its address across the spawn.
+        let test_this = this.is_none().then(|| self.clone());
         #[cfg(not(test))]
         if this.is_none() {
             bail!("task agent executor is not bound");
@@ -888,7 +896,7 @@ impl MessageProcessor {
                                 this.commit_durable_agent_event(event).await
                             } else {
                                 #[cfg(test)]
-                                { unsafe { (&*(raw_this.expect("raw listener owner") as *const MessageProcessor)).commit_durable_agent_event(event).await } }
+                                { test_this.as_ref().expect("test listener owner").commit_durable_agent_event(event).await }
                                 #[cfg(not(test))]
                                 { Err(DurableCommitRejection::permanent(
                                     "processor_stopped",
@@ -959,7 +967,7 @@ impl MessageProcessor {
                                         this.handle_progress_agent_event(event).await;
                                     } else {
                                         #[cfg(test)]
-                                        { unsafe { (&*(raw_this.expect("raw listener owner") as *const MessageProcessor)).handle_progress_agent_event(event).await; } }
+                                        { test_this.as_ref().expect("test listener owner").handle_progress_agent_event(event).await; }
                                     }
                                 })
                                     .catch_unwind()
@@ -2638,14 +2646,21 @@ impl MessageProcessor {
             loop {
                 this.native_terminal_effect_kick_pending
                     .store(false, Ordering::Release);
-                if let Err(error) = this
+                let (dispatched_count, storage_failed) = match this
                     .process_due_native_terminal_effects(now_timestamp_secs(), 8)
                     .await
                 {
+                    Ok(outcome) => (outcome.count, outcome.storage_failed),
+                    Err(_error) => (0, true),
+                };
+                if storage_failed {
                     warn!(
-                        error = %format!("{error:#}"),
-                        "native terminal-effect kick failed"
+                        dispatched_count,
+                        "native terminal-effect kick failed; retry deferred"
                     );
+                    // A failed durable deferral/claim must not spin on coalesced
+                    // kicks. The quantum has released all database capacity.
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
 
                 if this
@@ -6140,13 +6155,14 @@ impl MessageProcessor {
         &self,
         now_unix: i64,
         limit: u64,
-    ) -> Result<u64> {
+    ) -> Result<NativeTerminalEffectDispatchOutcome> {
         const CLAIM_LEASE_SECS: u64 = 90;
         const MAX_CONCURRENCY: usize = 8;
         const POST_TURN_TIMEOUT_SECS: u64 = 60;
         const CLEANUP_TIMEOUT_SECS: u64 = 15;
 
-        let records = self
+        #[cfg(not(test))]
+        let outcome = self
             .crud_store
             .claim_due_native_terminal_effects(
                 now_unix,
@@ -6154,8 +6170,18 @@ impl MessageProcessor {
                 limit.min(MAX_CONCURRENCY as u64),
             )
             .await?;
-        let count = records.len() as u64;
-        futures_util::stream::iter(records)
+        #[cfg(test)]
+        let outcome = self
+            .crud_store
+            .claim_due_native_terminal_effects_at(
+                now_unix,
+                CLAIM_LEASE_SECS,
+                limit.min(MAX_CONCURRENCY as u64),
+            )
+            .await?;
+        let count = outcome.records.len() as u64;
+        let storage_failed = outcome.storage_failed;
+        futures_util::stream::iter(outcome.records)
             .for_each_concurrent(MAX_CONCURRENCY, |record| async move {
                 let effect_started = Instant::now();
                 let is_memory_post_turn_extractor_effect = match &record.payload {
@@ -6418,7 +6444,10 @@ impl MessageProcessor {
                 }
             })
             .await;
-        Ok(count)
+        Ok(NativeTerminalEffectDispatchOutcome {
+            count,
+            storage_failed,
+        })
     }
 
     /// Completes prepared provider outcomes and synchronizes any loaded

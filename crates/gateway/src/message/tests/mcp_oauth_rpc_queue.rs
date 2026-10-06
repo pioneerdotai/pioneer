@@ -34,7 +34,8 @@ async fn authorized_event_cannot_restart_reinstalled_or_replaced_identity_after_
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// The WebSocket reader must keep progressing with a single async worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn same_websocket_terminal_decision_after_durable_put_preserves_cancel_timeout_and_success() {
     use pioneer_mcp_oauth::OAuthState;
     for decision in [
