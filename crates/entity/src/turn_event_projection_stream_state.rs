@@ -10,6 +10,9 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub turn_id: String,
     pub thread_id: String,
+    pub accepted_terminal_event_id: Option<String>,
+    pub accepted_terminal_event_type: Option<String>,
+    pub accepted_terminal_sequence: Option<i64>,
     pub status: String,
     pub blocking_event_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]

@@ -581,12 +581,13 @@ async fn source_rollback_and_projection_failure_roll_back_tracker_and_event() {
 #[tokio::test]
 async fn poison_missing_thread_keeps_backoff_and_allows_later_repair() {
     let (store, thread, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
-    turns::Entity::update_many()
-        .col_expr(turns::Column::ThreadId, Expr::val("missing_thread"))
-        .filter(turns::Column::Id.eq(&run.id))
+    // Remove the dependency without changing the occurrence's canonical scope.
+    // Rebinding the Turn would leave its existing stream in another thread.
+    let deleted = pioneer_entity::thread::Entity::delete_by_id(thread.id.clone())
         .exec(&store.connection)
         .await
         .unwrap();
+    assert_eq!(deleted.rows_affected, 1);
     let claim = claimed(&store).await;
     assert_eq!(
         store
@@ -608,12 +609,8 @@ async fn poison_missing_thread_keeps_backoff_and_allows_later_repair() {
     );
     // Repair a dependency without any new source-pair UPDATE. Pending must
     // remain retryable even though neither source trigger can wake it.
-    let restored_thread = Thread {
-        id: "missing_thread".to_owned(),
-        ..thread
-    };
     store
-        .upsert_thread_model(&restored_thread, PersistedActorRef::System)
+        .upsert_thread_model(&thread, PersistedActorRef::System)
         .await
         .unwrap();
     let current = row(&store, &run.id).await.unwrap();
@@ -726,10 +723,9 @@ async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_obj
         .unwrap();
     assert!(indexes.is_empty());
     let migrations = Migrator::migrations();
-    assert_eq!(
-        migrations[migrations.len() - tracker_rollback_steps() as usize].name(),
-        MIGRATION
-    );
+    let target = &migrations[migrations.len() - tracker_rollback_steps() as usize];
+    assert_eq!(target.name(), MIGRATION);
+    assert_eq!(target.use_transaction(), Some(true));
     assert!(
         !Migrator::get_applied_migrations(&store.connection)
             .await
@@ -1035,6 +1031,25 @@ async fn terminal_commit_without_fanout_and_generic_recovery_replay_change_track
         .reconcile_claimed_task_run_occurrence(&claim, NOW)
         .await
         .unwrap();
+    assert!(row(&store, &run.id).await.is_none());
+    let accepted =
+        crate::repositories::turn_event::latest_event_for_turn(&store.connection, &run.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(matches!(
+        &accepted.payload,
+        CanonicalTurnEventPayload::TurnCompleted(_)
+    ));
+    let marker =
+        crate::repositories::turn_event_projection_stream_state::find(&store.connection, &run.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        marker.accepted_terminal_event_id.as_ref(),
+        Some(&accepted.id)
+    );
     // Direct store recovery with the same timestamp is still tracked.
     store
         .update_turn_status(
@@ -1047,29 +1062,14 @@ async fn terminal_commit_without_fanout_and_generic_recovery_replay_change_track
         .await
         .unwrap();
     assert!(row(&store, &run.id).await.is_some());
-    let failed = Turn {
-        status: TurnStatus::Failed,
-        turn_kind: TurnKind::TaskRun,
-        ..sample_turn(&run.id)
-    };
-    let event = CanonicalTurnEventPayload::TurnFailed(TurnFailedNotification {
-        workspace_id: thread.workspace_id.clone(),
-        thread_id: thread.id.clone(),
-        turn: failed,
-    });
-    // Real envelope/projection APIs; make its receipt due again to model replay
-    // of an old Turn after a newer generic write restored its status.
-    store
-        .materialize_native_agent_turn_event(event, 1_700_000_004, None)
-        .await
-        .unwrap();
-    let receipt = pioneer_entity::turn_event_projection_state::Entity::find()
-        .filter(pioneer_entity::turn_event_projection_state::Column::TurnId.eq(&run.id))
-        .order_by_desc(pioneer_entity::turn_event_projection_state::Column::Sequence)
-        .one(&store.connection)
-        .await
-        .unwrap()
-        .unwrap();
+    // Replay the accepted Completed event, rather than appending a conflicting
+    // Failed result in the same execution cycle.
+    let receipt =
+        pioneer_entity::turn_event_projection_state::Entity::find_by_id(accepted.id.clone())
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
     store
         .update_turn_status(
             &thread.id,
@@ -1081,6 +1081,17 @@ async fn terminal_commit_without_fanout_and_generic_recovery_replay_change_track
         .await
         .unwrap();
     assert!(row(&store, &run.id).await.is_none());
+    store
+        .update_turn_status(
+            &thread.id,
+            &run.id,
+            TurnStatus::Interrupted,
+            Some("recovery"),
+            1_700_000_004,
+        )
+        .await
+        .unwrap();
+    assert!(row(&store, &run.id).await.is_some());
     let p = pioneer_entity::turn_event_projection_state::Entity::update_many()
         .col_expr(
             pioneer_entity::turn_event_projection_state::Column::Status,
@@ -1109,7 +1120,32 @@ async fn terminal_commit_without_fanout_and_generic_recovery_replay_change_track
             .projected,
         1
     );
-    assert!(row(&store, &run.id).await.is_some());
+    assert!(row(&store, &run.id).await.is_none());
+    let replayed =
+        crate::repositories::turn_event::latest_event_for_turn(&store.connection, &run.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(replayed.id, accepted.id);
+    assert_eq!(replayed.sequence, accepted.sequence);
+    assert_eq!(replayed.idempotency_key, accepted.idempotency_key);
+    let replayed_marker =
+        crate::repositories::turn_event_projection_stream_state::find(&store.connection, &run.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        replayed_marker.accepted_terminal_event_id,
+        marker.accepted_terminal_event_id
+    );
+    assert_eq!(
+        replayed_marker.accepted_terminal_event_type,
+        marker.accepted_terminal_event_type
+    );
+    assert_eq!(
+        replayed_marker.accepted_terminal_sequence,
+        marker.accepted_terminal_sequence
+    );
 }
 
 #[tokio::test]

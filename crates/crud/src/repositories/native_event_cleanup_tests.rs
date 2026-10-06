@@ -9,7 +9,7 @@ use pioneer_sqlite::{
     SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass, SqliteWriteEvent,
     SqliteWriteExecutor, SqliteWriteObserver, sqlite_read_only_connection_url,
 };
-use sea_orm::sea_query::SqliteQueryBuilder;
+use sea_orm::sea_query::{Query, SqliteQueryBuilder};
 use sea_orm::{ConnectOptions, Database, DatabaseBackend, Statement};
 use std::{
     path::PathBuf,
@@ -195,6 +195,12 @@ impl Fixture {
             .try_get_by_index(0)?)
     }
     async fn turn(&self, id: &str, completed: bool) -> Result<()> {
+        self.turn_in_schema(id, completed, false).await
+    }
+    async fn historical_completed_turn(&self, id: &str) -> Result<()> {
+        self.turn_in_schema(id, true, true).await
+    }
+    async fn turn_in_schema(&self, id: &str, completed: bool, historical: bool) -> Result<()> {
         let thread = Thread {
             workspace_id: "ws-cleanup".into(),
             id: "thread-cleanup".into(),
@@ -230,6 +236,112 @@ impl Fixture {
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
+        if historical {
+            // Seed the already-projected release-era result using only columns
+            // installed at the cleanup migration boundary. Today's materializer
+            // requires later terminal-marker columns and cannot run on this schema.
+            turn.status = TurnStatus::Completed;
+            let notification = TurnCompletedNotification {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn,
+            };
+            let payload = serde_json::to_string(&crate::CanonicalTurnEventPayload::TurnCompleted(
+                notification,
+            ))?;
+            let event_id = format!("historical-{id}");
+            let at = chrono::DateTime::from_timestamp(NOW, 0)
+                .unwrap()
+                .fixed_offset();
+            let statements = [
+                Query::insert()
+                    .into_table("thread")
+                    .columns([
+                        "id",
+                        "workspace_id",
+                        "preview",
+                        "mode",
+                        "model",
+                        "model_provider",
+                        "status",
+                    ])
+                    .values_panic([
+                        thread.id.clone().into(),
+                        thread.workspace_id.into(),
+                        "".into(),
+                        "agent".into(),
+                        thread.model.into(),
+                        thread.model_provider.into(),
+                        "active".into(),
+                    ])
+                    .on_conflict(OnConflict::column("id").do_nothing().to_owned())
+                    .to_owned(),
+                Query::insert()
+                    .into_table("turn")
+                    .columns(["id", "thread_id", "status"])
+                    .values_panic([id.into(), thread.id.clone().into(), "completed".into()])
+                    .to_owned(),
+                Query::insert()
+                    .into_table("turn_event")
+                    .columns([
+                        "id",
+                        "thread_id",
+                        "turn_id",
+                        "sequence",
+                        "event_type",
+                        "payload",
+                        "created_at",
+                    ])
+                    .values_panic([
+                        event_id.clone().into(),
+                        thread.id.clone().into(),
+                        id.into(),
+                        1_i64.into(),
+                        "turn/completed".into(),
+                        payload.into(),
+                        at.into(),
+                    ])
+                    .to_owned(),
+                Query::insert()
+                    .into_table("turn_event_projection_state")
+                    .columns([
+                        "event_id",
+                        "thread_id",
+                        "turn_id",
+                        "sequence",
+                        "status",
+                        "next_run_at",
+                        "projected_at",
+                    ])
+                    .values_panic([
+                        event_id.into(),
+                        thread.id.clone().into(),
+                        id.into(),
+                        1_i64.into(),
+                        "projected".into(),
+                        at.into(),
+                        at.into(),
+                    ])
+                    .to_owned(),
+                Query::insert()
+                    .into_table("turn_event_projection_stream_state")
+                    .columns([
+                        "turn_id",
+                        "thread_id",
+                        "status",
+                        "projected_through_sequence",
+                    ])
+                    .values_panic([id.into(), thread.id.into(), "healthy".into(), 1_i64.into()])
+                    .to_owned(),
+            ];
+            let statements = statements.map(|statement| DatabaseBackend::Sqlite.build(&statement));
+            let transaction = self.db.begin().await?;
+            for statement in statements {
+                transaction.execute_raw(statement).await?;
+            }
+            transaction.commit().await?;
+            return self.bind(id, "codex", "completed").await;
+        }
         self.store
             .materialize_turn_start(
                 &thread,
@@ -491,7 +603,7 @@ async fn migration_bootstrap_restart_vacuum_and_live_events_before_cursor() -> R
     let f = Fixture::open_version(false).await?;
     let prior_migrations = f.scalar("SELECT COUNT(*) FROM seaql_migrations").await?;
     assert!(prior_migrations + 1 < Migrator::migrations().len() as i64);
-    f.turn("legacy", true).await?;
+    f.historical_completed_turn("legacy").await?;
     for i in 0..130 {
         f.event(
             &format!("m-{i:03}"),
@@ -517,7 +629,7 @@ async fn migration_bootstrap_restart_vacuum_and_live_events_before_cursor() -> R
     assert!(!first.complete);
     let f = f.restart().await?;
     f.sql("VACUUM").await?;
-    f.turn("live", true).await?;
+    f.historical_completed_turn("live").await?;
     f.event("a-live", Some("live"), "codex", "item/completed", 1)
         .await?;
     assert_eq!(
@@ -981,7 +1093,7 @@ async fn moved_event_wakes_destination_and_queued_deletes_do_not_update_job() ->
 #[tokio::test]
 async fn bootstrap_cursor_rolls_back_with_job_registration_failure() -> Result<()> {
     let f = Fixture::open_version(false).await?;
-    f.turn("legacy", true).await?;
+    f.historical_completed_turn("legacy").await?;
     f.event("legacy", Some("legacy"), "codex", "item/completed", 8)
         .await?;
     let f = f.migrate(false).await?;

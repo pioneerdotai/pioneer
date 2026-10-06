@@ -325,3 +325,67 @@ async fn task_delivery_cancellation_outer_execution_failure_continues_worker() {
 async fn task_delivery_cancellation_execution_timeout_continues_worker_without_refinalization() {
     cancellation_worker_case(TaskDeliveryCommitTestKind::Finish, false, true).await;
 }
+
+#[tokio::test]
+async fn recovery_partial_failure_does_not_hide_independent_pending_delivery() {
+    let (_directory, processor, workspace) = race_processor().await;
+    let poison =
+        queue_worker_delivery(&processor, &workspace, "thr_race_delivery", RACE_TIME).await;
+    let pending =
+        queue_worker_delivery(&processor, &workspace, "thr_race_delivery", RACE_TIME + 1).await;
+    let TaskDeliveryTransitionOutcome::Applied((_, attempt)) = processor
+        .task_runtime
+        .background_control_service()
+        .start_delivery(&poison.id, RACE_TIME)
+        .await
+        .unwrap()
+    else {
+        panic!("fixture start lost authority")
+    };
+    let database = processor.crud_store.database_connection();
+    database
+        .execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "DELETE FROM task_delivery_attempt WHERE id=?",
+            [attempt.id.into()],
+        ))
+        .await
+        .unwrap();
+    // Failure is local to the row whose verified exact attempt is absent.
+    database.execute_unprepared("CREATE TRIGGER reject_missing_recovery_retry BEFORE INSERT ON task_delivery_recovery_retry WHEN NEW.expected_attempt_id IS NULL BEGIN SELECT RAISE(ABORT,'test row-local failure'); END").await.unwrap();
+    processor
+        .process_due_task_deliveries(RACE_TIME + 301, 64)
+        .await
+        .unwrap();
+    assert_eq!(
+        processor
+            .crud_store
+            .get_task_delivery(&pending.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        pioneer_protocol::TaskDeliveryStatus::Delivered
+    );
+    let source = processor
+        .crud_store
+        .with_maintenance_access()
+        .task_delivery_recovery_snapshot(&poison.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.delivery.status, "delivering");
+    assert!(source.attempt.is_none());
+    assert!(
+        source.retry.is_none(),
+        "failed deferral must remain visible as undurable"
+    );
+    let report = processor
+        .task_runtime
+        .background_control_service()
+        .recover_stuck_deliveries(RACE_TIME + 302, 64)
+        .await
+        .unwrap();
+    assert!(report.cooling_down);
+    assert_eq!(report.selected, 0);
+}

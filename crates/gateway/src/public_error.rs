@@ -124,26 +124,54 @@ fn public_message(code: PublicErrorCode) -> &'static str {
 pub(crate) mod test_support {
     use tracing_subscriber::prelude::*;
 
-    /// Thread-local tracing and isolated Sentry hub backed exclusively by
-    /// sentry's in-memory TestTransport. No global subscriber or network client.
-    pub(crate) fn capture_events<R>(
-        f: impl FnOnce() -> R,
-    ) -> (R, Vec<sentry::protocol::Event<'static>>) {
-        let subscriber = tracing_subscriber::registry().with(
-            sentry::integrations::tracing::layer().event_filter(|metadata| {
+    fn event_subscriber() -> impl tracing::Subscriber + Send + Sync {
+        tracing_subscriber::registry().with(sentry::integrations::tracing::layer().event_filter(
+            |metadata| {
                 use sentry::integrations::tracing::EventFilter;
                 match *metadata.level() {
                     tracing::Level::ERROR => EventFilter::Event,
                     tracing::Level::TRACE => EventFilter::Ignore,
                     _ => EventFilter::Breadcrumb,
                 }
-            }),
-        );
+            },
+        ))
+    }
+
+    /// Thread-local tracing and isolated Sentry hub backed exclusively by
+    /// sentry's in-memory TestTransport. No global subscriber or network client.
+    pub(crate) fn capture_events<R>(
+        f: impl FnOnce() -> R,
+    ) -> (R, Vec<sentry::protocol::Event<'static>>) {
+        let subscriber = event_subscriber();
         let mut result = None;
         let events = sentry::test::with_captured_events(|| {
             tracing::subscriber::with_default(subscriber, || result = Some(f()));
         });
         (result.expect("capture closure completed"), events)
+    }
+
+    /// Scope the real reporting layer to one asynchronous operation. The
+    /// in-memory transport keeps the original diagnostic available to fixture
+    /// assertions without changing public errors or the global subscriber.
+    pub(crate) async fn capture_events_async<R>(
+        future: impl std::future::Future<Output = R>,
+    ) -> (R, Vec<sentry::protocol::Event<'static>>) {
+        use sentry::SentryFutureExt;
+        use tracing::instrument::WithSubscriber;
+        let transport = sentry::test::TestTransport::new();
+        let mut options = sentry::ClientOptions::default();
+        options.dsn = Some("https://public@sentry.invalid/1".parse().unwrap());
+        options.transport = Some(std::sync::Arc::new(transport.clone()));
+        options.default_integrations = false;
+        let hub = std::sync::Arc::new(sentry::Hub::new(
+            Some(std::sync::Arc::new(sentry::Client::from(options))),
+            Default::default(),
+        ));
+        let result = future
+            .with_subscriber(event_subscriber())
+            .bind_hub(hub)
+            .await;
+        (result, transport.fetch_and_clear_events())
     }
 
     pub(crate) fn assert_correlated(
@@ -171,6 +199,32 @@ mod tests {
     use pioneer_protocol::{PublicErrorCode, PublicErrorStage, RequestId};
 
     use super::agent_rpc_error;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scoped_async_capture_keeps_original_admission_diagnostic_across_fresh_tasks() {
+        const DIAGNOSTIC: &str = "fixture-only original admission cause";
+        let (public, events) = super::test_support::capture_events_async(async {
+            crate::message::message_fresh_task(async {
+                tokio::task::yield_now().await;
+                super::map_agent_failure(
+                    PublicErrorCode::Internal,
+                    PublicErrorStage::Admission,
+                    DIAGNOSTIC,
+                )
+            })
+            .await
+            .unwrap()
+        })
+        .await;
+        assert_eq!(events.len(), 1);
+        super::test_support::assert_correlated(&events[0], &public);
+        let sentry::protocol::Context::Other(fields) = &events[0].contexts["Rust Tracing Fields"]
+        else {
+            panic!("tracing fields must be present");
+        };
+        assert_eq!(fields["raw_diagnostic"], DIAGNOSTIC);
+        assert!(!serde_json::to_string(&public).unwrap().contains(DIAGNOSTIC));
+    }
 
     #[test]
     fn explicitly_expected_rpc_refusal_preserves_the_transport_contract() {

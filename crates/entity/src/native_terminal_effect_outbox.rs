@@ -12,10 +12,8 @@ pub struct Model {
     pub batch_id: String,
     pub workspace_id: String,
     pub thread_id: String,
-    #[sea_orm(unique_key = "uidx_native_terminal_effect_turn_kind")]
     pub turn_id: String,
     pub runtime_generation: i64,
-    #[sea_orm(unique_key = "uidx_native_terminal_effect_turn_kind")]
     pub effect_kind: String,
     pub gate_kind: String,
     #[sea_orm(column_type = "Text")]
