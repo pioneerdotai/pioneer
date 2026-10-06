@@ -10,6 +10,83 @@ use pioneer_crud::compaction::{CanonicalSource, CommitOutcome, ManifestEntry, So
 use pioneer_provider::{CanonicalProviderRoundEnvelope, ProviderTermination};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Enter the registry's production authority scope without calling a model.
+/// The fixture uses the same async history preparation as native adapters.
+struct HistoryPreparationProvider {
+    name: String,
+}
+
+#[async_trait::async_trait]
+impl pioneer_provider::Provider for HistoryPreparationProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn prepare_input_budget(
+        &self,
+        mut request: ChatRequest,
+    ) -> anyhow::Result<pioneer_provider::attachments::PreparedInputBudget> {
+        let prepared = pioneer_provider::attachments::prepare_messages_for_provider_async(
+            self.name(),
+            &request.model,
+            &self.capabilities(),
+            &request.messages,
+        )
+        .await?;
+        assert!(
+            prepared.attachments.is_empty(),
+            "history fixture has no media"
+        );
+        request.messages = prepared.messages;
+        Ok(pioneer_provider::attachments::PreparedInputBudget {
+            request,
+            media: vec![],
+        })
+    }
+
+    async fn chat(&self, _request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        anyhow::bail!("history preparation fixture must not call a model")
+    }
+
+    async fn stream_chat(
+        &self,
+        _request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        anyhow::bail!("history preparation fixture must not call a model")
+    }
+}
+
+async fn prepare_history_for_provider(
+    provider: &str,
+    model: &str,
+    messages: &[ChatMessage],
+) -> Vec<ChatMessage> {
+    let registry = pioneer_provider::ProviderRegistry::with_provider(
+        provider,
+        Arc::new(HistoryPreparationProvider {
+            name: provider.into(),
+        }),
+    );
+    let adapter = registry.get_or_create(provider).unwrap();
+    assert!(adapter.authority_fingerprint().is_some());
+    adapter
+        .prepare_input_budget(ChatRequest {
+            model: model.into(),
+            messages: messages.to_vec(),
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        })
+        .await
+        .unwrap()
+        .request
+        .messages
+}
+
 #[tokio::test]
 async fn durable_final_response_aliases_survive_checkpoint_cleanup_and_frozen_restart() {
     for (provider, model, native, reasoning, ui_final, content) in [
@@ -336,17 +413,9 @@ async fn durable_final_case(
     assert_eq!(selected_neighbor.len(), 1);
     assert_eq!(selected_neighbor[0].content, "unrelated neighbor");
     // Actual provider preparation sees one native answer before publication.
-    let prepared = pioneer_provider::attachments::prepare_messages_for_provider_async(
-        provider,
-        model,
-        &pioneer_provider::ProviderCapabilities::default(),
-        &messages,
-    )
-    .await
-    .unwrap();
+    let prepared = prepare_history_for_provider(provider, model, &messages).await;
     assert_eq!(
         prepared
-            .messages
             .iter()
             .filter(|m| m.provider_replay_state.is_some())
             .count(),
@@ -618,34 +687,16 @@ async fn durable_final_case(
                 || (!ui_final.trim().is_empty() && m.content == ui_final)
                 || m.content.contains("canonical reasoning"))
     );
-    let prepared = pioneer_provider::attachments::prepare_messages_for_provider_async(
-        provider,
-        model,
-        &pioneer_provider::ProviderCapabilities::default(),
-        &cold.messages,
-    )
-    .await
-    .unwrap();
-    assert!(
-        prepared
-            .messages
-            .iter()
-            .all(|m| m.provider_replay_state.is_none())
-    );
+    let prepared = prepare_history_for_provider(provider, model, &cold.messages).await;
+    assert!(prepared.iter().all(|m| m.provider_replay_state.is_none()));
     assert!(
         !prepared
-            .messages
             .iter()
             .any(|m| (!ui_final.trim().is_empty() && m.content == ui_final)
                 || m.content.contains("canonical reasoning")),
         "summary must not replay the original visible UI answer/reasoning"
     );
-    assert!(
-        prepared
-            .messages
-            .iter()
-            .any(|m| m.content == "unrelated neighbor")
-    );
+    assert!(prepared.iter().any(|m| m.content == "unrelated neighbor"));
     let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
         &workspace,
         thread,
