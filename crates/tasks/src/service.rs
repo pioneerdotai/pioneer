@@ -68,7 +68,7 @@ const WAIT_LIVENESS_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 const LIVE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_AUTO_ACCEPT_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const REVIEW_AUTO_ACCEPT_SCAN_LIMIT: u64 = 1024;
-const DELIVERY_RECOVERY_BATCH_LIMIT: u64 = 1_000;
+const DELIVERY_RECOVERY_BATCH_LIMIT: u64 = pioneer_crud::DELIVERY_RECOVERY_BUDGET;
 const MAX_REVISION_FEEDBACK_CHARS: usize = 16_000;
 const MAX_WAIT_GOVERNOR_SCOPES: usize = 1_024;
 
@@ -291,9 +291,17 @@ impl TaskRuntime {
         self.maintenance_service
             .recover_retry_and_lock_state(now)
             .await?;
-        self.maintenance_service
+        if self
+            .maintenance_service
             .recover_stuck_deliveries(now, DELIVERY_RECOVERY_BATCH_LIMIT)
-            .await?;
+            .await
+            .is_err()
+        {
+            warn!(
+                failure_class = "task_delivery_recovery_startup_discovery_failed",
+                "delivery recovery unavailable at startup; continuing independent startup work"
+            );
+        }
         self.maintenance_service
             .auto_accept_expired_review_candidates(now, REVIEW_AUTO_ACCEPT_SCAN_LIMIT)
             .await?;
@@ -358,6 +366,38 @@ impl TaskRuntime {
     }
 }
 
+/// Outcome of one bounded quantum, including repairs committed before failures.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TaskDeliveryRecoveryResult {
+    /// Unique candidates; duplicate locators still consume discovery inputs.
+    pub selected: usize,
+    pub recovered: usize,
+    pub failed: usize,
+    /// Candidates whose failure deferral durability could not be established.
+    pub undurable: usize,
+    pub cooling_down: bool,
+}
+
+#[derive(Default)]
+struct DeliveryRecoveryState {
+    cursor: Option<pioneer_crud::DeliveryRecoveryCursor>,
+    retry_turn: bool,
+    failed_quanta: u32,
+    retry_at: Option<Instant>,
+}
+
+impl DeliveryRecoveryState {
+    fn delay_next_quantum(&mut self) {
+        self.failed_quanta = self.failed_quanta.saturating_add(1).min(16);
+        let delay = (5_u64 << (self.failed_quanta - 1)).min(300);
+        self.retry_at = Some(Instant::now() + Duration::from_secs(delay));
+        warn!(
+            failure_class = "task_delivery_recovery_cooldown",
+            "subsequent delivery recovery quanta delayed; durable deferral unavailable"
+        );
+    }
+}
+
 pub struct TaskService {
     store: Arc<CrudStore>,
     projector: TaskProjector,
@@ -365,6 +405,7 @@ pub struct TaskService {
     executors: Arc<TaskExecutorRegistry>,
     scheduler: RwLock<Option<Weak<TaskScheduler>>>,
     config: TaskRuntimeConfig,
+    delivery_recovery: Mutex<DeliveryRecoveryState>,
 }
 
 impl TaskService {
@@ -390,6 +431,7 @@ impl TaskService {
             executors,
             scheduler: RwLock::new(None),
             config,
+            delivery_recovery: Mutex::new(DeliveryRecoveryState::default()),
         }
     }
 
@@ -3612,45 +3654,183 @@ impl TaskService {
         Ok(())
     }
 
-    pub async fn recover_stuck_deliveries(&self, now: i64, limit: u64) -> TaskRuntimeResult<usize> {
+    pub async fn recover_stuck_deliveries(
+        &self,
+        now: i64,
+        limit: u64,
+    ) -> TaskRuntimeResult<TaskDeliveryRecoveryResult> {
+        if limit == 0 {
+            bail!("delivery recovery requires a nonzero input budget");
+        }
+        let limit = limit.min(pioneer_crud::DELIVERY_RECOVERY_BUDGET);
+        // Serializes only this service's quanta; no DB resource is held here.
+        // The cursor is fairness for current work, never a domain ACK.
+        let mut state = self.delivery_recovery.lock().await;
+        if state.retry_at.is_some_and(|at| Instant::now() < at) {
+            return Ok(TaskDeliveryRecoveryResult {
+                cooling_down: true,
+                ..Default::default()
+            });
+        }
+        let maintenance = Arc::new(self.store.with_maintenance_access());
         let cutoff = now.saturating_sub(300);
-        let deliveries = self.store.list_stuck_task_deliveries(cutoff, limit).await?;
-        let mut recovered = 0usize;
-        for mut delivery in deliveries {
-            let mut attempt = self
-                .store
-                .get_task_delivery_attempt(&delivery.id, delivery.attempt_count)
-                .await?
-                .with_context(|| {
-                    format!("stuck Task delivery `{}` has no exact attempt", delivery.id)
-                })?;
-            let retryable = delivery.attempt_count < delivery.max_attempts;
-            delivery.status = if retryable {
-                TaskDeliveryStatus::Pending
-            } else {
-                TaskDeliveryStatus::Failed
-            };
-            delivery.next_attempt_at = retryable.then_some(now);
-            let recovery_error = "task_delivery_recovered".to_owned();
-            delivery.last_error = Some(recovery_error.clone());
-            delivery.updated_at = now;
-            attempt.status = TaskDeliveryAttemptStatus::Failed;
-            attempt.completed_at = Some(now);
-            attempt.error = Some(recovery_error);
-            let outcome = self
-                .projector
-                .transition_delivery(
-                    TaskEventPayload::DeliveryFailed { delivery, attempt },
-                    TaskDeliveryTransition::Recover { cutoff },
-                    now,
-                )
+        // For limit=1 alternate sources; otherwise reserve half for each.
+        let retry_quota = if limit == 1 {
+            u64::from(state.retry_turn)
+        } else {
+            limit / 2
+        };
+        state.retry_turn = !state.retry_turn;
+        let discovery = async {
+            let retries = maintenance
+                .due_task_delivery_recovery_retries(now, retry_quota)
                 .await?;
-            if let TaskDeliveryTransitionOutcome::Applied(appended) = outcome {
-                self.event_bus.publish(appended).await;
-                recovered = recovered.saturating_add(1);
+            let source_limit = limit - retries.len() as u64;
+            let rows = if source_limit > 0 {
+                maintenance
+                    .task_delivery_recovery_page(cutoff, state.cursor.as_ref(), source_limit)
+                    .await?
+            } else {
+                Vec::new()
+            };
+            Ok::<_, anyhow::Error>((retries, rows, source_limit))
+        }
+        .await;
+        let (retries, rows, source_limit) = match discovery {
+            Ok(page) => page,
+            Err(error) => {
+                state.delay_next_quantum();
+                warn!(
+                    failure_class = "task_delivery_recovery_discovery_failed",
+                    "delivery recovery discovery storage access failed; no quantum issued"
+                );
+                return Err(error);
+            }
+        };
+        // Advance before any fallible row work. Wrap only in the next quantum.
+        if source_limit > 0 {
+            state.cursor = if rows.len() < source_limit as usize {
+                None
+            } else {
+                rows.last().cloned()
+            };
+        }
+        let mut selected = BTreeSet::new();
+        let mut result = TaskDeliveryRecoveryResult::default();
+        let candidates = retries
+            .into_iter()
+            .map(|r| (r.delivery_id.clone(), Some(r)))
+            .chain(rows.into_iter().map(|r| (r.id, None)));
+        for (id, due_retry) in candidates {
+            if !selected.insert(id.clone()) {
+                continue;
+            }
+            result.selected += 1;
+            let snapshot_store = maintenance.clone();
+            let snapshot_id = id;
+            let snapshot = match crate::task_boundary::task_fresh_task(
+                async move {
+                    snapshot_store
+                        .task_delivery_recovery_snapshot(&snapshot_id)
+                        .await
+                },
+                "task delivery recovery snapshot panicked",
+            )
+            .await
+            {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => continue,
+                Err(_) => {
+                    // Without a snapshot there is no authority to repair, infer
+                    // an absent attempt, or write a fenced retry.
+                    result.failed += 1;
+                    result.undurable += 1;
+                    warn!(
+                        failure_class = "task_delivery_recovery_snapshot_failed",
+                        "candidate snapshot unavailable; durable deferral unavailable"
+                    );
+                    continue;
+                }
+            };
+            if !snapshot.eligible(now)
+                || due_retry
+                    .as_ref()
+                    .is_some_and(|r| snapshot.retry.as_ref() != Some(r))
+            {
+                continue;
+            }
+            // Reuse the owned, abort-on-drop task boundary to isolate both
+            // preparation and apply panics without detaching cancelled work.
+            let source = snapshot.clone();
+            let store = self.store.clone();
+            let repair = crate::task_boundary::task_fresh_task(
+                async move {
+                    let event = source.failure_event(now)?;
+                    store
+                        .recover_task_delivery(event, &source, cutoff, now)
+                        .await
+                },
+                "task delivery recovery row panicked",
+            )
+            .await;
+            match repair {
+                Ok(TaskDeliveryTransitionOutcome::Applied(appended)) => {
+                    // Atomic event + both projections have committed; capacity
+                    // is released before publishing any notification.
+                    self.event_bus.publish(appended).await;
+                    result.recovered += 1;
+                }
+                Ok(TaskDeliveryTransitionOutcome::Superseded) => {}
+                Err(_) => {
+                    result.failed += 1;
+                    warn!(
+                        failure_class = "task_delivery_recovery_row_failed",
+                        "delivery recovery candidate failed; retaining current delivering work"
+                    );
+                    // Clock after writer admission, even when admission waited.
+                    // Keep an explicit caller time floor for deterministic quanta.
+                    let retry_store = maintenance.clone();
+                    if crate::task_boundary::task_fresh_task(
+                        async move {
+                            let clock = || now_timestamp_secs().max(now);
+                            retry_store
+                                .defer_task_delivery_recovery(&snapshot, &clock)
+                                .await
+                        },
+                        "task delivery recovery bookkeeping panicked",
+                    )
+                    .await
+                    .is_err()
+                    {
+                        result.undurable += 1;
+                        warn!(
+                            failure_class = "task_delivery_recovery_deferral_failed",
+                            "candidate failure bookkeeping failed; durable deferral unavailable"
+                        );
+                    }
+                }
             }
         }
-        Ok(recovered)
+        if result.undurable == 0 {
+            state.failed_quanta = 0;
+            state.retry_at = None;
+        } else {
+            // Once per quantum, after all selected work. A local error does not
+            // establish a storage-wide outage or revoke another row's budget.
+            state.delay_next_quantum();
+        }
+        result.cooling_down = result.undurable > 0;
+        if result.failed > 0 {
+            warn!(
+                failure_class = "task_delivery_recovery_partial_failure",
+                selected = result.selected,
+                recovered = result.recovered,
+                failed = result.failed,
+                undurable = result.undurable,
+                "delivery recovery quantum completed with candidate failures"
+            );
+        }
+        Ok(result)
     }
 
     pub async fn get_task(&self, params: TaskGetParams) -> TaskRuntimeResult<TaskGetResponse> {
