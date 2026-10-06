@@ -104,15 +104,22 @@ pub(super) fn mp3_samples(bytes: &[u8]) -> Result<(u64, u32)> {
             _ => 17,
         };
         let tag_at = 4 + side;
-        let tag = frame.get(tag_at..tag_at + 4);
-        ensure!(
-            frame.get(36..40) != Some(b"VBRI"),
-            "MP3 VBRI priming/count contract is not proven"
-        );
-        let is_xing = matches!(tag, Some(b"Xing" | b"Info"));
+        // Pinned MpaReader candidate contract (demuxer.rs:940–967,1021–1045):
+        // signature alone can be ordinary ancillary data. Prefix/extent decide
+        // classification BEFORE placement/protection/count/trim policies.
+        // header_size skips optional CRC; the tag offsets themselves use the
+        // fixed four-byte MPEG header, as in the pinned contract.
+        let header_size = 4 + if h[1] & 1 == 0 { 2 } else { 0 };
+        let is_vbri = frame.len() >= 36 + 26
+            && frame.get(36..40) == Some(b"VBRI")
+            && frame[header_size..36].iter().all(|b| *b == 0);
+        ensure!(!is_vbri, "MP3 VBRI priming/count contract is not proven");
+        let is_xing = frame.len() >= tag_at + 8
+            && matches!(frame.get(tag_at..tag_at + 4), Some(b"Xing" | b"Info"))
+            && frame[header_size..tag_at].iter().all(|b| *b == 0);
         if is_xing {
             ensure!(
-                frames == 0 && !xing && h[1] & 1 != 0 && frame[4..tag_at].iter().all(|b| *b == 0),
+                frames == 0 && !xing && h[1] & 1 != 0,
                 "MP3 embedded/protected info-tag timeline is not proven"
             );
             let flags = frame
@@ -236,4 +243,74 @@ pub(super) fn adts_samples(bytes: &[u8]) -> Result<(u64, u32)> {
         samples,
         RATES[usize::from(config.context("ADTS sample rate unavailable")?.0)],
     ))
+}
+
+#[cfg(test)]
+mod ancillary_classification_regressions {
+    use super::*;
+    use crate::attachments::{
+        input_estimate::duration_millis,
+        media_fixtures::{
+            ordinary_mp3_collision, rejected_mp3_tag_candidates, trimmed_xing_mp3, xing_mp3,
+        },
+    };
+    #[test]
+    fn ignored_private_bit_and_ancillary_magic_preserve_first_and_later_sample_clock() {
+        for magic in [b"Info", b"Xing", b"VBRI"] {
+            for index in [0, 37] {
+                let bytes = ordinary_mp3_collision(100, index, magic);
+                assert_eq!(mp3_samples(&bytes).unwrap(), (115200, 48000));
+                assert_eq!(duration_millis(&bytes, "audio/mpeg").unwrap(), 2400);
+                assert_eq!(
+                    duration_millis(&ordinary_mp3_collision(101, index, magic), "audio/mpeg")
+                        .unwrap(),
+                    2424
+                );
+            }
+        }
+        // One ordinary MPEG1 frame has1152/48000=24ms independently.
+        for magic in [b"Info", b"Xing", b"VBRI"] {
+            assert_eq!(
+                duration_millis(&ordinary_mp3_collision(1, 0, magic), "audio/mpeg").unwrap(),
+                24
+            );
+        }
+    }
+    #[test]
+    fn minimum_extent_and_version_layout_precede_tag_only_policies() {
+        // Valid zero-side-data MPEG2/24kHz stereo 8kbps +padding =>25bytes.
+        // Xing magic fits, full minimum eight-byte tag does not. 576 samples.
+        let mut short_xing = vec![0; 25];
+        short_xing[..4].copy_from_slice(&[0xff, 0xf3, 0x16, 0]);
+        short_xing[21..25].copy_from_slice(b"Xing");
+        assert_eq!(mp3_samples(&short_xing).unwrap(), (576, 24000));
+        assert_eq!(duration_millis(&short_xing, "audio/mpeg").unwrap(), 24);
+        // MPEG2/24kHz mono16kbps =>48bytes; VBRI magic fits but full26-byte
+        // metadata extent after36 does not. Zero coded lengths, ordinary audio.
+        let mut short_vbri = vec![0; 48];
+        short_vbri[..4].copy_from_slice(&[0xff, 0xf3, 0x24, 0xc0]);
+        short_vbri[36..40].copy_from_slice(b"VBRI");
+        assert_eq!(mp3_samples(&short_vbri).unwrap(), (576, 24000));
+        assert_eq!(duration_millis(&short_vbri, "audio/mpeg").unwrap(), 24);
+    }
+    #[test]
+    fn actual_candidates_keep_count_placement_protection_extent_and_trim_guards() {
+        for magic in [b"Xing", b"Info"] {
+            let mut valid = xing_mp3(100, 100);
+            valid[21..25].copy_from_slice(magic);
+            assert_eq!(mp3_samples(&valid).unwrap(), (115200, 48000));
+            // 100*1152 -100 delay -200 padding, independent of scanner.
+            let trimmed = trimmed_xing_mp3(magic);
+            assert_eq!(mp3_samples(&trimmed).unwrap(), (114900, 48000));
+            assert_eq!(duration_millis(&trimmed, "audio/mpeg").unwrap(), 2394);
+        }
+        for bytes in rejected_mp3_tag_candidates() {
+            assert!(mp3_samples(&bytes).is_err());
+        }
+        // Existing Lavc count/CRC trim proof remains exercised separately.
+        assert!(mp3_samples(crate::attachments::regression::mp3()).is_ok());
+        let mut crc = crate::attachments::regression::mp3().to_vec();
+        crc[0xb9 + 5] ^= 1;
+        assert!(mp3_samples(&crc).is_err());
+    }
 }

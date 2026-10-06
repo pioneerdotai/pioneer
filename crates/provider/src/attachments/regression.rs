@@ -1195,6 +1195,34 @@ async fn confirmed_elementary_audio_limits_and_mp4_edit_admission() {
                 false,
             ),
         ];
+        // 1152 samples/frame at 48000Hz: these independent bounds do not
+        // consult the scanner. Ignored private bits leave coded lengths zero.
+        for magic in [b"Info", b"Xing", b"VBRI"] {
+            for at in [0, 37] {
+                for (frames, limit, allowed) in
+                    [(100, 2400, true), (100, 2399, false), (101, 2400, false)]
+                {
+                    cases.push((
+                        InputContentType::Audio,
+                        "audio/mpeg",
+                        super::media_fixtures::ordinary_mp3_collision(frames, at, magic),
+                        limit,
+                        allowed,
+                    ));
+                }
+            }
+        }
+        for magic in [b"Info", b"Xing"] {
+            for (limit, allowed) in [(2394, true), (2393, false)] {
+                cases.push((
+                    InputContentType::Audio,
+                    "audio/mpeg",
+                    super::media_fixtures::trimmed_xing_mp3(magic),
+                    limit,
+                    allowed,
+                ));
+            }
+        }
         if name != "openai" {
             cases.extend([
                 (
@@ -1338,7 +1366,10 @@ async fn confirmed_elementary_audio_limits_and_mp4_edit_admission() {
         }
         let mut bad_crc = mp3().to_vec();
         bad_crc[0xb9 + 5] ^= 1;
-        for bytes in [super::media_fixtures::xing_mp3(100, 99), bad_crc] {
+        for bytes in super::media_fixtures::rejected_mp3_tag_candidates()
+            .into_iter()
+            .chain([bad_crc])
+        {
             let req = request(
                 "media",
                 vec![part(InputContentType::Audio, "audio/mpeg", &bytes)],
@@ -1438,6 +1469,27 @@ pub(crate) fn confirmed_wire_inputs(
 ) -> Vec<(InputContentType, &'static str, Vec<u8>)> {
     use super::media_fixtures::{encoded_audio_mp4, encoded_video_mp4, vbr_adts, vbr_mp3};
     let mut cases = vec![(InputContentType::Audio, "audio/mpeg", vbr_mp3(100))];
+    // All four native builder tests consume this collection after production
+    // async budget/admission and replay, comparing the complete encoded bytes.
+    for magic in [b"Info", b"Xing", b"VBRI"] {
+        for at in [0, 37] {
+            cases.push((
+                InputContentType::Audio,
+                "audio/mpeg",
+                super::media_fixtures::ordinary_mp3_collision(100, at, magic),
+            ));
+        }
+    }
+    for magic in [b"Info", b"Xing"] {
+        let mut bytes = super::media_fixtures::xing_mp3(100, 100);
+        bytes[21..25].copy_from_slice(magic);
+        cases.push((InputContentType::Audio, "audio/mpeg", bytes));
+        cases.push((
+            InputContentType::Audio,
+            "audio/mpeg",
+            super::media_fixtures::trimmed_xing_mp3(magic),
+        ));
+    }
     if provider != "openai" {
         cases.extend([
             (InputContentType::Audio, "audio/aac", vbr_adts(441)),
@@ -1463,4 +1515,51 @@ pub(crate) fn confirmed_wire_inputs(
         ]);
     }
     cases
+}
+
+#[tokio::test]
+async fn gemini_aggregate_counts_ordinary_ancillary_collisions_as_audio() {
+    use crate::Provider;
+    let provider = crate::providers::GeminiProvider::new("unused");
+    // Independent PCM + frame clock: 34197.6s + 100*1152/48000s =34200s.
+    // One additional ordinary frame exceeds the native bound by exactly24ms.
+    for magic in [b"Info", b"Xing", b"VBRI"] {
+        for at in [0, 37] {
+            for (frames, allowed) in [(100, true), (101, false)] {
+                let bytes = super::media_fixtures::ordinary_mp3_collision(frames, at, magic);
+                let req = request(
+                    "media",
+                    vec![
+                        part(
+                            InputContentType::Audio,
+                            "audio/wav",
+                            &wav_frames(3_419_760, 100),
+                        ),
+                        part(InputContentType::Audio, "audio/mpeg", &bytes),
+                    ],
+                );
+                let s = Arc::new(state("gemini", "media", json!({})));
+                assert_eq!(
+                    scoped(s.clone(), provider.prepare_input_budget(req.clone()))
+                        .await
+                        .is_ok(),
+                    allowed
+                );
+                assert_eq!(
+                    scoped(
+                        s,
+                        super::prepare_messages_for_provider_async(
+                            "gemini",
+                            "media",
+                            &provider.capabilities(),
+                            &req.messages
+                        )
+                    )
+                    .await
+                    .is_ok(),
+                    allowed
+                );
+            }
+        }
+    }
 }

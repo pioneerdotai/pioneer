@@ -345,3 +345,76 @@ pub(crate) fn xing_mp3(frames: usize, declared: u32) -> Vec<u8> {
     header.extend(vbr_mp3(frames));
     header
 }
+
+/// Valid ordinary silence with a metadata-looking ancillary payload. The
+/// MPEG1 mono ignored private bit (after 9-bit main_data_begin) is nonzero;
+/// SCFSI and both granules' part2_3_length/coded side data stay zero. Nothing
+/// references ancillary payload: main_data_begin and coded lengths remain zero.
+pub(crate) fn ordinary_mp3_collision(frames: usize, at: usize, magic: &[u8; 4]) -> Vec<u8> {
+    assert!(at < frames && matches!(magic, b"Info" | b"Xing" | b"VBRI"));
+    let mut bytes = vbr_mp3(frames);
+    let offset = if at < 20 {
+        at * 960
+    } else {
+        20 * 960 + (at - 20) * 96
+    };
+    bytes[offset + 5] = 0x40;
+    let ancillary = if magic == b"VBRI" { 36 } else { 21 };
+    bytes[offset + ancillary..offset + ancillary + 4].copy_from_slice(magic);
+    // Independent fixture shape, distinguishing ignored private bits from
+    // coded fields. These checks run only in future authorized tests.
+    assert_eq!(bytes[offset + 4], 0); // all 9 main_data_begin bits, including bit7 of byte5
+    assert_eq!(bytes[offset + 5] & 0x83, 0); // main_data_begin/SCFSI bits
+    assert!(bytes[offset + 6..offset + 21].iter().all(|b| *b == 0));
+    bytes
+}
+
+/// Metadata candidates, deliberately outside the admitted contract; unlike
+/// collision fixtures, these have complete extent and zero side/prefix.
+pub(crate) fn rejected_mp3_tag_candidates() -> Vec<Vec<u8>> {
+    let mut vbri = vbr_mp3(1);
+    vbri[36..40].copy_from_slice(b"VBRI");
+    vbri[40..42].copy_from_slice(&1u16.to_be_bytes()); // VBRI version
+    vbri[46..50].copy_from_slice(&960u32.to_be_bytes());
+    vbri[50..54].copy_from_slice(&1u32.to_be_bytes());
+    let mut protected = xing_mp3(100, 100);
+    protected[1] &= !1;
+    protected[4..6].copy_from_slice(&[0x12, 0x34]); // candidate prefix excludes CRC bytes
+    let embedded = [vbr_mp3(1), xing_mp3(100, 100)].concat();
+    let mut fields = xing_mp3(100, 100);
+    fields[25..29].copy_from_slice(&15u32.to_be_bytes()); // declared TOC/fields fit
+    fields[149] = 1; // unsupported nonzero encoder extension, not an ordinary collision
+    let mut short_fields = vbr_mp3(1);
+    short_fields.truncate(96);
+    short_fields[2] = 0x14; // valid short MPEG1/48kHz32kbps frame, exactly96bytes
+    short_fields[21..25].copy_from_slice(b"Info");
+    short_fields[25..29].copy_from_slice(&15u32.to_be_bytes());
+    short_fields[29..33].copy_from_slice(&1u32.to_be_bytes()); // TOC no longer fits -> proven candidate, incomplete fields
+    vec![
+        vbri,
+        protected,
+        embedded,
+        fields,
+        short_fields,
+        xing_mp3(100, 99),
+    ]
+}
+
+/// Known LAME extension with independent declared sample trim. CRC construction
+/// happens only in future authorized tests, never while preparing these edits.
+pub(crate) fn trimmed_xing_mp3(magic: &[u8; 4]) -> Vec<u8> {
+    use symphonia::core::io::Monitor;
+    assert!(matches!(magic, b"Xing" | b"Info"));
+    let mut bytes = xing_mp3(100, 100);
+    bytes[21..25].copy_from_slice(magic);
+    const EXTENSION: usize = 33; // flags=1, frame counter only
+    bytes[EXTENSION..EXTENSION + 9].copy_from_slice(b"LAME3.100");
+    // 100 delay +200 padding samples; this is explicit, not guessed priming.
+    let trim = (100u32 << 12) | 200;
+    bytes[EXTENSION + 21..EXTENSION + 24].copy_from_slice(&trim.to_be_bytes()[1..]);
+    let mut crc = symphonia::core::checksum::Crc16AnsiLe::new(0);
+    crc.process_buf_bytes(&bytes[..EXTENSION + 34]);
+    assert_ne!(crc.crc(), 0); // supported contract requires nonzero matching CRC
+    bytes[EXTENSION + 34..EXTENSION + 36].copy_from_slice(&crc.crc().to_be_bytes());
+    bytes
+}
