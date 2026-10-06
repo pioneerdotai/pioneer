@@ -3432,6 +3432,25 @@ mod terminal_boundary_tests {
             compiled_prompt: None,
         }
     }
+
+    async fn acknowledge_round_events(hub: &AgentEventHub) -> Vec<AgentDurableEvent> {
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        let mut events = Vec::new();
+        loop {
+            let event = receiver.recv().await.unwrap();
+            let usage_completed = matches!(&event,
+                AgentDurableEvent::ItemCompleted { notification }
+                    if matches!(&notification.item,
+                        TurnItem::SystemEvent { code, .. }
+                            if code.as_deref() == Some("provider_usage")));
+            receiver.acknowledge_last(Ok(()));
+            events.push(event);
+            if usage_completed {
+                return events;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn failed_partial_call_never_becomes_executable_round_or_automatic_retry() {
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -3445,36 +3464,43 @@ mod terminal_boundary_tests {
             attempts: attempts.clone(),
         });
         let hub = AgentEventHub::new();
-        let mut receiver = hub.take_durable_receiver().await.unwrap();
-        let acknowledgement = tokio::spawn(async move {
-            let event = receiver.recv().await.unwrap();
-            let AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } = event else {
-                panic!("expected failed observation")
-            };
+        let (result, events) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                request_agent_round(
+                    &provider,
+                    request(),
+                    "ws",
+                    "thread",
+                    "turn",
+                    "item",
+                    false,
+                    ProviderTimeoutPolicy::default(),
+                    &hub,
+                ),
+                acknowledge_round_events(&hub),
+            )
+        })
+        .await
+        .expect("provider round and all durable acknowledgements must finish");
+        let history = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } => Some(payload),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(history.len(), 1, "expected one failed observation");
+        for payload in history {
             let envelope: pioneer_provider::CanonicalProviderRoundEnvelope =
-                serde_json::from_value(payload).unwrap();
+                serde_json::from_value(payload.clone()).unwrap();
             assert_eq!(envelope.termination, ProviderTermination::ProviderError);
             assert!(
                 envelope.calls.is_empty(),
                 "failed observations must not retain executable identities"
             );
-            receiver.acknowledge_last(Ok(()));
-        });
-        let result = request_agent_round(
-            &provider,
-            request(),
-            "ws",
-            "thread",
-            "turn",
-            "item",
-            false,
-            ProviderTimeoutPolicy::default(),
-            &hub,
-        )
-        .await;
+        }
         assert!(matches!(result, Err(ChatTurnError::ProviderFailure { .. })));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        acknowledgement.await.unwrap();
     }
     #[tokio::test]
     async fn final_chunk_payload_is_accumulated_before_terminal_validation() {
@@ -3485,19 +3511,26 @@ mod terminal_boundary_tests {
             fail: false,
             attempts: Arc::new(AtomicUsize::new(0)),
         });
-        let result = request_agent_round(
-            &provider,
-            request(),
-            "ws",
-            "thread",
-            "turn",
-            "item",
-            false,
-            ProviderTimeoutPolicy::default(),
-            &AgentEventHub::new(),
-        )
+        let hub = AgentEventHub::new();
+        let (result, _) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                request_agent_round(
+                    &provider,
+                    request(),
+                    "ws",
+                    "thread",
+                    "turn",
+                    "item",
+                    false,
+                    ProviderTimeoutPolicy::default(),
+                    &hub,
+                ),
+                acknowledge_round_events(&hub),
+            )
+        })
         .await
-        .unwrap();
+        .expect("provider round and all durable acknowledgements must finish");
+        let result = result.unwrap();
         assert_eq!(result.text, "terminal text");
     }
 }
