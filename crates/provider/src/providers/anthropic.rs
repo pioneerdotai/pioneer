@@ -1481,10 +1481,16 @@ mod tests {
             .unwrap();
         let mut answer = ChatMessage::assistant("answer");
         answer.provider_replay_state = Some(state);
-        complete(&mut answer);
-        // Exactly the durable roundtrip used by cold history, retaining proof.
-        let answer: ChatMessage =
+        // Native replay proof survives storage. Completion provenance is supplied
+        // separately by the trusted cold loader, never accepted from stored JSON.
+        let mut answer: ChatMessage =
             serde_json::from_value(serde_json::to_value(answer).unwrap()).unwrap();
+        assert!(answer.provenance.is_none());
+        let mut unattributed = req.clone();
+        unattributed.model = "claude-opus-4-6".into();
+        unattributed.messages.push(answer.clone());
+        assert!(build(&provider, &unattributed).is_err());
+        complete(&mut answer);
         req.messages.push(answer.clone());
         req.messages
             .push(ChatMessage::user("next normal user turn"));

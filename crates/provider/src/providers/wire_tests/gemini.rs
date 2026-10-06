@@ -22,6 +22,7 @@ fn canonical_tool_rounds_parse_and_replay_native_parts() {
         ChatMessage::system("Use tools"),
         ChatMessage::user("Forecast and time"),
     ];
+    let mut native_parts = Vec::new();
     for (round, fixture) in [
         include_str!("../../../tests/fixtures/wire/gemini-round-1.json"),
         include_str!("../../../tests/fixtures/wire/gemini-round-2.json"),
@@ -54,6 +55,7 @@ fn canonical_tool_rounds_parse_and_replay_native_parts() {
             state.model = Some("gemini-2.5-flash".into());
             state
         });
+        native_parts.push(state.as_ref().unwrap().payload["parts"].clone());
         history.push(ChatMessage::assistant_tool_calls_with_provider_state(
             None::<String>,
             None::<String>,
@@ -85,20 +87,30 @@ fn canonical_tool_rounds_parse_and_replay_native_parts() {
             assert_eq!(assistant["role"], "model");
             assert_eq!(result["role"], "user");
             assert_eq!(
-                assistant["parts"][0]["functionCall"]["id"],
+                assistant["parts"], native_parts[previous],
+                "replay preserves all native parts in their original order"
+            );
+            let call_part = assistant["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|part| part.get("functionCall").is_some())
+                .unwrap();
+            assert_eq!(
+                call_part["functionCall"]["id"],
                 ["forecast_1", "clock_2"][previous]
             );
             assert_eq!(
                 result["parts"][0]["functionResponse"]["id"],
-                assistant["parts"][0]["functionCall"]["id"]
+                call_part["functionCall"]["id"]
             );
-            assert!(assistant["parts"][0]["functionCall"]["args"].is_object());
+            assert!(call_part["functionCall"]["args"].is_object());
             assert!(result["parts"][0]["functionResponse"]["response"].is_object());
             assert_eq!(
-                assistant["parts"][0]["thoughtSignature"],
+                call_part["thoughtSignature"],
                 ["AQIDBA==", "BQYHCA=="][previous]
             );
-            assert!(assistant["parts"][0].get("function_call").is_none());
+            assert!(call_part.get("function_call").is_none());
         }
         if round == 0 {
             assert_eq!(
@@ -134,8 +146,14 @@ fn canonical_optional_and_unknown_parts_do_not_hide_calls() {
     let calls = GeminiProvider::extract_tool_calls(&response);
     assert_eq!(calls[0].name, "clock");
     assert_eq!(calls[0].arguments, "{}");
-    assert!(GeminiProvider::extract_provider_replay_state(&response).is_none());
     let parts = &response.candidates[0].content.as_ref().unwrap().parts;
+    let mut state = GeminiProvider::extract_provider_replay_state(&response).unwrap();
+    assert_eq!(state.payload["schema_version"], 2);
+    assert_eq!(state.payload["parts"], serde_json::to_value(parts).unwrap());
+    assert_eq!(
+        state.payload["parts"][0]["executableCode"]["code"],
+        "print(1)"
+    );
     assert_eq!(
         parts[2].file_data.as_ref().unwrap().file_uri,
         "https://example.invalid/file"
@@ -145,6 +163,32 @@ fn canonical_optional_and_unknown_parts_do_not_hide_calls() {
         "image/png"
     );
     assert_eq!(parts[5].function_response.as_ref().unwrap().name, "clock");
+    // Opaque/unknown parts remain canonical data, without acquiring a proven
+    // continuation contract merely because the same model is selected.
+    state.model = Some("gemini-2.5-flash".into());
+    let mut messages = vec![ChatMessage::assistant_tool_calls_with_provider_state(
+        Some("answer"),
+        None::<String>,
+        calls.clone(),
+        Some(state.clone()),
+    )];
+    for call in calls {
+        messages.push(ChatMessage::tool_result(call.id, call.name, "{}"));
+    }
+    let request = request(messages);
+    let provider = GeminiProvider::new("fixture");
+    let prepared = prepare_messages_for_provider_model(
+        provider.name(),
+        &request.model,
+        &provider.capabilities(),
+        &request.messages,
+    )
+    .unwrap();
+    assert!(GeminiProvider::build_request_from_prepared(&request, &prepared).is_err());
+    assert_eq!(
+        request.messages[0].provider_replay_state.as_ref(),
+        Some(&state)
+    );
 }
 
 #[test]

@@ -535,9 +535,16 @@ mod tests {
             message.provider_replay_state =
                 Some(ProviderReplayState::for_model(owner, "source", payload));
             let active = message.clone();
-            complete(&mut message, "final");
-            let stored: ChatMessage =
+            let mut stored: ChatMessage =
                 serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+            assert!(
+                stored.provenance.is_none(),
+                "stored JSON cannot grant completion authority"
+            );
+            let unattributed = stored.clone();
+            // The trusted cold loader reconstructs provenance from exact durable
+            // source revisions; ChatMessage serialization intentionally omits it.
+            complete(&mut stored, "final");
             let same = project_messages_for_provider(owner, "source", &[stored.clone()]).unwrap();
             assert_eq!(same[0], stored);
             for profile in crate::definition::provider_definitions() {
@@ -550,6 +557,11 @@ mod tests {
                 assert!(
                     project_messages_for_provider(profile.name, "target", &[active.clone()])
                         .is_err()
+                );
+                assert!(
+                    project_messages_for_provider(profile.name, "target", &[unattributed.clone()])
+                        .is_err(),
+                    "a JSON roundtrip cannot authorize a foreign provider/model projection"
                 );
             }
             // A fork keeps native source ownership; it does not mint signatures.
