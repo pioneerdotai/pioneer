@@ -1823,6 +1823,8 @@ mod stream_call_identity_tests {
         // Construct the native struct so this identity test is independent of
         // the JSON casing correction owned by remediation group 2.
         let response = ApiGenerateResponse {
+            response_id: None,
+            model_version: None,
             candidates: vec![ApiCandidate {
                 finish_reason: None,
                 content: Some(ApiContent {

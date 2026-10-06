@@ -44,7 +44,10 @@ fn technical_system_event(item: &TurnItem, service_filter: bool) -> bool {
     match code.as_deref() {
         Some("agent_thread_status_changed") => true,
         Some(
-            "agent_runtime_item_updated" | "cli_runtime_turn_steer" | "task.finalization.snapshot",
+            "agent_runtime_item_updated"
+            | "cli_runtime_turn_steer"
+            | "task.finalization.snapshot"
+            | "provider_usage",
         ) if service_filter => true,
         Some("agent_runtime_event") => {
             details
@@ -431,6 +434,47 @@ mod tests {
             panic!("plan event must remain model-visible");
         };
         assert!(text.contains("Preserve the real plan"));
+    }
+
+    #[test]
+    fn provider_usage_is_omitted_from_current_history_with_legacy_digest_projection_retained() {
+        let item = system(
+            "provider_usage",
+            Some(serde_json::json!({
+                "schema_version": 1,
+                "nativeMethod": "provider/usage/observed",
+                "physical_attempt_id": "attempt",
+                "usage": {"input_tokens": 100, "output_tokens": 0, "cache_read_input_tokens": 80}
+            })),
+        );
+        assert!(canonical_item_model_projection(&item).is_omitted());
+        for event in [
+            CanonicalTurnEventPayload::ItemStarted(pioneer_protocol::ItemStartedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: item.clone(),
+            }),
+            completed(item.clone()),
+            CanonicalTurnEventPayload::ItemUpdated(ItemUpdatedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: item.clone(),
+            }),
+        ] {
+            assert!(canonical_event_model_projection(&event).is_omitted());
+            assert!(!canonical_event_model_projection_before_service_filter(&event).is_omitted());
+            let expected_kind = if matches!(&event, CanonicalTurnEventPayload::ItemStarted(_)) {
+                "start"
+            } else {
+                "technical"
+            };
+            assert_eq!(
+                crate::compaction::event_projection_metadata(&event).1,
+                expected_kind
+            );
+        }
     }
 
     #[test]
