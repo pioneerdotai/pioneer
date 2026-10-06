@@ -1213,15 +1213,26 @@ async fn confirmed_elementary_audio_limits_and_mp4_edit_admission() {
             }
         }
         for magic in [b"Info", b"Xing"] {
-            for (limit, allowed) in [(2394, true), (2393, false)] {
-                cases.push((
-                    InputContentType::Audio,
-                    "audio/mpeg",
-                    super::media_fixtures::trimmed_xing_mp3(magic),
-                    limit,
-                    allowed,
-                ));
+            for (bytes, _samples, _rate, bound) in super::media_fixtures::confirmed_mp3_trims(magic)
+            {
+                for (limit, allowed) in [(bound, true), (bound - 1, false)] {
+                    cases.push((
+                        InputContentType::Audio,
+                        "audio/mpeg",
+                        bytes.clone(),
+                        limit,
+                        allowed,
+                    ));
+                }
             }
+            // A real additional frame adds24ms, rather than changing a bound.
+            cases.push((
+                InputContentType::Audio,
+                "audio/mpeg",
+                super::media_fixtures::encoder_trim_mp3(magic, b"LAME3.100", 101, 576, 576),
+                2376,
+                false,
+            ));
         }
         if name != "openai" {
             cases.extend([
@@ -1369,6 +1380,12 @@ async fn confirmed_elementary_audio_limits_and_mp4_edit_admission() {
         for bytes in super::media_fixtures::rejected_mp3_tag_candidates()
             .into_iter()
             .chain([bad_crc])
+            .chain(super::media_fixtures::unproven_mp3_trims(b"Info"))
+            .chain(super::media_fixtures::unproven_mp3_trims(b"Xing"))
+            .chain([
+                super::media_fixtures::encoder_trim_mp3_mpeg2(b"Info", b"LAME3.100", 576, 1152),
+                super::media_fixtures::encoder_trim_mp3_mpeg2(b"Xing", b"LAME3.100", 576, 1152),
+            ])
         {
             let req = request(
                 "media",
@@ -1380,19 +1397,23 @@ async fn confirmed_elementary_audio_limits_and_mp4_edit_admission() {
                     .await
                     .is_err()
             );
+            let error = scoped(
+                s,
+                super::prepare_messages_for_provider_async(
+                    name,
+                    "media",
+                    &provider.capabilities(),
+                    &req.messages,
+                ),
+            )
+            .await
+            .unwrap_err();
             assert!(
-                scoped(
-                    s,
-                    super::prepare_messages_for_provider_async(
-                        name,
-                        "media",
-                        &provider.capabilities(),
-                        &req.messages
-                    )
-                )
-                .await
-                .is_err()
+                error
+                    .chain()
+                    .any(|e| e.downcast_ref::<super::MediaInputRejection>().is_some())
             );
+            assert!(!error.to_string().contains(&STANDARD.encode(&bytes)));
         }
         for mime in ["audio/mpeg", "audio/aac"] {
             if mime == "audio/aac" && name == "openai" {
@@ -1484,11 +1505,9 @@ pub(crate) fn confirmed_wire_inputs(
         let mut bytes = super::media_fixtures::xing_mp3(100, 100);
         bytes[21..25].copy_from_slice(magic);
         cases.push((InputContentType::Audio, "audio/mpeg", bytes));
-        cases.push((
-            InputContentType::Audio,
-            "audio/mpeg",
-            super::media_fixtures::trimmed_xing_mp3(magic),
-        ));
+        for (bytes, _samples, _rate, _millis) in super::media_fixtures::confirmed_mp3_trims(magic) {
+            cases.push((InputContentType::Audio, "audio/mpeg", bytes));
+        }
     }
     if provider != "openai" {
         cases.extend([
@@ -1559,6 +1578,88 @@ async fn gemini_aggregate_counts_ordinary_ancillary_collisions_as_audio() {
                     .is_ok(),
                     allowed
                 );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_aggregate_requires_source_backed_encoder_trim_domain() {
+    use crate::Provider;
+    let provider = crate::providers::GeminiProvider::new("unused");
+    for magic in [b"Info", b"Xing"] {
+        for encoder in [b"LAME3.100", b"Lavf62.11", b"Lavc62.11"] {
+            // Independent exact span: 4_274_703 PCM samples/125Hz=34197.624s;
+            // (100*1152 -576-576)/48000=2.376s; sum34200s. +1frame=+24ms.
+            for (frames, allowed) in [(100, true), (101, false)] {
+                let bytes =
+                    super::media_fixtures::encoder_trim_mp3(magic, encoder, frames, 576, 576);
+                let req = request(
+                    "media",
+                    vec![
+                        part(
+                            InputContentType::Audio,
+                            "audio/wav",
+                            &wav_frames(4_274_703, 125),
+                        ),
+                        part(InputContentType::Audio, "audio/mpeg", &bytes),
+                    ],
+                );
+                let s = Arc::new(state("gemini", "media", json!({})));
+                assert_eq!(
+                    scoped(s.clone(), provider.prepare_input_budget(req.clone()))
+                        .await
+                        .is_ok(),
+                    allowed
+                );
+                assert_eq!(
+                    scoped(
+                        s,
+                        super::prepare_messages_for_provider_async(
+                            "gemini",
+                            "media",
+                            &provider.capabilities(),
+                            &req.messages
+                        )
+                    )
+                    .await
+                    .is_ok(),
+                    allowed
+                );
+            }
+            for padding in [0, 200, 528] {
+                let bytes =
+                    super::media_fixtures::encoder_trim_mp3(magic, encoder, 100, 100, padding);
+                let req = request(
+                    "media",
+                    vec![
+                        part(InputContentType::Audio, "audio/wav", &wav()),
+                        part(InputContentType::Audio, "audio/mpeg", &bytes),
+                    ],
+                );
+                let s = Arc::new(state("gemini", "media", json!({})));
+                assert!(
+                    scoped(s.clone(), provider.prepare_input_budget(req.clone()))
+                        .await
+                        .is_err()
+                );
+                let error = scoped(
+                    s,
+                    super::prepare_messages_for_provider_async(
+                        "gemini",
+                        "media",
+                        &provider.capabilities(),
+                        &req.messages,
+                    ),
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    error
+                        .chain()
+                        .any(|e| e.downcast_ref::<super::MediaInputRejection>().is_some())
+                );
+                assert!(!error.to_string().contains(&STANDARD.encode(&bytes)));
             }
         }
     }

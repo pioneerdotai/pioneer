@@ -103,6 +103,7 @@ pub(super) fn mp3_samples(bytes: &[u8]) -> Result<(u64, u32)> {
             (false, true) => 9,
             _ => 17,
         };
+        let frame_samples = if v == 3 { 1152u64 } else { 576 };
         let tag_at = 4 + side;
         // Pinned MpaReader candidate contract (demuxer.rs:940–967,1021–1045):
         // signature alone can be ordinary ancillary data. Prefix/extent decide
@@ -163,15 +164,45 @@ pub(super) fn mp3_samples(bytes: &[u8]) -> Result<(u64, u32)> {
                 let packed = (u32::from(extension[21]) << 16)
                     | (u32::from(extension[22]) << 8)
                     | u32::from(extension[23]);
-                trim = u64::from(packed >> 12)
-                    .checked_add(u64::from(packed & 4095))
+                let delay = u64::from(packed >> 12);
+                let padding = u64::from(packed & 4095);
+                // Symphonia 0.6.1 demuxer.rs:848–855 explicitly applies
+                // leading=529+delay, trailing=max(padding-529,0) to these
+                // three labels. CRC proves bytes, not this semantic domain.
+                // Reject the non-cancelling domain instead of treating the
+                // raw sum as measured presentation samples.
+                const DECODER_DELAY: u64 = 529;
+                let trailing = padding
+                    .checked_sub(DECODER_DELAY)
+                    .context("MP3 encoder padding domain is not proven")?;
+                if &extension[..4] == b"LAME" {
+                    // Only the default completed LAME3.100 profile is proved:
+                    // encoder.h ENCDELAY=576; initialization sets that delay;
+                    // lame_encode_flush yields padding in
+                    // [576, 576+samples_per_frame-1]. Other builds/versions
+                    // need their own evidence, not an encoder label or CRC.
+                    // https://github.com/lameproject/lame/blob/master/libmp3lame/lame.c
+                    // https://github.com/lameproject/lame/blob/master/libmp3lame/encoder.h
+                    ensure!(
+                        &extension[..9] == b"LAME3.100"
+                            && delay == 576
+                            && (576..=frame_samples + 575).contains(&padding),
+                        "MP3 completed LAME trim domain is not proven"
+                    );
+                }
+                // Lavf/Lavc use the explicitly pinned decoder tag contract,
+                // padding>=529, not LAME's encoder-specific minimum576.
+                // No claim that the bytes were produced by a given encoder.
+                trim = delay
+                    .checked_add(DECODER_DELAY)
+                    .and_then(|leading| leading.checked_add(trailing))
                     .context("MP3 trim overflow")?;
             }
             xing = true;
         } else {
             frames = frames.checked_add(1).context("MP3 frame count overflow")?;
         }
-        samples_per_frame = if v == 3 { 1152 } else { 576 };
+        samples_per_frame = frame_samples;
         offset = frame_end;
     }
     ensure!(frames > 0, "MP3 confirmed frames unavailable");
@@ -184,7 +215,7 @@ pub(super) fn mp3_samples(bytes: &[u8]) -> Result<(u64, u32)> {
             "MP3 declared/scanned frame count mismatch"
         );
         // No library estimated count or PacketBuilder::trimmed_dur is used.
-        // Header priming/padding is applied only after full scan/count/CRC proof.
+        // Declared trims apply only after full scan/count/CRC AND domain proof.
         samples = samples
             .checked_sub(trim)
             .context("MP3 trim exceeds confirmed samples")?;
@@ -299,10 +330,10 @@ mod ancillary_classification_regressions {
             let mut valid = xing_mp3(100, 100);
             valid[21..25].copy_from_slice(magic);
             assert_eq!(mp3_samples(&valid).unwrap(), (115200, 48000));
-            // 100*1152 -100 delay -200 padding, independent of scanner.
+            // Source-backed completed LAME: 100*1152 -576 -576, independently.
             let trimmed = trimmed_xing_mp3(magic);
-            assert_eq!(mp3_samples(&trimmed).unwrap(), (114900, 48000));
-            assert_eq!(duration_millis(&trimmed, "audio/mpeg").unwrap(), 2394);
+            assert_eq!(mp3_samples(&trimmed).unwrap(), (114048, 48000));
+            assert_eq!(duration_millis(&trimmed, "audio/mpeg").unwrap(), 2376);
         }
         for bytes in rejected_mp3_tag_candidates() {
             assert!(mp3_samples(&bytes).is_err());
@@ -312,5 +343,73 @@ mod ancillary_classification_regressions {
         let mut crc = crate::attachments::regression::mp3().to_vec();
         crc[0xb9 + 5] ^= 1;
         assert!(mp3_samples(&crc).is_err());
+    }
+}
+
+#[cfg(test)]
+mod encoder_trim_domain_regressions {
+    use super::*;
+    use crate::attachments::{
+        input_estimate::{duration_millis, native_duration},
+        media_fixtures::{
+            confirmed_mp3_trims, encoder_trim_mp3, encoder_trim_mp3_mpeg2, unproven_mp3_trims,
+        },
+    };
+    #[test]
+    fn supported_domains_have_independent_samples_and_exact_hard_bounds() {
+        for magic in [b"Info", b"Xing"] {
+            for (bytes, samples, rate, millis) in confirmed_mp3_trims(magic) {
+                assert_eq!(mp3_samples(&bytes).unwrap(), (samples, rate));
+                let duration = native_duration(&bytes, "audio/mpeg").unwrap();
+                assert_eq!(duration_millis(&bytes, "audio/mpeg").unwrap(), millis);
+                assert!(duration.within_millis(millis).unwrap());
+                assert!(!duration.within_millis(millis - 1).unwrap());
+            }
+        }
+    }
+    #[test]
+    fn crc_valid_bytes_do_not_prove_low_padding_or_completed_encoder_domain() {
+        for magic in [b"Info", b"Xing"] {
+            for bytes in unproven_mp3_trims(magic) {
+                assert!(mp3_samples(&bytes).is_err());
+            }
+            // The former positive must reach the domain guard after valid CRC,
+            // not fail a checksum/counter check that hides this regression.
+            let former_positive = encoder_trim_mp3(magic, b"LAME3.100", 100, 100, 200);
+            assert!(
+                mp3_samples(&former_positive)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("padding domain")
+            );
+            for encoder in [b"LAME3.100", b"Lavf62.11", b"Lavc62.11"] {
+                for padding in [0, 200, 528] {
+                    let bytes = encoder_trim_mp3(magic, encoder, 100, 576, padding);
+                    assert!(
+                        mp3_samples(&bytes)
+                            .unwrap_err()
+                            .to_string()
+                            .contains("padding domain")
+                    );
+                }
+            }
+            for padding in [529, 575, 1728] {
+                let bytes = encoder_trim_mp3(magic, b"LAME3.100", 100, 576, padding);
+                assert!(
+                    mp3_samples(&bytes)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("completed LAME trim domain")
+                );
+            }
+            assert!(mp3_samples(&encoder_trim_mp3_mpeg2(magic, b"LAME3.100", 576, 1152)).is_err());
+            let underflow = encoder_trim_mp3(magic, b"LAME3.100", 1, 576, 1152);
+            assert!(
+                mp3_samples(&underflow)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("trim exceeds confirmed samples")
+            );
+        }
     }
 }

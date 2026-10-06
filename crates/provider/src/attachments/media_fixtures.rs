@@ -400,21 +400,146 @@ pub(crate) fn rejected_mp3_tag_candidates() -> Vec<Vec<u8>> {
     ]
 }
 
-/// Known LAME extension with independent declared sample trim. CRC construction
-/// happens only in future authorized tests, never while preparing these edits.
+/// Source-backed completed default LAME3.100 domain: delay576/padding576.
+/// Metadata construction alone is not proof of an actual encoder invocation.
 pub(crate) fn trimmed_xing_mp3(magic: &[u8; 4]) -> Vec<u8> {
-    use symphonia::core::io::Monitor;
+    encoder_trim_mp3(magic, b"LAME3.100", 100, 576, 576)
+}
+
+/// CRC-valid declared trim, including deliberately unsupported domains.
+/// Executed only by future authorized tests, not during source preparation.
+pub(crate) fn encoder_trim_mp3(
+    magic: &[u8; 4],
+    encoder: &[u8; 9],
+    frames: usize,
+    delay: u16,
+    padding: u16,
+) -> Vec<u8> {
     assert!(matches!(magic, b"Xing" | b"Info"));
-    let mut bytes = xing_mp3(100, 100);
+    let mut bytes = xing_mp3(frames, u32::try_from(frames).unwrap());
     bytes[21..25].copy_from_slice(magic);
-    const EXTENSION: usize = 33; // flags=1, frame counter only
-    bytes[EXTENSION..EXTENSION + 9].copy_from_slice(b"LAME3.100");
-    // 100 delay +200 padding samples; this is explicit, not guessed priming.
-    let trim = (100u32 << 12) | 200;
-    bytes[EXTENSION + 21..EXTENSION + 24].copy_from_slice(&trim.to_be_bytes()[1..]);
+    write_encoder_trim(bytes, 33, encoder, delay, padding) // flags=1, counter only
+}
+
+fn write_encoder_trim(
+    mut bytes: Vec<u8>,
+    extension: usize,
+    encoder: &[u8; 9],
+    delay: u16,
+    padding: u16,
+) -> Vec<u8> {
+    use symphonia::core::io::Monitor;
+    assert!(delay <= 4095 && padding <= 4095);
+    bytes[extension..extension + 9].copy_from_slice(encoder);
+    let trim = (u32::from(delay) << 12) | u32::from(padding);
+    bytes[extension + 21..extension + 24].copy_from_slice(&trim.to_be_bytes()[1..]);
     let mut crc = symphonia::core::checksum::Crc16AnsiLe::new(0);
-    crc.process_buf_bytes(&bytes[..EXTENSION + 34]);
-    assert_ne!(crc.crc(), 0); // supported contract requires nonzero matching CRC
-    bytes[EXTENSION + 34..EXTENSION + 36].copy_from_slice(&crc.crc().to_be_bytes());
+    crc.process_buf_bytes(&bytes[..extension + 34]);
+    if crc.crc() == 0 {
+        // Descriptive lowpass byte does not alter frames or declared trim.
+        // Select a nonzero tag CRC; do not accidentally test the CRC guard
+        // instead of the semantic domain. This builder remains unexecuted.
+        bytes[extension + 10] = 1;
+        crc = symphonia::core::checksum::Crc16AnsiLe::new(0);
+        crc.process_buf_bytes(&bytes[..extension + 34]);
+    }
+    assert_ne!(crc.crc(), 0);
+    bytes[extension + 34..extension + 36].copy_from_slice(&crc.crc().to_be_bytes());
     bytes
+}
+
+pub(crate) fn encoder_trim_mp3_mpeg2(
+    magic: &[u8; 4],
+    encoder: &[u8; 9],
+    delay: u16,
+    padding: u16,
+) -> Vec<u8> {
+    assert!(matches!(magic, b"Xing" | b"Info"));
+    // MPEG2/24kHz/mono160kbps =>480bytes, zero reservoir/coded data;
+    // mono side-info9bytes, Xing13, full counter then extension25.
+    let mut frame = vec![0; 480];
+    frame[..4].copy_from_slice(&[0xff, 0xf3, 0xe4, 0xc0]);
+    let mut bytes = frame.clone();
+    bytes[13..17].copy_from_slice(magic);
+    bytes[17..21].copy_from_slice(&1u32.to_be_bytes());
+    bytes[21..25].copy_from_slice(&100u32.to_be_bytes());
+    for _ in 0..100 {
+        bytes.extend_from_slice(&frame);
+    }
+    write_encoder_trim(bytes, 25, encoder, delay, padding)
+}
+
+pub(crate) fn unproven_mp3_trims(magic: &[u8; 4]) -> Vec<Vec<u8>> {
+    let mut cases = Vec::new();
+    for encoder in [b"LAME3.100", b"Lavf62.11", b"Lavc62.11"] {
+        for padding in [0, 200, 528] {
+            cases.push(encoder_trim_mp3(magic, encoder, 100, 576, padding));
+        }
+    }
+    // Former positive100/200 is now explicitly outside the completed domain.
+    cases.push(encoder_trim_mp3(magic, b"LAME3.100", 100, 100, 200));
+    for padding in [529, 575, 1728] {
+        cases.push(encoder_trim_mp3(magic, b"LAME3.100", 100, 576, padding));
+    }
+    cases.push(encoder_trim_mp3(magic, b"LAME3.100", 100, 100, 576));
+    cases.push(encoder_trim_mp3(magic, b"LAME3.099", 100, 576, 576));
+    // Valid domain but more trim than raw1152samples -> checked subtraction.
+    cases.push(encoder_trim_mp3(magic, b"LAME3.100", 1, 576, 1152));
+    cases.push(encoder_trim_mp3(magic, b"LAME3.100", 1, 576, 576)); // zero span
+    for encoder in [b"Lavf62.11", b"Lavc62.11"] {
+        cases.push(encoder_trim_mp3(magic, encoder, 1, 4095, 4095));
+        cases.push(encoder_trim_mp3(magic, encoder, 1, 623, 529)); // zero span
+    }
+    cases
+}
+
+/// Independent literals from the source-backed raw sample clock and trim
+/// domain; CRC construction is not used as the expected-duration oracle.
+pub(crate) fn confirmed_mp3_trims(magic: &[u8; 4]) -> Vec<(Vec<u8>, u64, u32, u64)> {
+    let mut cases = vec![
+        (trimmed_xing_mp3(magic), 114048, 48000, 2376), // 115200-576-576
+        (
+            encoder_trim_mp3(magic, b"LAME3.100", 100, 576, 1727),
+            112897,
+            48000,
+            2353,
+        ),
+    ];
+    for encoder in [b"Lavf62.11", b"Lavc62.11"] {
+        for (delay, padding, samples, millis) in [
+            (576, 529, 114095, 2377), // exact cancellation boundary
+            (576, 530, 114094, 2377),
+            (576, 576, 114048, 2376),
+            (0, 529, 114671, 2389), // decoder contract permits declared delay0
+            (4095, 4095, 107010, 2230), // packed field maximum, no underflow
+        ] {
+            cases.push((
+                encoder_trim_mp3(magic, encoder, 100, delay, padding),
+                samples,
+                48000,
+                millis,
+            ));
+        }
+    }
+    cases.push((
+        encoder_trim_mp3_mpeg2(magic, b"LAME3.100", 576, 576),
+        56448,
+        24000,
+        2352,
+    ));
+    cases.push((
+        encoder_trim_mp3_mpeg2(magic, b"LAME3.100", 576, 1151),
+        55873,
+        24000,
+        2329,
+    ));
+    for encoder in [b"Lavf62.11", b"Lavc62.11"] {
+        cases.push((
+            encoder_trim_mp3_mpeg2(magic, encoder, 576, 529),
+            56495,
+            24000,
+            2354,
+        ));
+    }
+    cases
 }
