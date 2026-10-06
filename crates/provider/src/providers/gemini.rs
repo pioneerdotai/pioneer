@@ -972,6 +972,7 @@ impl crate::traits::Provider for GeminiProvider {
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let api_request = Self::build_request_from_prepared(&request, &prepared)?;
 
+        crate::attachments::validate_inline_payload("gemini", &api_request)?;
         let request_builder = self
             .client
             .post(self.generate_content_url(&model))
@@ -1041,6 +1042,7 @@ impl crate::traits::Provider for GeminiProvider {
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let api_request = Self::build_request_from_prepared(&request, &prepared)?;
 
+        crate::attachments::validate_inline_payload("gemini", &api_request)?;
         let request_builder = self
             .client
             .post(self.stream_generate_content_url(&model))
@@ -1786,6 +1788,289 @@ mod tests {
         };
         let api_req = GeminiProvider::build_request(&request);
         assert_eq!(api_req.contents[1].role, "model");
+    }
+}
+
+#[cfg(test)]
+mod media_contract_tests {
+    use super::*;
+    use crate::{
+        AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart, Provider,
+    };
+    #[test]
+    fn every_declared_kind_uses_native_inline_bytes_and_mime_not_chat_content_parts() {
+        let provider = GeminiProvider::new("unused");
+        for (mime, kind) in [
+            ("image/png", 0),
+            ("application/pdf", 1),
+            ("audio/wav", 2),
+            ("video/mp4", 3),
+        ] {
+            let bytes = match kind {
+                0 => crate::attachments::regression::image(image::ImageFormat::Png, 1, 1),
+                1 => crate::attachments::regression::pdf(1),
+                2 => crate::attachments::regression::wav(),
+                _ => crate::attachments::regression::video().to_vec(),
+            };
+            let attachment = MessageAttachment {
+                mime_type: mime.into(),
+                name: None,
+                size_bytes: None,
+                sha256: None,
+                source: AttachmentDataSource::Bytes {
+                    base64_data: BASE64.encode(&bytes),
+                },
+                artifact: None,
+            };
+            let part = match kind {
+                0 => MessageContentPart::image(attachment),
+                1 => MessageContentPart::file(attachment),
+                2 => MessageContentPart::audio(attachment),
+                _ => MessageContentPart::video(attachment),
+            };
+            let prepared = crate::attachments::prepare_messages_for_provider(
+                "gemini",
+                &provider.capabilities(),
+                &[ChatMessage::user_parts(vec![part])],
+            )
+            .unwrap();
+            let native = GeminiProvider::attachment_part(&prepared.attachments[0]).unwrap();
+            assert!(native.file_data.is_none());
+            let inline = native.inline_data.unwrap();
+            assert_eq!(inline.mime_type, mime);
+            assert_eq!(inline.data, BASE64.encode(&bytes));
+            // Canonical ApiPart JSON field names are the g02 dependency. This
+            // fixture asserts representation without blessing snake_case wire.
+        }
+    }
+}
+
+#[cfg(test)]
+mod async_media_admission_regressions {
+    use super::*;
+    use crate::Provider;
+    use crate::attachments::regression as fixture;
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn four_typed_inputs_are_budgeted_pinned_and_rendered_on_generate_content() {
+        let provider = GeminiProvider::new("unused");
+        let state = Arc::new(fixture::state("gemini", "media", serde_json::json!({})));
+        let req = fixture::request(
+            "media",
+            vec![
+                fixture::part(
+                    InputContentType::Image,
+                    "image/png",
+                    &fixture::image(image::ImageFormat::Png, 1, 1),
+                ),
+                fixture::part(InputContentType::File, "application/pdf", &fixture::pdf(1)),
+                fixture::part(InputContentType::Audio, "audio/wav", &fixture::wav()),
+                fixture::part(InputContentType::Video, "video/mp4", &fixture::video()),
+            ],
+        );
+        let budget = fixture::scoped(state.clone(), provider.prepare_input_budget(req))
+            .await
+            .unwrap();
+        assert_eq!(budget.media.len(), 4);
+        let prepared = fixture::scoped(
+            state,
+            crate::attachments::prepare_messages_for_provider_async(
+                "gemini",
+                "media",
+                &provider.capabilities(),
+                &budget.request.messages,
+            ),
+        )
+        .await
+        .unwrap();
+        let body = GeminiProvider::build_request_from_prepared(&budget.request, &prepared).unwrap();
+        let parts = &body.contents[0].parts;
+        for (index, mime) in ["image/png", "application/pdf", "audio/wav", "video/mp4"]
+            .into_iter()
+            .enumerate()
+        {
+            let native = parts[index + 1].inline_data.as_ref().unwrap();
+            assert_eq!(native.mime_type, mime);
+            let crate::AttachmentDataSource::Bytes { base64_data } =
+                &fixture::attachment(&budget.request.messages[0].content_parts[index]).source
+            else {
+                panic!("must pin")
+            };
+            assert_eq!(&native.data, base64_data);
+        }
+        // Canonical ApiPart JSON field casing remains the explicit G02
+        // dependency; this fixture verifies typed representation, not acceptance.
+    }
+}
+
+#[cfg(test)]
+mod webm_wire_regressions {
+    use super::*;
+    use crate::{
+        Provider,
+        attachments::{media_fixtures::webm, regression as fixture},
+    };
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn identified_webm_video_budget_and_generate_content_keep_mime_and_bytes() {
+        let provider = GeminiProvider::new("unused");
+        for audio in [false, true] {
+            let bytes = webm(audio, true, "webm");
+            let state = Arc::new(fixture::state("gemini", "media", serde_json::json!({})));
+            let budget = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(fixture::request(
+                    "media",
+                    vec![fixture::part(InputContentType::Video, "video/webm", &bytes)],
+                )),
+            )
+            .await
+            .unwrap();
+            let prepared = fixture::scoped(
+                state,
+                crate::attachments::prepare_messages_for_provider_async(
+                    "gemini",
+                    "media",
+                    &provider.capabilities(),
+                    &budget.request.messages,
+                ),
+            )
+            .await
+            .unwrap();
+            let wire =
+                GeminiProvider::build_request_from_prepared(&budget.request, &prepared).unwrap();
+            let native = wire.contents[0]
+                .parts
+                .iter()
+                .find_map(|p| p.inline_data.as_ref())
+                .unwrap();
+            assert_eq!(native.mime_type, "video/webm");
+            assert_eq!(native.data, BASE64.encode(&bytes));
+        }
+    }
+}
+
+#[cfg(test)]
+mod container_timeline_wire_regressions {
+    use super::*;
+    use crate::{
+        Provider,
+        attachments::{
+            media_fixtures::{TimingFixture, webm_timeline},
+            regression as fixture,
+        },
+    };
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn eleven_second_container_budget_both_modes_and_replay_keep_native_bytes() {
+        let provider = GeminiProvider::new("unused");
+        let bytes = webm_timeline(
+            true,
+            true,
+            "webm",
+            TimingFixture {
+                video_start: 10000,
+                declared_duration: Some(11000.0),
+                ..Default::default()
+            },
+        );
+        let state = Arc::new(fixture::state(
+            "gemini",
+            "media",
+            serde_json::json!({"video":{"maxDurationMillis":11000}}),
+        ));
+        let budget = fixture::scoped(
+            state.clone(),
+            provider.prepare_input_budget(fixture::request(
+                "media",
+                vec![fixture::part(InputContentType::Video, "video/webm", &bytes)],
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(budget.media[0].input_tokens, 3850);
+        for _stream in [false, true] {
+            // both GenerateContent modes share this typed builder
+            let replay = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(budget.request.clone()),
+            )
+            .await
+            .unwrap();
+            let prepared = fixture::scoped(
+                state.clone(),
+                crate::attachments::prepare_messages_for_provider_async(
+                    "gemini",
+                    "media",
+                    &provider.capabilities(),
+                    &replay.request.messages,
+                ),
+            )
+            .await
+            .unwrap();
+            let wire =
+                GeminiProvider::build_request_from_prepared(&replay.request, &prepared).unwrap();
+            let native = wire.contents[0]
+                .parts
+                .iter()
+                .find_map(|p| p.inline_data.as_ref())
+                .unwrap();
+            assert_eq!(native.mime_type, "video/webm");
+            assert_eq!(native.data, BASE64.encode(&bytes));
+        }
+    }
+}
+
+#[cfg(test)]
+mod confirmed_duration_wire_regressions {
+    use super::*;
+    use crate::{Provider, attachments::regression as fixture};
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn confirmed_elementary_audio_and_no_edit_mp4_keep_native_bytes_in_both_modes() {
+        let provider = GeminiProvider::new("unused");
+        for (kind, mime, bytes) in fixture::confirmed_wire_inputs("gemini") {
+            let state = Arc::new(fixture::state("gemini", "media", serde_json::json!({})));
+            let budget = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(fixture::request(
+                    "media",
+                    vec![fixture::part(kind, mime, &bytes)],
+                )),
+            )
+            .await
+            .unwrap();
+            for _stream in [false, true] {
+                let replay = fixture::scoped(
+                    state.clone(),
+                    provider.prepare_input_budget(budget.request.clone()),
+                )
+                .await
+                .unwrap();
+                let prepared = fixture::scoped(
+                    state.clone(),
+                    crate::attachments::prepare_messages_for_provider_async(
+                        "gemini",
+                        "media",
+                        &provider.capabilities(),
+                        &replay.request.messages,
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(prepared.attachments[0].kind, kind);
+                assert_eq!(prepared.attachments[0].mime_type, mime);
+                let wire = GeminiProvider::build_request_from_prepared(&replay.request, &prepared)
+                    .unwrap();
+                let native = wire.contents[0]
+                    .parts
+                    .iter()
+                    .find_map(|p| p.inline_data.as_ref())
+                    .unwrap();
+                assert_eq!(native.mime_type, mime);
+                assert_eq!(native.data, BASE64.encode(&bytes));
+            }
+        }
     }
 }
 

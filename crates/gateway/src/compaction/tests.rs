@@ -8780,7 +8780,9 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
 async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_generation() {
     use pioneer_agent::compaction::controller::NativeContext;
     use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef, ProviderRegistry};
-    let old = "old fact ".repeat(4000);
+    // Exceed the vision model's context so this still exercises compaction,
+    // while its PDF attachment uses a supported native input contract.
+    let old = "old fact ".repeat(64_000);
     let f = fixture(&old, vec![], true, false).await;
     let source = f
         .store
@@ -8835,22 +8837,22 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
         .content_parts
         .push(pioneer_provider::MessageContentPart::file(
             pioneer_provider::MessageAttachment {
-                mime_type: "text/plain".into(),
-                name: Some("retained.txt".into()),
+                mime_type: "application/pdf".into(),
+                name: Some("retained.pdf".into()),
                 size_bytes: None,
                 sha256: None,
                 artifact: None,
                 source: pioneer_provider::AttachmentDataSource::Bytes {
                     base64_data: base64::engine::general_purpose::STANDARD
-                        .encode("retained media evidence ".repeat(100)),
+                        .encode(crate::media_test_fixtures::pdf()),
                 },
             },
         ));
     let request = ChatRequest {
-        model: "gpt-4".into(),
+        model: "gpt-4o".into(),
         messages: vec![history, current],
         temperature: None,
-        max_tokens: None,
+        max_tokens: Some(2048),
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
@@ -12659,20 +12661,28 @@ async fn native_media_preparation_materializes_full_request_without_main_provide
     };
     let mut message = ChatMessage::user("Inspect these inputs");
     let image = MessageAttachment {
-        mime_type: "image/png".into(), name: Some("pixel.png".into()), size_bytes: None, sha256: None, artifact: None,
-        source: AttachmentDataSource::Bytes { base64_data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jU1cAAAAASUVORK5CYII=".into() } };
+        mime_type: "image/png".into(),
+        name: Some("pixel.png".into()),
+        size_bytes: None,
+        sha256: None,
+        artifact: None,
+        source: AttachmentDataSource::Bytes {
+            base64_data: base64::engine::general_purpose::STANDARD
+                .encode(crate::media_test_fixtures::image(image::ImageFormat::Png)),
+        },
+    };
     message.content_parts.push(MessageContentPart::image(image));
     message
         .content_parts
         .push(MessageContentPart::file(MessageAttachment {
-            mime_type: "text/plain".into(),
-            name: Some("evidence.txt".into()),
+            mime_type: "application/pdf".into(),
+            name: Some("evidence.pdf".into()),
             size_bytes: None,
             sha256: None,
             artifact: None,
             source: AttachmentDataSource::Bytes {
                 base64_data: base64::engine::general_purpose::STANDARD
-                    .encode("Доказательство 🦀".repeat(100)),
+                    .encode(crate::media_test_fixtures::pdf()),
             },
         }));
     let request = ChatRequest {
