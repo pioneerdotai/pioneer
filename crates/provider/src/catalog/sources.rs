@@ -17,8 +17,13 @@ fn constrained_compat() -> Value {
     json!({"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false,"maxTokensField":"max_tokens","supportsStrictMode":false,"supportsLongCacheRetention":false})
 }
 
-pub(super) fn models_dev(data: &Value, nvidia: &Value, strict: bool) -> Result<Vec<Candidate>> {
+pub(super) fn models_dev(
+    data: &Value,
+    nvidia: &Value,
+    strict: bool,
+) -> Result<(Vec<Candidate>, BTreeSet<&'static str>)> {
     let mut result = Vec::new();
+    let mut specialized = BTreeSet::new();
     let specs = [
         (
             "amazon-bedrock",
@@ -133,6 +138,7 @@ pub(super) fn models_dev(data: &Value, nvidia: &Value, strict: bool) -> Result<V
         ),
     ];
     for (source, provider, api, url) in specs {
+        specialized.insert(provider);
         for (id, m) in entries(data, source) {
             if m["tool_call"] != true {
                 continue;
@@ -186,6 +192,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
             result.push(candidate);
         }
     }
+    specialized.insert("cloudflare-ai-gateway");
     let mut cloudflare_ids = BTreeSet::new();
     for (prefixed, m) in entries(data, "cloudflare-ai-gateway") {
         if m["tool_call"] != true {
@@ -230,6 +237,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         c.compat(json!({"sendSessionAffinityHeaders":true}));
         result.push(c);
     }
+    specialized.insert("nvidia");
     let mut live = BTreeMap::new();
     for m in nvidia["data"].as_array().into_iter().flatten() {
         let id = text(&m["id"]);
@@ -276,6 +284,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
             "https://open.bigmodel.cn/api/coding/paas/v4",
         ),
     ] {
+        specialized.insert(provider);
         for (id, m) in entries(data, source) {
             if m["tool_call"] != true {
                 continue;
@@ -296,6 +305,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
             result.push(c);
         }
     }
+    specialized.insert("together");
     let together_source = ["together", "togetherai", "together-ai"]
         .into_iter()
         .find(|p| !data[*p].is_null())
@@ -315,6 +325,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         together(&mut c);
         result.push(c);
     }
+    specialized.insert("baseten");
     for (id, m) in entries(data, "baseten") {
         if m["status"] == "deprecated" {
             continue;
@@ -342,6 +353,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         }
         if glm {
             c.model["input"] = json!(["text"]);
+            c.model["inputOrigin"] = json!({"kind":"override","expression":"existing Pi Baseten GLM compatibility projection; raw modalities retained in sourceMetadata"});
             c.thinking(json!({"off":"none","minimal":null,"low":null,"medium":null,"high":"high","xhigh":null,"max":"max"}));
         } else if toggle {
             c.thinking(json!({"off":"off","minimal":null,"low":null,"medium":null,"high":"high","xhigh":null,"max":null}));
@@ -350,6 +362,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         }
         result.push(c);
     }
+    specialized.insert("fireworks");
     for (id, m) in entries(data, "fireworks-ai") {
         if m["tool_call"] != true {
             continue;
@@ -388,6 +401,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         } else {
             "https://opencode.ai/zen/go"
         };
+        specialized.insert(provider);
         for (id, m) in entries(data, provider) {
             if m["tool_call"] != true || m["status"] == "deprecated" {
                 continue;
@@ -445,6 +459,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
             result.push(c);
         }
     }
+    specialized.insert("github-copilot");
     for (id, m) in entries(data, "github-copilot") {
         if m["tool_call"] != true || m["status"] == "deprecated" {
             continue;
@@ -495,6 +510,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         }
         result.push(c);
     }
+    specialized.insert("kimi-coding");
     for (id, m) in entries(data, "kimi-for-coding") {
         if m["tool_call"] != true {
             continue;
@@ -547,6 +563,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         ("moonshotai", "https://api.moonshot.ai/v1"),
         ("moonshotai-cn", "https://api.moonshot.cn/v1"),
     ] {
+        specialized.insert(provider);
         for (id, m) in entries(data, provider) {
             if m["tool_call"] != true {
                 continue;
@@ -589,6 +606,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         ),
     ] {
         let mut emitted = BTreeSet::new();
+        specialized.insert(provider);
         for (id, m) in entries(data, source) {
             if m["tool_call"] != true
                 || QWEN_TOKEN_PLAN_EXCLUDED_MODEL_IDS.contains(&id.as_str())
@@ -624,7 +642,97 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
             );
         }
     }
-    Ok(result)
+    Ok((result, specialized))
+}
+
+/// Supplemental registered brands have lower precedence than specialized
+/// routes and existing explicit corrections, even when a route emits zero rows.
+pub(super) fn registered_supplements(
+    data: &Value,
+    specialized: &BTreeSet<&str>,
+    existing: &[Candidate],
+) -> Vec<Candidate> {
+    let mut result: Vec<Candidate> = Vec::new();
+    // Extend the existing dynamic source path to registered compatible brands.
+    // Specialized transforms above retain precedence. Missing named data does
+    // not inherit the modalities of a similarly named upstream model.
+    for definition in crate::definition::provider_definitions() {
+        let provider = definition.name;
+        if matches!(
+            provider,
+            "openai"
+                | "anthropic"
+                | "gemini"
+                | "bedrock"
+                | "copilot"
+                | "azure-openai"
+                | "ollama"
+                // The native /models route below owns this gateway's identities
+                // and filters. models.dev must not refill rejected native rows.
+                | "openrouter"
+                | "local"
+                | "telnyx"
+                | "glm"
+                | "custom"
+        ) {
+            continue;
+        }
+        // Never refill entries intentionally filtered by specialized routing
+        // (notably NVIDIA's live model list and provider-specific exclusions).
+        if specialized.contains(crate::catalog::catalog_provider(provider).as_str())
+            || specialized.iter().any(|route| {
+                crate::definition::provider_definition(route)
+                    .map_or(*route == provider, |d| d.name == provider)
+            })
+        {
+            continue;
+        }
+        let Some(url) = definition.default_base_url else {
+            continue;
+        };
+        // Reuse canonical aliases and source-declared endpoint identity rather
+        // than a second provider-name table. Ambiguous identities stay unknown.
+        let source = if data[provider]["models"].is_object() {
+            provider
+        } else {
+            let matches = data
+                .as_object()
+                .into_iter()
+                .flat_map(|providers| providers.iter())
+                .filter(|(name, value)| {
+                    value["models"].is_object()
+                        && (crate::definition::provider_definition(name)
+                            .is_some_and(|d| d.name == provider)
+                            || value["api"].as_str() == Some(url))
+                })
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>();
+            let [source] = matches.as_slice() else {
+                continue;
+            };
+            *source
+        };
+        for (id, m) in entries(data, source) {
+            if m["tool_call"] != true
+                || m["status"] == "deprecated"
+                || result
+                    .iter()
+                    .chain(existing.iter())
+                    .any(|c| c.provider() == provider && c.id() == id)
+            {
+                continue;
+            }
+            result.push(base(
+                provider,
+                id,
+                "openai-completions",
+                url,
+                m,
+                (4096, 4096),
+            ));
+        }
+    }
+    result
 }
 
 // Shared source-unit conversion, not a tariff table. Invalid known values
@@ -672,11 +780,16 @@ pub(super) fn openrouter(data: &Value) -> Vec<Candidate> {
             // This source's candidates were filtered by supported_parameters.
             c.tool_calling = Some(has(&m["supported_parameters"], "tools"));
             c.model["reasoning"] = json!(has(&m["supported_parameters"], "reasoning"));
-            c.model["input"] = if text(&m["architecture"]["modality"]).contains("image") {
-                json!(["text", "image"])
-            } else {
-                json!(["text"])
-            };
+            // Explicit arrays preserve audio/video/file. Legacy modality strings
+            // describe the same contract; absent metadata stays unknown.
+            let input = m["architecture"]["input_modalities"].as_array().cloned()
+                .or_else(|| m["architecture"]["modality"].as_str()
+                    .and_then(|v| v.split_once("->"))
+                    .map(|(input, _)| input.split('+').map(|v| json!(v)).collect()));
+            c.model["input"] = json!(input.clone().unwrap_or_default());
+            c.model["inputOrigin"] = json!({"kind":if input.is_some(){"source"}else{"fallback"},"expression":"openrouter.architecture.input_modalities or modality"});
+            c.model["sourceMetadata"] = json!({"architecture":m["architecture"]});
+            c.model["output"] = m["architecture"]["output_modalities"].clone();
             let context = if number(&m["top_provider"]["context_length"]) != 0. {
                 &m["top_provider"]["context_length"]
             } else {
@@ -763,11 +876,11 @@ pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
                 json!({"url":SOURCE_URLS[2],"units":"USD_per_token","raw":m["pricing"]});
             c.model["reasoning"] = json!(has(&m["tags"], "reasoning"));
             c.tool_calling = Some(has(&m["tags"], "tool-use"));
-            c.model["input"] = if has(&m["tags"], "vision") {
-                json!(["text", "image"])
-            } else {
-                json!(["text"])
-            };
+            c.model["input"] = m["input_modalities"].as_array().map(|v| json!(v))
+                .unwrap_or_else(|| if has(&m["tags"], "vision") {json!(["text", "image"])} else {json!([])});
+            c.model["inputOrigin"] = json!({"kind":if m["input_modalities"].is_array(){"source"}else if has(&m["tags"], "vision"){"partial"}else{"fallback"},"expression":"vercel.input_modalities or positive vision tag"});
+            c.model["sourceMetadata"] = json!({"tags":m["tags"],"input_modalities":m["input_modalities"]});
+            c.model["output"] = m["output_modalities"].clone();
             (c.model["contextWindow"], c.context_origin) =
                 limit(&m["context_window"], 4096, "vercel.context_window");
             (c.model["maxTokens"], c.output_origin) =

@@ -174,6 +174,7 @@ struct AuthorityBoundProvider {
     authority_fingerprint: ProviderAuthorityFingerprint,
     revoked: Arc<AtomicBool>,
     redact_endpoint_errors: bool,
+    input_admission: Arc<crate::attachments::admission::AdmissionState>,
     discovery_tools: RwLock<BTreeMap<String, bool>>,
     use_public_catalog: bool,
 }
@@ -237,6 +238,10 @@ fn redacted_endpoint_error(
 ) -> anyhow::Error {
     if error.is::<RedactedEndpointError>() {
         return error;
+    }
+    if let Some(rejection) = error.downcast_ref::<crate::attachments::MediaInputRejection>() {
+        // Keep only the controlled diagnostic, dropping any raw context chain.
+        return rejection.clone().into();
     }
     // Adapters can supply structured status even when their error does not
     // contain a reqwest source or the usual `API error (...)` prefix.
@@ -325,6 +330,9 @@ impl AuthorityBoundProvider {
         catalog: &crate::catalog::ModelCatalog,
         models: &mut [ProviderModelInfo],
     ) {
+        // Keep raw media evidence before any catalog enrichment, in this same
+        // authority instance. A refresh replaces both capability snapshots.
+        self.input_admission.replace_discovery(models.to_vec());
         // Keep raw discovery capability in this authority's existing instance;
         // enrichment must never export it to another credential/endpoint scope.
         *self.discovery_tools.write().expect("discovery tools lock") = models
@@ -415,9 +423,12 @@ impl Provider for AuthorityBoundProvider {
     ) -> Result<crate::attachments::PreparedInputBudget> {
         self.ensure_not_revoked()?;
         self.public_result(
-            crate::attachments::runtime::with_async_authority_scope(
-                self.authority_fingerprint.as_str().to_owned(),
-                self.inner.prepare_input_budget(request),
+            crate::attachments::admission::scope(
+                self.input_admission.clone(),
+                crate::attachments::runtime::with_async_authority_scope(
+                    self.authority_fingerprint.as_str().to_owned(),
+                    self.inner.prepare_input_budget(request),
+                ),
             )
             .await,
         )
@@ -428,13 +439,16 @@ impl Provider for AuthorityBoundProvider {
         let context = crate::usage::UsageContext::capture(self.inner.as_ref(), &request.model);
         let mut response = self
             .public_result(
-                crate::attachments::runtime::with_async_authority_scope(
-                    self.authority_fingerprint.as_str().to_owned(),
-                    crate::tools::policy::with_discovery_tools(
-                        self.name(),
-                        self.use_public_catalog,
-                        self.discovery_tool_snapshot(),
-                        self.inner.chat(request),
+                crate::attachments::admission::scope(
+                    self.input_admission.clone(),
+                    crate::attachments::runtime::with_async_authority_scope(
+                        self.authority_fingerprint.as_str().to_owned(),
+                        crate::tools::policy::with_discovery_tools(
+                            self.name(),
+                            self.use_public_catalog,
+                            self.discovery_tool_snapshot(),
+                            self.inner.chat(request),
+                        ),
                     ),
                 )
                 .await,
@@ -460,13 +474,16 @@ impl Provider for AuthorityBoundProvider {
         let context = crate::usage::UsageContext::capture(self.inner.as_ref(), &request.model);
         let mut response = self
             .public_result(
-                crate::attachments::runtime::with_async_authority_scope(
-                    self.authority_fingerprint.as_str().to_owned(),
-                    crate::tools::policy::with_discovery_tools(
-                        self.name(),
-                        self.use_public_catalog,
-                        self.discovery_tool_snapshot(),
-                        self.inner.stream_chat_with_diagnostics(request),
+                crate::attachments::admission::scope(
+                    self.input_admission.clone(),
+                    crate::attachments::runtime::with_async_authority_scope(
+                        self.authority_fingerprint.as_str().to_owned(),
+                        crate::tools::policy::with_discovery_tools(
+                            self.name(),
+                            self.use_public_catalog,
+                            self.discovery_tool_snapshot(),
+                            self.inner.stream_chat_with_diagnostics(request),
+                        ),
                     ),
                 )
                 .await,
@@ -917,6 +934,7 @@ impl ProviderRegistry {
             authority_fingerprint,
             revoked: revoked.clone(),
             redact_endpoint_errors: base_url.is_some(),
+            input_admission: Arc::new(Default::default()),
             use_public_catalog,
             discovery_tools: RwLock::new(BTreeMap::new()),
         });
@@ -1043,6 +1061,7 @@ impl ProviderRegistry {
             authority_fingerprint: authority_fingerprint.clone(),
             revoked: revoked.clone(),
             redact_endpoint_errors: false,
+            input_admission: Arc::new(Default::default()),
             use_public_catalog,
             discovery_tools: RwLock::new(BTreeMap::new()),
         });
@@ -1281,6 +1300,7 @@ mod tests {
             authority_fingerprint: ProviderAuthorityFingerprint(authority.into()),
             revoked: Arc::new(AtomicBool::new(false)),
             redact_endpoint_errors: false,
+            input_admission: Arc::new(Default::default()),
             use_public_catalog: false,
             discovery_tools: RwLock::new(BTreeMap::new()),
         };
@@ -3073,13 +3093,40 @@ mod tests {
             let provider = registry
                 .get_or_create_for_workspace("upload-workspace", "openai")
                 .unwrap();
+            // Keep the actual registry-created adapter, endpoint authority and
+            // redaction wrapper. Give only this test authority a known PDF
+            // model so upload errors are reached after real PDF admission.
+            drop(provider);
+            let provider = {
+                let mut cache = registry.cache.write().unwrap();
+                let entry = cache
+                    .entries
+                    .values_mut()
+                    .find(|entry| entry.provider.name() == "openai")
+                    .unwrap();
+                let wrapper = Arc::get_mut(&mut entry.provider).unwrap();
+                wrapper.input_admission = Arc::new(crate::attachments::regression::state(
+                    "openai",
+                    "media",
+                    serde_json::json!({}),
+                ));
+                entry.provider.clone()
+            };
             let mut request = chat_request();
+            request.model = "media".into();
             // The normal planner uploads files at or above its default threshold.
-            let bytes = vec![b'x'; 512 * 1024];
+            let mut pdf =
+                lopdf::Document::load_mem(&crate::attachments::regression::pdf(1)).unwrap();
+            pdf.add_object(lopdf::Stream::new(
+                lopdf::dictionary! {},
+                vec![b'x'; 512 * 1024],
+            ));
+            let mut bytes = Vec::new();
+            pdf.save_to(&mut bytes).unwrap();
             request.messages = vec![crate::ChatMessage::user_parts(vec![
                 crate::MessageContentPart::file(crate::MessageAttachment {
-                    mime_type: "application/octet-stream".into(),
-                    name: Some("payload.bin".into()),
+                    mime_type: "application/pdf".into(),
+                    name: Some("payload.pdf".into()),
                     size_bytes: Some(bytes.len() as u64),
                     sha256: None,
                     source: crate::AttachmentDataSource::Bytes {
@@ -3179,6 +3226,26 @@ mod usage_error_retention_tests {
         );
         assert!(!format!("{redacted:#}").contains("SECRET"));
         assert!(!format!("{redacted:#}").contains("private.example"));
+    }
+}
+
+#[cfg(test)]
+mod media_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn media_rejection_crosses_private_endpoint_redaction_without_raw_context() {
+        let provider = crate::providers::EchoProvider;
+        let error = anyhow::anyhow!("https://private.test/credential/path").context(
+            crate::attachments::MediaInputRejection(
+                "unknown input capabilities; refresh the catalog",
+            ),
+        );
+        let safe = redacted_endpoint_error(&provider, error, ProviderFailureStage::Connect);
+        assert_eq!(
+            safe.to_string(),
+            "unknown input capabilities; refresh the catalog"
+        );
+        assert!(!format!("{safe:#}").contains("private.test"));
     }
 }
 

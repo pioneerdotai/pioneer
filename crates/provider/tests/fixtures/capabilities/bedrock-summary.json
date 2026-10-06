@@ -1,0 +1,1 @@
+{"modelSummaries":[{"modelId":"anthropic.claude-sonnet-4-6","modelName":"Claude Sonnet 4.6","providerName":"Anthropic","inputModalities":["TEXT","IMAGE"],"outputModalities":["TEXT"],"responseStreamingSupported":true,"modelLifecycle":{"status":"ACTIVE"}}]}
