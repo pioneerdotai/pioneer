@@ -823,7 +823,9 @@ fn map_codex_turn_completed(
     let Some(native_turn_id) = string_path(params, &["turn", "id"]) else {
         return raw_notification(notification, options, "turn/completed missing turn.id");
     };
-    let status = string_path(params, &["turn", "status"]).unwrap_or_else(|| "completed".to_owned());
+    let Some(status) = string_path(params, &["turn", "status"]) else {
+        return raw_notification(notification, options, "turn/completed missing turn.status");
+    };
     if status == "failed" {
         return RuntimeEvent::TurnFailed(RuntimeTurnFailed {
             native_thread_id: string_path(params, &["threadId"]),
@@ -841,6 +843,13 @@ fn map_codex_turn_completed(
             reason: status,
             native: native_notification(notification, options),
         });
+    }
+    if status != "completed" {
+        return raw_notification(
+            notification,
+            options,
+            "turn/completed has an unknown terminal status",
+        );
     }
     RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
         native_thread_id: string_path(params, &["threadId"]),
@@ -2394,5 +2403,40 @@ mod tests {
         assert_eq!(permission.request_kind, "permission_approval");
         assert_eq!(permission.native_item_id.as_deref(), Some("native_mcp_1"));
         assert_eq!(permission.native_request_id_json, Some(json!(11)));
+    }
+}
+
+#[cfg(test)]
+mod terminal_status_tests {
+    use super::*;
+    #[test]
+    fn codex_completed_notification_cannot_default_missing_or_unknown_status_to_success() {
+        for status in [
+            None,
+            Some("inProgress"),
+            Some("future"),
+            Some("completed"),
+            Some("interrupted"),
+            Some("failed"),
+        ] {
+            let mut turn = serde_json::json!({"id":"turn"});
+            if let Some(status) = status {
+                turn["status"] = serde_json::json!(status);
+            }
+            let event = map_codex_notification_event(
+                &CodexJsonlRpcNotificationEvent {
+                    method: "turn/completed".into(),
+                    params: Some(serde_json::json!({"threadId":"thread","turn":turn})),
+                    raw: serde_json::json!({}),
+                },
+                RuntimeEventMappingOptions::default(),
+            );
+            match status {
+                Some("completed") => assert!(matches!(event, RuntimeEvent::TurnCompleted(_))),
+                Some("interrupted") => assert!(matches!(event, RuntimeEvent::TurnInterrupted(_))),
+                Some("failed") => assert!(matches!(event, RuntimeEvent::TurnFailed(_))),
+                _ => assert!(matches!(event, RuntimeEvent::Raw(_))),
+            }
+        }
     }
 }

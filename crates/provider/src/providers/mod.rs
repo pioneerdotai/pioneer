@@ -35,3 +35,6 @@ pub use telnyx::TelnyxProvider;
 
 #[cfg(test)]
 mod usage_tests;
+
+#[cfg(test)]
+mod streaming_tests;
