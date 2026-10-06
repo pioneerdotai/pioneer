@@ -5518,10 +5518,18 @@ impl MessageProcessor {
         ack.id.push_str(":ack");
         ack.native_method = "gateway/terminal_ack".into();
         ack.payload_redacted_json = "{}".into();
-        self.crud_store
-            .with_maintenance_access()
-            .append_cli_runtime_native_event_if_absent(ack)
-            .await?;
+        let store = self.crud_store.with_maintenance_access();
+        if store
+            .get_cli_runtime_native_event(&ack.id)
+            .await?
+            .is_some_and(|existing| existing.native_method == "gateway/terminal_recovery_ack")
+        {
+            // Recovery already transferred this outcome to its durable job in
+            // the authority-changing commit. Preserve that ACK; the repository
+            // still checks every identity/payload field on the idempotent insert.
+            ack.native_method = "gateway/terminal_recovery_ack".into();
+        }
+        store.append_cli_runtime_native_event_if_absent(ack).await?;
         Ok(())
     }
 

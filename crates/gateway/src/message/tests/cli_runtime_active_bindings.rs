@@ -3617,6 +3617,14 @@ async fn cli_accepted_unconfirmed_recovery_outcome_survives_expiration_takeover_
                         .await
                         .unwrap()
                 );
+                let source = store
+                    .cli_runtime_turn_terminal_guard_by_id(BLOCKED_TURN)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .terminal_event_source()
+                    .unwrap();
+                let outcome_id = source.terminal_delivery_id();
                 assert!(session.interrupts.lock().await.is_empty());
                 let original_owner = store
                     .get_turn_execution(BLOCKED_TURN)
@@ -3703,8 +3711,25 @@ async fn cli_accepted_unconfirmed_recovery_outcome_survives_expiration_takeover_
                         &mut CliRuntimeStaleTurnScan::default(),
                     )
                     .await;
-                assert_eq!((delivered.selected, delivered.processed), (1, 1));
+                assert_eq!(
+                    (delivered.selected, delivered.processed),
+                    (1, 1),
+                    "runtime={kind}, completed={completed}, exhaust={exhaust}"
+                );
                 let delivered_job = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+                let ack = store
+                    .get_cli_runtime_native_event(&format!("{outcome_id}:ack"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    ack.native_method,
+                    if completed {
+                        "gateway/terminal_ack"
+                    } else {
+                        "gateway/terminal_recovery_ack"
+                    }
+                );
                 if completed {
                     assert_eq!(
                         delivered_job.status,
@@ -4101,6 +4126,15 @@ async fn cli_accepted_recovery_failure_ack_and_authority_change_roll_back_togeth
         _ = &mut producer => panic!("failure must be accepted before delivery"),
     }
     drop(producer);
+    let source = store
+        .cli_runtime_turn_terminal_guard_by_id(BLOCKED_TURN)
+        .await
+        .unwrap()
+        .unwrap()
+        .terminal_event_source()
+        .unwrap();
+    let record =
+        crate::message::cli_runtime::cli_runtime_terminal_event_record(&source, String::new());
     store.database_connection().execute_unprepared(
         "CREATE TRIGGER reject_recovery_ack BEFORE INSERT ON cli_runtime_native_event WHEN NEW.native_method = 'gateway/terminal_recovery_ack' BEGIN SELECT RAISE(ABORT, 'injected ACK failure'); END"
     ).await.unwrap();
@@ -4146,6 +4180,30 @@ async fn cli_accepted_recovery_failure_ack_and_authority_change_roll_back_togeth
             .has_pending_cli_runtime_terminal_event(BLOCKED_TURN)
             .await
             .unwrap()
+    );
+    let ack_id = format!("{}:ack", record.id);
+    let ack = store
+        .get_cli_runtime_native_event(&ack_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ack.native_method, "gateway/terminal_recovery_ack");
+    processor
+        .ack_cli_runtime_terminal_event(&record)
+        .await
+        .unwrap();
+    let mut conflicting = record;
+    conflicting.native_turn_id = Some("another-native-execution".into());
+    assert!(
+        processor
+            .ack_cli_runtime_terminal_event(&conflicting)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.get_cli_runtime_native_event(&ack_id).await.unwrap(),
+        Some(ack),
+        "generic ACK replay preserves the recovery marker and its exact native identity"
     );
 }
 
