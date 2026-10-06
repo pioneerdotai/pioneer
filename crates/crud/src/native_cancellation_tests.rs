@@ -1656,16 +1656,17 @@ async fn assert_upgrade_schema(db: &pioneer_sqlite::SqliteDatabase, installed: b
 #[tokio::test]
 async fn native_cancellation_production_upgrade_and_latest_down() {
     const OLD_NAME: &str = "m20261001_000001_native_cancellation_context";
-    const LATER_MAIN: [&str; 3] = [
+    const LATER_MAIN: [&str; 4] = [
         "m20261002_000001_task_run_occurrence_reconcile",
         "m20261004_000001_task_occurrence_reconcile",
         "m20261004_000004_compaction_lifecycle_pending",
+        "m20261004_000007_agent_action_outbox_ranges",
     ];
     let cancellation = cancellation_migration_name();
     // Upgrade and down(1) must use the production registry's final migration.
     assert_eq!(cancellation, "m20261005_000001_native_cancellation_context");
     assert_ne!(cancellation, OLD_NAME);
-    assert!(cancellation.as_str() > LATER_MAIN[2]);
+    assert!(cancellation.as_str() > *LATER_MAIN.last().unwrap());
     assert_eq!(Migrator::migrations().last().unwrap().name(), cancellation);
     let db = pioneer_sqlite::SqliteDatabase::from_single_connection(
         Database::connect("sqlite::memory:").await.unwrap(),

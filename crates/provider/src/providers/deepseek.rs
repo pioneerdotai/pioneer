@@ -164,7 +164,7 @@ impl DeepSeekProvider {
         Ok(())
     }
 
-    fn validate_stream(
+    pub(super) fn validate_stream(
         model: String,
         stream: BoxStream<'static, Result<StreamChunk>>,
     ) -> BoxStream<'static, Result<StreamChunk>> {
@@ -173,7 +173,11 @@ impl DeepSeekProvider {
             let mut stream = stream;
             let mut pending_replay_state: Option<ProviderReplayState> = None;
 
-            while let Some(result) = stream.next().await {
+            while let Some(result) = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = stream.next() => result,
+            } {
                 let mut chunk = match result {
                     Ok(chunk) => chunk,
                     Err(error) => {

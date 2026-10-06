@@ -723,7 +723,9 @@ async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_obj
         .unwrap();
     assert!(indexes.is_empty());
     assert!(
-        Migrator::migrations()
+        !Migrator::get_applied_migrations(&store.connection)
+            .await
+            .unwrap()
             .iter()
             .any(|migration| migration.name() == MIGRATION)
     );
