@@ -842,6 +842,12 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
             }
         };
         let mut managed_mcp_guard = ClaudeManagedMcpConfigStartupGuard::new(managed_mcp_config);
+        startup.retain_preparation(
+            crate::cli_runtime::manager::CliStartupProcessCleanup::Claude(
+                managed_mcp_guard.descriptor().clone(),
+            ),
+        );
+        managed_mcp_guard.cleanup_on_drop = false;
         let allowed_tool_names = launch_projection
             .map(|projection| projection.preflight.allowed_tool_names.as_slice())
             .unwrap_or_default();
@@ -989,12 +995,14 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
 }
 
 struct ClaudeManagedMcpConfigStartupGuard {
+    cleanup_on_drop: bool,
     descriptor: Option<ClaudeManagedMcpConfigDescriptor>,
 }
 
 impl ClaudeManagedMcpConfigStartupGuard {
     fn new(descriptor: ClaudeManagedMcpConfigDescriptor) -> Self {
         Self {
+            cleanup_on_drop: true,
             descriptor: Some(descriptor),
         }
     }
@@ -1014,6 +1022,9 @@ impl ClaudeManagedMcpConfigStartupGuard {
 
 impl Drop for ClaudeManagedMcpConfigStartupGuard {
     fn drop(&mut self) {
+        if !self.cleanup_on_drop {
+            return;
+        }
         let Some(descriptor) = self.descriptor.take() else {
             return;
         };

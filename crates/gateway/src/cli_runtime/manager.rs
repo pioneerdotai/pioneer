@@ -772,7 +772,7 @@ impl CLIAgentRuntimeManager {
             let startup = owner.startup.clone();
             let factory_owner = owner.clone();
             let lifecycle = self.lifecycle.clone();
-            owner.publish_start_task(tokio::spawn(async move {
+            owner.spawn_start_task(async move {
                 let result = factory
                     .start_session_with_launch_spec(&instance, &launch_spec, &startup)
                     .await
@@ -784,7 +784,7 @@ impl CLIAgentRuntimeManager {
                     factory_owner.begin_close(lifecycle);
                 }
                 outcome
-            }));
+            });
         }
         let mut waiter = StartupWaitGuard(owner.clone(), false, self.lifecycle.clone());
         if let Err(error) = owner.finish_startup().await {
@@ -959,6 +959,9 @@ impl CLIAgentRuntimeManager {
         &self,
         key: &CLIAgentRuntimeSessionKey,
     ) -> Option<CLIAgentRuntimeSessionHandle> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return None;
+        }
         self.cached(key)?.handle()
     }
     pub(crate) async fn is_current_instance(&self, instance: &CliSessionInstanceId) -> bool {
@@ -1055,18 +1058,18 @@ impl CLIAgentRuntimeManager {
         Ok(true)
     }
     pub(crate) async fn close_all(&self) -> Result<usize> {
-        {
-            let _sessions = self.sessions.lock().expect("CLI registry poisoned");
+        let instances = {
+            let sessions = self.sessions.lock().expect("CLI registry poisoned");
             self.shutting_down.store(true, Ordering::Release);
-        }
+            for cached in sessions.values() {
+                cached.owner.begin_close(self.lifecycle.clone());
+            }
+            sessions
+                .values()
+                .map(|cached| cached.instance.clone())
+                .collect::<Vec<_>>()
+        };
         self.lifecycle.shutdown_started().await;
-        let instances = self
-            .sessions
-            .lock()
-            .expect("CLI registry poisoned")
-            .values()
-            .map(|cached| cached.instance.clone())
-            .collect::<Vec<_>>();
         let mut count = 0;
         let mut first_error = None;
         for instance in instances {

@@ -1266,6 +1266,12 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
         )
         .map_err(|error| anyhow!("failed to prepare Codex generation overlay: {error}"))?;
         let mut overlay_guard = CodexGenerationOverlayStartupGuard::new(overlay);
+        startup.retain_preparation(
+            crate::cli_runtime::manager::CliStartupProcessCleanup::Codex(
+                overlay_guard.descriptor().clone(),
+            ),
+        );
+        overlay_guard.cleanup_on_drop = false;
         let mut prepared_mcp_bridge = None;
         let mut mcp_attestation = CodexMcpAttestationExpectation::unmanaged_empty(
             self.mcp_limits.max_codex_config_origins(),
@@ -2569,12 +2575,14 @@ fn is_codex_native_mcp_event(event: &RuntimeEvent) -> bool {
 }
 
 struct CodexGenerationOverlayStartupGuard {
+    cleanup_on_drop: bool,
     descriptor: Option<CodexGenerationOverlayDescriptor>,
 }
 
 impl CodexGenerationOverlayStartupGuard {
     fn new(descriptor: CodexGenerationOverlayDescriptor) -> Self {
         Self {
+            cleanup_on_drop: true,
             descriptor: Some(descriptor),
         }
     }
@@ -2600,6 +2608,9 @@ impl CodexGenerationOverlayStartupGuard {
 
 impl Drop for CodexGenerationOverlayStartupGuard {
     fn drop(&mut self) {
+        if !self.cleanup_on_drop {
+            return;
+        }
         let Some(descriptor) = self.descriptor.take() else {
             return;
         };

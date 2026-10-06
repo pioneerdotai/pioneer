@@ -34,6 +34,15 @@ impl CLIAgentRuntimeSessionStartup {
     pub(crate) async fn cancelled(&self) {
         self.cancellation.cancelled().await;
     }
+    /// Files/grants prepared before spawn are resources too. Retain the
+    /// managed descriptor until the actual factory task has ended and the
+    /// supervisor has released its references, without inventing a process.
+    pub(crate) fn retain_preparation(&self, cleanup: CliStartupProcessCleanup) {
+        self.retain_session(Arc::new(StartupProcessSession {
+            process: None,
+            cleanup: StdMutex::new(Some(cleanup)),
+        }));
+    }
     /// Synchronous publication immediately after spawn, before the next await.
     pub(crate) fn retain_process(
         &self,
@@ -41,7 +50,7 @@ impl CLIAgentRuntimeSessionStartup {
         cleanup: CliStartupProcessCleanup,
     ) {
         self.retain_session(Arc::new(StartupProcessSession {
-            process,
+            process: Some(process),
             cleanup: StdMutex::new(Some(cleanup)),
         }));
     }
@@ -56,7 +65,7 @@ impl CLIAgentRuntimeSessionStartup {
     }
 }
 struct StartupProcessSession {
-    process: Arc<Mutex<CLIAgentProcess>>,
+    process: Option<Arc<Mutex<CLIAgentProcess>>>,
     cleanup: StdMutex<Option<CliStartupProcessCleanup>>,
 }
 #[async_trait]
@@ -66,11 +75,13 @@ impl CLIAgentRuntimeSession for StartupProcessSession {
         self.cleanup_after_stop().await
     }
     async fn stop_and_wait(&self) -> Result<()> {
-        self.process
-            .lock()
-            .await
-            .terminate_with_grace(Duration::from_secs(2))
-            .await?;
+        if let Some(process) = &self.process {
+            process
+                .lock()
+                .await
+                .terminate_with_grace(Duration::from_secs(2))
+                .await?;
+        }
         Ok(())
     }
     async fn cleanup_after_stop(&self) -> Result<()> {
@@ -133,11 +144,18 @@ impl CliSessionOwner {
             stopped: AtomicBool::new(false),
         })
     }
-    pub(super) fn publish_start_task(&self, task: JoinHandle<Result<(), String>>) {
-        self.startup_completion
+    pub(super) fn spawn_start_task<F>(&self, future: F)
+    where
+        F: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        // Lock before spawn: its future can run on another worker immediately,
+        // including its failed-start cleanup path. No observer can consume an
+        // empty startup owner between task creation and handle publication.
+        let mut completion = self
+            .startup_completion
             .try_lock()
-            .expect("startup task publication is synchronous")
-            .task = Some(task);
+            .expect("startup task publication is synchronous");
+        completion.task = Some(tokio::spawn(future));
     }
     pub(super) async fn finish_startup(&self) -> Result<()> {
         let mut completion = self.startup_completion.lock().await;
@@ -325,8 +343,11 @@ impl CliSessionOwner {
         let callbacks_result = self.join_callbacks().await;
         native_result?;
         callbacks_result?;
-        if self.startup_completion.lock().await.panicked {
-            bail!("CLI startup panicked; outcome remains failed");
+        {
+            let completion = self.startup_completion.lock().await;
+            if completion.panicked || completion.outcome.is_none() {
+                bail!("CLI startup completion is unknown or panicked; owner remains failed");
+            }
         }
         lifecycle.after_session_close_result(&self.instance).await?;
         if let Some(session) = session {
@@ -411,6 +432,101 @@ mod tests {
             cleaned: AtomicUsize::new(0),
         })
     }
+    struct PreparedLifecycle {
+        root: std::path::PathBuf,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+    #[async_trait]
+    impl CLIAgentRuntimeSessionLifecycle for PreparedLifecycle {
+        async fn after_session_close_result(&self, _instance: &CliSessionInstanceId) -> Result<()> {
+            assert!(
+                self.root.is_dir(),
+                "managed root must survive until supervisor cleanup"
+            );
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn prepared_without_process_retains_real_root_until_strict_cleanup_finishes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let owner = owner();
+        let identity = pioneer_cli_agent_runtime::claude::ClaudeManagedMcpConfigIdentity::new(
+            "ws",
+            "claude",
+            "thread",
+            owner.instance.boot_id().as_str(),
+            1,
+        )
+        .unwrap();
+        let descriptor = pioneer_cli_agent_runtime::claude::materialize_claude_mcp_config(
+            temporary.path().join("managed").as_path(),
+            identity,
+            pioneer_cli_agent_runtime::claude::ClaudeManagedMcpLaunchMode::Empty,
+        )
+        .unwrap();
+        let root = descriptor.session_root_path.clone();
+        owner
+            .startup
+            .retain_preparation(CliStartupProcessCleanup::Claude(descriptor));
+        owner.spawn_start_task(async { Err("prepared startup failed before spawn".to_owned()) });
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let lifecycle = Arc::new(PreparedLifecycle {
+            root: root.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let waiter = {
+            let owner = owner.clone();
+            let lifecycle = lifecycle.clone();
+            tokio::spawn(async move { owner.close_and_wait(lifecycle).await })
+        };
+        entered.notified().await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(root.is_dir());
+        assert!(!owner.stopped.load(Ordering::Acquire));
+        release.notify_one();
+        owner.close_and_wait(lifecycle).await.unwrap();
+        assert!(!root.exists());
+        assert!(owner.stopped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn cleanup_started_inside_factory_waits_for_its_actual_start_handle() {
+        let owner = owner();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let factory_owner = owner.clone();
+        let announced = entered.clone();
+        let gate = release.clone();
+        owner.spawn_start_task(async move {
+            factory_owner.begin_close(Arc::new(NoopCLIAgentRuntimeSessionLifecycle));
+            announced.notify_one();
+            gate.notified().await;
+            Err("injected failed factory".to_owned())
+        });
+        entered.notified().await;
+        let waiter = {
+            let owner = owner.clone();
+            tokio::spawn(async move {
+                owner
+                    .close_and_wait(Arc::new(NoopCLIAgentRuntimeSessionLifecycle))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        assert!(!owner.stopped.load(Ordering::Acquire));
+        release.notify_one();
+        waiter.await.unwrap().unwrap();
+        assert!(owner.stopped.load(Ordering::Acquire));
+        assert!(owner.finish_startup().await.is_err());
+    }
+
     #[tokio::test]
     async fn cancelled_start_and_close_retain_actual_native_completion() {
         let owner = owner();
@@ -422,12 +538,12 @@ mod tests {
         let factory_native = native.clone();
         let release = release_factory.clone();
         let announced = published.clone();
-        owner.publish_start_task(tokio::spawn(async move {
+        owner.spawn_start_task(async move {
             startup.retain_session(factory_native);
             announced.notify_one();
             release.notified().await;
             Ok(())
-        }));
+        });
         let waiter = {
             let owner = owner.clone();
             tokio::spawn(async move {
@@ -476,7 +592,7 @@ mod tests {
         let release_worker = Arc::new(Notify::new());
         let native = native(release_worker.clone());
         owner.startup.retain_session(native.clone());
-        owner.publish_start_task(tokio::spawn(async { Ok(()) }));
+        owner.spawn_start_task(async { Ok(()) });
         owner.finish_startup().await.unwrap();
         let callback_entered = Arc::new(Notify::new());
         let release_callback = Arc::new(Notify::new());
@@ -510,7 +626,7 @@ mod tests {
     #[tokio::test]
     async fn consumed_callback_panic_remains_failed_on_repeat() {
         let owner = owner();
-        owner.publish_start_task(tokio::spawn(async { Ok(()) }));
+        owner.spawn_start_task(async { Ok(()) });
         owner.finish_startup().await.unwrap();
         assert!(owner.spawn_callback(async {
             panic!("injected callback failure");
