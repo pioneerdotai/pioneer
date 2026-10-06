@@ -9,7 +9,10 @@ use sea_orm::{
     ConnectionTrait, Statement, TransactionTrait, entity::prelude::DateTimeWithTimeZone,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use zstd::dict::EncoderDictionary;
 
 pub(crate) const PERIODIC_MAINTENANCE_INTERVAL_SECONDS: u64 = 300;
 pub(crate) const PERIODIC_BACKLOG_RECHECK_MILLIS: u64 = 250;
@@ -142,6 +145,65 @@ struct CompressionDictionary {
     bytes: Option<Vec<u8>>,
 }
 
+// Owned by one database's maintenance worker, outside its outer cycle loop.
+// There is one active generation per column. Batches are awaited sequentially;
+// their slot is moved (not cloned) into the sole in-flight blocking job and
+// restored only after joining it. Replacement drops the old CDict before copy:
+// at most two native dictionaries exist, including in-flight references.
+// Cancellation drains the join before worker shutdown; no blocking job writes DB.
+pub(crate) struct PreparedDictionaryCache {
+    database_identity: usize,
+    entries: [Option<PreparedDictionaryEntry>; 2],
+    #[cfg(test)]
+    preparations: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    after_cpu: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    after_training: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    pub(crate) after_cycle: Option<Arc<dyn Fn(&Self) + Send + Sync>>,
+}
+
+impl PreparedDictionaryCache {
+    pub(crate) fn new(store: &CrudStore) -> Self {
+        Self {
+            database_identity: store.database_connection().runtime_identity(),
+            entries: [None, None],
+            #[cfg(test)]
+            preparations: Arc::default(),
+            #[cfg(test)]
+            after_cpu: None,
+            #[cfg(test)]
+            after_training: None,
+            #[cfg(test)]
+            after_cycle: None,
+        }
+    }
+
+    fn retained_native_bytes(&self) -> usize {
+        self.entries
+            .iter()
+            .flatten()
+            .map(|entry| entry.dictionary.as_cdict().sizeof())
+            .sum()
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct PreparedDictionaryKey {
+    database_identity: usize,
+    table: &'static str,
+    column: &'static str,
+    dictionary_id: i64,
+    compression_level: i32,
+    bytes_digest: [u8; 32],
+}
+
+struct PreparedDictionaryEntry {
+    key: PreparedDictionaryKey,
+    dictionary: Arc<EncoderDictionary<'static>>,
+}
+
 #[derive(Debug)]
 struct PreparedPayloadRow {
     rowid: i64,
@@ -189,8 +251,10 @@ pub(crate) async fn run_startup_once(
     maintenance_seconds: Option<f64>,
     target_db_load: f64,
 ) -> Result<ZstdColumnCompressionSummary> {
+    let mut cache = PreparedDictionaryCache::new(crud_store);
     run_periodic_maintenance(
         crud_store,
+        &mut cache,
         std::slice::from_ref(&config),
         maintenance_seconds,
         target_db_load,
@@ -211,8 +275,10 @@ pub(crate) async fn run_periodic_maintenance_once(
     maintenance_seconds: Option<f64>,
     target_db_load: f64,
 ) -> Result<ZstdPeriodicMaintenanceOutcome> {
+    let mut cache = PreparedDictionaryCache::new(crud_store);
     run_periodic_maintenance(
         crud_store,
+        &mut cache,
         configs,
         maintenance_seconds,
         target_db_load,
@@ -224,6 +290,7 @@ pub(crate) async fn run_periodic_maintenance_once(
 
 pub(crate) async fn run_cooperative_maintenance_cycle(
     crud_store: &CrudStore,
+    cache: &mut PreparedDictionaryCache,
     configs: &[ZstdColumnConfig],
     maintenance_seconds: Option<f64>,
     target_db_load: f64,
@@ -231,6 +298,7 @@ pub(crate) async fn run_cooperative_maintenance_cycle(
 ) -> Result<ZstdPeriodicMaintenanceOutcome> {
     run_periodic_maintenance(
         crud_store,
+        cache,
         configs,
         maintenance_seconds,
         target_db_load,
@@ -250,36 +318,97 @@ pub(crate) async fn ensure_compression_schema(
 ) -> Result<Vec<ZstdColumnCompressionSummary>> {
     let crud_store = crud_store.with_maintenance_access();
     let db = crud_store.database_connection();
-    verify_sqlite_zstd_registered(&db).await?;
+    zstd_database_phase(Some(cancellation), verify_sqlite_zstd_registered(&db)).await?;
 
     let mut summaries = Vec::with_capacity(configs.len());
     for config in configs {
         if cancellation.is_cancelled() {
             break;
         }
-        let ensure = crud_store
-            .run_background_database_quantum(|| {
-                let db = db.clone();
-                async move { ensure_compression_enabled(&db, *config, RowInspection::Bounded).await }
-            })
-            .await?;
+        let ensure = zstd_database_quantum(&crud_store, Some(cancellation), || {
+            let db = db.clone();
+            async move {
+                ensure_compression_enabled(&db, *config, RowInspection::Bounded, Some(cancellation))
+                    .await
+            }
+        })
+        .await?;
         summaries.push(summary_without_maintenance(*config, ensure));
     }
     Ok(summaries)
 }
 
+#[derive(Debug)]
+struct ZstdDatabaseCancelled;
+
+impl std::fmt::Display for ZstdDatabaseCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("zstd database phase cancelled")
+    }
+}
+
+impl std::error::Error for ZstdDatabaseCancelled {}
+
+fn check_database_cancellation(
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<()> {
+    if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return Err(ZstdDatabaseCancelled.into());
+    }
+    Ok(())
+}
+
+// Only DB futures may cross this boundary. Dropping them releases queued
+// reservations/read permits and uses the runtime's transaction cleanup. An
+// in-progress commit may have an unknown outcome; cancellation never retries it.
+// Blocking CPU jobs are deliberately awaited outside this helper.
+async fn zstd_database_phase<T>(
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if let Some(cancellation) = cancellation {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(ZstdDatabaseCancelled.into()),
+            result = operation => result,
+        }
+    } else {
+        operation.await
+    }
+}
+
+async fn zstd_database_quantum<T, F, Fut>(
+    store: &CrudStore,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+    mut operation: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    // The outer boundary cancels retry backoff too. The inner boundary checks
+    // every attempt, so a lock-race retry cannot start DB work after cancellation.
+    zstd_database_phase(
+        cancellation,
+        store.run_background_database_quantum(|| zstd_database_phase(cancellation, operation())),
+    )
+    .await
+}
+
 async fn run_periodic_maintenance(
     crud_store: &CrudStore,
+    cache: &mut PreparedDictionaryCache,
     configs: &[ZstdColumnConfig],
     maintenance_seconds: Option<f64>,
     target_db_load: f64,
     cancellation: Option<&tokio_util::sync::CancellationToken>,
     row_inspection: RowInspection,
 ) -> Result<ZstdPeriodicMaintenanceOutcome> {
-    crate::database::attribution::scope_database_workload_result(
+    let result = crate::database::attribution::scope_database_workload_result(
         pioneer_observability::DatabaseWorkload::ZstdMaintenance,
         run_periodic_maintenance_inner(
             crud_store,
+            cache,
             configs,
             maintenance_seconds,
             target_db_load,
@@ -287,11 +416,19 @@ async fn run_periodic_maintenance(
             row_inspection,
         ),
     )
-    .await
+    .await;
+    match result {
+        Err(error) if error.is::<ZstdDatabaseCancelled>() => Ok(ZstdPeriodicMaintenanceOutcome {
+            cancelled: true,
+            ..Default::default()
+        }),
+        result => result,
+    }
 }
 
 async fn run_periodic_maintenance_inner(
     crud_store: &CrudStore,
+    cache: &mut PreparedDictionaryCache,
     configs: &[ZstdColumnConfig],
     maintenance_seconds: Option<f64>,
     target_db_load: f64,
@@ -307,27 +444,34 @@ async fn run_periodic_maintenance_inner(
         });
     }
     let db = crud_store.database_connection();
-    verify_sqlite_zstd_registered(&db).await?;
+    anyhow::ensure!(
+        cache.database_identity == db.runtime_identity(),
+        "zstd cache belongs to a different database worker"
+    );
+    zstd_database_phase(cancellation, verify_sqlite_zstd_registered(&db)).await?;
 
     let configs = configs.to_vec();
-    let before = crud_store
-        .run_background_database_quantum(|| {
-            let db = db.clone();
-            let configs = configs.clone();
-            async move {
-                let mut before = Vec::with_capacity(configs.len());
-                for config in configs {
-                    let ensure = ensure_compression_enabled(&db, config, row_inspection).await?;
-                    let pending_before = match row_inspection {
-                        RowInspection::Exact => pending_uncompressed_rows(&db, config).await?,
-                        RowInspection::Bounded => 0,
-                    };
-                    before.push((config, ensure, pending_before));
-                }
-                Ok(before)
+    let before = zstd_database_quantum(crud_store, cancellation, || {
+        let db = db.clone();
+        let configs = configs.clone();
+        async move {
+            let mut before = Vec::with_capacity(configs.len());
+            for config in configs {
+                let ensure =
+                    ensure_compression_enabled(&db, config, row_inspection, cancellation).await?;
+                let pending_before = match row_inspection {
+                    RowInspection::Exact => {
+                        zstd_database_phase(cancellation, pending_uncompressed_rows(&db, config))
+                            .await?
+                    }
+                    RowInspection::Bounded => 0,
+                };
+                before.push((config, ensure, pending_before));
             }
-        })
-        .await?;
+            Ok(before)
+        }
+    })
+    .await?;
 
     let enabled_configs = before
         .iter()
@@ -338,6 +482,7 @@ async fn run_periodic_maintenance_inner(
     let maintenance = if !enabled_configs.is_empty() {
         run_cooperative_maintenance(
             crud_store,
+            cache,
             &db,
             enabled_configs.as_slice(),
             maintenance_seconds,
@@ -369,7 +514,9 @@ async fn run_periodic_maintenance_inner(
             RowInspection::Bounded => progress.observed_rows,
         };
         let pending_after = match row_inspection {
-            RowInspection::Exact => pending_uncompressed_rows(&db, config).await?,
+            RowInspection::Exact => {
+                zstd_database_phase(cancellation, pending_uncompressed_rows(&db, config)).await?
+            }
             RowInspection::Bounded => progress.observed_rows.saturating_sub(progress.applied_rows),
         };
         summaries.push(ZstdColumnCompressionSummary {
@@ -398,6 +545,7 @@ async fn run_periodic_maintenance_inner(
 
 async fn run_cooperative_maintenance(
     crud_store: &CrudStore,
+    cache: &mut PreparedDictionaryCache,
     db: &SqliteDatabase,
     configs: &[ZstdColumnConfig],
     maintenance_seconds: Option<f64>,
@@ -441,7 +589,8 @@ async fn run_cooperative_maintenance(
 
             attempted = true;
             let started_at = Instant::now();
-            let batch = run_one_compression_batch(crud_store, db, config, cancellation).await?;
+            let batch =
+                run_one_compression_batch(crud_store, cache, db, config, cancellation).await?;
             let progress = &mut columns[index].1;
             progress.observed_rows = progress.observed_rows.saturating_add(batch.observed_rows);
             progress.applied_rows = progress.applied_rows.saturating_add(batch.applied_rows);
@@ -455,6 +604,13 @@ async fn run_cooperative_maintenance(
             active[index] = batch.more_pending && batch.applied_rows != 0;
             made_progress |= batch.applied_rows != 0;
 
+            if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                return Ok(CooperativeMaintenanceOutcome {
+                    deferred: false,
+                    cancelled: true,
+                    columns,
+                });
+            }
             if batch.more_pending {
                 pause_after_batch(started_at.elapsed(), target_db_load, deadline, cancellation)
                     .await?;
@@ -473,11 +629,20 @@ async fn run_cooperative_maintenance(
 
 async fn run_one_compression_batch(
     crud_store: &CrudStore,
+    cache: &mut PreparedDictionaryCache,
     db: &SqliteDatabase,
     config: ZstdColumnConfig,
     cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<CompressionBatchOutcome> {
-    let dictionary = resolve_compression_dictionary(crud_store, db, config).await?;
+    let dictionary = resolve_compression_dictionary(
+        crud_store,
+        db,
+        config,
+        cancellation,
+        #[cfg(test)]
+        cache.after_training.clone(),
+    )
+    .await?;
     let Some(dictionary) = dictionary.dictionary else {
         return Ok(CompressionBatchOutcome {
             observed_rows: dictionary.observed_rows,
@@ -493,31 +658,35 @@ async fn run_one_compression_batch(
         });
     }
 
-    let rows = crud_store
-        .run_background_database_quantum(|| {
-            let db = db.clone();
-            async move {
-                load_pending_payload_rows(
-                    &db,
-                    config,
-                    COMPRESSION_BATCH_MAX_ROWS,
-                    COMPRESSION_BATCH_MAX_SOURCE_BYTES,
-                )
-                .await
-            }
-        })
-        .await?;
+    let rows = zstd_database_quantum(crud_store, cancellation, || {
+        let db = db.clone();
+        async move {
+            load_pending_payload_rows(
+                &db,
+                config,
+                COMPRESSION_BATCH_MAX_ROWS,
+                COMPRESSION_BATCH_MAX_SOURCE_BYTES,
+            )
+            .await
+        }
+    })
+    .await?;
     if rows.is_empty() {
         return Ok(CompressionBatchOutcome::default());
     }
     let observed_rows = rows.len() as u64;
     let source_bytes = rows.iter().map(|row| row.payload.len() as u64).sum::<u64>();
     let dictionary_id = dictionary.id;
-    let prepared = tokio::task::spawn_blocking(move || {
-        prepare_payload_rows(rows, config.compression_level, dictionary.bytes.as_deref())
-    })
-    .await
-    .context("zstd payload compression worker failed to join")??;
+    let Some(prepared) =
+        prepare_payload_batch(cache, db, config, rows, dictionary, cancellation).await?
+    else {
+        return Ok(CompressionBatchOutcome {
+            observed_rows,
+            source_bytes,
+            more_pending: true,
+            ..Default::default()
+        });
+    };
 
     if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
         return Ok(CompressionBatchOutcome {
@@ -527,19 +696,19 @@ async fn run_one_compression_batch(
             ..Default::default()
         });
     }
-    let (applied_rows, stale_rows) = crud_store
-        .run_background_database_quantum(|| {
-            let db = db.clone();
-            let prepared = &prepared;
-            async move { apply_prepared_payload_rows(&db, config, dictionary_id, prepared).await }
-        })
-        .await?;
-    let more_pending = crud_store
-        .run_background_database_quantum(|| {
-            let db = db.clone();
-            async move { has_pending_uncompressed_rows(&db, config).await }
-        })
-        .await?;
+    let (applied_rows, stale_rows) = zstd_database_quantum(crud_store, cancellation, || {
+        let db = db.clone();
+        let prepared = &prepared;
+        async move {
+            apply_prepared_payload_rows(&db, config, dictionary_id, prepared, cancellation).await
+        }
+    })
+    .await?;
+    let more_pending = zstd_database_quantum(crud_store, cancellation, || {
+        let db = db.clone();
+        async move { has_pending_uncompressed_rows(&db, config).await }
+    })
+    .await?;
 
     Ok(CompressionBatchOutcome {
         observed_rows,
@@ -554,13 +723,14 @@ async fn resolve_compression_dictionary(
     crud_store: &CrudStore,
     db: &SqliteDatabase,
     config: ZstdColumnConfig,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+    #[cfg(test)] after_training: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> Result<DictionaryResolution> {
-    if let Some(dictionary) = crud_store
-        .run_background_database_quantum(|| {
-            let db = db.clone();
-            async move { load_compression_dictionary(&db, config).await }
-        })
-        .await?
+    if let Some(dictionary) = zstd_database_quantum(crud_store, cancellation, || {
+        let db = db.clone();
+        async move { load_compression_dictionary(&db, config).await }
+    })
+    .await?
     {
         return Ok(DictionaryResolution {
             dictionary: Some(dictionary),
@@ -570,20 +740,19 @@ async fn resolve_compression_dictionary(
         });
     }
 
-    let sample = crud_store
-        .run_background_database_quantum(|| {
-            let db = db.clone();
-            async move {
-                load_pending_payload_rows(
-                    &db,
-                    config,
-                    DICTIONARY_SAMPLE_MAX_ROWS,
-                    DICTIONARY_SAMPLE_MAX_SOURCE_BYTES,
-                )
-                .await
-            }
-        })
-        .await?;
+    let sample = zstd_database_quantum(crud_store, cancellation, || {
+        let db = db.clone();
+        async move {
+            load_pending_payload_rows(
+                &db,
+                config,
+                DICTIONARY_SAMPLE_MAX_ROWS,
+                DICTIONARY_SAMPLE_MAX_SOURCE_BYTES,
+            )
+            .await
+        }
+    })
+    .await?;
     if sample.is_empty() {
         return Ok(DictionaryResolution {
             dictionary: None,
@@ -614,16 +783,37 @@ async fn resolve_compression_dictionary(
         });
     }
 
+    if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return Ok(DictionaryResolution {
+            dictionary: None,
+            observed_rows: sample_rows as u64,
+            source_bytes: sample_bytes as u64,
+            more_pending: true,
+        });
+    }
     let wanted_size = (sample_bytes / 100).clamp(DICTIONARY_MIN_BYTES, DICTIONARY_MAX_BYTES);
     let samples = sample
         .into_iter()
         .map(|row| row.payload.into_bytes())
         .collect::<Vec<_>>();
     let trained = tokio::task::spawn_blocking(move || {
-        pioneer_sqlite::zstd::train_dictionary(samples.as_slice(), wanted_size)
+        let result = pioneer_sqlite::zstd::train_dictionary(samples.as_slice(), wanted_size);
+        #[cfg(test)]
+        if let Some(after_training) = after_training {
+            after_training();
+        }
+        result
     })
     .await
     .context("zstd dictionary training worker failed to join")?;
+    if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return Ok(DictionaryResolution {
+            dictionary: None,
+            observed_rows: sample_rows as u64,
+            source_bytes: sample_bytes as u64,
+            more_pending: true,
+        });
+    }
     let candidate = match trained {
         Ok(candidate) => candidate,
         Err(_) => {
@@ -643,13 +833,12 @@ async fn resolve_compression_dictionary(
             });
         }
     };
-    let dictionary = crud_store
-        .run_background_database_quantum(|| {
-            let db = db.clone();
-            let candidate = candidate.clone();
-            async move { persist_compression_dictionary(&db, config, candidate).await }
-        })
-        .await?;
+    let dictionary = zstd_database_quantum(crud_store, cancellation, || {
+        let db = db.clone();
+        let candidate = candidate.clone();
+        async move { persist_compression_dictionary(&db, config, candidate, cancellation).await }
+    })
+    .await?;
     Ok(DictionaryResolution {
         dictionary: Some(dictionary),
         observed_rows: sample_rows as u64,
@@ -658,14 +847,110 @@ async fn resolve_compression_dictionary(
     })
 }
 
+// No DB capacity is retained here. Await the started job even on cancellation:
+// native compression cannot be interrupted, and returning early would detach it.
+async fn prepare_payload_batch(
+    cache: &mut PreparedDictionaryCache,
+    db: &SqliteDatabase,
+    config: ZstdColumnConfig,
+    rows: Vec<PendingPayloadRow>,
+    dictionary: CompressionDictionary,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<Option<Vec<PreparedPayloadRow>>> {
+    anyhow::ensure!(
+        cache.database_identity == db.runtime_identity(),
+        "zstd cache belongs to a different database worker"
+    );
+    if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return Ok(None);
+    }
+    let index = match config.count_source {
+        ZstdColumnCountSource::TurnEvent => 0,
+        ZstdColumnCountSource::TurnItem => 1,
+    };
+    let mut entry = cache.entries[index].take();
+    let database_identity = cache.database_identity;
+    let cancellation = cancellation.cloned();
+    #[cfg(test)]
+    let preparations = cache.preparations.clone();
+    #[cfg(test)]
+    let after_cpu = cache.after_cpu.clone();
+    let (entry, result) = tokio::task::spawn_blocking(move || {
+        let result = (|| {
+            if cancellation
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                return Ok(None);
+            }
+            match dictionary
+                .bytes
+                .as_deref()
+                .filter(|bytes| !bytes.is_empty())
+            {
+                Some(bytes) => {
+                    let key = PreparedDictionaryKey {
+                        database_identity,
+                        table: config.table,
+                        column: config.column,
+                        dictionary_id: dictionary.id,
+                        compression_level: config.compression_level,
+                        bytes_digest: Sha256::digest(bytes).into(),
+                    };
+                    if entry.as_ref().is_none_or(|entry| entry.key != key) {
+                        // Release the previous generation before allocating its replacement.
+                        drop(entry.take());
+                        let prepared =
+                            Arc::new(EncoderDictionary::copy(bytes, config.compression_level));
+                        #[cfg(test)]
+                        preparations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tracing::debug!(
+                            native_bytes = prepared.as_cdict().sizeof(),
+                            "zstd prepared dictionary cache miss"
+                        );
+                        entry = Some(PreparedDictionaryEntry {
+                            key,
+                            dictionary: prepared,
+                        });
+                    }
+                }
+                None => entry = None,
+            }
+            // The Arc owner and this explicit borrow both live through the entire
+            // batch; the compressor is dropped before the entry leaves this job.
+            let prepared: Option<&EncoderDictionary<'static>> =
+                entry.as_ref().map(|entry| entry.dictionary.as_ref());
+            let rows = prepare_payload_rows(rows, config.compression_level, prepared)?;
+            #[cfg(test)]
+            if let Some(after_cpu) = after_cpu {
+                after_cpu();
+            }
+            Ok(Some(rows))
+        })();
+        (entry, result)
+    })
+    .await
+    .context("zstd payload compression worker failed to join")?;
+    cache.entries[index] = entry;
+    tracing::debug!(
+        retained_native_bytes = cache.retained_native_bytes(),
+        "zstd prepared dictionary cache retained"
+    );
+    result
+}
+
 fn prepare_payload_rows(
     rows: Vec<PendingPayloadRow>,
     compression_level: i32,
-    dictionary: Option<&[u8]>,
+    dictionary: Option<&EncoderDictionary<'static>>,
 ) -> Result<Vec<PreparedPayloadRow>> {
-    let mut compressor =
-        pioneer_sqlite::zstd::ColumnValueCompressor::new(compression_level, dictionary)
-            .context("failed to prepare bounded zstd payload batch compressor")?;
+    let mut compressor = match dictionary {
+        Some(dictionary) => {
+            pioneer_sqlite::zstd::ColumnValueCompressor::with_prepared_dictionary(dictionary)
+        }
+        None => pioneer_sqlite::zstd::ColumnValueCompressor::new(compression_level, None),
+    }
+    .context("failed to prepare bounded zstd payload batch compressor")?;
     rows.into_iter()
         .map(|row| {
             let compressed_payload = compressor
@@ -811,13 +1096,16 @@ async fn persist_compression_dictionary(
     db: &SqliteDatabase,
     config: ZstdColumnConfig,
     candidate: Vec<u8>,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<CompressionDictionary> {
+    check_database_cancellation(cancellation)?;
     let transaction = db.begin().await.with_context(|| {
         format!(
             "failed to begin zstd dictionary commit for {}",
             config.label()
         )
     })?;
+    check_database_cancellation(cancellation)?;
     transaction
         .execute_raw(Statement::from_sql_and_values(
             transaction.get_database_backend(),
@@ -827,6 +1115,7 @@ async fn persist_compression_dictionary(
         ))
         .await
         .with_context(|| format!("failed to commit zstd dictionary for {}", config.label()))?;
+    check_database_cancellation(cancellation)?;
     let row = transaction
         .query_one_raw(Statement::from_sql_and_values(
             transaction.get_database_backend(),
@@ -850,6 +1139,7 @@ async fn persist_compression_dictionary(
                 .context("failed to decode persisted zstd dictionary")?,
         ),
     };
+    check_database_cancellation(cancellation)?;
     transaction.commit().await.with_context(|| {
         format!(
             "failed to finish zstd dictionary commit for {}",
@@ -864,14 +1154,18 @@ async fn apply_prepared_payload_rows(
     config: ZstdColumnConfig,
     dictionary_id: i64,
     rows: &[PreparedPayloadRow],
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<(u64, u64)> {
+    check_database_cancellation(cancellation)?;
     let transaction = db
         .begin()
         .await
         .with_context(|| format!("failed to begin bounded zstd commit for {}", config.label()))?;
+    check_database_cancellation(cancellation)?;
     let mut applied = 0u64;
     let mut stale = 0u64;
     for row in rows {
+        check_database_cancellation(cancellation)?;
         let result = transaction
             .execute_raw(Statement::from_sql_and_values(
                 transaction.get_database_backend(),
@@ -901,6 +1195,7 @@ async fn apply_prepared_payload_rows(
             }
         }
     }
+    check_database_cancellation(cancellation)?;
     transaction
         .commit()
         .await
@@ -915,7 +1210,7 @@ pub(crate) async fn compress_history_payloads_for_test(store: &CrudStore) -> Res
     let db = store.with_maintenance_access().database_connection();
     let mut total = 0;
     for &config in ZSTD_PAYLOAD_COLUMNS {
-        if !compression_is_enabled(&db, config).await? {
+        if !compression_is_enabled(&db, config, None).await? {
             enable_transparent_compression(&db, config).await?;
         }
         for _ in 0..32 {
@@ -930,7 +1225,8 @@ pub(crate) async fn compress_history_payloads_for_test(store: &CrudStore) -> Res
                 break;
             }
             let prepared = prepare_payload_rows(rows, 3, None)?;
-            let (applied, _) = apply_prepared_payload_rows(&db, config, -1, &prepared).await?;
+            let (applied, _) =
+                apply_prepared_payload_rows(&db, config, -1, &prepared, None).await?;
             total += applied;
         }
         anyhow::ensure!(
@@ -988,15 +1284,23 @@ async fn ensure_compression_enabled(
     db: &SqliteDatabase,
     config: ZstdColumnConfig,
     row_inspection: RowInspection,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<EnsureCompressionResult> {
-    let was_enabled = compression_is_enabled(db, config).await?;
+    let was_enabled = zstd_database_phase(
+        cancellation,
+        compression_is_enabled(db, config, cancellation),
+    )
+    .await?;
     let (total_rows, has_rows) = match row_inspection {
         RowInspection::Exact => {
-            let total_rows = row_count(db, config).await?;
+            let total_rows = zstd_database_phase(cancellation, row_count(db, config)).await?;
             (total_rows, total_rows != 0)
         }
         RowInspection::Bounded if was_enabled => (0, true),
-        RowInspection::Bounded => (0, table_has_rows(db, config).await?),
+        RowInspection::Bounded => (
+            0,
+            zstd_database_phase(cancellation, table_has_rows(db, config)).await?,
+        ),
     };
     let mut enabled_now = false;
     let mut skipped_empty = false;
@@ -1005,16 +1309,31 @@ async fn ensure_compression_enabled(
         if !has_rows {
             skipped_empty = true;
         } else {
-            mark_compression_backfilling(db, config).await?;
-            if let Err(error) = enable_transparent_compression(&db.maintenance(), config).await {
-                mark_compression_failed(db, config, &error).await?;
+            zstd_database_phase(cancellation, mark_compression_backfilling(db, config)).await?;
+            if let Err(error) = zstd_database_phase(
+                cancellation,
+                enable_transparent_compression(&db.maintenance(), config),
+            )
+            .await
+            {
+                check_database_cancellation(cancellation)?;
+                zstd_database_phase(cancellation, mark_compression_failed(db, config, &error))
+                    .await?;
                 return Err(error);
             }
-            mark_compression_complete(db, config, total_rows).await?;
+            zstd_database_phase(
+                cancellation,
+                mark_compression_complete(db, config, total_rows),
+            )
+            .await?;
             enabled_now = true;
         }
     } else {
-        mark_existing_compression_complete(db, config, total_rows).await?;
+        zstd_database_phase(
+            cancellation,
+            mark_existing_compression_complete(db, config, total_rows, cancellation),
+        )
+        .await?;
     }
 
     Ok(EnsureCompressionResult {
@@ -1057,29 +1376,39 @@ async fn verify_sqlite_zstd_registered(db: &SqliteDatabase) -> Result<()> {
     .map(|_| ())
 }
 
-async fn compression_is_enabled(db: &SqliteDatabase, config: ZstdColumnConfig) -> Result<bool> {
-    let backing_table = query_i64(
-        db,
-        format!(
-            "SELECT COUNT(*) AS value \
+async fn compression_is_enabled(
+    db: &SqliteDatabase,
+    config: ZstdColumnConfig,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<bool> {
+    let backing_table = zstd_database_phase(
+        cancellation,
+        query_i64(
+            db,
+            format!(
+                "SELECT COUNT(*) AS value \
          FROM sqlite_master \
          WHERE type = 'table' AND name = '{}'",
-            config.backing_table
-        )
-        .as_str(),
-        "failed to detect sqlite-zstd backing table",
+                config.backing_table
+            )
+            .as_str(),
+            "failed to detect sqlite-zstd backing table",
+        ),
     )
     .await?;
-    let compressed_view = query_i64(
-        db,
-        format!(
-            "SELECT COUNT(*) AS value \
+    let compressed_view = zstd_database_phase(
+        cancellation,
+        query_i64(
+            db,
+            format!(
+                "SELECT COUNT(*) AS value \
          FROM sqlite_master \
          WHERE type = 'view' AND name = '{}'",
-            config.table
-        )
-        .as_str(),
-        "failed to detect sqlite-zstd view",
+                config.table
+            )
+            .as_str(),
+            "failed to detect sqlite-zstd view",
+        ),
     )
     .await?;
 
@@ -1112,7 +1441,7 @@ async fn enable_transparent_compression(
 }
 
 async fn pending_uncompressed_rows(db: &SqliteDatabase, config: ZstdColumnConfig) -> Result<u64> {
-    if !compression_is_enabled(db, config).await? {
+    if !compression_is_enabled(db, config, None).await? {
         return Ok(0);
     }
     query_i64(
@@ -1216,9 +1545,19 @@ async fn mark_existing_compression_complete<C: ConnectionTrait>(
     db: &C,
     config: ZstdColumnConfig,
     total_rows: u64,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<()> {
-    let Some(meta) = find_projection_meta(db, config.projection_key).await? else {
-        return mark_compression_complete(db, config, total_rows).await;
+    let Some(meta) = zstd_database_phase(
+        cancellation,
+        find_projection_meta(db, config.projection_key),
+    )
+    .await?
+    else {
+        return zstd_database_phase(
+            cancellation,
+            mark_compression_complete(db, config, total_rows),
+        )
+        .await;
     };
 
     if meta.projection_version == config.projection_version
@@ -1227,7 +1566,11 @@ async fn mark_existing_compression_complete<C: ConnectionTrait>(
         return Ok(());
     }
 
-    mark_compression_complete(db, config, total_rows).await
+    zstd_database_phase(
+        cancellation,
+        mark_compression_complete(db, config, total_rows),
+    )
+    .await
 }
 
 async fn mark_compression_failed<C: ConnectionTrait>(
@@ -1308,17 +1651,81 @@ mod tests {
     struct BudgetSchedulingObserver {
         reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadEvent>>,
         writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+        writer_queued: Notify,
+        reader_queued: Notify,
+        cancel_on_writer_admission: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
     }
 
     impl pioneer_sqlite::SqliteReadObserver for BudgetSchedulingObserver {
         fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
             self.reads.lock().unwrap().push(event);
+            if matches!(event, pioneer_sqlite::SqliteReadEvent::AdmissionEnqueued { queue_depth, active, .. } if queue_depth != 0 && active != 0)
+            {
+                self.reader_queued.notify_one();
+            }
         }
     }
 
     impl pioneer_sqlite::SqliteWriteObserver for BudgetSchedulingObserver {
         fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
             self.writes.lock().unwrap().push(event);
+            match event {
+                pioneer_sqlite::SqliteWriteEvent::Enqueued {
+                    class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                    queue,
+                } if queue.maintenance != 0 => {
+                    self.writer_queued.notify_one();
+                }
+                pioneer_sqlite::SqliteWriteEvent::Acquired {
+                    class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                    ..
+                } => {
+                    if let Some(token) = self.cancel_on_writer_admission.lock().unwrap().take() {
+                        token.cancel();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    impl BudgetSchedulingObserver {
+        async fn wait_for_writer_queue(&self) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if self.writes.lock().unwrap().iter().any(|event| {
+                        matches!(event,
+                            pioneer_sqlite::SqliteWriteEvent::Enqueued {
+                                class: pioneer_sqlite::SqliteWriteClass::Maintenance, queue,
+                            } if queue.maintenance == 1
+                        )
+                    }) {
+                        return;
+                    }
+                    self.writer_queued.notified().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        fn assert_writer_queue_cancelled(&self) {
+            let events = self.writes.lock().unwrap();
+            assert!(
+                events.iter().any(|event| matches!(event,
+                    pioneer_sqlite::SqliteWriteEvent::Cancelled {
+                        class: pioneer_sqlite::SqliteWriteClass::Maintenance, queue, ..
+                    } if queue.maintenance == 0
+                )),
+                "RAII must remove the queued reservation while the writer is still held"
+            );
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                pioneer_sqlite::SqliteWriteEvent::Acquired {
+                    class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                    ..
+                }
+            )));
         }
     }
 
@@ -1409,6 +1816,716 @@ mod tests {
             store,
             observer,
             payloads,
+        }
+    }
+
+    // Observe actual CDict copies in the blocking miss path, rather than
+    // counting calls to cache/compressor constructors.
+    async fn prepare_cached_fixture(
+        cache: &mut super::PreparedDictionaryCache,
+        db: &pioneer_sqlite::SqliteDatabase,
+        config: super::ZstdColumnConfig,
+        id: i64,
+        bytes: Option<&[u8]>,
+    ) -> Vec<super::PreparedPayloadRow> {
+        super::prepare_payload_batch(
+            cache,
+            db,
+            config,
+            vec![super::PendingPayloadRow {
+                rowid: 1,
+                id: "fixture".into(),
+                payload: "shared payload dictionary content".repeat(32),
+            }],
+            super::CompressionDictionary {
+                id,
+                bytes: bytes.map(<[u8]>::to_vec),
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn prepared_dictionaries_reuse_across_batches_and_outer_cycles() {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let fixture = budget_fixture(&vec!["shared payload dictionary content"; 65]).await;
+        let db = fixture
+            .store
+            .with_maintenance_access()
+            .database_connection();
+        let bytes = b"shared payload dictionary content";
+        for &config in ZSTD_PAYLOAD_COLUMNS {
+            super::persist_compression_dictionary(&db, config, bytes.to_vec(), None)
+                .await
+                .unwrap();
+        }
+        let mut cache = super::PreparedDictionaryCache::new(&fixture.store);
+        let preparations = cache.preparations.clone();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cycles = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(Notify::new());
+        let owners = Arc::new(Mutex::new(Vec::new()));
+        let (observed_cycles, cycle_completed, observed_owners, cycle_cancellation) = (
+            cycles.clone(),
+            completed.clone(),
+            owners.clone(),
+            cancellation.clone(),
+        );
+        cache.after_cycle = Some(Arc::new(move |cache| {
+            // Observe the real worker's outer loop after each column has run
+            // three bounded batches, including the sleep/recheck boundary.
+            let cycle = observed_cycles.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(cache.preparations.load(Ordering::SeqCst), 2);
+            assert_eq!(cache.entries.iter().flatten().count(), 2);
+            let actual_native_bytes = cache
+                .entries
+                .iter()
+                .flatten()
+                .map(|entry| entry.dictionary.as_cdict().sizeof())
+                .sum::<usize>();
+            assert_eq!(cache.retained_native_bytes(), actual_native_bytes);
+            assert!(actual_native_bytes > 2 * bytes.len());
+            let mut owners = observed_owners.lock().unwrap();
+            for (index, entry) in cache.entries.iter().enumerate() {
+                let entry = entry.as_ref().unwrap();
+                assert_eq!(
+                    Arc::strong_count(&entry.dictionary),
+                    1,
+                    "completed jobs retain no extra Arc"
+                );
+                if cycle == 0 {
+                    owners.push(Arc::downgrade(&entry.dictionary));
+                } else {
+                    assert!(owners[index].ptr_eq(&Arc::downgrade(&entry.dictionary)));
+                }
+            }
+            cycle_completed.notify_one();
+            if cycle == 1 {
+                cycle_cancellation.cancel();
+            }
+        }));
+        let worker = tokio::spawn(crate::database::maintenance::run_zstd_worker_for_test(
+            Arc::new(fixture.store.clone()),
+            cancellation,
+            cache,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), completed.notified())
+            .await
+            .unwrap();
+        for (index, &config) in ZSTD_PAYLOAD_COLUMNS.iter().enumerate() {
+            let rows = db
+                .query_all_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    format!("SELECT payload FROM {}", config.table),
+                ))
+                .await
+                .unwrap();
+            let mut actual = rows
+                .iter()
+                .map(|row| row.try_get::<String>("", "payload").unwrap())
+                .collect::<Vec<_>>();
+            let mut expected = fixture.payloads[index].clone();
+            actual.sort();
+            expected.sort();
+            assert_eq!(
+                actual, expected,
+                "existing domain fixtures decode through the unchanged view"
+            );
+            assert!(
+                load_pending_payload_rows(&db, config, 32, 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            db.execute_unprepared(&format!("UPDATE {} SET payload = payload", config.table))
+                .await
+                .unwrap();
+        }
+        // Skip the worker's actual idle delay after repopulating both sources.
+        // Resume wall-clock timers before DB/CPU waits, so test timeouts do not
+        // auto-advance while SQLite's native threads complete their work.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(
+            super::PERIODIC_MAINTENANCE_INTERVAL_SECONDS,
+        ))
+        .await;
+        tokio::time::resume();
+        tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cycles.load(Ordering::SeqCst), 2);
+        assert_eq!(preparations.load(Ordering::SeqCst), 2);
+        for &config in ZSTD_PAYLOAD_COLUMNS {
+            assert!(
+                load_pending_payload_rows(&db, config, 32, 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(
+            owners
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|owner| owner.upgrade().is_none()),
+            "actual worker shutdown releases CDicts"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_cache_replaces_identity_and_releases_old_generations() {
+        use std::sync::atomic::Ordering;
+        let fixture = budget_fixture(&["shared payload dictionary content"]).await;
+        let db = fixture.store.database_connection();
+        let mut cache = super::PreparedDictionaryCache::new(&fixture.store);
+        let first_bytes = b"shared payload dictionary content";
+        prepare_cached_fixture(&mut cache, &db, TURN_EVENT_PAYLOAD, 1, Some(first_bytes)).await;
+        let first = Arc::downgrade(&cache.entries[0].as_ref().unwrap().dictionary);
+        prepare_cached_fixture(&mut cache, &db, TURN_EVENT_PAYLOAD, 1, Some(first_bytes)).await;
+        assert_eq!(cache.preparations.load(Ordering::SeqCst), 1);
+        assert!(first.ptr_eq(&Arc::downgrade(
+            &cache.entries[0].as_ref().unwrap().dictionary
+        )));
+        // New ID with identical bytes still changes the identity.
+        prepare_cached_fixture(&mut cache, &db, TURN_EVENT_PAYLOAD, 2, Some(first_bytes)).await;
+        assert!(first.upgrade().is_none());
+        let rotated = Arc::downgrade(&cache.entries[0].as_ref().unwrap().dictionary);
+        // No DB mutation here: changing persisted bytes would also invalidate
+        // historical decoding. This exercises a changed read snapshot's key.
+        prepare_cached_fixture(
+            &mut cache,
+            &db,
+            TURN_EVENT_PAYLOAD,
+            2,
+            Some(b"different shared content"),
+        )
+        .await;
+        assert!(rotated.upgrade().is_none());
+        let changed = Arc::downgrade(&cache.entries[0].as_ref().unwrap().dictionary);
+        let different_level = super::ZstdColumnConfig {
+            compression_level: 18,
+            ..TURN_EVENT_PAYLOAD
+        };
+        prepare_cached_fixture(
+            &mut cache,
+            &db,
+            different_level,
+            2,
+            Some(b"different shared content"),
+        )
+        .await;
+        assert!(changed.upgrade().is_none());
+        assert_eq!(cache.preparations.load(Ordering::SeqCst), 4);
+        prepare_cached_fixture(&mut cache, &db, TURN_ITEM_PAYLOAD, 2, Some(first_bytes)).await;
+        assert_eq!(cache.entries.iter().flatten().count(), 2);
+        assert_eq!(cache.preparations.load(Ordering::SeqCst), 5);
+        let event = Arc::downgrade(&cache.entries[0].as_ref().unwrap().dictionary);
+        let item = Arc::downgrade(&cache.entries[1].as_ref().unwrap().dictionary);
+        let raw = prepare_cached_fixture(&mut cache, &db, TURN_EVENT_PAYLOAD, -1, None).await;
+        assert!(event.upgrade().is_none());
+        assert_eq!(
+            raw[0].compressed_payload,
+            pioneer_sqlite::zstd::compress_column_value(
+                raw[0].original_payload.as_bytes(),
+                19,
+                None
+            )
+            .unwrap()
+        );
+        prepare_cached_fixture(&mut cache, &db, TURN_ITEM_PAYLOAD, -1, Some(b"")).await;
+        assert!(item.upgrade().is_none());
+        assert_eq!(
+            cache.preparations.load(Ordering::SeqCst),
+            5,
+            "no CDict for empty/no dictionary"
+        );
+        assert_eq!(cache.retained_native_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn prepared_cache_is_private_to_its_database_worker() {
+        use std::sync::atomic::Ordering;
+        let first = budget_fixture(&["shared content"]).await;
+        let second = budget_fixture(&["shared content"]).await;
+        let mut first_cache = super::PreparedDictionaryCache::new(&first.store);
+        let mut second_cache = super::PreparedDictionaryCache::new(&second.store);
+        let first_db = first.store.database_connection();
+        let second_db = second.store.database_connection();
+        for (cache, db) in [
+            (&mut first_cache, &first_db),
+            (&mut second_cache, &second_db),
+        ] {
+            prepare_cached_fixture(cache, db, TURN_EVENT_PAYLOAD, 1, Some(b"shared content")).await;
+            assert_eq!(cache.preparations.load(Ordering::SeqCst), 1);
+        }
+        assert!(!Arc::ptr_eq(
+            &first_cache.entries[0].as_ref().unwrap().dictionary,
+            &second_cache.entries[0].as_ref().unwrap().dictionary
+        ));
+        let error = super::prepare_payload_batch(
+            &mut first_cache,
+            &second_db,
+            TURN_EVENT_PAYLOAD,
+            Vec::new(),
+            super::CompressionDictionary {
+                id: 1,
+                bytes: Some(b"shared content".to_vec()),
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("different database worker"));
+        assert_eq!(first_cache.preparations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_cpu_does_not_prepare_or_apply() {
+        use std::sync::atomic::Ordering;
+        let fixture = budget_fixture(&["shared content"]).await;
+        let mut cache = super::PreparedDictionaryCache::new(&fixture.store);
+        let db = fixture.store.database_connection();
+        let rows = load_pending_payload_rows(&db, TURN_EVENT_PAYLOAD, 32, 1024 * 1024)
+            .await
+            .unwrap();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        assert!(
+            super::prepare_payload_batch(
+                &mut cache,
+                &db,
+                TURN_EVENT_PAYLOAD,
+                rows,
+                super::CompressionDictionary {
+                    id: 1,
+                    bytes: Some(b"shared content".to_vec())
+                },
+                Some(&cancellation),
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let outcome = super::run_cooperative_maintenance_cycle(
+            &fixture.store,
+            &mut cache,
+            ZSTD_PAYLOAD_COLUMNS,
+            None,
+            1.0,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.cancelled);
+        assert_eq!(cache.preparations.load(Ordering::SeqCst), 0);
+        assert_eq!(cache.retained_native_bytes(), 0);
+        assert_eq!(
+            load_pending_payload_rows(&db, TURN_EVENT_PAYLOAD, 32, 1024 * 1024)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(fixture.observer.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_cpu_drains_join_without_db_apply_or_arc_leak() {
+        use std::sync::{Mutex, atomic::Ordering};
+        let fixture = budget_fixture(&["shared content"]).await;
+        let store = fixture.store.clone().with_maintenance_access();
+        let db = store.database_connection();
+        let dictionary = super::persist_compression_dictionary(
+            &db,
+            TURN_EVENT_PAYLOAD,
+            b"shared content".to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut cache = super::PreparedDictionaryCache::new(&store);
+        prepare_cached_fixture(
+            &mut cache,
+            &db,
+            TURN_EVENT_PAYLOAD,
+            dictionary.id,
+            dictionary.bytes.as_deref(),
+        )
+        .await;
+        let owner = Arc::downgrade(&cache.entries[0].as_ref().unwrap().dictionary);
+        fixture.observer.writes.lock().unwrap().clear();
+        let entered = Arc::new(Notify::new());
+        let (release, receiver) = std::sync::mpsc::channel::<()>();
+        let receiver = Mutex::new(receiver);
+        let cpu_entered = entered.clone();
+        cache.after_cpu = Some(Arc::new(move || {
+            cpu_entered.notify_one();
+            // Sender drop also releases this job on test panic.
+            let _ = receiver
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10));
+        }));
+        let preparations = cache.preparations.clone();
+        let (token_send, token_receive) = tokio::sync::oneshot::channel();
+        let (outcome_send, outcome_receive) = tokio::sync::oneshot::channel();
+        let mut supervisor =
+            crate::post_startup::PostStartupSupervisor::start(move |scope| async move {
+                let job_cancellation = scope.cancellation();
+                token_send.send(job_cancellation.clone()).unwrap();
+                let outcome = super::run_one_compression_batch(
+                    &store,
+                    &mut cache,
+                    &db,
+                    TURN_EVENT_PAYLOAD,
+                    Some(&job_cancellation),
+                )
+                .await;
+                assert_eq!(cache.entries.iter().flatten().count(), 1);
+                outcome_send.send(outcome).unwrap();
+            });
+        let cancellation = token_receive.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        let shutdown = tokio::spawn(async move {
+            supervisor.shutdown().await;
+        });
+        cancellation.cancelled().await;
+        assert!(
+            !shutdown.is_finished(),
+            "started native work must still be owned and awaited"
+        );
+        assert_eq!(
+            owner.strong_count(),
+            1,
+            "the in-flight slot retains its CDict"
+        );
+        // Both DB contours remain available while CPU/join is blocked.
+        let interactive_db = fixture.store.database_connection();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            assert_eq!(
+                load_pending_payload_rows(&interactive_db, TURN_EVENT_PAYLOAD, 32, 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            interactive_db
+                .execute_unprepared("UPDATE turn_event SET payload = payload WHERE id = 'event_0'")
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        drop(release);
+        tokio::time::timeout(std::time::Duration::from_secs(5), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome = outcome_receive.await.unwrap().unwrap();
+        assert_eq!(outcome.applied_rows, 0);
+        assert!(outcome.more_pending);
+        assert_eq!(preparations.load(Ordering::SeqCst), 1);
+        assert!(
+            fixture
+                .observer
+                .writes
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(
+                    event,
+                    pioneer_sqlite::SqliteWriteEvent::Acquired {
+                        class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                        ..
+                    }
+                )),
+            "cancelled preparation must never submit its maintenance apply"
+        );
+        assert_eq!(
+            load_pending_payload_rows(&interactive_db, TURN_EVENT_PAYLOAD, 32, 1024 * 1024)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            owner.upgrade().is_none(),
+            "supervisor shutdown releases the worker cache and completed CPU references"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_of_queued_apply_finishes_shutdown_before_writer_release() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fixture = budget_fixture(&["shared content"]).await;
+        let store = fixture.store.clone().with_maintenance_access();
+        let db = store.database_connection();
+        let dictionary = super::persist_compression_dictionary(
+            &db,
+            TURN_EVENT_PAYLOAD,
+            b"shared content".to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut cache = super::PreparedDictionaryCache::new(&store);
+        prepare_cached_fixture(
+            &mut cache,
+            &db,
+            TURN_EVENT_PAYLOAD,
+            dictionary.id,
+            dictionary.bytes.as_deref(),
+        )
+        .await;
+        let owner = Arc::downgrade(&cache.entries[0].as_ref().unwrap().dictionary);
+        let cpu_completed = Arc::new(AtomicBool::new(false));
+        let observed_cpu = cpu_completed.clone();
+        cache.after_cpu = Some(Arc::new(move || {
+            observed_cpu.store(true, Ordering::SeqCst);
+        }));
+        let interactive = fixture.store.database_connection();
+        let held_writer = interactive.begin().await.unwrap();
+        fixture.observer.writes.lock().unwrap().clear();
+        let (result_send, result_receive) = tokio::sync::oneshot::channel();
+        let mut supervisor =
+            crate::post_startup::PostStartupSupervisor::start(move |scope| async move {
+                let cancellation = scope.cancellation();
+                let result = super::run_one_compression_batch(
+                    &store,
+                    &mut cache,
+                    &db,
+                    TURN_EVENT_PAYLOAD,
+                    Some(&cancellation),
+                )
+                .await;
+                result_send.send(result).unwrap();
+            });
+        fixture.observer.wait_for_writer_queue().await;
+        assert!(cpu_completed.load(Ordering::SeqCst));
+        // Shutdown must complete without releasing the occupied writer.
+        tokio::time::timeout(std::time::Duration::from_secs(5), supervisor.shutdown())
+            .await
+            .unwrap();
+        let error = result_receive.await.unwrap().unwrap_err();
+        assert!(error.is::<super::ZstdDatabaseCancelled>());
+        fixture.observer.assert_writer_queue_cancelled();
+        assert!(owner.upgrade().is_none());
+        let pending = load_pending_payload_rows(&interactive, TURN_EVENT_PAYLOAD, 32, 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].payload, fixture.payloads[0][0]);
+        held_writer.rollback().await.unwrap();
+        // A subsequent real writer operation also proves that no cancelled
+        // reservation can be dispatched after the held writer releases.
+        interactive
+            .execute_unprepared("UPDATE turn_event SET payload = payload WHERE id = 'event_0'")
+            .await
+            .unwrap();
+        fixture.observer.assert_writer_queue_cancelled();
+        let pending = load_pending_payload_rows(&interactive, TURN_EVENT_PAYLOAD, 32, 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1); // Includes _payload_dict IS NULL.
+        assert_eq!(pending[0].payload, fixture.payloads[0][0]);
+    }
+
+    #[tokio::test]
+    async fn cancellation_of_queued_trained_dictionary_does_not_persist() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let text =
+            "shared dictionary training content with repeated field names and values ".repeat(1000);
+        let fixture = budget_fixture(&vec![text.as_str(); 16]).await;
+        let store = fixture.store.clone().with_maintenance_access();
+        let db = store.database_connection();
+        let mut cache = super::PreparedDictionaryCache::new(&store);
+        let training_completed = Arc::new(AtomicBool::new(false));
+        let observed_training = training_completed.clone();
+        cache.after_training = Some(Arc::new(move || {
+            observed_training.store(true, Ordering::SeqCst);
+        }));
+        let preparations = cache.preparations.clone();
+        let interactive = fixture.store.database_connection();
+        let held_writer = interactive.begin().await.unwrap();
+        fixture.observer.writes.lock().unwrap().clear();
+        let (result_send, result_receive) = tokio::sync::oneshot::channel();
+        let mut supervisor =
+            crate::post_startup::PostStartupSupervisor::start(move |scope| async move {
+                let cancellation = scope.cancellation();
+                // Stop at the real resolver: training failure must not make
+                // this regression accidentally observe a no-dictionary apply.
+                let result = super::resolve_compression_dictionary(
+                    &store,
+                    &db,
+                    TURN_EVENT_PAYLOAD,
+                    Some(&cancellation),
+                    cache.after_training.clone(),
+                )
+                .await;
+                result_send.send(result).unwrap();
+            });
+        fixture.observer.wait_for_writer_queue().await;
+        assert!(training_completed.load(Ordering::SeqCst));
+        tokio::time::timeout(std::time::Duration::from_secs(5), supervisor.shutdown())
+            .await
+            .unwrap();
+        assert!(
+            result_receive
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is::<super::ZstdDatabaseCancelled>()
+        );
+        fixture.observer.assert_writer_queue_cancelled();
+        assert_eq!(preparations.load(Ordering::SeqCst), 0);
+        assert!(
+            load_compression_dictionary(&interactive, TURN_EVENT_PAYLOAD)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        held_writer.rollback().await.unwrap();
+        let next_writer = interactive.begin().await.unwrap();
+        next_writer.rollback().await.unwrap();
+        fixture.observer.assert_writer_queue_cancelled();
+        assert!(
+            load_compression_dictionary(&interactive, TURN_EVENT_PAYLOAD)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let pending =
+            load_pending_payload_rows(&interactive, TURN_EVENT_PAYLOAD, 32, 1024 * 1024 * 2)
+                .await
+                .unwrap();
+        assert_eq!(pending.len(), 16);
+        assert_eq!(pending[0].payload, fixture.payloads[0][0]);
+    }
+
+    #[tokio::test]
+    async fn cancellation_of_queued_schema_read_stops_worker_before_cpu_or_next_quantum() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let fixture = budget_fixture(&["shared content"]).await;
+        let store = Arc::new(fixture.store.clone().with_maintenance_access());
+        let db = store.database_connection();
+        let held_reader = db.begin_read().await.unwrap();
+        fixture.observer.reads.lock().unwrap().clear();
+        fixture.observer.writes.lock().unwrap().clear();
+        let mut cache = super::PreparedDictionaryCache::new(&store);
+        let preparations = cache.preparations.clone();
+        let trainings = Arc::new(AtomicUsize::new(0));
+        let observed_trainings = trainings.clone();
+        cache.after_training = Some(Arc::new(move || {
+            observed_trainings.fetch_add(1, Ordering::SeqCst);
+        }));
+        let mut supervisor =
+            crate::post_startup::PostStartupSupervisor::start(move |scope| async move {
+                crate::database::maintenance::run_zstd_worker_for_test(
+                    store,
+                    scope.cancellation(),
+                    cache,
+                )
+                .await;
+            });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fixture.observer.reader_queued.notified(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), supervisor.shutdown())
+            .await
+            .unwrap();
+        {
+            let events = fixture.observer.reads.lock().unwrap();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                pioneer_sqlite::SqliteReadEvent::AdmissionCancelled {
+                    queue_depth: 0,
+                    active: 1,
+                    ..
+                }
+            )));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        pioneer_sqlite::SqliteReadEvent::AdmissionEnqueued { .. }
+                    ))
+                    .count(),
+                1,
+                "no next DB phase or repeated quantum after cancellation"
+            );
+        }
+        assert!(fixture.observer.writes.lock().unwrap().is_empty());
+        assert_eq!(preparations.load(Ordering::SeqCst), 0);
+        assert_eq!(trainings.load(Ordering::SeqCst), 0);
+        held_reader.rollback().await.unwrap();
+        // Runtime read capacity remains reusable after the queued wait is dropped.
+        let pending = load_pending_payload_rows(&db, TURN_EVENT_PAYLOAD, 32, 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(pending[0].payload, fixture.payloads[0][0]);
+    }
+
+    #[tokio::test]
+    async fn cancellation_at_writer_admission_guards_both_mutation_paths() {
+        let fixture = budget_fixture(&["shared content"]).await;
+        let store = fixture.store.clone().with_maintenance_access();
+        let db = store.database_connection();
+        let rows = load_pending_payload_rows(&db, TURN_EVENT_PAYLOAD, 32, 1024 * 1024)
+            .await
+            .unwrap();
+        let prepared = prepare_payload_rows(rows, 19, None).unwrap();
+        for dictionary_commit in [false, true] {
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            *fixture.observer.cancel_on_writer_admission.lock().unwrap() =
+                Some(cancellation.clone());
+            // Await the admitted transaction itself, so this exercises the
+            // explicit post-admission guard rather than the outer select.
+            let result = if dictionary_commit {
+                super::persist_compression_dictionary(
+                    &db,
+                    TURN_EVENT_PAYLOAD,
+                    b"candidate".to_vec(),
+                    Some(&cancellation),
+                )
+                .await
+                .map(|_| ())
+            } else {
+                apply_prepared_payload_rows(
+                    &db,
+                    TURN_EVENT_PAYLOAD,
+                    -1,
+                    &prepared,
+                    Some(&cancellation),
+                )
+                .await
+                .map(|_| ())
+            };
+            assert!(result.unwrap_err().is::<super::ZstdDatabaseCancelled>());
+            let pending = load_pending_payload_rows(&db, TURN_EVENT_PAYLOAD, 32, 1024 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].payload, fixture.payloads[0][0]);
+            assert!(
+                load_compression_dictionary(&db, TURN_EVENT_PAYLOAD)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 
@@ -1507,13 +2624,13 @@ mod tests {
             assert!(first[0].payload.len() > 4096);
             let prepared = prepare_payload_rows(first, 1, None).unwrap();
             assert_eq!(
-                apply_prepared_payload_rows(&db, config, -1, &prepared)
+                apply_prepared_payload_rows(&db, config, -1, &prepared, None)
                     .await
                     .unwrap(),
                 (1, 0)
             );
             assert_eq!(
-                apply_prepared_payload_rows(&db, config, -1, &prepared)
+                apply_prepared_payload_rows(&db, config, -1, &prepared, None)
                     .await
                     .unwrap(),
                 (0, 1),
@@ -1549,7 +2666,7 @@ mod tests {
             .await
             .unwrap();
             assert!(
-                apply_prepared_payload_rows(&db, config, -1, &prepared)
+                apply_prepared_payload_rows(&db, config, -1, &prepared, None)
                     .await
                     .is_err()
             );
@@ -1565,7 +2682,7 @@ mod tests {
                 "a failure on the second row must roll back the first row too"
             );
             assert_eq!(
-                apply_prepared_payload_rows(&db, config, -1, &prepared)
+                apply_prepared_payload_rows(&db, config, -1, &prepared, None)
                     .await
                     .unwrap(),
                 (2, 0)
@@ -2003,12 +3120,18 @@ mod tests {
             .expect("dictionary lookup should work")
             .expect("dictionary should exist");
         let dictionary_id = dictionary.id;
-        let prepared = prepare_payload_rows(
+        let mut cache = super::PreparedDictionaryCache::new(&store);
+        let prepared = super::prepare_payload_batch(
+            &mut cache,
+            &maintenance_db,
+            TURN_ITEM_PAYLOAD,
             rows,
-            TURN_ITEM_PAYLOAD.compression_level,
-            dictionary.bytes.as_deref(),
+            dictionary,
+            None,
         )
-        .expect("payload preparation should work");
+        .await
+        .expect("payload preparation should work")
+        .unwrap();
 
         upsert_agent_message_turn_item(
             &connection,
@@ -2023,6 +3146,7 @@ mod tests {
             TURN_ITEM_PAYLOAD,
             dictionary_id,
             prepared.as_slice(),
+            None,
         )
         .await
         .expect("stale maintenance commit should be harmless");

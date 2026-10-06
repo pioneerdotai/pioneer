@@ -1,3 +1,9 @@
+#[path = "tests/agent_action_outbox.rs"]
+mod agent_action_outbox;
+
+#[path = "tests/compaction_lifecycle_poll.rs"]
+mod compaction_lifecycle_poll;
+
 #[path = "tests/task_run_occurrence_tracker.rs"]
 mod task_run_occurrence_tracker;
 
@@ -33155,11 +33161,16 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
 
     let mut child_dispatched = false;
     for _ in 0..200 {
-        if crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
-            .await
-            .expect("direct Agent outbox dispatch should succeed")
-            > 0
-        {
+        let batch =
+            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                .await
+                .expect("direct Agent outbox dispatch should succeed");
+        assert!(
+            batch.errors.is_empty(),
+            "direct Agent outbox storage should succeed: {:?}",
+            batch.errors
+        );
+        if batch.delivered > 0 {
             child_dispatched = true;
             break;
         }
@@ -75656,7 +75667,7 @@ async fn check_completed_history(
             );
             let missing = harness
                 .crud_store
-                .compaction_lifecycle_recovery((phase_13_now_secs() as u64) * 1000, "")
+                .compaction_due_lifecycle(phase_13_now_secs() * 1000)
                 .await
                 .unwrap();
             assert_eq!(
@@ -75664,7 +75675,16 @@ async fn check_completed_history(
                 1,
                 "committed checkpoint is missing terminal publication"
             );
-            assert_eq!(missing[0].status, "completed");
+            assert_eq!(
+                harness
+                    .crud_store
+                    .compaction_operation(&missing[0].operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "completed"
+            );
             assert!(provider.call_count() > 0);
             Some(provider.call_count())
         } else {

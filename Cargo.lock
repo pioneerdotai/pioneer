@@ -9364,6 +9364,7 @@ dependencies = [
  "pioneer-runtime-events",
  "pioneer-skills",
  "pioneer-tools",
+ "sentry",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -9371,6 +9372,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -9556,6 +9558,7 @@ version = "0.56.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "futures-util",
  "hex",
  "pioneer-compaction",
  "pioneer-entity",
@@ -9864,6 +9867,7 @@ dependencies = [
  "url",
  "uuid",
  "zeroize",
+ "zstd 0.14.0",
 ]
 
 [[package]]

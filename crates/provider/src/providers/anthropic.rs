@@ -3,7 +3,7 @@ use crate::attachments::{
     ensure_no_unrendered_attachments, prepare_messages_for_provider_async,
 };
 use crate::reasoning_registry;
-use crate::tools::stream::{IncrementalLineDecoder, sse_data};
+use crate::tools::stream::IncrementalSseDecoder;
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
     ProviderInputCapabilities, ProviderReplayState, ProviderTermination, ProviderTimeoutPolicy,
@@ -113,9 +113,18 @@ struct AnthropicToolDefinition {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct AnthropicToolChoice {
+    #[serde(flatten)]
+    mode: AnthropicToolChoiceMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disable_parallel_tool_use: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum AnthropicToolChoice {
+enum AnthropicToolChoiceMode {
     Auto,
+    None,
     Any,
     Tool { name: String },
 }
@@ -194,6 +203,14 @@ struct StreamEvent {
     /// Present on `content_block_start` events — carries the block type.
     #[serde(default)]
     content_block: Option<StreamContentBlock>,
+    #[serde(default)]
+    error: Option<StreamNativeError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamNativeError {
+    #[serde(default, rename = "type")]
+    error_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,6 +221,8 @@ struct StreamMessage {
 
 #[derive(Debug, Deserialize)]
 struct StreamDelta {
+    #[serde(default, rename = "type")]
+    delta_type: Option<String>,
     #[serde(default)]
     stop_reason: Option<String>,
     #[serde(default)]
@@ -224,6 +243,8 @@ struct StreamDelta {
 struct StreamContentBlock {
     #[serde(rename = "type")]
     block_type: String,
+    #[serde(default)]
+    text: Option<String>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -301,7 +322,10 @@ impl AnthropicProvider {
                 .tools
                 .as_ref()
                 .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.clone().map(Self::convert_tool_choice),
+            tool_choice: Self::convert_tool_choice(
+                request.tool_choice.clone(),
+                request.parallel_tool_calls,
+            ),
             output_config: None,
             stream,
         })
@@ -478,13 +502,23 @@ impl AnthropicProvider {
             .collect()
     }
 
-    fn convert_tool_choice(choice: ToolChoice) -> AnthropicToolChoice {
-        match choice {
-            ToolChoice::Auto => AnthropicToolChoice::Auto,
-            ToolChoice::None => AnthropicToolChoice::Auto,
-            ToolChoice::Required => AnthropicToolChoice::Any,
-            ToolChoice::Tool { name } => AnthropicToolChoice::Tool { name },
+    fn convert_tool_choice(
+        choice: Option<ToolChoice>,
+        parallel: Option<bool>,
+    ) -> Option<AnthropicToolChoice> {
+        if choice.is_none() && parallel.is_none() {
+            return None;
         }
+        let mode = match choice.unwrap_or(ToolChoice::Auto) {
+            ToolChoice::Auto => AnthropicToolChoiceMode::Auto,
+            ToolChoice::None => AnthropicToolChoiceMode::None,
+            ToolChoice::Required => AnthropicToolChoiceMode::Any,
+            ToolChoice::Tool { name } => AnthropicToolChoiceMode::Tool { name },
+        };
+        Some(AnthropicToolChoice {
+            mode,
+            disable_parallel_tool_use: parallel.map(|enabled| !enabled),
+        })
     }
 
     fn messages_url(&self) -> String {
@@ -646,109 +680,25 @@ impl PendingToolUse {
     }
 }
 
-#[async_trait]
-impl crate::traits::Provider for AnthropicProvider {
-    fn name(&self) -> &str {
-        "anthropic"
-    }
-
-    fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities {
-            streaming: true,
-            vision: true,
-            tool_calling: true,
-            embeddings: false,
-            transcription: false,
-            input_types: ProviderInputCapabilities {
-                text: true,
-                file: InputTypeSupport::native_inline_only(),
-                image: InputTypeSupport::native_inline_only(),
-                audio: InputTypeSupport::disabled(),
-                video: InputTypeSupport::disabled(),
-            },
-        }
-    }
-
-    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider_async(
-            self.name(),
-            request.model.as_str(),
-            &self.capabilities(),
-            request.rendered_messages_with_compiled_prompt().as_slice(),
-        )
-        .await?;
-        ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let (system, messages) = Self::prepare_messages(&prepared)?;
-
-        let api_request = Self::build_chat_request(&request, system, messages, false)?;
-
-        let request_builder = self
-            .client
-            .post(self.messages_url())
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&api_request);
-        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
-        }
-
-        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
-            response,
-            Default::default(),
-            "provider_response",
-        )
-        .await?;
-        Self::parse_response(api_response)
-    }
-
-    async fn stream_chat(
-        &self,
-        request: ChatRequest,
-    ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let prepared = prepare_messages_for_provider_async(
-            self.name(),
-            request.model.as_str(),
-            &self.capabilities(),
-            request.rendered_messages_with_compiled_prompt().as_slice(),
-        )
-        .await?;
-        ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let (system, messages) = Self::prepare_messages(&prepared)?;
-
-        let api_request = Self::build_chat_request(&request, system, messages, true)?;
-
-        let request_builder = self
-            .client
-            .post(self.messages_url())
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&api_request);
-        let response =
-            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
-
-        if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
-        }
-
-        let byte_stream = crate::http::bounded_response_stream(
-            response,
-            crate::types::ProviderResponseLimits::default().max_transport_bytes,
-            "provider_stream",
-        );
-
+// The same decoder is used by HTTP transport and in-memory regression fixtures.
+impl AnthropicProvider {
+    pub(super) fn decode_stream(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
         tokio::spawn(async move {
             use std::collections::{BTreeMap, HashMap, HashSet};
 
-            let mut decoder = IncrementalLineDecoder::default();
+            let mut decoder = IncrementalSseDecoder::default();
             let mut termination = None;
+            let mut native_terminal_reason: Option<String> = None;
+            // Ordinary Messages profile: no opt-in server-side fallback phases.
+            let mut message_delta_started = false;
+            let mut used_blocks = HashSet::new();
+            let mut block_types = HashMap::new();
+            let mut message_started = false;
+            let mut active_blocks = HashSet::new();
             let mut thinking_blocks = HashSet::new();
             let mut replay_thinking_blocks: BTreeMap<usize, ApiMessageContentBlock> =
                 BTreeMap::new();
@@ -780,18 +730,152 @@ impl crate::traits::Provider for AnthropicProvider {
                         return;
                     }
                 };
-                for line in lines {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    let Some(data) = sse_data(line) else {
-                        continue;
-                    };
+                for frame in lines {
+                    let data = frame.data.as_str();
 
                     match serde_json::from_str::<StreamEvent>(data) {
                         Ok(event) => {
+                            if event.event_type == "error"
+                                || frame.event.as_deref() == Some("error")
+                            {
+                                let error = crate::failure::AnthropicStreamError::from_type(
+                                    event
+                                        .error
+                                        .as_ref()
+                                        .and_then(|error| error.error_type.as_deref()),
+                                );
+                                let _ = tx.send(Err(error.into())).await;
+                                return;
+                            }
+
+                            if event.event_type == "message_start" {
+                                if message_started {
+                                    let _ = tx
+                                        .send(Err(anyhow!("duplicate Anthropic message_start")))
+                                        .await;
+                                    return;
+                                }
+                                message_started = true;
+                            }
+                            if matches!(
+                                event.event_type.as_str(),
+                                "content_block_start"
+                                    | "content_block_delta"
+                                    | "content_block_stop"
+                            ) {
+                                let Some(index) = event.index else {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "Anthropic block event is missing its index"
+                                        )))
+                                        .await;
+                                    return;
+                                };
+                                let valid = message_started
+                                    && !message_delta_started
+                                    && match event.event_type.as_str() {
+                                        "content_block_start" => {
+                                            used_blocks.insert(index) && active_blocks.insert(index)
+                                        }
+                                        "content_block_stop" => active_blocks.remove(&index),
+                                        _ => active_blocks.contains(&index),
+                                    };
+                                if !valid {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "invalid Anthropic content block lifecycle"
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                            }
+                            if event.event_type == "content_block_start" {
+                                let Some(block) = event.content_block.as_ref() else {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "Anthropic block start is missing its payload"
+                                        )))
+                                        .await;
+                                    return;
+                                };
+                                if block.block_type == "tool_use"
+                                    && (block.id.as_deref().is_none_or(str::is_empty)
+                                        || block.name.as_deref().is_none_or(str::is_empty)
+                                        || block.input.is_none())
+                                {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "incomplete Anthropic tool block identity or input"
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                                block_types.insert(event.index.unwrap(), block.block_type.clone());
+                            }
+                            if event.event_type == "content_block_delta" {
+                                let Some(delta) = event.delta.as_ref() else {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "Anthropic block delta is missing its payload"
+                                        )))
+                                        .await;
+                                    return;
+                                };
+                                let block_type =
+                                    block_types.get(&event.index.unwrap()).map(String::as_str);
+                                if delta.delta_type.is_none() {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "Anthropic block delta is missing its type"
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                                let expected = match delta.delta_type.as_deref() {
+                                    Some("text_delta") => Some("text"),
+                                    Some("input_json_delta") => Some("tool_use"),
+                                    Some("thinking_delta" | "signature_delta") => Some("thinking"),
+                                    _ => None,
+                                };
+                                if !matches!(
+                                    block_type,
+                                    Some("text" | "tool_use" | "thinking" | "redacted_thinking")
+                                ) {
+                                    continue;
+                                }
+                                let missing_payload = match delta.delta_type.as_deref() {
+                                    Some("text_delta") => delta.text.is_none(),
+                                    Some("input_json_delta") => delta.partial_json.is_none(),
+                                    Some("thinking_delta") => delta.thinking.is_none(),
+                                    Some("signature_delta") => delta.signature.is_none(),
+                                    _ => false,
+                                };
+                                if missing_payload || (expected.is_some() && expected != block_type)
+                                {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "Anthropic delta contradicts its block type"
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                                // Future delta types are ignored rather than interpreted as executable data.
+                                if expected.is_none() {
+                                    continue;
+                                }
+                            }
+                            if event.event_type == "message_delta" {
+                                if !message_started
+                                    || !active_blocks.is_empty()
+                                    || event.delta.is_none()
+                                {
+                                    let _ = tx
+                                        .send(Err(anyhow!("invalid Anthropic message delta phase")))
+                                        .await;
+                                    return;
+                                }
+                                message_delta_started = true;
+                            }
                             for usage in event
                                 .message
                                 .as_ref()
@@ -808,6 +892,14 @@ impl crate::traits::Provider for AnthropicProvider {
                                 }
                             }
                             if event.event_type == "message_stop" {
+                                if !message_started
+                                    || !message_delta_started
+                                    || !active_blocks.is_empty()
+                                {
+                                    let _ = tx.send(Err(crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into())).await;
+                                    return;
+                                }
+
                                 let remaining_calls = pending_tool_uses
                                     .drain()
                                     .map(|(_, call)| call.finalize())
@@ -866,6 +958,18 @@ impl crate::traits::Provider for AnthropicProvider {
                                 if let Some(reason) =
                                     event.delta.and_then(|delta| delta.stop_reason)
                                 {
+                                    if native_terminal_reason
+                                        .as_deref()
+                                        .is_some_and(|previous| previous != reason)
+                                    {
+                                        let _ = tx
+                                            .send(Err(anyhow!(
+                                                "contradictory Anthropic stop reason"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    native_terminal_reason = Some(reason.clone());
                                     termination =
                                         Some(ProviderTermination::from_openai_reason(&reason));
                                 }
@@ -876,7 +980,35 @@ impl crate::traits::Provider for AnthropicProvider {
                                 let index = event.index.unwrap_or(0);
                                 if let Some(block) = event.content_block.as_ref() {
                                     match block.block_type.as_str() {
+                                        "text" => {
+                                            if let Some(text) =
+                                                block.text.as_ref().filter(|text| !text.is_empty())
+                                            {
+                                                if tx
+                                                    .send(Ok(StreamChunk::delta(text.clone())))
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    return;
+                                                }
+                                            }
+                                        }
                                         "thinking" => {
+                                            if let Some(thinking) = block
+                                                .thinking
+                                                .as_ref()
+                                                .filter(|thinking| !thinking.is_empty())
+                                            {
+                                                if tx
+                                                    .send(Ok(StreamChunk::reasoning(
+                                                        thinking.clone(),
+                                                    )))
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    return;
+                                                }
+                                            }
                                             thinking_blocks.insert(index);
                                             replay_thinking_blocks.insert(
                                                 index,
@@ -1009,9 +1141,9 @@ impl crate::traits::Provider for AnthropicProvider {
                                 }
                             }
                         }
-                        Err(e) => {
+                        Err(_) => {
                             if tx
-                                .send(Err(anyhow!("malformed Anthropic SSE frame: {e}")))
+                                .send(Err(anyhow!("malformed Anthropic SSE frame")))
                                 .await
                                 .is_err()
                             {
@@ -1023,17 +1155,120 @@ impl crate::traits::Provider for AnthropicProvider {
                 }
             }
 
-            let error = decoder
-                .finish()
-                .err()
-                .unwrap_or_else(|| anyhow!("Anthropic stream ended before message_stop"));
+            let error = decoder.finish().err().unwrap_or_else(|| {
+                crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into()
+            });
             if tx.send(Err(error)).await.is_err() {
                 return;
             }
         });
 
         let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(Box::pin(chunk_stream))
+        Box::pin(chunk_stream)
+    }
+}
+
+#[async_trait]
+impl crate::traits::Provider for AnthropicProvider {
+    fn name(&self) -> &str {
+        "anthropic"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: true,
+            vision: true,
+            tool_calling: true,
+            embeddings: false,
+            transcription: false,
+            input_types: ProviderInputCapabilities {
+                text: true,
+                file: InputTypeSupport::native_inline_only(),
+                image: InputTypeSupport::native_inline_only(),
+                audio: InputTypeSupport::disabled(),
+                video: InputTypeSupport::disabled(),
+            },
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
+            self.name(),
+            request.model.as_str(),
+            &self.capabilities(),
+            request.rendered_messages_with_compiled_prompt().as_slice(),
+        )
+        .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
+        ensure_no_unrendered_attachments(self.name(), &prepared)?;
+        let (system, messages) = Self::prepare_messages(&prepared)?;
+
+        let api_request = Self::build_chat_request(&request, system, messages, false)?;
+
+        let request_builder = self
+            .client
+            .post(self.messages_url())
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(&api_request);
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(Self::api_error(response).await);
+        }
+
+        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
+        Self::parse_response(api_response)
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
+            self.name(),
+            request.model.as_str(),
+            &self.capabilities(),
+            request.rendered_messages_with_compiled_prompt().as_slice(),
+        )
+        .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
+        ensure_no_unrendered_attachments(self.name(), &prepared)?;
+        let (system, messages) = Self::prepare_messages(&prepared)?;
+
+        let api_request = Self::build_chat_request(&request, system, messages, true)?;
+
+        let request_builder = self
+            .client
+            .post(self.messages_url())
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(&api_request);
+        let response =
+            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
+
+        if !response.status().is_success() {
+            return Err(Self::api_error(response).await);
+        }
+
+        let byte_stream = crate::http::bounded_response_stream(
+            response,
+            crate::types::ProviderResponseLimits::default().max_transport_bytes,
+            "provider_stream",
+        );
+
+        Ok(Self::decode_stream(byte_stream))
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -1321,6 +1556,42 @@ mod tests {
             .unwrap();
             assert!(body.get("temperature").is_some());
         }
+    }
+
+    #[test]
+    fn native_tool_modes_and_parallel_control_are_nested() {
+        for parallel in [None, Some(true), Some(false)] {
+            for (choice, expected) in [
+                (ToolChoice::Auto, "auto"),
+                (ToolChoice::None, "none"),
+                (ToolChoice::Required, "any"),
+                (
+                    ToolChoice::Tool {
+                        name: "lookup".into(),
+                    },
+                    "tool",
+                ),
+            ] {
+                let value = serde_json::to_value(AnthropicProvider::convert_tool_choice(
+                    Some(choice),
+                    parallel,
+                ))
+                .unwrap();
+                assert_eq!(value["type"], expected);
+                if let Some(enabled) = parallel {
+                    assert_eq!(value["disable_parallel_tool_use"], !enabled);
+                } else {
+                    assert!(value.get("disable_parallel_tool_use").is_none());
+                }
+            }
+        }
+        let default_choice =
+            serde_json::to_value(AnthropicProvider::convert_tool_choice(None, Some(false)))
+                .unwrap();
+        assert_eq!(
+            default_choice,
+            serde_json::json!({"type":"auto","disable_parallel_tool_use":true})
+        );
     }
 
     #[test]

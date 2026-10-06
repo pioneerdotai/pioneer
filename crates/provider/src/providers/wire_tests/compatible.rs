@@ -5,24 +5,25 @@ fn canonical_chat_rounds_keep_nested_arguments_and_ids_for_each_profile() {
     // This covers the actual shared builder for each registered compatible profile.
     // Acceptance by each vendor/model still needs its own contract/recorded response.
     for definition in crate::definition::provider_definitions().filter(|definition| {
-        !matches!(
-            definition.name,
-            "openai"
-                | "anthropic"
-                | "openrouter"
-                | "deepseek"
-                | "gemini"
-                | "ollama"
-                | "telnyx"
-                | "copilot"
-                | "glm"
-                | "zai"
-                | "glm-coding"
-                | "zai-coding"
-                | "local"
-                | "bedrock"
-                | "azure-openai"
-        )
+        definition.retirement_reason().is_none()
+            && !matches!(
+                definition.name,
+                "openai"
+                    | "anthropic"
+                    | "openrouter"
+                    | "deepseek"
+                    | "gemini"
+                    | "ollama"
+                    | "telnyx"
+                    | "copilot"
+                    | "glm"
+                    | "zai"
+                    | "glm-coding"
+                    | "zai-coding"
+                    | "local"
+                    | "bedrock"
+                    | "azure-openai"
+            )
     }) {
         let provider = OpenAiCompatibleProvider::new(
             definition.name,
@@ -102,11 +103,20 @@ fn canonical_chat_rounds_keep_nested_arguments_and_ids_for_each_profile() {
                     let result = &wire["messages"][3 + previous * 2];
                     assert_eq!(call["type"], "function");
                     assert!(call["function"]["arguments"].is_string());
-                    assert_eq!(call["id"], ["forecast_1", "clock_2"][previous]);
+                    let original_id = ["forecast_1", "clock_2"][previous];
+                    if definition.name == "mistral" {
+                        let wire_id = call["id"].as_str().unwrap();
+                        assert_eq!(wire_id.len(), 9);
+                        assert!(wire_id.bytes().all(|b| b.is_ascii_alphanumeric()));
+                        assert_ne!(wire_id, original_id);
+                    } else {
+                        assert_eq!(call["id"], original_id);
+                    }
                     assert_eq!(result["role"], "tool");
                     assert_eq!(result["tool_call_id"], call["id"]);
                 }
             }
+            assert_eq!(request.messages, history, "canonical IDs must be unchanged");
         }
     }
 }
