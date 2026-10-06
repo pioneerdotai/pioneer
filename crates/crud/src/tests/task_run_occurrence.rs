@@ -13,10 +13,18 @@ use sea_orm::sea_query::{ExprTrait, Query};
 const NOW: i64 = 4_000_000_000;
 const MIGRATION: &str = "m20261002_000001_task_run_occurrence_reconcile";
 
+// Event-driven fixture creation needs the cancellation marker columns. Use
+// that production schema prefix, without later irreversible migrations.
+struct TrackerFixtureMigrator;
+
+impl MigratorTrait for TrackerFixtureMigrator {
+    fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+        migrations_through("m20261005_000001_native_cancellation_context")
+    }
+}
+
 fn tracker_rollback_steps() -> u32 {
-    // Later migrations must be removed before this tracker, rather than
-    // assuming that the parent tracker is the final registered migration.
-    (Migrator::migrations()
+    (TrackerFixtureMigrator::migrations()
         .iter()
         .rev()
         .position(|migration| migration.name() == MIGRATION)
@@ -661,15 +669,17 @@ async fn ordinary_event_driven_repair_can_overtake_claimed_background_work() {
 
 #[tokio::test]
 async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_objects() {
-    let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
+    let store = test_store_with_workspace_migrator::<TrackerFixtureMigrator>("ws_task").await;
+    let (store, _, run) =
+        terminal_task_run_occurrence_fixture_with_store(store, Some(TurnKind::TaskRun)).await;
     let maintenance = store.with_maintenance_access();
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(tracker_rollback_steps()))
+    TrackerFixtureMigrator::down(&*tx, Some(tracker_rollback_steps()))
         .await
         .unwrap();
     tx.commit().await.unwrap();
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::up(&*tx, None).await.unwrap();
+    TrackerFixtureMigrator::up(&*tx, None).await.unwrap();
     tx.commit().await.unwrap();
     assert!(
         row(&store, &run.id).await.is_none(),
@@ -698,7 +708,7 @@ async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_obj
         1
     );
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(tracker_rollback_steps()))
+    TrackerFixtureMigrator::down(&*tx, Some(tracker_rollback_steps()))
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -722,12 +732,12 @@ async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_obj
         .await
         .unwrap();
     assert!(indexes.is_empty());
-    let migrations = Migrator::migrations();
-    let target = &migrations[migrations.len() - tracker_rollback_steps() as usize];
+    let migrations = TrackerFixtureMigrator::migrations();
+    let target = migrations.iter().find(|m| m.name() == MIGRATION).unwrap();
     assert_eq!(target.name(), MIGRATION);
     assert_eq!(target.use_transaction(), Some(true));
     assert!(
-        !Migrator::get_applied_migrations(&store.connection)
+        !TrackerFixtureMigrator::get_applied_migrations(&store.connection)
             .await
             .unwrap()
             .iter()
@@ -1573,11 +1583,11 @@ async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_execu
 
 #[tokio::test]
 async fn migration_installation_and_completion_marker_rollback_together() {
-    let store = test_store_with_workspace("ws_task")
+    let store = test_store_with_workspace_migrator::<TrackerFixtureMigrator>("ws_task")
         .await
         .with_maintenance_access();
     let tx = store.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(tracker_rollback_steps()))
+    TrackerFixtureMigrator::down(&*tx, Some(tracker_rollback_steps()))
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -1585,7 +1595,7 @@ async fn migration_installation_and_completion_marker_rollback_together() {
     // tables/index/seed and first trigger have already been written.
     store.connection.execute_unprepared("CREATE TRIGGER task_run_occurrence_reconcile_task_run_update AFTER UPDATE ON task_run WHEN 0 BEGIN SELECT 1; END").await.unwrap();
     let tx = store.connection.begin().await.unwrap();
-    assert!(Migrator::up(&*tx, None).await.is_err());
+    assert!(TrackerFixtureMigrator::up(&*tx, None).await.is_err());
     tx.rollback().await.unwrap();
     let query = Query::select()
         .column("name")
@@ -1624,7 +1634,7 @@ async fn migration_installation_and_completion_marker_rollback_together() {
         .await
         .unwrap();
     let tx = store.connection.begin().await.unwrap();
-    Migrator::up(&*tx, None).await.unwrap();
+    TrackerFixtureMigrator::up(&*tx, None).await.unwrap();
     tx.commit().await.unwrap();
     assert_eq!(generation(&store).await, 0);
 }
@@ -1700,7 +1710,9 @@ async fn attempt_count_saturates_but_poison_row_stays_retryable_forever() {
 
 #[tokio::test]
 async fn recovery_completed_at_write_tracks_preinstall_run_without_history_discovery() {
-    let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
+    let store = test_store_with_workspace_migrator::<TrackerFixtureMigrator>("ws_task").await;
+    let (store, _, run) =
+        terminal_task_run_occurrence_fixture_with_store(store, Some(TurnKind::TaskRun)).await;
     runs::Entity::update_many()
         .col_expr(
             runs::Column::CompletedAt,
@@ -1712,12 +1724,12 @@ async fn recovery_completed_at_write_tracks_preinstall_run_without_history_disco
         .unwrap();
     let maintenance = store.with_maintenance_access();
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(tracker_rollback_steps()))
+    TrackerFixtureMigrator::down(&*tx, Some(tracker_rollback_steps()))
         .await
         .unwrap();
     tx.commit().await.unwrap();
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::up(&*tx, None).await.unwrap();
+    TrackerFixtureMigrator::up(&*tx, None).await.unwrap();
     tx.commit().await.unwrap();
     assert!(row(&store, &run.id).await.is_none());
     // The existing generic recovery still owns its algorithm. Its actual

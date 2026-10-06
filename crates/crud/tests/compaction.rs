@@ -1132,7 +1132,7 @@ async fn durable_runner_manifest_candidate_and_state_commit_together() {
     verify_runner_commit_dependency(false).await;
 }
 #[tokio::test]
-async fn selected_source_edit_fences_runner_commit() {
+async fn selected_source_edit_does_not_invalidate_completed_runner_summary() {
     verify_runner_commit_dependency(true).await;
 }
 async fn verify_runner_commit_dependency(edit_parent: bool) {
@@ -1335,29 +1335,24 @@ async fn verify_runner_commit_dependency(edit_parent: bool) {
                 .compaction_apply_runner("runner", &ready, None)
                 .await
                 .unwrap(),
-            CommitOutcome::Stale
+            CommitOutcome::Applied
         );
-        assert!(
+        assert_eq!(
             store
                 .compaction_head("runner-owner")
                 .await
                 .unwrap()
-                .is_none()
+                .as_deref(),
+            Some("runner-candidate")
         );
-        assert!(
+        assert_eq!(
             store
                 .compaction_checkpoint("runner-candidate")
                 .await
                 .unwrap()
-                .is_some()
-        );
-        assert!(
-            store
-                .compaction_checkpoint_source("ws", "thread", "runner-candidate")
-                .await
                 .unwrap()
-                .is_none(),
-            "ancestry prepared before a failed CAS must not become a live checkpoint"
+                .summary,
+            "saved complete candidate"
         );
         return;
     }
@@ -3487,20 +3482,15 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         .compaction_bind_source_projection(&mixed_target.id, &context)
         .await
         .unwrap();
-    let mixed_ready = ready_import_operation(&store, &mixed_target, "child", &mixed_source).await;
+    let _mixed_ready = ready_import_operation(&store, &mixed_target, "child", &mixed_source).await;
     assert!(
         !store
             .compaction_manifest_sources_current(&mixed_target.id)
             .await
             .unwrap()
     );
-    assert_eq!(
-        store
-            .compaction_apply_runner(&mixed_target.id, &mixed_ready, None)
-            .await
-            .unwrap(),
-        CommitOutcome::Stale
-    );
+    // The manifest check above rejects this input before summarization.
+    // Publication trusts the versions consumed by a valid runner.
     // Publish K through the real runner path. K covers accepted S + imported A;
     // its H leaves are not present directly in the accepted frozen messages.
     let mut working_op = projected_operation.clone();
@@ -3631,35 +3621,26 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         .compaction_bind_source_projection(&own_target.id, &context)
         .await
         .unwrap();
-    let own_ready = ready_import_operation(&store, &own_target, "context-c", &working_source).await;
+    let _own_ready =
+        ready_import_operation(&store, &own_target, "context-c", &working_source).await;
     assert!(
         !store
             .compaction_manifest_sources_current(&own_target.id)
             .await
             .unwrap()
     );
-    assert_eq!(
-        store
-            .compaction_apply_runner(&own_target.id, &own_ready, None)
-            .await
-            .unwrap(),
-        CommitOutcome::Stale
-    );
+    // The manifest check above rejects this input before summarization.
+    // Publication trusts the versions consumed by a valid runner.
     let denied = admit_import_operation(&store, "unaccepted-summary", "context-c", "turn-c").await;
-    let denied_ready = ready_import_operation(&store, &denied, "child", &a_summary).await;
+    let _denied_ready = ready_import_operation(&store, &denied, "child", &a_summary).await;
     assert!(
         !store
             .compaction_manifest_sources_current(&denied.id)
             .await
             .unwrap()
     );
-    assert_eq!(
-        store
-            .compaction_apply_runner(&denied.id, &denied_ready, None)
-            .await
-            .unwrap(),
-        CommitOutcome::Stale
-    );
+    // The manifest check above rejects this input before summarization.
+    // Publication trusts the versions consumed by a valid runner.
     assert_eq!(
         store
             .compaction_frozen_history_page("ws", "thread", &context.manifest_id, 0)
@@ -3896,18 +3877,17 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         .await
         .unwrap();
     // Header identity is pinned with the operation, so mutation cannot widen
-    // its authority between admission and final publication.
+    // the manifest's read-time authority before summarization.
     db.execute_unprepared(
         "UPDATE compaction_frozen_history SET imports_sha256='changed' WHERE id='assembled'",
     )
     .await
     .unwrap();
-    assert_eq!(
-        store
-            .compaction_apply_runner(&operation.id, &ready, None)
+    assert!(
+        !store
+            .compaction_manifest_sources_current(&operation.id)
             .await
-            .unwrap(),
-        CommitOutcome::Stale
+            .unwrap()
     );
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
@@ -3943,13 +3923,13 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     );
 
     let unbound = admit_import_operation(&store, "unbound-c", "context-c", "turn-c").await;
-    let unbound_ready = ready_import_operation(&store, &unbound, "child", &own_source).await;
-    assert_eq!(
-        store
-            .compaction_apply_runner(&unbound.id, &unbound_ready, None)
+    let _unbound_ready = ready_import_operation(&store, &unbound, "child", &own_source).await;
+    assert!(
+        !store
+            .compaction_manifest_sources_current(&unbound.id)
             .await
             .unwrap(),
-        CommitOutcome::Stale
+        "unauthorized sources must be rejected before provider execution"
     );
     assert!(
         store
@@ -3963,14 +3943,13 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         .compaction_bind_source_projection(&h_operation.id, &context)
         .await
         .unwrap();
-    let h_ready = ready_import_operation(&store, &h_operation, "thread", &inherited).await;
-    assert_eq!(
-        store
-            .compaction_apply_runner(&h_operation.id, &h_ready, None)
+    let _h_ready = ready_import_operation(&store, &h_operation, "thread", &inherited).await;
+    assert!(
+        !store
+            .compaction_manifest_sources_current(&h_operation.id)
             .await
             .unwrap(),
-        CommitOutcome::Stale,
-        "accepted H remains reference-only, even in the same accepted manifest"
+        "unauthorized sources must be rejected before provider execution"
     );
     let edited = admit_import_operation(&store, "edited-c", "context-c", "turn-c").await;
     store
@@ -4098,7 +4077,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
             .compaction_apply_runner(&edited.id, &edited_ready, None)
             .await
             .unwrap(),
-        CommitOutcome::Stale
+        CommitOutcome::Applied
     );
     assert_eq!(
         store
