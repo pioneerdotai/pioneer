@@ -2038,3 +2038,9 @@ pub(crate) fn isolated_test_app_config() -> anyhow::Result<pioneer_config::AppCo
         "../../../config/default.toml"
     ))?)
 }
+
+#[cfg(test)]
+pub(crate) mod media_test_fixtures;
+
+#[cfg(test)]
+mod provider_media_regression_tests;

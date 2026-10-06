@@ -3895,6 +3895,37 @@ impl Provider for CaptureSummaryProvider {
         }
     }
 
+    async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
+        if !self.native_attachments || self.name != "openai" {
+            anyhow::bail!("provider '{}' does not support listing models", self.name);
+        }
+        // Media fixtures opt into the real Chat adapter contract and discover
+        // these test models through their workspace's authority wrapper.
+        Ok(["test-model", "o4-mini"]
+            .into_iter()
+            .map(|id| pioneer_protocol::ProviderModelInfo {
+                id: id.to_owned(),
+                name: Some(format!("{id} native capture fixture")),
+                description: None,
+                created: None,
+                provider: "openai".to_owned(),
+                owned_by: None,
+                limits: Default::default(),
+                capabilities: pioneer_protocol::ProviderModelCapabilities {
+                    vision: Some(true),
+                    input_modalities: Some(vec!["text".into(), "image".into(), "pdf".into()]),
+                    output_modalities: Some(vec!["text".into()]),
+                    ..Default::default()
+                },
+                transcription: None,
+                pricing: None,
+                active: Some(true),
+                family: None,
+                lifecycle_status: None,
+            })
+            .collect())
+    }
+
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
         let is_summary_request = self.valid_summary_completion
             && request.messages.first().is_some_and(|message| {
@@ -3914,7 +3945,7 @@ impl Provider for CaptureSummaryProvider {
                         format!("{runtime} manual answer 1"),
                         format!("{runtime} manual answer 2"),
                         format!("historical-{runtime}.png"),
-                        format!("historical-{runtime}.txt"),
+                        format!("historical-{runtime}.pdf"),
                         format!("mcp-tool:workspace:history:{runtime}"),
                     ]
                 })
@@ -12493,15 +12524,36 @@ async fn ingest_user_test_artifact_for_thread(
     primary_thread_id: Option<&str>,
     display_name: &str,
 ) -> pioneer_protocol::ArtifactRef {
+    ingest_typed_test_artifact_for_thread(
+        processor,
+        workspace_id,
+        primary_thread_id,
+        display_name,
+        b"hello artifact".to_vec(),
+        pioneer_protocol::ArtifactKind::File,
+        "text/plain",
+    )
+    .await
+}
+
+async fn ingest_typed_test_artifact_for_thread(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    primary_thread_id: Option<&str>,
+    display_name: &str,
+    bytes: Vec<u8>,
+    kind: pioneer_protocol::ArtifactKind,
+    mime_type: &str,
+) -> pioneer_protocol::ArtifactRef {
     processor
         .artifact_service
         .ingest_bytes(pioneer_artifacts::IngestArtifactBytesRequest {
             workspace_id: workspace_id.to_owned(),
             primary_thread_id: primary_thread_id.map(str::to_owned),
-            bytes: b"hello artifact".to_vec(),
+            bytes,
             display_name: display_name.to_owned(),
-            kind: pioneer_protocol::ArtifactKind::File,
-            mime_type: Some("text/plain".to_owned()),
+            kind,
+            mime_type: Some(mime_type.to_owned()),
             created_by_kind: pioneer_protocol::ArtifactCreatedByKind::User,
             created_by_actor_id: Some("test-user".to_owned()),
             binding: None,
@@ -12510,6 +12562,29 @@ async fn ingest_user_test_artifact_for_thread(
         .await
         .expect("artifact ingest should succeed")
         .artifact
+}
+
+async fn discover_native_capture_models(
+    registry: &pioneer_provider::ProviderRegistry,
+    workspace_id: &str,
+) {
+    crate::compaction::load_test_catalog();
+    let models = registry
+        .get_or_create_for_workspace(workspace_id, "openai")
+        .unwrap()
+        .list_models()
+        .await
+        .unwrap();
+    assert_eq!(models.len(), 2);
+    assert!(models.iter().all(|model| {
+        model
+            .capabilities
+            .input_modalities
+            .as_ref()
+            .is_some_and(|input| {
+                input.iter().any(|kind| kind == "image") && input.iter().any(|kind| kind == "pdf")
+            })
+    }));
 }
 
 async fn materialize_artifact_api_thread(
@@ -12918,12 +12993,16 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let capture_provider =
-        Arc::new(CaptureSummaryProvider::new("artifact answer").with_native_attachments());
+    let capture_provider = Arc::new(
+        CaptureSummaryProvider::new("artifact answer")
+            .with_native_attachments()
+            .named("openai"),
+    );
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         capture_provider.clone(),
     ));
+    discover_native_capture_models(&provider_registry, workspace_id.as_str()).await;
     let processor = Arc::new(MessageProcessor::new(
         thread_manager,
         provider_registry,
@@ -12948,11 +13027,15 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
         "thr_artifact_followup_history",
     )
     .await;
-    let artifact = ingest_user_test_artifact_for_thread(
+    let image_bytes = crate::media_test_fixtures::image(image::ImageFormat::Jpeg);
+    let artifact = ingest_typed_test_artifact_for_thread(
         &processor,
         workspace_id.as_str(),
         Some(thread.thread.id.as_str()),
         "car.jpg",
+        image_bytes.clone(),
+        pioneer_protocol::ArtifactKind::Image,
+        "image/jpeg",
     )
     .await;
 
@@ -13034,6 +13117,8 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
         "the native artifact follow-up must complete"
     );
 
+    use base64::Engine;
+    let expected_base64 = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
     let requests = capture_provider.snapshot_requests();
     assert_eq!(requests.len(), 2);
     let second_request = &requests[1];
@@ -13060,11 +13145,12 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
     assert!(
         matches!(
             artifact_history_message.content_parts.as_slice(),
-            [pioneer_provider::MessageContentPart::File { file }]
-                if file.name.as_deref() == Some("car.jpg")
-                    && matches!(&file.source, pioneer_provider::AttachmentDataSource::Bytes { base64_data }
-                        if base64_data == "aGVsbG8gYXJ0aWZhY3Q=")
-                    && file.artifact.as_ref().is_some_and(|accepted| {
+            [pioneer_provider::MessageContentPart::Image { image }]
+                if image.name.as_deref() == Some("car.jpg")
+                    && image.mime_type == "image/jpeg"
+                    && matches!(&image.source, pioneer_provider::AttachmentDataSource::Bytes { base64_data }
+                        if base64_data == &expected_base64)
+                    && image.artifact.as_ref().is_some_and(|accepted| {
                         accepted.artifact_id == artifact.artifact_id
                             && accepted.artifact_version_id == artifact.version_id
                     })
@@ -13081,12 +13167,16 @@ async fn followup_history_rejects_unavailable_accepted_artifact_before_provider(
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let capture_provider =
-        Arc::new(CaptureSummaryProvider::new("artifact answer").with_native_attachments());
+    let capture_provider = Arc::new(
+        CaptureSummaryProvider::new("artifact answer")
+            .with_native_attachments()
+            .named("openai"),
+    );
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         capture_provider.clone(),
     ));
+    discover_native_capture_models(&provider_registry, workspace_id.as_str()).await;
     let processor = Arc::new(MessageProcessor::new(
         thread_manager,
         provider_registry,
@@ -13111,11 +13201,15 @@ async fn followup_history_rejects_unavailable_accepted_artifact_before_provider(
         "thr_unavailable_artifact_followup",
     )
     .await;
-    let artifact = ingest_user_test_artifact_for_thread(
+    let image_bytes = crate::media_test_fixtures::image(image::ImageFormat::Jpeg);
+    let artifact = ingest_typed_test_artifact_for_thread(
         &processor,
         workspace_id.as_str(),
         Some(thread.thread.id.as_str()),
         "accepted-car.jpg",
+        image_bytes.clone(),
+        pioneer_protocol::ArtifactKind::Image,
+        "image/jpeg",
     )
     .await;
 
@@ -27069,6 +27163,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
         let summary_provider = Arc::new(
             CaptureSummaryProvider::new("released CLI summary")
                 .with_native_attachments()
+                .named("openai")
                 .with_valid_summary_completion(),
         );
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
@@ -27078,6 +27173,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
         provider_registry
             .insert("openai", summary_provider.clone())
             .expect("CLI test provider should register");
+        discover_native_capture_models(&provider_registry, workspace_id.as_str()).await;
         let mut processor = Arc::new(with_enabled_test_cli_runtime_catalog(
             MessageProcessor::new(
                 thread_manager,
@@ -27132,19 +27228,17 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             fixture_time.saturating_sub(2),
         )
         .await;
-        let historical_file = ingest_user_test_artifact_for_thread(
+        let historical_file = ingest_typed_test_artifact_for_thread(
             &processor,
             workspace_id.as_str(),
             Some(parent_thread_id.as_str()),
-            "accepted-history.txt",
+            "accepted-history.pdf",
+            crate::media_test_fixtures::pdf(),
+            pioneer_protocol::ArtifactKind::File,
+            "application/pdf",
         )
         .await;
-        let one_pixel_png = vec![
-            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
-            8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 8, 215, 99, 248, 207,
-            192, 240, 31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66,
-            96, 130,
-        ];
+        let one_pixel_png = crate::media_test_fixtures::image(image::ImageFormat::Png);
         let historical_image = processor
             .artifact_service
             .ingest_bytes(pioneer_artifacts::IngestArtifactBytesRequest {
@@ -27172,13 +27266,16 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             .into_owned();
         let historical_local_file = historical_media_dir
             .path()
-            .join(format!("historical-{runtime_id}.txt"))
+            .join(format!("historical-{runtime_id}.pdf"))
             .to_string_lossy()
             .into_owned();
         std::fs::write(historical_local_image.as_str(), one_pixel_png)
             .expect("historical local-image fixture");
-        std::fs::write(historical_local_file.as_str(), b"recorded local file")
-            .expect("historical local-file fixture");
+        std::fs::write(
+            historical_local_file.as_str(),
+            crate::media_test_fixtures::pdf(),
+        )
+        .expect("historical local-file fixture");
         let media_turn_id = format!("turn_native_parent_media_{runtime_id}");
         seed_completed_task_parent_with_inputs_at(
             &processor,
@@ -27437,7 +27534,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             "{runtime_id} must bootstrap the accepted parent history"
         );
         let initial_adapter_input = native_start.input.to_string();
-        assert!(initial_adapter_input.contains("accepted-history.txt"));
+        assert!(initial_adapter_input.contains("accepted-history.pdf"));
         assert!(initial_adapter_input.contains("accepted-history.png"));
         assert!(initial_adapter_input.contains("localImage"));
         assert_eq!(
@@ -28738,7 +28835,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                         || (native_file_parts == 0
                             && native_request_text.contains("## Goal and constraints")
                             && native_request_text
-                                .contains(format!("historical-{runtime_id}.txt").as_str())),
+                                .contains(format!("historical-{runtime_id}.pdf").as_str())),
                     "native request must deliver the file exactly once or cite it through an accepted summary, not rematerialize covered media"
                 );
                 assert_eq!(

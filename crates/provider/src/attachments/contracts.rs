@@ -387,6 +387,11 @@ pub(super) fn validate_prepared(
     messages: &[ChatMessage],
     attachments: &[super::PreparedAttachment],
 ) -> Result<()> {
+    // Text-only adapters have no native media contract to validate. Keep this
+    // separate from unknown adapters with actual binary input, which fail closed.
+    if attachments.is_empty() {
+        return Ok(());
+    }
     let Some(definition) = crate::definition::provider_definition(provider) else {
         // Unregistered test doubles exercise materialization independently of
         // provider contracts. Production custom endpoints have canonical IDs.
