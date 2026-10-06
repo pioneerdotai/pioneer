@@ -1,14 +1,23 @@
+pub(crate) mod admission;
+mod audio_timing;
 mod budget;
+mod contracts;
 mod errors;
 pub(crate) mod input_estimate;
+#[cfg(test)]
+pub(crate) mod media_fixtures;
+mod mp4_timing;
 mod normalize;
 mod observability;
 mod plan;
 mod registry;
+#[cfg(test)]
+pub(crate) mod regression;
 mod resolve;
 pub(crate) mod runtime;
 mod security;
 mod types;
+mod webm;
 
 use crate::attachments::errors::AttachmentPipelineError;
 use crate::attachments::normalize::{normalize_attachment_name, reconcile_mime};
@@ -17,9 +26,12 @@ use crate::types::{
     ChatMessage, ChatRequest, InputContentType, MessageAttachment, MessageContentPart,
     ProviderCapabilities,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+pub(crate) use contracts::MediaInputRejection;
+pub(crate) use normalize::canonical_mime as canonical_media_mime;
+pub(crate) use normalize::normalize_mime as normalized_media_mime;
 use std::sync::Arc;
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
@@ -182,6 +194,32 @@ async fn prepare_messages_async(
     capabilities: &ProviderCapabilities,
     messages: &[ChatMessage],
 ) -> Result<PreparedProviderMessages> {
+    // Reject mismatches before I/O and retain this snapshot through materialization.
+    let state = admission::current();
+    let entry = if messages.iter().any(ChatMessage::has_attachments)
+        && crate::definition::provider_definition(provider_name).is_some()
+    {
+        #[cfg(test)]
+        let fixture_catalog = state.as_ref().and_then(|s| s.catalog.clone());
+        #[cfg(not(test))]
+        let fixture_catalog: Option<Arc<crate::catalog::ModelCatalog>> = None;
+        let catalog = fixture_catalog
+            .map(Ok)
+            .unwrap_or_else(crate::catalog::model_catalog)
+            .context(MediaInputRejection(
+                "model catalog is unavailable; retry after catalog refresh",
+            ))?;
+        let entry = admission::effective_model(provider_name, model, &catalog);
+        contracts::validate_effective_model_inputs(
+            provider_name,
+            capabilities,
+            messages,
+            entry.as_ref(),
+        )?;
+        entry
+    } else {
+        None
+    };
     let authority_fingerprint = runtime::current_authority_fingerprint()?;
     let permit = tokio::time::timeout(
         ATTACHMENT_BLOCKING_QUEUE_TIMEOUT,
@@ -197,15 +235,43 @@ async fn prepare_messages_async(
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         runtime::with_blocking_authority_scope(authority_fingerprint, || {
-            let config = default_attachment_pipeline_config();
-            prepare_messages_for_provider_target(
-                provider_name.as_str(),
-                Some(model.as_str()),
-                thinking_override,
-                &capabilities,
-                messages.as_slice(),
-                &config,
-            )
+            admission::blocking_scope(state, || {
+                #[cfg(test)]
+                let config = admission::current()
+                    .and_then(|s| s.pipeline_config.clone())
+                    .unwrap_or_else(default_attachment_pipeline_config);
+                #[cfg(not(test))]
+                let config = default_attachment_pipeline_config();
+                let prepared = prepare_messages_for_provider_target(
+                    provider_name.as_str(),
+                    Some(model.as_str()),
+                    thinking_override,
+                    &capabilities,
+                    messages.as_slice(),
+                    &config,
+                )
+                .context(MediaInputRejection(
+                    "media input could not be materialized under the selected attachment policy",
+                ))?;
+                if let Some(entry) = entry.as_ref() {
+                    for attachment in &prepared.attachments {
+                        contracts::validate_materialized_constraints(entry, attachment).context(
+                            MediaInputRejection(
+                                "materialized media violates catalog size/duration/MIME limits",
+                            ),
+                        )?;
+                    }
+                    contracts::validate_model_media_limits(
+                        &provider_name,
+                        entry,
+                        &prepared.attachments,
+                    )
+                    .context(MediaInputRejection(
+                        "media input exceeds the native model PDF/media limit",
+                    ))?;
+                }
+                Ok(prepared)
+            })
         })
     })
     .await
@@ -298,6 +364,21 @@ fn prepare_messages_impl(
         }
 
         for (part_index, part) in message.content_parts.iter().enumerate() {
+            if let Some((kind, attachment)) = match part {
+                MessageContentPart::Text { .. } => None,
+                MessageContentPart::File { file } => Some((InputContentType::File, file)),
+                MessageContentPart::Image { image } => Some((InputContentType::Image, image)),
+                MessageContentPart::Audio { audio } => Some((InputContentType::Audio, audio)),
+                MessageContentPart::Video { video } => Some((InputContentType::Video, video)),
+            } {
+                contracts::validate_representation(
+                    provider_name,
+                    kind,
+                    message.role.clone(),
+                    &attachment.mime_type,
+                    &attachment.source,
+                ).context(MediaInputRejection("media MIME/source/role is unsupported; external references require owned materialized bytes"))?;
+            }
             let attachment_count_before = attachments.len();
             match part {
                 MessageContentPart::Text { text } => {
@@ -383,6 +464,9 @@ fn prepare_messages_impl(
         attachments.as_mut_slice(),
     )?;
 
+    contracts::validate_prepared(provider_name, &prepared_messages, &attachments).context(
+        MediaInputRejection("media input violates native MIME/role/count/size/text requirements"),
+    )?;
     let budget_report = budget::validate_budget(config, attachments.as_slice())?;
 
     Ok(PreparedProviderMessages {
@@ -582,7 +666,11 @@ mod tests {
                     size_bytes: None,
                     sha256: None,
                     source: AttachmentDataSource::Bytes {
-                        base64_data: BASE64.encode([1u8, 2, 3, 4]),
+                        base64_data: BASE64.encode(super::regression::image(
+                            image::ImageFormat::Png,
+                            1,
+                            1,
+                        )),
                     },
                     artifact: None,
                 }),
@@ -649,7 +737,7 @@ mod tests {
             size_bytes: None,
             sha256: None,
             source: AttachmentDataSource::Bytes {
-                base64_data: BASE64.encode([1u8, 2, 3]),
+                base64_data: BASE64.encode(super::regression::image(image::ImageFormat::Png, 1, 1)),
             },
             artifact: None,
         })]);
@@ -664,9 +752,10 @@ mod tests {
 
     #[test]
     fn budget_limits_are_enforced() {
+        let png = super::regression::image(image::ImageFormat::Png, 1, 1);
         let config = AttachmentPipelineConfig {
-            max_bytes_per_attachment: 4,
-            max_total_bytes_per_request: 6,
+            max_bytes_per_attachment: png.len(),
+            max_total_bytes_per_request: 2 * png.len() - 1,
             max_attachments_per_request: 2,
             upload_preferred_min_bytes: 1024,
             ..AttachmentPipelineConfig::default()
@@ -678,7 +767,7 @@ mod tests {
             size_bytes: None,
             sha256: None,
             source: AttachmentDataSource::Bytes {
-                base64_data: BASE64.encode([1u8, 2, 3, 4]),
+                base64_data: BASE64.encode(&png),
             },
             artifact: None,
         });
@@ -688,7 +777,7 @@ mod tests {
             size_bytes: None,
             sha256: None,
             source: AttachmentDataSource::Bytes {
-                base64_data: BASE64.encode([5u8, 6, 7]),
+                base64_data: BASE64.encode(&png),
             },
             artifact: None,
         });
@@ -871,5 +960,53 @@ mod tests {
         )
         .expect_err("path outside allowlist must be blocked");
         assert!(err.to_string().contains("UNSUPPORTED_ATTACHMENT_SOURCE"));
+    }
+}
+
+/// Count the complete serialized body before transport. The endpoint limit
+/// includes binary base64 expansion, text, tools and all structural overhead.
+/// Sources: Claude PDF support (32 MB); Gemini file input methods (100 MB).
+pub(crate) fn validate_inline_payload(provider: &str, value: &impl serde::Serialize) -> Result<()> {
+    let limit = match provider {
+        "anthropic" => 32_000_000,
+        "gemini" => 100_000_000,
+        "groq" => 20_000_000,
+        _ => return Ok(()),
+    };
+    struct Counter {
+        bytes: usize,
+        limit: usize,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self.bytes.saturating_add(bytes.len());
+            if self.bytes > self.limit {
+                return Err(std::io::Error::other(
+                    "native request payload exceeds endpoint byte limit",
+                ));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Counter { bytes: 0, limit }, value).map_err(|_| {
+        MediaInputRejection(
+            "native request exceeds its inline payload byte limit or cannot be serialized",
+        )
+        .into()
+    })
+}
+
+#[cfg(test)]
+mod payload_limit_tests {
+    use super::*;
+    #[test]
+    fn native_payload_limit_counts_json_escaping_and_structural_overhead() {
+        // Raw text is below 32 MB, but serialized quotes expand past the limit.
+        let payload = serde_json::json!({"content":"\"".repeat(16_000_001)});
+        assert!(validate_inline_payload("anthropic", &payload).is_err());
+        assert!(validate_inline_payload("gemini", &payload).is_ok());
     }
 }

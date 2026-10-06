@@ -1003,7 +1003,25 @@ impl OpenAiCompatibleProvider {
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
-        self.build_chat_request_from_prepared(request, stream, prepared)
+        let has_image = prepared
+            .attachments
+            .iter()
+            .any(|a| a.kind == InputContentType::Image);
+        let body = self.build_chat_request_from_prepared(request, stream, prepared)?;
+        if self.name == "groq" && has_image {
+            crate::attachments::validate_inline_payload("groq", &body)?;
+        }
+        Ok(body)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn render_chat_request_async_for_test(
+        &self,
+        request: ChatRequest,
+        stream: bool,
+    ) -> Result<serde_json::Value> {
+        serde_json::to_value(self.build_chat_request_async(request, stream).await?)
+            .map_err(Into::into)
     }
 
     #[cfg(test)]
@@ -2112,7 +2130,7 @@ mod tests {
     #[tokio::test]
     async fn completed_transcript_keeps_typed_media_through_preflight_budget_and_wire() {
         let provider = OpenAiCompatibleProvider::new(
-            "deepseek",
+            "fixture-media-renderer",
             "https://api.example.com/v1",
             "test-key",
             AuthStyle::Bearer,
@@ -2175,7 +2193,7 @@ mod tests {
         let canonical = messages.clone();
         let prepared = prepare_messages_for_provider_model(
             provider.name(),
-            "deepseek-reasoner",
+            "fixture-media",
             &provider.capabilities(),
             &messages,
         )
@@ -2197,7 +2215,7 @@ mod tests {
             Some("artifact-file")
         );
         let request = ChatRequest {
-            model: "deepseek-reasoner".into(),
+            model: "fixture-media".into(),
             messages: messages.clone(),
             temperature: None,
             max_tokens: None,
@@ -2235,7 +2253,7 @@ mod tests {
         ));
         let prepared_wire = prepare_messages_for_provider_model(
             provider.name(),
-            "deepseek-reasoner",
+            "fixture-media",
             &provider.capabilities(),
             &budgeted.request.messages,
         )
@@ -2248,16 +2266,21 @@ mod tests {
             .build_chat_request_from_prepared(budgeted.request, false, prepared_wire)
             .unwrap();
         let json = serde_json::to_value(&wire).unwrap();
-        assert_eq!(json["messages"].as_array().unwrap().len(), 2);
-        assert!(json["messages"][0].get("tool_calls").is_none());
-        assert!(json["messages"][1].get("tool_call_id").is_none());
+        assert_eq!(json["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(json["messages"][0]["role"], "assistant");
+        assert_eq!(json["messages"][0]["tool_calls"][0]["id"], "call");
+        assert_eq!(json["messages"][1]["role"], "tool");
+        assert_eq!(json["messages"][1]["tool_call_id"], "call");
+        assert_eq!(json["messages"][1]["content"], "tool result");
+        assert_eq!(json["messages"][2]["role"], "user");
+        assert!(json["messages"][2].get("tool_call_id").is_none());
         assert!(
-            json["messages"][1]["content"]
+            json["messages"][2]["content"]
                 .to_string()
                 .contains("image_url")
         );
         assert!(
-            json["messages"][1]["content"]
+            json["messages"][2]["content"]
                 .to_string()
                 .contains("file_data")
         );

@@ -1,3 +1,6 @@
+#[cfg(test)]
+use super::embedding::ordered_vectors;
+use super::embedding::validate_input;
 use crate::{
     attachments::{
         AttachmentOperationError, AttachmentPipelineConfig, AttachmentTransportKind,
@@ -36,8 +39,9 @@ use pioneer_protocol::{
 pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 
 #[derive(Clone, Copy)]
-struct OpenAiEmbeddingModelDefinition {
-    id: &'static str,
+pub(super) struct OpenAiEmbeddingModelDefinition {
+    pub(super) id: &'static str,
+    pub(super) dimension: usize,
     name: &'static str,
     description: &'static str,
 }
@@ -45,20 +49,29 @@ struct OpenAiEmbeddingModelDefinition {
 const OPENAI_EMBEDDING_MODELS: &[OpenAiEmbeddingModelDefinition] = &[
     OpenAiEmbeddingModelDefinition {
         id: "text-embedding-3-small",
+        dimension: 1536,
         name: "Text Embedding 3 Small",
         description: "1536-dimensional embedding model optimized for cost and latency.",
     },
     OpenAiEmbeddingModelDefinition {
         id: "text-embedding-3-large",
+        dimension: 3072,
         name: "Text Embedding 3 Large",
         description: "3072-dimensional embedding model optimized for higher retrieval quality.",
     },
     OpenAiEmbeddingModelDefinition {
         id: "text-embedding-ada-002",
+        dimension: 1536,
         name: "Text Embedding Ada 002",
         description: "Legacy 1536-dimensional embedding model.",
     },
 ];
+
+pub(super) fn embedding_model_definition(
+    id: &str,
+) -> Option<&'static OpenAiEmbeddingModelDefinition> {
+    OPENAI_EMBEDDING_MODELS.iter().find(|model| model.id == id)
+}
 
 pub struct OpenAiProvider {
     api_key: String,
@@ -242,16 +255,7 @@ struct ApiEmbeddingRequest {
     encoding_format: &'static str,
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiEmbeddingResponse {
-    data: Vec<ApiEmbeddingData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApiEmbeddingData {
-    embedding: Vec<f32>,
-    index: usize,
-}
+type ApiEmbeddingResponse = super::embedding::IndexedEmbeddingResponse;
 
 // ── SSE streaming response types ────────────────────────────────────────────
 
@@ -1359,6 +1363,15 @@ impl crate::traits::Provider for OpenAiProvider {
     }
 
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+        validate_input(&request.model, &request.input)?;
+        super::embedding::EmbeddingBatchLimits::for_model(
+            "openai",
+            &request.model,
+            None,
+            None,
+            None,
+        )?
+        .validate_request(&request.input)?;
         let expected_count = request.input.len();
         let api_request = ApiEmbeddingRequest {
             model: request.model,
@@ -1379,25 +1392,13 @@ impl crate::traits::Provider for OpenAiProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let mut data = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
+        let response = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
             response,
             Default::default(),
             "provider_response",
         )
-        .await?
-        .data;
-        data.sort_by_key(|item| item.index);
-        if data.len() != expected_count {
-            return Err(anyhow!(
-                "OpenAI embedding response returned {} embeddings for {} inputs",
-                data.len(),
-                expected_count
-            ));
-        }
-
-        Ok(EmbeddingResponse {
-            embeddings: data.into_iter().map(|item| item.embedding).collect(),
-        })
+        .await?;
+        response.into_response(expected_count)
     }
 }
 
@@ -1719,6 +1720,68 @@ mod tests {
         assert!(OpenAiProvider::build_chat_request(&request, vec![], false).is_err());
     }
     use super::*;
+
+    #[tokio::test]
+    async fn g09_direct_embedding_adapter_rejects_invalid_batch_before_network() {
+        let provider = OpenAiProvider::new("unused-fixture-key");
+        for model in [
+            "text-embedding-3-small",
+            "text-embedding-3-large",
+            "text-embedding-ada-002",
+        ] {
+            let error = provider
+                .embed(EmbeddingRequest::new(model, vec!["short".to_owned(); 2048]))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("budget"));
+            let error = provider
+                .embed(EmbeddingRequest::new(model, vec![" a".repeat(8193)]))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("token budget"));
+        }
+    }
+
+    #[test]
+    fn embedding_wire_contract_has_actual_endpoint_model_input_encoding_and_usage() {
+        let provider = OpenAiProvider::new("fixture-key");
+        assert_eq!(
+            provider.embeddings_url(),
+            "https://api.openai.com/v1/embeddings"
+        );
+        let input = vec!["first".to_owned(), "second".to_owned()];
+        let body = ApiEmbeddingRequest {
+            model: "text-embedding-3-small".to_owned(),
+            input: input.clone(),
+            encoding_format: "float",
+        };
+        assert_eq!(
+            serde_json::to_value(body).unwrap(),
+            serde_json::json!({
+                "model": "text-embedding-3-small", "input": input, "encoding_format": "float"
+            })
+        );
+        let response: ApiEmbeddingResponse = serde_json::from_value(serde_json::json!({
+            "data": [{"index":1,"embedding":[2.0]},{"index":0,"embedding":[1.0]}],
+            "usage": {"prompt_tokens":7,"total_tokens":7}
+        }))
+        .unwrap();
+        assert_eq!(
+            ordered_vectors(response.data, 2).unwrap(),
+            vec![vec![1.0], vec![2.0]]
+        );
+        let usage: crate::types::TokenUsage = response.usage.unwrap().into();
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(0));
+        for bad in [serde_json::json!(-1), serde_json::json!(0.5)] {
+            assert!(
+                serde_json::from_value::<ApiEmbeddingResponse>(serde_json::json!({
+                    "data":[{"index":bad,"embedding":[1.0]}]
+                }))
+                .is_err()
+            );
+        }
+    }
     use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
     use crate::traits::Provider;
     use crate::types::{
@@ -2151,6 +2214,125 @@ mod tests {
         let caps = provider.capabilities();
         assert!(caps.streaming);
         assert!(caps.vision);
+    }
+}
+
+#[cfg(test)]
+mod media_contract_tests {
+    use super::*;
+    use crate::{AttachmentDataSource, MessageAttachment, MessageContentPart};
+    use crate::{ChatMessage, Provider};
+    #[test]
+    fn chat_pdf_inline_bytes_and_internal_owned_upload_use_different_fields() {
+        let provider = OpenAiProvider::new("unused");
+        let pdf_bytes = crate::attachments::regression::pdf(1);
+        let file = MessageAttachment {
+            mime_type: "application/pdf".into(),
+            name: Some("doc.pdf".into()),
+            size_bytes: None,
+            sha256: None,
+            source: AttachmentDataSource::Bytes {
+                base64_data: BASE64.encode(&pdf_bytes),
+            },
+            artifact: None,
+        };
+        let mut prepared = crate::attachments::prepare_messages_for_provider(
+            "openai",
+            &provider.capabilities(),
+            &[ChatMessage::user_parts(vec![MessageContentPart::file(
+                file,
+            )])],
+        )
+        .unwrap();
+        let inline = serde_json::to_value(
+            OpenAiProvider::build_file_part(&prepared.attachments[0]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inline["file"]["file_data"], BASE64.encode(&pdf_bytes));
+        assert_eq!(inline["file"]["filename"], "doc.pdf");
+        assert!(inline["file"].get("file_id").is_none());
+        // Simulate the existing authority-scoped upload's result AFTER bytes
+        // were checked. A caller-supplied reference is rejected before this.
+        prepared.attachments[0].source = PreparedAttachmentSource::Reference {
+            reference: "file-owned-upload".into(),
+        };
+        prepared.attachments[0].transport_plan.kind = AttachmentTransportKind::Upload;
+        prepared.attachments[0].bytes = None;
+        let uploaded = serde_json::to_value(
+            OpenAiProvider::build_file_part(&prepared.attachments[0]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(uploaded["file"]["file_id"], "file-owned-upload");
+        assert!(uploaded["file"].get("file_data").is_none());
+    }
+    #[test]
+    fn chat_audio_format_is_not_derived_from_an_arbitrary_mime_subtype() {
+        assert_eq!(
+            OpenAiProvider::audio_format_from_mime("audio/wav").unwrap(),
+            "wav"
+        );
+        assert_eq!(
+            OpenAiProvider::audio_format_from_mime("audio/mpeg").unwrap(),
+            "mp3"
+        );
+        assert!(OpenAiProvider::audio_format_from_mime("audio/flac").is_err());
+    }
+}
+
+#[cfg(test)]
+mod confirmed_duration_wire_regressions {
+    use super::*;
+    use crate::{Provider, attachments::regression as fixture};
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn confirmed_mp3_budget_native_projection_and_replay_keep_bytes() {
+        let provider = OpenAiProvider::new("unused");
+        for (kind, mime, bytes) in fixture::confirmed_wire_inputs("openai") {
+            let state = Arc::new(fixture::state(
+                "openai",
+                "media",
+                serde_json::json!({"audio":{"maxDurationMillis":2400}}),
+            ));
+            let budget = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(fixture::request(
+                    "media",
+                    vec![fixture::part(kind, mime, &bytes)],
+                )),
+            )
+            .await
+            .unwrap();
+            for _stream in [false, true] {
+                // Both Chat routes use this actual native message projection.
+                let replay = fixture::scoped(
+                    state.clone(),
+                    provider.prepare_input_budget(budget.request.clone()),
+                )
+                .await
+                .unwrap();
+                let prepared = fixture::scoped(
+                    state.clone(),
+                    prepare_messages_for_provider_async(
+                        "openai",
+                        "media",
+                        &provider.capabilities(),
+                        &replay.request.messages,
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(prepared.attachments[0].kind, kind);
+                assert_eq!(prepared.attachments[0].mime_type, mime);
+                let wire =
+                    serde_json::to_value(OpenAiProvider::convert_messages(&prepared).unwrap())
+                        .unwrap();
+                assert_eq!(wire[0]["content"][1]["input_audio"]["format"], "mp3");
+                assert_eq!(
+                    wire[0]["content"][1]["input_audio"]["data"],
+                    BASE64.encode(&bytes)
+                );
+            }
+        }
     }
 }
 

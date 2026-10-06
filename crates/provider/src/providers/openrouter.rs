@@ -1,3 +1,6 @@
+#[cfg(test)]
+use super::embedding::ordered_vectors;
+use super::embedding::validate_input;
 use crate::failure::ProviderStreamIncomplete;
 use crate::{
     attachments::{
@@ -227,16 +230,7 @@ struct ApiEmbeddingRequest {
     encoding_format: &'static str,
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiEmbeddingResponse {
-    data: Vec<ApiEmbeddingData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApiEmbeddingData {
-    embedding: Vec<f32>,
-    index: usize,
-}
+type ApiEmbeddingResponse = super::embedding::IndexedEmbeddingResponse;
 
 // ── SSE streaming response types ────────────────────────────────────────────
 
@@ -598,6 +592,36 @@ struct OpenRouterModelEntry {
     pricing: Option<OpenRouterPricing>,
     #[serde(default)]
     reasoning: Option<OpenRouterReasoningMetadata>,
+    #[serde(default)]
+    architecture: Option<OpenRouterArchitecture>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterArchitecture {
+    #[serde(default)]
+    input_modalities: Option<Vec<String>>,
+    #[serde(default)]
+    output_modalities: Option<Vec<String>>,
+    #[serde(default)]
+    modality: Option<String>,
+}
+impl OpenRouterArchitecture {
+    fn legacy_side(&self, input: bool) -> Option<Vec<String>> {
+        let (left, right) = self.modality.as_deref()?.split_once("->")?;
+        let side = if input { left } else { right };
+        let values = side
+            .split('+')
+            .map(|v| v.trim().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        (!values.is_empty()
+            && values.iter().all(|v| {
+                matches!(
+                    v.as_str(),
+                    "text" | "image" | "audio" | "video" | "file" | "pdf"
+                )
+            }))
+        .then_some(values)
+    }
 }
 
 // Keep field presence/null separately from booleans and per-model enums.
@@ -682,24 +706,27 @@ impl OpenRouterProvider {
         }
     }
 
-    fn audio_format_from_mime(mime: &str) -> String {
-        let normalized = mime
-            .split(';')
-            .next()
-            .unwrap_or(mime)
-            .trim()
-            .to_ascii_lowercase();
-        let subtype = normalized
-            .split('/')
-            .nth(1)
-            .unwrap_or(normalized.as_str())
-            .trim();
-        match subtype {
-            "x-wav" => "wav".to_owned(),
-            "mpga" => "mp3".to_owned(),
-            "x-m4a" => "m4a".to_owned(),
-            "x-aiff" => "aiff".to_owned(),
-            other => other.to_owned(),
+    fn build_request_from_prepared(
+        request: &ChatRequest,
+        prepared: &PreparedProviderMessages,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        let rendered_messages = Self::convert_messages(prepared)?;
+        Self::build_chat_request(request, rendered_messages, stream)
+    }
+
+    fn audio_format_from_mime(mime: &str) -> Result<&'static str> {
+        // Official SDK file-url-utils.ts; finite encoded formats, not arbitrary subtypes.
+        let mime = crate::attachments::normalized_media_mime(mime)?;
+        match crate::attachments::canonical_media_mime(&mime) {
+            "audio/wav" | "audio/x-wav" => Ok("wav"),
+            "audio/mpeg" | "audio/mp3" | "audio/mpga" => Ok("mp3"),
+            "audio/mp4" | "audio/x-m4a" => Ok("m4a"),
+            "audio/aiff" | "audio/x-aiff" => Ok("aiff"),
+            "audio/flac" => Ok("flac"),
+            "audio/ogg" => Ok("ogg"),
+            "audio/aac" => Ok("aac"),
+            _ => Err(anyhow!("unsupported OpenRouter encoded audio MIME")),
         }
     }
 
@@ -773,7 +800,8 @@ impl OpenRouterProvider {
                     parts.push(ApiContentPart::InputAudio {
                         input_audio: ApiInputAudioPart {
                             data: BASE64.encode(attachment_bytes(attachment)?),
-                            format: Self::audio_format_from_mime(attachment.mime_type.as_str()),
+                            format: Self::audio_format_from_mime(attachment.mime_type.as_str())?
+                                .to_owned(),
                         },
                     });
                 }
@@ -1394,9 +1422,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         .await?;
         crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let rendered_messages = Self::convert_messages(&prepared)?;
-
-        let api_request = Self::build_chat_request(&request, rendered_messages, false)?;
+        let api_request = Self::build_request_from_prepared(&request, &prepared, false)?;
 
         let request_builder = Self::with_app_attribution(
             self.client
@@ -1516,9 +1542,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         .await?;
         crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let rendered_messages = Self::convert_messages(&prepared)?;
-
-        let api_request = Self::build_chat_request(&request, rendered_messages, true)?;
+        let api_request = Self::build_request_from_prepared(&request, &prepared, true)?;
 
         let request_builder = Self::with_app_attribution(
             self.client
@@ -1576,6 +1600,15 @@ impl crate::traits::Provider for OpenRouterProvider {
     }
 
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+        validate_input(&request.model, &request.input)?;
+        super::embedding::EmbeddingBatchLimits::for_model(
+            "openrouter",
+            &request.model,
+            None,
+            None,
+            None,
+        )?
+        .validate_request(&request.input)?;
         let expected_count = request.input.len();
         let api_request = ApiEmbeddingRequest {
             model: request.model,
@@ -1597,25 +1630,13 @@ impl crate::traits::Provider for OpenRouterProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let mut data = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
+        let response = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
             response,
             Default::default(),
             "provider_response",
         )
-        .await?
-        .data;
-        data.sort_by_key(|item| item.index);
-        if data.len() != expected_count {
-            return Err(anyhow!(
-                "OpenRouter embedding response returned {} embeddings for {} inputs",
-                data.len(),
-                expected_count
-            ));
-        }
-
-        Ok(EmbeddingResponse {
-            embeddings: data.into_iter().map(|item| item.embedding).collect(),
-        })
+        .await?;
+        response.into_response(expected_count)
     }
 }
 
@@ -1640,6 +1661,20 @@ fn provider_model_from_openrouter_model_entry(m: OpenRouterModelEntry) -> Provid
         ),
         ..Default::default()
     };
+    if let Some(architecture) = m.architecture {
+        capabilities.input_modalities = architecture
+            .input_modalities
+            .clone()
+            .or_else(|| architecture.legacy_side(true));
+        capabilities.output_modalities = architecture
+            .output_modalities
+            .clone()
+            .or_else(|| architecture.legacy_side(false));
+        capabilities.vision = capabilities
+            .input_modalities
+            .as_ref()
+            .map(|v| v.iter().any(|m| m.eq_ignore_ascii_case("image")));
+    }
     if let Some(reasoning) = reasoning {
         // Effort/default/mandatory/budget facts are not a native thinking bool.
         capabilities.reasoning = Some(reasoning);
@@ -1911,6 +1946,78 @@ mod tests {
         );
     }
     use super::*;
+
+    #[tokio::test]
+    async fn g09_direct_embedding_adapter_rejects_invalid_batch_before_network() {
+        let provider = OpenRouterProvider::new("unused-fixture-key");
+        for model in [
+            "openai/text-embedding-3-small",
+            "openai/text-embedding-3-large",
+        ] {
+            let error = provider
+                .embed(EmbeddingRequest::new(model, vec!["short".to_owned(); 2048]))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("budget"));
+            let error = provider
+                .embed(EmbeddingRequest::new(model, vec![" a".repeat(8193)]))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("token budget"));
+        }
+        assert!(
+            provider
+                .embed(EmbeddingRequest::new(
+                    "vendor/unknown",
+                    vec!["a".into(), "b".into()]
+                ))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("budget")
+        );
+    }
+
+    #[test]
+    fn embedding_wire_contract_has_actual_endpoint_model_input_encoding_and_usage() {
+        let provider = OpenRouterProvider::new("fixture-key");
+        assert_eq!(
+            provider.embeddings_url(),
+            "https://openrouter.ai/api/v1/embeddings"
+        );
+        let input = vec!["first".to_owned(), "second".to_owned()];
+        let body = ApiEmbeddingRequest {
+            model: "openai/text-embedding-3-small".to_owned(),
+            input: input.clone(),
+            encoding_format: "float",
+        };
+        assert_eq!(
+            serde_json::to_value(body).unwrap(),
+            serde_json::json!({
+                "model": "openai/text-embedding-3-small", "input": input, "encoding_format": "float"
+            })
+        );
+        let response: ApiEmbeddingResponse = serde_json::from_value(serde_json::json!({
+            "data": [{"index":1,"embedding":[2.0]},{"index":0,"embedding":[1.0]}],
+            "usage": {"prompt_tokens":7,"total_tokens":7}
+        }))
+        .unwrap();
+        assert_eq!(
+            ordered_vectors(response.data, 2).unwrap(),
+            vec![vec![1.0], vec![2.0]]
+        );
+        let usage: crate::types::TokenUsage = response.usage.unwrap().into();
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(0));
+        for bad in [serde_json::json!(-1), serde_json::json!(0.5)] {
+            assert!(
+                serde_json::from_value::<ApiEmbeddingResponse>(serde_json::json!({
+                    "data":[{"index":bad,"embedding":[1.0]}]
+                }))
+                .is_err()
+            );
+        }
+    }
     use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
     use crate::providers::OpenAiCompatibleProvider;
     use crate::tools::stream::IncrementalLineDecoder;
@@ -2836,6 +2943,461 @@ mod tests {
         let caps = provider.capabilities();
         assert!(caps.streaming);
         assert!(caps.vision);
+    }
+}
+
+#[cfg(test)]
+mod media_contract_tests {
+    use super::*;
+    use crate::{AttachmentDataSource, MessageAttachment, MessageContentPart};
+    use crate::{ChatMessage, Provider};
+    #[test]
+    fn chat_gateway_pdf_uses_mime_data_url_and_audio_mp4_maps_to_m4a() {
+        let provider = OpenRouterProvider::new("unused");
+        let pdf_bytes = crate::attachments::regression::pdf(1);
+        let file = MessageAttachment {
+            mime_type: "application/pdf".into(),
+            name: Some("doc.pdf".into()),
+            size_bytes: None,
+            sha256: None,
+            source: AttachmentDataSource::Bytes {
+                base64_data: BASE64.encode(&pdf_bytes),
+            },
+            artifact: None,
+        };
+        let prepared = crate::attachments::prepare_messages_for_provider(
+            "openrouter",
+            &provider.capabilities(),
+            &[ChatMessage::user_parts(vec![MessageContentPart::file(
+                file,
+            )])],
+        )
+        .unwrap();
+        let inline = serde_json::to_value(
+            OpenRouterProvider::build_file_part(&prepared.attachments[0]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            inline["file"]["file_data"],
+            format!("data:application/pdf;base64,{}", BASE64.encode(&pdf_bytes))
+        );
+        assert_eq!(
+            OpenRouterProvider::audio_format_from_mime("audio/mp4").unwrap(),
+            "m4a"
+        );
+    }
+}
+
+#[cfg(test)]
+mod encoded_audio_regressions {
+    use super::*;
+    use crate::Provider;
+    use crate::attachments::regression as fixture;
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn encoded_wav_mp3_aliases_reach_async_admission_and_native_wire_unchanged() {
+        let provider = OpenRouterProvider::new("unused");
+        for (mime, bytes, format) in [
+            ("audio/wav", fixture::wav(), "wav"),
+            (" AUDIO/X-WAV ", fixture::wav(), "wav"),
+            (
+                "audio/mpeg",
+                crate::attachments::media_fixtures::vbr_mp3(100),
+                "mp3",
+            ),
+            (
+                "audio/mp3",
+                crate::attachments::media_fixtures::vbr_mp3(100),
+                "mp3",
+            ),
+        ] {
+            let state = Arc::new(fixture::state("openrouter", "media", serde_json::json!({})));
+            let req = fixture::request(
+                "media",
+                vec![fixture::part(InputContentType::Audio, mime, &bytes)],
+            );
+            let budget = fixture::scoped(state.clone(), provider.prepare_input_budget(req))
+                .await
+                .unwrap();
+            let prepared = fixture::scoped(
+                state,
+                crate::attachments::prepare_messages_for_provider_async(
+                    "openrouter",
+                    "media",
+                    &provider.capabilities(),
+                    &budget.request.messages,
+                ),
+            )
+            .await
+            .unwrap();
+            let wire =
+                serde_json::to_value(OpenRouterProvider::convert_messages(&prepared).unwrap())
+                    .unwrap();
+            assert_eq!(wire[0]["content"][1]["input_audio"]["format"], format);
+            assert_eq!(
+                wire[0]["content"][1]["input_audio"]["data"],
+                BASE64.encode(&bytes)
+            );
+        }
+    }
+    #[test]
+    fn finite_renderer_mapping_matches_all_declared_encoded_aliases() {
+        for (mime, format) in [
+            ("audio/wav", "wav"),
+            ("audio/x-wav", "wav"),
+            ("audio/wave", "wav"),
+            ("audio/mpeg", "mp3"),
+            ("audio/mp3", "mp3"),
+            ("audio/mpga", "mp3"),
+            ("audio/mp4", "m4a"),
+            ("audio/m4a", "m4a"),
+            ("audio/x-m4a", "m4a"),
+            ("audio/aiff", "aiff"),
+            ("audio/x-aiff", "aiff"),
+            ("audio/flac", "flac"),
+            ("audio/x-flac", "flac"),
+            ("audio/ogg", "ogg"),
+            ("audio/vorbis", "ogg"),
+            ("audio/aac", "aac"),
+            ("audio/x-aac", "aac"),
+        ] {
+            assert_eq!(
+                OpenRouterProvider::audio_format_from_mime(mime).unwrap(),
+                format
+            );
+            // Normalization, not transcoding; serialized format is finite.
+            let wire =
+                serde_json::to_value(OpenRouterProvider::audio_format_from_mime(mime).unwrap())
+                    .unwrap();
+            assert_eq!(wire, format);
+            assert!(fixture::representation("openrouter", InputContentType::Audio, mime).is_ok());
+        }
+        for mime in [
+            "audio/made-up",
+            "audio/pcm16",
+            "audio/pcm24",
+            "video/mp4",
+            "",
+            "audio/mpeg;unexpected",
+        ] {
+            assert!(OpenRouterProvider::audio_format_from_mime(mime).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod discovery_input_regressions {
+    use super::*;
+    use crate::{
+        Provider,
+        attachments::{admission::AdmissionState, regression as fixture},
+    };
+    use std::sync::Arc;
+    fn decode() -> Vec<ProviderModelInfo> {
+        let response: ModelsListResponse = serde_json::from_str(include_str!(
+            "../../tests/fixtures/capabilities/openrouter-models.json"
+        ))
+        .unwrap();
+        response
+            .data
+            .into_iter()
+            .map(provider_model_from_openrouter_model_entry)
+            .collect()
+    }
+    #[tokio::test]
+    async fn native_architecture_decoder_enrichment_refresh_and_both_mode_admission() {
+        let provider = OpenRouterProvider::new("unused");
+        let state = Arc::new(fixture::state("openrouter", "media", serde_json::json!({})));
+        let raw = decode();
+        assert_eq!(
+            raw[0].capabilities.input_modalities.as_ref().unwrap(),
+            &["text"]
+        );
+        assert_eq!(
+            raw[0].capabilities.output_modalities.as_ref().unwrap(),
+            &["image"]
+        );
+        assert_eq!(raw[3].capabilities.vision, Some(false));
+        assert_eq!(raw[4].capabilities.vision, Some(true));
+        assert_eq!(raw[5].capabilities.input_modalities, None);
+        state.replace_discovery(raw.clone()); // same raw production mapper snapshot boundary as list_models
+        let mut dto = raw;
+        state
+            .catalog
+            .as_ref()
+            .unwrap()
+            .enrich("openrouter", &mut dto);
+        assert_eq!(dto[0].capabilities.vision, Some(false));
+        let png = fixture::image(image::ImageFormat::Png, 1, 1);
+        for (id, accepted) in [
+            ("vision", false),
+            ("new/vision", true),
+            ("missing", false),
+            ("empty", false),
+            ("legacy", true),
+            ("invalid-legacy", false),
+            ("text", false),
+        ] {
+            let request = fixture::request(
+                id,
+                vec![fixture::part(InputContentType::Image, "image/png", &png)],
+            );
+            let result = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(request.clone()),
+            )
+            .await;
+            assert_eq!(result.is_ok(), accepted, "{id}");
+            for stream in [false, true] {
+                let req = result
+                    .as_ref()
+                    .map(|b| b.request.clone())
+                    .unwrap_or(request.clone());
+                let prepared = fixture::scoped(
+                    state.clone(),
+                    prepare_messages_for_provider_async(
+                        "openrouter",
+                        id,
+                        &provider.capabilities(),
+                        &req.messages,
+                    ),
+                )
+                .await;
+                assert_eq!(prepared.is_ok(), accepted, "{id}, stream={stream}");
+                if let Ok(prepared) = prepared {
+                    let wire = serde_json::to_value(
+                        OpenRouterProvider::build_request_from_prepared(&req, &prepared, stream)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(wire["stream"], stream);
+                    assert_eq!(
+                        wire["messages"][0]["content"][1]["image_url"]["url"],
+                        format!("data:image/png;base64,{}", BASE64.encode(&png))
+                    );
+                }
+            }
+        }
+        let other = Arc::new(AdmissionState::for_test(
+            state.catalog.as_ref().unwrap().clone(),
+        ));
+        let req = fixture::request(
+            "new/vision",
+            vec![fixture::part(InputContentType::Image, "image/png", &png)],
+        );
+        assert!(
+            fixture::scoped(other, provider.prepare_input_budget(req.clone()))
+                .await
+                .is_err()
+        );
+        state.replace_discovery(Vec::new()); // successful explicit refresh replaces, never merges stale evidence
+        assert!(
+            fixture::scoped(state, provider.prepare_input_budget(req))
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod webm_wire_regressions {
+    use super::*;
+    use crate::{
+        Provider,
+        attachments::{media_fixtures::webm, regression as fixture},
+    };
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn webm_video_tracks_survive_budget_both_mode_projection_and_replay() {
+        let provider = OpenRouterProvider::new("unused");
+        for audio in [false, true] {
+            let bytes = webm(audio, true, "webm");
+            let state = Arc::new(fixture::state("openrouter", "media", serde_json::json!({})));
+            let budget = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(fixture::request(
+                    "media",
+                    vec![fixture::part(InputContentType::Video, "video/webm", &bytes)],
+                )),
+            )
+            .await
+            .unwrap();
+            for stream in [false, true] {
+                let replay = fixture::scoped(
+                    state.clone(),
+                    provider.prepare_input_budget(budget.request.clone()),
+                )
+                .await
+                .unwrap();
+                let prepared = fixture::scoped(
+                    state.clone(),
+                    prepare_messages_for_provider_async(
+                        "openrouter",
+                        "media",
+                        &provider.capabilities(),
+                        &replay.request.messages,
+                    ),
+                )
+                .await
+                .unwrap();
+                let wire = serde_json::to_value(
+                    OpenRouterProvider::build_request_from_prepared(
+                        &replay.request,
+                        &prepared,
+                        stream,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(wire["stream"], stream);
+                assert_eq!(
+                    wire["messages"][0]["content"][1]["video_url"]["url"],
+                    format!("data:video/webm;base64,{}", BASE64.encode(&bytes))
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod container_timeline_wire_regressions {
+    use super::*;
+    use crate::{
+        Provider,
+        attachments::{
+            media_fixtures::{TimingFixture, webm_timeline},
+            regression as fixture,
+        },
+    };
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn eleven_second_container_budget_both_modes_and_replay_keep_native_bytes() {
+        let provider = OpenRouterProvider::new("unused");
+        let bytes = webm_timeline(
+            true,
+            true,
+            "webm",
+            TimingFixture {
+                video_start: 10000,
+                declared_duration: Some(11000.0),
+                ..Default::default()
+            },
+        );
+        let state = Arc::new(fixture::state(
+            "openrouter",
+            "media",
+            serde_json::json!({"video":{"maxDurationMillis":11000}}),
+        ));
+        let budget = fixture::scoped(
+            state.clone(),
+            provider.prepare_input_budget(fixture::request(
+                "media",
+                vec![fixture::part(InputContentType::Video, "video/webm", &bytes)],
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(budget.media[0].input_tokens, 3850);
+        for stream in [false, true] {
+            let replay = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(budget.request.clone()),
+            )
+            .await
+            .unwrap();
+            let prepared = fixture::scoped(
+                state.clone(),
+                prepare_messages_for_provider_async(
+                    "openrouter",
+                    "media",
+                    &provider.capabilities(),
+                    &replay.request.messages,
+                ),
+            )
+            .await
+            .unwrap();
+            let wire = serde_json::to_value(
+                OpenRouterProvider::build_request_from_prepared(&replay.request, &prepared, stream)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(wire["stream"], stream);
+            assert_eq!(
+                wire["messages"][0]["content"][1]["video_url"]["url"],
+                format!("data:video/webm;base64,{}", BASE64.encode(&bytes))
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod confirmed_duration_wire_regressions {
+    use super::*;
+    use crate::{Provider, attachments::regression as fixture};
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn confirmed_elementary_audio_and_no_edit_mp4_keep_native_bytes_in_both_modes() {
+        let provider = OpenRouterProvider::new("unused");
+        for (kind, mime, bytes) in fixture::confirmed_wire_inputs("openrouter") {
+            let state = Arc::new(fixture::state("openrouter", "media", serde_json::json!({})));
+            let budget = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(fixture::request(
+                    "media",
+                    vec![fixture::part(kind, mime, &bytes)],
+                )),
+            )
+            .await
+            .unwrap();
+            for stream in [false, true] {
+                let replay = fixture::scoped(
+                    state.clone(),
+                    provider.prepare_input_budget(budget.request.clone()),
+                )
+                .await
+                .unwrap();
+                let prepared = fixture::scoped(
+                    state.clone(),
+                    prepare_messages_for_provider_async(
+                        "openrouter",
+                        "media",
+                        &provider.capabilities(),
+                        &replay.request.messages,
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(prepared.attachments[0].kind, kind);
+                assert_eq!(prepared.attachments[0].mime_type, mime);
+                let wire = serde_json::to_value(
+                    OpenRouterProvider::build_request_from_prepared(
+                        &replay.request,
+                        &prepared,
+                        stream,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(wire["stream"], stream);
+                let native = &wire["messages"][0]["content"][1];
+                if kind == InputContentType::Video {
+                    assert_eq!(
+                        native["video_url"]["url"],
+                        format!("data:video/mp4;base64,{}", BASE64.encode(&bytes))
+                    );
+                } else {
+                    assert_eq!(
+                        native["input_audio"]["format"],
+                        match mime {
+                            "audio/mpeg" => "mp3",
+                            "audio/aac" => "aac",
+                            _ => "m4a",
+                        }
+                    );
+                    assert_eq!(native["input_audio"]["data"], BASE64.encode(&bytes));
+                }
+            }
+        }
     }
 }
 

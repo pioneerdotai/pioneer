@@ -219,6 +219,9 @@ pub async fn prepare_supplemental<C: ConnectionTrait>(
         effects,
         compacted_payload_sha256,
     } = prepared;
+    if super::native_cancellation_context::has_accepted(db, &preparation.turn_id).await? {
+        bail!("recovery supplemental preparation was superseded by accepted native cancellation");
+    }
     if preparation.effects.iter().any(|effect| {
         effect.gate != NativeTerminalEffectGate::TerminalCommit
             || effect.effect_kind != NativeTerminalEffectKind::AttachedTaskCleanup
@@ -412,6 +415,11 @@ async fn prepare_with_policy<C: ConnectionTrait>(
     }
 
     let terminal = turn_row.status != "in_progress";
+    if !terminal
+        && super::native_cancellation_context::has_accepted(db, &preparation.turn_id).await?
+    {
+        bail!("terminal-effect preparation was superseded by accepted native cancellation");
+    }
     if !terminal && supersede_omitted_effects {
         native_terminal_effect_outbox::Entity::update_many()
             .col_expr(

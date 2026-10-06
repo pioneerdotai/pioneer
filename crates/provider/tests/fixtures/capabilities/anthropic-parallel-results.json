@@ -1,0 +1,103 @@
+[
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "tool_use",
+        "id": "A",
+        "name": "read",
+        "input": {}
+      },
+      {
+        "type": "tool_use",
+        "id": "B",
+        "name": "read",
+        "input": {}
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "tool_result",
+        "tool_use_id": "A",
+        "content": [
+          {
+            "type": "text",
+            "text": "A text"
+          },
+          {
+            "type": "image",
+            "source": {
+              "type": "base64",
+              "media_type": "image/png",
+              "data": "<A>"
+            }
+          }
+        ]
+      },
+      {
+        "type": "tool_result",
+        "tool_use_id": "B",
+        "content": [
+          {
+            "type": "text",
+            "text": "B text"
+          },
+          {
+            "type": "document",
+            "source": {
+              "type": "base64",
+              "media_type": "application/pdf",
+              "data": "<B>"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "tool_use",
+        "id": "C",
+        "name": "read",
+        "input": {}
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "tool_result",
+        "tool_use_id": "C",
+        "content": [
+          {
+            "type": "text",
+            "text": "C text"
+          },
+          {
+            "type": "image",
+            "source": {
+              "type": "base64",
+              "media_type": "image/png",
+              "data": "<C>"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "finished"
+      }
+    ]
+  }
+]

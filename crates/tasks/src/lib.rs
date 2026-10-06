@@ -51,7 +51,8 @@ pub use review::{
 };
 pub use scheduler::{TASK_EXECUTION_LEASE_SECONDS, TaskScheduler, TaskSchedulerHandle};
 pub use service::{
-    TaskReviewRuntimeConfig, TaskRuntime, TaskRuntimeConfig, TaskService, WriteLockDecision,
+    TaskDeliveryRecoveryResult, TaskReviewRuntimeConfig, TaskRuntime, TaskRuntimeConfig,
+    TaskService, WriteLockDecision,
 };
 pub use trigger::TaskTriggerCalculator;
 

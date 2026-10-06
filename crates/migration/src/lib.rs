@@ -13,7 +13,10 @@ mod m20261001_000001_delivery_authority_spec_indexes;
 mod m20261002_000001_task_run_occurrence_reconcile;
 mod m20261004_000001_task_occurrence_reconcile;
 mod m20261004_000004_compaction_lifecycle_pending;
+mod m20261004_000006_task_delivery_recovery;
 mod m20261004_000007_agent_action_outbox_ranges;
+mod m20261004_000008_task_event_fanout_pending;
+mod m20261005_000001_native_cancellation_context;
 pub use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
@@ -163,7 +166,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20261002_000001_task_run_occurrence_reconcile::Migration),
             Box::new(m20261004_000001_task_occurrence_reconcile::Migration),
             Box::new(m20261004_000004_compaction_lifecycle_pending::Migration),
+            Box::new(m20261004_000006_task_delivery_recovery::Migration),
             Box::new(m20261004_000007_agent_action_outbox_ranges::Migration),
+            Box::new(m20261004_000008_task_event_fanout_pending::Migration),
+            Box::new(m20261005_000001_native_cancellation_context::Migration),
         ]
     }
 }
