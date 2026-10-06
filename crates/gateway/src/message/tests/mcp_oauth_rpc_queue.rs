@@ -34,7 +34,8 @@ async fn authorized_event_cannot_restart_reinstalled_or_replaced_identity_after_
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// One async worker makes handing off the synchronous clock barrier essential.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn same_websocket_terminal_decision_after_durable_put_preserves_cancel_timeout_and_success() {
     use pioneer_mcp_oauth::OAuthState;
     for decision in [
@@ -1546,11 +1547,20 @@ impl pioneer_mcp_oauth::OAuthClock for WireCommitClock {
                 })
         });
         if stored && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            self.entered.notify_one();
-            let mut released = self.released.lock().unwrap();
-            while !*released {
-                released = self.release.wait(released).unwrap();
-            }
+            // This synchronous clock can run on a Tokio worker after the put.
+            // Hand off that worker before parking, so the notified controller
+            // and its WebSocket Cancel can run and release the barrier.
+            tokio::task::block_in_place(|| {
+                self.entered.notify_one();
+                let released = self.released.lock().unwrap();
+                let (released, _) = self
+                    .release
+                    .wait_timeout_while(released, Duration::from_secs(10), |released| !*released)
+                    .unwrap();
+                let completed = *released;
+                drop(released);
+                assert!(completed, "post-put clock barrier was not released");
+            });
         }
         *self.now.lock().unwrap()
     }
