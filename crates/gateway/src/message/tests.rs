@@ -68531,6 +68531,14 @@ struct MemoryAgentE2eHarness {
 }
 
 async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGatewayHarness {
+    setup_memory_gateway_harness_with_backend(case_id, enabled, None).await
+}
+
+async fn setup_memory_gateway_harness_with_backend(
+    case_id: &str,
+    enabled: bool,
+    backend: Option<Arc<dyn pioneer_memory::MemoryBackend>>,
+) -> MemoryGatewayHarness {
     let session_manager = Arc::new(SessionManager::new());
     let (tx, rx) = mpsc::channel(32);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -68541,8 +68549,13 @@ async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGat
         .await;
     let runtime_home = unique_temp_dir(&format!("memory_{case_id}"));
     std::fs::create_dir_all(runtime_home.as_path()).expect("create memory runtime home");
-    let memory_runtime = Arc::new(
-        GatewayMemoryRuntime::from_config(
+    let uses_memvid = backend.is_none();
+    let memory_runtime = Arc::new(match backend {
+        Some(backend) => {
+            assert!(enabled, "custom memory backend requires an enabled runtime");
+            GatewayMemoryRuntime::enabled_with_backend_for_test(crud_store.clone(), backend)
+        }
+        None => GatewayMemoryRuntime::from_config(
             crud_store.clone(),
             runtime_home.as_path(),
             &GatewayMemoryConfig {
@@ -68554,10 +68567,12 @@ async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGat
             },
         )
         .expect("memory runtime should initialize"),
-    );
+    });
 
     if enabled {
         assert!(memory_runtime.is_enabled());
+    }
+    if enabled && uses_memvid {
         assert!(
             memory_runtime
                 .capsules_root()
@@ -70250,7 +70265,15 @@ async fn memory_tool_remember_writes_memory_with_turn_provenance() {
 
 #[tokio::test]
 async fn supervised_memory_mutations_prompt_before_real_database_side_effects() {
-    let harness = setup_memory_gateway_harness("tool_supervised_consent", true).await;
+    // Exercise the real approval broker, tools, memory service and SQLite writes.
+    // Memvid indexing is covered separately; its Tantivy writer lifecycle must
+    // not make this permission regression depend on filesystem lock timing.
+    let harness = setup_memory_gateway_harness_with_backend(
+        "tool_supervised_consent",
+        true,
+        Some(Arc::new(pioneer_memory::InMemoryMemoryBackend::default())),
+    )
+    .await;
     let context = memory_tool_context(&harness, "tool_supervised_consent");
     let materialization = materialize_memory_tools_for_context(&harness, context.clone()).await;
     let permission_profile = pioneer_protocol::system_turn_permission_profile_snapshot(
@@ -70277,6 +70300,7 @@ async fn supervised_memory_mutations_prompt_before_real_database_side_effects() 
         crate::permissions::GatewayPermissionApprovalBroker::channel();
     let opened = Arc::new(AtomicUsize::new(0));
     let opened_for_worker = opened.clone();
+    let store_for_worker = harness.crud_store.clone();
     let approval_worker = tokio::spawn(async move {
         while let Some(event) = approval_events.recv().await {
             match event {
@@ -70290,6 +70314,15 @@ async fn supervised_memory_mutations_prompt_before_real_database_side_effects() 
                         pioneer_tools::PermissionActionKind::MemoryWrite
                     );
                     let index = opened_for_worker.fetch_add(1, Ordering::SeqCst);
+                    let rows_before_decision = store_for_worker
+                        .list_agent_memory_records(AgentMemoryListFilter::default())
+                        .await
+                        .expect("read memory before approval decision");
+                    assert_eq!(
+                        rows_before_decision.len(),
+                        index,
+                        "memory writes must wait for the approval decision"
+                    );
                     let resolution = if index == 0 {
                         pioneer_tools::PermissionApprovalResolution::AllowOnce
                     } else {
@@ -70359,6 +70392,23 @@ async fn supervised_memory_mutations_prompt_before_real_database_side_effects() 
     assert_eq!(opened.load(Ordering::SeqCst), 2);
     assert_eq!(rows.len(), 1, "denied mutation must not create a DB row");
     assert_eq!(rows[0].key.as_deref(), Some("supervised_allowed"));
+
+    let runtime = harness.processor.memory_runtime();
+    let stored = runtime
+        .service()
+        .get(
+            runtime.operation_context_for_authorized_turn(&context, None, false),
+            MemoryGetParams {
+                memory_id: rows[0].id.clone(),
+                include_deleted: false,
+            },
+        )
+        .await
+        .expect("read approved memory through the service");
+    assert_eq!(
+        stored.record.expect("approved memory should exist").content,
+        "approved supervised memory"
+    );
 
     drop(tools);
     approval_worker.abort();
