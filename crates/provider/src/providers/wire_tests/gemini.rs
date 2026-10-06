@@ -147,36 +147,91 @@ fn canonical_optional_and_unknown_parts_do_not_hide_calls() {
     assert_eq!(parts[5].function_response.as_ref().unwrap().name, "clock");
 }
 
-#[test]
-fn prepared_media_uses_canonical_part_and_nested_names() {
+#[tokio::test]
+async fn prepared_media_uses_canonical_part_and_nested_names() {
+    use crate::attachments::regression as fixture;
+    use std::sync::Arc;
+
     let provider = GeminiProvider::new("fixture");
+    let state = Arc::new(fixture::state("gemini", "media", serde_json::json!({})));
+    let image = fixture::image(image::ImageFormat::Png, 1, 1);
+    let pdf = fixture::pdf(1);
     let mut message = ChatMessage::user("Inspect");
     message.content_parts = vec![
-        MessageContentPart::image(MessageAttachment {
-            mime_type: "image/png".into(), name: None, size_bytes: None, sha256: None,
-            source: AttachmentDataSource::Bytes { base64_data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+VrWQAAAAASUVORK5CYII=".into() }, artifact: None,
-        }),
-        MessageContentPart::file(MessageAttachment {
-            mime_type: "application/pdf".into(), name: None, size_bytes: None, sha256: None,
-            source: AttachmentDataSource::Reference { reference: "https://generativelanguage.googleapis.com/v1beta/files/fixture".into() }, artifact: None,
-        }),
+        fixture::part(crate::InputContentType::Image, "image/png", &image),
+        fixture::part(crate::InputContentType::File, "application/pdf", &pdf),
     ];
-    let request = request(vec![message]);
-    let prepared =
-        prepare_messages_for_provider(provider.name(), &provider.capabilities(), &request.messages)
-            .unwrap();
+    let mut request = request(vec![message]);
+    request.model = "media".into();
+    let mut external_reference = request.clone();
+    external_reference.messages[0].content_parts[1] = MessageContentPart::file(MessageAttachment {
+        mime_type: "application/pdf".into(),
+        name: None,
+        size_bytes: None,
+        sha256: None,
+        source: AttachmentDataSource::Reference {
+            reference: "https://generativelanguage.googleapis.com/v1beta/files/fixture".into(),
+        },
+        artifact: None,
+    });
+    assert!(
+        fixture::scoped(
+            state.clone(),
+            provider.prepare_input_budget(external_reference)
+        )
+        .await
+        .is_err()
+    );
+
+    let budget = fixture::scoped(state.clone(), provider.prepare_input_budget(request))
+        .await
+        .unwrap();
+    let mut prepared = fixture::scoped(
+        state,
+        prepare_messages_for_provider_async(
+            provider.name(),
+            "media",
+            &provider.capabilities(),
+            &budget.request.messages,
+        ),
+    )
+    .await
+    .unwrap();
     assert_eq!(prepared.attachments.len(), 2);
     let wire = serde_json::to_value(
-        GeminiProvider::build_request_from_prepared(&request, &prepared).unwrap(),
+        GeminiProvider::build_request_from_prepared(&budget.request, &prepared).unwrap(),
     )
     .unwrap();
     let parts = wire["contents"][0]["parts"].as_array().unwrap();
-    let inline = parts
+    let inline_image = parts
         .iter()
-        .find_map(|part| part.get("inlineData"))
+        .find_map(|part| {
+            part.get("inlineData")
+                .filter(|data| data["mimeType"] == "image/png")
+        })
         .unwrap();
-    assert_eq!(inline["mimeType"], "image/png");
-    assert!(inline["data"].is_string());
+    assert_eq!(inline_image["data"], BASE64.encode(&image));
+    let inline_pdf = parts
+        .iter()
+        .find_map(|part| {
+            part.get("inlineData")
+                .filter(|data| data["mimeType"] == "application/pdf")
+        })
+        .unwrap();
+    assert_eq!(inline_pdf["data"], BASE64.encode(&pdf));
+
+    // Wire-only projection of an internal upload result after validating the
+    // original PDF bytes. This does not admit a caller-supplied file reference.
+    prepared.attachments[1].source = PreparedAttachmentSource::Reference {
+        reference: "https://generativelanguage.googleapis.com/v1beta/files/fixture".into(),
+    };
+    prepared.attachments[1].transport_plan.kind = crate::AttachmentTransportKind::Upload;
+    prepared.attachments[1].bytes = None;
+    let wire = serde_json::to_value(
+        GeminiProvider::build_request_from_prepared(&budget.request, &prepared).unwrap(),
+    )
+    .unwrap();
+    let parts = wire["contents"][0]["parts"].as_array().unwrap();
     let file = parts.iter().find_map(|part| part.get("fileData")).unwrap();
     assert_eq!(file["mimeType"], "application/pdf");
     assert_eq!(

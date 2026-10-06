@@ -1,0 +1,296 @@
+{
+  "groq": {
+    "text": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "vision": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "media": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "unknown": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    }
+  },
+  "openai": {
+    "text": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "vision": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "media": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "unknown": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    }
+  },
+  "anthropic": {
+    "text": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "vision": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "media": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "unknown": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    }
+  },
+  "google": {
+    "text": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "vision": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "media": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "unknown": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    }
+  },
+  "openrouter": {
+    "text": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "vision": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "media": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "unknown": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    }
+  },
+  "amazon-bedrock": {
+    "text": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "vision": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "media": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "unknown": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    }
+  },
+  "github-copilot": {
+    "text": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "vision": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "media": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    },
+    "unknown": {
+      "contextWindow": {
+        "kind": "source",
+        "expression": "fixture.context"
+      },
+      "maxTokens": {
+        "kind": "source",
+        "expression": "fixture.output"
+      }
+    }
+  }
+}
