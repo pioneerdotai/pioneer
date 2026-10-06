@@ -316,6 +316,15 @@ impl ExecutionEventHub {
         self.progress.flush_for_durable(event).await;
     }
 
+    pub fn pending_progress_targets_for_item(
+        &self,
+        workspace_id: &str,
+        item_id: &str,
+    ) -> Vec<(String, String)> {
+        self.progress
+            .pending_targets_for_item(workspace_id, item_id)
+    }
+
     pub async fn flush_progress_for_item(
         &self,
         workspace_id: &str,

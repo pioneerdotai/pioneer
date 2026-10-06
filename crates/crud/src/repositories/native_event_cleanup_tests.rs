@@ -147,7 +147,16 @@ impl Fixture {
         options.map_sqlx_sqlite_opts(|o| o.pragma("foreign_keys", "ON"));
         let writer = Database::connect(options).await?;
         match migration {
-            Some(true) => Migrator::down(&writer, Some(1)).await?,
+            Some(true) => {
+                // This fixture can stop at the cleanup release boundary, so
+                // only applied migrations belong to the rollback suffix.
+                let migrations = Migrator::get_applied_migrations(&writer).await?;
+                let target = migrations
+                    .iter()
+                    .position(|m| m.name() == "m20260919_000001_native_event_cleanup_queue")
+                    .expect("cleanup queue is applied");
+                Migrator::down(&writer, Some((migrations.len() - target) as u32)).await?;
+            }
             Some(false) => {
                 let applied: i64 = writer
                     .query_one_raw(Statement::from_string(
@@ -592,6 +601,8 @@ async fn byte_budget_runtime_ownership_and_empty_preparation_races() -> Result<(
 #[tokio::test]
 async fn migration_bootstrap_restart_vacuum_and_live_events_before_cursor() -> Result<()> {
     let f = Fixture::open_version(false).await?;
+    let prior_migrations = f.scalar("SELECT COUNT(*) FROM seaql_migrations").await?;
+    assert!(prior_migrations + 1 < Migrator::migrations().len() as i64);
     f.historical_completed_turn("legacy").await?;
     for i in 0..130 {
         f.event(
@@ -638,7 +649,30 @@ async fn migration_bootstrap_restart_vacuum_and_live_events_before_cursor() -> R
     assert!(bootstrap(&f.db).await?.complete);
     // Down removes only queue schema; upgrading again re-enables bootstrap.
     let f = f.migrate(true).await?;
+    assert_eq!(
+        f.scalar("SELECT COUNT(*) FROM seaql_migrations").await?,
+        prior_migrations,
+        "rollback must preserve migrations preceding cleanup"
+    );
+    assert_eq!(
+        f.scalar("SELECT COUNT(*) FROM seaql_migrations WHERE version='m20260919_000001_native_event_cleanup_queue'").await?,
+        0,
+        "rollback must remove the cleanup completion marker"
+    );
+    assert_eq!(
+        f.scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='history_check_due'"
+        )
+        .await?,
+        1,
+        "rollback must preserve the earlier history-check schema"
+    );
     let f = f.migrate(false).await?;
+    assert_eq!(
+        f.scalar("SELECT COUNT(*) FROM seaql_migrations").await?,
+        prior_migrations + 1,
+        "upgrade must reinstall cleanup without advancing later migrations"
+    );
     assert_eq!(
         f.scalar("SELECT complete FROM native_event_cleanup_bootstrap")
             .await?,

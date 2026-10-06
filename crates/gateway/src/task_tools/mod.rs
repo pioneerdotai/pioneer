@@ -5225,10 +5225,18 @@ pub(crate) async fn task_turn_item_from_response_with_progress(
     progress_preview: Option<String>,
 ) -> anyhow::Result<TaskTurnItem> {
     let run = select_task_anchor_run(response);
-    task_turn_item_from_response_with_run(
+    task_turn_item_from_context(
         processor.crud_store.as_ref(),
-        response,
+        &response.task,
         run,
+        anchor_trigger(response, run),
+        select_anchor_agent_spec(response, run)
+            .map(|a| pioneer_crud::TaskAnchorAgent {
+                agent_role: a.agent_role.clone(),
+                depth: a.depth,
+                max_depth: a.max_depth,
+            })
+            .as_ref(),
         task_anchor_id(response.task.id.as_str()),
         progress_preview,
     )
@@ -5253,14 +5261,31 @@ pub(crate) async fn task_turn_item_from_response_for_run_with_progress(
     progress_preview: Option<String>,
 ) -> anyhow::Result<TaskTurnItem> {
     let run = response.runs.iter().find(|run| run.id == run_id);
-    task_turn_item_from_response_with_run(
+    task_turn_item_from_context(
         processor.crud_store.as_ref(),
-        response,
+        &response.task,
         run,
+        anchor_trigger(response, run),
+        select_anchor_agent_spec(response, run)
+            .map(|a| pioneer_crud::TaskAnchorAgent {
+                agent_role: a.agent_role.clone(),
+                depth: a.depth,
+                max_depth: a.max_depth,
+            })
+            .as_ref(),
         item_id,
         progress_preview,
     )
     .await
+}
+
+fn anchor_trigger<'a>(
+    response: &'a TaskGetResponse,
+    run: Option<&TaskRun>,
+) -> Option<&'a TaskTrigger> {
+    run.and_then(|run| run.trigger_id.as_ref())
+        .and_then(|id| response.triggers.iter().find(|t| t.id == *id))
+        .or_else(|| response.triggers.last())
 }
 
 pub(crate) fn task_anchor_id(task_id: &str) -> String {
@@ -5271,25 +5296,15 @@ pub(crate) fn task_run_anchor_id(run_id: &str) -> String {
     format!("task_run_{run_id}")
 }
 
-async fn task_turn_item_from_response_with_run(
+pub(crate) async fn task_turn_item_from_context(
     crud_store: &CrudStore,
-    response: &TaskGetResponse,
+    task: &Task,
     run: Option<&TaskRun>,
+    trigger: Option<&TaskTrigger>,
+    agent_spec: Option<&pioneer_crud::TaskAnchorAgent>,
     item_id: String,
     progress_preview: Option<String>,
 ) -> anyhow::Result<TaskTurnItem> {
-    let task = &response.task;
-    let trigger = run
-        .and_then(|run| {
-            run.trigger_id.as_ref().and_then(|trigger_id| {
-                response
-                    .triggers
-                    .iter()
-                    .find(|trigger| trigger.id == *trigger_id)
-            })
-        })
-        .or_else(|| response.triggers.last());
-    let agent_spec = select_anchor_agent_spec(response, run);
     let child_anchor = match run {
         Some(run) => {
             crud_store

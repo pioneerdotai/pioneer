@@ -338,6 +338,42 @@ impl ProgressCoalescer {
         self.send_live_events(events);
     }
 
+    /// Existing coalescer keys are capped by max_pending_keys. Empty historic
+    /// targets need no flush; no extra tracking state is kept here.
+    pub fn pending_targets_for_item(
+        &self,
+        workspace_id: &str,
+        item_id: &str,
+    ) -> Vec<(String, String)> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("progress coalescer poisoned");
+        let mut targets = Vec::new();
+        for key in state
+            .pending
+            .keys()
+            .filter(|k| k.workspace_id == workspace_id && k.item_id == item_id)
+        {
+            let target = (key.thread_id.clone(), key.turn_id.clone());
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+        for key in state
+            .heartbeats
+            .values()
+            .filter(|k| k.workspace_id == workspace_id && k.item_id == item_id)
+        {
+            let target = (key.thread_id.clone(), key.turn_id.clone());
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+        targets
+    }
+
     pub async fn flush_item(
         &self,
         workspace_id: &str,
@@ -758,4 +794,54 @@ fn annotate_progress_payload(
         }
     }
     notification.payload = Some(payload);
+}
+
+#[cfg(test)]
+mod fanout_tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn terminal_flush_targets_only_existing_bounded_buffers_and_respects_workspace() {
+        let coalescer = ProgressCoalescer::new(16, ProgressCoalescerConfig::default());
+        let mut rx = coalescer.subscribe_live();
+        for (workspace, turn, item) in [
+            ("w", "creation", "task_t"),
+            ("w", "occurrence", "task_t"),
+            ("other", "foreign", "task_t"),
+            ("w", "other_item", "task_other"),
+        ] {
+            coalescer.offer(AgentProgressEvent::TaskProgress {
+                workspace_id: workspace.into(),
+                thread_id: "thread".into(),
+                turn_id: turn.into(),
+                item_id: item.into(),
+                task_id: "t".into(),
+                run_id: None,
+                summary: "pending".into(),
+            });
+        }
+        let mut targets = coalescer.pending_targets_for_item("w", "task_t");
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec![
+                ("thread".into(), "creation".into()),
+                ("thread".into(), "occurrence".into())
+            ]
+        );
+        for (thread, turn) in targets {
+            coalescer.flush_item("w", &thread, &turn, "task_t").await;
+        }
+        assert!(coalescer.pending_targets_for_item("w", "task_t").is_empty());
+        assert_eq!(
+            coalescer.pending_targets_for_item("other", "task_t").len(),
+            1
+        );
+        assert_eq!(
+            coalescer.pending_targets_for_item("w", "task_other").len(),
+            1
+        );
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+    }
 }

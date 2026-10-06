@@ -96,13 +96,27 @@ pub fn resolve_attachment_source(
         }
         AttachmentDataSource::Url { url } => {
             let parsed = security::parse_and_validate_url(provider_name, url, &config.security)?;
-            let bytes = fetch_url_attachment(
-                provider_name,
-                parsed.as_str(),
-                attachment.mime_type.as_str(),
-                config,
-                source_limit,
-            )?;
+            // Fixture transport replaces only HTTP delivery, after production
+            // opt-in/domain/URL guards; no mock server or live network required.
+            #[cfg(test)]
+            let fixture = super::admission::current().and_then(|s| s.fixture_url(parsed.as_str()));
+            #[cfg(not(test))]
+            let fixture: Option<Vec<u8>> = None;
+            let bytes = if let Some(bytes) = fixture {
+                anyhow::ensure!(
+                    bytes.len() <= source_limit,
+                    "fixture URL exceeds source limit"
+                );
+                bytes
+            } else {
+                fetch_url_attachment(
+                    provider_name,
+                    parsed.as_str(),
+                    attachment.mime_type.as_str(),
+                    config,
+                    source_limit,
+                )?
+            };
             let source_name = parsed
                 .path_segments()
                 .and_then(|segments| segments.last())
