@@ -1,7 +1,7 @@
 use crate::attachments::errors::AttachmentPipelineError;
 use crate::attachments::types::AttachmentNormalizationPolicy;
 use crate::types::InputContentType;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mime_guess::get_mime_extensions_str;
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -14,35 +14,90 @@ pub fn normalize_mime(raw: &str) -> Result<String> {
     Ok(mime)
 }
 
+/// Aliases identify the same encoded format; this never transcodes bytes.
+pub(crate) fn canonical_mime(mime: &str) -> &str {
+    match mime {
+        "audio/x-wav" | "audio/wave" => "audio/wav",
+        "audio/mp3" | "audio/mpga" => "audio/mpeg",
+        "audio/x-m4a" | "audio/m4a" => "audio/mp4",
+        "audio/x-aiff" => "audio/aiff",
+        "audio/x-flac" => "audio/flac",
+        "audio/vorbis" => "audio/ogg",
+        "audio/x-aac" => "audio/aac",
+        _ => mime,
+    }
+}
+
 pub fn reconcile_mime(
     declared_mime: &str,
     bytes: Option<&[u8]>,
     policy: &AttachmentNormalizationPolicy,
 ) -> Result<String> {
-    let declared = normalize_mime(declared_mime)?;
+    let declared = canonical_mime(&normalize_mime(declared_mime)?).to_owned();
     let Some(data) = bytes else {
         return Ok(declared);
     };
 
-    let Some(sniffed) = sniff_mime_from_bytes(data) else {
+    let decoded_image = image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()?
+        .format()
+        .map(|f| f.to_mime_type());
+    let Some(sniffed) = decoded_image.or_else(|| sniff_mime_from_bytes(data)) else {
+        if declared.starts_with("image/")
+            || declared.starts_with("audio/")
+            || declared.starts_with("video/")
+        {
+            return Err(AttachmentPipelineError::mime_mismatch(
+                &declared,
+                "unrecognized encoded format",
+            )
+            .into());
+        }
         return Ok(declared);
     };
 
-    if sniffed == declared {
-        return Ok(declared);
-    }
-
-    let declared_top = declared.split('/').next().unwrap_or_default();
-    let sniffed_top = sniffed.split('/').next().unwrap_or_default();
-    if declared_top == sniffed_top {
-        return Ok(declared);
+    // Inspect actual tracks: audio-only MP4 and video MP4 share file magic.
+    let actual = if sniffed == "video/webm" {
+        super::webm::actual_mime(data)?
+    } else if sniffed == "video/mp4" {
+        // Reject unproved edit structures before the dependency allocates a
+        // full table which its public Track projection subsequently discards.
+        // Duration/identity cross-scale proof remains in native_duration.
+        super::mp4_timing::identity_edits(data).context(super::MediaInputRejection(
+            "MP4 edit/fragment timeline is unsupported or unproven",
+        ))?;
+        let context = mp4parse::read_mp4(&mut std::io::Cursor::new(data))?;
+        if context
+            .tracks
+            .iter()
+            .any(|t| t.track_type == mp4parse::TrackType::Video)
+        {
+            "video/mp4"
+        } else if context
+            .tracks
+            .iter()
+            .any(|t| t.track_type == mp4parse::TrackType::Audio)
+        {
+            "audio/mp4"
+        } else {
+            return Err(AttachmentPipelineError::mime_mismatch(
+                &declared,
+                "unknown MP4 track format",
+            )
+            .into());
+        }
+    } else {
+        sniffed
+    };
+    if canonical_mime(&declared) == canonical_mime(actual) {
+        return Ok(canonical_mime(&declared).to_owned());
     }
 
     if policy.strict_mime_match {
-        return Err(AttachmentPipelineError::mime_mismatch(declared.as_str(), sniffed).into());
+        return Err(AttachmentPipelineError::mime_mismatch(declared.as_str(), actual).into());
     }
 
-    Ok(sniffed.to_owned())
+    Ok(canonical_mime(actual).to_owned())
 }
 
 pub fn normalize_attachment_name(
@@ -197,13 +252,37 @@ pub fn sniff_mime_from_bytes(bytes: &[u8]) -> Option<&'static str> {
     if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
         return Some("image/webp");
     }
+    if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        return Some("video/webm");
+    }
     if bytes.len() >= 4 && bytes.starts_with(b"%PDF") {
         return Some("application/pdf");
     }
     if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
         return Some("audio/wav");
     }
-    if bytes.len() >= 3 && bytes.starts_with(b"ID3") {
+    if bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] & 0xf6 == 0xf0 {
+        return Some("audio/aac");
+    }
+    if bytes.starts_with(b"fLaC") {
+        return Some("audio/flac");
+    }
+    if bytes.starts_with(b"OggS") {
+        return Some("audio/ogg");
+    }
+    if bytes.len() >= 12
+        && bytes.starts_with(b"FORM")
+        && (&bytes[8..12] == b"AIFF" || &bytes[8..12] == b"AIFC")
+    {
+        return Some("audio/aiff");
+    }
+    if bytes.len() >= 3
+        && (bytes.starts_with(b"ID3")
+            || (bytes[0] == 0xff
+                && bytes[1] & 0xe0 == 0xe0
+                && bytes[1] & 0x06 != 0
+                && bytes[2] & 0xf0 != 0xf0))
+    {
         return Some("audio/mpeg");
     }
     if bytes.len() >= 12

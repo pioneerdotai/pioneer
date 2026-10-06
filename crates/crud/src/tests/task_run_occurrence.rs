@@ -723,7 +723,7 @@ async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_obj
         .unwrap();
     assert!(indexes.is_empty());
     let migrations = Migrator::migrations();
-    let target = migrations.iter().find(|m| m.name() == MIGRATION).unwrap();
+    let target = &migrations[migrations.len() - tracker_rollback_steps() as usize];
     assert_eq!(target.name(), MIGRATION);
     assert_eq!(target.use_transaction(), Some(true));
     assert!(
