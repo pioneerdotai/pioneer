@@ -1,5 +1,6 @@
 //! Bounded package delivery and sequential calls to the native installers.
 use super::*;
+use anyhow::Context;
 mod lifecycle;
 use pioneer_crud::PluginOwnershipWrite;
 use pioneer_plugins::{ComponentPlan, Entry, LoadedPluginPlan, Snapshot};
@@ -924,6 +925,72 @@ impl MessageProcessor {
         )
         .await
     }
+
+    pub(super) async fn acquire_task_plugin_launch_guards(
+        &self,
+        task: &pioneer_protocol::Task,
+        turn: &str,
+    ) -> anyhow::Result<Vec<tokio::sync::OwnedMutexGuard<()>>> {
+        if self.crud_store.get_plugin_selection(turn).await?.is_some() {
+            return self
+                .acquire_plugin_launch_guards(&task.workspace_id, turn)
+                .await;
+        }
+        let Some(launch) = self
+            .crud_store
+            .get_task_actor_contract(&task.id)
+            .await?
+            .and_then(|contract| contract.launch)
+        else {
+            return Ok(Vec::new());
+        };
+        let normalized = self
+            .normalize_task_launch_capabilities(&task.workspace_id, &launch.execution)
+            .await?;
+        let Some(snapshot) = normalized.plugin_selection else {
+            return Ok(Vec::new());
+        };
+        let guards = acquire_plugin_selection_admission(
+            self.crud_store.as_ref(),
+            &self.plugin_mutation_locks,
+            &task.workspace_id,
+            &snapshot,
+        )
+        .await?;
+        self.crud_store
+            .prepare_plugin_selection(turn, &snapshot)
+            .await?;
+        Ok(guards)
+    }
+
+    pub(super) async fn acquire_cli_instance_plugin_guards(
+        &self,
+        instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
+    ) -> anyhow::Result<Vec<tokio::sync::OwnedMutexGuard<()>>> {
+        let manager = self
+            .cli_runtime_manager
+            .as_ref()
+            .context("CLI manager unavailable")?;
+        let snapshot = manager.plugin_selection_for_instance(instance)?;
+        let guards = match snapshot {
+            Some(snapshot) => {
+                anyhow::ensure!(snapshot.phase == "ready", "plugins.selection_not_ready");
+                acquire_plugin_selection_admission(
+                    self.crud_store.as_ref(),
+                    &self.plugin_mutation_locks,
+                    &instance.key().workspace_id,
+                    &snapshot,
+                )
+                .await?
+            }
+            None => Vec::new(),
+        };
+        anyhow::ensure!(
+            manager.is_current_instance(instance).await,
+            "CLI instance changed before continuation"
+        );
+        Ok(guards)
+    }
 }
 
 impl MessageProcessor {
@@ -933,6 +1000,11 @@ impl MessageProcessor {
         deadline: tokio::time::Instant,
     ) -> anyhow::Result<()> {
         let parent = &guard.parent;
+        let cli_owners = self
+            .cli_runtime_manager
+            .as_ref()
+            .map(|manager| manager.plugin_stop_inventory(&parent.workspace_id, &parent.id))
+            .unwrap_or_default();
         // Actual native inventory supplies candidate IDs. DB status is never
         // used to infer quiescence, and stale historical rows are not scanned.
         let ids = self.agent_manager.native_stop_thread_ids().await?;
@@ -973,6 +1045,17 @@ impl MessageProcessor {
                 deadline,
             )
             .await?;
+        }
+        if let Some(manager) = &self.cli_runtime_manager {
+            for owner in &cli_owners {
+                manager.stop_and_wait(owner, deadline).await?;
+            }
+            anyhow::ensure!(
+                manager
+                    .plugin_stop_inventory(&parent.workspace_id, &parent.id)
+                    .is_empty(),
+                "plugins.execution_publication_changed"
+            );
         }
         // Graph/fallback stop drains model tool work. The same installation
         // lifecycle then acknowledges MCP invocation/session/process shutdown.
@@ -1427,6 +1510,22 @@ pub(crate) async fn acquire_plugin_launch_admission(
     let Some(snapshot) = store.get_plugin_selection(turn).await? else {
         return Ok(Vec::new());
     };
+    let guards = acquire_plugin_selection_admission(store, gates, workspace, &snapshot).await?;
+    anyhow::ensure!(
+        store.get_plugin_selection(turn).await?.as_ref() == Some(&snapshot),
+        "plugins.selection_changed"
+    );
+    Ok(guards)
+}
+
+/// The same parent locks also cover CLI preparation before its Turn exists.
+/// The snapshot is built by the Gateway normalizer, never by public input.
+pub(super) async fn acquire_plugin_selection_admission(
+    store: &pioneer_crud::CrudStore,
+    gates: &PluginMutationLocks,
+    workspace: &str,
+    snapshot: &pioneer_protocol::PluginSelectionSnapshot,
+) -> anyhow::Result<Vec<tokio::sync::OwnedMutexGuard<()>>> {
     let mut parents = snapshot.parents.clone();
     parents.sort_by(|a, b| a.id.cmp(&b.id));
     let mut guards = Vec::with_capacity(parents.len());
@@ -1449,9 +1548,96 @@ pub(crate) async fn acquire_plugin_launch_admission(
         );
         guards.push(guard);
     }
-    anyhow::ensure!(
-        store.get_plugin_selection(turn).await?.as_ref() == Some(&snapshot),
-        "plugins.selection_changed"
-    );
     Ok(guards)
+}
+
+/// Validate the existing committed snapshot and late native admission, without
+/// resolving a historical parent into a silently newer revision.
+pub(super) async fn validate_cli_plugin_selection(
+    store: &pioneer_crud::CrudStore,
+    workspace: &str,
+    turn: &str,
+) -> anyhow::Result<Option<pioneer_protocol::PluginSelectionSnapshot>> {
+    let Some(snapshot) = store.get_plugin_selection(turn).await? else {
+        // Missing metadata is not standalone authority for frozen owned leaves
+        // (including a crash before prepared publication).
+        for binding in store.list_turn_skill_bindings(turn).await? {
+            anyhow::ensure!(
+                store
+                    .find_skill_plugin_owner(&binding.skill_id)
+                    .await?
+                    .is_none(),
+                "plugins.selection_missing_for_owned_skill"
+            );
+        }
+        let installations = store
+            .list_turn_mcp_bindings(turn)
+            .await?
+            .into_iter()
+            .map(|binding| binding.server_installation_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for id in installations {
+            anyhow::ensure!(
+                store.find_mcp_plugin_owner(&id).await?.is_none(),
+                "plugins.selection_missing_for_owned_mcp"
+            );
+        }
+        return Ok(None);
+    };
+    anyhow::ensure!(snapshot.phase == "ready", "plugins.selection_not_ready");
+    for selected in &snapshot.parents {
+        let parent = store
+            .find_plugin_installation(&selected.id)
+            .await?
+            .context("plugin parent missing")?;
+        anyhow::ensure!(
+            parent.workspace_id == workspace
+                && parent.revision == selected.revision
+                && parent.enabled
+                && parent.state == "installed"
+                && parent.pending_json.is_none(),
+            "plugins.stale_or_disabled"
+        );
+    }
+    for child in &snapshot.children {
+        anyhow::ensure!(
+            store
+                .plugin_turn_child_available(turn, &child.kind, &child.id, workspace)
+                .await?,
+            "plugins.child_unavailable"
+        );
+    }
+    // The frozen native projection may not introduce an owned component that
+    // is absent from this ready selection, including after interrupted writes.
+    for binding in store.list_turn_skill_bindings(turn).await? {
+        if store
+            .find_skill_plugin_owner(&binding.skill_id)
+            .await?
+            .is_some()
+        {
+            anyhow::ensure!(
+                snapshot
+                    .children
+                    .iter()
+                    .any(|child| child.kind == "skill" && child.id == binding.skill_id.as_str()),
+                "plugins.owned_skill_outside_selection"
+            );
+        }
+    }
+    for binding in store.list_turn_mcp_bindings(turn).await? {
+        if store
+            .find_mcp_plugin_owner(&binding.server_installation_id)
+            .await?
+            .is_some()
+        {
+            anyhow::ensure!(
+                snapshot
+                    .children
+                    .iter()
+                    .any(|child| child.kind == "mcp" && child.id == binding.server_installation_id),
+                "plugins.owned_mcp_outside_selection"
+            );
+        }
+    }
+    Ok(Some(snapshot))
 }

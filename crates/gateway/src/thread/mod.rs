@@ -932,6 +932,51 @@ impl ThreadManager {
         .await
     }
 
+    /// Same admission as ordinary Agent/Task turns; only Gateway callers may
+    /// replace a validated parent envelope with its bounded native expansion.
+    pub(crate) async fn agent_turn_start_with_plugin_capabilities(
+        &self,
+        params: TurnStartParams,
+        capabilities: Vec<pioneer_protocol::TurnCapability>,
+        permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
+        author: pioneer_protocol::TurnAuthorSnapshot,
+        concurrent: bool,
+    ) -> Result<TurnStartOutcome> {
+        if !params.capabilities.iter().any(|cap| {
+            matches!(
+                cap.kind,
+                pioneer_protocol::TurnCapabilityKind::Plugin { .. }
+            )
+        }) {
+            anyhow::ensure!(
+                params.capabilities == capabilities,
+                "standalone execution projection changed"
+            );
+            return if concurrent {
+                self.concurrent_agent_turn_start_with_permission_profile(
+                    params,
+                    permission_profile,
+                    author,
+                )
+                .await
+            } else {
+                self.agent_turn_start_with_permission_profile(params, permission_profile, author)
+                    .await
+            };
+        }
+        self.turn_start_for_actor_with_permission_profile_concurrency(
+            None,
+            params,
+            Some(permission_profile),
+            Some(author),
+            Vec::new(),
+            TurnOrigin::User,
+            concurrent,
+            Some(capabilities),
+        )
+        .await
+    }
+
     pub async fn agent_turn_start_with_permission_profile_and_origin(
         &self,
         params: TurnStartParams,

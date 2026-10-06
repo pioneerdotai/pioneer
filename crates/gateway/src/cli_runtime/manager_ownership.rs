@@ -126,11 +126,31 @@ pub(super) struct CliSessionOwner {
     close: Mutex<Option<JoinHandle<Result<(), String>>>>,
     close_failure: StdMutex<Option<String>>,
     pub(super) stopped: AtomicBool,
+    admitted_turns: StdMutex<std::collections::HashSet<String>>,
 }
 impl CliSessionOwner {
+    pub(super) fn admit_turn(&self, turn: &str) -> Result<()> {
+        anyhow::ensure!(
+            !self.closing.load(Ordering::Acquire),
+            "CLI process is closing"
+        );
+        let mut turns = self
+            .admitted_turns
+            .lock()
+            .expect("CLI turn ownership poisoned");
+        // Retain history until this actual process/workers have stopped: a
+        // terminal row does not prove that its callbacks have drained.
+        anyhow::ensure!(
+            turns.len() < 65_536 || turns.contains(turn),
+            "CLI turn ownership inventory full; close session and retry"
+        );
+        turns.insert(turn.to_owned());
+        Ok(())
+    }
     pub(super) fn new(instance: CliSessionInstanceId) -> Arc<Self> {
         Arc::new(Self {
             instance,
+            admitted_turns: StdMutex::new(std::collections::HashSet::new()),
             startup: Arc::default(),
             startup_completion: Mutex::new(StartupCompletion::default()),
             closing: AtomicBool::new(false),
@@ -377,6 +397,13 @@ pub(crate) struct CliSessionStopOwner(pub(super) Arc<CliSessionOwner>);
 impl CliSessionStopOwner {
     pub(crate) fn instance(&self) -> &CliSessionInstanceId {
         &self.0.instance
+    }
+    pub(crate) fn owns_turn(&self, turn: &str) -> bool {
+        self.0
+            .admitted_turns
+            .lock()
+            .expect("CLI turn ownership poisoned")
+            .contains(turn)
     }
 }
 

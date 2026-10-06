@@ -641,12 +641,24 @@ pub(super) fn new_turn_execution(
 pub(crate) struct NormalizedTurnCapabilities {
     pub(super) plugin_selection: Option<pioneer_protocol::PluginSelectionSnapshot>,
     plugin_capability_ids: HashSet<String>,
-    pub(super) presentation: Vec<pioneer_protocol::TurnCapability>,
+    pub(crate) presentation: Vec<pioneer_protocol::TurnCapability>,
     pub(crate) execution: Vec<pioneer_protocol::TurnCapability>,
     pub(super) pack_names: HashMap<pioneer_protocol::SkillPackId, String>,
 }
 
+fn native_grant_capability_key(capability: &pioneer_protocol::TurnCapability) -> String {
+    match &capability.kind {
+        pioneer_protocol::TurnCapabilityKind::McpTool {
+            server_name,
+            scope_kind,
+            ..
+        } => pioneer_protocol::mcp_server_capability_key(*scope_kind, server_name),
+        _ => capability.id.clone(),
+    }
+}
+
 pub(super) struct PreparedCliRuntimeNativeTurnStart {
+    plugin_launch_guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
     outcome: crate::thread::TurnStartOutcome,
     user_message_capability_attachments: Vec<pioneer_protocol::UserMessageAttachment>,
     session_instance: crate::cli_runtime::session_instance::CliSessionInstanceId,
@@ -672,6 +684,8 @@ struct PreparedCliRuntimeDelivery {
 }
 
 struct CliRuntimeAdmissionPhase {
+    plugin_selection: Option<pioneer_protocol::PluginSelectionSnapshot>,
+    plugin_launch_guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
     thread: pioneer_protocol::Thread,
     normalized_presentation_capabilities: Vec<pioneer_protocol::TurnCapability>,
     normalized_pack_names: HashMap<pioneer_protocol::SkillPackId, String>,
@@ -1182,6 +1196,187 @@ impl MessageProcessor {
             }
         }
         Ok(catalog)
+    }
+
+    /// Public Task creation selects parents only. Freeze the server-derived
+    /// native grants before the ordinary Task admission; execution later uses
+    /// the durable ceiling and rechecks the pinned parent revision.
+    pub(super) async fn normalize_new_task_launch_capabilities(
+        &self,
+        workspace: &str,
+        launch: &mut pioneer_protocol::AgentLaunchSelection,
+    ) -> anyhow::Result<NormalizedTurnCapabilities> {
+        let requested =
+            super::agent_action_tools::task_launch_selection_capabilities(&launch.execution)?;
+        let normalized = self
+            .normalize_turn_skill_capabilities(workspace, &requested)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if normalized.plugin_selection.is_some() {
+            // Public native grant fields are not a trusted plugin expansion.
+            // They may describe separately selected standalone components only.
+            let supplied =
+                super::agent_action_tools::launch_selection_capabilities(&launch.execution)?;
+            anyhow::ensure!(
+                supplied
+                    .iter()
+                    .all(|cap| normalized.execution.iter().any(|eligible| !normalized
+                        .plugin_capability_ids
+                        .contains(&eligible.id)
+                        && native_grant_capability_key(eligible) == cap.id)),
+                "Task native grants are outside its standalone selection"
+            );
+        }
+        super::agent_action_tools::pin_launch_selection_capabilities(
+            launch,
+            &normalized.execution,
+        )?;
+        if normalized.plugin_selection.is_some() {
+            launch.execution.selected_capabilities = normalized.presentation.clone();
+        }
+        Ok(normalized)
+    }
+
+    /// Durable Task grants remain native IDs, while their selection preserves
+    /// parents. Reuse the public resolver, then cap its result by that exact
+    /// server-persisted ceiling. A new parent revision never repairs an old Task.
+    pub(crate) async fn normalize_task_launch_capabilities(
+        &self,
+        workspace: &str,
+        selection: &pioneer_protocol::AgentExecutionSelection,
+    ) -> anyhow::Result<NormalizedTurnCapabilities> {
+        let requested = super::agent_action_tools::task_launch_selection_capabilities(selection)?;
+        let mut normalized = self
+            .normalize_turn_skill_capabilities(workspace, &requested)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if normalized.plugin_selection.is_some() {
+            let granted = super::agent_action_tools::launch_selection_capabilities(selection)?;
+            let snapshot = normalized
+                .plugin_selection
+                .as_ref()
+                .expect("selection checked");
+            for cap in &granted {
+                if normalized
+                    .execution
+                    .iter()
+                    .any(|eligible| native_grant_capability_key(eligible) == cap.id)
+                {
+                    continue;
+                }
+                let (kind, id) = match &cap.kind {
+                    pioneer_protocol::TurnCapabilityKind::Skill { skill_id, .. } => {
+                        ("skill", skill_id.to_string())
+                    }
+                    pioneer_protocol::TurnCapabilityKind::McpServer {
+                        name,
+                        scope_kind: pioneer_protocol::McpScopeKind::Workspace,
+                    } => (
+                        "mcp",
+                        self.crud_store
+                            .find_mcp_server_installation("workspace", workspace, name)
+                            .await?
+                            .and_then(|row| row.id)
+                            .unwrap_or_default(),
+                    ),
+                    _ => anyhow::bail!("Task grant is outside its selected capabilities"),
+                };
+                anyhow::ensure!(
+                    snapshot
+                        .children
+                        .iter()
+                        .any(|child| child.kind == kind && child.id == id),
+                    "Task grant is outside its selected plugin components"
+                );
+            }
+            anyhow::ensure!(
+                normalized
+                    .execution
+                    .iter()
+                    .filter(|cap| !normalized.plugin_capability_ids.contains(&cap.id))
+                    .all(|cap| granted
+                        .iter()
+                        .any(|grant| grant.id == native_grant_capability_key(cap))),
+                "Task standalone selection differs from its grant"
+            );
+            let ceiling = granted
+                .into_iter()
+                .map(|cap| cap.id)
+                .collect::<HashSet<_>>();
+            normalized
+                .execution
+                .retain(|cap| ceiling.contains(&native_grant_capability_key(cap)));
+            normalized
+                .plugin_capability_ids
+                .retain(|id| ceiling.contains(id));
+        }
+        Ok(normalized)
+    }
+
+    /// Restore parent presentation from a trusted ready Turn. This is used only
+    /// for server-side inheritance, never for a public raw-child selection.
+    pub(crate) async fn inherited_plugin_presentation(
+        &self,
+        workspace: &str,
+        source_turn: &str,
+        execution: &[pioneer_protocol::TurnCapability],
+    ) -> anyhow::Result<Vec<pioneer_protocol::TurnCapability>> {
+        let Some(snapshot) = super::plugins::validate_cli_plugin_selection(
+            self.crud_store.as_ref(),
+            workspace,
+            source_turn,
+        )
+        .await?
+        else {
+            return Ok(execution.to_vec());
+        };
+        self.plugin_presentation_from_selection(workspace, &snapshot, execution)
+            .await
+    }
+
+    pub(super) async fn plugin_presentation_from_selection(
+        &self,
+        workspace: &str,
+        snapshot: &pioneer_protocol::PluginSelectionSnapshot,
+        execution: &[pioneer_protocol::TurnCapability],
+    ) -> anyhow::Result<Vec<pioneer_protocol::TurnCapability>> {
+        let mut presentation = Vec::new();
+        for cap in execution {
+            let id = match &cap.kind {
+                pioneer_protocol::TurnCapabilityKind::Skill { skill_id, .. } => {
+                    skill_id.to_string()
+                }
+                pioneer_protocol::TurnCapabilityKind::McpServer {
+                    name,
+                    scope_kind: pioneer_protocol::McpScopeKind::Workspace,
+                }
+                | pioneer_protocol::TurnCapabilityKind::McpTool {
+                    server_name: name,
+                    scope_kind: pioneer_protocol::McpScopeKind::Workspace,
+                    ..
+                } => self
+                    .crud_store
+                    .find_mcp_server_installation("workspace", workspace, name)
+                    .await?
+                    .and_then(|row| row.id)
+                    .unwrap_or_else(|| cap.id.clone()),
+                _ => cap.id.clone(),
+            };
+            if !snapshot.children.iter().any(|child| child.id == id) {
+                presentation.push(cap.clone());
+            }
+        }
+        for parent in &snapshot.parents {
+            presentation.push(pioneer_protocol::TurnCapability {
+                id: pioneer_protocol::plugin_capability_key(&parent.id),
+                label: None,
+                kind: pioneer_protocol::TurnCapabilityKind::Plugin {
+                    plugin_id: parent.id.clone(),
+                    expected_revision: parent.revision,
+                },
+            });
+        }
+        Ok(presentation)
     }
 
     pub(crate) async fn normalize_turn_skill_capabilities(
@@ -1921,24 +2116,6 @@ impl MessageProcessor {
             // on top of the database projector and can exhaust a standard Tokio
             // worker stack.
             let started_phase = message_future(async {
-                if params
-                    .capabilities
-                    .iter()
-                    .any(|c| matches!(c.kind, pioneer_protocol::TurnCapabilityKind::Plugin { .. }))
-                {
-                    self.send_turn_start_failure(
-                        connection_id,
-                        request_id.clone(),
-                        &success_response,
-                        &thread.id,
-                        &turn_id,
-                        TurnStartFailure::invalid_input(
-                            "Plugins are not supported for detached task execution yet",
-                        ),
-                    )
-                    .await;
-                    return None;
-                }
                 let normalized_capabilities = match self
                     .normalize_turn_skill_capabilities(
                         thread.workspace_id.as_str(),
@@ -2011,8 +2188,24 @@ impl MessageProcessor {
                 // Composer. Skill packs are expanded only at the execution boundary;
                 // persisting the expanded capabilities here would make the child
                 // message render every pack member as an individually selected skill.
+                params.capabilities = normalized_capabilities.presentation.clone();
                 let launch = params.clone();
                 params.capabilities = normalized_capabilities.execution.clone();
+                if let Err(error) = project_plugin_root_launch(
+                    &mut params,
+                    &normalized_capabilities.plugin_capability_ids,
+                ) {
+                    self.send_turn_start_failure(
+                        connection_id,
+                        request_id.clone(),
+                        &success_response,
+                        &thread.id,
+                        &turn_id,
+                        error,
+                    )
+                    .await;
+                    return None;
+                }
                 if let Err(failure) = validate_root_agent_launch_capabilities(&params) {
                     self.send_turn_start_failure(
                         connection_id,
@@ -2133,22 +2326,40 @@ impl MessageProcessor {
                         return None;
                     }
                 };
-                let outcome_result = match resolved_permission_profile {
-                    Some(profile) => {
-                        self.thread_manager
-                            .turn_start_with_user_metadata_and_permission_profile(
-                                connection_id,
-                                params,
-                                profile,
-                                author,
-                                mentions,
-                            )
-                            .await
-                    }
-                    None => {
-                        self.thread_manager
-                            .turn_start_with_user_metadata(connection_id, params, author, mentions)
-                            .await
+                let outcome_result = if normalized_capabilities.plugin_selection.is_some() {
+                    self.thread_manager
+                        .turn_start_with_plugin_capabilities(
+                            connection_id,
+                            launch.clone(),
+                            params.capabilities.clone(),
+                            resolved_permission_profile.clone(),
+                            author,
+                            mentions,
+                        )
+                        .await
+                } else {
+                    match resolved_permission_profile {
+                        Some(profile) => {
+                            self.thread_manager
+                                .turn_start_with_user_metadata_and_permission_profile(
+                                    connection_id,
+                                    params,
+                                    profile,
+                                    author,
+                                    mentions,
+                                )
+                                .await
+                        }
+                        None => {
+                            self.thread_manager
+                                .turn_start_with_user_metadata(
+                                    connection_id,
+                                    params,
+                                    author,
+                                    mentions,
+                                )
+                                .await
+                        }
                     }
                 };
                 let outcome = match outcome_result {
@@ -2492,6 +2703,9 @@ impl MessageProcessor {
                     )
                     .await;
                     return None;
+                }
+                if launch.capabilities.iter().any(|cap| matches!(cap.kind, pioneer_protocol::TurnCapabilityKind::Plugin { .. })) {
+                    canonical_launch.execution.selected_capabilities = launch.capabilities.clone();
                 }
                 task_params.launch = Some(canonical_launch.clone());
                 let agent_authorization_grant = match resolved_launch.as_ref() {
@@ -2892,20 +3106,6 @@ impl MessageProcessor {
         let outcome = outcome_result.map_err(|error| {
             TurnStartFailure::internal(format!("failed to start turn: {error:#}"))
         })?;
-        if let Some(selection) = &normalized_capabilities.plugin_selection {
-            if let Err(_) = self
-                .crud_store
-                .prepare_plugin_selection(&outcome.materialization.turn.id, selection)
-                .await
-            {
-                self.thread_manager
-                    .rollback_turn_start(outcome.rollback_context.clone())
-                    .await;
-                return Err(TurnStartFailure::unavailable(
-                    "plugin selection snapshot unavailable",
-                ));
-            }
-        }
         let effective_reasoning_effort = match self
             .resolve_turn_reasoning_effort(
                 outcome.started_notification.workspace_id.as_str(),
@@ -3146,6 +3346,23 @@ impl MessageProcessor {
                 )));
             }
         };
+        if let Some(selection) = &normalized_capabilities.plugin_selection {
+            if let Err(error) = self
+                .crud_store
+                .prepare_plugin_selection(&outcome.materialization.turn.id, selection)
+                .await
+            {
+                self.mark_turn_blocked(
+                    outcome.materialization.thread.id.clone(),
+                    outcome.materialization.turn.id.clone(),
+                    format!("plugin selection snapshot unavailable: {error:#}"),
+                )
+                .await;
+                return Err(TurnStartFailure::unavailable(
+                    "plugin selection snapshot unavailable",
+                ));
+            }
+        }
         if graph_result.as_ref().is_some_and(|result| result.queued) {
             return Err(TurnStartFailure::internal(
                 "root Agent execution was unexpectedly queued",
@@ -4129,35 +4346,40 @@ impl MessageProcessor {
                 let receipt_path = self
                     .artifact_runtime_home
                     .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME);
-                let plans = match crate::cli_runtime::skills::build_cli_runtime_skill_install_plans(
-                    runtime_config,
-                    runtime_kind,
-                    &resolved,
-                    &receipt_path,
-                ) {
-                    Ok(plans) => plans,
-                    Err(error) => {
-                        let failure_reason =
-                            format!("failed to plan CLI runtime skills: {error:#}");
-                        for skill in &resolved {
-                            warn!(
-                                event = "cli_runtime_skill_preflight",
-                                runtime_id,
-                                runtime_kind = ?runtime_kind,
-                                skill_slug = skill.slug.as_str(),
-                                source_kind = skill.definition.identity.source_kind.as_db_value(),
-                                install_name = pioneer_skills::sanitize_name(
-                                    &skill.definition.identity.name
-                                ),
-                                result = "failed",
-                                failure_reason = failure_reason.as_str(),
-                                elapsed_ms = preflight_started.elapsed().as_millis(),
-                                "CLI runtime skill preflight planning failed"
-                            );
+                let plans =
+                    match crate::cli_runtime::skills::build_cli_runtime_owned_skill_install_plans(
+                        self.crud_store.as_ref(),
+                        thread.workspace_id.as_str(),
+                        runtime_config,
+                        runtime_kind,
+                        &resolved,
+                        &receipt_path,
+                    )
+                    .await
+                    {
+                        Ok(plans) => plans,
+                        Err(error) => {
+                            let failure_reason =
+                                format!("failed to plan CLI runtime skills: {error:#}");
+                            for skill in &resolved {
+                                warn!(
+                                    event = "cli_runtime_skill_preflight",
+                                    runtime_id,
+                                    runtime_kind = ?runtime_kind,
+                                    skill_slug = skill.slug.as_str(),
+                                    source_kind = skill.definition.identity.source_kind.as_db_value(),
+                                    install_name = pioneer_skills::sanitize_name(
+                                        &skill.definition.identity.name
+                                    ),
+                                    result = "failed",
+                                    failure_reason = failure_reason.as_str(),
+                                    elapsed_ms = preflight_started.elapsed().as_millis(),
+                                    "CLI runtime skill preflight planning failed"
+                                );
+                            }
+                            return Err(TurnStartFailure::internal(failure_reason));
                         }
-                        return Err(TurnStartFailure::internal(failure_reason));
-                    }
-                };
+                    };
                 (plans, resolved_skill_bindings)
             };
             let plan = crate::cli_runtime::skills::CliRuntimeCombinedPreflightPlan {
@@ -4384,6 +4606,8 @@ impl MessageProcessor {
                 return;
             };
             params.model_provider = Some(cli_runtime_provider_key(runtime_id.as_str()));
+            let cli_prepare_deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_millis(runtime_config.request_timeout_ms);
 
             // Keep backend discovery, admission/preflight, and durable launch in
             // separate heap-backed futures. Combining this entire lifecycle in one
@@ -4402,11 +4626,18 @@ impl MessageProcessor {
                 ));
                 return None;
             };
-            if params.capabilities.iter().any(|c| matches!(c.kind, pioneer_protocol::TurnCapabilityKind::Plugin { .. })) {
-                send_turn_start_failure!("Plugins are not supported by this CLI runtime yet".to_owned());
-                return None;
+            if matches!(&execution_authority, TurnExecutionAuthority::Durable { .. })
+                && !params.capabilities.iter().any(|cap| matches!(cap.kind, pioneer_protocol::TurnCapabilityKind::Plugin { .. })) {
+                match self.crud_store.get_plugin_selection(params.turn_id.as_str()).await {
+                    Ok(Some(snapshot)) => match self.plugin_presentation_from_selection(&thread.workspace_id, &snapshot, &params.capabilities).await {
+                        Ok(presentation) => params.capabilities = presentation,
+                        Err(error) => { send_turn_start_failure!(format!("durable plugin selection unavailable: {error:#}")); return None; }
+                    },
+                    Ok(None) => {},
+                    Err(error) => { send_turn_start_failure!(format!("durable plugin selection unavailable: {error:#}")); return None; }
+                }
             }
-            let normalized_capabilities = match self
+            let mut normalized_capabilities = match self
                 .normalize_turn_skill_capabilities(
                     thread.workspace_id.as_str(),
                     params.capabilities.as_slice(),
@@ -4419,6 +4650,17 @@ impl MessageProcessor {
                     return None;
                 }
             };
+            if normalized_capabilities.plugin_selection.is_some()
+                && let TurnExecutionAuthority::Durable { context, .. } = &execution_authority {
+                normalized_capabilities.execution.retain(|cap| {
+                    if !normalized_capabilities.plugin_capability_ids.contains(&cap.id) { return true; }
+                    match &cap.kind {
+                        pioneer_protocol::TurnCapabilityKind::Skill { skill_id, .. } => context.granted_skill_ids().contains(&skill_id.to_string()),
+                        pioneer_protocol::TurnCapabilityKind::McpServer { .. } => context.granted_mcp_server_capability_ids().contains(&cap.id),
+                        _ => false,
+                    }
+                });
+            }
             if matches!(
                 &execution_authority,
                 TurnExecutionAuthority::Fresh(admission)
@@ -4434,9 +4676,30 @@ impl MessageProcessor {
                 send_turn_start_failure!(message);
                 return None;
             }
+            let plugin_selection = normalized_capabilities.plugin_selection;
+            let plugin_launch_guards = if let Some(snapshot) = &plugin_selection {
+                match super::plugins::acquire_plugin_selection_admission(
+                    self.crud_store.as_ref(), &self.plugin_mutation_locks, &thread.workspace_id, snapshot,
+                ).await {
+                    Ok(guards) => guards,
+                    Err(error) => { send_turn_start_failure!(format!("plugin admission changed; refresh selection: {error}")); return None; }
+                }
+            } else { Vec::new() };
             let normalized_presentation_capabilities = normalized_capabilities.presentation;
             let normalized_pack_names = normalized_capabilities.pack_names;
             params.capabilities = normalized_capabilities.execution;
+            if matches!(&execution_authority, TurnExecutionAuthority::Durable { .. })
+                && let Some(launch) = params.agent_launch.as_mut() {
+                // A durable Task/Agent may already contain server-pinned plugin
+                // grants. Re-project just this trusted portion idempotently;
+                // fresh public launches retain the strict standalone check.
+                launch.execution.skill_ids.retain(|id| !normalized_capabilities.plugin_capability_ids.contains(&pioneer_protocol::skill_capability_key(id)));
+                launch.execution.mcp_server_ids.retain(|id| !normalized_capabilities.plugin_capability_ids.contains(id));
+            }
+            if let Err(failure) = project_plugin_root_launch(&mut params, &normalized_capabilities.plugin_capability_ids) {
+                send_turn_start_failure!(failure);
+                return None;
+            }
             if let Err(failure) = validate_root_agent_launch_capabilities(&params) {
                 send_turn_start_failure!(failure);
                 return None;
@@ -5408,6 +5671,8 @@ impl MessageProcessor {
                 None => None,
             };
             Some(CliRuntimeAdmissionPhase {
+                plugin_selection,
+                plugin_launch_guards,
                 thread,
                 normalized_presentation_capabilities,
                 normalized_pack_names,
@@ -5426,6 +5691,8 @@ impl MessageProcessor {
             })
             .await;
             let Some(CliRuntimeAdmissionPhase {
+                plugin_selection,
+                plugin_launch_guards,
                 thread,
                 normalized_presentation_capabilities,
                 normalized_pack_names,
@@ -5623,6 +5890,16 @@ impl MessageProcessor {
             };
             let outcome_result = if let Some(outcome) = admitted_outcome {
                 Ok(*outcome)
+            } else if plugin_selection.is_some() {
+                let mut public_envelope = params.clone();
+                public_envelope.capabilities = normalized_presentation_capabilities.clone();
+                if let (Some(profile), Some(agent_author)) = (success_response.task_permission_profile(), success_response.task_agent_author()) {
+                    self.thread_manager.agent_turn_start_with_plugin_capabilities(public_envelope, params.capabilities.clone(), profile, agent_author, false).await
+                } else {
+                    self.thread_manager.turn_start_with_plugin_capabilities(
+                        connection_id, public_envelope, params.capabilities.clone(), resolved_permission_profile.clone(), author, mentions,
+                    ).await
+                }
             } else if let Some(permission_profile) =
                 success_response.task_permission_profile()
             {
@@ -5943,6 +6220,14 @@ impl MessageProcessor {
                     return None;
                 }
             };
+            if let Some(snapshot) = &plugin_selection {
+                if let Err(error) = self.crud_store.prepare_plugin_selection(&outcome.materialization.turn.id, snapshot).await {
+                    self.mark_turn_blocked(outcome.materialization.thread.id.clone(), outcome.materialization.turn.id.clone(),
+                        format!("plugin selection could not be prepared: {error:#}")).await;
+                    send_turn_start_failure!(format!("plugin selection could not be prepared: {error:#}"));
+                    return None;
+                }
+            }
             if graph_result.as_ref().is_some_and(|result| result.queued) {
                 send_turn_start_failure!("root CLI Agent execution was unexpectedly queued");
                 return None;
@@ -6128,25 +6413,31 @@ impl MessageProcessor {
                     return None;
                 }
             }
-            let event = AgentDurableEvent::TurnSkillsResolved {
-                thread_id: outcome.started_notification.thread_id.clone(),
-                turn_id: outcome.started_notification.turn.id.clone(),
-                bindings: combined_preflight.skill_bindings.clone(),
-            };
-            if !self.handle_durable_agent_event(event).await {
-                self.mark_turn_blocked(
-                    outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
-                    "failed to commit CLI runtime turn skill bindings".to_owned(),
-                )
-                .await;
-                send_turn_start_failure!(
-                    "failed to commit CLI runtime turn skill bindings".to_owned()
-                );
-                return None;
-            }
-
             for plan in &combined_preflight.skill_install_plans {
+                if let Some(plugin) = &plan.plugin_id {
+                    let refresh = async {
+                        let candidates = self.external_runtime_receipt_conversion_candidates().await?;
+                        let current = {
+                            let _receipt_guard = self.acquire_skills_write_lock().await;
+                            crate::cli_runtime::skills::owned_skill_projection_is_current(plan, &candidates)?
+                        };
+                        if !current {
+                            for owner in manager.plugin_stop_inventory(&thread.workspace_id, plugin) {
+                                manager.stop_and_wait(&owner, cli_prepare_deadline).await?;
+                            }
+                            anyhow::ensure!(manager.plugin_stop_inventory(&thread.workspace_id, plugin).is_empty(),
+                                "owned skill projection publication changed during refresh");
+                        }
+                        anyhow::Ok(())
+                    }.await;
+                    if let Err(error) = refresh {
+                        self.mark_turn_blocked(outcome.started_notification.thread_id.clone(),
+                            outcome.started_notification.turn.id.clone(),
+                            format!("CLI plugin projection refresh could not confirm stop: {error:#}")).await;
+                        send_turn_start_failure!(format!("CLI plugin projection refresh could not confirm stop: {error:#}"));
+                        return None;
+                    }
+                }
                 let install_started = std::time::Instant::now();
                 match self.install_one_cli_runtime_skill(plan).await {
                     Ok(result) => {
@@ -6207,6 +6498,24 @@ impl MessageProcessor {
                     }
                 }
             }
+            let event = AgentDurableEvent::TurnSkillsResolved {
+                thread_id: outcome.started_notification.thread_id.clone(),
+                turn_id: outcome.started_notification.turn.id.clone(),
+                bindings: combined_preflight.skill_bindings.clone(),
+            };
+            if !self.handle_durable_agent_event(event).await {
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    "failed to commit CLI runtime turn skill bindings".to_owned(),
+                )
+                .await;
+                send_turn_start_failure!(
+                    "failed to commit CLI runtime turn skill bindings".to_owned()
+                );
+                return None;
+            }
+
             #[cfg(test)]
             self.cli_runtime_skill_preflight_test_events
                 .lock()
@@ -6438,12 +6747,27 @@ impl MessageProcessor {
                 };
             let native_cwd = security_snapshot.sandbox.cwd.clone();
             let proxy_env = crate::cli_runtime::config::proxy_env(proxy_url.as_deref());
+            let committed_plugin_selection = match super::plugins::validate_cli_plugin_selection(
+                self.crud_store.as_ref(),
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.started_notification.turn.id.as_str(),
+            ).await {
+                Ok(selection) => selection,
+                Err(error) => {
+                    self.mark_turn_blocked(outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        format!("CLI plugin selection is not ready: {error:#}")).await;
+                    send_turn_start_failure!(format!("CLI plugin selection is not ready: {error:#}"));
+                    return;
+                }
+            };
             let session_options = crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                plugin_selection: committed_plugin_selection.clone(),
                 cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
                 approval_policy: Some(effective_approval_policy.clone()),
                 authorization_scope_fingerprint: Some(authorization_scope_fingerprint),
                 env: proxy_env,
-                selected_skills: if matches!(runtime_kind, CLIAgentRuntimeKind::Claude) {
+                selected_skills: if matches!(runtime_kind, CLIAgentRuntimeKind::Claude) || committed_plugin_selection.is_some() {
                     installed_skills
                         .iter()
                         .map(crate::cli_runtime::skills::CliRuntimeSelectedSkill::from)
@@ -6635,6 +6959,12 @@ impl MessageProcessor {
                     return;
                 }
             };
+            if let Err(error) = manager.admit_turn_owner(session_handle.instance(), &outcome.started_notification.turn.id) {
+                self.mark_turn_blocked(outcome.started_notification.thread_id.clone(), outcome.started_notification.turn.id.clone(),
+                    format!("CLI actual turn ownership unavailable: {error:#}")).await;
+                send_turn_start_failure!(format!("CLI actual turn ownership unavailable: {error:#}"));
+                return;
+            }
             let cli_session = session_handle.session();
             self.ensure_cli_runtime_session_event_pumps(
                 session_handle.instance(),
@@ -6796,6 +7126,7 @@ impl MessageProcessor {
                     elevated_instructions,
                 };
             let native_turn_start = PreparedCliRuntimeNativeTurnStart {
+                plugin_launch_guards,
                 outcome,
                 user_message_capability_attachments,
                 session_instance: session_handle.instance().clone(),
@@ -6906,6 +7237,7 @@ impl MessageProcessor {
         prepared: PreparedCliRuntimeNativeTurnStart,
     ) {
         let PreparedCliRuntimeNativeTurnStart {
+            plugin_launch_guards,
             outcome,
             user_message_capability_attachments: _,
             session_instance,
@@ -7112,6 +7444,7 @@ impl MessageProcessor {
                 std::time::Duration::from_millis(request_timeout_ms),
             )
             .await;
+        drop(plugin_launch_guards);
         drop(_startup_dispatch);
         let native_turn = match native_turn_result {
             Ok(native_turn) => native_turn,
@@ -7856,41 +8189,58 @@ impl MessageProcessor {
                     };
                 }
             };
-        let selected_skills = if matches!(runtime_kind, CLIAgentRuntimeKind::Claude) {
-            let frozen_bindings = skill_bindings
-                .iter()
-                .map(|binding| pioneer_protocol::TurnSkillBinding {
-                    skill_id: binding.skill_id.clone(),
-                    skill_owner: binding.skill_owner.clone(),
-                    skill_slug: binding.skill_slug.clone(),
-                    skill_version: binding.skill_version.clone(),
-                    fingerprint: binding.fingerprint.clone(),
-                    source_kind: binding.source_kind.clone(),
-                    resolved_reason: binding.resolved_reason.clone(),
-                })
-                .collect::<Vec<_>>();
-            let receipt_path = self
-                .artifact_runtime_home
-                .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME);
-            match crate::cli_runtime::skills::restore_cli_runtime_selected_skills(
-                &runtime,
-                runtime_kind,
-                frozen_bindings.as_slice(),
-                receipt_path.as_path(),
-            ) {
-                Ok(selected) => selected,
-                Err(error) => {
-                    return CliRuntimeLaunchSpecRestore::InvalidBinding {
-                        diagnostic: format!(
-                            "failed to restore exact Claude skill projection: {error:#}"
-                        ),
-                    };
-                }
+        let plugin_selection = match super::plugins::validate_cli_plugin_selection(
+            self.crud_store.as_ref(),
+            binding.workspace_id.as_str(),
+            binding.turn_id.as_str(),
+        )
+        .await
+        {
+            Ok(selection) => selection,
+            Err(error) => {
+                return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                    diagnostic: format!("CLI plugin continuation authority is invalid: {error:#}"),
+                };
             }
-        } else {
-            Vec::new()
         };
+        let selected_skills =
+            if matches!(runtime_kind, CLIAgentRuntimeKind::Claude) || plugin_selection.is_some() {
+                let frozen_bindings = skill_bindings
+                    .iter()
+                    .map(|binding| pioneer_protocol::TurnSkillBinding {
+                        skill_id: binding.skill_id.clone(),
+                        skill_owner: binding.skill_owner.clone(),
+                        skill_slug: binding.skill_slug.clone(),
+                        skill_version: binding.skill_version.clone(),
+                        fingerprint: binding.fingerprint.clone(),
+                        source_kind: binding.source_kind.clone(),
+                        resolved_reason: binding.resolved_reason.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let receipt_path = self
+                    .artifact_runtime_home
+                    .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME);
+                match crate::cli_runtime::skills::restore_cli_runtime_selected_skills(
+                    &runtime,
+                    runtime_kind,
+                    frozen_bindings.as_slice(),
+                    receipt_path.as_path(),
+                    plugin_selection.as_ref(),
+                ) {
+                    Ok(selected) => selected,
+                    Err(error) => {
+                        return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                            diagnostic: format!(
+                                "failed to restore exact CLI skill projection: {error:#}"
+                            ),
+                        };
+                    }
+                }
+            } else {
+                Vec::new()
+            };
         let session_options = crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+            plugin_selection,
             cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
             approval_policy: binding.approval_policy.clone(),
             authorization_scope_fingerprint: Some(authorization_scope_fingerprint),
@@ -7997,6 +8347,15 @@ impl MessageProcessor {
         &self,
         request: crate::resilience::CliRuntimeRecoveryAttemptRequest,
     ) -> Result<bool, CliRuntimeRecoveryStartFailure> {
+        let _plugin_launch = self
+            .acquire_plugin_launch_guards(
+                request.binding.workspace_id.as_str(),
+                request.binding.turn_id.as_str(),
+            )
+            .await
+            .map_err(|error| CliRuntimeRecoveryStartFailure::InvalidBinding {
+                diagnostic: format!("CLI recovery plugin admission failed: {error:#}"),
+            })?;
         let restored = match self.restore_cli_runtime_launch_spec(&request.binding).await {
             CliRuntimeLaunchSpecRestore::Ready(restored) => restored,
             CliRuntimeLaunchSpecRestore::Unavailable { diagnostic } => {
@@ -8075,6 +8434,7 @@ impl MessageProcessor {
                 restored.launch_spec.clone(),
             )
             .await?;
+        manager.admit_turn_owner(session_handle.instance(), &binding.turn_id)?;
         let cli_session = session_handle.session();
         self.ensure_cli_runtime_session_event_pumps(
             session_handle.instance(),

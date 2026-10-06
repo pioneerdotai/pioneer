@@ -108,6 +108,9 @@ pub(crate) struct CLIAgentRuntimeTurnSteerResult {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CLIAgentRuntimeSessionStartOptions {
+    /// Server-derived, committed selection; part of the existing reuse identity
+    /// and discoverable in the same entry before the native factory is polled.
+    pub plugin_selection: Option<pioneer_protocol::PluginSelectionSnapshot>,
     pub cwd: Option<PathBuf>,
     pub approval_policy: Option<String>,
     /// Stable identity of the principal, role, permission ceiling and maximum
@@ -839,6 +842,27 @@ impl CLIAgentRuntimeManager {
             .map(|entry| CliSessionStopOwner(entry.owner.clone()))
             .collect()
     }
+    pub(crate) fn plugin_stop_inventory(
+        &self,
+        workspace: &str,
+        plugin: &str,
+    ) -> Vec<CliSessionStopOwner> {
+        self.sessions
+            .lock()
+            .expect("CLI registry poisoned")
+            .values()
+            .filter(|entry| {
+                entry.instance.key().workspace_id == workspace
+                    && entry
+                        .launch_spec
+                        .options
+                        .plugin_selection
+                        .as_ref()
+                        .is_some_and(|selection| selection.parents.iter().any(|p| p.id == plugin))
+            })
+            .map(|entry| CliSessionStopOwner(entry.owner.clone()))
+            .collect()
+    }
     pub(crate) fn capture_stop_owner(
         &self,
         instance: &CliSessionInstanceId,
@@ -847,6 +871,30 @@ impl CLIAgentRuntimeManager {
             .filter(|entry| entry.instance == *instance)
             .map(|entry| CliSessionStopOwner(entry.owner))
             .ok_or_else(|| anyhow!("CLI instance stop owner is unknown"))
+    }
+
+    /// Bind a Turn to this actual process before any native thread/Turn work.
+    /// This metadata belongs to the existing owner, not a second registry.
+    pub(crate) fn admit_turn_owner(
+        &self,
+        instance: &CliSessionInstanceId,
+        turn: &str,
+    ) -> Result<()> {
+        let entry = self
+            .cached(instance.key())
+            .filter(|entry| entry.instance == *instance)
+            .ok_or_else(|| anyhow!("CLI turn process owner is unknown"))?;
+        entry.owner.admit_turn(turn)
+    }
+
+    pub(crate) fn plugin_selection_for_instance(
+        &self,
+        instance: &CliSessionInstanceId,
+    ) -> Result<Option<pioneer_protocol::PluginSelectionSnapshot>> {
+        self.cached(instance.key())
+            .filter(|entry| entry.instance == *instance)
+            .map(|entry| entry.launch_spec.options.plugin_selection.clone())
+            .ok_or_else(|| anyhow!("CLI instance launch contract is unknown"))
     }
     /// Captured actual owner, caller deadline, never late logical-key lookup.
     pub(crate) async fn stop_and_wait(
@@ -1439,6 +1487,7 @@ mod tests {
         let manager = manager_with_factory(factory.clone());
         let key = key("thread-a");
         let options_a = CLIAgentRuntimeSessionStartOptions {
+            plugin_selection: None,
             cwd: None,
             approval_policy: Some("on-request".to_owned()),
             authorization_scope_fingerprint: Some("scope-a".to_owned()),
@@ -1448,6 +1497,7 @@ mod tests {
             elevated_instructions: None,
         };
         let options_b = CLIAgentRuntimeSessionStartOptions {
+            plugin_selection: None,
             cwd: None,
             approval_policy: Some("never".to_owned()),
             authorization_scope_fingerprint: Some("scope-b".to_owned()),
@@ -2255,6 +2305,8 @@ mod tests {
         let normal = CLIAgentRuntimeSessionStartOptions::default();
         let skill_enabled = CLIAgentRuntimeSessionStartOptions {
             selected_skills: vec![crate::cli_runtime::skills::CliRuntimeSelectedSkill {
+                plugin_id: None,
+                skill_relative_path: None,
                 install_name: "selected".to_owned(),
                 installed_path: std::path::PathBuf::from("/tmp/selected"),
                 source_folder_hash: "selected-hash".to_owned(),
@@ -2488,5 +2540,117 @@ mod tests {
         assert_eq!(closed, 2);
         assert_eq!(factory.closes.load(Ordering::SeqCst), 2);
         assert_eq!(manager.session_count().await, 0);
+    }
+
+    // C2 source regression: NOT_RUN / NOT_COMPILED.
+    #[tokio::test]
+    async fn owned_selection_is_visible_before_factory_await_and_revision_change_restarts() {
+        let entered = Arc::new(Notify::new());
+        let factory = Arc::new(FakeFactory {
+            startup_wait_for_cancel: true,
+            startup_entered: Some(entered.clone()),
+            ..Default::default()
+        });
+        let manager = Arc::new(manager_with_factory(factory));
+        let selection = pioneer_protocol::PluginSelectionSnapshot {
+            parents: vec![pioneer_protocol::PluginSelectedParent {
+                id: "parent".into(),
+                revision: 1,
+            }],
+            children: Vec::new(),
+            phase: "ready".into(),
+        };
+        let starter = {
+            let manager = manager.clone();
+            let selection = selection.clone();
+            tokio::spawn(async move {
+                manager
+                    .get_or_start_at(
+                        key("owned-startup"),
+                        CLIAgentRuntimeSessionStartOptions {
+                            plugin_selection: Some(selection),
+                            ..Default::default()
+                        },
+                        1_000,
+                    )
+                    .await
+            })
+        };
+        entered.notified().await;
+        assert!(
+            manager
+                .plugin_stop_inventory("other-workspace", "parent")
+                .is_empty()
+        );
+        assert!(
+            manager
+                .plugin_stop_inventory("ws", "other-parent")
+                .is_empty()
+        );
+        let owner = manager.plugin_stop_inventory("ws", "parent").pop().unwrap();
+        assert!(!owner.0.ready.load(Ordering::Acquire));
+        assert_eq!(
+            manager
+                .plugin_selection_for_instance(owner.instance())
+                .unwrap(),
+            Some(selection.clone())
+        );
+        manager
+            .stop_and_wait(&owner, tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(starter.await.unwrap().is_err());
+        assert!(manager.plugin_stop_inventory("ws", "parent").is_empty());
+
+        let factory = Arc::new(FakeFactory::default());
+        let manager = manager_with_factory(factory.clone());
+        let options = CLIAgentRuntimeSessionStartOptions {
+            plugin_selection: Some(selection.clone()),
+            ..Default::default()
+        };
+        let original = manager
+            .get_or_start_at(key("owned-reuse"), options.clone(), 1_000)
+            .await
+            .unwrap();
+        manager
+            .admit_turn_owner(original.instance(), "old-turn")
+            .unwrap();
+        let captured = manager.capture_stop_owner(original.instance()).unwrap();
+        assert!(captured.owns_turn("old-turn"));
+        let reused = manager
+            .get_or_start_at(key("owned-reuse"), options.clone(), 1_100)
+            .await
+            .unwrap();
+        assert_eq!(original.instance(), reused.instance());
+        let mut revised = options;
+        revised.plugin_selection.as_mut().unwrap().parents[0].revision = 2;
+        let replacement = manager
+            .get_or_start_at(key("owned-reuse"), revised, 1_200)
+            .await
+            .unwrap();
+        manager
+            .admit_turn_owner(replacement.instance(), "replacement-turn")
+            .unwrap();
+        let replacement_owner = manager.capture_stop_owner(replacement.instance()).unwrap();
+        assert!(!replacement_owner.owns_turn("old-turn"));
+        assert!(replacement_owner.owns_turn("replacement-turn"));
+        assert_ne!(replacement.instance(), original.instance());
+        manager
+            .stop_and_wait(
+                &captured,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .existing_session(&key("owned-reuse"))
+                .await
+                .unwrap()
+                .instance(),
+            replacement.instance()
+        );
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
+        manager.close_all().await.unwrap();
     }
 }

@@ -29,6 +29,10 @@ pub struct ExternalRuntimeSkillReceiptEntry {
     pub source_kind: String,
     pub source_folder_hash: String,
     pub install_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_relative_path: Option<String>,
     pub installed_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
 }
@@ -130,6 +134,18 @@ fn destination_key(entry: &ExternalRuntimeSkillReceiptEntry) -> DestinationKey {
 }
 
 fn normalize_entry_paths(entry: &mut ExternalRuntimeSkillReceiptEntry) -> Result<()> {
+    if entry.plugin_id.is_none() && entry.skill_relative_path.is_some() {
+        bail!("standalone receipt cannot select a package member");
+    }
+    if let Some(relative) = &entry.skill_relative_path {
+        if relative.is_empty()
+            || Path::new(relative)
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            bail!("external runtime skill context path is not relative and contained");
+        }
+    }
     entry.native_skills_root = normalized_root_string(Path::new(&entry.native_skills_root))?;
     entry.install_path = normalize_external_runtime_path(Path::new(&entry.install_path))?
         .to_string_lossy()
@@ -249,6 +265,8 @@ pub fn ensure_external_runtime_receipt_v2(
         upsert_external_runtime_receipt_entry(
             &mut converted,
             ExternalRuntimeSkillReceiptEntry {
+                plugin_id: None,
+                skill_relative_path: None,
                 skill_id: candidate.skill_id.clone(),
                 owner: candidate.owner.clone(),
                 slug: candidate.slug.clone(),
@@ -366,7 +384,13 @@ pub fn external_runtime_skill_is_current(
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Ok(false);
     }
-    if fs::read(destination.join("SKILL.md")).is_err() {
+    if fs::read(
+        destination
+            .join(expected.skill_relative_path.as_deref().unwrap_or(""))
+            .join("SKILL.md"),
+    )
+    .is_err()
+    {
         return Ok(false);
     }
 
@@ -399,6 +423,8 @@ pub fn external_runtime_skill_is_current(
         && actual.source_kind == expected.source_kind
         && actual.source_folder_hash == expected.source_folder_hash
         && actual.install_path == expected_install_path
+        && actual.plugin_id == expected.plugin_id
+        && actual.skill_relative_path == expected.skill_relative_path
         && actual.install_path == destination)
 }
 
@@ -513,6 +539,8 @@ mod tests {
     ) -> ExternalRuntimeSkillReceiptEntry {
         let leaf_slug = slug.rsplit('/').next().unwrap_or(slug);
         ExternalRuntimeSkillReceiptEntry {
+            plugin_id: None,
+            skill_relative_path: None,
             skill_id: test_skill_id(slug),
             owner: Some("workspace".to_owned()),
             slug: leaf_slug.to_owned(),
