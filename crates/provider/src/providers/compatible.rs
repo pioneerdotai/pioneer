@@ -1015,16 +1015,6 @@ impl OpenAiCompatibleProvider {
     }
 
     #[cfg(test)]
-    pub(crate) async fn render_chat_request_async_for_test(
-        &self,
-        request: ChatRequest,
-        stream: bool,
-    ) -> Result<serde_json::Value> {
-        serde_json::to_value(self.build_chat_request_async(request, stream).await?)
-            .map_err(Into::into)
-    }
-
-    #[cfg(test)]
     fn build_chat_request(&self, request: ChatRequest, stream: bool) -> Result<ApiChatRequest> {
         let request = crate::tools::policy::prepare_request(self.name.as_str(), request)?;
         let capabilities =
@@ -1058,7 +1048,7 @@ impl OpenAiCompatibleProvider {
     /// Uses production's asynchronous model/request-aware materialization and
     /// shared wire constructor. No HTTP/provider endpoint is involved.
     #[cfg(test)]
-    pub(super) async fn render_chat_request_async_for_test(
+    pub(crate) async fn render_chat_request_async_for_test(
         &self,
         request: ChatRequest,
         stream: bool,
