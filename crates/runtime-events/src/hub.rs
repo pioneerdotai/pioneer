@@ -171,6 +171,32 @@ impl ExecutionEventHub {
         )
     }
 
+    pub fn new_with_owned_progress() -> Self {
+        let mut hub = Self::new();
+        hub.progress = ProgressCoalescer::new_owned(
+            DEFAULT_LIVE_EVENT_CHANNEL_CAPACITY,
+            ProgressCoalescerConfig::default(),
+        );
+        hub
+    }
+    /// Strict native shutdown additionally rejects queued publishers and joins
+    /// flush workers. The legacy flush-only method remains unchanged.
+    pub async fn shutdown_and_wait(&self) -> Result<(), String> {
+        let mut receiver = self.durable_lane.receiver.lock().await;
+        receiver.close();
+        while let Ok(mut envelope) = receiver.try_recv() {
+            if let Some(waiter) = envelope.committed_tx.take() {
+                let _ = waiter.send(Err(DurableCommitRejection::permanent(
+                    "native_session_closed",
+                    "native session closed",
+                )));
+            }
+        }
+        drop(receiver);
+        self.snapshot.close();
+        self.progress.shutdown_and_wait().await
+    }
+
     pub fn with_capacity(durable_capacity: usize, live_capacity: usize) -> Self {
         Self::with_progress_config(
             durable_capacity,

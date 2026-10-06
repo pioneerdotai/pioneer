@@ -283,6 +283,18 @@ struct CliMcpBridgeSession {
     bootstrap_directory: Option<PrivateSessionDirectory>,
     endpoint_directory: Option<PrivateSessionDirectory>,
     cancellation: CancellationToken,
+    cleanup: Option<Arc<Mutex<CliMcpBridgeCleanup>>>,
+}
+// Cleanup resources stay in the same supervisor session entry across awaits.
+struct CliMcpBridgeCleanup {
+    connection: Option<PlatformConnection>,
+    listener: Option<PlatformListener>,
+    bootstrap: Option<PrivateBootstrapArtifact>,
+    bootstrap_directory: Option<PrivateSessionDirectory>,
+    endpoint_directory: Option<PrivateSessionDirectory>,
+    grant_ref: CliMcpGrantRef,
+    grant_revoked: bool,
+    finished: bool,
 }
 
 pub(crate) struct CliMcpBridgeSupervisor {
@@ -448,6 +460,7 @@ impl CliMcpBridgeSupervisor {
             bootstrap_directory,
             endpoint_directory: Some(endpoint_directory),
             cancellation,
+            cleanup: None,
         };
         let mut sessions = self.sessions.lock().await;
         if self.issuing_stopped.load(Ordering::Acquire)
@@ -628,52 +641,98 @@ impl CliMcpBridgeSupervisor {
             bound_grant,
             connection: Some(connection),
             terminated: false,
+            defer_cleanup: false,
         })
     }
 
     pub(crate) async fn cancel_session(&self, process_instance: &CliSessionInstanceId) {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.get_mut(process_instance) {
+        // Native server shutdown carries the normal drain. No socket send while
+        // holding the session inventory lock and no artifact release here.
+        if let Some(session) = self.sessions.lock().await.get(process_instance) {
             session.cancellation.cancel();
-            if let Some(connection) = session.connection.as_mut()
-                && let Ok(frame) = BridgeFrame::new(BridgeFrameType::Cancellation, Vec::new())
-            {
-                let _ = timeout(CONTROL_FRAME_TIMEOUT, connection.send_frame(&frame)).await;
-            }
         }
     }
-
-    pub(crate) async fn revoke_session(&self, process_instance: &CliSessionInstanceId) -> bool {
-        let mut session = {
+    pub(crate) async fn revoke_session_result(
+        &self,
+        process_instance: &CliSessionInstanceId,
+    ) -> anyhow::Result<bool> {
+        let cleanup = {
             let mut sessions = self.sessions.lock().await;
-            let Some(mut session) = sessions.remove(process_instance) else {
-                return false;
+            let Some(session) = sessions.get_mut(process_instance) else {
+                return Ok(false);
             };
+            if session.state == CliMcpBridgeSessionState::TransportOwned {
+                anyhow::bail!("CLI MCP facade still owns its transport");
+            }
+            session.cancellation.cancel();
             session.state = CliMcpBridgeSessionState::Revoking;
             session
+                .cleanup
+                .get_or_insert_with(|| {
+                    Arc::new(Mutex::new(CliMcpBridgeCleanup {
+                        connection: session.connection.take(),
+                        listener: session.listener.take(),
+                        bootstrap: session.bootstrap.take(),
+                        bootstrap_directory: session.bootstrap_directory.take(),
+                        endpoint_directory: session.endpoint_directory.take(),
+                        grant_ref: session.grant_ref.clone(),
+                        grant_revoked: false,
+                        finished: false,
+                    }))
+                })
+                .clone()
         };
-        session.cancellation.cancel();
-        if let Some(mut connection) = session.connection.take() {
-            if let Ok(frame) = BridgeFrame::new(BridgeFrameType::Cancellation, Vec::new()) {
-                let _ = timeout(CONTROL_FRAME_TIMEOUT, connection.send_frame(&frame)).await;
+        let mut resources = cleanup.lock().await;
+        if !resources.finished {
+            if let Some(connection) = resources.connection.as_mut() {
+                // A shutdown error retains the actual socket for a subsequent
+                // strict retry. Peer EOF is handled by the existing IPC path.
+                timeout(CONTROL_FRAME_TIMEOUT, connection.shutdown())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("CLI MCP connection shutdown timed out"))??;
+                resources.connection.take();
             }
-            if let Ok(frame) = BridgeFrame::new(BridgeFrameType::Shutdown, Vec::new()) {
-                let _ = timeout(CONTROL_FRAME_TIMEOUT, connection.send_frame(&frame)).await;
+            resources.listener.take();
+            if !resources.grant_revoked {
+                self.coordinator
+                    .revoke_grant(&resources.grant_ref)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("CLI MCP revoke failed: {e:?}"))?;
+                resources.grant_revoked = true;
             }
-            let _ = timeout(CONTROL_FRAME_TIMEOUT, connection.shutdown()).await;
+            if let Some(bootstrap) = resources.bootstrap.as_mut() {
+                bootstrap.cleanup()?;
+                resources.bootstrap.take();
+            }
+            if let Some(directory) = resources.bootstrap_directory.as_mut() {
+                directory.cleanup()?;
+                resources.bootstrap_directory.take();
+            }
+            if let Some(directory) = resources.endpoint_directory.as_mut() {
+                directory.cleanup()?;
+                resources.endpoint_directory.take();
+            }
+            resources.finished = true;
         }
-        drop(session.listener.take());
-        let _ = self.coordinator.revoke_grant(&session.grant_ref).await;
-        if let Some(mut bootstrap) = session.bootstrap.take() {
-            let _ = bootstrap.cleanup();
+        drop(resources);
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(process_instance)
+            .and_then(|session| session.cleanup.as_ref())
+            .is_some_and(|current| Arc::ptr_eq(current, &cleanup))
+        {
+            sessions.remove(process_instance);
         }
-        if let Some(mut directory) = session.bootstrap_directory.take() {
-            let _ = directory.cleanup();
+        Ok(true)
+    }
+    pub(crate) async fn revoke_session(&self, process_instance: &CliSessionInstanceId) -> bool {
+        match self.revoke_session_result(process_instance).await {
+            Ok(removed) => removed,
+            Err(error) => {
+                tracing::warn!(error = %error, "CLI MCP cleanup retained");
+                false
+            }
         }
-        if let Some(mut directory) = session.endpoint_directory.take() {
-            let _ = directory.cleanup();
-        }
-        true
     }
 
     pub(crate) async fn stop_issuing_and_cancel(&self) {
@@ -748,9 +807,13 @@ pub(crate) struct CliMcpBridgeTransport {
     bound_grant: CliMcpBoundGrant,
     connection: Option<PlatformConnection>,
     terminated: bool,
+    defer_cleanup: bool,
 }
 
 impl CliMcpBridgeTransport {
+    pub(crate) fn defer_cleanup_until_join(&mut self) {
+        self.defer_cleanup = true;
+    }
     pub(crate) fn bound_grant(&self) -> &CliMcpBoundGrant {
         &self.bound_grant
     }
@@ -764,17 +827,10 @@ impl CliMcpBridgeTransport {
             .ok_or(CliMcpBridgeSupervisorError::InvalidTransition)?
             .receive_frame()
             .await;
-        match outcome {
-            Ok(Some(frame)) => Ok(Some(frame)),
-            Ok(None) => {
-                self.terminate().await;
-                Ok(None)
-            }
-            Err(error) => {
-                self.terminate().await;
-                Err(error.into())
-            }
+        if !self.defer_cleanup && !matches!(outcome, Ok(Some(_))) {
+            self.terminate().await;
         }
+        outcome.map_err(Into::into)
     }
 
     pub(crate) async fn send_frame(
@@ -788,36 +844,52 @@ impl CliMcpBridgeTransport {
             .send_frame(frame)
             .await;
         if let Err(error) = outcome {
-            self.terminate().await;
+            if !self.defer_cleanup {
+                self.terminate().await;
+            }
             return Err(error.into());
         }
         Ok(())
     }
 
-    pub(crate) async fn terminate(&mut self) {
+    pub(crate) async fn retire_connection(&mut self) -> Result<(), CliMcpBridgeSupervisorError> {
         if self.terminated {
+            return Ok(());
+        }
+        let mut sessions = self.supervisor.sessions.lock().await;
+        let session = sessions
+            .get_mut(&self.process_instance)
+            .ok_or(CliMcpBridgeSupervisorError::UnknownSession)?;
+        if session.state != CliMcpBridgeSessionState::TransportOwned || session.connection.is_some()
+        {
+            return Err(CliMcpBridgeSupervisorError::InvalidTransition);
+        }
+        session.connection = self.connection.take();
+        session.state = CliMcpBridgeSessionState::Attached;
+        self.terminated = true;
+        Ok(())
+    }
+    pub(crate) async fn terminate(&mut self) {
+        if let Err(error) = self.retire_connection().await {
+            tracing::warn!(error = %error, "legacy CLI MCP transport cleanup is unknown");
             return;
         }
-        self.terminated = true;
-        if let Some(connection) = self.connection.as_mut() {
-            let _ = connection.shutdown().await;
-        }
-        self.connection.take();
         self.supervisor.revoke_session(&self.process_instance).await;
     }
 }
-
 impl Drop for CliMcpBridgeTransport {
     fn drop(&mut self) {
-        if self.terminated {
+        if self.terminated || self.defer_cleanup {
             return;
         }
+        // Preserve standalone/probe best effort drop. A facade-owned transport
+        // never uses this path: its instance retains normal drain and cleanup.
         self.connection.take();
         let supervisor = self.supervisor.clone();
-        let process_instance = self.process_instance.clone();
+        let instance = self.process_instance.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                supervisor.revoke_session(&process_instance).await;
+                supervisor.revoke_session(&instance).await;
             });
         }
     }
@@ -835,6 +907,14 @@ impl CLIAgentRuntimeSessionLifecycle for CliMcpBridgeSupervisor {
 
     async fn after_session_close(&self, instance: &CliSessionInstanceId) {
         self.revoke_session(instance).await;
+    }
+
+    async fn after_session_close_result(
+        &self,
+        instance: &CliSessionInstanceId,
+    ) -> anyhow::Result<()> {
+        self.revoke_session_result(instance).await?;
+        Ok(())
     }
 
     async fn shutdown_finished(&self) {
@@ -975,6 +1055,36 @@ mod tests {
         ));
         assert!(supervisor.state(launch.process_instance()).await.is_none());
         assert!(!launch.bootstrap_path().exists());
+    }
+
+    #[tokio::test]
+    async fn strict_cleanup_retains_failed_directory_and_retries_same_owner() {
+        let root = temporary_root();
+        let supervisor = CliMcpBridgeSupervisor::new(root.path().join("sessions"));
+        let launch = supervisor.prepare(scope(1), expiry()).await.unwrap();
+        let directory = launch.bootstrap_path().parent().unwrap().to_path_buf();
+        let blocker = directory.join("unexpected-file");
+        std::fs::write(&blocker, b"cleanup failure injection").unwrap();
+        assert!(
+            supervisor
+                .revoke_session_result(launch.process_instance())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            supervisor.state(launch.process_instance()).await,
+            Some(CliMcpBridgeSessionState::Revoking)
+        );
+        assert!(directory.exists());
+        std::fs::remove_file(blocker).unwrap();
+        assert!(
+            supervisor
+                .revoke_session_result(launch.process_instance())
+                .await
+                .unwrap()
+        );
+        assert!(supervisor.state(launch.process_instance()).await.is_none());
+        assert!(!directory.exists());
     }
 
     #[tokio::test]

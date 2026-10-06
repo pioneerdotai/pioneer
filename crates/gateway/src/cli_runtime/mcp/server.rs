@@ -13,15 +13,21 @@ use std::fmt;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 const OUTBOUND_CONTROL_RESERVE: usize = 8;
 
 pub(crate) struct CliMcpBridgeFacadeHandle {
     context: Arc<CliMcpBridgeFacadeContext>,
+    shutdown: CancellationToken,
+    facade: Arc<CliMcpToolFacade>,
 }
 
 impl CliMcpBridgeFacadeHandle {
+    pub(crate) fn request_shutdown(&self) {
+        self.facade.request_shutdown();
+        self.shutdown.cancel();
+    }
     pub(crate) async fn set_activation(&self, activation: Option<CliMcpActivationGeneration>) {
         *self.context.activation.write().await = activation;
     }
@@ -80,7 +86,8 @@ pub(crate) struct CliMcpBridgeFacadeServer {
     outbound_sender: mpsc::Sender<Vec<u8>>,
     max_pending_bytes: usize,
     max_call_tasks: usize,
-    shutdown_drain: std::time::Duration,
+    shutdown: CancellationToken,
+    retained_cleanup: bool,
 }
 
 impl CliMcpBridgeFacadeServer {
@@ -91,6 +98,43 @@ impl CliMcpBridgeFacadeServer {
         projection_generation: CliMcpProjectionGeneration,
         projection: CliMcpFacadeProjection,
         limits: CliMcpFacadeLimits,
+    ) -> Result<(CliMcpBridgeFacadeHandle, Self), CliMcpFacadeConfigurationError> {
+        Self::build_with_cleanup_owner(
+            transport,
+            coordinator,
+            invoker,
+            projection_generation,
+            projection,
+            limits,
+            false,
+        )
+    }
+    pub(crate) fn build_owned(
+        transport: CliMcpBridgeTransport,
+        coordinator: Arc<super::coordinator::CliMcpCoordinator>,
+        invoker: Arc<dyn TurnMcpInvoker>,
+        projection_generation: CliMcpProjectionGeneration,
+        projection: CliMcpFacadeProjection,
+        limits: CliMcpFacadeLimits,
+    ) -> Result<(CliMcpBridgeFacadeHandle, Self), CliMcpFacadeConfigurationError> {
+        Self::build_with_cleanup_owner(
+            transport,
+            coordinator,
+            invoker,
+            projection_generation,
+            projection,
+            limits,
+            true,
+        )
+    }
+    fn build_with_cleanup_owner(
+        mut transport: CliMcpBridgeTransport,
+        coordinator: Arc<super::coordinator::CliMcpCoordinator>,
+        invoker: Arc<dyn TurnMcpInvoker>,
+        projection_generation: CliMcpProjectionGeneration,
+        projection: CliMcpFacadeProjection,
+        limits: CliMcpFacadeLimits,
+        retained_cleanup: bool,
     ) -> Result<(CliMcpBridgeFacadeHandle, Self), CliMcpFacadeConfigurationError> {
         let channel_capacity = limits
             .max_ledger_entries
@@ -105,12 +149,18 @@ impl CliMcpBridgeFacadeServer {
             }),
             limits.clone(),
         )?;
+        if retained_cleanup {
+            transport.defer_cleanup_until_join();
+        }
         let context = Arc::new(CliMcpBridgeFacadeContext {
             bound_grant: transport.bound_grant().clone(),
             projection_generation,
             activation: RwLock::new(None),
         });
+        let shutdown = CancellationToken::new();
         let handle = CliMcpBridgeFacadeHandle {
+            shutdown: shutdown.clone(),
+            facade: facade.clone(),
             context: context.clone(),
         };
         let server = Self {
@@ -121,7 +171,8 @@ impl CliMcpBridgeFacadeServer {
             outbound_sender,
             max_pending_bytes: limits.max_frame_bytes,
             max_call_tasks: limits.max_ledger_entries,
-            shutdown_drain: limits.shutdown_drain_duration,
+            shutdown,
+            retained_cleanup,
         };
         Ok((handle, server))
     }
@@ -130,21 +181,30 @@ impl CliMcpBridgeFacadeServer {
         let mut pending = Vec::new();
         let mut calls = JoinSet::new();
         let outcome = self.run_loop(&mut pending, &mut calls).await;
-        let facade_shutdown = self.facade.shutdown().await;
-        let calls_drained = timeout(self.shutdown_drain, async {
-            while calls.join_next().await.is_some() {}
-        })
-        .await
-        .is_ok();
-        if !calls_drained {
-            calls.abort_all();
-            while calls.join_next().await.is_some() {}
+        // Close outbound admission so cancelled calls cannot block on progress
+        // or result backpressure after the run loop exits.
+        self.outbound.close();
+        self.facade.shutdown().await;
+        let mut failed_call = false;
+        while let Some(joined) = calls.join_next().await {
+            failed_call |= joined.is_err();
         }
-        self.transport.terminate().await;
+        let facade_shutdown = self.facade.shutdown().await;
+        // Return the connection to its existing supervisor entry. Grant and
+        // artifact cleanup happens only after this actual server has joined.
+        if self.retained_cleanup {
+            self.transport.retire_connection().await?;
+        } else {
+            self.transport.terminate().await;
+        }
         pending.fill(0);
-        if !facade_shutdown.drained || !calls_drained {
+        if failed_call {
+            return Err(CliMcpBridgeServerError::CallTaskFailed);
+        }
+        if !facade_shutdown.drained {
             return Err(CliMcpBridgeServerError::ShutdownTimeout);
         }
+
         outcome
     }
 
@@ -156,6 +216,7 @@ impl CliMcpBridgeFacadeServer {
         loop {
             tokio::select! {
                 biased;
+                _ = self.shutdown.cancelled() => return Ok(()),
                 outbound = self.outbound.recv() => {
                     let Some(outbound) = outbound else {
                         return Err(CliMcpBridgeServerError::OutboundClosed);
@@ -201,6 +262,9 @@ impl CliMcpBridgeFacadeServer {
         }
         pending.extend_from_slice(payload);
         while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            if self.shutdown.is_cancelled() {
+                return Ok(());
+            }
             let mut line = pending.drain(..=newline).collect::<Vec<_>>();
             while line.last().is_some_and(u8::is_ascii_whitespace) {
                 line.pop();
@@ -327,6 +391,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, duplex};
+    use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
 
     const SECRET_CANARY: &str = "pioneer-secret-canary-7c3278d3c7214b66965e";
@@ -335,6 +400,8 @@ mod tests {
         calls: AtomicUsize,
         wait_calls: AtomicUsize,
         gateway_only_secret: String,
+        after_cancel_entered: tokio::sync::Notify,
+        after_cancel_release: tokio::sync::Notify,
     }
 
     #[async_trait]
@@ -354,6 +421,15 @@ mod tests {
             if invocation.canonical_callable_name == "wait" {
                 self.wait_calls.fetch_add(1, Ordering::SeqCst);
                 cancellation.cancelled().await;
+                if invocation
+                    .arguments
+                    .get("delay_after_cancel")
+                    .and_then(JsonValue::as_bool)
+                    == Some(true)
+                {
+                    self.after_cancel_entered.notify_one();
+                    self.after_cancel_release.notified().await;
+                }
                 return Err(TurnMcpInvocationError::new(
                     TurnMcpInvocationErrorCode::Cancelled,
                     "cancelled by fake provider",
@@ -497,8 +573,10 @@ mod tests {
             calls: AtomicUsize::new(0),
             wait_calls: AtomicUsize::new(0),
             gateway_only_secret: SECRET_CANARY.to_owned(),
+            after_cancel_entered: tokio::sync::Notify::new(),
+            after_cancel_release: tokio::sync::Notify::new(),
         });
-        let (handle, server) = CliMcpBridgeFacadeServer::build(
+        let (handle, server) = CliMcpBridgeFacadeServer::build_owned(
             transport,
             supervisor.coordinator(),
             invoker.clone(),
@@ -507,7 +585,7 @@ mod tests {
             CliMcpFacadeLimits::default(),
         )
         .expect("server");
-        let server = tokio::spawn(server.run());
+        let mut server = tokio::spawn(server.run());
         let mut provider = ProviderClient {
             writer: provider_writer,
             reader: BufReader::new(provider_reader),
@@ -592,9 +670,32 @@ mod tests {
         let cancelled = provider.response(&json!(4)).await;
         assert_eq!(cancelled["error"]["data"]["kind"], "cancelled");
 
+        // Normal shutdown must retain the server and nested call even after
+        // cancellation has been observed by the invoker.
+        provider.send(json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "wait", "arguments": {"delay_after_cancel": true}}})).await;
+        wait_for_count(&invoker.wait_calls, 2).await;
+        handle.request_shutdown();
+        invoker.after_cancel_entered.notified().await;
+        assert!(
+            timeout(Duration::from_millis(10), &mut server)
+                .await
+                .is_err()
+        );
+        assert!(
+            supervisor
+                .revoke_session_result(&process_instance)
+                .await
+                .is_err(),
+            "active transport cannot release cleanup resources"
+        );
+        invoker.after_cancel_release.notify_one();
+        server.await.expect("server join").expect("server success");
+        supervisor
+            .revoke_session_result(&process_instance)
+            .await
+            .expect("strict cleanup after server join");
         provider.writer.shutdown().await.expect("provider EOF");
         helper.await.expect("helper join").expect("helper success");
-        server.await.expect("server join").expect("server success");
         assert!(
             supervisor
                 .coordinator()
@@ -620,7 +721,7 @@ mod tests {
                 "Gateway-only secret leaked to prohibited surface"
             );
         }
-        assert_eq!(invoker.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(invoker.calls.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
@@ -731,6 +832,8 @@ mod tests {
             calls: AtomicUsize::new(0),
             wait_calls: AtomicUsize::new(0),
             gateway_only_secret: SECRET_CANARY.to_owned(),
+            after_cancel_entered: tokio::sync::Notify::new(),
+            after_cancel_release: tokio::sync::Notify::new(),
         });
         let facade = CliMcpToolFacade::new(
             coordinator.clone(),

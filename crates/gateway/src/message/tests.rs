@@ -1120,6 +1120,7 @@ impl CLIAgentRuntimeSessionFactory for StaticCliRuntimeSessionFactory {
         &self,
         _instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
         launch_spec: &CliSessionLaunchSpec,
+        _startup: &crate::cli_runtime::manager::CLIAgentRuntimeSessionStartup,
     ) -> anyhow::Result<Arc<dyn CLIAgentRuntimeSession>> {
         if let crate::cli_runtime::continuation::CliProviderContinuation::ClaudeFork {
             source_session_id,
