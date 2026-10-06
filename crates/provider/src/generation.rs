@@ -183,11 +183,21 @@ pub(crate) fn reasoning_model(
         if !map.is_object() {
             *map = json!({});
         }
-        map[level] = if *supported {
+        let key = if provider == "openrouter" && level == "none" {
+            "off"
+        } else {
+            level
+        };
+        map[key] = if *supported {
             json!(level)
         } else {
             Value::Null
         };
+    }
+    if provider == "openrouter" {
+        if let Some(supported) = native.get("reasoning.supported").copied().flatten() {
+            model.reasoning = supported;
+        }
     }
     Some(model)
 }
@@ -199,9 +209,56 @@ fn validate_native_reasoning(
 ) -> Result<()> {
     let denies = |key: &str| native.get(key) == Some(&Some(false));
     ensure!(
+        !matches!(provider, "anthropic" | "bedrock")
+            || !selected_off(request.reasoning)
+            || !denies("thinking.types.disabled"),
+        "native Models API denies disabled thinking"
+    );
+    ensure!(
         provider != "gemini" || request.reasoning.is_none() || !denies("thinking.supported"),
         "native Models API denies thinking support"
     );
+    if provider == "openrouter" {
+        ensure!(
+            request.reasoning.is_none() || !denies("reasoning.supported"),
+            "native OpenRouter metadata denies reasoning support"
+        );
+        ensure!(
+            !selected_off(request.reasoning) || native.get("mandatory") != Some(&Some(true)),
+            "native OpenRouter metadata requires reasoning; off cannot be honored"
+        );
+        ensure!(
+            request.reasoning.is_none() || !denies("effort.enum"),
+            "native OpenRouter metadata does not expose effort selection"
+        );
+        if let Some(selected) = request.reasoning {
+            let selected = match selected {
+                ReasoningConfig::Disabled => "none",
+                ReasoningConfig::Effort(e) => e.as_str(),
+            };
+            ensure!(
+                !denies(&format!("effort.{selected}")),
+                "native OpenRouter enum denies requested effort"
+            );
+        }
+        if let Some(effort) = fields.get("reasoning").and_then(|v| v["effort"].as_str()) {
+            ensure!(
+                matches!(
+                    effort,
+                    "max" | "xhigh" | "high" | "medium" | "low" | "minimal" | "none"
+                ),
+                "invalid OpenRouter reasoning effort enum"
+            );
+            ensure!(
+                !denies(&format!("effort.{effort}")),
+                "native OpenRouter enum denies selected effort"
+            );
+            ensure!(
+                !selected_off(request.reasoning) || effort == "none",
+                "OpenRouter off mapping must disable reasoning"
+            );
+        }
+    }
     if let Some(effort) = fields
         .get("output_config")
         .and_then(|v| v["effort"].as_str())
@@ -230,11 +287,29 @@ pub(crate) fn chat_fields_from_catalog(
     request: &ChatRequest,
 ) -> Result<Fields> {
     validate_cap_with_catalog(catalog, provider, request)?;
-    chat_fields_with_model(
-        provider,
-        request,
-        catalog.and_then(|c| c.model(provider, &request.model)),
-    )
+    // Native OpenRouter metadata shares the existing authority scope. Other
+    // compatible adapters keep their existing catalog/protocol resolution.
+    let native = native_reasoning(provider, &request.model);
+    let native_model = (provider == "openrouter")
+        .then(|| {
+            reasoning_model(
+                provider,
+                catalog
+                    .filter(|_| public_reasoning_catalog(provider))
+                    .and_then(|c| c.model(provider, &request.model)),
+                &native,
+            )
+        })
+        .flatten();
+    let model = if provider == "openrouter" {
+        native_model.as_ref()
+    } else {
+        catalog.and_then(|c| c.model(provider, &request.model))
+    };
+    validate_native_reasoning(provider, request, &Fields::new(), &native)?;
+    let fields = chat_fields_with_model(provider, request, model)?;
+    validate_native_reasoning(provider, request, &fields, &native)?;
+    Ok(fields)
 }
 
 fn mapped_effort(
@@ -1210,14 +1285,51 @@ pub(crate) fn test_catalog_model(
         serde_json::from_str(include_str!("../tests/fixtures/catalog/models.json")).unwrap();
     let mut origins: Value =
         serde_json::from_str(include_str!("../tests/fixtures/catalog/provenance.json")).unwrap();
-    let mut model = models[provider][template].clone();
+    let catalog_key = crate::catalog::catalog_provider(provider);
+    let mut model = models
+        .get(&catalog_key)
+        .and_then(|models| models.get(template))
+        .filter(|model| model.is_object())
+        .expect("complete catalog model template")
+        .clone();
+    let template_model: CatalogModel = serde_json::from_value(model.clone())
+        .expect("catalog template has all required model fields");
+    let origin = origins
+        .get(&catalog_key)
+        .and_then(|models| models.get(template))
+        .filter(|origin| origin.is_object())
+        .expect("catalog provenance template")
+        .clone();
+    for field in ["contextWindow", "maxTokens"] {
+        serde_json::from_value::<crate::catalog::LimitOrigin>(origin[field].clone())
+            .expect("complete limit provenance template");
+    }
     model["id"] = json!(id);
     for (key, value) in metadata.as_object().unwrap() {
         model[key] = value.clone();
     }
-    models[provider][id] = model;
-    origins[provider][id] = origins[provider][template].clone();
-    ModelCatalog::parse(&models.to_string(), &origins.to_string()).unwrap()
+    models[&catalog_key][id] = model;
+    origins[&catalog_key][id] = origin;
+    let catalog = ModelCatalog::parse(&models.to_string(), &origins.to_string()).unwrap();
+    let actual = catalog
+        .model(provider, id)
+        .expect("runtime provider resolves patched fixture");
+    assert_eq!(actual.id, id);
+    assert_eq!(
+        actual.api,
+        metadata
+            .get("api")
+            .and_then(Value::as_str)
+            .unwrap_or(&template_model.api)
+    );
+    for (key, value) in metadata.as_object().unwrap() {
+        assert_eq!(
+            &serde_json::to_value(actual).unwrap()[key],
+            value,
+            "patched catalog field {key}"
+        );
+    }
+    catalog
 }
 
 #[cfg(test)]

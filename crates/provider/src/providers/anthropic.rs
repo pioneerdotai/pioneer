@@ -1478,6 +1478,43 @@ mod tests {
                 for base in ["low", "medium", "high"] {
                     assert!(r.effort_options.contains(&base.into()));
                 }
+                assert_eq!(
+                    r.effort_options.iter().any(|e| e == "none"),
+                    r.mandatory == Some(false)
+                );
+                for stream in [false, true] {
+                    let request = crate::generation::test_request(id);
+                    let body = serde_json::to_value(
+                        AnthropicProvider::build_chat_request_with_catalog(
+                            &request,
+                            None,
+                            vec![],
+                            stream,
+                            Some(&catalog),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert!(body.get("thinking").is_none());
+                    assert!(body.get("output_config").is_none());
+                    if r.mandatory == Some(false) {
+                        let mut request = request;
+                        request.reasoning = Some(ReasoningConfig::Disabled);
+                        let body = serde_json::to_value(
+                            AnthropicProvider::build_chat_request_with_catalog(
+                                &request,
+                                None,
+                                vec![],
+                                stream,
+                                Some(&catalog),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(body["thinking"]["type"], "disabled");
+                        assert!(body.get("output_config").is_none());
+                    }
+                }
                 for effort in &r.effort_options {
                     let mut request = crate::generation::test_request(id);
                     request.reasoning = Some(ReasoningConfig::Effort(
@@ -1496,7 +1533,12 @@ mod tests {
                         )
                         .unwrap();
                         assert_eq!(json["model"], id);
-                        assert_eq!(json["output_config"]["effort"], effort.as_str());
+                        if effort == "none" {
+                            assert_eq!(json["thinking"]["type"], "disabled");
+                            assert!(json.get("output_config").is_none());
+                        } else {
+                            assert_eq!(json["output_config"]["effort"], effort.as_str());
+                        }
                         assert_eq!(json["max_tokens"], 1024);
                     }
                 }
@@ -1532,6 +1574,92 @@ mod tests {
             parsed.capabilities.reasoning.as_ref().unwrap().supported,
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn optional_claude_off_obeys_native_and_catalog_vetoes_in_both_bodies() {
+        for id in [
+            "claude-opus-4-5",
+            "claude-opus-4-6",
+            "claude-opus-5",
+            "claude-sonnet-5",
+        ] {
+            for native_veto in [false, true] {
+                let parsed = provider_model_from_anthropic_model_entry(serde_json::from_value(serde_json::json!({
+                    "id":id, "capabilities":{"thinking":{"supported":true,"types":{"disabled":{"supported":!native_veto}}}}
+                })).unwrap());
+                let native = parsed
+                    .capabilities
+                    .reasoning
+                    .as_ref()
+                    .unwrap()
+                    .native
+                    .clone();
+                for catalog_veto in [false, true] {
+                    let catalog = crate::generation::test_catalog_model(
+                        "anthropic",
+                        id,
+                        "claude-opus-4-6",
+                        if catalog_veto {
+                            serde_json::json!({"thinkingLevelMap":{"off":null}})
+                        } else {
+                            serde_json::json!({"thinkingLevelMap":{"max":"max"}})
+                        },
+                    );
+                    let mut models = vec![parsed.clone()];
+                    catalog.enrich("anthropic", &mut models);
+                    let allowed = !native_veto && !catalog_veto;
+                    assert_eq!(
+                        models[0]
+                            .capabilities
+                            .reasoning
+                            .as_ref()
+                            .unwrap()
+                            .effort_options
+                            .iter()
+                            .any(|e| e == "none"),
+                        allowed
+                    );
+                    for selected in [
+                        None,
+                        Some(ReasoningConfig::Disabled),
+                        Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                    ] {
+                        let mut request = crate::generation::test_request(id);
+                        request.reasoning = selected;
+                        for stream in [false, true] {
+                            let result = crate::generation::with_native_reasoning(
+                                "anthropic",
+                                true,
+                                [(id.into(), native.clone())].into_iter().collect(),
+                                async {
+                                    AnthropicProvider::build_chat_request_with_catalog(
+                                        &request,
+                                        None,
+                                        vec![],
+                                        stream,
+                                        Some(&catalog),
+                                    )
+                                },
+                            )
+                            .await;
+                            if selected.is_none() || allowed {
+                                let body = serde_json::to_value(result.unwrap()).unwrap();
+                                assert!(body.get("output_config").is_none());
+                                if selected.is_none() {
+                                    assert!(body.get("thinking").is_none());
+                                } else {
+                                    assert_eq!(body["thinking"]["type"], "disabled");
+                                }
+                                assert_eq!(body["max_tokens"], 1024);
+                            } else {
+                                assert!(result.is_err());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1952,7 +2080,7 @@ mod tests {
         assert_eq!(reasoning.supported, Some(true));
         assert_eq!(
             reasoning.effort_options,
-            vec!["low", "medium", "high", "xhigh", "max"]
+            vec!["none", "low", "medium", "high", "xhigh", "max"]
         );
         assert_eq!(reasoning.default_effort.as_deref(), Some("high"));
     }
@@ -1966,7 +2094,7 @@ mod tests {
         assert_eq!(reasoning.supported, Some(true));
         assert_eq!(
             reasoning.effort_options,
-            vec!["low", "medium", "high", "max"]
+            vec!["none", "low", "medium", "high", "max"]
         );
     }
 
@@ -2011,7 +2139,7 @@ mod tests {
             .expect("supported reasoning model");
         assert_eq!(
             reasoning.effort_options,
-            vec!["low", "medium", "high", "xhigh", "max"]
+            vec!["none", "low", "medium", "high", "xhigh", "max"]
         );
         assert_eq!(models[0].capabilities.thinking, Some(true));
         assert_eq!(models[0].limits.context_window, Some(264000));

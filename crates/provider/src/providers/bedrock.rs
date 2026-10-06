@@ -1229,27 +1229,27 @@ mod tests {
         for (id, expected) in [
             (
                 "anthropic.claude-opus-4-5-20251101-v1:0",
-                vec!["low", "medium", "high"],
+                vec!["none", "low", "medium", "high"],
             ),
             (
                 "eu.anthropic.claude-opus-4-5-20251101-v1:0",
-                vec!["low", "medium", "high"],
+                vec!["none", "low", "medium", "high"],
             ),
             (
                 "anthropic.claude-opus-4-6-v1",
-                vec!["low", "medium", "high", "xhigh", "max"],
+                vec!["none", "low", "medium", "high", "xhigh", "max"],
             ),
             (
                 "us.anthropic.claude-opus-4-6-v1",
-                vec!["low", "medium", "high", "xhigh", "max"],
+                vec!["none", "low", "medium", "high", "xhigh", "max"],
             ),
             (
                 "anthropic.claude-sonnet-4-6",
-                vec!["low", "medium", "high", "max"],
+                vec!["none", "low", "medium", "high", "max"],
             ),
             (
                 "anthropic.claude-opus-5",
-                vec!["low", "medium", "high", "xhigh", "max"],
+                vec!["none", "low", "medium", "high", "xhigh", "max"],
             ),
         ] {
             let parsed = provider_model_from_bedrock_model_summary(
@@ -1259,7 +1259,7 @@ mod tests {
                 "bedrock",
                 id,
                 "anthropic.claude-opus-4-6-v1",
-                serde_json::json!({"thinkingLevelMap":{"off":null}}),
+                serde_json::json!({"thinkingLevelMap":{"max":"max"}}),
             );
             for catalog in [
                 crate::generation::test_catalog(false),
@@ -1287,11 +1287,26 @@ mod tests {
                         .unwrap(),
                     )
                     .unwrap();
-                    assert_eq!(
-                        body["additionalModelRequestFields"]["output_config"]["effort"],
-                        effort.as_str()
-                    );
+                    if effort == "none" {
+                        assert_eq!(
+                            body["additionalModelRequestFields"]["thinking"]["type"],
+                            "disabled"
+                        );
+                        assert!(
+                            body["additionalModelRequestFields"]
+                                .get("output_config")
+                                .is_none()
+                        );
+                    } else {
+                        assert_eq!(
+                            body["additionalModelRequestFields"]["output_config"]["effort"],
+                            effort.as_str()
+                        );
+                    }
                     assert_eq!(body["inferenceConfig"]["maxTokens"], 1024);
+                    if effort == "none" {
+                        continue;
+                    }
                     if id.contains("4-5") {
                         assert!(
                             body["additionalModelRequestFields"]
@@ -1303,6 +1318,83 @@ mod tests {
                             body["additionalModelRequestFields"]["thinking"]["type"],
                             "adaptive"
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aws_optional_off_and_catalog_veto_match_converse_discovery() {
+        for id in [
+            "anthropic.claude-opus-4-5-20251101-v1:0",
+            "us.anthropic.claude-opus-4-6-v1",
+            "anthropic.claude-sonnet-5",
+            "anthropic.claude-opus-5",
+            "anthropic.claude-fable-5",
+        ] {
+            for veto in [false, true] {
+                let catalog = crate::generation::test_catalog_model(
+                    "bedrock",
+                    id,
+                    "anthropic.claude-opus-4-6-v1",
+                    if veto {
+                        serde_json::json!({"thinkingLevelMap":{"off":null}})
+                    } else {
+                        serde_json::json!({"thinkingLevelMap":{"max":"max"}})
+                    },
+                );
+                let mut models = vec![provider_model_from_bedrock_model_summary(
+                    serde_json::from_value(serde_json::json!({"modelId":id})).unwrap(),
+                )];
+                catalog.enrich("bedrock", &mut models);
+                let allowed = !veto && !id.contains("fable");
+                assert_eq!(
+                    models[0]
+                        .capabilities
+                        .reasoning
+                        .as_ref()
+                        .unwrap()
+                        .effort_options
+                        .iter()
+                        .any(|e| e == "none"),
+                    allowed
+                );
+                for selected in [
+                    None,
+                    Some(ReasoningConfig::Disabled),
+                    Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                ] {
+                    let mut request = crate::generation::test_request(id);
+                    request.reasoning = selected;
+                    // Production stream remains chat fallback; both use this constructor.
+                    let result = BedrockProvider::build_request_with_catalog(
+                        &request,
+                        &prepared_for(&request.messages),
+                        Some(&catalog),
+                    );
+                    if selected.is_none() || allowed {
+                        let body = serde_json::to_value(result.unwrap()).unwrap();
+                        assert!(
+                            body["additionalModelRequestFields"]
+                                .get("output_config")
+                                .is_none()
+                        );
+                        if selected.is_none() {
+                            assert!(
+                                body["additionalModelRequestFields"]
+                                    .get("thinking")
+                                    .is_none()
+                            );
+                        } else {
+                            assert_eq!(
+                                body["additionalModelRequestFields"]["thinking"]["type"],
+                                "disabled"
+                            );
+                        }
+                        assert_eq!(body["inferenceConfig"]["maxTokens"], 1024);
+                    } else {
+                        assert!(result.is_err());
                     }
                 }
             }
@@ -2130,7 +2222,10 @@ mod tests {
         .expect("bedrock opus 4.5 effort metadata");
 
         assert_eq!(reasoning.supported, Some(true));
-        assert_eq!(reasoning.effort_options, vec!["low", "medium", "high"]);
+        assert_eq!(
+            reasoning.effort_options,
+            vec!["none", "low", "medium", "high"]
+        );
         assert_eq!(reasoning.default_effort.as_deref(), Some("high"));
     }
 
@@ -2186,7 +2281,10 @@ mod tests {
             .reasoning
             .as_ref()
             .expect("bedrock claude reasoning model");
-        assert_eq!(reasoning.effort_options, vec!["low", "medium", "high"]);
+        assert_eq!(
+            reasoning.effort_options,
+            vec!["none", "low", "medium", "high"]
+        );
         assert_eq!(models[0].capabilities.vision, Some(true));
         assert_eq!(models[0].active, Some(true));
 

@@ -265,12 +265,16 @@ impl ModelCatalog {
 fn enrich_reasoning(provider: &str, model: &mut ProviderModelInfo, entry: Option<&CatalogModel>) {
     use pioneer_protocol::ReasoningCapabilitySource as Source;
     let fallback = crate::reasoning_registry::reasoning_capabilities_for_model(provider, &model.id);
+    let documented_off = fallback
+        .as_ref()
+        .is_some_and(|r| r.effort_options.iter().any(|e| e == "none"));
     let native = model
         .capabilities
         .reasoning
         .as_ref()
         .map(|r| r.native.clone())
         .unwrap_or_default();
+    let catalog_thinking = entry.map(|e| e.reasoning);
     let entry = crate::generation::reasoning_model(provider, entry, &native);
     if model.capabilities.reasoning.is_none()
         && fallback.is_none()
@@ -315,7 +319,11 @@ fn enrich_reasoning(provider: &str, model: &mut ProviderModelInfo, entry: Option
                     .then_some(model.capabilities.thinking)
                     .flatten()
             })
-            .or(Some(entry.reasoning));
+            .or(if provider == "openrouter" {
+                catalog_thinking
+            } else {
+                Some(entry.reasoning)
+            });
         let source_efforts = entry
             .metadata
             .get("sourceGeneration")
@@ -359,6 +367,19 @@ fn enrich_reasoning(provider: &str, model: &mut ProviderModelInfo, entry: Option
         // Catalog/mixed fields do not originate in StaticRegistry.
         reasoning.source = Some(Source::Unknown);
     }
+    // Qualitative source enums do not describe the separate disabled mode.
+    // Fill that documented control only for bounded optional native profiles;
+    // explicit off vetoes and native mode denials still win below.
+    if documented_off
+        && entry.as_ref().is_none_or(|e| {
+            e.metadata
+                .get("thinkingLevelMap")
+                .is_none_or(|m| m.get("off") != Some(&Value::Null))
+        })
+        && !reasoning.effort_options.iter().any(|e| e == "none")
+    {
+        reasoning.effort_options.push("none".into());
+    }
     // Restore native sublevels after catalog replacement. Native thinking and
     // effort support are independent; mode denials are checked by the mapper.
     for (key, supported) in &native {
@@ -383,6 +404,9 @@ fn enrich_reasoning(provider: &str, model: &mut ProviderModelInfo, entry: Option
         reasoning.default_effort = None;
         reasoning.supports_token_budget = Some(false); // no numeric product control
     }
+    if provider == "openrouter" {
+        crate::providers::openrouter::preserve_native_reasoning(&mut reasoning);
+    }
     reasoning.effort_options.retain(|e| {
         crate::ReasoningEffort::from_str(e).is_some_and(|e| {
             crate::generation::effort_supported_with_native(
@@ -401,7 +425,11 @@ fn enrich_reasoning(provider: &str, model: &mut ProviderModelInfo, entry: Option
             .unwrap_or(usize::MAX)
     });
     reasoning.effort_options.dedup();
-    if reasoning
+    if !native.iter().any(|(k, v)| {
+        k.strip_prefix("default_effort.")
+            .is_some_and(|e| crate::ReasoningEffort::from_str(e).is_some())
+            && *v == Some(true)
+    }) && reasoning
         .default_effort
         .as_ref()
         .is_some_and(|e| !reasoning.effort_options.contains(e))
@@ -416,7 +444,7 @@ fn enrich_reasoning(provider: &str, model: &mut ProviderModelInfo, entry: Option
             && native.get("effort.supported") == Some(&Some(false))
     {
         reasoning.supported = Some(false);
-    } else if native.values().any(|v| *v == Some(true)) {
+    } else if provider != "openrouter" && native.values().any(|v| *v == Some(true)) {
         reasoning.supported = Some(true);
     }
     if !native.is_empty() && reasoning.source == Some(Source::StaticRegistry) {

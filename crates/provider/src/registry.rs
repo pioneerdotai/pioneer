@@ -1231,6 +1231,240 @@ mod tests {
         assert!(provider.chat(chat_request()).await.is_ok());
     }
 
+    struct RouterReasoningFixture {
+        discovery: String,
+        catalog: Arc<crate::catalog::ModelCatalog>,
+        bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+    #[async_trait]
+    impl Provider for RouterReasoningFixture {
+        fn name(&self) -> &str {
+            "openrouter"
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+        async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+            Ok(crate::providers::openrouter::models_from_native_discovery_fixture(&self.discovery))
+        }
+        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+            let body = crate::providers::openrouter::render_chat_request_mode_for_test(
+                &self.catalog,
+                &request,
+                false,
+            )
+            .await?;
+            self.bodies.lock().unwrap().push(body);
+            Ok(ChatResponse {
+                text: String::new(),
+                usage: None,
+                termination: ProviderTermination::Complete,
+                reasoning_content: None,
+                tool_calls: vec![],
+                provider_replay_state: None,
+            })
+        }
+        async fn stream_chat(
+            &self,
+            request: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+            let body = crate::providers::openrouter::render_chat_request_mode_for_test(
+                &self.catalog,
+                &request,
+                true,
+            )
+            .await?;
+            self.bodies.lock().unwrap().push(body);
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn router_native_fields_survive_catalog_conflicts_and_actual_authority_requests() {
+        use crate::{ReasoningConfig, ReasoningEffort};
+        let id = "openai/gpt-5.4";
+        // Each case has a distinct real authority instance/cache. These facts
+        // enter through the production parser, never with_native_reasoning.
+        for (metadata, expected, supported, mandatory, default, budget) in [
+            (
+                serde_json::json!({"supported_efforts":["low","high"], "default_effort":"high", "default_enabled":true,"mandatory":true,"supports_max_tokens":false}),
+                vec!["low", "high"],
+                Some(true),
+                Some(true),
+                Some("high"),
+                Some(false),
+            ),
+            (
+                serde_json::json!({"supported_efforts":["none","low","high"], "mandatory":false}),
+                vec!["none", "low", "high"],
+                Some(true),
+                Some(false),
+                None,
+                None,
+            ),
+            (
+                serde_json::json!({"supported_efforts":[], "default_enabled":false}),
+                vec![],
+                Some(false),
+                Some(false),
+                None,
+                None,
+            ),
+            // An explicit aggregate negative remains independent of a positive enum.
+            (
+                serde_json::json!({"supported":false,"supported_efforts":["low","high"],"mandatory":true}),
+                vec![],
+                Some(false),
+                Some(true),
+                None,
+                None,
+            ),
+            // Documented omission within the object denies effort selection,
+            // but does not turn budget support or a default into effort support.
+            (
+                serde_json::json!({"default_effort":"high","supports_max_tokens":true}),
+                vec![],
+                Some(true),
+                Some(false),
+                Some("high"),
+                Some(true),
+            ),
+            (
+                serde_json::json!({"supported_efforts":null,"default_effort":"none","default_enabled":false,"mandatory":false}),
+                vec!["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                Some(true),
+                Some(false),
+                Some("none"),
+                None,
+            ),
+            // Absent or malformed enum carries no confirmed per-model enum;
+            // matching catalog fallback remains visible as mixed/unknown source.
+            (
+                serde_json::Value::Null,
+                vec!["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                Some(true),
+                Some(false),
+                None,
+                None,
+            ),
+            (
+                serde_json::json!({"supported_efforts":[null],"mandatory":null,"supports_max_tokens":null}),
+                vec!["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                Some(true),
+                Some(false),
+                None,
+                None,
+            ),
+        ] {
+            let mut catalog_metadata = serde_json::json!({"thinkingLevelMap":{"off":"none","medium":"high","xhigh":"xhigh","max":"max","minimal":"minimal","low":"low","high":"high"}});
+            if metadata["mandatory"] == true && metadata.get("supported").is_none() {
+                catalog_metadata["reasoning"] = serde_json::json!(false);
+                catalog_metadata["compat"] = serde_json::json!({"supportsReasoningEffort":false});
+            }
+            let catalog = Arc::new(crate::generation::test_catalog_model(
+                "openrouter",
+                id,
+                id,
+                catalog_metadata,
+            ));
+            let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let wrapper = AuthorityBoundProvider {
+                inner: Arc::new(RouterReasoningFixture {
+                    discovery: serde_json::json!({"data":[{"id":id,"reasoning":metadata}]})
+                        .to_string(),
+                    catalog: catalog.clone(),
+                    bodies: bodies.clone(),
+                }),
+                authority_fingerprint: ProviderAuthorityFingerprint(
+                    "router-reasoning-fixture".into(),
+                ),
+                revoked: Arc::new(AtomicBool::new(false)),
+                redact_endpoint_errors: false,
+                use_public_catalog: true,
+                discovery_tools: RwLock::new(BTreeMap::new()),
+                discovery_reasoning: RwLock::new(BTreeMap::new()),
+            };
+            let mut models = wrapper.inner.list_models().await.unwrap();
+            let raw_native = models[0]
+                .capabilities
+                .reasoning
+                .as_ref()
+                .map(|r| r.native.clone())
+                .unwrap_or_default();
+            wrapper.enrich_discovery(&catalog, &mut models);
+            let r = models[0].capabilities.reasoning.as_ref().unwrap();
+            assert_eq!(r.native, raw_native);
+            for (field, fact) in [
+                ("mandatory", "mandatory"),
+                ("default_enabled", "default_enabled"),
+                ("supports_max_tokens", "supports_token_budget"),
+                ("supported", "reasoning.supported"),
+            ] {
+                assert_eq!(
+                    raw_native.get(fact).copied(),
+                    metadata.get(field).map(serde_json::Value::as_bool)
+                );
+            }
+
+            assert_eq!(
+                models[0].capabilities.thinking,
+                Some(!(metadata["mandatory"] == true && metadata.get("supported").is_none()))
+            );
+            assert_eq!(r.effort_options, expected);
+            assert_eq!(r.supported, supported);
+            assert_eq!(r.mandatory, mandatory);
+            assert_eq!(r.default_effort.as_deref(), default);
+            assert_eq!(r.supports_token_budget, budget);
+            let mut request = crate::generation::test_request(id);
+            for setting in [
+                None,
+                Some(ReasoningConfig::Disabled),
+                Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::Minimal)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::Low)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::Medium)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::XHigh)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::Max)),
+            ] {
+                request.reasoning = setting;
+                let effort = setting.map(|s| match s {
+                    ReasoningConfig::Disabled => "none",
+                    ReasoningConfig::Effort(e) => e.as_str(),
+                });
+                let allowed = effort.is_none_or(|e| expected.contains(&e));
+                for stream in [false, true] {
+                    let result = if stream {
+                        wrapper.stream_chat(request.clone()).await.map(|_| ())
+                    } else {
+                        wrapper.chat(request.clone()).await.map(|_| ())
+                    };
+                    if allowed {
+                        result.unwrap();
+                        let body = bodies.lock().unwrap().last().unwrap().clone();
+                        assert_eq!(body["stream"], stream);
+                        assert_eq!(body["max_tokens"], 1024);
+                        if let Some(effort) = effort {
+                            let expected_wire = if effort == "medium"
+                                && raw_native.get("effort.medium") != Some(&Some(true))
+                            {
+                                "high"
+                            } else {
+                                effort
+                            };
+                            assert_eq!(body["reasoning"]["effort"], expected_wire);
+                        } else {
+                            assert!(body.get("reasoning").is_none());
+                        }
+                    } else {
+                        let error = result.unwrap_err().to_string();
+                        assert!(error.contains("native OpenRouter"), "{error}");
+                    }
+                }
+            }
+        }
+    }
+
     struct ToolDiscoveryProvider;
     #[async_trait]
     impl Provider for ToolDiscoveryProvider {

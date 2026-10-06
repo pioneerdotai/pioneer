@@ -326,9 +326,16 @@ fn documented_native_profile(
     } else {
         return None;
     };
+    let mut controls: Vec<String> = efforts.iter().map(|e| (*e).into()).collect();
+    // Product off is a thinking mode, never a Claude output_config effort.
+    // Only the bounded optional-thinking Messages/Converse profiles above
+    // document disabled; mandatory/between_tools profiles do not grant it.
+    if matches!(provider, "anthropic" | "bedrock") && mandatory == Some(false) {
+        controls.insert(0, "none".into());
+    }
     Some(ProviderModelReasoningCapabilities {
         supported: Some(true),
-        effort_options: efforts.iter().map(|e| (*e).into()).collect(),
+        effort_options: controls,
         default_effort: Some(default.into()),
         mandatory,
         source: Some(ReasoningCapabilitySource::StaticRegistry),
