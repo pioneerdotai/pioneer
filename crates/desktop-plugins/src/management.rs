@@ -30,7 +30,7 @@ fn confirmed_restore_intent(
 mod restore_tests {
     // Regression sources only: NOT_RUN / NOT_COMPILED; no native prompt run.
     use super::*;
-    #[test]
+    #[::core::prelude::v1::test]
     fn cancelled_stale_and_failed_retry_targets_cannot_send_identity_reset() {
         let key = PluginComponentKey {
             kind: "skill".into(),

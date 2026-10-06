@@ -56,7 +56,7 @@ pub(crate) fn status_label(status: &str) -> String {
 #[cfg(test)]
 mod status_tests {
     // Regression sources only: NOT_RUN / NOT_COMPILED.
-    #[test]
+    #[::core::prelude::v1::test]
     fn skill_runtime_states_have_real_labels_and_mcp_labels_stay_distinct() {
         for (state, label) in [
             ("active", t!("plugins.active")),
