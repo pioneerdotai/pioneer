@@ -1327,10 +1327,17 @@ pub(crate) fn thread_episodic_vector_projection_identity_hash_for_parts(
     } else {
         "false"
     };
-    let identity = format!(
+    let mut identity = format!(
         "thread_episodic_vector_projection_v1\nenabled={}\nprovider={provider}\nmodel={model}\ndimension={dimension}\nnormalized={normalized}\n",
         enabled
     );
+    if enabled
+        && provider == "local"
+        && let Some(version) = pioneer_provider::providers::local_embedding_model_info(model)
+            .and_then(|info| info.preparation_version())
+    {
+        identity.push_str(&format!("preparation={version}\n"));
+    }
     let digest = Sha256::digest(identity.as_bytes());
     hex_lower(digest.as_slice())
 }

@@ -877,6 +877,7 @@ impl EmbeddingRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddingResponse {
     pub embeddings: Vec<Vec<f32>>,
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1024,7 +1025,7 @@ impl ProviderTermination {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TokenUsage {
     /// Full effective input, including cache reads/writes exactly once.
     /// None means unreported, never zero by implication.

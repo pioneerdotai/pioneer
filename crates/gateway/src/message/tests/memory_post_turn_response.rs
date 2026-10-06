@@ -242,7 +242,8 @@ impl Fixture {
                 .processor
                 .process_due_native_terminal_effects(self.now + 100_000, 1)
                 .await
-                .unwrap(),
+                .unwrap()
+                .count,
             1
         );
     }
@@ -280,9 +281,10 @@ impl Fixture {
         let claim = self
             .harness
             .crud_store
-            .claim_due_native_terminal_effects(self.now, 90, 1)
+            .claim_due_native_terminal_effects_at(self.now, 90, 1)
             .await
             .unwrap()
+            .records
             .pop()
             .unwrap();
         let checkpoint = json!({"schema_version": 1, "raw_json": raw, "model": "test-model", "model_provider": "openai"}).to_string();
@@ -412,7 +414,8 @@ fn memory_response_budget_is_not_reopened() {
                 .processor
                 .process_due_native_terminal_effects(f.now + 200_000, 10)
                 .await
-                .unwrap(),
+                .unwrap()
+                .count,
             0
         );
         let runs = f
@@ -440,9 +443,10 @@ fn memory_response_legacy_checkpoint_validation_and_replay() {
                 let claim = f
                     .harness
                     .crud_store
-                    .claim_due_native_terminal_effects(f.now + 100_000, 90, 1)
+                    .claim_due_native_terminal_effects_at(f.now + 100_000, 90, 1)
                     .await
                     .unwrap()
+                    .records
                     .pop()
                     .unwrap();
                 for _ in 0..2 {
@@ -511,7 +515,8 @@ fn memory_response_legacy_checkpoint_validation_and_replay() {
                         .processor
                         .process_due_native_terminal_effects(f.now + 200_000, 10)
                         .await
-                        .unwrap(),
+                        .unwrap()
+                        .count,
                     0
                 );
             }
@@ -543,17 +548,19 @@ fn memory_response_stale_claim_cannot_publish_checkpoint_or_memory() {
         let old = f
             .harness
             .crud_store
-            .claim_due_native_terminal_effects(f.now, 1, 1)
+            .claim_due_native_terminal_effects_at(f.now, 1, 1)
             .await
             .unwrap()
+            .records
             .pop()
             .unwrap();
         let current = f
             .harness
             .crud_store
-            .claim_due_native_terminal_effects(f.now + 2, 90, 1)
+            .claim_due_native_terminal_effects_at(f.now + 2, 90, 1)
             .await
             .unwrap()
+            .records
             .pop()
             .unwrap();
         let bridge = GatewayMemoryProvider::new(Arc::downgrade(&f.harness.processor));
@@ -654,9 +661,10 @@ fn memory_response_write_failure_replays_without_model_or_duplicate_memory() {
         let claim = f
             .harness
             .crud_store
-            .claim_due_native_terminal_effects(f.now + 100_000, 90, 1)
+            .claim_due_native_terminal_effects_at(f.now + 100_000, 90, 1)
             .await
             .unwrap()
+            .records
             .pop()
             .unwrap();
         f.harness
@@ -710,9 +718,10 @@ fn memory_response_claim_lost_during_provider_request_fences_checkpoint() {
         let claim = f
             .harness
             .crud_store
-            .claim_due_native_terminal_effects(f.now, 90, 1)
+            .claim_due_native_terminal_effects_at(f.now, 90, 1)
             .await
             .unwrap()
+            .records
             .pop()
             .unwrap();
         *f.provider.revoke.lock().unwrap() = Some((
@@ -869,7 +878,8 @@ fn memory_response_stream_eof_has_bounded_retry_and_never_checkpoints_partial_te
                     .processor
                     .process_due_native_terminal_effects(f.now + 200_000, 10)
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .count,
                 0
             );
             let _ = std::fs::remove_dir_all(&f.harness.runtime_home);
@@ -1019,7 +1029,8 @@ fn memory_openrouter_incomplete_adapter_stream_exhausts_only_original_budget() {
                             .processor
                             .process_due_native_terminal_effects(now, 10)
                             .await
-                            .unwrap(),
+                            .unwrap()
+                            .count,
                         0
                     );
                 }

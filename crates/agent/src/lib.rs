@@ -1911,6 +1911,10 @@ enum AgentCommand {
         item_id: String,
         ack: AgentControlAck,
     },
+    DurableStartRejected {
+        turn_id: String,
+        run_id: u64,
+    },
     CancelTurn {
         turn_id: String,
         reason: String,
@@ -2196,6 +2200,14 @@ struct TurnExecutionControl {
     turn_cancellation_token: CancellationToken,
     command_tx: mpsc::Sender<AgentCommand>,
     run_id: u64,
+    durable_cancellation: Arc<StdRwLock<Option<DurableCancellationObservation>>>,
+}
+
+#[derive(Clone)]
+struct DurableCancellationObservation {
+    turn_id: String,
+    run_id: u64,
+    actor_generation: u64,
 }
 
 #[derive(Clone)]
@@ -2211,7 +2223,20 @@ impl TurnExecutionControl {
             turn_cancellation_token: CancellationToken::new(),
             command_tx,
             run_id,
+            durable_cancellation: Arc::new(StdRwLock::new(None)),
         }
+    }
+
+    fn has_durable_cancellation(&self, turn_id: &str) -> bool {
+        self.durable_cancellation
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|receipt| {
+                receipt.turn_id == turn_id
+                    && receipt.run_id == self.run_id
+                    && receipt.actor_generation != 0
+            })
     }
 
     async fn register_attempt(&self, item_id: String) -> CancellationToken {
@@ -2502,6 +2527,9 @@ pub(crate) struct NativeTurnRuntimeSnapshot {
     pub(crate) hook_runtime: Option<Arc<HookRuntime>>,
     pub(crate) tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
     pub(crate) post_turn_hook_dispatch_policy: AgentPostTurnHookDispatchPolicy,
+    pub(crate) interrupted_hook_snapshot: Option<
+        Arc<Result<serde_json::Value, pioneer_protocol::NativeTerminalEffectPreparationFailure>>,
+    >,
     pub(crate) permission_approval_broker: Arc<dyn PermissionApprovalBroker>,
 }
 
@@ -2550,6 +2578,9 @@ struct NativeRuntimeDependencyState {
     hook_runtime: Option<Arc<HookRuntime>>,
     post_turn_hook_dispatch_policy: AgentPostTurnHookDispatchPolicy,
     permission_approval_broker: Arc<dyn PermissionApprovalBroker>,
+    interrupted_hook_snapshot: Option<
+        Arc<Result<serde_json::Value, pioneer_protocol::NativeTerminalEffectPreparationFailure>>,
+    >,
     terminal_runtime_history: VecDeque<NativeTerminalRuntimeSnapshot>,
 }
 
@@ -2595,6 +2626,7 @@ impl NativeRuntimeDependencies {
                 hook_runtime: None,
                 post_turn_hook_dispatch_policy: AgentPostTurnHookDispatchPolicy::default(),
                 permission_approval_broker: Arc::new(StaticPermissionApprovalBroker::default()),
+                interrupted_hook_snapshot: None,
                 terminal_runtime_history: VecDeque::with_capacity(
                     NATIVE_TERMINAL_RUNTIME_HISTORY_LIMIT,
                 ),
@@ -2618,6 +2650,7 @@ impl NativeRuntimeDependencies {
         }
         update(&mut state);
         state.generation = state.generation.saturating_add(1);
+        state.interrupted_hook_snapshot = None;
     }
 
     /// Update provider bindings that are only inputs to the next assembled
@@ -2655,7 +2688,17 @@ impl NativeRuntimeDependencies {
     }
 
     pub(crate) async fn snapshot(&self) -> NativeTurnRuntimeSnapshot {
-        let state = self.state.read().await;
+        let mut state = self.state.write().await;
+        if state.interrupted_hook_snapshot.is_none()
+            && state
+                .post_turn_hook_dispatch_policy
+                .should_dispatch(pioneer_hooks::TurnPostTurnStatus::Interrupted)
+            && let Some(runtime) = state.hook_runtime.as_ref()
+        {
+            state.interrupted_hook_snapshot = Some(Arc::new(
+                post_turn::capture_durable_post_turn_snapshot(runtime),
+            ));
+        }
         NativeTurnRuntimeSnapshot {
             context_controller: state.context_controller.clone(),
             generation: state.generation,
@@ -2674,6 +2717,7 @@ impl NativeRuntimeDependencies {
                 .as_ref()
                 .map(|_| self.tool_bundle_artifacts.clone()),
             post_turn_hook_dispatch_policy: state.post_turn_hook_dispatch_policy,
+            interrupted_hook_snapshot: state.interrupted_hook_snapshot.clone(),
             permission_approval_broker: state.permission_approval_broker.clone(),
         }
     }
@@ -3672,6 +3716,23 @@ impl AgentManager {
         }
     }
 
+    pub async fn pending_progress_targets_for_item(
+        &self,
+        workspace_id: &str,
+        item_id: &str,
+    ) -> Vec<(String, String)> {
+        let state = self.state.read().await;
+        state
+            .threads
+            .values()
+            .flat_map(|thread| {
+                thread
+                    .event_hub
+                    .pending_progress_targets_for_item(workspace_id, item_id)
+            })
+            .collect()
+    }
+
     pub async fn flush_progress_for_item(
         &self,
         thread_id: &str,
@@ -3749,6 +3810,45 @@ impl AgentManager {
         )
         .await;
         self.finish_control_dispatch(thread_id, result).await
+    }
+
+    /// Called only after the controller confirmed canonical cancellation and its
+    /// obligations. Bind that observation to the exact actor generation and run;
+    /// a cancellation token alone is never a durable receipt.
+    pub async fn observe_durable_cancellation(
+        &self,
+        receipt: pioneer_protocol::NativeDurableCancellationReceipt,
+        actor_generation: u64,
+    ) -> Result<(), AgentControlError> {
+        let thread_id = receipt.thread_id.as_str();
+        let turn_id = receipt.turn_id.as_str();
+        let state = self.state.read().await;
+        let thread = state
+            .threads
+            .get(thread_id)
+            .ok_or(AgentControlError::ThreadNotFound)?;
+        if thread.generation != actor_generation
+            || thread.workspace_id != receipt.workspace_id
+            || receipt.canonical_event_id.is_empty()
+            || receipt.execution_owner_id.is_empty()
+        {
+            return Err(AgentControlError::TurnMismatch);
+        }
+        let control = thread
+            .control_plane
+            .execution_for(turn_id)
+            .ok_or(AgentControlError::NoActiveTurn)?;
+        *control
+            .durable_cancellation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(DurableCancellationObservation {
+                turn_id: turn_id.to_owned(),
+                run_id: control.run_id,
+                actor_generation,
+            });
+        control.cancel_all_attempts();
+        Ok(())
     }
 
     pub async fn cancel_turn(

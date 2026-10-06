@@ -177,7 +177,8 @@ impl LegacyCheckpointFixture {
             self.background
                 .process_due_native_terminal_effects(reopen_at, 1)
                 .await
-                .unwrap(),
+                .unwrap()
+                .count,
             1
         );
         assert_eq!(self.status().await.attempt_count, self.legacy_max_attempts);
@@ -414,9 +415,10 @@ async fn recovery_fixture_on_workspace(
     let (legacy_completed_at, legacy_max_attempts, stale_claim) = loop {
         let claim = background
             .crud_store
-            .claim_due_native_terminal_effects(now, 90, 1)
+            .claim_due_native_terminal_effects_at(now, 90, 1)
             .await
             .unwrap()
+            .records
             .pop()
             .unwrap();
         assert_eq!(claim.effect_id, effect_id);
@@ -613,7 +615,8 @@ async fn assert_transient_recovery(fixture: &LegacyCheckpointFixture) {
             .background
             .process_due_native_terminal_effects(reopen_at, 1)
             .await
-            .unwrap(),
+            .unwrap()
+            .count,
         1
     );
     assert_eq!(fixture.status().await.status, "succeeded");
@@ -693,7 +696,8 @@ async fn legacy_checkpoint_mixed_results_replay_real_writes_without_canonical_du
             .background
             .process_due_native_terminal_effects(reopen_at, 1)
             .await
-            .unwrap(),
+            .unwrap()
+            .count,
         1
     );
     assert_eq!(fixture.status().await.status, "succeeded");
@@ -788,7 +792,8 @@ async fn execute_legacy_manifest(fixture: &LegacyCheckpointFixture) {
             .background
             .process_due_native_terminal_effects(now, 1)
             .await
-            .unwrap(),
+            .unwrap()
+            .count,
         1
     );
     assert_eq!(
@@ -1145,7 +1150,8 @@ async fn manifest_poison_does_not_block_healthy_obligation_in_same_worker_batch(
             .background
             .process_due_native_terminal_effects(now, 2)
             .await
-            .unwrap(),
+            .unwrap()
+            .count,
         2
     );
     assert_eq!(fixture.status().await.status, "unresolved");
@@ -1187,7 +1193,8 @@ async fn manifest_typed_transient_worker_retries_in_original_budget_then_continu
             .background
             .process_due_native_terminal_effects(now, 1)
             .await
-            .unwrap(),
+            .unwrap()
+            .count,
         1
     );
     let failed = fixture.status().await;
@@ -1205,7 +1212,8 @@ async fn manifest_typed_transient_worker_retries_in_original_budget_then_continu
             .background
             .process_due_native_terminal_effects(now + 1, 1)
             .await
-            .unwrap(),
+            .unwrap()
+            .count,
         0
     );
     // Advance only the scanner's supplied timestamp, never real time or retry policy.
@@ -1214,7 +1222,8 @@ async fn manifest_typed_transient_worker_retries_in_original_budget_then_continu
             .background
             .process_due_native_terminal_effects(now + 300, 1)
             .await
-            .unwrap(),
+            .unwrap()
+            .count,
         1
     );
     let succeeded = fixture.status().await;
@@ -1264,7 +1273,8 @@ async fn legacy_manifest_typed_transient_result_controls_normal_recovery() {
             .background
             .process_due_native_terminal_effects(now, 1)
             .await
-            .unwrap(),
+            .unwrap()
+            .count,
         1
     );
     assert_eq!(fixture.status().await.status, "succeeded");
@@ -1291,9 +1301,10 @@ async fn legacy_live_states_receive_new_manifest_classification_on_next_delivery
         if state != "ready" {
             let claim = fixture
                 .store()
-                .claim_due_native_terminal_effects(now, 90, 1)
+                .claim_due_native_terminal_effects_at(now, 90, 1)
                 .await
                 .unwrap()
+                .records
                 .pop()
                 .unwrap();
             stale_claim = Some(claim.claim_token.clone());
@@ -1339,7 +1350,8 @@ async fn legacy_live_states_receive_new_manifest_classification_on_next_delivery
                 .background
                 .process_due_native_terminal_effects(execute_at, 1)
                 .await
-                .unwrap(),
+                .unwrap()
+                .count,
             1
         );
         let status = fixture.status().await;
@@ -1512,9 +1524,10 @@ async fn legacy_manifest_marker_and_single_budget_survive_database_reopen_and_cl
             .await
             .unwrap();
         let original_claim = store
-            .claim_due_native_terminal_effects(now, 90, 1)
+            .claim_due_native_terminal_effects_at(now, 90, 1)
             .await
             .unwrap()
+            .records
             .pop()
             .unwrap();
         store
@@ -1563,9 +1576,10 @@ async fn legacy_manifest_marker_and_single_budget_survive_database_reopen_and_cl
         );
         if crash_after_claim {
             let claim = store
-                .claim_due_native_terminal_effects(requeue_at, 90, 1)
+                .claim_due_native_terminal_effects_at(requeue_at, 90, 1)
                 .await
                 .unwrap()
+                .records
                 .pop()
                 .unwrap();
             assert_eq!(claim.attempt_count, claim.max_attempts);
@@ -1612,9 +1626,10 @@ async fn legacy_manifest_marker_and_single_budget_survive_database_reopen_and_cl
             0
         );
         let claims = restarted
-            .claim_due_native_terminal_effects(requeue_at + 91, 90, 1)
+            .claim_due_native_terminal_effects_at(requeue_at + 91, 90, 1)
             .await
-            .unwrap();
+            .unwrap()
+            .records;
         if crash_after_claim {
             assert!(claims.is_empty());
             assert_eq!(
@@ -1697,9 +1712,10 @@ async fn legacy_manifest_worker_timeout_keeps_single_budget_after_database_reope
             for _ in 0..budget {
                 let claim = fixture
                     .store()
-                    .claim_due_native_terminal_effects(execute_at, 90, 1)
+                    .claim_due_native_terminal_effects_at(execute_at, 90, 1)
                     .await
                     .unwrap()
+                    .records
                     .pop()
                     .unwrap();
                 assert!(!claim.legacy_manifest_revalidation);
@@ -1760,7 +1776,7 @@ async fn legacy_manifest_worker_timeout_keeps_single_budget_after_database_reope
         tokio::time::pause();
         tokio::time::advance(std::time::Duration::from_secs(61)).await;
         tokio::time::resume();
-        assert_eq!(worker.await.unwrap().unwrap(), 1);
+        assert_eq!(worker.await.unwrap().unwrap().count, 1);
         let expected_code = if legacy {
             "memory.post_turn_extractor.legacy_manifest_revalidation_timeout"
         } else {
@@ -1841,9 +1857,10 @@ async fn legacy_manifest_worker_timeout_keeps_single_budget_after_database_reope
             );
             assert!(
                 restarted
-                    .claim_due_native_terminal_effects(scan_at, 90, 1)
+                    .claim_due_native_terminal_effects_at(scan_at, 90, 1)
                     .await
                     .unwrap()
+                    .records
                     .is_empty()
             );
             let final_status = restarted
@@ -1864,9 +1881,10 @@ async fn legacy_manifest_worker_timeout_keeps_single_budget_after_database_reope
             assert_eq!(pending.max_attempts, 8);
             assert_eq!(pending.attempt_count, 0);
             let claim = restarted
-                .claim_due_native_terminal_effects(scan_at, 90, 1)
+                .claim_due_native_terminal_effects_at(scan_at, 90, 1)
                 .await
                 .unwrap()
+                .records
                 .pop()
                 .unwrap();
             assert!(!claim.legacy_manifest_revalidation);
