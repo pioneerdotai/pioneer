@@ -33,6 +33,7 @@ fn canonical_tool_rounds_keep_native_block_ids_and_object_inputs() {
         let wire = serde_json::to_value(ApiChatRequest {
             model: "claude-sonnet-4-5".into(), messages, max_tokens: 128, temperature: None,
             system, tools: None, tool_choice: None, output_config: None, stream: false,
+            cache_control: None,
         }).unwrap();
         assert_eq!(wire["system"], "Use tools");
         for previous in 0..=round {

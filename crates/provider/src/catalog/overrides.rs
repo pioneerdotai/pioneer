@@ -40,6 +40,7 @@ fn explicit(
         expression: "pinned Pi explicit model definition".into(),
     };
     Candidate {
+        tool_calling: None,
         model: json!({"id":id,"name":name,"provider":provider,"api":api,"baseUrl":url,"reasoning":reasoning,
         "input":if image {vec!["text","image"]} else {vec!["text"]},"pricingSource":{"kind":"pinned_catalog_override","units":"USD_per_million_tokens"},"cost":cost,"contextWindow":context,"maxTokens":output}),
         context_origin: origin.clone(),

@@ -3510,7 +3510,8 @@ async fn execute_agent_provider_response(
     let filesystem_prompt_snapshot = execution_security_snapshot.clone();
 
     let tool_loop_config = tool_loop_config.normalized();
-    let provider_tool_calling = provider.capabilities().tool_calling && !disable_tool_calling;
+    let provider_tool_calling =
+        provider.model_tool_calling(model.as_str()) && !disable_tool_calling;
     let native_file_tool_capability = if provider_tool_calling {
         provider.native_file_tool_capability(model.as_str())
     } else {

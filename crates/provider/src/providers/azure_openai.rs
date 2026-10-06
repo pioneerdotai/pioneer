@@ -708,6 +708,33 @@ impl AzureOpenAiProvider {
         )
     }
 
+    fn build_chat_request(
+        &self,
+        request: ChatRequest,
+        stream: bool,
+        mut prepared: PreparedProviderMessages,
+    ) -> Result<ApiChatRequest> {
+        use crate::traits::Provider;
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
+        ensure_no_unrendered_attachments(self.name(), &prepared)?;
+        Ok(ApiChatRequest {
+            model: self.deployment_model(),
+            messages: Self::convert_messages(&prepared)?,
+            temperature: request.temperature,
+            max_tokens: request.max_tokens,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
+            parallel_tool_calls: request.parallel_tool_calls,
+            reasoning_effort: reasoning_effort_for_azure_openai_request(request.reasoning),
+            stream,
+            stream_options: stream.then(|| serde_json::json!({"include_usage": true})),
+        })
+    }
+
     fn models_url(&self) -> String {
         if self.api_version == "v1" {
             return format!("{}/openai/v1/models", self.endpoint_root());
@@ -803,6 +830,7 @@ impl crate::traits::Provider for AzureOpenAiProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
         self.validate_connection(true)?;
         let prepared = prepare_messages_for_provider_async(
             self.name(),
@@ -811,22 +839,7 @@ impl crate::traits::Provider for AzureOpenAiProvider {
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
-        ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = ApiChatRequest {
-            model: self.deployment_model(),
-            messages: Self::convert_messages(&prepared)?,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            reasoning_effort: reasoning_effort_for_azure_openai_request(request.reasoning),
-            stream: false,
-            stream_options: None,
-        };
+        let api_request = self.build_chat_request(request, false, prepared)?;
 
         let request_builder = self
             .client
@@ -901,6 +914,7 @@ impl crate::traits::Provider for AzureOpenAiProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
         self.validate_connection(true)?;
         let prepared = prepare_messages_for_provider_async(
             self.name(),
@@ -909,22 +923,7 @@ impl crate::traits::Provider for AzureOpenAiProvider {
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
-        ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = ApiChatRequest {
-            model: self.deployment_model(),
-            messages: Self::convert_messages(&prepared)?,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            reasoning_effort: reasoning_effort_for_azure_openai_request(request.reasoning),
-            stream: true,
-            stream_options: Some(serde_json::json!({"include_usage": true})),
-        };
+        let api_request = self.build_chat_request(request, true, prepared)?;
 
         let request_builder = self
             .client
@@ -1223,6 +1222,109 @@ mod tests {
         AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart, ReasoningConfig,
         ReasoningEffort,
     };
+
+    #[test]
+    fn actual_azure_identity_preserves_modes_and_parallel_in_both_builders() {
+        let provider = AzureOpenAiProvider::new("unused", "unused", "opaque-deployment");
+        assert_eq!(provider.name(), "azure_openai");
+        for stream in [false, true] {
+            for parallel in [None, Some(true), Some(false)] {
+                for (choice, expected) in [
+                    (ToolChoice::Auto, "auto"),
+                    (ToolChoice::None, "none"),
+                    (ToolChoice::Required, "required"),
+                    (
+                        ToolChoice::Tool {
+                            name: "lookup".into(),
+                        },
+                        "named",
+                    ),
+                ] {
+                    let mut request = crate::tools::policy::test_request();
+                    request.model = "opaque-deployment".into();
+                    request.tool_choice = Some(choice.clone());
+                    request.parallel_tool_calls = parallel;
+                    let prepared = prepare_messages_for_provider(
+                        provider.name(),
+                        &provider.capabilities(),
+                        &request.messages,
+                    )
+                    .unwrap();
+                    let wire = serde_json::to_value(
+                        provider
+                            .build_chat_request(request.clone(), stream, prepared)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(wire["stream"], stream);
+                    assert_eq!(
+                        wire.get("model").and_then(serde_json::Value::as_str),
+                        provider.deployment_model().as_deref()
+                    );
+                    assert_eq!(
+                        wire.get("parallel_tool_calls")
+                            .and_then(serde_json::Value::as_bool),
+                        if matches!(choice, ToolChoice::None) {
+                            None
+                        } else {
+                            parallel
+                        }
+                    );
+                    if expected == "named" {
+                        assert_eq!(wire["tool_choice"]["function"]["name"], "lookup");
+                    } else {
+                        assert_eq!(wire["tool_choice"], expected);
+                    }
+                    let canonical =
+                        crate::tools::policy::prepare_request("azure-openai", request.clone())
+                            .unwrap();
+                    let actual =
+                        crate::tools::policy::prepare_request(provider.name(), request).unwrap();
+                    assert_eq!(actual.parallel_tool_calls, canonical.parallel_tool_calls);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_azure_entrypoints_reject_responses_only_tools_before_http() {
+        let provider = AzureOpenAiProvider::new("unused", "unused", "opaque-deployment");
+        for model in ["gpt-6-astra", "gpt-6.1-sol-2026-09-01"] {
+            for parallel in [None, Some(true), Some(false)] {
+                for choice in [
+                    ToolChoice::Auto,
+                    ToolChoice::None,
+                    ToolChoice::Required,
+                    ToolChoice::Tool {
+                        name: "lookup".into(),
+                    },
+                ] {
+                    let mut request = crate::tools::policy::test_request();
+                    request.model = model.into();
+                    request.tool_choice = Some(choice);
+                    request.parallel_tool_calls = parallel;
+                    assert!(
+                        provider
+                            .chat(request.clone())
+                            .await
+                            .err()
+                            .unwrap()
+                            .to_string()
+                            .contains("Responses API")
+                    );
+                    assert!(
+                        provider
+                            .stream_chat(request)
+                            .await
+                            .err()
+                            .unwrap()
+                            .to_string()
+                            .contains("Responses API")
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn creates_with_defaults() {
