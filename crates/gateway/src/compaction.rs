@@ -12,10 +12,15 @@ pub(crate) use coverage::{CheckpointGraphResolver, observe_preparation_work};
 mod delivered;
 pub(crate) mod frozen;
 mod history;
+pub(crate) use history::final_response_aliases;
+#[cfg(test)]
+pub(crate) use history::load_exact_line_history;
 #[cfg(test)]
 pub(crate) use history::pause_selected_turn_load;
 mod native;
 mod origins;
+#[cfg(test)]
+pub(crate) use origins::resolve_message_origins;
 mod result_budget;
 mod service;
 #[cfg(test)]

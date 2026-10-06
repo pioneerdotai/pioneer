@@ -1057,7 +1057,7 @@ async fn persist_provider_history_message(
 ) -> Result<(), ChatTurnError> {
     let payload = serde_json::to_value(envelope).map_err(|error| {
         ChatTurnError::Terminal(format!(
-            "failed to serialize provider history before tool execution: {error}"
+            "failed to serialize canonical provider history: {error}"
         ))
     })?;
     event_tx
@@ -5647,6 +5647,11 @@ async fn execute_agent_provider_response(
                     .await
                     .map_err(|error| (error, current_thinking_id.clone()))?;
                 }
+
+                provider::persist_completed_response(
+                    event_tx.as_ref(), thread_id, turn_id, message_item_id, current_thinking_id.as_str(),
+                    &round.text, &round.reasoning, round.provider_replay_state.as_ref(),
+                ).await.map_err(|error| (error, current_thinking_id.clone()))?;
 
                 emit_durable_event(
                     event_tx.as_ref(),

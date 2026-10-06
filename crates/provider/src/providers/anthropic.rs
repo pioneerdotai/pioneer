@@ -20,11 +20,22 @@ use serde::{Deserialize, Serialize};
 
 use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
 
+fn append_native_string(block: &mut serde_json::Value, key: &str, delta: &str) {
+    let mut text = block
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    text.push_str(delta);
+    block[key] = serde_json::Value::String(text);
+}
+
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 pub struct AnthropicProvider {
+    replay_authority: String,
     api_key: String,
     base_url: String,
     timeout_policy: ProviderTimeoutPolicy,
@@ -94,6 +105,9 @@ enum ApiMessageContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+    /// Complete provider-owned block; v2 replay preserves unknown native fields.
+    #[serde(untagged)]
+    Native(serde_json::Value),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -145,24 +159,26 @@ struct ApiChatResponse {
     usage: Option<ApiUsage>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ContentBlock {
     #[serde(rename = "type")]
     block_type: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     thinking: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     signature: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     data: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     input: Option<serde_json::Value>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,24 +260,26 @@ struct StreamDelta {
     partial_json: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct StreamContentBlock {
     #[serde(rename = "type")]
     block_type: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     input: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     thinking: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     signature: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     data: Option<String>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 // ── List models response types ─────────────────────────────────────────────
@@ -308,6 +326,7 @@ impl AnthropicProvider {
         timeout_policy: ProviderTimeoutPolicy,
     ) -> Self {
         Self {
+            replay_authority: pioneer_protocol::generate_id(32),
             api_key: api_key.into(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             timeout_policy,
@@ -329,8 +348,133 @@ impl AnthropicProvider {
         }
     }
 
-    /// Extract system messages into a single system prompt and return
-    /// the remaining non-system messages converted to API format.
+    /// Keep full native blocks alongside the readable response projection.
+    fn decode_response(api_response: ApiChatResponse) -> Result<ChatResponse> {
+        let termination = api_response
+            .stop_reason
+            .as_deref()
+            .map(ProviderTermination::from_openai_reason)
+            .unwrap_or_else(|| ProviderTermination::Unknown("missing_stop_reason".to_owned()));
+        let usage = api_response.usage.map(|u| u.normalized());
+
+        let mut text_parts = Vec::new();
+        let mut thinking_parts = Vec::new();
+        let mut tool_calls = Vec::new();
+        let mut replay_blocks = Vec::new();
+
+        for block in api_response.content {
+            replay_blocks.push(serde_json::to_value(&block)?);
+            match block.block_type.as_str() {
+                "text" => {
+                    if let Some(t) = block.text {
+                        text_parts.push(t);
+                    }
+                }
+                "thinking" => {
+                    let thinking = block.thinking.or(block.text).unwrap_or_default();
+                    if !thinking.is_empty() {
+                        thinking_parts.push(thinking.clone());
+                    }
+                }
+                "redacted_thinking" => {}
+                "tool_use" => {
+                    let input = require_tool_input(block.input.ok_or_else(|| {
+                        anyhow!("Anthropic tool_use input must be a JSON object")
+                    })?)?;
+                    if let (Some(id), Some(name)) = (block.id, block.name) {
+                        tool_calls.push(ProviderToolCall {
+                            id,
+                            name,
+                            arguments: serde_json::to_string(&input)?,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let text = text_parts.join("");
+        let reasoning_content = if thinking_parts.is_empty() {
+            None
+        } else {
+            Some(thinking_parts.join(""))
+        };
+        let provider_replay_state = if replay_blocks.is_empty() {
+            None
+        } else {
+            Some(ProviderReplayState::new(
+                "anthropic",
+                serde_json::json!({ "schema_version": 2, "blocks": replay_blocks }),
+            ))
+        };
+
+        if text.is_empty()
+            && tool_calls.is_empty()
+            && reasoning_content.as_deref().unwrap_or_default().is_empty()
+        {
+            return Err(anyhow!("no response from Anthropic"));
+        }
+
+        Ok(ChatResponse {
+            text,
+            usage,
+            termination,
+            reasoning_content,
+            tool_calls,
+            provider_replay_state,
+        })
+    }
+    /// Extract system messages and render the remaining native history.
+    fn build_native_request(
+        &self,
+        request: &ChatRequest,
+        prepared: &PreparedProviderMessages,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        if self.base_url != BASE_URL
+            && prepared.messages.iter().any(|message| {
+                message.provider_replay_state.as_ref().is_some_and(|state| {
+                    crate::continuation::retention(state)
+                        != crate::continuation::Retention::Ordinary
+                })
+            })
+        {
+            anyhow::bail!(
+                "native thinking replay through a custom Messages relay lacks documented prefix/account authority"
+            );
+        }
+        let (system, messages) = Self::prepare_messages(prepared)?;
+        let body = ApiChatRequest {
+            model: request.model.clone(),
+            messages,
+            max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            temperature: request.temperature,
+            system,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: Self::convert_tool_choice(
+                request.tool_choice.clone(),
+                request.parallel_tool_calls,
+            ),
+            output_config: Self::output_config(request.reasoning),
+            stream,
+        };
+        crate::continuation::validate_prefix(
+            &serde_json::to_value(&body)?,
+            prepared
+                .messages
+                .iter()
+                .filter(|m| m.role != Role::System)
+                .enumerate()
+                .filter_map(|(i, m)| m.provider_replay_state.clone().map(|s| (i, s))),
+            &request.model,
+            &self.replay_authority,
+        )?;
+        Ok(body)
+    }
+
     fn prepare_messages(
         prepared: &PreparedProviderMessages,
     ) -> Result<(Option<String>, Vec<ApiMessage>)> {
@@ -386,10 +530,47 @@ impl AnthropicProvider {
                                 state.provider
                             )
                         })?;
+                        if payload
+                            .get("schema_version")
+                            .is_some_and(|version| version != 1 && version != 2)
+                        {
+                            return Err(anyhow!("unsupported anthropic replay schema version"));
+                        }
                         let blocks = payload
                             .get("blocks")
                             .cloned()
                             .ok_or_else(|| anyhow!("anthropic replay state is missing `blocks`"))?;
+                        // Native v2 blocks keep their original fields, but tool input
+                        // must satisfy the same object contract as ordinary/legacy calls.
+                        let native_blocks = blocks
+                            .as_array()
+                            .ok_or_else(|| anyhow!("invalid anthropic replay blocks"))?;
+                        for block in native_blocks {
+                            if block.get("type").and_then(serde_json::Value::as_str)
+                                == Some("tool_use")
+                            {
+                                require_tool_input(block.get("input").cloned().ok_or_else(
+                                    || anyhow!("Anthropic tool_use input must be a JSON object"),
+                                )?)?;
+                            }
+                        }
+                        if payload
+                            .get("schema_version")
+                            .and_then(serde_json::Value::as_u64)
+                            == Some(2)
+                        {
+                            content.extend(
+                                native_blocks
+                                    .iter()
+                                    .cloned()
+                                    .map(ApiMessageContentBlock::Native),
+                            );
+                            api_messages.push(ApiMessage {
+                                role: role.to_owned(),
+                                content,
+                            });
+                            continue;
+                        }
                         content.extend(
                             serde_json::from_value::<Vec<ApiMessageContentBlock>>(blocks).map_err(
                                 |error| anyhow!("invalid anthropic replay state: {error}"),
@@ -524,90 +705,7 @@ impl AnthropicProvider {
     }
 
     fn parse_response(api_response: ApiChatResponse) -> Result<ChatResponse> {
-        let termination = api_response
-            .stop_reason
-            .as_deref()
-            .map(ProviderTermination::from_openai_reason)
-            .unwrap_or_else(|| ProviderTermination::Unknown("missing_stop_reason".to_owned()));
-        let usage = api_response.usage.map(|u| u.normalized());
-
-        let mut text_parts = Vec::new();
-        let mut thinking_parts = Vec::new();
-        let mut tool_calls = Vec::new();
-        let mut replay_blocks = Vec::new();
-
-        for block in api_response.content {
-            match block.block_type.as_str() {
-                "text" => {
-                    if let Some(t) = block.text {
-                        text_parts.push(t);
-                    }
-                }
-                "thinking" => {
-                    let thinking = block.thinking.or(block.text).unwrap_or_default();
-                    if !thinking.is_empty() {
-                        thinking_parts.push(thinking.clone());
-                    }
-                    if let Some(signature) = block.signature {
-                        replay_blocks.push(ApiMessageContentBlock::Thinking {
-                            thinking,
-                            signature,
-                        });
-                    }
-                }
-                "redacted_thinking" => {
-                    if let Some(data) = block.data {
-                        replay_blocks.push(ApiMessageContentBlock::RedactedThinking { data });
-                    }
-                }
-                "tool_use" => {
-                    // Native tool_use requires an object input, including for zero-arg tools.
-                    // Missing/null is not Gemini's protobuf default and must not hide a call.
-                    let input = require_tool_input(block.input.ok_or_else(|| {
-                        anyhow!("Anthropic tool_use input must be a JSON object")
-                    })?)?;
-                    if let (Some(id), Some(name)) = (block.id, block.name) {
-                        tool_calls.push(ProviderToolCall {
-                            id,
-                            name,
-                            arguments: serde_json::to_string(&input)?,
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let text = text_parts.join("");
-        let reasoning_content = if thinking_parts.is_empty() {
-            None
-        } else {
-            Some(thinking_parts.join(""))
-        };
-        let provider_replay_state = if replay_blocks.is_empty() {
-            None
-        } else {
-            Some(ProviderReplayState::new(
-                "anthropic",
-                serde_json::json!({ "blocks": replay_blocks }),
-            ))
-        };
-
-        if text.is_empty()
-            && tool_calls.is_empty()
-            && reasoning_content.as_deref().unwrap_or_default().is_empty()
-        {
-            return Err(anyhow!("no response from Anthropic"));
-        }
-
-        Ok(ChatResponse {
-            text,
-            usage,
-            termination,
-            reasoning_content,
-            tool_calls,
-            provider_replay_state,
-        })
+        Self::decode_response(api_response)
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
@@ -674,10 +772,25 @@ impl PendingToolUse {
     }
 }
 
+struct StreamReplayContext {
+    model: String,
+    authority: String,
+    unverified_relay: bool,
+    prefix_body: serde_json::Value,
+}
+
 // The same decoder is used by HTTP transport and in-memory regression fixtures.
 impl AnthropicProvider {
+    #[cfg(test)]
     pub(super) fn decode_stream(
         byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
+        Self::decode_stream_with_replay(byte_stream, None)
+    }
+
+    fn decode_stream_with_replay(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+        replay_context: Option<StreamReplayContext>,
     ) -> BoxStream<'static, Result<StreamChunk>> {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
@@ -694,9 +807,8 @@ impl AnthropicProvider {
             let mut message_started = false;
             let mut active_blocks = HashSet::new();
             let mut thinking_blocks = HashSet::new();
-            let mut replay_thinking_blocks: BTreeMap<usize, ApiMessageContentBlock> =
-                BTreeMap::new();
-            let mut pending_tool_uses: HashMap<usize, PendingToolUse> = HashMap::new();
+            let mut replay_blocks: BTreeMap<usize, serde_json::Value> = BTreeMap::new();
+            let mut pending_tool_uses: BTreeMap<usize, PendingToolUse> = BTreeMap::new();
 
             tokio::pin!(byte_stream);
 
@@ -894,9 +1006,15 @@ impl AnthropicProvider {
                                     return;
                                 }
 
-                                let remaining_calls = pending_tool_uses
-                                    .drain()
-                                    .map(|(_, call)| call.finalize())
+                                let remaining_calls = std::mem::take(&mut pending_tool_uses)
+                                    .into_iter()
+                                    .map(|(index, call)| {
+                                        let call = call.finalize()?;
+                                        if let Some(block) = replay_blocks.get_mut(&index) {
+                                            block["input"] = parse_tool_input(&call.arguments)?;
+                                        }
+                                        Ok(call)
+                                    })
                                     .collect::<Result<Vec<_>>>();
                                 let remaining_calls = match remaining_calls {
                                     Ok(calls) => calls,
@@ -916,16 +1034,34 @@ impl AnthropicProvider {
                                         return;
                                     }
                                 }
-                                if !replay_thinking_blocks.is_empty() {
-                                    let blocks =
-                                        replay_thinking_blocks.into_values().collect::<Vec<_>>();
+                                if !replay_blocks.is_empty() {
+                                    let blocks = replay_blocks.into_values().collect::<Vec<_>>();
+                                    let mut state = ProviderReplayState::new(
+                                        "anthropic",
+                                        serde_json::json!({ "schema_version": 2, "blocks": blocks }),
+                                    );
+                                    // Decoder-only fixtures have no request prefix authority.
+                                    // HTTP always supplies the exact body and adapter instance.
+                                    if let Some(context) = &replay_context {
+                                        if context.unverified_relay
+                                            && crate::continuation::retention(&state)
+                                                != crate::continuation::Retention::Ordinary
+                                        {
+                                            state.payload["api_profile"] =
+                                                serde_json::json!("unverified-relay");
+                                        }
+                                        if let Err(error) = crate::continuation::bind_prefix(
+                                            &mut state,
+                                            &context.model,
+                                            &context.authority,
+                                            &context.prefix_body,
+                                        ) {
+                                            let _ = tx.send(Err(error)).await;
+                                            return;
+                                        }
+                                    }
                                     if tx
-                                        .send(Ok(StreamChunk::provider_replay_state(
-                                            ProviderReplayState::new(
-                                                "anthropic",
-                                                serde_json::json!({ "blocks": blocks }),
-                                            ),
-                                        )))
+                                        .send(Ok(StreamChunk::provider_replay_state(state)))
                                         .await
                                         .is_err()
                                     {
@@ -973,6 +1109,11 @@ impl AnthropicProvider {
                             if event.event_type == "content_block_start" {
                                 let index = event.index.unwrap_or(0);
                                 if let Some(block) = event.content_block.as_ref() {
+                                    replay_blocks.insert(
+                                        index,
+                                        serde_json::to_value(block)
+                                            .expect("native block serializes"),
+                                    );
                                     match block.block_type.as_str() {
                                         "text" => {
                                             if let Some(text) =
@@ -1004,30 +1145,9 @@ impl AnthropicProvider {
                                                 }
                                             }
                                             thinking_blocks.insert(index);
-                                            replay_thinking_blocks.insert(
-                                                index,
-                                                ApiMessageContentBlock::Thinking {
-                                                    thinking: block
-                                                        .thinking
-                                                        .clone()
-                                                        .unwrap_or_default(),
-                                                    signature: block
-                                                        .signature
-                                                        .clone()
-                                                        .unwrap_or_default(),
-                                                },
-                                            );
                                         }
                                         "redacted_thinking" => {
                                             thinking_blocks.remove(&index);
-                                            if let Some(data) = block.data.clone() {
-                                                replay_thinking_blocks.insert(
-                                                    index,
-                                                    ApiMessageContentBlock::RedactedThinking {
-                                                        data,
-                                                    },
-                                                );
-                                            }
                                         }
                                         "tool_use" => {
                                             thinking_blocks.remove(&index);
@@ -1067,6 +1187,12 @@ impl AnthropicProvider {
                                 if let Some(call) = pending_tool_uses.remove(&index) {
                                     match call.finalize() {
                                         Ok(call) => {
+                                            if let Some(block) = replay_blocks.get_mut(&index) {
+                                                block["input"] = serde_json::from_str(
+                                                    &call.arguments,
+                                                )
+                                                .expect("finalized tool input is valid JSON");
+                                            }
                                             if tx
                                                 .send(Ok(StreamChunk::tool_calls(vec![call])))
                                                 .await
@@ -1092,12 +1218,10 @@ impl AnthropicProvider {
                                     if thinking_blocks.contains(&index) {
                                         if let Some(thinking) = delta.thinking {
                                             if !thinking.is_empty() {
-                                                if let Some(ApiMessageContentBlock::Thinking {
-                                                    thinking: replay_thinking,
-                                                    ..
-                                                }) = replay_thinking_blocks.get_mut(&index)
-                                                {
-                                                    replay_thinking.push_str(&thinking);
+                                                if let Some(block) = replay_blocks.get_mut(&index) {
+                                                    append_native_string(
+                                                        block, "thinking", &thinking,
+                                                    );
                                                 }
                                                 if tx
                                                     .send(Ok(StreamChunk::reasoning(thinking)))
@@ -1109,12 +1233,9 @@ impl AnthropicProvider {
                                             }
                                         }
                                         if let Some(signature) = delta.signature
-                                            && let Some(ApiMessageContentBlock::Thinking {
-                                                signature: replay_signature,
-                                                ..
-                                            }) = replay_thinking_blocks.get_mut(&index)
+                                            && let Some(block) = replay_blocks.get_mut(&index)
                                         {
-                                            replay_signature.push_str(&signature);
+                                            append_native_string(block, "signature", &signature);
                                         }
                                     } else if let Some(partial_json) = delta.partial_json {
                                         if let Some(call) = pending_tool_uses.get_mut(&index) {
@@ -1126,6 +1247,9 @@ impl AnthropicProvider {
                                         }
                                     } else if let Some(text) = delta.text {
                                         if !text.is_empty() {
+                                            if let Some(block) = replay_blocks.get_mut(&index) {
+                                                append_native_string(block, "text", &text);
+                                            }
                                             if tx.send(Ok(StreamChunk::delta(text))).await.is_err()
                                             {
                                                 return;
@@ -1196,25 +1320,8 @@ impl crate::traits::Provider for AnthropicProvider {
         .await?;
         crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let (system, messages) = Self::prepare_messages(&prepared)?;
-
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages,
-            max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-            temperature: request.temperature,
-            system,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: Self::convert_tool_choice(
-                request.tool_choice,
-                request.parallel_tool_calls,
-            ),
-            output_config: Self::output_config(request.reasoning),
-            stream: false,
-        };
+        let api_request = self.build_native_request(&request, &prepared, false)?;
+        let prefix_body = serde_json::to_value(&api_request)?;
 
         crate::attachments::validate_inline_payload("anthropic", &api_request)?;
         let request_builder = self
@@ -1238,7 +1345,21 @@ impl crate::traits::Provider for AnthropicProvider {
             "provider_response",
         )
         .await?;
-        Self::parse_response(api_response)
+        let mut response = Self::parse_response(api_response)?;
+        if let Some(state) = response.provider_replay_state.as_mut() {
+            if self.base_url != BASE_URL
+                && crate::continuation::retention(state) != crate::continuation::Retention::Ordinary
+            {
+                state.payload["api_profile"] = serde_json::json!("unverified-relay");
+            }
+            crate::continuation::bind_prefix(
+                state,
+                &request.model,
+                &self.replay_authority,
+                &prefix_body,
+            )?;
+        }
+        Ok(response)
     }
 
     async fn stream_chat(
@@ -1255,25 +1376,8 @@ impl crate::traits::Provider for AnthropicProvider {
         .await?;
         crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let (system, messages) = Self::prepare_messages(&prepared)?;
-
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages,
-            max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-            temperature: request.temperature,
-            system,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: Self::convert_tool_choice(
-                request.tool_choice,
-                request.parallel_tool_calls,
-            ),
-            output_config: Self::output_config(request.reasoning),
-            stream: true,
-        };
+        let api_request = self.build_native_request(&request, &prepared, true)?;
+        let prefix_body = serde_json::to_value(&api_request)?;
 
         crate::attachments::validate_inline_payload("anthropic", &api_request)?;
         let request_builder = self
@@ -1296,7 +1400,15 @@ impl crate::traits::Provider for AnthropicProvider {
             "provider_stream",
         );
 
-        Ok(Self::decode_stream(byte_stream))
+        Ok(Self::decode_stream_with_replay(
+            byte_stream,
+            Some(StreamReplayContext {
+                model: request.model.clone(),
+                authority: self.replay_authority.clone(),
+                unverified_relay: self.base_url != BASE_URL,
+                prefix_body,
+            }),
+        ))
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -1368,6 +1480,339 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
 
 #[cfg(test)]
 mod tests {
+    // Synthetic signatures exercise our policy, never vendor cryptography.
+    #[test]
+    fn production_native_body_enforces_durable_prefix_and_instance_authority() {
+        use super::super::history_test_support::request;
+        let provider = AnthropicProvider::new("test-key");
+        let mut req = request(vec![ChatMessage::user("first")]);
+        req.model = "claude-sonnet-5-5".into();
+        req.compiled_prompt = Some(CompiledPromptPayload {
+            stable_system_text: "rules".into(),
+            dynamic_system_text: "time=one".into(),
+            boundary_marker: "boundary".into(),
+            full_system_text: "rules\ntime=one".into(),
+        });
+        req.tools = Some(vec![crate::ToolDefinition {
+            name: "read".into(),
+            description: "read".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }]);
+        let build = |p: &AnthropicProvider, r: &ChatRequest| {
+            let prepared = prepare_messages_for_provider_model(
+                p.name(),
+                &r.model,
+                &p.capabilities(),
+                &r.rendered_messages_with_compiled_prompt(),
+            )?;
+            p.build_native_request(r, &prepared, false)
+                .map(|body| serde_json::to_value(body).unwrap())
+        };
+        let sent = build(&provider, &req).unwrap();
+        let response: ApiChatResponse = serde_json::from_value(serde_json::json!({
+            "id":"response", "content":[{"type":"thinking","thinking":"reason","signature":"synthetic"},{"type":"redacted_thinking","data":"opaque"},{"type":"text","text":"answer"}],
+            "stop_reason":"end_turn", "usage":{"input_tokens":1,"output_tokens":1}
+        })).unwrap();
+        let decoded = AnthropicProvider::decode_response(response).unwrap();
+        let mut state = decoded.provider_replay_state.unwrap();
+        crate::continuation::bind_prefix(&mut state, &req.model, &provider.replay_authority, &sent)
+            .unwrap();
+        let mut answer = ChatMessage::assistant("answer");
+        answer.provider_replay_state = Some(state);
+        // Native replay proof survives storage. Completion provenance is supplied
+        // separately by the trusted cold loader, never accepted from stored JSON.
+        let mut answer: ChatMessage =
+            serde_json::from_value(serde_json::to_value(answer).unwrap()).unwrap();
+        assert!(answer.provenance.is_none());
+        let mut unattributed = req.clone();
+        unattributed.model = "claude-opus-4-6".into();
+        unattributed.messages.push(answer.clone());
+        assert!(build(&provider, &unattributed).is_err());
+        complete(&mut answer);
+        req.messages.push(answer.clone());
+        req.messages
+            .push(ChatMessage::user("next normal user turn"));
+        assert!(build(&provider, &req).is_ok());
+        for change in 0..5 {
+            let mut changed = req.clone();
+            match change {
+                0 => changed
+                    .compiled_prompt
+                    .as_mut()
+                    .unwrap()
+                    .full_system_text
+                    .push_str("timestamp refresh"),
+                1 => {
+                    changed.compiled_prompt.as_mut().unwrap().full_system_text =
+                        "new instructions".into()
+                }
+                2 => {
+                    changed.tools.as_mut().unwrap()[0].parameters =
+                        serde_json::json!({"type":"object","required":["path"]})
+                }
+                3 => changed.messages[0].content = "rewritten prefix".into(),
+                _ => {
+                    changed.messages[1]
+                        .provider_replay_state
+                        .as_mut()
+                        .unwrap()
+                        .payload
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("prefix_proof");
+                }
+            }
+            assert!(
+                build(&provider, &changed).is_err(),
+                "changed timestamp/system/tools/retry/legacy {change}"
+            );
+        }
+        let restarted = AnthropicProvider::new("test-key");
+        assert!(
+            build(&restarted, &req).is_err(),
+            "restart/fork has no verified account authority"
+        );
+        let mut foreign = req.clone();
+        foreign.model = "claude-opus-4-6".into();
+        assert!(
+            build(&provider, &foreign).is_ok(),
+            "completed foreign-model state is projected as portable history"
+        );
+        assert!(
+            answer
+                .provider_replay_state
+                .unwrap()
+                .payload
+                .get("prefix_proof")
+                .is_some()
+        );
+        let mut unbound = req.clone();
+        unbound.model = "claude-opus-4-6".into();
+        let state = unbound.messages[1].provider_replay_state.as_mut().unwrap();
+        state.model = Some(unbound.model.clone());
+        state
+            .payload
+            .as_object_mut()
+            .unwrap()
+            .remove("prefix_proof");
+        unbound.compiled_prompt.as_mut().unwrap().full_system_text =
+            "changed unbound profile".into();
+        assert!(
+            build(&provider, &unbound).is_ok(),
+            "documented old generation does not bind prefix"
+        );
+    }
+
+    #[test]
+    fn full_native_response_survives_storage_and_replays_without_regrouping() {
+        let response: ApiChatResponse = serde_json::from_str(include_str!(
+            "../../tests/fixtures/history/anthropic-interleaved.json"
+        ))
+        .unwrap();
+        let raw: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/history/anthropic-interleaved.json"
+        ))
+        .unwrap();
+        let decoded = AnthropicProvider::decode_response(response).unwrap();
+        assert_eq!(decoded.text, "beforebetween");
+        assert_eq!(decoded.tool_calls.len(), 2);
+        let mut message = ChatMessage::assistant_tool_calls_with_provider_state(
+            Some(decoded.text),
+            decoded.reasoning_content,
+            decoded.tool_calls,
+            decoded.provider_replay_state,
+        );
+        message.provider_replay_state.as_mut().unwrap().model = Some("fixture".into());
+        let stored: ChatMessage =
+            serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+        let projected =
+            crate::history::project_messages_for_provider("anthropic", "fixture", &[stored])
+                .unwrap();
+        let (_, wire) = render_messages(&projected);
+        assert_eq!(
+            serde_json::to_value(&wire[0]).unwrap()["content"],
+            raw["content"]
+        );
+    }
+
+    #[test]
+    fn ordered_v2_replay_preserves_blocks_without_bypassing_tool_input_validation() {
+        let provider = AnthropicProvider::new("fixture");
+        for input in [
+            Some(serde_json::json!({"nested":{"values":[null,true,2,"text"]}})),
+            Some(serde_json::json!([])),
+            Some(serde_json::json!(42)),
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("private-input")),
+            None,
+        ] {
+            let mut call = serde_json::json!({"type":"tool_use","id":"call_1","name":"clock"});
+            if let Some(input) = input.as_ref() {
+                call["input"] = input.clone();
+            }
+            let blocks = serde_json::json!([
+                {"type":"text","text":"before"},
+                call,
+                {"type":"text","text":"after"}
+            ]);
+            let mut assistant = ChatMessage::assistant("beforeafter");
+            assistant.provider_replay_state = Some(ProviderReplayState::for_model(
+                "anthropic",
+                "claude-sonnet-4-5",
+                serde_json::json!({"schema_version":2,"blocks":blocks}),
+            ));
+            let original = assistant.provider_replay_state.clone();
+            let prepared = prepare_messages_for_provider_model(
+                provider.name(),
+                "claude-sonnet-4-5",
+                &provider.capabilities(),
+                &[assistant],
+            )
+            .unwrap();
+            let rendered = AnthropicProvider::prepare_messages(&prepared);
+            if input.as_ref().is_some_and(serde_json::Value::is_object) {
+                let (_, messages) = rendered.unwrap();
+                assert_eq!(
+                    serde_json::to_value(messages).unwrap()[0]["content"],
+                    blocks
+                );
+            } else {
+                let error = rendered.unwrap_err().to_string();
+                assert!(error.contains("Anthropic tool_use input must be a JSON object"));
+                assert!(!error.contains("private-input"));
+            }
+            assert_eq!(prepared.messages[0].provider_replay_state, original);
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_native_block_indexes_preserve_signed_redacted_and_tool_parts() {
+        use super::super::history_test_support::{request, serve_sse};
+        let (base, server) = serve_sse(include_str!(
+            "../../tests/fixtures/history/anthropic-interleaved.sse"
+        ))
+        .await;
+        let provider = crate::ProviderRegistry::with_provider(
+            "anthropic",
+            std::sync::Arc::new(AnthropicProvider::with_base_url_and_timeout_policy(
+                "key",
+                base,
+                Default::default(),
+            )),
+        )
+        .get_or_create("anthropic")
+        .unwrap();
+        let mut stream = provider
+            .stream_chat(request(vec![ChatMessage::user("start")]))
+            .await
+            .unwrap();
+        let mut calls = Vec::new();
+        let mut state = None;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            calls.extend(chunk.tool_calls);
+            if chunk.provider_replay_state.is_some() {
+                state = chunk.provider_replay_state;
+            }
+        }
+        server.await.unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        let state = state.unwrap();
+        assert_eq!(
+            state.payload["blocks"],
+            serde_json::json!([
+                {"type":"thinking","thinking":"first","signature":"signed-1"},
+                {"type":"tool_use","id":"a","name":"first","input":{"x":1}},
+                {"type":"text","text":"between"},
+                {"type":"redacted_thinking","data":"opaque-redacted"},
+                {"type":"tool_use","id":"b","name":"second","input":{}}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_stream_decoder_binds_ordered_blocks_to_actual_outbound_prefix() {
+        use super::super::history_test_support::request;
+        use futures_util::stream;
+
+        let provider = AnthropicProvider::new("test-key");
+        let mut req = request(vec![
+            ChatMessage::system("rules"),
+            ChatMessage::user("start"),
+        ]);
+        req.model = "claude-sonnet-5-5".into();
+        let prepared = prepare_messages_for_provider_model(
+            provider.name(),
+            &req.model,
+            &provider.capabilities(),
+            &req.messages,
+        )
+        .unwrap();
+        let sent = serde_json::to_value(
+            provider
+                .build_native_request(&req, &prepared, true)
+                .unwrap(),
+        )
+        .unwrap();
+        let input = include_str!("../../tests/fixtures/history/anthropic-interleaved.sse");
+        let bytes = input
+            .as_bytes()
+            .iter()
+            .map(|byte| Ok(bytes::Bytes::copy_from_slice(&[*byte])))
+            .collect::<Vec<_>>();
+        let chunks = AnthropicProvider::decode_stream_with_replay(
+            Box::pin(stream::iter(bytes)),
+            Some(StreamReplayContext {
+                model: req.model.clone(),
+                authority: provider.replay_authority.clone(),
+                unverified_relay: false,
+                prefix_body: sent.clone(),
+            }),
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+        assert_eq!(
+            chunks.last().unwrap().termination,
+            Some(ProviderTermination::ToolCalls)
+        );
+        let state = chunks
+            .into_iter()
+            .find_map(|chunk| chunk.provider_replay_state)
+            .unwrap();
+        assert_eq!(state.payload["blocks"][0]["signature"], "signed-1");
+        assert_eq!(state.payload["blocks"][2]["text"], "between");
+        assert_eq!(state.payload["blocks"][3]["data"], "opaque-redacted");
+        let state: ProviderReplayState =
+            serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+        let mut next = sent;
+        next["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "role":"assistant", "content":state.payload["blocks"]
+            }));
+        let validate = |body: &serde_json::Value| {
+            crate::continuation::validate_prefix(
+                body,
+                std::iter::once((1, state.clone())),
+                &req.model,
+                &provider.replay_authority,
+            )
+        };
+        assert!(validate(&next).is_ok());
+        next["system"] = serde_json::json!("changed rules");
+        assert!(validate(&next).is_err());
+    }
+
     #[test]
     fn native_tool_modes_and_parallel_control_are_nested() {
         for parallel in [None, Some(true), Some(false)] {
