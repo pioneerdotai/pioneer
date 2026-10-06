@@ -133,31 +133,44 @@ pub(crate) async fn load_skills_catalog_from_store(
             .await?
         {
             skill.host_explicit_only = true;
-            let parent = crud_store
-                .find_plugin_installation(&owner.plugin_id)
-                .await?;
-            let asset_root = parent.as_ref().and_then(|parent| {
-                let expected = format!("skills/{}", owner.member_key);
-                if owner.member_path.as_deref() != Some(expected.as_str()) {
-                    return None;
-                }
-                let package = Path::new(&parent.package_path);
-                let root = pioneer_plugins::containment::resolve_contained(
-                    package,
-                    &package.join(expected),
-                )
-                .ok()?;
-                pioneer_plugins::containment::resolve_contained(package, &root.join("SKILL.md"))
+            let overrides: std::collections::BTreeSet<String> =
+                serde_json::from_str(&owner.override_fields_json)?;
+            // load_catalog already supplies the genuine native definition, file
+            // and assets. A source override must retain that complete context,
+            // including its native unavailable state, without bundled fallback.
+            let asset_context_available = if overrides.contains("skill_source") {
+                true
+            } else {
+                let parent = crud_store
+                    .find_plugin_installation(&owner.plugin_id)
+                    .await?;
+                let asset_root = parent.as_ref().and_then(|parent| {
+                    let expected = format!("skills/{}", owner.member_key);
+                    if owner.member_path.as_deref() != Some(expected.as_str()) {
+                        return None;
+                    }
+                    let package = Path::new(&parent.package_path);
+                    let root = pioneer_plugins::containment::resolve_contained(
+                        package,
+                        &package.join(expected),
+                    )
                     .ok()?;
-                Some(root)
-            });
-            if let Some(root) = &asset_root {
-                // Definition/policy remain the native installation's. Only the
-                // runtime asset context uses the verified immutable package.
-                skill.identity.skill_dir = root.to_string_lossy().into();
-                skill.identity.skill_file = root.join("SKILL.md").to_string_lossy().into();
-            }
-            if asset_root.is_none()
+                    pioneer_plugins::containment::resolve_contained(
+                        package,
+                        &root.join("SKILL.md"),
+                    )
+                    .ok()?;
+                    Some(root)
+                });
+                if let Some(root) = &asset_root {
+                    // Definition/policy remain the native installation's. Only the
+                    // runtime asset context uses the verified immutable package.
+                    skill.identity.skill_dir = root.to_string_lossy().into();
+                    skill.identity.skill_file = root.join("SKILL.md").to_string_lossy().into();
+                }
+                asset_root.is_some()
+            };
+            if !asset_context_available
                 || !crud_store
                     .plugin_child_available("skill", skill.identity.skill_id.as_str(), workspace_id)
                     .await?

@@ -33,6 +33,9 @@ impl ClientPublicationSink for UploadChanges {
 
 pub(crate) fn status_label(status: &str) -> String {
     match status {
+        "active" => t!("plugins.active"),
+        "blocked" => t!("plugins.blocked"),
+        "unavailable" => t!("plugins.unavailable"),
         "installed" => t!("plugins.installed"),
         "partial" => t!("plugins.partial"),
         "installing" | "starting" => t!("plugins.installing"),
@@ -48,6 +51,34 @@ pub(crate) fn status_label(status: &str) -> String {
         _ => t!("plugins.unavailable"),
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod status_tests {
+    // Regression sources only: NOT_RUN / NOT_COMPILED.
+    #[test]
+    fn skill_runtime_states_have_real_labels_and_mcp_labels_stay_distinct() {
+        for (state, label) in [
+            ("active", t!("plugins.active")),
+            ("disabled", t!("plugins.disabled")),
+            ("blocked", t!("plugins.blocked")),
+            ("unavailable", t!("plugins.unavailable")),
+            ("ready", t!("plugins.authorized")),
+            ("auth_required", t!("plugins.auth_required")),
+            ("offline", t!("plugins.offline")),
+        ] {
+            assert_eq!(super::status_label(state), label.to_string());
+        }
+        assert_ne!(
+            super::status_label("active"),
+            super::status_label("unavailable")
+        );
+        assert_ne!(
+            super::status_label("blocked"),
+            super::status_label("unavailable")
+        );
+        assert_ne!(super::status_label("ready"), super::status_label("active"));
+    }
 }
 
 fn diagnostic_label(code: &str) -> String {
@@ -81,6 +112,7 @@ pub struct PluginsView {
     install_failed: bool,
     management: PluginManagementState,
     mutation: Option<Task<()>>,
+    restore_confirmation: Option<Task<()>>,
     update_target: Option<(String, i64)>,
     update_preview: Option<(String, PluginsUpdatePreviewResponse)>,
     remove_confirmation: bool,
@@ -127,6 +159,7 @@ impl PluginsView {
                 install_failed: false,
                 management: Default::default(),
                 mutation: None,
+                restore_confirmation: None,
                 update_target: None,
                 update_preview: None,
                 remove_confirmation: false,
@@ -141,6 +174,7 @@ impl PluginsView {
         let opening = active && !self.active;
         if changed {
             self.mutation = None;
+            self.restore_confirmation = None;
             self.management = Default::default();
             self.update_target = None;
             self.update_preview = None;
@@ -334,7 +368,10 @@ impl Render for PluginsView {
                 .child(child.element())
                 .into_any_element();
         }
-        let busy = self.upload_active() || self.management.busy || self.management.refresh_required;
+        let busy = self.upload_active()
+            || self.management.busy
+            || self.management.refresh_required
+            || self.restore_confirmation.is_some();
         let manage = self
             .workspace
             .as_deref()

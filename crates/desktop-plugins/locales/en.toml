@@ -62,3 +62,8 @@ identity_reset = "This repaired component will get a new installation and defaul
 
 fresh_package_required = "The saved package is unavailable or changed. Choose a new package or remove the plugin."
 reapply_native_change = "The component change was not committed. Reapply it in Settings, or remove the plugin."
+
+active = "Active"
+blocked = "Blocked"
+restore_skill_title = "Restore skill “%{name}”?"
+restore_mcp_title = "Restore MCP server “%{name}”?"

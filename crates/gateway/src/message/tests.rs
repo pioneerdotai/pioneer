@@ -78555,3 +78555,7 @@ async fn plugin_mutation_and_final_native_start_share_the_parent_admission_barri
             .is_err()
     );
 }
+
+// C1-01 source regressions only: NOT_RUN / NOT_COMPILED.
+#[path = "tests_plugin_source.rs"]
+mod plugin_source_tests;

@@ -1,4 +1,99 @@
 use super::*;
+
+// Local confirmation revalidation; the existing Gateway mutation remains
+// authoritative for rights, ownership and revision. No grants are transferred.
+fn confirmed_restore_intent(
+    confirmed: bool,
+    expected: &PluginItem,
+    key: &PluginComponentKey,
+    current: Option<&PluginItem>,
+) -> Option<PluginManagementIntent> {
+    let current = current?;
+    (confirmed
+        && current.id == expected.id
+        && current.revision == expected.revision
+        && current.state == "installed"
+        && current.components.iter().any(|component| {
+            component.kind == key.kind
+                && component.member_key == key.member_key
+                && component.status == "removed_by_user"
+                && component.skill_id.is_none()
+                && component.mcp_installation_id.is_none()
+        }))
+    .then(|| PluginManagementIntent::Retry {
+        components: vec![key.clone()],
+        restore_removed: true,
+    })
+}
+
+#[cfg(test)]
+mod restore_tests {
+    // Regression sources only: NOT_RUN / NOT_COMPILED; no native prompt run.
+    use super::*;
+    #[test]
+    fn cancelled_stale_and_failed_retry_targets_cannot_send_identity_reset() {
+        let key = PluginComponentKey {
+            kind: "skill".into(),
+            member_key: "one".into(),
+        };
+        let mut parent = PluginItem {
+            id: "P".repeat(21),
+            name: "fixture".into(),
+            version: None,
+            enabled: true,
+            state: "installed".into(),
+            revision: 4,
+            status: "partial".into(),
+            diagnostics: vec![],
+            components: vec![
+                PluginComponentItem {
+                    kind: key.kind.clone(),
+                    member_key: key.member_key.clone(),
+                    status: "removed_by_user".into(),
+                    diagnostic: None,
+                    skill_id: None,
+                    mcp_installation_id: None,
+                    runtime_status: None,
+                },
+                PluginComponentItem {
+                    kind: "mcp".into(),
+                    member_key: "sibling".into(),
+                    status: "removed_by_user".into(),
+                    diagnostic: None,
+                    skill_id: None,
+                    mcp_installation_id: None,
+                    runtime_status: None,
+                },
+            ],
+        };
+        assert!(confirmed_restore_intent(false, &parent, &key, Some(&parent)).is_none());
+        let intent = confirmed_restore_intent(true, &parent, &key, Some(&parent)).unwrap();
+        let PluginManagementIntent::Retry {
+            components,
+            restore_removed,
+        } = intent
+        else {
+            panic!("expected exact restore retry")
+        };
+        assert!(restore_removed);
+        assert_eq!(components, vec![key.clone()]);
+        let expected = parent.clone();
+        parent.revision += 1;
+        assert!(confirmed_restore_intent(true, &expected, &key, Some(&parent)).is_none());
+        parent = expected.clone();
+        parent.id = "Q".repeat(21);
+        assert!(confirmed_restore_intent(true, &expected, &key, Some(&parent)).is_none());
+        parent = expected.clone();
+        parent.components[0].status = "failed".into();
+        parent.components[0].skill_id =
+            Some(pioneer_protocol::SkillId::new("S".repeat(21)).unwrap());
+        assert!(confirmed_restore_intent(true, &expected, &key, Some(&parent)).is_none());
+        parent = expected.clone();
+        parent.state = "interrupted".into();
+        assert!(confirmed_restore_intent(true, &expected, &key, Some(&parent)).is_none());
+        assert!(confirmed_restore_intent(true, &expected, &key, None).is_none());
+    }
+}
 use gpui_kit::base::{Checkbox, CheckboxState};
 use pioneer_client::plugins::{PluginManagementIntent, PluginsMutateParams};
 #[derive(Clone)]
@@ -187,23 +282,93 @@ impl PluginsView {
                             .to_string(),
                         )
                         .disabled(busy)
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.mutate(
-                                parent.clone(),
-                                PluginManagementIntent::Retry {
-                                    components: vec![PluginComponentKey {
-                                        kind: component.kind.clone(),
-                                        member_key: component.member_key.clone(),
-                                    }],
-                                    restore_removed: restore,
-                                },
-                                cx,
-                            )
-                        })),
+                        .on_click(cx.listener(
+                            move |view, _, window, cx| {
+                                if restore {
+                                    view.confirm_restore_component(&parent, &component, window, cx);
+                                    return;
+                                }
+                                view.mutate(
+                                    parent.clone(),
+                                    PluginManagementIntent::Retry {
+                                        components: vec![PluginComponentKey {
+                                            kind: component.kind.clone(),
+                                            member_key: component.member_key.clone(),
+                                        }],
+                                        restore_removed: false,
+                                    },
+                                    cx,
+                                )
+                            },
+                        )),
                     )
                 },
             )
             .into_any_element()
+    }
+    fn confirm_restore_component(
+        &mut self,
+        parent: &PluginItem,
+        component: &PluginComponentItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.restore_confirmation.is_some() || self.management.busy {
+            return;
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &t!(
+                if component.kind == "skill" {
+                    "plugins.restore_skill_title"
+                } else {
+                    "plugins.restore_mcp_title"
+                },
+                name = component.member_key.as_str()
+            )
+            .to_string(),
+            Some(&t!("plugins.restore_notice").to_string()),
+            &[
+                PromptButton::new(t!("plugins.restore").to_string()),
+                PromptButton::cancel(t!("plugins.cancel").to_string()),
+            ],
+            cx,
+        );
+        let parent = parent.clone();
+        let key = PluginComponentKey {
+            kind: component.kind.clone(),
+            member_key: component.member_key.clone(),
+        };
+        let workspace = self.workspace.clone();
+        let connection = self.connection;
+        self.restore_confirmation = Some(cx.spawn(async move |view: WeakEntity<Self>, cx| {
+            let confirmed = answer.await == Ok(0);
+            let _ = view.update(cx, |view, cx| {
+                if view.workspace != workspace || view.connection != connection {
+                    return;
+                }
+                view.restore_confirmation = None;
+                if !confirmed {
+                    cx.notify();
+                    return;
+                }
+                let current = view
+                    .catalog
+                    .plugins
+                    .iter()
+                    .find(|plugin| plugin.id == parent.id);
+                if let Some(intent) = confirmed_restore_intent(confirmed, &parent, &key, current) {
+                    view.mutate(parent, intent, cx);
+                } else {
+                    // The authoritative revision or member changed while the
+                    // native prompt was open. Refresh instead of resetting it.
+                    view.management.complete(false);
+                    view.refresh(cx);
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
     pub(super) fn management_controls(
         &self,
