@@ -13801,7 +13801,15 @@ async fn g09_owned_voice_ingress_cancel_disconnect_and_terminal_branches() {
             )
             .with_voice_input_supervisor(ready_gateway_voice_supervisor("unused native stub"));
             processor.voice_test_transcriber = Some(Arc::new(move |_buffer| {
-                entered_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                // Observe the production blocking scope before installing anything
+                // in the fake. This must come from the actual request dispatcher.
+                entered_tx
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(pioneer_observability::turn_startup::current_key())
+                    .unwrap();
                 let (released, condition) = &*gate;
                 let mut flag = released.lock().unwrap();
                 while !*flag {
@@ -13818,7 +13826,14 @@ async fn g09_owned_voice_ingress_cancel_disconnect_and_terminal_branches() {
             }));
             let processor = Arc::new(processor);
             let thread_id = "thr_g09_owned_voice";
-            let turn_id = "turn_g09_owned_voice";
+            // Two distinct request contexts and a valid business ID outside the
+            // telemetry key length bound. The latter must preserve None rather
+            // than synthesizing a context from the session's turn ID.
+            let turn_id_owned = match terminal {
+                "runtime_error" => "t".repeat(513),
+                _ => format!("turn_g09_owned_voice_{terminal}_{action}"),
+            };
+            let turn_id = turn_id_owned.as_str();
             let thread = start_thread_for_artifact_test(
                 &processor,
                 connection_id,
@@ -13851,20 +13866,36 @@ async fn g09_owned_voice_ingress_cancel_disconnect_and_terminal_branches() {
             let finalize=json!({"jsonrpc":"2.0","id":"g09finalize","method":"voice/session/finalize","params":{
                 "session_id":session.session_id,"context":{"workspace_id":workspace_id,"thread_id":thread_id,"turn_id":turn_id}
             }}).to_string();
+            let expected_startup_key = if terminal == "runtime_error" {
+                None
+            } else {
+                Some(turn_id.to_owned())
+            };
+            let request: JsonValue = serde_json::from_str(&finalize).unwrap();
+            assert_eq!(
+                pioneer_observability::turn_startup::request_key(&request["params"]),
+                expected_startup_key
+            );
             tokio::time::timeout(
                 Duration::from_secs(5),
-                processor
-                    .clone()
-                    .process_owned_request(context.clone(), finalize.clone()),
+                // An unrelated caller key must not override request-derived
+                // context or leak into the absent-context case.
+                pioneer_observability::turn_startup::scope(
+                    Some("unrelated-ingress-context".to_owned()),
+                    processor
+                        .clone()
+                        .process_owned_request(context.clone(), finalize.clone()),
+                ),
             )
             .await
             .expect("reader must return at ACK while transcriber remains pending");
             let ack = recv_response_by_id(&mut rx, "g09finalize").await;
             assert_eq!(ack.result["status"], json!("transcribing"));
-            tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            let worker_startup_key = tokio::time::timeout(Duration::from_secs(5), entered_rx)
                 .await
                 .unwrap()
                 .unwrap();
+            assert_eq!(worker_startup_key, expected_startup_key);
             // Same owner repeated finalize is bounded/rejected; another connection
             // cannot claim the authenticated owner's session (connection_id retained).
             processor
