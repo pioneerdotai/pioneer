@@ -854,11 +854,13 @@ impl CLIAgentRuntimeManager {
         captured: &CliSessionStopOwner,
         deadline: tokio::time::Instant,
     ) -> Result<()> {
+        // Startup holds the key lock while awaiting its factory. Deliver stop
+        // to the captured owner before waiting for that lock or caller deadline.
+        captured.0.begin_close(self.lifecycle.clone());
         if CLI_CALLBACK_INSTANCE
             .try_with(|id| id == captured.instance())
             .unwrap_or(false)
         {
-            captured.0.begin_close(self.lifecycle.clone());
             bail!("CLI callback requested stop; its own completion cannot be acknowledged here");
         }
         tokio::time::timeout_at(deadline, async {
@@ -893,28 +895,27 @@ impl CLIAgentRuntimeManager {
         key: &CLIAgentRuntimeSessionKey,
         cutoff_ms: u64,
     ) -> Result<bool> {
-        if CLI_CALLBACK_INSTANCE
-            .try_with(|id| id.key() == key)
-            .unwrap_or(false)
-        {
-            if let Some(cached) = self
-                .cached(key)
-                .filter(|cached| cached.started_at_ms <= cutoff_ms)
-            {
-                cached.owner.begin_close(self.lifecycle.clone());
-                bail!("CLI callback stop is pending its own drain");
-            }
-            return Ok(false);
-        }
-        let lock = self.start_lock_for_key(key).await;
-        let _guard = lock.lock().await;
         let Some(cached) = self
             .cached(key)
             .filter(|cached| cached.started_at_ms <= cutoff_ms)
         else {
             return Ok(false);
         };
-        self.close_cached(&cached).await
+        cached.owner.begin_close(self.lifecycle.clone());
+        if CLI_CALLBACK_INSTANCE
+            .try_with(|id| id.key() == key)
+            .unwrap_or(false)
+        {
+            bail!("CLI callback stop is pending its own drain");
+        }
+        let lock = self.start_lock_for_key(key).await;
+        let _guard = lock.lock().await;
+        let Some(current) = self.cached(key).filter(|current| {
+            current.instance == cached.instance && current.started_at_ms <= cutoff_ms
+        }) else {
+            return Ok(false);
+        };
+        self.close_cached(&current).await
     }
     async fn close_cached(&self, cached: &CLIAgentRuntimeCachedSession) -> Result<bool> {
         if CLI_CALLBACK_INSTANCE
@@ -1044,11 +1045,11 @@ impl CLIAgentRuntimeManager {
         let Ok(captured) = self.capture_stop_owner(instance) else {
             return Ok(false);
         };
+        captured.0.begin_close(self.lifecycle.clone());
         if CLI_CALLBACK_INSTANCE
             .try_with(|id| id == instance)
             .unwrap_or(false)
         {
-            captured.0.begin_close(self.lifecycle.clone());
             bail!("CLI callback stop is pending its own drain");
         }
         let lock = self.start_lock_for_key(instance.key()).await;
@@ -1184,6 +1185,10 @@ mod tests {
         starts: AtomicUsize,
         closes: Arc<AtomicUsize>,
         release: Option<Arc<Notify>>,
+        startup_wait_for_cancel: bool,
+        startup_entered: Option<Arc<Notify>>,
+        startup_cancel_seen: Option<Arc<Notify>>,
+        startup_cancel_release: Option<Arc<Notify>>,
         close_started: Option<Arc<Notify>>,
         close_release: Option<Arc<Notify>>,
         fail_after: Option<usize>,
@@ -1199,10 +1204,22 @@ mod tests {
             &self,
             _instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
             launch_spec: &CliSessionLaunchSpec,
-            _startup: &CLIAgentRuntimeSessionStartup,
+            startup: &CLIAgentRuntimeSessionStartup,
         ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
             self.launch_specs.lock().await.push(launch_spec.clone());
             let id = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(entered) = &self.startup_entered {
+                entered.notify_one();
+            }
+            if self.startup_wait_for_cancel {
+                startup.cancelled().await;
+                if let Some(seen) = &self.startup_cancel_seen {
+                    seen.notify_one();
+                }
+                if let Some(release) = &self.startup_cancel_release {
+                    release.notified().await;
+                }
+            }
             if let Some(release) = self.release.as_ref() {
                 release.notified().await;
             }
@@ -1907,6 +1924,182 @@ mod tests {
             .await
             .unwrap();
         assert!(manager.stop_inventory("ws").is_empty());
+    }
+
+    #[tokio::test]
+    async fn captured_stop_and_requested_closes_cancel_startup_before_waiting_for_key_lock() {
+        for mode in ["strict", "instance", "cutoff"] {
+            let entered = Arc::new(Notify::new());
+            let factory = Arc::new(FakeFactory {
+                startup_wait_for_cancel: true,
+                startup_entered: Some(entered.clone()),
+                ..Default::default()
+            });
+            let manager = Arc::new(manager_with_factory(factory.clone()));
+            let key = key(mode);
+            let starter = {
+                let manager = manager.clone();
+                let key = key.clone();
+                tokio::spawn(async move {
+                    manager
+                        .get_or_start_at(key, CLIAgentRuntimeSessionStartOptions::default(), 1_000)
+                        .await
+                })
+            };
+            entered.notified().await;
+            let captured = manager.stop_inventory("ws").pop().unwrap();
+            assert!(!captured.0.ready.load(Ordering::Acquire));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                match mode {
+                    "strict" => manager
+                        .stop_and_wait(
+                            &captured,
+                            tokio::time::Instant::now() + Duration::from_secs(1),
+                        )
+                        .await
+                        .unwrap(),
+                    "instance" => {
+                        assert!(
+                            manager
+                                .close_session_instance(captured.instance())
+                                .await
+                                .unwrap()
+                        );
+                    }
+                    _ => {
+                        assert!(
+                            manager
+                                .close_session_if_started_at_or_before(&key, 1_000)
+                                .await
+                                .unwrap()
+                        );
+                    }
+                }
+            })
+            .await
+            .expect("startup cancellation must not depend on the startup key lock");
+            assert!(starter.await.unwrap().is_err());
+            assert!(captured.0.closing.load(Ordering::Acquire));
+            assert!(!captured.0.ready.load(Ordering::Acquire));
+            assert!(manager.stop_inventory("ws").is_empty());
+            assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_stop_deadline_and_cancelled_waiter_retain_closing_before_key_lock() {
+        for cancel_waiter in [false, true] {
+            let entered = Arc::new(Notify::new());
+            let cancelled = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let factory = Arc::new(FakeFactory {
+                startup_wait_for_cancel: true,
+                startup_entered: Some(entered.clone()),
+                startup_cancel_seen: Some(cancelled.clone()),
+                startup_cancel_release: Some(release.clone()),
+                ..Default::default()
+            });
+            let manager = Arc::new(manager_with_factory(factory.clone()));
+            let key = key("startup-stop-deadline");
+            let starter = {
+                let manager = manager.clone();
+                let key = key.clone();
+                tokio::spawn(async move { manager.get_or_start(key).await })
+            };
+            entered.notified().await;
+            let captured = manager.stop_inventory("ws").pop().unwrap();
+            let waiter = {
+                let manager = manager.clone();
+                let captured = captured.clone();
+                tokio::spawn(async move {
+                    manager
+                        .stop_and_wait(
+                            &captured,
+                            tokio::time::Instant::now()
+                                + if cancel_waiter {
+                                    Duration::from_secs(60)
+                                } else {
+                                    Duration::from_millis(25)
+                                },
+                        )
+                        .await
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(1), cancelled.notified())
+                .await
+                .expect("stop must signal the factory while startup still owns the lock");
+            if cancel_waiter {
+                waiter.abort();
+                assert!(waiter.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(waiter.await.unwrap().is_err());
+            }
+            assert!(!starter.is_finished());
+            assert!(captured.0.closing.load(Ordering::Acquire));
+            assert!(!captured.0.ready.load(Ordering::Acquire));
+            assert!(captured.0.startup.check_admission().is_err());
+            assert_eq!(manager.stop_inventory("ws").len(), 1);
+            assert!(manager.existing_session(&key).await.is_none());
+            // A factory returning a session after cancellation must never
+            // publish Ready. The retained cleanup still joins/closes it once.
+            release.notify_one();
+            assert!(starter.await.unwrap().is_err());
+            manager
+                .stop_and_wait(
+                    &captured,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+            assert!(manager.stop_inventory("ws").is_empty());
+            assert!(!captured.0.ready.load(Ordering::Acquire));
+            assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_stop_closes_admission_without_waiting_for_itself_or_reentrant_key() {
+        let factory = Arc::new(FakeFactory::default());
+        let manager = Arc::new(manager_with_factory(factory.clone()));
+        let key = key("callback-stop");
+        let handle = manager.get_or_start(key.clone()).await.unwrap();
+        let captured = manager.capture_stop_owner(handle.instance()).unwrap();
+        let (done, completion) = tokio::sync::oneshot::channel();
+        let callback_manager = manager.clone();
+        let callback_owner = captured.clone();
+        assert!(manager.spawn_instance_work(handle.instance(), async move {
+            assert!(callback_manager.get_or_start(key).await.is_err());
+            assert!(
+                callback_manager
+                    .stop_and_wait(
+                        &callback_owner,
+                        tokio::time::Instant::now() + Duration::from_secs(1)
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                callback_manager
+                    .close_session_instance(callback_owner.instance())
+                    .await
+                    .is_err()
+            );
+            assert!(callback_owner.0.closing.load(Ordering::Acquire));
+            done.send(()).unwrap();
+        }));
+        tokio::time::timeout(Duration::from_secs(1), completion)
+            .await
+            .unwrap()
+            .unwrap();
+        manager
+            .stop_and_wait(
+                &captured,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert!(manager.stop_inventory("ws").is_empty());
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

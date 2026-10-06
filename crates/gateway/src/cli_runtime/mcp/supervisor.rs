@@ -860,7 +860,9 @@ impl CliMcpBridgeTransport {
         let session = sessions
             .get_mut(&self.process_instance)
             .ok_or(CliMcpBridgeSupervisorError::UnknownSession)?;
-        if session.state != CliMcpBridgeSessionState::TransportOwned || session.connection.is_some()
+        if session.state != CliMcpBridgeSessionState::TransportOwned
+            || session.connection.is_some()
+            || session.bound_grant.as_ref() != Some(&self.bound_grant)
         {
             return Err(CliMcpBridgeSupervisorError::InvalidTransition);
         }
@@ -884,12 +886,20 @@ impl Drop for CliMcpBridgeTransport {
         }
         // Preserve standalone/probe best effort drop. A facade-owned transport
         // never uses this path: its instance retains normal drain and cleanup.
-        self.connection.take();
-        let supervisor = self.supervisor.clone();
-        let instance = self.process_instance.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            // Move the actual connection into the same retirement operation.
+            // Revoke rejects TransportOwned until retirement returns the socket
+            // to this exact entry. Suppress another Drop task if retirement fails.
+            let mut cleanup = Self {
+                supervisor: self.supervisor.clone(),
+                process_instance: self.process_instance.clone(),
+                bound_grant: self.bound_grant.clone(),
+                connection: self.connection.take(),
+                terminated: false,
+                defer_cleanup: true,
+            };
             runtime.spawn(async move {
-                supervisor.revoke_session(&instance).await;
+                cleanup.terminate().await;
             });
         }
     }
