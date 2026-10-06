@@ -54789,13 +54789,12 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 cleanup_calls.lock().unwrap().len(),
                 if resume_direct { 2 } else { 1 }
             );
-            assert_eq!(
-                processor
-                    .process_due_native_terminal_effects(chrono::Utc::now().timestamp(), 8)
-                    .await
-                    .unwrap(),
-                0
-            );
+            let replay_dispatch = processor
+                .process_due_native_terminal_effects(chrono::Utc::now().timestamp(), 8)
+                .await
+                .unwrap();
+            assert!(!replay_dispatch.storage_failed);
+            assert_eq!(replay_dispatch.count, 0);
         } else {
             assert_eq!(
                 crud_store_for_assert
