@@ -950,6 +950,16 @@ struct PendingNativePermissionApprovalRequest {
     respond_to: oneshot::Sender<pioneer_tools::PermissionApprovalResolution>,
 }
 
+#[derive(Default)]
+struct TaskEventFanoutSummary {
+    selected: usize,
+    bootstrap_inputs: usize,
+    event_inputs: usize,
+    emitted: usize,
+    errors: usize,
+    pending: Option<bool>,
+}
+
 impl MessageProcessor {
     #[cfg(test)]
     pub fn new_with_memory_runtime(
@@ -3448,171 +3458,243 @@ impl MessageProcessor {
             .event_bus()
             .subscribe(pioneer_tasks::TaskEventFilter::default());
         *guard = Some(tokio::spawn(async move {
-            let mut cursors_by_task: HashMap<String, i64> = HashMap::new();
-            let mut durable_replay_after_task_id: Option<String> = None;
-            let mut durable_replay = interval(Duration::from_secs(5));
-            durable_replay.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let mut bootstrap_complete = false;
+            let mut bus_open = true;
+            let mut periodic = interval(Duration::from_secs(5));
+            periodic.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
+                // The bus is only a wake. This owned dispatcher is the sole
+                // emitter, so even slow Tasks cannot acquire competing lanes.
+                tokio::select! {
+                    delivery=subscription.recv(),if bus_open=>match delivery {
+                        pioneer_tasks::TaskEventWakeDelivery::Wake(_)=>{},
+                        pioneer_tasks::TaskEventWakeDelivery::Lagged(count)=>warn!(missed_wakes=count,"task fanout wake bus lagged"),
+                        pioneer_tasks::TaskEventWakeDelivery::Closed=>bus_open=false,
+                    },
+                    _=periodic.tick()=>{},
+                }
                 let Some(this) = processor.upgrade() else {
                     break;
                 };
-                let runtime = this.with_database_class(SqliteWriteClass::Critical);
-                let reconciliation = this.for_background_reconciliation();
-                tokio::select! {
-                    delivery = subscription.recv() => match delivery {
-                        pioneer_tasks::TaskEventWakeDelivery::Wake(wake) => {
-                            if let Err(error) = crate::database::attribution::scope_database_workload_result(
-                                pioneer_observability::DatabaseWorkload::TaskEventFanout,
-                                runtime.emit_committed_task_events_after_cursor(
-                                    wake.task_id.as_str(),
-                                    &mut cursors_by_task,
-                                ),
-                            )
-                            .await
-                            {
-                                warn!(
-                                    task_id = %wake.task_id,
-                                    event_id = %wake.event_id,
-                                    sequence = wake.sequence,
-                                    error = %format!("{error:#}"),
-                                    "failed to fan out committed task events after wake; durable replay will retry"
-                                );
-                            }
+                let result = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::TaskEventFanout,
+                    this.for_background_reconciliation()
+                        .task_event_fanout_quantum(&mut bootstrap_complete),
+                )
+                .await;
+                match result {
+                    Ok(summary) => {
+                        debug!(selected=summary.selected,bootstrap_inputs=summary.bootstrap_inputs,event_inputs=summary.event_inputs,emitted=summary.emitted,errors=summary.errors,pending=?summary.pending,bootstrap_complete,"task fanout quantum completed");
+                        if summary.errors > 0 {
+                            // Storage/claim failures cannot spin via a hot bus.
+                            // Sleep owns no DB resources; cancellation aborts it.
+                            tokio::time::sleep(Duration::from_secs(5)).await;
                         }
-                        pioneer_tasks::TaskEventWakeDelivery::Lagged(count) => {
-                            warn!(
-                                missed_wakes = count,
-                                "task wake bus lagged; durable fanout backlog will be rescanned"
-                            );
-                            if let Err(error) = crate::database::attribution::scope_database_workload_result(
-                                pioneer_observability::DatabaseWorkload::TaskEventFanout,
-                                reconciliation.replay_pending_task_event_fanout(
-                                    &mut cursors_by_task,
-                                    &mut durable_replay_after_task_id,
-                                ),
-                            )
-                            .await
-                            {
-                                warn!(
-                                    missed_wakes = count,
-                                    error = %format!("{error:#}"),
-                                    "failed to rescan durable task event fanout backlog after lag"
-                                );
-                            }
-                        }
-                        pioneer_tasks::TaskEventWakeDelivery::Closed => break,
-                    },
-                    _ = durable_replay.tick() => {
-                        if let Err(error) = crate::database::attribution::scope_database_workload_result(
-                            pioneer_observability::DatabaseWorkload::TaskEventFanout,
-                            reconciliation.replay_pending_task_event_fanout(
-                                &mut cursors_by_task,
-                                &mut durable_replay_after_task_id,
-                            ),
-                        )
-                        .await
-                        {
-                            warn!(
-                                error = %format!("{error:#}"),
-                                "periodic durable task event fanout replay failed"
-                            );
-                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            failure_class =
+                                if reconciliation_diagnostics::is_storage_failure(&error) {
+                                    "storage"
+                                } else {
+                                    "candidate"
+                                },
+                            "task fanout discovery failed"
+                        );
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
             }
         }));
     }
 
-    async fn replay_pending_task_event_fanout(
+    async fn task_event_fanout_quantum(
         &self,
-        cursors_by_task: &mut HashMap<String, i64>,
-        after_task_id: &mut Option<String>,
-    ) -> anyhow::Result<()> {
-        const REPLAY_BATCH_SIZE: u64 = 256;
-        let mut task_ids = self
-            .crud_store
-            .list_pending_task_event_fanout_task_ids(after_task_id.as_deref(), REPLAY_BATCH_SIZE)
-            .await?;
-        if task_ids.is_empty() && after_task_id.is_some() {
-            *after_task_id = None;
-            task_ids = self
-                .crud_store
-                .list_pending_task_event_fanout_task_ids(None, REPLAY_BATCH_SIZE)
-                .await?;
-        }
-        *after_task_id = if task_ids.len() == REPLAY_BATCH_SIZE as usize {
-            task_ids.last().cloned()
+        bootstrap_complete: &mut bool,
+    ) -> anyhow::Result<TaskEventFanoutSummary> {
+        self.task_event_fanout_quantum_with_clock(bootstrap_complete, &now_timestamp_secs)
+            .await
+    }
+
+    async fn task_event_fanout_quantum_with_clock(
+        &self,
+        bootstrap_complete: &mut bool,
+        clock: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> anyhow::Result<TaskEventFanoutSummary> {
+        use pioneer_crud::{
+            TASK_EVENT_FANOUT_BYTE_BUDGET, TASK_EVENT_FANOUT_EVENT_BUDGET,
+            TASK_EVENT_FANOUT_TASK_BUDGET,
+        };
+        let maintenance = self.crud_store.with_maintenance_access();
+        let bootstrap_rows = if *bootstrap_complete {
+            0
         } else {
-            None
-        };
-        let maintenance_service = self.task_runtime.maintenance_service();
-        for task_id in task_ids {
-            if let Err(error) = self
-                .emit_committed_task_events_after_cursor_with_service(
-                    maintenance_service.as_ref(),
-                    task_id.as_str(),
-                    cursors_by_task,
-                )
-                .await
-            {
-                warn!(
-                    task_id = %task_id,
-                    error = %format!("{error:#}"),
-                    "failed to replay committed task events from durable fanout cursor"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    async fn emit_committed_task_events_after_cursor(
-        &self,
-        task_id: &str,
-        cursors_by_task: &mut HashMap<String, i64>,
-    ) -> anyhow::Result<()> {
-        let service = self.task_runtime.service();
-        self.emit_committed_task_events_after_cursor_with_service(
-            service.as_ref(),
-            task_id,
-            cursors_by_task,
-        )
-        .await
-    }
-
-    async fn emit_committed_task_events_after_cursor_with_service(
-        &self,
-        service: &pioneer_tasks::TaskService,
-        task_id: &str,
-        cursors_by_task: &mut HashMap<String, i64>,
-    ) -> anyhow::Result<()> {
-        let after_sequence = match cursors_by_task.get(task_id).copied() {
-            Some(sequence) => sequence,
-            None => {
-                let sequence = self
-                    .crud_store
-                    .get_task_event_fanout_cursor(task_id)
-                    .await?
-                    .with_context(|| {
-                        format!("missing durable task event fanout cursor for `{task_id}`")
-                    })?;
-                cursors_by_task.insert(task_id.to_owned(), sequence);
-                sequence
-            }
-        };
-        let events = service
-            .list_task_events_after(task_id, after_sequence)
-            .await?;
-
-        for event in events {
-            let sequence = event.sequence;
-            self.emit_task_event(event).await?;
-            self.crud_store
-                .advance_task_event_fanout_cursor(task_id, sequence)
+            let (rows, complete) = maintenance
+                .bootstrap_task_event_fanout(TASK_EVENT_FANOUT_TASK_BUDGET / 2)
                 .await?;
-            cursors_by_task.insert(task_id.to_owned(), sequence);
+            *bootstrap_complete = complete;
+            rows
+        };
+        let candidates = maintenance
+            .due_task_event_fanout(
+                clock(),
+                TASK_EVENT_FANOUT_TASK_BUDGET - bootstrap_rows as u64,
+            )
+            .await?;
+        let mut summary = TaskEventFanoutSummary {
+            selected: candidates.len(),
+            bootstrap_inputs: bootstrap_rows,
+            ..Default::default()
+        };
+        let mut events_left = TASK_EVENT_FANOUT_EVENT_BUDGET;
+        let mut bytes_left = TASK_EVENT_FANOUT_BYTE_BUDGET;
+        let mut tasks_left = candidates.len();
+        for candidate in candidates {
+            if events_left == 0 || bytes_left == 0 {
+                break;
+            }
+            let allowance = (events_left / tasks_left.max(1)).max(1);
+            tasks_left -= 1;
+            // One allocation even if claim/preparation/release panics. No
+            // compensating rediscovery or fresh budget after an unknown commit.
+            events_left = events_left.saturating_sub(allowance);
+            let result = std::panic::AssertUnwindSafe(async {
+                let Some(claim) = maintenance
+                    .claim_task_event_fanout(&candidate, clock)
+                    .await?
+                else {
+                    return Ok::<(), anyhow::Error>(());
+                };
+                let outcome = match self
+                    .emit_task_event_fanout_page(
+                        &claim,
+                        allowance,
+                        &mut bytes_left,
+                        &mut summary.emitted,
+                        clock,
+                    )
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        summary.errors += 1;
+                        warn!(
+                            failure_class =
+                                if reconciliation_diagnostics::is_storage_failure(&error) {
+                                    "storage"
+                                } else {
+                                    "candidate"
+                                },
+                            "task fanout delivery failed; prefix ACKs retained"
+                        );
+                        pioneer_crud::TaskEventFanoutOutcome::Failed
+                    }
+                };
+                maintenance
+                    .release_task_event_fanout(&claim, outcome, clock)
+                    .await?;
+                Ok(())
+            })
+            .catch_unwind()
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    summary.errors += 1;
+                    warn!(
+                        failure_class = if reconciliation_diagnostics::is_storage_failure(&error) {
+                            "storage"
+                        } else {
+                            "candidate"
+                        },
+                        "task fanout candidate bookkeeping failed"
+                    );
+                }
+                Err(_) => {
+                    // Panic says nothing about commit/rollback. Leave durable
+                    // state intact, including confirmed ACKs; never compensate.
+                    summary.errors += 1;
+                    warn!(failure_class = "panic", "task fanout candidate panicked");
+                }
+            }
         }
+        summary.event_inputs = TASK_EVENT_FANOUT_EVENT_BUDGET - events_left;
+        summary.pending = match maintenance.has_pending_task_event_fanout().await {
+            Ok(pending) => Some(pending || !*bootstrap_complete),
+            Err(error) => {
+                summary.errors += 1;
+                warn!(
+                    failure_class = if reconciliation_diagnostics::is_storage_failure(&error) {
+                        "storage"
+                    } else {
+                        "candidate"
+                    },
+                    "task fanout queue state unavailable"
+                );
+                None
+            }
+        };
+        Ok(summary)
+    }
 
-        Ok(())
+    async fn emit_task_event_fanout_page(
+        &self,
+        claim: &pioneer_crud::TaskEventFanoutClaim,
+        limit: usize,
+        bytes_left: &mut usize,
+        emitted: &mut usize,
+        clock: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> anyhow::Result<pioneer_crud::TaskEventFanoutOutcome> {
+        let maintenance = self.crud_store.with_maintenance_access();
+        let after = maintenance
+            .get_task_event_fanout_cursor(&claim.task_id)
+            .await?
+            .with_context(|| {
+                format!(
+                    "missing durable task event fanout cursor for `{}`",
+                    claim.task_id
+                )
+            })?;
+        let allow_oversized = *bytes_left == pioneer_crud::TASK_EVENT_FANOUT_BYTE_BUDGET;
+        let page = maintenance
+            .task_event_fanout_page(&claim.task_id, after, limit, bytes_left, allow_oversized)
+            .await;
+        let events = match page {
+            Ok(pioneer_crud::TaskEventFanoutPage::Prefix { events, .. }) => events,
+            Ok(pioneer_crud::TaskEventFanoutPage::BudgetDeferred) => {
+                return Ok(pioneer_crud::TaskEventFanoutOutcome::BudgetDeferred);
+            }
+            Err(error) => return Err(error),
+        };
+        // Repository charged the admissible prefix before reading full rows,
+        // so decode/read/emit panics cannot issue the same byte budget again.
+        for event in events {
+            let event = event?;
+            if !maintenance.renew_task_event_fanout(claim, clock).await? {
+                anyhow::bail!("task fanout holder changed before emit");
+            }
+            let sequence = event.sequence;
+            // Poll emit and renewal together. Awaiting renewal inside a timer
+            // branch could deadlock if emit currently owns a short write tx.
+            // Both futures belong to this dispatcher and drop on cancellation.
+            let result: anyhow::Result<()> = tokio::select! {
+                result=self.emit_task_event(event)=>result,
+                result=async {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        if !maintenance.renew_task_event_fanout(claim, clock).await? {
+                            anyhow::bail!("task fanout holder changed during emit");
+                        }
+                    }
+                }=>result,
+            };
+            result?;
+            self.crud_store
+                .ack_task_event_fanout(claim, sequence, clock)
+                .await?;
+            *emitted += 1;
+        }
+        Ok(pioneer_crud::TaskEventFanoutOutcome::Delivered)
     }
 
     pub(crate) fn current_skills_snapshot_version(&self) -> u64 {

@@ -8,7 +8,13 @@ mod model_history;
 mod projector;
 mod repositories;
 mod task_delivery_lifecycle;
+mod task_event_context;
 mod task_events;
+pub use repositories::task_event_fanout::{
+    TASK_EVENT_FANOUT_BYTE_BUDGET, TASK_EVENT_FANOUT_EVENT_BUDGET, TASK_EVENT_FANOUT_TASK_BUDGET,
+    TaskEventFanoutClaim, TaskEventFanoutOutcome, TaskEventFanoutPage,
+};
+pub use task_event_context::{TaskAnchorAgent, TaskAnchorContext, TaskEventContext};
 mod task_run_occurrence;
 mod task_terminal;
 pub use repositories::task_run_occurrence_reconcile::{
@@ -14298,12 +14304,104 @@ impl CrudStore {
         task_event::list_event_task_ids(&self.connection).await
     }
 
-    pub async fn list_pending_task_event_fanout_task_ids(
+    pub async fn bootstrap_task_event_fanout(&self, limit: u64) -> Result<(usize, bool)> {
+        repositories::task_event_fanout::bootstrap(
+            &self.with_maintenance_access().connection,
+            limit,
+        )
+        .await
+    }
+    pub async fn due_task_event_fanout(
         &self,
-        after_task_id: Option<&str>,
+        now: i64,
         limit: u64,
-    ) -> Result<Vec<String>> {
-        task_event::list_pending_fanout_task_ids(&self.connection, after_task_id, limit).await
+    ) -> Result<Vec<pioneer_entity::task_event_fanout_pending::Model>> {
+        repositories::task_event_fanout::due(&self.with_maintenance_access().connection, now, limit)
+            .await
+    }
+    pub async fn has_pending_task_event_fanout(&self) -> Result<bool> {
+        repositories::task_event_fanout::has_pending(&self.with_maintenance_access().connection)
+            .await
+    }
+    pub async fn claim_task_event_fanout(
+        &self,
+        row: &pioneer_entity::task_event_fanout_pending::Model,
+        clock: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> Result<Option<TaskEventFanoutClaim>> {
+        repositories::task_event_fanout::claim(
+            &self.with_maintenance_access().connection,
+            row,
+            pioneer_protocol::generate_id(21),
+            clock,
+        )
+        .await
+    }
+    pub async fn renew_task_event_fanout(
+        &self,
+        claim: &TaskEventFanoutClaim,
+        clock: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> Result<bool> {
+        repositories::task_event_fanout::renew(
+            &self.with_maintenance_access().connection,
+            claim,
+            clock,
+        )
+        .await
+    }
+    pub async fn ack_task_event_fanout(
+        &self,
+        claim: &TaskEventFanoutClaim,
+        sequence: i64,
+        clock: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> Result<()> {
+        repositories::task_event_fanout::ack(&self.connection, claim, sequence, clock).await
+    }
+    pub async fn release_task_event_fanout(
+        &self,
+        claim: &TaskEventFanoutClaim,
+        outcome: TaskEventFanoutOutcome,
+        clock: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> Result<()> {
+        repositories::task_event_fanout::release(
+            &self.with_maintenance_access().connection,
+            claim,
+            outcome,
+            clock,
+        )
+        .await
+    }
+    pub async fn task_event_fanout_page(
+        &self,
+        task_id: &str,
+        after: i64,
+        limit: usize,
+        bytes_left: &mut usize,
+        allow_oversized: bool,
+    ) -> Result<TaskEventFanoutPage<Result<AppendedTaskEvent>>> {
+        let page = task_event::fanout_page(
+            &self.connection,
+            task_id,
+            after,
+            limit,
+            bytes_left,
+            allow_oversized,
+        )
+        .await?;
+        let TaskEventFanoutPage::Prefix {
+            events: rows,
+            bytes,
+        } = page
+        else {
+            return Ok(TaskEventFanoutPage::BudgetDeferred);
+        };
+        // All reader resources have been returned before JSON decoding.
+        let events = rows
+            .into_iter()
+            .map(|row| {
+                task_event::appended_task_event_from_model(row, TaskEventAppendStatus::Inserted)
+            })
+            .collect::<Vec<_>>();
+        Ok(TaskEventFanoutPage::Prefix { events, bytes })
     }
 
     pub async fn get_task_event_fanout_cursor(&self, task_id: &str) -> Result<Option<i64>> {
@@ -31258,6 +31356,8 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    #[path = "task_event_fanout.rs"]
+    mod fanout;
     #[path = "task_run_occurrence.rs"]
     mod occurrence_tracker;
     use super::{
@@ -43352,9 +43452,12 @@ mod tests {
         );
         assert_eq!(
             store
-                .list_pending_task_event_fanout_task_ids(None, 256)
+                .due_task_event_fanout(i64::MAX, 64)
                 .await
-                .expect("durable fanout backlog should list"),
+                .expect("durable fanout backlog should list")
+                .into_iter()
+                .map(|row| row.task_id)
+                .collect::<Vec<_>>(),
             vec![task.id.clone()],
             "an unacknowledged terminal/progress event must remain discoverable without a wake"
         );
@@ -43372,7 +43475,7 @@ mod tests {
         );
         assert!(
             store
-                .list_pending_task_event_fanout_task_ids(None, 256)
+                .due_task_event_fanout(i64::MAX, 64)
                 .await
                 .expect("acknowledged fanout backlog should list")
                 .is_empty(),

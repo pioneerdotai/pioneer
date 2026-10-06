@@ -23,6 +23,33 @@ const MAX_DELIVERY_LIST_LIMIT: u64 = 1_000;
 const MAX_DELIVERY_BATCH_IDS: usize = 512;
 const MAX_DELIVERY_ATTEMPTS: u32 = 16;
 
+// Preserve the notification helper's latest-100 window without loading snapshots
+// or the (unbounded) attempt history of those deliveries.
+pub async fn pending_thread_targets<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    task_id: &str,
+    run_id: &str,
+) -> Result<Vec<(String, Option<String>)>> {
+    Ok(task_delivery::Entity::find()
+        .select_only()
+        .columns([
+            task_delivery::Column::Mode,
+            task_delivery::Column::TargetThreadId,
+        ])
+        .filter(task_delivery::Column::WorkspaceId.eq(workspace_id))
+        .filter(task_delivery::Column::TaskId.eq(task_id))
+        .filter(task_delivery::Column::RunId.eq(run_id))
+        .filter(sea_orm::sea_query::Expr::cust(
+            "status IN ('pending','delivering')",
+        ))
+        .order_by_desc(task_delivery::Column::UpdatedAt)
+        .limit(100)
+        .into_tuple::<(String, Option<String>)>()
+        .all(db)
+        .await?)
+}
+
 #[derive(Clone, Debug)]
 pub struct PreparedTaskDeliveryProjection {
     delivery: TaskDelivery,

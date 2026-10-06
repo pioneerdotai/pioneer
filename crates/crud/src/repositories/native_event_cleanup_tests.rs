@@ -147,7 +147,14 @@ impl Fixture {
         options.map_sqlx_sqlite_opts(|o| o.pragma("foreign_keys", "ON"));
         let writer = Database::connect(options).await?;
         match migration {
-            Some(true) => Migrator::down(&writer, Some(1)).await?,
+            Some(true) => {
+                let migrations = Migrator::migrations();
+                let target = migrations
+                    .iter()
+                    .position(|m| m.name() == "m20260919_000001_native_event_cleanup_queue")
+                    .expect("cleanup queue remains registered");
+                Migrator::down(&writer, Some((migrations.len() - target) as u32)).await?;
+            }
             Some(false) => {
                 let applied: i64 = writer
                     .query_one_raw(Statement::from_string(

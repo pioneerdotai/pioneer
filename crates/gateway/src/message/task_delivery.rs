@@ -1,7 +1,7 @@
 use super::*;
 use crate::authorization::AuthorizationExternalError;
 use anyhow::{Result, anyhow, bail};
-use pioneer_protocol::{TaskDeliveryStatus, TaskGetResponse, TaskRunStatus, ThreadMode};
+use pioneer_protocol::{TaskRunStatus, ThreadMode};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -271,42 +271,30 @@ impl MessageProcessor {
 
     pub(super) async fn task_run_awaits_occurrence_thread_delivery(
         &self,
-        task_response: &TaskGetResponse,
+        task_response: &pioneer_crud::TaskEventContext,
         run_id: &str,
     ) -> Result<bool> {
-        let Some(current) = self
-            .crud_store
-            .get_task(task_response.task.id.as_str())
-            .await?
-        else {
+        let Some(current_run) = self.crud_store.get_task_run(run_id).await? else {
             return Ok(false);
         };
-        if !current
-            .runs
-            .iter()
-            .any(|run| run.id == run_id && run.status == TaskRunStatus::Succeeded)
+        if current_run.task_id != task_response.task.id
+            || current_run.status != TaskRunStatus::Succeeded
         {
             return Ok(false);
         }
-        let deliveries = self
-            .crud_store
-            .list_task_deliveries(pioneer_protocol::TaskDeliveriesParams {
-                workspace_id: current.task.workspace_id.clone(),
-                task_id: Some(current.task.id.clone()),
-                run_id: Some(run_id.to_owned()),
-                statuses: vec![TaskDeliveryStatus::Pending, TaskDeliveryStatus::Delivering],
-                limit: Some(100),
-            })
-            .await?;
         let occurrence_thread_id = self
             .crud_store
             .get_turn_location(run_id)
             .await?
             .map(|(thread_id, _)| thread_id);
-        Ok(deliveries.deliveries.iter().any(|delivery| {
-            delivery.mode == TaskDeliveryMode::Thread
-                && delivery.target_thread_id == occurrence_thread_id
-        }))
+        self.crud_store
+            .task_run_has_pending_thread_delivery(
+                &task_response.task.workspace_id,
+                &task_response.task.id,
+                run_id,
+                occurrence_thread_id.as_deref(),
+            )
+            .await
     }
 
     pub(super) async fn process_due_task_deliveries(&self, now: i64, limit: u64) -> Result<()> {

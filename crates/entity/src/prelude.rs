@@ -121,6 +121,8 @@ pub use super::task_delivery_authority::Entity as TaskDeliveryAuthority;
 pub use super::task_dependency::Entity as TaskDependency;
 pub use super::task_event::Entity as TaskEvent;
 pub use super::task_event_fanout_cursor::Entity as TaskEventFanoutCursor;
+pub use super::task_event_fanout_pending::Entity as TaskEventFanoutPending;
+pub use super::task_event_fanout_sequence::Entity as TaskEventFanoutSequence;
 pub use super::task_execution_admission::Entity as TaskExecutionAdmission;
 pub use super::task_occurrence_contract::Entity as TaskOccurrenceContract;
 pub use super::task_result_candidate::Entity as TaskResultCandidate;

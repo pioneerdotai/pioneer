@@ -1,13 +1,14 @@
 use super::*;
 use anyhow::{Result, bail};
+use pioneer_crud::TaskEventContext;
 use pioneer_crud::{
     TaskRunOccurrenceClaimDeferral, TaskRunOccurrenceClaimFailure,
     TaskRunOccurrenceClaimFailurePhase, TaskRunOccurrenceClock,
     TaskRunOccurrenceTerminalizationOutcome,
 };
 use pioneer_protocol::{
-    ItemUpdatedNotification, TaskAttachmentMode, TaskDeliveryStatus, TaskEventPayload,
-    TaskGetResponse, TaskRescheduleReason, TaskTriggerKind,
+    ItemUpdatedNotification, TaskDeliveryStatus, TaskEventPayload, TaskRescheduleReason,
+    TaskTriggerKind,
 };
 use serde_json::json;
 
@@ -285,8 +286,11 @@ impl MessageProcessor {
         &self,
         event: pioneer_crud::AppendedTaskEvent,
     ) -> Result<()> {
-        let task_id = event.payload.task_id().to_owned();
-        let Some(task_response) = self.crud_store.get_task(task_id.as_str()).await? else {
+        let Some(task_response) = self
+            .crud_store
+            .get_task_event_context(&event.payload)
+            .await?
+        else {
             return Ok(());
         };
         if let Some(work) = task_response
@@ -347,7 +351,8 @@ impl MessageProcessor {
         };
         let refresh_parent_anchor = !is_progress_event
             && !awaits_occurrence_thread_delivery
-            && should_refresh_parent_task_anchor(&task_response, &event.payload);
+            && should_refresh_parent_task_anchor(&self.crud_store, &task_response, &event.payload)
+                .await?;
         if refresh_parent_anchor {
             self.refresh_parent_task_anchor(&task_response).await?;
         }
@@ -394,9 +399,9 @@ impl MessageProcessor {
             }
             TaskEventPayload::TaskScheduled { trigger_id, .. } => {
                 if let Some(trigger) = task_response
-                    .triggers
-                    .into_iter()
-                    .find(|trigger| trigger.id == trigger_id)
+                    .scheduled_trigger
+                    .as_ref()
+                    .filter(|trigger| trigger.id == trigger_id)
                 {
                     self.send_notification_to_task_workspace_connections(
                         notification_task_id.as_str(),
@@ -411,20 +416,14 @@ impl MessageProcessor {
                 }
             }
             TaskEventPayload::TaskQueued { .. } => {
-                let run = context.run_id.as_ref().and_then(|run_id| {
-                    task_response
-                        .runs
-                        .iter()
-                        .find(|run| run.id == *run_id)
-                        .cloned()
-                });
+                let run = task_response.run.as_ref();
                 self.send_notification_to_task_workspace_connections(
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_QUEUED,
                     &json!({
                         "context": context,
-                        "run": run.as_ref().map(crate::task_projection::project_run),
+                        "run": run.map(crate::task_projection::project_run),
                     }),
                 )
                 .await;
@@ -442,7 +441,7 @@ impl MessageProcessor {
                 .await;
             }
             TaskEventPayload::RunStarted { run_id, .. } => {
-                if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
+                if let Some(run) = task_response.run.as_ref().filter(|run| run.id == run_id) {
                     self.send_notification_to_task_workspace_connections(
                         notification_task_id.as_str(),
                         workspace_id.as_str(),
@@ -478,7 +477,7 @@ impl MessageProcessor {
             TaskEventPayload::RunCompleted { run_id, .. } => {
                 self.mark_task_run_occurrence_turn_terminal(run_id.as_str())
                     .await?;
-                if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
+                if let Some(run) = task_response.run.as_ref().filter(|run| run.id == run_id) {
                     self.send_notification_to_task_workspace_connections(
                         notification_task_id.as_str(),
                         workspace_id.as_str(),
@@ -494,7 +493,7 @@ impl MessageProcessor {
             TaskEventPayload::RunFailed { run_id, .. } => {
                 self.mark_task_run_occurrence_turn_terminal(run_id.as_str())
                     .await?;
-                if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
+                if let Some(run) = task_response.run.as_ref().filter(|run| run.id == run_id) {
                     self.send_notification_to_task_workspace_connections(
                         notification_task_id.as_str(),
                         workspace_id.as_str(),
@@ -510,7 +509,7 @@ impl MessageProcessor {
             TaskEventPayload::RunBlocked { run_id, .. } => {
                 self.mark_task_run_occurrence_turn_terminal(run_id.as_str())
                     .await?;
-                if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
+                if let Some(run) = task_response.run.as_ref().filter(|run| run.id == run_id) {
                     self.send_notification_to_task_workspace_connections(
                         notification_task_id.as_str(),
                         workspace_id.as_str(),
@@ -526,7 +525,7 @@ impl MessageProcessor {
             TaskEventPayload::RunCancelled { run_id, .. } => {
                 self.mark_task_run_occurrence_turn_terminal(run_id.as_str())
                     .await?;
-                if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
+                if let Some(run) = task_response.run.as_ref().filter(|run| run.id == run_id) {
                     self.send_notification_to_task_workspace_connections(
                         notification_task_id.as_str(),
                         workspace_id.as_str(),
@@ -875,7 +874,7 @@ impl MessageProcessor {
         Ok(())
     }
 
-    async fn refresh_parent_task_anchor(&self, response: &TaskGetResponse) -> Result<bool> {
+    async fn refresh_parent_task_anchor(&self, response: &TaskEventContext) -> Result<bool> {
         let Some(parent_thread_id) = response.task.created_by_thread_id.as_deref() else {
             return Ok(false);
         };
@@ -888,7 +887,7 @@ impl MessageProcessor {
 
     pub(super) async fn refresh_task_anchor_in_turn(
         &self,
-        response: &TaskGetResponse,
+        response: &TaskEventContext,
         thread_id: &str,
         turn_id: &str,
         run_id: Option<&str>,
@@ -899,42 +898,36 @@ impl MessageProcessor {
 
     async fn refresh_task_anchor_in_turn_with_progress(
         &self,
-        response: &TaskGetResponse,
+        response: &TaskEventContext,
         thread_id: &str,
         turn_id: &str,
         run_id: Option<&str>,
         progress_preview: Option<String>,
     ) -> Result<bool> {
-        let item = match run_id {
-            Some(run_id) if task_run_uses_creation_anchor(response, run_id) => {
-                crate::task_tools::task_turn_item_from_response_for_run_with_progress(
-                    self,
-                    response,
-                    run_id,
-                    crate::task_tools::task_anchor_id(response.task.id.as_str()),
-                    progress_preview,
+        let anchor = if run_id.is_some() {
+            self.crud_store
+                .get_task_run_anchor_context(
+                    &response.task,
+                    response.run.as_ref(),
+                    response.run_trigger.as_ref(),
                 )
                 .await?
-            }
-            Some(run_id) => {
-                crate::task_tools::task_turn_item_from_response_for_run_with_progress(
-                    self,
-                    response,
-                    run_id,
-                    crate::task_tools::task_run_anchor_id(run_id),
-                    progress_preview,
-                )
+        } else {
+            self.crud_store
+                .get_task_creation_anchor_context(&response.task)
                 .await?
-            }
-            None => {
-                crate::task_tools::task_turn_item_from_response_with_progress(
-                    self,
-                    response,
-                    progress_preview,
-                )
-                .await?
-            }
         };
+        let item_id = parent_task_anchor_item_id(response, run_id);
+        let item = crate::task_tools::task_turn_item_from_context(
+            &self.crud_store,
+            &response.task,
+            anchor.run.as_ref(),
+            anchor.trigger.as_ref(),
+            anchor.agent.as_ref(),
+            item_id,
+            progress_preview,
+        )
+        .await?;
         let Some(existing) = self
             .crud_store
             .get_turn_item(turn_id, item.id.as_str())
@@ -974,7 +967,7 @@ impl MessageProcessor {
 
     async fn publish_parent_task_progress_snapshot(
         &self,
-        response: &TaskGetResponse,
+        response: &TaskEventContext,
         payload: &TaskEventPayload,
     ) -> Result<()> {
         let TaskEventPayload::Progress {
@@ -1043,7 +1036,7 @@ impl MessageProcessor {
 
     async fn flush_parent_task_progress_snapshot(
         &self,
-        response: &TaskGetResponse,
+        response: &TaskEventContext,
         payload: &TaskEventPayload,
     ) {
         let item_id = parent_task_anchor_item_id(response, payload.run_id());
@@ -1070,7 +1063,7 @@ impl MessageProcessor {
 
     async fn task_timeline_changed_target(
         &self,
-        response: &TaskGetResponse,
+        response: &TaskEventContext,
         payload: &TaskEventPayload,
     ) -> Option<TaskTimelineChangedTarget> {
         let task = &response.task;
@@ -1093,7 +1086,7 @@ impl MessageProcessor {
 
     async fn task_timeline_parent_target(
         &self,
-        response: &TaskGetResponse,
+        response: &TaskEventContext,
         payload: &TaskEventPayload,
     ) -> Option<(String, String)> {
         if let TaskEventPayload::ChildThreadLinked { lineage } = payload {
@@ -1120,7 +1113,7 @@ impl MessageProcessor {
 
     async fn task_progress_parent_target(
         &self,
-        response: &TaskGetResponse,
+        response: &TaskEventContext,
         payload: &TaskEventPayload,
     ) -> Option<(String, String)> {
         match payload.run_id() {
@@ -1134,7 +1127,7 @@ impl MessageProcessor {
 
     async fn task_progress_flush_targets(
         &self,
-        response: &TaskGetResponse,
+        response: &TaskEventContext,
         payload: &TaskEventPayload,
     ) -> Vec<(String, String)> {
         let mut targets = Vec::new();
@@ -1152,10 +1145,18 @@ impl MessageProcessor {
             targets.push((thread_id, turn_id));
         }
 
-        for run in &response.runs {
-            if let Some(target) = self.task_run_parent_target(response, run.id.as_str()).await
-                && !targets.iter().any(|existing| existing == &target)
-            {
+        // Task terminal events have no run_id. Only buffered snapshots can
+        // produce a flush; empty historical targets were no-ops. Consult the
+        // existing bounded coalescers instead of loading every historical run.
+        for target in self
+            .agent_manager
+            .pending_progress_targets_for_item(
+                response.task.workspace_id.as_str(),
+                crate::task_tools::task_anchor_id(response.task.id.as_str()).as_str(),
+            )
+            .await
+        {
+            if !targets.contains(&target) {
                 targets.push(target);
             }
         }
@@ -1165,7 +1166,7 @@ impl MessageProcessor {
 
     async fn task_run_parent_target(
         &self,
-        response: &TaskGetResponse,
+        response: &TaskEventContext,
         run_id: &str,
     ) -> Option<(String, String)> {
         // The occurrence Turn is the authoritative presentation address and is
@@ -1211,10 +1212,16 @@ impl MessageProcessor {
     #[cfg(test)]
     pub(super) async fn task_progress_parent_target_for_test(
         &self,
-        response: &TaskGetResponse,
+        _response: &pioneer_protocol::TaskGetResponse,
         payload: &TaskEventPayload,
     ) -> Option<(String, String)> {
-        self.task_progress_parent_target(response, payload).await
+        let response = self
+            .crud_store
+            .get_task_event_context(payload)
+            .await
+            .ok()
+            .flatten()?;
+        self.task_progress_parent_target(&response, payload).await
     }
 }
 
@@ -1323,15 +1330,16 @@ impl MessageProcessor {
     }
 }
 
-fn should_refresh_parent_task_anchor(
-    response: &TaskGetResponse,
+async fn should_refresh_parent_task_anchor(
+    store: &pioneer_crud::CrudStore,
+    response: &TaskEventContext,
     payload: &TaskEventPayload,
-) -> bool {
+) -> Result<bool> {
     if let Some(run_id) = payload.run_id() {
-        return task_run_uses_creation_anchor(response, run_id);
+        return Ok(task_run_uses_creation_anchor(response, run_id));
     }
 
-    match payload {
+    Ok(match payload {
         TaskEventPayload::TaskScheduled { .. }
         | TaskEventPayload::TaskUpdated { .. }
         | TaskEventPayload::TaskPaused { .. }
@@ -1344,44 +1352,21 @@ fn should_refresh_parent_task_anchor(
         ),
         TaskEventPayload::TaskCompleted { .. }
         | TaskEventPayload::TaskFailed { .. }
-        | TaskEventPayload::TaskBlocked { .. } => response
-            .runs
-            .last()
-            .map(|run| task_run_uses_creation_anchor(response, run.id.as_str()))
-            .unwrap_or(false),
+        | TaskEventPayload::TaskBlocked { .. } => {
+            response.task.created_by_turn_id.is_some()
+                && store
+                    .latest_task_run_uses_creation_anchor(&response.task)
+                    .await?
+        }
         _ => false,
-    }
+    })
 }
 
-fn task_run_uses_creation_anchor(response: &TaskGetResponse, run_id: &str) -> bool {
-    if response.task.created_by_turn_id.is_none() {
-        return false;
-    }
-    if !response
-        .task
-        .lifecycle_policy
-        .as_ref()
-        .map(|policy| policy.attachment == TaskAttachmentMode::Attached)
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    response
-        .runs
-        .iter()
-        .find(|run| run.id == run_id)
-        .and_then(|run| run.trigger_id.as_deref())
-        .and_then(|trigger_id| {
-            response
-                .triggers
-                .iter()
-                .find(|trigger| trigger.id == trigger_id)
-        })
-        .map(|trigger| trigger.kind() == TaskTriggerKind::Immediate)
-        .unwrap_or(false)
+fn task_run_uses_creation_anchor(response: &TaskEventContext, run_id: &str) -> bool {
+    response.run_uses_creation_anchor(run_id)
 }
 
-fn parent_task_anchor_item_id(response: &TaskGetResponse, run_id: Option<&str>) -> String {
+fn parent_task_anchor_item_id(response: &TaskEventContext, run_id: Option<&str>) -> String {
     match run_id {
         Some(run_id) if !task_run_uses_creation_anchor(response, run_id) => {
             crate::task_tools::task_run_anchor_id(run_id)

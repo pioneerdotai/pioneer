@@ -3672,6 +3672,23 @@ impl AgentManager {
         }
     }
 
+    pub async fn pending_progress_targets_for_item(
+        &self,
+        workspace_id: &str,
+        item_id: &str,
+    ) -> Vec<(String, String)> {
+        let state = self.state.read().await;
+        state
+            .threads
+            .values()
+            .flat_map(|thread| {
+                thread
+                    .event_hub
+                    .pending_progress_targets_for_item(workspace_id, item_id)
+            })
+            .collect()
+    }
+
     pub async fn flush_progress_for_item(
         &self,
         thread_id: &str,
