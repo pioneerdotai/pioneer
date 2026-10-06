@@ -283,6 +283,20 @@ impl Fixture {
         }
         .insert(&self.db)
         .await?;
+        // The snapshot includes a successfully projected start and completion.
+        // A terminal Turn alone is not sufficient for native event cleanup.
+        pioneer_entity::turn_event_projection_stream_state::ActiveModel {
+            turn_id: Set(id.into()),
+            thread_id: Set("thread-cleanup".into()),
+            status: Set("healthy".into()),
+            projected_through_sequence: Set(2),
+            receipts_compacted_through_sequence: Set(0),
+            created_at: Set(at),
+            updated_at: Set(at),
+            ..Default::default()
+        }
+        .insert(&self.db)
+        .await?;
         self.bind(id, "codex", "completed").await
     }
     async fn bind(&self, id: &str, runtime: &str, status: &str) -> Result<()> {
@@ -530,6 +544,7 @@ async fn migration_bootstrap_restart_vacuum_and_live_events_before_cursor() -> R
         )
         .await?;
     }
+    assert_eq!(f.prepared("legacy").await?.ids.len(), 128);
     let f = f.migrate(false).await?;
     assert_eq!(
         f.scalar("SELECT COUNT(*) FROM native_event_cleanup_job")
@@ -989,6 +1004,7 @@ async fn bootstrap_cursor_rolls_back_with_job_registration_failure() -> Result<(
     f.historical_completed_turn("legacy").await?;
     f.event("legacy", Some("legacy"), "codex", "item/completed", 8)
         .await?;
+    assert_eq!(f.prepared("legacy").await?.ids.len(), 1);
     let f = f.migrate(false).await?;
     f.sql("CREATE TRIGGER fail_bootstrap BEFORE INSERT ON native_event_cleanup_job BEGIN SELECT RAISE(ABORT,'injected bootstrap failure'); END").await?;
     assert!(bootstrap(&f.db).await.is_err());
