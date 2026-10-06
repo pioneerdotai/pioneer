@@ -13860,9 +13860,12 @@ async fn g09_owned_voice_ingress_cancel_disconnect_and_terminal_branches() {
                 .await
                 .unwrap();
             let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
-            let before =
-                serde_json::to_value(crud.get_thread_history(thread_id, Some(64)).await.unwrap())
-                    .unwrap();
+            let before = crud
+                .get_thread_history(thread_id, Some(64))
+                .await
+                .unwrap()
+                .expect("voice target history must exist");
+            let before_events = serde_json::to_value(&before.events).unwrap();
             let finalize=json!({"jsonrpc":"2.0","id":"g09finalize","method":"voice/session/finalize","params":{
                 "session_id":session.session_id,"context":{"workspace_id":workspace_id,"thread_id":thread_id,"turn_id":turn_id}
             }}).to_string();
@@ -13972,13 +13975,13 @@ async fn g09_owned_voice_ingress_cancel_disconnect_and_terminal_branches() {
                 let _ = recv_error_by_id(&mut rx, "g09latecancel").await;
             } else {
                 assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
-                assert_eq!(
-                    serde_json::to_value(
-                        crud.get_thread_history(thread_id, Some(64)).await.unwrap()
-                    )
-                    .unwrap(),
-                    before
-                );
+                let after = crud
+                    .get_thread_history(thread_id, Some(64))
+                    .await
+                    .unwrap()
+                    .expect("cancel/disconnect must preserve voice target history");
+                assert_eq!(after.workspace_id, before.workspace_id);
+                assert_eq!(serde_json::to_value(&after.events).unwrap(), before_events);
             }
             while let Ok(message) = rx.try_recv() {
                 if let Message::Text(text) = message {
