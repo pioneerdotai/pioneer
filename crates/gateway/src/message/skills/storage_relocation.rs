@@ -257,6 +257,7 @@ pub(crate) async fn import_configured_skill_roots(
             }
         };
 
+        let mut fallback_paths = None;
         for source_path in packages {
             summary.packages_discovered = summary.packages_discovered.saturating_add(1);
             let source_path = match normalize_import_source_path(source_path.as_path()) {
@@ -312,6 +313,7 @@ pub(crate) async fn import_configured_skill_roots(
                 &config.reserved_skill_ids,
                 source_path,
                 source_ref.clone(),
+                &mut fallback_paths,
             )
             .await
             {
@@ -714,6 +716,9 @@ async fn import_one_configured_package(
     reserved_skill_ids: &HashSet<SkillId>,
     source_path: PathBuf,
     source_ref: String,
+    fallback_paths: &mut Option<
+        std::collections::BTreeMap<PathBuf, Option<SkillInstallationRecord>>,
+    >,
 ) -> Result<ImportOneOutcome> {
     let (row, created) = {
         let _guard = skills_write_lock.lock().await;
@@ -723,6 +728,7 @@ async fn import_one_configured_package(
             root.scope_key.as_str(),
             source_path.as_path(),
             source_ref.as_str(),
+            fallback_paths,
         )
         .await?;
         match existing {
@@ -883,44 +889,47 @@ async fn find_row_for_import_source(
     scope_key: &str,
     source_path: &Path,
     source_ref: &str,
+    fallback_paths: &mut Option<
+        std::collections::BTreeMap<PathBuf, Option<SkillInstallationRecord>>,
+    >,
 ) -> Result<Option<SkillInstallationRecord>> {
-    let mut after = None;
-    let mut provenance_match = None;
-    let mut path_match = None;
-    let mut path_ambiguous = false;
-    loop {
-        let page = crud_store
-            .list_skill_installations_scope_page(source_kind, scope_key, after.as_deref(), 64)
-            .await?;
-        if page.is_empty() {
-            break;
-        }
-        after = page.last().map(|row| row.skill_id.to_string());
-        for row in page {
-            if row.source_ref == source_ref {
-                if provenance_match.replace(row.clone()).is_some() {
-                    bail!("multiple skill rows share exact import provenance `{source_ref}`");
+    if let Some(snapshot) = crud_store
+        .find_skill_import_provenance(source_kind, scope_key, source_ref)
+        .await?
+    {
+        return Ok(Some(snapshot.record));
+    }
+    if fallback_paths.is_none() {
+        let mut index = std::collections::BTreeMap::new();
+        let mut after = None;
+        loop {
+            let page = crud_store
+                .list_skill_installations_scope_page(source_kind, scope_key, after.as_deref(), 64)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().map(|row| row.skill_id.to_string());
+            // Reader capacity has been released before normalization.
+            for row in page {
+                if let Ok(path) = normalize_absolute_path(Path::new(&row.install_path)) {
+                    index
+                        .entry(path)
+                        .and_modify(|row| *row = None)
+                        .or_insert(Some(row));
                 }
             }
-            if normalize_absolute_path(Path::new(&row.install_path))
-                .ok()
-                .as_deref()
-                == Some(source_path)
-            {
-                path_ambiguous |= path_match.replace(row).is_some();
-            }
         }
+        *fallback_paths = Some(index);
     }
-    if let Some(row) = provenance_match {
-        return Ok(Some(row));
+    match fallback_paths
+        .as_ref()
+        .and_then(|index| index.get(source_path))
+    {
+        Some(None) => bail!("ambiguous configured source path"),
+        Some(Some(row)) => Ok(Some(row.clone())),
+        None => Ok(None),
     }
-    if path_ambiguous {
-        bail!(
-            "multiple skill rows share exact configured source path `{}`",
-            source_path.display()
-        );
-    }
-    Ok(path_match)
 }
 
 async fn allocate_import_skill_id(
@@ -1163,6 +1172,21 @@ fn publish_candidate_files(
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static WATCH_PUBLICATION_FAULT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+fn watch_publication_fault(_point: &str) -> bool {
+    #[cfg(test)]
+    {
+        return WATCH_PUBLICATION_FAULT.with(|fault| fault.get() == Some(_point));
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// Native reconciliation uses the existing installer lock, metadata/lock-file
 /// rules and row fence. Replacing a tree is two same-filesystem renames; recursive
 /// cleanup is returned to the watcher's bounded FS cursor, outside the lock.
@@ -1173,9 +1197,10 @@ pub(crate) async fn publish_watched_candidate(
     snapshot: pioneer_crud::SkillReconciliationSnapshot,
     workspace: Option<pioneer_entity::workspace::Model>,
     stage: Option<PathBuf>,
+    recovery: Option<PathBuf>,
     stop: tokio_util::sync::CancellationToken,
     still_current: impl Fn() -> bool + Send + Sync,
-    track_garbage: impl Fn(PathBuf) -> Result<()>,
+    track_garbage: impl Fn(PathBuf, bool) -> Result<()>,
 ) -> Result<SkillStorageRelocationOutcome> {
     let _lock = tokio::select! {
         biased;
@@ -1190,17 +1215,37 @@ pub(crate) async fn publish_watched_candidate(
     if let Some(stage) = &stage {
         verify_copied_revision(&candidate, stage)?;
     }
+    let reused_recovery = recovery.is_some();
+    let confirm_only = reused_recovery
+        && candidate.source_path == candidate.destination
+        && row_metadata_matches(&snapshot.record, &candidate.prepared_metadata)
+        && normalize_absolute_path(Path::new(&snapshot.record.install_path))?
+            == candidate.destination;
+    let recovery = if let Some(recovery) = recovery {
+        recovery
+    } else if let Some(stage) = &stage {
+        stage
+            .parent()
+            .context("stage wrapper missing")?
+            .to_path_buf()
+    } else {
+        let parent = candidate
+            .destination
+            .parent()
+            .context("destination parent missing")?;
+        fs::create_dir_all(parent)?;
+        super::watcher::reconcile::new_attempt(parent, candidate.install_root.clone())?
+    };
+    track_garbage(recovery.clone(), false)?;
+    super::watcher::reconcile::set_attempt_skill(
+        &recovery,
+        candidate.expected_row.skill_id.clone(),
+    )?;
+    super::watcher::reconcile::set_attempt_publishing(&recovery, true)?;
     let renamed = stage.is_none() && candidate.source_path != candidate.destination;
     let mut backup = None;
     if (stage.is_some() || renamed) && fs::symlink_metadata(&candidate.destination).is_ok() {
-        let path = candidate.destination.with_file_name(format!(
-            ".pioneer-relocation-{}",
-            pioneer_protocol::generate_id(21)
-        ));
-        if fs::symlink_metadata(&path).is_ok() {
-            bail!("skill backup path collision");
-        }
-        track_garbage(path.clone())?;
+        let path = recovery.join("backup");
         fs::rename(&candidate.destination, &path)?;
         backup = Some(path);
     }
@@ -1213,44 +1258,139 @@ pub(crate) async fn publish_watched_candidate(
     };
     if let Err(error) = published {
         if let Some(backup) = &backup {
-            let _ = fs::rename(backup, &candidate.destination);
+            fs::rename(backup, &candidate.destination)
+                .context("publication failed and backup restoration failed; recovery retained")?;
+        }
+        if !reused_recovery {
+            super::watcher::reconcile::set_attempt_publishing(&recovery, false)?;
         }
         return Err(error.into());
     }
-    let rollback_files = || {
+    let rollback_files = || -> Result<()> {
+        if watch_publication_fault("restore_files") {
+            bail!("injected file restoration failure");
+        }
         if let Some(stage) = &stage {
-            let _ = fs::rename(&candidate.destination, stage);
+            fs::rename(&candidate.destination, stage).context("failed to restore staged skill")?;
         } else if renamed {
-            rollback_managed_leaf_rename(&candidate);
+            fs::rename(&candidate.destination, &candidate.source_path)
+                .context("failed to restore managed source")?;
         }
         if let Some(backup) = &backup {
-            let _ = fs::rename(backup, &candidate.destination);
+            fs::rename(backup, &candidate.destination).context("failed to restore skill backup")?;
         }
+        Ok(())
     };
     let now = crate::message::now_timestamp_secs();
-    let previous_lock = match write_candidate_lock_entry(&candidate, now) {
+    let previous_lock = match write_candidate_lock_entry_with_recovery(
+        &candidate,
+        now,
+        Some(&recovery),
+    ) {
         Ok(previous) => previous,
         Err(error) => {
-            rollback_files();
-            return Err(error);
+            if let Err(restore) = rollback_files() {
+                return Err(pioneer_crud::SkillReconciliationError {
+                        outcome: pioneer_crud::SkillReconciliationFailure::NotCommitted,
+                        error: restore.context(format!("lock publication failed ({error:#}); file restoration failed; recovery retained")),
+                    }.into());
+            }
+            if !reused_recovery {
+                super::watcher::reconcile::set_attempt_publishing(&recovery, false)?;
+            }
+            return Err(pioneer_crud::SkillReconciliationError {
+                outcome: pioneer_crud::SkillReconciliationFailure::NotCommitted,
+                error: error.context("skill lock publication failed before database operation"),
+            }
+            .into());
         }
     };
     let patch = candidate_database_patch(&candidate);
-    let switched = tokio::select! {
-        biased;
-        _ = stop.cancelled() => bail!("skills publication commit status unknown after cancellation"),
-        result = crud_store.reconcile_skill_installation(&snapshot, &patch, now, workspace.as_ref(), &still_current) => result,
+    let started = std::sync::atomic::AtomicBool::new(false);
+    let database_work = async {
+        if confirm_only {
+            crud_store
+                .confirm_skill_reconciliation(
+                    &snapshot,
+                    workspace.as_ref(),
+                    &still_current,
+                    &started,
+                )
+                .await
+        } else {
+            crud_store
+                .reconcile_skill_installation_with_progress(
+                    &snapshot,
+                    &patch,
+                    now,
+                    workspace.as_ref(),
+                    &still_current,
+                    &started,
+                )
+                .await
+        }
     };
+    let mut switched = tokio::select! {
+        biased;
+        _ = stop.cancelled() => Err(pioneer_crud::SkillReconciliationError {
+            outcome: if started.load(std::sync::atomic::Ordering::Acquire) { pioneer_crud::SkillReconciliationFailure::Unknown } else { pioneer_crud::SkillReconciliationFailure::NotCommitted },
+            error: anyhow::anyhow!("skills publication cancelled"),
+        }.into()),
+        result = database_work => result,
+    };
+    // Test a lost acknowledgement after an actual successful commit, without
+    // pretending that a failed prepare/begin is an ambiguous commit.
+    if watch_publication_fault("commit_ack") && matches!(switched, Ok(true)) {
+        switched = Err(pioneer_crud::SkillReconciliationError {
+            outcome: pioneer_crud::SkillReconciliationFailure::Unknown,
+            error: anyhow::anyhow!("injected lost commit acknowledgement"),
+        }
+        .into());
+    }
     match switched {
-        Ok(true) => {}
+        Ok(true) => {
+            // A post-commit marker/cleanup error does not undo an acknowledged
+            // domain change or hide its notification. Ownership records the proof.
+            if track_garbage(recovery.clone(), true).is_err()
+                || super::watcher::reconcile::set_attempt_publishing(&recovery, false).is_err()
+            {
+                warn!("committed skill artifact cleanup deferred");
+            }
+        }
         Ok(false) => {
-            restore_candidate_lock_entry(&candidate, previous_lock.as_ref());
-            rollback_files();
+            restore_candidate_lock_entry_checked(&candidate, previous_lock.as_ref())
+                .and_then(|()| rollback_files())
+                .map_err(|error| pioneer_crud::SkillReconciliationError {
+                    outcome: pioneer_crud::SkillReconciliationFailure::NotCommitted,
+                    error: error.context("stale publication compensation failed; backup retained"),
+                })?;
+            if !reused_recovery {
+                super::watcher::reconcile::set_attempt_publishing(&recovery, false)?;
+            }
             return Ok(SkillStorageRelocationOutcome::Stale);
         }
-        // A failed commit may have taken effect. Do not perform an unfenced
-        // rollback/repair or another claim in this quantum; retry reads fresh facts.
-        Err(error) => return Err(error),
+        Err(error) => {
+            if error
+                .downcast_ref::<pioneer_crud::SkillReconciliationError>()
+                .is_some_and(|error| {
+                    error.outcome == pioneer_crud::SkillReconciliationFailure::NotCommitted
+                })
+            {
+                if let Err(restore) =
+                    restore_candidate_lock_entry_checked(&candidate, previous_lock.as_ref())
+                        .and_then(|()| rollback_files())
+                {
+                    return Err(pioneer_crud::SkillReconciliationError {
+                        outcome: pioneer_crud::SkillReconciliationFailure::NotCommitted,
+                        error: restore.context(format!("publication rejected ({error:#}); compensation failed and backup retained")),
+                    }.into());
+                }
+                if !reused_recovery {
+                    super::watcher::reconcile::set_attempt_publishing(&recovery, false)?;
+                }
+            }
+            return Err(error);
+        }
     }
     let mut old_paths = Vec::new();
     if candidate.remove_managed_source_after_switch
@@ -1265,18 +1405,24 @@ pub(crate) async fn publish_watched_candidate(
         if path != candidate.destination
             && path_is_existing_descendant(&candidate.install_root, &path)
         {
-            let garbage = path.with_file_name(format!(
-                ".pioneer-relocation-{}",
-                pioneer_protocol::generate_id(21)
-            ));
-            if fs::symlink_metadata(&garbage).is_err() {
-                if track_garbage(garbage.clone()).is_err() {
-                    warn!("managed skill source cleanup could not be tracked");
+            let Some(parent) = path.parent() else {
+                warn!("committed skill source cleanup deferred: missing parent");
+                continue;
+            };
+            let garbage = match super::watcher::reconcile::new_attempt(
+                parent,
+                candidate.install_root.clone(),
+            ) {
+                Ok(path) => path,
+                Err(_) => {
+                    warn!("committed skill source cleanup deferred");
                     continue;
                 }
-                if fs::rename(&path, &garbage).is_err() {
-                    warn!("managed skill source cleanup deferred");
-                }
+            };
+            if track_garbage(garbage.clone(), true).is_err()
+                || fs::rename(&path, garbage.join("payload")).is_err()
+            {
+                warn!("committed skill source cleanup deferred");
             }
         }
     }
@@ -1302,6 +1448,14 @@ fn write_candidate_lock_entry(
     candidate: &SkillStorageRelocationCandidate,
     now: i64,
 ) -> Result<Option<SkillLockEntry>> {
+    write_candidate_lock_entry_with_recovery(candidate, now, None)
+}
+
+fn write_candidate_lock_entry_with_recovery(
+    candidate: &SkillStorageRelocationCandidate,
+    now: i64,
+    recovery: Option<&Path>,
+) -> Result<Option<SkillLockEntry>> {
     let Some(lock_path) = candidate.managed_lock_path.as_deref() else {
         return Ok(None);
     };
@@ -1311,6 +1465,21 @@ fn write_candidate_lock_entry(
         .iter()
         .find(|entry| entry.skill_id == candidate.expected_row.skill_id)
         .cloned();
+    if let Some(recovery) = recovery {
+        let path = recovery.join("previous-lock-entry.json");
+        // Preserve the original entry (including installed_at) if compensation
+        // fails and the worker stops. Reusing an uncertain backup must not replace
+        // the only original lock facts with the later published entry.
+        if !path.try_exists()? {
+            use std::io::Write;
+            let mut file = tempfile::NamedTempFile::new_in(recovery)?;
+            file.write_all(&serde_json::to_vec(&previous)?)?;
+            file.as_file().sync_all()?;
+            file.persist(&path).map_err(|error| error.error)?;
+            #[cfg(unix)]
+            fs::File::open(recovery)?.sync_all()?;
+        }
+    }
     let installed_at = previous
         .as_ref()
         .map(|entry| entry.installed_at)
@@ -1334,14 +1503,17 @@ fn write_candidate_lock_entry(
     Ok(previous)
 }
 
-fn restore_candidate_lock_entry(
+fn restore_candidate_lock_entry_checked(
     candidate: &SkillStorageRelocationCandidate,
     previous: Option<&SkillLockEntry>,
-) {
+) -> Result<()> {
+    if watch_publication_fault("restore_lock") {
+        bail!("injected lock restoration failure");
+    }
     let Some(lock_path) = candidate.managed_lock_path.as_deref() else {
-        return;
+        return Ok(());
     };
-    let result = (|| -> Result<()> {
+    (|| -> Result<()> {
         let mut lock = read_skills_lock(lock_path)?;
         if let Some(previous) = previous {
             upsert_lock_entry(&mut lock, previous.clone());
@@ -1349,14 +1521,14 @@ fn restore_candidate_lock_entry(
             remove_lock_entry(&mut lock, &candidate.expected_row.skill_id);
         }
         write_skills_lock_atomic(lock_path, &lock)
-    })();
-    if let Err(error) = result {
-        warn!(
-            skill_id = %candidate.expected_row.skill_id,
-            path = %lock_path.display(),
-            error = %format!("{error:#}"),
-            "failed to restore managed skills lock after relocation database failure"
-        );
+    })()
+}
+fn restore_candidate_lock_entry(
+    candidate: &SkillStorageRelocationCandidate,
+    previous: Option<&SkillLockEntry>,
+) {
+    if let Err(error) = restore_candidate_lock_entry_checked(candidate, previous) {
+        warn!(error = %error, "failed to restore managed skills lock");
     }
 }
 

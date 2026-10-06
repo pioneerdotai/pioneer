@@ -15,7 +15,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 #[path = "watcher_reconcile.rs"]
-mod reconcile;
+pub(super) mod reconcile;
 
 const DEBOUNCE: Duration = Duration::from_millis(300);
 const MAX_LATENCY: Duration = Duration::from_secs(2);
@@ -178,6 +178,22 @@ struct Signals {
     overflow: AtomicBool,
     recover: AtomicBool,
     wake: Notify,
+    #[cfg(test)]
+    snapshot_failure_page: StdMutex<Option<usize>>,
+    #[cfg(test)]
+    loop_iterations: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    snapshots: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    source_reads: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    preparations: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    hashes: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    provenance_lookups: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    fallback_rows: std::sync::atomic::AtomicU64,
 }
 
 impl Signals {
@@ -212,7 +228,10 @@ impl Signals {
             {
                 changed = true;
                 dirty.mark(now, rescan || all);
-                dirty.watch_dirty |= all || paths.iter().any(|path| root.starts_with(path));
+                dirty.watch_dirty |= all
+                    || paths.iter().any(|path| root.starts_with(path))
+                    || (!cfg!(target_os = "macos")
+                        && matches!(&event, Ok(event) if matches!(event.kind, EventKind::Create(notify::event::CreateKind::Folder | notify::event::CreateKind::Any) | EventKind::Remove(notify::event::RemoveKind::Folder | notify::event::RemoveKind::Any) | EventKind::Modify(notify::event::ModifyKind::Name(_)))));
             }
         }
         drop(roots);
@@ -245,13 +264,11 @@ impl JobFence {
     }
     fn valid(&self) -> bool {
         !self.stop.is_cancelled()
-            && self
-                .signals
-                .roots
-                .lock()
-                .expect("skills roots lock")
-                .get(&self.root)
-                .is_some_and(|dirty| dirty.incarnation == self.incarnation)
+            && self.signals.roots.try_lock().is_ok_and(|roots| {
+                roots
+                    .get(&self.root)
+                    .is_some_and(|dirty| dirty.incarnation == self.incarnation)
+            })
     }
 }
 
@@ -267,15 +284,59 @@ struct Job {
     failed: bool,
 }
 
+struct WatchWalk {
+    initial: std::collections::VecDeque<(PathBuf, RecursiveMode)>,
+    directories: Vec<std::fs::ReadDir>,
+    prune_after: Option<PathBuf>,
+}
+struct NativePlan {
+    paths: BTreeMap<PathBuf, u64>,
+    generation: u64,
+    walk: Option<WatchWalk>,
+    pending: bool,
+    replacement: bool,
+    initialized: bool,
+    rescan_after_registration: bool,
+    retry_at: Instant,
+    attempts: u32,
+}
+impl NativePlan {
+    fn new() -> Self {
+        Self {
+            paths: BTreeMap::new(),
+            generation: 0,
+            walk: None,
+            pending: true,
+            replacement: false,
+            initialized: false,
+            rescan_after_registration: false,
+            retry_at: Instant::now(),
+            attempts: 0,
+        }
+    }
+}
+struct NativeWatch {
+    active: bool,
+    mode: RecursiveMode,
+    owners: BTreeSet<PathBuf>,
+}
 struct Native {
     watcher: Option<RecommendedWatcher>,
-    watched: BTreeMap<PathBuf, RecursiveMode>,
-    plans: BTreeMap<PathBuf, Vec<(PathBuf, RecursiveMode)>>,
+    watched: BTreeMap<PathBuf, NativeWatch>,
+    plans: BTreeMap<PathBuf, NativePlan>,
     retry_at: Instant,
     attempts: u32,
     recovery_pending: bool,
+    last_root: Option<PathBuf>,
+    sync_after: Option<PathBuf>,
+    // Linux notify Recursive performs an internal unbounded WalkDir. Instead
+    // subscribe each directory before enumerating it, in this worker's cursor.
+    recursive: bool,
+    #[cfg(test)]
+    fail_watch_once: BTreeSet<PathBuf>,
+    #[cfg(test)]
+    watch_calls: BTreeMap<PathBuf, usize>,
 }
-
 impl Native {
     fn new() -> Self {
         Self {
@@ -285,6 +346,13 @@ impl Native {
             retry_at: Instant::now(),
             attempts: 0,
             recovery_pending: false,
+            last_root: None,
+            sync_after: None,
+            recursive: !cfg!(target_os = "linux"),
+            #[cfg(test)]
+            fail_watch_once: BTreeSet::new(),
+            #[cfg(test)]
+            watch_calls: BTreeMap::new(),
         }
     }
     fn request_recovery(&mut self) {
@@ -294,88 +362,261 @@ impl Native {
             self.retry_at = Instant::now() + retry_delay(self.attempts);
         }
     }
-    // Runs as an owned blocking quantum, never on the Tokio reactor.
+    fn ready(&self, root: &Path) -> bool {
+        (self.watcher.is_none() && self.recovery_pending)
+            || self
+                .plans
+                .get(root)
+                .is_some_and(|p| p.initialized || p.attempts != 0)
+    }
     fn refresh(
         mut self,
         paths: Vec<PathBuf>,
         changed: BTreeSet<PathBuf>,
         signals: Arc<Signals>,
     ) -> Self {
-        let result = (|| -> Result<()> {
-            let recover = signals.recover.swap(false, Ordering::AcqRel);
-            if self.recovery_pending || recover {
-                self.recovery_pending = false;
-                self.watcher.take();
-                self.watched.clear();
-                self.plans.clear();
-                signals.invalidate_all();
-            }
-            if self.watcher.is_none() {
-                let callback = signals.clone();
-                // This is the same platform type used by recommended_watcher.
-                // Its constructor is needed to disable symlink traversal from the
-                // start (notify cannot change this option at runtime).
-                self.watcher = Some(RecommendedWatcher::new(
-                    move |event| callback.event(event),
-                    notify::Config::default().with_follow_symlinks(false),
-                )?);
-            }
-            self.plans.retain(|root, _| paths.contains(root));
-            for root in paths {
-                if !self.plans.contains_key(&root) || changed.contains(&root) {
-                    self.plans.insert(root.clone(), watch_plan(&root)?);
-                }
-            }
-            let mut desired = BTreeMap::new();
-            for plan in self.plans.values() {
-                for (path, mode) in plan {
-                    desired
-                        .entry(path.clone())
-                        .and_modify(|old| {
-                            if *mode == RecursiveMode::Recursive {
-                                *old = *mode;
-                            }
-                        })
-                        .or_insert(*mode);
-                }
-            }
-            let watcher = self.watcher.as_mut().expect("watcher exists");
-            // Subscribe replacements first, then release superseded sentinels.
-            for (path, mode) in &desired {
-                if self.watched.get(path) != Some(mode) || changed.contains(path) {
-                    // A deleted/recreated directory can have the same path while
-                    // its old native registration already refers to a dead inode.
-                    if self.watched.contains_key(path) {
-                        let _ = watcher.unwatch(path);
-                    }
-                    watcher.watch(path, *mode)?;
-                    self.watched.insert(path.clone(), *mode);
-                }
-            }
-            let obsolete = self
-                .watched
-                .keys()
-                .filter(|path| !desired.contains_key(*path))
-                .cloned()
-                .collect::<Vec<_>>();
-            for path in obsolete {
-                let _ = watcher.unwatch(&path);
-                self.watched.remove(&path);
-            }
-            Ok(())
-        })();
-        if result.is_err() {
-            // Keep useful subscriptions; retry native registration with backoff.
-            self.attempts = self.attempts.saturating_add(1).min(16);
-            self.retry_at = Instant::now() + retry_delay(self.attempts);
+        let now = Instant::now();
+        if self.recovery_pending || signals.recover.swap(false, Ordering::AcqRel) {
+            self.recovery_pending = false;
+            self.watcher.take();
+            self.watched.clear();
+            self.plans.clear();
+            self.sync_after = None;
             signals.invalidate_all();
-            warn!(
-                "skills native observation degraded; recovery uses backoff and the 30-minute safety reconciliation"
-            );
-        } else {
-            self.attempts = 0;
-            self.retry_at = Instant::now();
         }
+        if self.watcher.is_none() {
+            let callback = signals.clone();
+            match RecommendedWatcher::new(
+                move |event| callback.event(event),
+                notify::Config::default().with_follow_symlinks(false),
+            ) {
+                Ok(watcher) => self.watcher = Some(watcher),
+                Err(_) => {
+                    self.request_recovery();
+                    return self;
+                }
+            }
+        }
+        // Root synchronization and subscription work each consume an explicit
+        // quantum; repeated calls advance the same owned directory iterators.
+        let active: BTreeSet<_> = paths.into_iter().collect();
+        let page = active
+            .iter()
+            .filter(|root| self.sync_after.as_ref().is_none_or(|after| *root > after))
+            .take(64)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.sync_after = page.last().cloned();
+        for root in page {
+            self.plans.entry(root).or_insert_with(NativePlan::new);
+        }
+        for root in changed {
+            if let Some(plan) = self.plans.get_mut(&root) {
+                plan.pending = true;
+                plan.replacement = true;
+                plan.rescan_after_registration = true;
+            }
+        }
+        // Removed roots are pruned in the same bounded path cursor below.
+        let candidates = self
+            .plans
+            .iter()
+            .filter(|(root, plan)| {
+                !active.contains(*root)
+                    || ((plan.pending || plan.walk.is_some()) && plan.retry_at <= now)
+            })
+            .map(|(root, _)| root.clone())
+            .collect::<Vec<_>>();
+        if let Some(root) = next_root(&candidates, self.last_root.as_ref()).cloned() {
+            self.last_root = Some(root.clone());
+            let mut plan = self.plans.remove(&root).expect("native plan");
+            let mut failed_subscription = None;
+            let result = (|| -> Result<()> {
+                if plan.walk.is_none() {
+                    plan.generation = plan
+                        .generation
+                        .checked_add(1)
+                        .context("native generation exhausted")?;
+                    let initial = if active.contains(&root) {
+                        watch_plan(&root)?
+                    } else {
+                        Vec::new()
+                    };
+                    plan.walk = Some(WatchWalk {
+                        initial: initial.into(),
+                        directories: Vec::new(),
+                        prune_after: None,
+                    });
+                    plan.pending = false;
+                }
+                for _ in 0..64 {
+                    let walk = plan.walk.as_mut().expect("registration cursor");
+                    let next = if let Some(item) = walk.initial.pop_front() {
+                        Some(item)
+                    } else if let Some(entries) = walk.directories.last_mut() {
+                        match entries.next() {
+                            None => {
+                                walk.directories.pop();
+                                continue;
+                            }
+                            Some(entry) => {
+                                let entry = entry?;
+                                let metadata = std::fs::symlink_metadata(entry.path())?;
+                                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                                    continue;
+                                }
+                                Some((entry.path(), RecursiveMode::Recursive))
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some((path, requested)) = next {
+                        let mode = if !self.recursive {
+                            RecursiveMode::NonRecursive
+                        } else if active.contains(&path) {
+                            RecursiveMode::Recursive
+                        } else {
+                            requested
+                        };
+                        let owner_roots = self
+                            .watched
+                            .get(&path)
+                            .map(|w| w.owners.clone())
+                            .unwrap_or_default();
+                        let replace =
+                            plan.replacement && plan.paths.get(&path) != Some(&plan.generation);
+                        let existing = self.watched.get(&path);
+                        let watch = existing.is_none_or(|watch| !watch.active)
+                            || replace
+                            || existing.is_some_and(|w| w.mode != mode);
+                        plan.paths.insert(path.clone(), plan.generation);
+                        if watch {
+                            failed_subscription = Some(path.clone());
+                            // Ownership survives a failed replacement, while the
+                            // active flag loses proof before unwatch. Shared roots
+                            // must not lose their sentinel when another root retries.
+                            if self.watched.get(&path).is_some_and(|watch| watch.active) {
+                                self.watched.get_mut(&path).unwrap().active = false;
+                                let _ = self.watcher.as_mut().unwrap().unwatch(&path);
+                            }
+                            let mut owners = owner_roots;
+                            owners.insert(root.clone());
+                            self.watched.insert(
+                                path.clone(),
+                                NativeWatch {
+                                    active: false,
+                                    mode,
+                                    owners,
+                                },
+                            );
+                            #[cfg(test)]
+                            {
+                                *self.watch_calls.entry(path.clone()).or_default() += 1;
+                                if self.fail_watch_once.remove(&path) {
+                                    bail!("injected replacement watch failure");
+                                }
+                            }
+                            self.watcher.as_mut().unwrap().watch(&path, mode)?;
+                            self.watched.get_mut(&path).unwrap().active = true;
+                            failed_subscription = None;
+                        }
+                        self.watched
+                            .get_mut(&path)
+                            .unwrap()
+                            .owners
+                            .insert(root.clone());
+                        if !self.recursive && requested == RecursiveMode::Recursive {
+                            // No snapshot/enumeration before this directory's native
+                            // subscription. New/moved folders request another round.
+                            walk.directories.push(std::fs::read_dir(&path)?);
+                        }
+                        continue;
+                    }
+                    let next = plan
+                        .paths
+                        .range::<PathBuf, _>((
+                            walk.prune_after
+                                .as_ref()
+                                .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .next()
+                        .map(|(path, generation)| (path.clone(), *generation));
+                    let Some((path, generation)) = next else {
+                        plan.walk = None;
+                        plan.replacement = false;
+                        break;
+                    };
+                    walk.prune_after = Some(path.clone());
+                    if generation != plan.generation {
+                        plan.paths.remove(&path);
+                        if let Some(watch) = self.watched.get_mut(&path) {
+                            watch.owners.remove(&root);
+                            if watch.owners.is_empty() {
+                                self.watched.remove(&path);
+                                let _ = self.watcher.as_mut().unwrap().unwatch(&path);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            if result.is_err() {
+                plan.attempts = plan.attempts.saturating_add(1).min(16);
+                plan.retry_at = now + retry_delay(plan.attempts);
+                plan.walk = None;
+                plan.pending = true;
+                plan.rescan_after_registration = true;
+                if let Some(watch) = failed_subscription
+                    .as_ref()
+                    .and_then(|path| self.watched.get(path))
+                {
+                    for owner in &watch.owners {
+                        if let Some(other) = self.plans.get_mut(owner) {
+                            other.pending = true;
+                            other.retry_at = other.retry_at.max(plan.retry_at);
+                            other.rescan_after_registration = true;
+                        }
+                    }
+                }
+                warn!(
+                    "skills native registration failed; useful subscriptions retained and root retry delayed"
+                );
+            } else {
+                if plan.walk.is_none() {
+                    plan.attempts = 0;
+                    plan.initialized = true;
+                }
+                if plan.walk.is_none() && plan.rescan_after_registration {
+                    if let Some(dirty) = signals
+                        .roots
+                        .lock()
+                        .expect("skills roots lock")
+                        .get_mut(&root)
+                    {
+                        dirty.mark(Instant::now(), true);
+                    }
+                    plan.rescan_after_registration = false;
+                }
+            }
+            if active.contains(&root) || !plan.paths.is_empty() {
+                self.plans.insert(root, plan);
+            }
+        }
+        self.attempts = u32::from(
+            self.sync_after.is_some()
+                || self.plans.iter().any(|(root, plan)| {
+                    !active.contains(root) || plan.pending || plan.walk.is_some()
+                }),
+        );
+        self.retry_at = self
+            .plans
+            .values()
+            .filter(|p| p.pending || p.walk.is_some())
+            .map(|p| p.retry_at)
+            .min()
+            .unwrap_or(now);
         self
     }
 }
@@ -493,7 +734,13 @@ fn next_root<'a>(ready: &'a [PathBuf], last: Option<&PathBuf>) -> Option<&'a Pat
 }
 
 async fn run(this: Arc<MessageProcessor>, stop: CancellationToken) {
-    let signals = Arc::new(Signals::default());
+    run_with_signals(this, stop, Arc::new(Signals::default())).await;
+}
+async fn run_with_signals(
+    this: Arc<MessageProcessor>,
+    stop: CancellationToken,
+    signals: Arc<Signals>,
+) {
     let changes = this.workspace_manager.changes();
     let mut native = Native::new();
     let mut registrations: BTreeMap<PathBuf, Registration> = BTreeMap::new();
@@ -512,6 +759,8 @@ async fn run(this: Arc<MessageProcessor>, stop: CancellationToken) {
         "skills native events may be unavailable on network filesystems; observation there is degraded to the bounded 30-minute safety reconciliation"
     );
     while !stop.is_cancelled() {
+        #[cfg(test)]
+        signals.loop_iterations.fetch_add(1, Ordering::Relaxed);
         {
             let mut roots = signals.roots.lock().expect("skills roots lock");
             for (path, dirty) in roots.iter_mut() {
@@ -549,9 +798,11 @@ async fn run(this: Arc<MessageProcessor>, stop: CancellationToken) {
             && Instant::now() >= snapshot_retry
         {
             let revision = changes.revision();
-            let snapshot = snapshot_roots(&this, &stop, &signals, &mut native).await;
+            let snapshot = snapshot_roots(&this, &stop, &signals).await;
             match snapshot {
                 Ok(mut next) => {
+                    #[cfg(test)]
+                    signals.snapshots.fetch_add(1, Ordering::Relaxed);
                     let mut dirty = signals.roots.lock().expect("skills roots lock");
                     dirty.retain(|path, _| next.contains_key(path));
                     for (path, registration) in &mut next {
@@ -612,9 +863,6 @@ async fn run(this: Arc<MessageProcessor>, stop: CancellationToken) {
                 Ok(updated) => {
                     native = updated;
                     refresh_watches = native.attempts != 0;
-                    if refresh_watches {
-                        rewatch.extend(registrations.keys().cloned());
-                    }
                 }
                 Err(_) => break,
             }
@@ -626,11 +874,12 @@ async fn run(this: Arc<MessageProcessor>, stop: CancellationToken) {
             registrations
                 .keys()
                 .filter(|root| {
-                    jobs.contains_key(*root)
-                        || roots
-                            .get(*root)
-                            .and_then(Dirty::due)
-                            .is_some_and(|due| due <= now)
+                    native.ready(root)
+                        && (jobs.contains_key(*root)
+                            || roots
+                                .get(*root)
+                                .and_then(Dirty::due)
+                                .is_some_and(|due| due <= now))
                 })
                 .cloned()
                 .collect::<Vec<_>>()
@@ -735,8 +984,9 @@ async fn run(this: Arc<MessageProcessor>, stop: CancellationToken) {
             .roots
             .lock()
             .expect("skills roots lock")
-            .values()
-            .filter_map(Dirty::due)
+            .iter()
+            .filter(|(path, _)| registrations.contains_key(*path) && native.ready(path))
+            .filter_map(|(_, dirty)| dirty.due())
             .min()
             .unwrap_or(next_safety);
         let mut deadline = next_due.min(next_safety);
@@ -757,43 +1007,33 @@ async fn run(this: Arc<MessageProcessor>, stop: CancellationToken) {
     // No job is being polled here, hence every blocking quantum has been joined.
     jobs.clear();
     let _ = tokio::task::spawn_blocking(move || drop(native)).await;
-    // Cleanup also yields between bounded quanta; shutdown owns every join.
-    loop {
-        let path = attempts.lock().expect("skills attempts lock").pop_first();
-        let Some((path, _)) = path else {
-            break;
-        };
-        let start = tokio::task::spawn_blocking(move || reconcile::Removal::new(path)).await;
-        let Ok(Ok(mut removal)) = start else {
-            continue;
-        };
-        loop {
-            let result = tokio::task::spawn_blocking(move || {
-                let done = removal.step()?;
-                Ok::<_, anyhow::Error>((removal, done))
-            })
-            .await;
-            let Ok(Ok((next, done))) = result else {
-                break;
-            };
-            removal = next;
-            if done {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    }
+    // Cancellation stops after the owned quantum. Exact durable markers let the
+    // next worker reclaim staging; shutdown must neither erase an uncertain
+    // backup nor recursively drain arbitrarily large garbage before returning.
 }
 
 async fn snapshot_roots(
     this: &MessageProcessor,
     stop: &CancellationToken,
-    signals: &Arc<Signals>,
-    native: &mut Native,
+    _signals: &Arc<Signals>,
 ) -> Result<BTreeMap<PathBuf, Registration>> {
     let mut roots = BTreeMap::<PathBuf, Registration>::new();
     let mut after = None;
+    #[cfg(test)]
+    let mut page_number = 0;
     loop {
+        #[cfg(test)]
+        {
+            if *_signals
+                .snapshot_failure_page
+                .lock()
+                .expect("snapshot failpoint")
+                == Some(page_number)
+            {
+                bail!("injected Workspace page failure");
+            }
+            page_number += 1;
+        }
         let page = tokio::select! { biased; _ = stop.cancelled() => bail!("skills watcher stopped"), page = this.workspace_manager.active_page(after.as_deref()) => page? };
         if page.is_empty() {
             break;
@@ -811,7 +1051,8 @@ async fn snapshot_roots(
                     let owner =
                         (root.source_kind != SkillSourceKind::System).then_some(workspace.clone());
                     found.push((
-                        physical_root(&root.source_root)?,
+                        physical_root(&root.source_root)
+                            .unwrap_or(normalize_absolute_path(&root.source_root)?),
                         Mapping::Import(config, owner),
                     ));
                 }
@@ -821,7 +1062,8 @@ async fn snapshot_roots(
                     let owner =
                         (root.source_kind != SkillSourceKind::System).then_some(workspace.clone());
                     found.push((
-                        physical_root(&root.managed_root)?,
+                        physical_root(&root.managed_root)
+                            .unwrap_or(normalize_absolute_path(&root.managed_root)?),
                         Mapping::Managed(config, owner),
                     ));
                 }
@@ -829,12 +1071,6 @@ async fn snapshot_roots(
             })
             .await?;
             for (path, mapping) in registrations {
-                signals
-                    .roots
-                    .lock()
-                    .expect("skills roots lock")
-                    .entry(path.clone())
-                    .or_insert_with(|| Dirty::new(0, Instant::now()));
                 let registration = roots.entry(path).or_default();
                 if !registration
                     .mappings
@@ -845,28 +1081,6 @@ async fn snapshot_roots(
                 }
                 registration.subscribers.insert(workspace_id.clone());
             }
-        }
-        // Native handles exist before any package discovery/preparation starts.
-        // Failed registrations keep degraded state and are retried independently.
-        if Instant::now() >= native.retry_at {
-            let paths = roots
-                .keys()
-                .cloned()
-                .chain(
-                    signals
-                        .roots
-                        .lock()
-                        .expect("skills roots lock")
-                        .keys()
-                        .cloned(),
-                )
-                .collect();
-            let callback = signals.clone();
-            let moved = std::mem::replace(native, Native::new());
-            *native = owned_fs(stop, move || {
-                Ok(moved.refresh(paths, BTreeSet::new(), callback))
-            })
-            .await?;
         }
     }
     Ok(roots)

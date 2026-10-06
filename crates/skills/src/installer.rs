@@ -1,5 +1,5 @@
 use crate::audit::{SkillAuditAction, SkillAuditDecision, SkillAuditEvent};
-use crate::contract::{SkillSourceKind, parse_skill_from_file};
+use crate::contract::SkillSourceKind;
 use crate::dependencies::{
     DependencyCheckInput, DependencyCheckResult, evaluate_skill_dependencies,
 };
@@ -687,80 +687,106 @@ impl MaterializedSkillPreparation {
     }
 
     pub fn step(&mut self, entries_budget: usize) -> Result<Option<PreparedMaterializedSkill>> {
-        let scan = self
-            .scan
-            .as_mut()
-            .context("skill preparation already completed")?;
+        let request = self
+            .request
+            .as_ref()
+            .context("skill preparation completed")?
+            .clone();
+        self.step_facts(entries_budget)?
+            .map(|facts| facts.prepare(request))
+            .transpose()
+    }
+
+    /// Physical directory security facts and source bytes, independently of a
+    /// Workspace ID or policy decision. Never reusable for another source path.
+    pub fn step_facts(&mut self, entries_budget: usize) -> Result<Option<MaterializedSkillFacts>> {
+        let scan = self.scan.as_mut().context("skill preparation completed")?;
         if !scan.step(entries_budget.min(64)) {
             return Ok(None);
         }
-        let report = self.scan.take().expect("scan exists").report();
-        finish_materialized_skill_preparation(self.request.take().expect("request exists"), report)
-            .map(Some)
+        let scan = self.scan.take().expect("scan exists");
+        let largest_file_bytes = scan.largest_file_bytes;
+        let report = scan.report();
+        if report.decision == crate::security::SecurityDecision::Block {
+            bail!("install blocked by security scan findings");
+        }
+        let request = self.request.take().expect("request exists");
+        let path = request.materialized_source_path;
+        let input = crate::contract::read_skill_file_input(
+            request.skill_id,
+            &path.join("SKILL.md"),
+            request.source_kind,
+            path.parent().unwrap_or(&path),
+            request.policy.security.max_install_file_bytes.max(1),
+        )?;
+        Ok(Some(MaterializedSkillFacts {
+            largest_file_bytes: largest_file_bytes.max(input.len() as u64),
+            source_path: path,
+            input,
+            security_report: report,
+        }))
     }
 }
 
-fn finish_materialized_skill_preparation(
-    request: PrepareMaterializedSkillRequest,
+/// Owned facts of one source directory, retained only by a root round. Security
+/// thresholds, trust, dependency policy and source-kind parsing remain per scope.
+#[derive(Debug)]
+pub struct MaterializedSkillFacts {
+    source_path: PathBuf,
+    input: crate::contract::SkillFileInput,
+    largest_file_bytes: u64,
     security_report: crate::security::SecurityScanReport,
-) -> Result<PreparedMaterializedSkill> {
-    let source_root = request
-        .materialized_source_path
-        .parent()
-        .unwrap_or(&request.materialized_source_path)
-        .to_path_buf();
-    // This report belongs to the incremental scan above; its decision is
-    // accumulated per quantum rather than walking all findings again.
-    if security_report.decision == crate::security::SecurityDecision::Block {
-        bail!("install blocked by security scan findings");
+}
+impl MaterializedSkillFacts {
+    pub fn definition_for(
+        &self,
+        request: &PrepareMaterializedSkillRequest,
+    ) -> Result<crate::compile::SkillDefinition> {
+        self.scoped_definition(request)
+            .map(|(definition, _)| definition)
     }
-
-    let skill_file = request.materialized_source_path.join("SKILL.md");
-    if !skill_file.is_file() {
-        bail!(
-            "staged skill `{}` is missing required SKILL.md",
-            request.materialized_source_path.display()
-        );
+    fn scoped_definition(
+        &self,
+        request: &PrepareMaterializedSkillRequest,
+    ) -> Result<(crate::compile::SkillDefinition, DependencyCheckResult)> {
+        if request.materialized_source_path != self.source_path {
+            bail!("materialized source facts cannot change path");
+        }
+        if self.largest_file_bytes > request.policy.security.max_install_file_bytes.max(1) as u64 {
+            bail!("install blocked by file size policy");
+        }
+        let definition = self
+            .input
+            .parse(request.skill_id.clone(), request.source_kind)?;
+        if !request.policy.security.allow_untrusted_install
+            && matches!(
+                definition.runtime.trust_level,
+                crate::contract::SkillTrustLevel::Untrusted
+            )
+        {
+            bail!("untrusted skill is blocked by policy");
+        }
+        let dependency_report =
+            evaluate_skill_dependencies(&definition, &request.policy.dependency_input);
+        if request.policy.block_on_dependency_failures && dependency_report.has_failures() {
+            bail!("install blocked by dependency failures");
+        }
+        Ok((definition, dependency_report))
     }
-
-    let definition = parse_skill_from_file(
-        request.skill_id,
-        skill_file.as_path(),
-        request.source_kind.clone(),
-        source_root.as_path(),
-        request.policy.security.max_install_file_bytes.max(1),
-    )?;
-
-    if !request.policy.security.allow_untrusted_install
-        && matches!(
-            definition.runtime.trust_level,
-            crate::contract::SkillTrustLevel::Untrusted
-        )
-    {
-        bail!(
-            "untrusted skill `{}` is blocked by policy",
-            definition.identity.slug
-        );
+    pub fn prepare(
+        self,
+        request: PrepareMaterializedSkillRequest,
+    ) -> Result<PreparedMaterializedSkill> {
+        let (definition, dependency_report) = self.scoped_definition(&request)?;
+        Ok(PreparedMaterializedSkill {
+            definition,
+            dependency_report,
+            source_kind: request.source_kind,
+            source_ref: request.source_ref,
+            source_path: self.source_path,
+            security_report: self.security_report,
+        })
     }
-
-    let dependency_report =
-        evaluate_skill_dependencies(&definition, &request.policy.dependency_input);
-
-    if request.policy.block_on_dependency_failures && dependency_report.has_failures() {
-        bail!(
-            "install blocked by dependency failures for `{}`",
-            definition.identity.slug
-        );
-    }
-
-    Ok(PreparedMaterializedSkill {
-        definition,
-        source_kind: request.source_kind,
-        source_ref: request.source_ref,
-        source_path: request.materialized_source_path,
-        dependency_report,
-        security_report,
-    })
 }
 
 pub fn commit_prepared_skill(request: CommitPreparedSkillRequest) -> Result<InstallSkillResult> {

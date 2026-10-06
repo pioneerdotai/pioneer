@@ -86,23 +86,13 @@ impl Fixture {
         options.max_connections(1);
         options.map_sqlx_sqlite_opts(|o| o.pragma("foreign_keys", "ON"));
         let writer = Database::connect(options).await?;
-        Migrator::up(
-            &writer,
-            if latest {
-                None
-            } else {
-                Some(
-                    Migrator::migrations()
-                        .iter()
-                        .position(|migration| {
-                            migration.name() == "m20260919_000001_native_event_cleanup_queue"
-                        })
-                        .expect("native cleanup migration is registered")
-                        as u32,
-                )
-            },
-        )
-        .await?;
+        let boundary = Migrator::migrations()
+            .iter()
+            .position(|migration| migration.name() == "m20260919_000001_native_event_cleanup_queue")
+            .expect("native cleanup migration registered") as u32;
+        // This fixture's latest means its own release boundary, not whichever
+        // unrelated migration was appended most recently.
+        Migrator::up(&writer, Some(boundary + u32::from(latest))).await?;
         writer.execute_unprepared("PRAGMA journal_mode=WAL").await?;
         let fixture = Self::connect(path, writer).await?;
         fixture.sql("INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws-cleanup','Cleanup',1,1)").await?;
@@ -147,7 +137,14 @@ impl Fixture {
         options.map_sqlx_sqlite_opts(|o| o.pragma("foreign_keys", "ON"));
         let writer = Database::connect(options).await?;
         match migration {
-            Some(true) => Migrator::down(&writer, Some(1)).await?,
+            Some(true) => {
+                let applied = Migrator::get_applied_migrations(&writer).await?;
+                let boundary = applied
+                    .iter()
+                    .position(|m| m.name() == "m20260919_000001_native_event_cleanup_queue")
+                    .expect("native cleanup migration applied");
+                Migrator::down(&writer, Some((applied.len() - boundary) as u32)).await?;
+            }
             Some(false) => {
                 let applied: i64 = writer
                     .query_one_raw(Statement::from_string(

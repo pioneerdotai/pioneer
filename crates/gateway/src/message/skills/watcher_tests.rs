@@ -31,9 +31,13 @@ pub(super) struct Harness {
     pub(super) processor: Arc<MessageProcessor>,
     pub(super) workspace: pioneer_entity::workspace::Model,
     pub(super) observer: Arc<Observer>,
+    pub(super) writer: SqliteWriteExecutor,
 }
 
 pub(super) async fn harness() -> Harness {
+    harness_with_bad_root(false).await
+}
+async fn harness_with_bad_root(bad_root: bool) -> Harness {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("skills.sqlite");
     let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
@@ -51,11 +55,9 @@ pub(super) async fn harness() -> Harness {
         .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
     let reader = Database::connect(options).await.unwrap();
     let observer = Arc::new(Observer::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
-        reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
-        observer.clone(),
-    );
+    let writer = SqliteWriteExecutor::with_observer(writer, observer.clone());
+    let database =
+        SqliteDatabase::from_executor_with_read_observer(reader, writer.clone(), observer.clone());
     let manager = Arc::new(crate::workspace::WorkspaceManager::new(database.clone()));
     manager
         .create_workspace("ws", Some("Skills test"))
@@ -85,6 +87,14 @@ pub(super) async fn harness() -> Harness {
             .to_string(),
     ];
     config.skills.user_import_roots = vec![directory.path().join("source").display().to_string()];
+    if bad_root {
+        let path = directory.path().join("bad-root");
+        std::fs::write(&path, b"not a directory").unwrap();
+        config
+            .skills
+            .user_import_roots
+            .push(path.display().to_string());
+    }
     config.skills.security.allow_untrusted_install = true;
     let processor = Arc::new(
         MessageProcessor::new(
@@ -117,6 +127,7 @@ pub(super) async fn harness() -> Harness {
         processor,
         workspace,
         observer,
+        writer,
     }
 }
 
@@ -269,8 +280,8 @@ async fn shared_system_roots_are_registered_once_with_all_workspace_scopes() {
         .unwrap();
     let signals = Arc::new(Signals::default());
     let stop = CancellationToken::new();
-    let mut native = Native::new();
-    let roots = snapshot_roots(&harness.processor, &stop, &signals, &mut native)
+    let native = Native::new();
+    let roots = snapshot_roots(&harness.processor, &stop, &signals)
         .await
         .unwrap();
     let system = roots.values().filter(|root| root.mappings.iter().any(|mapping| matches!(mapping, Mapping::Managed(config, _) if config.roots[0].source_kind == SkillSourceKind::System))).collect::<Vec<_>>();
@@ -280,15 +291,10 @@ async fn shared_system_roots_are_registered_once_with_all_workspace_scopes() {
         BTreeSet::from(["ws".into(), "second".into()])
     );
     assert_eq!(system[0].mappings.len(), 1);
-    // No FS snapshot occurred before registrations: all roots remain pending.
-    assert!(
-        signals
-            .roots
-            .lock()
-            .unwrap()
-            .values()
-            .all(|dirty| dirty.acknowledged == 0)
-    );
+    // Workspace preparation is unpublished. Native subscription and the full
+    // initial FS snapshot follow activation in the actual worker.
+    assert!(signals.roots.lock().unwrap().is_empty());
+    assert!(native.watched.is_empty());
     let changed = harness.processor.workspace_manager.changes();
     let before = changed.revision();
     let scoped = harness
@@ -327,6 +333,12 @@ fn native_backend_failure_has_backoff_without_a_polling_fallback() {
     );
     assert_eq!(native.attempts, 1);
     assert!(native.retry_at > Instant::now());
+    let mut unavailable = Native::new();
+    unavailable.request_recovery();
+    assert!(
+        unavailable.ready(Path::new("/degraded")),
+        "native unavailability must not block initial/safety reconciliation"
+    );
 }
 
 #[tokio::test]
@@ -343,7 +355,14 @@ async fn native_atomic_save_and_rename_mark_dirty_without_hash_polling() {
     let callback = signals.clone();
     let paths = vec![root.clone()];
     let native = tokio::task::spawn_blocking(move || {
-        Native::new().refresh(paths, BTreeSet::new(), callback)
+        let mut native = Native::new();
+        for _ in 0..10 {
+            native = native.refresh(paths.clone(), BTreeSet::new(), callback.clone());
+            if native.attempts == 0 {
+                break;
+            }
+        }
+        native
     })
     .await
     .unwrap();
@@ -431,4 +450,291 @@ fn repeated_backend_events_cannot_cancel_the_recovery_delay() {
     }
     assert_eq!(native.attempts, 1);
     assert_eq!(native.retry_at, retry);
+}
+
+// These exercise the actual worker, including subscriptions, deadlines, jobs and
+// sleeping, rather than an isolated Duration expression.
+#[tokio::test]
+async fn partial_snapshot_startup_backoff_and_late_event_recovery() {
+    let harness = harness().await;
+    let source = harness.directory.path().join("source/pkg");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("SKILL.md"), "---\nname: Test\n---\nInitial").unwrap();
+    let signals = Arc::new(Signals::default());
+    *signals.snapshot_failure_page.lock().unwrap() = Some(1);
+    let stop = CancellationToken::new();
+    let worker = tokio::spawn(run_with_signals(
+        harness.processor.clone(),
+        stop.clone(),
+        signals.clone(),
+    ));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let iterations = signals.loop_iterations.load(Ordering::Relaxed);
+    assert!(iterations < 20, "snapshot backoff must sleep");
+    assert!(
+        signals.roots.lock().unwrap().is_empty(),
+        "failed snapshot publishes no orphan roots"
+    );
+    std::fs::write(source.join("SKILL.md"), "---\nname: Test\n---\nLate edit").unwrap();
+    *signals.snapshot_failure_page.lock().unwrap() = None;
+    signals.wake.notify_one();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        signals.snapshots.load(Ordering::Relaxed),
+        0,
+        "wake cannot cancel poison delay"
+    );
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let rows = harness
+                .processor
+                .crud_store
+                .list_skill_installations_scope_page("user", "ws", None, 64)
+                .await
+                .unwrap();
+            if let Some(row) = rows.iter().find(|row| !row.fingerprint.is_empty()) {
+                assert!(
+                    std::fs::read_to_string(Path::new(&row.install_path).join("SKILL.md"))
+                        .unwrap()
+                        .contains("Late edit")
+                );
+                assert!(signals.snapshots.load(Ordering::Relaxed) > 0);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.cancel();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_snapshot_update_keeps_live_roots_and_root_failure_is_isolated() {
+    let harness = harness_with_bad_root(true).await;
+    let signals = Arc::new(Signals::default());
+    let stop = CancellationToken::new();
+    let worker = tokio::spawn(run_with_signals(
+        harness.processor.clone(),
+        stop.clone(),
+        signals.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while signals.snapshots.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let roots = signals.roots.lock().unwrap().len();
+    *signals.snapshot_failure_page.lock().unwrap() = Some(1);
+    harness
+        .processor
+        .workspace_manager
+        .create_workspace("other", Some("Changed"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let before = signals.loop_iterations.load(Ordering::Relaxed);
+    let source = harness.directory.path().join("source/pkg");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("SKILL.md"),
+        "---\nname: Healthy\n---\nLate healthy root",
+    )
+    .unwrap();
+    signals.event(Ok(Event::new(EventKind::Any).add_path(source)));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(signals.roots.lock().unwrap().len(), roots);
+    assert!(
+        signals.loop_iterations.load(Ordering::Relaxed) - before < 200,
+        "no expired provisional deadline spin"
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rows = harness
+                .processor
+                .crud_store
+                .list_skill_installations_scope_page("user", "ws", None, 64)
+                .await
+                .unwrap();
+            if rows.iter().any(|row| !row.fingerprint.is_empty()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("healthy previous mapping continues during snapshot backoff");
+    *signals.snapshot_failure_page.lock().unwrap() = None;
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let rows = harness
+                .processor
+                .crud_store
+                .list_skill_installations_scope_page("user", "ws", None, 64)
+                .await
+                .unwrap();
+            if signals.snapshots.load(Ordering::Relaxed) >= 2
+                && rows.iter().any(|row| !row.fingerprint.is_empty())
+            {
+                let other = harness
+                    .processor
+                    .crud_store
+                    .list_skill_installations_scope_page("user", "other", None, 64)
+                    .await
+                    .unwrap();
+                if other.iter().any(|row| !row.fingerprint.is_empty()) {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.cancel();
+    worker.await.unwrap();
+}
+
+#[test]
+fn bounded_native_directory_registration_and_shared_sentinel_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let parent = fs_canonical(directory.path());
+    let root = parent.join("root");
+    std::fs::create_dir(&root).unwrap();
+    for i in 0..150 {
+        std::fs::create_dir(root.join(format!("d{i}"))).unwrap();
+    }
+    let signals = Arc::new(Signals::default());
+    let mut native = Native::new();
+    native.recursive = false; // exercise the Linux strategy on every test host
+    native = native.refresh(vec![root.clone()], BTreeSet::new(), signals.clone());
+    assert!(native.watched.len() <= 64);
+    assert!(!native.ready(&root));
+    for _ in 0..20 {
+        native = native.refresh(vec![root.clone()], BTreeSet::new(), signals.clone());
+        if native.ready(&root) {
+            break;
+        }
+    }
+    assert!(native.ready(&root));
+    assert_eq!(native.watched.len(), 152);
+    let sentinel = parent.join("sentinel");
+    std::fs::create_dir(&sentinel).unwrap();
+    let a = sentinel.join("absent/a");
+    let b = sentinel.join("absent/b");
+    for _ in 0..4 {
+        native = native.refresh(
+            vec![root.clone(), a.clone(), b.clone()],
+            BTreeSet::new(),
+            signals.clone(),
+        );
+    }
+    assert_eq!(native.watched[&sentinel].owners.len(), 2);
+    let watched_before = native.watch_calls[&sentinel];
+    native.fail_watch_once.insert(sentinel.clone());
+    std::fs::remove_dir(&sentinel).unwrap();
+    std::fs::create_dir(&sentinel).unwrap();
+    native = native.refresh(
+        vec![root.clone(), a.clone(), b.clone()],
+        BTreeSet::from([a.clone(), b.clone()]),
+        signals.clone(),
+    );
+    assert!(
+        !native
+            .watched
+            .get(&sentinel)
+            .is_some_and(|watch| watch.active),
+        "unwatch plus failed replacement cannot claim a live subscription"
+    );
+    assert!(native.plans[&a].retry_at > Instant::now());
+    native.plans.get_mut(&a).unwrap().retry_at = Instant::now();
+    native.plans.get_mut(&b).unwrap().retry_at = Instant::now();
+    for _ in 0..4 {
+        native = native.refresh(
+            vec![root.clone(), a.clone(), b.clone()],
+            BTreeSet::new(),
+            signals.clone(),
+        );
+    }
+    assert!(native.watched.contains_key(&sentinel));
+    assert!(native.watch_calls[&sentinel] > watched_before);
+    std::fs::create_dir(sentinel.join("absent")).unwrap();
+    for _ in 0..4 {
+        native = native.refresh(
+            vec![root.clone(), a.clone(), b.clone()],
+            BTreeSet::from([a.clone(), b.clone()]),
+            signals.clone(),
+        );
+    }
+    assert!(
+        native.watched.contains_key(&sentinel.join("absent")),
+        "subscription advances without safety round"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_preserves_protected_last_copy_discovered_after_restart() {
+    let harness = harness().await;
+    let config = harness.processor.managed_root_scan_config("ws").unwrap();
+    let root = config
+        .roots
+        .iter()
+        .find(|root| root.source_kind == SkillSourceKind::User)
+        .unwrap()
+        .managed_root
+        .clone();
+    let parent = root.join("container");
+    std::fs::create_dir_all(&parent).unwrap();
+    let wrapper = reconcile::new_attempt(&parent, root).unwrap();
+    std::fs::create_dir(wrapper.join("backup")).unwrap();
+    std::fs::write(wrapper.join("backup/SKILL.md"), "Last copy").unwrap();
+    reconcile::set_attempt_publishing(&wrapper, true).unwrap();
+    let signals = Arc::new(Signals::default());
+    let stop = CancellationToken::new();
+    let worker = tokio::spawn(run_with_signals(
+        harness.processor.clone(),
+        stop.clone(),
+        signals.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while signals.snapshots.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    stop.cancel();
+    worker.await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(wrapper.join("backup/SKILL.md")).unwrap(),
+        "Last copy"
+    );
+}
+
+#[test]
+fn prepared_guard_never_waits_for_the_callback_mutex_under_writer_capacity() {
+    let signals = Arc::new(Signals::default());
+    let root = PathBuf::from("/guard");
+    signals
+        .roots
+        .lock()
+        .unwrap()
+        .insert(root.clone(), Dirty::new(1, Instant::now()));
+    let guard = JobFence {
+        signals: signals.clone(),
+        root,
+        incarnation: 1,
+        stop: CancellationToken::new(),
+    };
+    let lock = signals.roots.lock().unwrap();
+    assert!(
+        !guard.valid(),
+        "contention rejects the prepared write instead of waiting under DB capacity"
+    );
+    drop(lock);
+    assert!(guard.valid());
 }

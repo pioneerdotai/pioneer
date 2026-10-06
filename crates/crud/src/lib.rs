@@ -2081,6 +2081,40 @@ pub struct SkillReconciliationSnapshot {
     model: pioneer_entity::skill_installation::Model,
 }
 
+/// Outcome of a failed prepared publication. An error before a transaction's
+/// mutation or after acknowledged rollback proves that no commit took place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillReconciliationFailure {
+    NotCommitted,
+    Unknown,
+}
+
+#[derive(Debug)]
+pub struct SkillReconciliationError {
+    pub outcome: SkillReconciliationFailure,
+    pub error: anyhow::Error,
+}
+impl std::fmt::Display for SkillReconciliationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "skill reconciliation {:?}: {}", self.outcome, self.error)
+    }
+}
+impl std::error::Error for SkillReconciliationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+fn reconciliation_error(
+    error: impl Into<anyhow::Error>,
+    outcome: SkillReconciliationFailure,
+) -> anyhow::Error {
+    SkillReconciliationError {
+        outcome,
+        error: error.into(),
+    }
+    .into()
+}
+
 impl SkillReconciliationSnapshot {
     fn from_model(model: pioneer_entity::skill_installation::Model) -> Result<Self> {
         Ok(Self {
@@ -18547,7 +18581,7 @@ impl CrudStore {
         patch: &SkillInstallationPatch,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
-        self.update_skill_installation_guarded(skill_id, patch, event_timestamp_secs, None)
+        self.update_skill_installation_guarded(skill_id, patch, event_timestamp_secs, None, true)
             .await
     }
 
@@ -18560,16 +18594,71 @@ impl CrudStore {
         workspace: Option<&pioneer_entity::workspace::Model>,
         still_current: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<bool> {
+        self.reconcile_skill_installation_with_progress(
+            expected,
+            patch,
+            now,
+            workspace,
+            still_current,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await
+    }
+
+    pub async fn reconcile_skill_installation_with_progress(
+        &self,
+        expected: &SkillReconciliationSnapshot,
+        patch: &SkillInstallationPatch,
+        now: i64,
+        workspace: Option<&pioneer_entity::workspace::Model>,
+        still_current: &(dyn Fn() -> bool + Send + Sync),
+        mutation_started: &std::sync::atomic::AtomicBool,
+    ) -> Result<bool> {
         // The public view cannot substitute scope/metadata for the exact facts
         // captured by this snapshot. Validate it before acquiring DB capacity.
-        if skill_installation_record_from_model(expected.model.clone())? != expected.record {
-            bail!("prepared skill snapshot view changed");
+        if skill_installation_record_from_model(expected.model.clone())
+            .map_err(|e| reconciliation_error(e, SkillReconciliationFailure::NotCommitted))?
+            != expected.record
+        {
+            return Err(reconciliation_error(
+                anyhow::anyhow!("prepared skill snapshot view changed"),
+                SkillReconciliationFailure::NotCommitted,
+            ));
         }
         self.update_skill_installation_guarded(
             &expected.record.skill_id,
             patch,
             now,
-            Some((expected, workspace, still_current)),
+            Some((expected, workspace, still_current, mutation_started)),
+            true,
+        )
+        .await
+    }
+
+    /// Resolve an uncertain publication against current full facts without a
+    /// second metadata UPDATE/WAL write. Uses the same short writer guards.
+    pub async fn confirm_skill_reconciliation(
+        &self,
+        expected: &SkillReconciliationSnapshot,
+        workspace: Option<&pioneer_entity::workspace::Model>,
+        still_current: &(dyn Fn() -> bool + Send + Sync),
+        transaction_started: &std::sync::atomic::AtomicBool,
+    ) -> Result<bool> {
+        if skill_installation_record_from_model(expected.model.clone())
+            .map_err(|e| reconciliation_error(e, SkillReconciliationFailure::NotCommitted))?
+            != expected.record
+        {
+            return Err(reconciliation_error(
+                anyhow::anyhow!("prepared skill snapshot view changed"),
+                SkillReconciliationFailure::NotCommitted,
+            ));
+        }
+        self.update_skill_installation_guarded(
+            &expected.record.skill_id,
+            &SkillInstallationPatch::default(),
+            expected.record.updated_at_unix,
+            Some((expected, workspace, still_current, transaction_started)),
+            false,
         )
         .await
     }
@@ -18583,9 +18672,20 @@ impl CrudStore {
             &SkillReconciliationSnapshot,
             Option<&pioneer_entity::workspace::Model>,
             &(dyn Fn() -> bool + Send + Sync),
+            &std::sync::atomic::AtomicBool,
         )>,
+        write: bool,
     ) -> Result<bool> {
-        let fence = prepare_generic_skill_update_fence(&self.connection, skill_id, patch).await?;
+        let failure = |error: anyhow::Error, outcome| {
+            if expected.is_some() {
+                reconciliation_error(error, outcome)
+            } else {
+                error
+            }
+        };
+        let fence = prepare_generic_skill_update_fence(&self.connection, skill_id, patch)
+            .await
+            .map_err(|e| failure(e, SkillReconciliationFailure::NotCommitted))?;
         let now = unix_to_datetime(event_timestamp_secs);
         let operation = || {
             let fence = fence.clone();
@@ -18594,14 +18694,15 @@ impl CrudStore {
                     .connection
                     .begin()
                     .await
-                    .context("failed to begin skill installation update transaction")?;
+                    .context("failed to begin skill installation update transaction")
+                    .map_err(|e| failure(e, SkillReconciliationFailure::NotCommitted))?;
                 let result: Result<bool> = async {
                     if !revalidate_generic_skill_update_fence(&transaction, skill_id, &fence)
                         .await?
                     {
                         return Ok(false);
                     }
-                    if let Some((expected, workspace, still_current)) = expected {
+                    if let Some((expected, workspace, still_current, _)) = expected {
                         if !still_current() {
                             return Ok(false);
                         }
@@ -18632,6 +18733,12 @@ impl CrudStore {
                             bail!("reconciliation cannot change skill source scope");
                         }
                     }
+                    if !write {
+                        return Ok(true);
+                    }
+                    if let Some((_, _, _, started)) = expected {
+                        started.store(true, std::sync::atomic::Ordering::Release);
+                    }
                     skill_installation::update_skill_installation(
                         &transaction,
                         skill_id,
@@ -18642,23 +18749,37 @@ impl CrudStore {
                 }
                 .await;
                 match result {
-                    Ok(updated) => {
+                    Ok(updated)
+                        if expected.is_none_or(|(_, _, current, _)| current()) && updated =>
+                    {
+                        if let Some((_, _, _, started)) = expected {
+                            started.store(true, std::sync::atomic::Ordering::Release);
+                        }
                         transaction
                             .commit()
                             .await
-                            .context("failed to commit skill installation update")?;
-                        Ok(updated)
+                            .context("failed to acknowledge skill installation commit")
+                            .map_err(|e| failure(e, SkillReconciliationFailure::Unknown))?;
+                        Ok(true)
                     }
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error)
+                    Ok(_) => {
+                        transaction
+                            .rollback()
+                            .await
+                            .context("failed to acknowledge stale skill rollback")
+                            .map_err(|e| failure(e, SkillReconciliationFailure::Unknown))?;
+                        Ok(false)
                     }
+                    Err(error) => match transaction.rollback().await {
+                        Ok(()) => Err(failure(error, SkillReconciliationFailure::NotCommitted)),
+                        Err(rollback) => Err(failure(
+                            error.context(format!("rollback acknowledgement failed: {rollback}")),
+                            SkillReconciliationFailure::Unknown,
+                        )),
+                    },
                 }
             }
         };
-        // A reconciliation commit error can be ambiguous. Its owning root
-        // retains backoff and rereads facts in a later quantum, never retrying
-        // this prepared mutation under an unknown commit outcome.
         if expected.is_some() {
             operation().await
         } else {
@@ -18869,6 +18990,23 @@ impl CrudStore {
             Ok(snapshot)
         }
         .await
+    }
+
+    pub async fn find_skill_import_provenance(
+        &self,
+        kind: &str,
+        scope: &str,
+        reference: &str,
+    ) -> Result<Option<SkillReconciliationSnapshot>> {
+        let mut rows =
+            skill_installation::find_import_provenance(&self.connection, kind, scope, reference)
+                .await?;
+        if rows.len() > 1 {
+            bail!("ambiguous exact skill import provenance");
+        }
+        rows.pop()
+            .map(SkillReconciliationSnapshot::from_model)
+            .transpose()
     }
 
     pub async fn list_skill_reconciliation_page(

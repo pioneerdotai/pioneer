@@ -203,6 +203,23 @@ pub(crate) async fn has_skill_import_provenance<C: ConnectionTrait>(
         .is_empty())
 }
 
+/// Indexed exact provenance lookup; two rows are sufficient to prove ambiguity.
+pub(crate) async fn find_import_provenance<C: ConnectionTrait>(
+    db: &C,
+    kind: &str,
+    scope: &str,
+    reference: &str,
+) -> Result<Vec<skill_installation::Model>> {
+    skill_installation::Entity::find()
+        .filter(skill_installation::Column::SourceKind.eq(kind.to_owned()))
+        .filter(skill_installation::Column::ScopeKey.eq(scope.to_owned()))
+        .filter(skill_installation::Column::SourceRef.eq(reference.to_owned()))
+        .limit(2)
+        .all(db)
+        .await
+        .context("failed to find exact import provenance")
+}
+
 /// Background discovery must never fetch unrelated source scopes.
 pub async fn list_skill_installations_scope_page<C: ConnectionTrait>(
     db: &C,

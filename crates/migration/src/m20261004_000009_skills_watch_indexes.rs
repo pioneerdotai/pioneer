@@ -117,4 +117,95 @@ mod tests {
                 .unwrap()
         );
     }
+    #[tokio::test]
+    async fn partial_ddl_and_completion_marker_rollback_preserve_foreign_objects_and_sources() {
+        use sea_orm::TransactionTrait;
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let name = Migration.name();
+        let before = crate::Migrator::migrations()
+            .iter()
+            .position(|m| m.name() == name)
+            .unwrap() as u32;
+        crate::Migrator::up(&db, Some(before)).await.unwrap();
+        db.execute_unprepared("CREATE TABLE foreign_skills_object(value TEXT); CREATE INDEX foreign_skills_index ON foreign_skills_object(value); INSERT INTO foreign_skills_object VALUES('keep'); INSERT INTO workspace(id,name,is_active,is_current) VALUES('skills-migration','Keep',1,0); CREATE TABLE idx_workspace_active_id(value TEXT)").await.unwrap();
+        db.execute_unprepared("INSERT INTO skill_installation(id,slug,source_kind,scope_key,source_ref,install_path,trust_level,fingerprint) VALUES('MMMMMMMMMMMMMMMMMMMMM','keep','user','skills-migration','original-source','/original/path','community','original-fingerprint')").await.unwrap();
+        // The third DDL statement collides with a table, after both skill indexes
+        // have been installed. The same transaction owns the completion marker.
+        let transaction = db.begin().await.unwrap();
+        assert!(crate::Migrator::up(&transaction, None).await.is_err());
+        transaction.rollback().await.unwrap();
+        for index in [
+            "idx_skill_installation_source_scope_id",
+            "idx_skill_installation_import_provenance",
+        ] {
+            assert!(
+                !SchemaManager::new(&db)
+                    .has_index("skill_installation", index)
+                    .await
+                    .unwrap()
+            );
+        }
+        let marker = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT version FROM seaql_migrations WHERE version=?",
+                [name.into()],
+            ))
+            .await
+            .unwrap();
+        assert!(marker.is_none());
+        assert!(
+            SchemaManager::new(&db)
+                .has_table("idx_workspace_active_id")
+                .await
+                .unwrap()
+        );
+        db.execute_unprepared("DROP TABLE idx_workspace_active_id")
+            .await
+            .unwrap();
+        crate::Migrator::up(&db, None).await.unwrap();
+        crate::Migrator::up(&db, None).await.unwrap();
+        let suffix = (crate::Migrator::migrations().len() - before as usize) as u32;
+        crate::Migrator::down(&db, Some(suffix)).await.unwrap();
+        crate::Migrator::up(&db, None).await.unwrap();
+        assert!(
+            SchemaManager::new(&db)
+                .has_index("workspace", "idx_workspace_active_id")
+                .await
+                .unwrap()
+        );
+        assert!(
+            SchemaManager::new(&db)
+                .has_index("foreign_skills_object", "foreign_skills_index")
+                .await
+                .unwrap()
+        );
+        let source = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT name FROM workspace WHERE id='skills-migration'".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.try_get::<String>("", "name").unwrap(), "Keep");
+        let skill = db.query_one_raw(Statement::from_string(DbBackend::Sqlite, "SELECT source_ref,fingerprint FROM skill_installation WHERE id='MMMMMMMMMMMMMMMMMMMMM'".to_owned())).await.unwrap().unwrap();
+        assert_eq!(
+            skill.try_get::<String>("", "source_ref").unwrap(),
+            "original-source"
+        );
+        assert_eq!(
+            skill.try_get::<String>("", "fingerprint").unwrap(),
+            "original-fingerprint"
+        );
+        let foreign = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT value FROM foreign_skills_object".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(foreign.try_get::<String>("", "value").unwrap(), "keep");
+    }
 }

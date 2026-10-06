@@ -4211,7 +4211,12 @@ async fn publication_migration_installs_source_fence_on_existing_zstd_storage() 
     writer
         .run_migrations::<Migrator>(
             SqliteWriteClass::Maintenance,
-            Some((Migrator::migrations().len() - 1) as u32),
+            Some(
+                Migrator::migrations()
+                    .iter()
+                    .position(|m| m.name() == "m20260919_000002_compaction_publication_fence")
+                    .expect("publication fence migration registered") as u32,
+            ),
         )
         .await
         .unwrap();

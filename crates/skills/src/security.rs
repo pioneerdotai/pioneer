@@ -83,6 +83,7 @@ pub(crate) struct SkillDirectoryScan {
     findings: Vec<SecurityFinding>,
     decision: SecurityDecision,
     max_file_bytes: usize,
+    pub(crate) largest_file_bytes: u64,
 }
 
 impl SkillDirectoryScan {
@@ -95,6 +96,7 @@ impl SkillDirectoryScan {
             findings: Vec::new(),
             decision: SecurityDecision::Allow,
             max_file_bytes,
+            largest_file_bytes: 0,
         };
         match (&scan.root, skill) {
             (None, _) => scan.record(block_finding(
@@ -177,6 +179,7 @@ impl SkillDirectoryScan {
                     self.directories.push(entries);
                 }
             } else if metadata.is_file() {
+                self.largest_file_bytes = self.largest_file_bytes.max(metadata.len());
                 if metadata.len() > self.max_file_bytes as u64 {
                     self.record(block_finding(
                         "file.size_limit",

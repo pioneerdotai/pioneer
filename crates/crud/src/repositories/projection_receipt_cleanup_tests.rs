@@ -78,7 +78,10 @@ async fn boundary(store: &CrudStore, turn_id: &str) -> i64 {
 #[tokio::test]
 async fn schema_upgrade_only_adds_the_boundary_and_does_not_delete_old_receipts() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
-    let migrations_before_cleanup = Migrator::migrations().len() as u32 - 1;
+    let migrations_before_cleanup = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == "m20260906_000003_projection_receipt_cleanup")
+        .expect("receipt cleanup migration registered") as u32;
     Migrator::up(&db, Some(migrations_before_cleanup))
         .await
         .unwrap();

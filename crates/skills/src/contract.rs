@@ -931,6 +931,28 @@ pub fn parse_skill_markdown(
     Ok(definition)
 }
 
+/// The bytes and sidecar facts of one physical file. IDs, source semantics and
+/// policy decisions are applied separately; the watcher owns this for one round.
+#[derive(Debug)]
+pub(crate) struct SkillFileInput {
+    raw: String,
+    context: SkillMarkdownParseContext,
+}
+impl SkillFileInput {
+    pub(crate) fn len(&self) -> usize {
+        self.raw.len()
+    }
+    pub(crate) fn parse(
+        &self,
+        skill_id: SkillId,
+        source_kind: SkillSourceKind,
+    ) -> Result<SkillDefinition> {
+        let mut context = self.context.clone();
+        context.skill_id = skill_id;
+        context.source_kind = source_kind;
+        parse_skill_markdown(&self.raw, context)
+    }
+}
 pub fn parse_skill_from_file(
     skill_id: SkillId,
     skill_file: &Path,
@@ -938,6 +960,22 @@ pub fn parse_skill_from_file(
     source_root: &Path,
     max_file_bytes: usize,
 ) -> Result<SkillDefinition> {
+    read_skill_file_input(
+        skill_id.clone(),
+        skill_file,
+        source_kind,
+        source_root,
+        max_file_bytes,
+    )?
+    .parse(skill_id, source_kind)
+}
+pub(crate) fn read_skill_file_input(
+    skill_id: SkillId,
+    skill_file: &Path,
+    source_kind: SkillSourceKind,
+    source_root: &Path,
+    max_file_bytes: usize,
+) -> Result<SkillFileInput> {
     let metadata = fs::metadata(skill_file)
         .with_context(|| format!("failed to stat skill file `{}`", skill_file.display()))?;
     let file_size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
@@ -963,9 +1001,9 @@ pub fn parse_skill_from_file(
         .unwrap_or("skill")
         .to_owned();
 
-    parse_skill_markdown(
-        raw.as_str(),
-        SkillMarkdownParseContext {
+    Ok(SkillFileInput {
+        raw,
+        context: SkillMarkdownParseContext {
             skill_id,
             source_kind,
             source_root: source_root.display().to_string(),
@@ -977,7 +1015,7 @@ pub fn parse_skill_from_file(
             version_hint_override: sidecar_meta.version_hint,
             display_name_override: sidecar_meta.display_name,
         },
-    )
+    })
 }
 
 #[cfg(test)]
