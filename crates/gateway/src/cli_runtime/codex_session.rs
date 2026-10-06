@@ -40,10 +40,10 @@ use async_trait::async_trait;
 use pioneer_cli_agent_runtime::codex::{
     CodexAppServerClient, CodexCollaborationMode, CodexConfigReadSnapshot,
     CodexGenerationOverlayDescriptor, CodexGenerationOverlayIdentity, CodexHomeOverlayPolicy,
-    CodexJsonlRpcClient, CodexJsonlRpcNotificationEvent, CodexManagedMcpConfigInput,
-    CodexManagedMcpConfigLimits, CodexManagedMcpSemanticInput, CodexManagedMcpToolIdentity,
-    CodexThreadForkParams, CodexThreadNameSetParams, CodexThreadOpenSnapshot,
-    CodexThreadStartParams, CodexTurnStartParams, CodexTurnSteerParams,
+    CodexJsonlRpcClient, CodexJsonlRpcNotificationEvent, CodexJsonlRpcOwner,
+    CodexManagedMcpConfigInput, CodexManagedMcpConfigLimits, CodexManagedMcpSemanticInput,
+    CodexManagedMcpToolIdentity, CodexThreadForkParams, CodexThreadNameSetParams,
+    CodexThreadOpenSnapshot, CodexThreadStartParams, CodexTurnStartParams, CodexTurnSteerParams,
     cleanup_codex_generation_overlay, codex_config_read_max_origins,
     codex_config_value_fingerprint, codex_generation_app_server_process_config,
     recover_codex_fork_source_rollout_path, recover_codex_stale_rollout_path,
@@ -1357,7 +1357,7 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
         };
         let rpc_setup = (|| -> Result<_> {
             let (stdout, stdin) = process.take_stdio()?;
-            let rpc = CodexJsonlRpcClient::new_with_channel_capacity_and_budget(
+            let (rpc, owner) = CodexJsonlRpcClient::new_owned_with_channel_capacity_and_budget(
                 BufReader::new(stdout),
                 stdin,
                 instance.event_channel_capacity,
@@ -1374,9 +1374,9 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
             let diagnostics = rpc
                 .take_diagnostic_receiver()
                 .ok_or_else(|| anyhow!("Codex diagnostic receiver was already taken"))?;
-            Ok((rpc, notifications, server_requests, diagnostics))
+            Ok((rpc, owner, notifications, server_requests, diagnostics))
         })();
-        let (rpc, notifications, server_requests, diagnostics) = match rpc_setup {
+        let (rpc, mut rpc_owner, notifications, server_requests, diagnostics) = match rpc_setup {
             Ok(setup) => setup,
             Err(error) => {
                 if let Some(bridge) = required_mcp_bridge.as_ref() {
@@ -1401,12 +1401,17 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
             }
             cleanup_failed_codex_startup(&self.bridge_supervisor, process_instance, &mut process)
                 .await;
+            rpc_owner
+                .abort_and_join_result()
+                .await
+                .context("failed to drain Codex transport after initialize failure")?;
             return Err(anyhow!(error)).context("Codex initialize handshake failed");
         }
         let generation_overlay = overlay_guard.disarm();
 
         Ok(Arc::new(CodexCLIAgentRuntimeSession {
             client,
+            rpc_owner: tokio::sync::Mutex::new(rpc_owner),
             process: tokio::sync::Mutex::new(process),
             request_timeout: Duration::from_millis(instance.request_timeout_ms),
             shutdown_grace: Duration::from_secs(2),
@@ -1879,6 +1884,7 @@ impl CodexCLIAgentRuntimeSessionFactory {
 
 struct CodexCLIAgentRuntimeSession {
     client: CodexAppServerClient,
+    rpc_owner: tokio::sync::Mutex<CodexJsonlRpcOwner>,
     process: tokio::sync::Mutex<CLIAgentProcess>,
     request_timeout: Duration,
     shutdown_grace: Duration,
@@ -2015,6 +2021,15 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
         let mut process = self.process.lock().await;
         let _ = process.terminate_with_grace(self.shutdown_grace).await?;
         drop(process);
+        // A shutdown command is only admission. Join the exact reader,
+        // dispatcher and ordered ingress before deleting this overlay. The
+        // owner stays in the session when this wait is cancelled or fails.
+        self.rpc_owner
+            .lock()
+            .await
+            .abort_and_join_result()
+            .await
+            .context("failed to drain Codex runtime transport")?;
         let overlay = self
             .generation_overlay
             .lock()
