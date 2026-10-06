@@ -23,6 +23,7 @@ pub enum ExecutionEventHubError {
 pub enum DurableCommitRejectionKind {
     Retryable,
     Permanent,
+    SupersededByDurableInterruption,
 }
 
 /// A safe, low-cardinality reason why a durable projection was rejected.
@@ -50,6 +51,16 @@ impl DurableCommitRejection {
             kind: DurableCommitRejectionKind::Permanent,
             code,
             message,
+        }
+    }
+
+    /// The consumer confirmed an accepted Interrupted canonical event with
+    /// durable obligations for this turn. This is not a successful execution write.
+    pub const fn superseded_by_durable_interruption() -> Self {
+        Self {
+            kind: DurableCommitRejectionKind::SupersededByDurableInterruption,
+            code: "durable_interruption_accepted",
+            message: "execution was superseded by confirmed durable interruption",
         }
     }
 

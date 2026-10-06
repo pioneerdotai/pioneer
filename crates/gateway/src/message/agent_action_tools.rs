@@ -7,6 +7,7 @@ use super::MessageProcessor;
 use crate::authorization::{AgentActionKindName, AgentToolAdapterError, BoundAgentActionAdapter};
 use anyhow::Context as _;
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use pioneer_agent::TurnToolContext;
 use pioneer_protocol::{
     AgentActionIntent, AgentExecutionId, AgentModelToolName, AgentPublicOutcome,
@@ -21,6 +22,7 @@ use pioneer_tools::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Weak};
 use tokio::sync::Mutex;
 
@@ -2038,69 +2040,125 @@ struct DurableAgentStartDispatch {
 pub(crate) async fn process_due_agent_action_outbox(
     processor: &Arc<MessageProcessor>,
     limit: u64,
-) -> anyhow::Result<usize> {
-    let database = processor.crud_store.database_connection();
-    let now = pioneer_crud::utc_now();
-    let rows = pioneer_crud::claim_agent_action_outbox(&database, now.clone(), limit).await?;
-    let mut delivered = 0usize;
-    for row in rows {
-        let result = dispatch_agent_action_outbox_row(processor, &row).await;
-        match result {
-            Ok(AgentActionOutboxDispatch::Delivered) => {
-                if pioneer_crud::mark_agent_action_outbox_delivered(
-                    &database,
-                    row.id.as_str(),
-                    row.attempts,
-                    pioneer_crud::utc_now(),
-                )
-                .await?
-                {
-                    delivered = delivered.saturating_add(1);
+) -> anyhow::Result<AgentActionOutboxProcessingBatch> {
+    // Discovery, claim and retry bookkeeping use Maintenance. The dispatcher
+    // keeps the caller's existing scope for its narrow correctness operations.
+    let database = processor
+        .crud_store
+        .with_maintenance_access()
+        .database_connection();
+    let batch = pioneer_crud::claim_agent_action_outbox(&database, limit).await?;
+    Ok(
+        process_claimed_agent_action_outbox(&database, batch, |row| {
+            let processor = processor.clone();
+            async move { dispatch_agent_action_outbox_row(&processor, &row).await }
+        })
+        .await,
+    )
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AgentActionOutboxProcessingBatch {
+    pub delivered: usize,
+    pub errors: Vec<anyhow::Error>,
+}
+
+// Keep dispatch/preparation outside DB capacity. This small loop also lets the
+// regression tests inject each dispatch outcome and local ACK storage faults.
+pub(super) async fn process_claimed_agent_action_outbox<C, F, Fut>(
+    database: &C,
+    batch: pioneer_crud::AgentActionOutboxClaimBatch,
+    mut dispatch: F,
+) -> AgentActionOutboxProcessingBatch
+where
+    C: sea_orm::ConnectionTrait,
+    F: FnMut(pioneer_entity::agent_action_outbox::Model) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<AgentActionOutboxDispatch>>,
+{
+    let mut output = AgentActionOutboxProcessingBatch {
+        delivered: 0,
+        errors: batch.errors,
+    };
+    for row in batch.rows {
+        // Calling dispatch inside the async block catches synchronous future
+        // creation panics too. The same boundary covers polling and callbacks.
+        let outcome = AssertUnwindSafe(async {
+            let (outbox_id, action_id, attempts) =
+                (row.id.clone(), row.action_id.clone(), row.attempts);
+            let result = dispatch(row).await;
+            let ack = match result {
+                Ok(AgentActionOutboxDispatch::Delivered) => {
+                    pioneer_crud::mark_agent_action_outbox_delivered(
+                        database,
+                        &outbox_id,
+                        attempts,
+                        pioneer_crud::utc_now(),
+                    )
+                    .await
                 }
-            }
-            Ok(AgentActionOutboxDispatch::AwaitingPermit) => {
-                pioneer_crud::defer_agent_action_outbox_for_permit(
-                    &database,
-                    row.id.as_str(),
-                    row.attempts,
-                    pioneer_crud::utc_now(),
-                )
-                .await?;
-            }
-            Ok(AgentActionOutboxDispatch::AwaitingRuntime) => {
-                pioneer_crud::defer_agent_action_outbox_for_runtime(
-                    &database,
-                    row.id.as_str(),
-                    row.attempts,
-                    pioneer_crud::utc_now(),
-                )
-                .await?;
-            }
-            Err(_error) => {
-                let marked = pioneer_crud::mark_agent_action_outbox_failed(
-                    &database,
-                    row.id.as_str(),
-                    row.attempts,
-                    pioneer_crud::utc_now(),
-                )
-                .await?;
-                if marked && row.attempts >= pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS {
-                    tracing::error!(
-                        outbox_id = row.id,
-                        action_id = row.action_id,
-                        attempts = row.attempts,
-                        failure_class = "outbox_delivery_failed",
-                        "agent domain action outbox reached its delivery retry limit"
-                    );
+                Ok(AgentActionOutboxDispatch::AwaitingPermit) => {
+                    pioneer_crud::defer_agent_action_outbox_for_permit(
+                        database,
+                        &outbox_id,
+                        attempts,
+                        pioneer_crud::utc_now(),
+                    )
+                    .await
+                    .map(|_| false)
                 }
+                Ok(AgentActionOutboxDispatch::AwaitingRuntime) => {
+                    pioneer_crud::defer_agent_action_outbox_for_runtime(
+                        database,
+                        &outbox_id,
+                        attempts,
+                        pioneer_crud::utc_now(),
+                    )
+                    .await
+                    .map(|_| false)
+                }
+                Err(_error) => {
+                    let marked = pioneer_crud::mark_agent_action_outbox_failed(
+                        database,
+                        &outbox_id,
+                        attempts,
+                        pioneer_crud::utc_now(),
+                    )
+                    .await;
+                    if matches!(marked, Ok(true))
+                        && attempts >= pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS
+                    {
+                        tracing::error!(
+                            outbox_id,
+                            action_id,
+                            attempts = attempts,
+                            failure_class = "outbox_delivery_failed",
+                            "agent domain action outbox reached its delivery retry limit"
+                        );
+                    }
+                    marked.map(|_| false)
+                }
+            };
+            match ack {
+                Ok(true) => output.delivered += 1,
+                Ok(false) => {}
+                Err(error) => output.errors.push(error),
             }
+        })
+        .catch_unwind()
+        .await;
+        if outcome.is_err() {
+            // A dispatch/ACK may already have committed. Preserve its lease or
+            // committed state; never blindly compensate for an unknown outcome.
+            output.errors.push(anyhow::anyhow!(
+                "outbox_dispatch_callback_panic_outcome_unknown"
+            ));
         }
     }
-    Ok(delivered)
+    output
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentActionOutboxDispatch {
+pub(super) enum AgentActionOutboxDispatch {
     Delivered,
     AwaitingPermit,
     AwaitingRuntime,

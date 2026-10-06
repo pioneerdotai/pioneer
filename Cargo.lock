@@ -9558,6 +9558,7 @@ version = "0.56.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "futures-util",
  "hex",
  "pioneer-compaction",
  "pioneer-entity",
@@ -9866,6 +9867,7 @@ dependencies = [
  "url",
  "uuid",
  "zeroize",
+ "zstd 0.14.0",
 ]
 
 [[package]]

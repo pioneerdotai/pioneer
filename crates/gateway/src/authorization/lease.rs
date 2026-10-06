@@ -195,6 +195,14 @@ impl ExecutionLeaseRegistry {
             }
             .into());
         }
+        // Canonical cancellation may be accepted while its ordered projection
+        // is deferred. The receipt fences execution across that durable gap.
+        if store.native_cancellation_was_accepted(execution_id).await? {
+            return Err(ExecutionTurnNotInProgress {
+                status: TurnStatus::Interrupted,
+            }
+            .into());
+        }
         let needs_restore = !self.leases.read().await.contains_key(execution_id);
         if needs_restore {
             let context = ExecutionAuthorizationContext::load_for_turn(store, execution_id).await?;

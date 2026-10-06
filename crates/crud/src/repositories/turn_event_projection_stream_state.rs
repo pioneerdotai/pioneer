@@ -17,6 +17,9 @@ pub async fn ensure_healthy<C: ConnectionTrait>(
         turn_event_projection_stream_state::ActiveModel {
             turn_id: Set(turn_id.to_owned()),
             thread_id: Set(thread_id.to_owned()),
+            accepted_terminal_event_id: Set(None),
+            accepted_terminal_event_type: Set(None),
+            accepted_terminal_sequence: Set(None),
             projected_through_sequence: Set(0),
             receipts_compacted_through_sequence: Set(0),
             status: Set(STREAM_STATUS_HEALTHY.to_owned()),
@@ -221,4 +224,134 @@ pub async fn restore<C: ConnectionTrait>(
         .with_context(|| format!("failed to restore projection stream for Turn `{turn_id}`"))?
         .rows_affected
         > 0)
+}
+
+/// Canonical acceptance, independent of projection completion. PK lookup only.
+pub async fn has_accepted_terminal<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<bool> {
+    Ok(find(db, turn_id).await?.is_some_and(|row| {
+        row.accepted_terminal_event_id.is_some()
+            || row.accepted_terminal_event_type.is_some()
+            || row.accepted_terminal_sequence.is_some()
+    }))
+}
+
+/// Called only for a newly inserted terminal event in its append transaction.
+/// Existing canonical replay never writes this marker.
+pub async fn accept_terminal<C: ConnectionTrait>(
+    db: &C,
+    event: &crate::AppendedTurnEvent,
+) -> Result<()> {
+    if !matches!(
+        &event.payload,
+        crate::CanonicalTurnEventPayload::TurnCompleted(_)
+            | crate::CanonicalTurnEventPayload::TurnFailed(_)
+            | crate::CanonicalTurnEventPayload::TurnBlocked(_)
+    ) {
+        return Ok(());
+    }
+    let changed = turn_event_projection_stream_state::Entity::update_many()
+        .col_expr(
+            turn_event_projection_stream_state::Column::AcceptedTerminalEventId,
+            Expr::value(event.id.clone()),
+        )
+        .col_expr(
+            turn_event_projection_stream_state::Column::AcceptedTerminalEventType,
+            Expr::value(event.payload.event_type().to_owned()),
+        )
+        .col_expr(
+            turn_event_projection_stream_state::Column::AcceptedTerminalSequence,
+            Expr::value(event.sequence),
+        )
+        .filter(turn_event_projection_stream_state::Column::TurnId.eq(event.turn_id.clone()))
+        .filter(turn_event_projection_stream_state::Column::ThreadId.eq(event.thread_id.clone()))
+        .filter(turn_event_projection_stream_state::Column::AcceptedTerminalEventId.is_null())
+        .filter(turn_event_projection_stream_state::Column::AcceptedTerminalEventType.is_null())
+        .filter(turn_event_projection_stream_state::Column::AcceptedTerminalSequence.is_null())
+        .exec(db)
+        .await?
+        .rows_affected;
+    anyhow::ensure!(
+        changed == 1,
+        "terminal append conflicts with accepted canonical result"
+    );
+    Ok(())
+}
+
+/// Only the two atomic lawful Blocked resume operations call this helper.
+/// Receipt/health restoration, owner change and watermark work cannot clear it.
+pub async fn clear_confirmed_blocked_for_resume<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_id: &str,
+    now: DateTimeWithTimeZone,
+    blocked_turn: &pioneer_entity::turn::Model,
+) -> Result<()> {
+    // The caller already read/revalidated this row in the same writer transaction.
+    anyhow::ensure!(
+        blocked_turn.id == turn_id
+            && blocked_turn.thread_id == thread_id
+            && blocked_turn.status == "blocked",
+        "terminal marker can only clear for durable Blocked resume"
+    );
+    anyhow::ensure!(
+        !super::native_cancellation_context::has_accepted(db, turn_id).await?,
+        "blocked resume cannot clear an accepted cancellation fence"
+    );
+    let Some(current) = find(db, turn_id).await? else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        current.thread_id == thread_id,
+        "blocked resume crosses projection stream scope"
+    );
+    if current.accepted_terminal_event_id.is_none()
+        && current.accepted_terminal_event_type.is_none()
+        && current.accepted_terminal_sequence.is_none()
+    {
+        return Ok(());
+    } // Legacy marker absence.
+    let sequence = current
+        .accepted_terminal_sequence
+        .context("blocked marker has no accepted sequence")?;
+    let id = current
+        .accepted_terminal_event_id
+        .context("blocked marker has no canonical identity")?;
+    anyhow::ensure!(
+        current.accepted_terminal_event_type.as_deref() == Some("turn/blocked")
+            && sequence > 0
+            && sequence <= current.projected_through_sequence,
+        "blocked resume conflicts with unconfirmed or non-blocked terminal acceptance"
+    );
+    let changed = turn_event_projection_stream_state::Entity::update_many()
+        .col_expr(
+            turn_event_projection_stream_state::Column::AcceptedTerminalEventId,
+            Expr::value(None::<String>),
+        )
+        .col_expr(
+            turn_event_projection_stream_state::Column::AcceptedTerminalEventType,
+            Expr::value(None::<String>),
+        )
+        .col_expr(
+            turn_event_projection_stream_state::Column::AcceptedTerminalSequence,
+            Expr::value(None::<i64>),
+        )
+        .col_expr(
+            turn_event_projection_stream_state::Column::UpdatedAt,
+            Expr::value(now),
+        )
+        .filter(turn_event_projection_stream_state::Column::TurnId.eq(turn_id))
+        .filter(turn_event_projection_stream_state::Column::AcceptedTerminalEventId.eq(id))
+        .filter(
+            turn_event_projection_stream_state::Column::AcceptedTerminalEventType
+                .eq("turn/blocked"),
+        )
+        .filter(turn_event_projection_stream_state::Column::AcceptedTerminalSequence.eq(sequence))
+        .exec(db)
+        .await?
+        .rows_affected;
+    anyhow::ensure!(
+        changed == 1,
+        "blocked terminal marker changed while resuming"
+    );
+    Ok(())
 }
