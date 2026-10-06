@@ -138,6 +138,9 @@ struct EntryData {
 #[cfg(feature = "test-support")]
 #[derive(Default)]
 pub struct OAuthTestHooks {
+    pub pause_before_winner: std::sync::atomic::AtomicBool,
+    pub exchange_persisted: tokio::sync::Notify,
+    pub reserve_winner: tokio::sync::Notify,
     pub pause_after_winner: std::sync::atomic::AtomicBool,
     pub winner_reserved: tokio::sync::Notify,
     pub publish_resolution: tokio::sync::Notify,
@@ -1639,6 +1642,18 @@ impl McpOAuthService {
             }.with_subscriber(tracing::subscriber::NoSubscriber::default())=>result,
         };
         authorization.set_credential_store(entry.credentials.clone());
+        #[cfg(feature = "test-support")]
+        if let Some(hooks) = &self.inner.options.test_hooks {
+            if hooks
+                .pause_before_winner
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                // The exchange write has returned; neither the persistence IO
+                // gate nor the terminal decision lock is held at this barrier.
+                hooks.exchange_persisted.notify_one();
+                hooks.reserve_winner.notified().await;
+            }
+        }
         // This mutex is the linearization point shared with Cancel. Close
         // admission before releasing the refresh lease or performing any await.
         // A cancellation that won remains recorded until the exchange drains.

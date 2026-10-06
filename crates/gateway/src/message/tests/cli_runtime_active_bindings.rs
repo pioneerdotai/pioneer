@@ -2005,6 +2005,14 @@ async fn cli_saved_native_outcome_reopens_for_codex_and_claude_without_provider_
         let (reopened, store, session, _) =
             blocked_observation_fixture_with_receipt(&path, kind, false, true).await;
         *session.turn_observation.lock().await = None;
+        assert!(
+            reopened
+                .thread_manager
+                .turn_get(BLOCKED_THREAD, BLOCKED_TURN)
+                .await
+                .is_none(),
+            "restart replay must restore the canonical lifecycle from storage"
+        );
         let now = chrono::Utc::now().timestamp();
         // Production order: the coordinator runs before Gateway events and
         // active discovery. A foreign unexpired receipt cannot be bypassed.
@@ -2031,7 +2039,9 @@ async fn cli_saved_native_outcome_reopens_for_codex_and_claude_without_provider_
         );
         assert!(session.turn_starts.lock().await.is_empty());
         use pioneer_entity::turn_execution as execution;
-        let expired_at = chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(1);
+        let expired_at = chrono::DateTime::from_timestamp(now - 1, 0)
+            .unwrap()
+            .fixed_offset();
         execution::Entity::update_many()
             .col_expr(execution::Column::HeartbeatAt, Expr::value(expired_at))
             .col_expr(execution::Column::LeaseUntil, Expr::value(expired_at))
@@ -3652,7 +3662,9 @@ async fn cli_accepted_unconfirmed_recovery_outcome_survives_expiration_takeover_
                     original_owner
                 );
                 use pioneer_entity::turn_execution as execution;
-                let expired_at = chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(1);
+                let expired_at = chrono::DateTime::from_timestamp(now - 1, 0)
+                    .unwrap()
+                    .fixed_offset();
                 execution::Entity::update_many()
                     .col_expr(execution::Column::HeartbeatAt, Expr::value(expired_at))
                     .col_expr(execution::Column::LeaseUntil, Expr::value(expired_at))
@@ -4163,6 +4175,14 @@ async fn cli_timeout_poll_and_command_heartbeat_prioritize_saved_native_failure(
             .existing_session(&key)
             .await
             .unwrap();
+        assert!(
+            store
+                .get_cli_runtime_instruction_projection(GUARDED_TURN)
+                .await
+                .unwrap()
+                .is_none(),
+            "saved delivery on the existing session must not require fresh launch admission"
+        );
         processor.arm_completed_history_preparation_barrier("__cli_native_terminal_saved__");
         let mut producer = Box::pin(processor.handle_cli_runtime_timeline_event(
             handle.instance(),

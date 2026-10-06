@@ -5594,19 +5594,29 @@ impl MessageProcessor {
             .cli_runtime_manager
             .as_ref()
             .context("CLI manager unavailable for saved terminal delivery")?;
-        let restored = match self
-            .restore_cli_runtime_launch_spec(&expected.binding)
-            .await
-        {
-            CliRuntimeLaunchSpecRestore::Ready(restored) => restored,
-            CliRuntimeLaunchSpecRestore::Unavailable { diagnostic }
-            | CliRuntimeLaunchSpecRestore::InvalidBinding { diagnostic } => {
-                anyhow::bail!("{diagnostic}")
+        let key = CLIAgentRuntimeSessionKey::new(
+            &expected.binding.workspace_id,
+            &expected.binding.runtime_id,
+            &expected.binding.continuation_thread_id,
+        )?;
+        let handle = match manager.existing_session(&key).await {
+            Some(handle) => handle,
+            None => {
+                let restored = match self
+                    .restore_cli_runtime_launch_spec(&expected.binding)
+                    .await
+                {
+                    CliRuntimeLaunchSpecRestore::Ready(restored) => restored,
+                    CliRuntimeLaunchSpecRestore::Unavailable { diagnostic }
+                    | CliRuntimeLaunchSpecRestore::InvalidBinding { diagnostic } => {
+                        anyhow::bail!("{diagnostic}")
+                    }
+                };
+                manager
+                    .get_or_start_with_launch_spec(restored.session_key, restored.launch_spec)
+                    .await?
             }
         };
-        let handle = manager
-            .get_or_start_with_launch_spec(restored.session_key, restored.launch_spec)
-            .await?;
         // Event and Claude transcript UUID are on disk; no old process snapshot
         // is consulted. Retained ownership covers the real lane through ACK.
         delivery.terminal_delivery_id = Some(record.id.clone());
@@ -5724,6 +5734,27 @@ impl MessageProcessor {
                 "ignored CLI runtime event for non-active Pioneer turn"
             );
             return false;
+        }
+        if terminal_status.is_some() {
+            let restored = async {
+                let (workspace_id, turn) = self
+                    .crud_store
+                    .get_turn(&turn_binding.thread_id, &turn_binding.turn_id)
+                    .await?
+                    .context("native terminal Turn is missing")?;
+                self.ensure_cli_runtime_turn_loaded_for_lifecycle(
+                    &workspace_id,
+                    &turn_binding.thread_id,
+                    &turn,
+                )
+                .await
+            }
+            .await;
+            if let Err(error) = restored {
+                warn!(turn_id = turn_binding.turn_id.as_str(), error = %error,
+                    "failed to rehydrate native terminal Turn lifecycle");
+                return false;
+            }
         }
         if turn_binding.runtime_kind == "codex"
             && !self

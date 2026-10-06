@@ -59764,7 +59764,7 @@ async fn cli_runtime_request_respond_rejects_pending_for_blocked_turn_without_na
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_request_respond_for_completed_turn_expires_all_pending_requests() {
+async fn cli_runtime_completed_turn_cleanup_expires_pending_requests_before_response() {
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -59853,15 +59853,13 @@ async fn cli_runtime_request_respond_for_completed_turn_expires_all_pending_requ
         )
         .await
         .expect("the canonical Turn must also be completed before terminal cleanup");
-    crate::cli_runtime::turn_binding::update_cli_runtime_turn_binding_status(
-        crud_store.as_ref(),
-        turn_id,
-        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED,
-        None,
-        chrono::Utc::now().fixed_offset(),
-    )
-    .await
-    .expect("test turn binding should complete");
+    assert_eq!(
+        processor
+            .renew_active_cli_runtime_turn_deadlines(turn_id, chrono::Utc::now().timestamp())
+            .await
+            .expect("terminal canonical Turn must repair its lagging active CLI binding"),
+        crate::resilience::RuntimeTimeoutObservation::Terminal
+    );
     let completed_binding = crud_store
         .get_cli_runtime_turn_binding(turn_id)
         .await
@@ -59898,7 +59896,7 @@ async fn cli_runtime_request_respond_for_completed_turn_expires_all_pending_requ
     assert_eq!(
         first_after_response.status,
         pioneer_crud::CliRuntimePendingRequestStatus::Expired,
-        "completed binding validation should expire the answered request before native response"
+        "terminal cleanup must expire the request before a late native response"
     );
 
     let error = recv_error_by_id(&mut rx, "cliruntime_reqdone001").await;
