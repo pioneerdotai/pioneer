@@ -4,7 +4,7 @@
 use crate::types::ProviderFailureClassification;
 use pioneer_protocol::{ProviderFailureClass, ProviderFailureStage};
 
-/// Confirmed protocol completion failure, detected by the OpenRouter decoder.
+/// Confirmed protocol completion failure, detected by a stream decoder.
 /// This contains no response, endpoint or provider-controlled detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderStreamIncomplete {
@@ -22,6 +22,162 @@ impl std::fmt::Display for ProviderStreamIncomplete {
 }
 
 impl std::error::Error for ProviderStreamIncomplete {}
+
+/// A native error outcome with an allowlisted cause. Provider-controlled error
+/// messages and unknown codes are deliberately discarded at the decode boundary.
+/// Display/Debug and downstream diagnostics can never expose response payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicStreamError {
+    Overloaded,
+    RateLimit,
+    Authentication,
+    Permission,
+    InvalidRequest,
+    NotFound,
+    Api,
+    Unknown,
+}
+
+impl AnthropicStreamError {
+    pub fn from_type(error_type: Option<&str>) -> Self {
+        match error_type {
+            Some("overloaded_error") => Self::Overloaded,
+            Some("rate_limit_error") => Self::RateLimit,
+            Some("authentication_error") => Self::Authentication,
+            Some("permission_error") => Self::Permission,
+            Some("invalid_request_error") => Self::InvalidRequest,
+            Some("not_found_error") => Self::NotFound,
+            Some("api_error") => Self::Api,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Overloaded => "overloaded_error",
+            Self::RateLimit => "rate_limit_error",
+            Self::Authentication => "authentication_error",
+            Self::Permission => "permission_error",
+            Self::InvalidRequest => "invalid_request_error",
+            Self::NotFound => "not_found_error",
+            Self::Api => "api_error",
+            Self::Unknown => "unknown_native_error",
+        }
+    }
+
+    fn classification(self) -> ProviderFailureClassification {
+        let class = match self {
+            Self::Overloaded | Self::Api => ProviderFailureClass::Provider5xx,
+            Self::RateLimit => ProviderFailureClass::RateLimit,
+            Self::Authentication | Self::Permission => ProviderFailureClass::AuthOrPermission,
+            Self::InvalidRequest | Self::NotFound | Self::Unknown => {
+                ProviderFailureClass::ProviderRejected
+            }
+        };
+        let mut classification = ProviderFailureClassification::new(class);
+        classification.provider_code = (self != Self::Unknown).then(|| self.code().to_owned());
+        // Native events have no HTTP failure status: the response was HTTP 200.
+        classification
+    }
+}
+
+impl std::fmt::Display for AnthropicStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Anthropic stream failed ({})", self.code())
+    }
+}
+
+impl std::error::Error for AnthropicStreamError {}
+
+pub fn anthropic_stream_error(error: &anyhow::Error) -> Option<AnthropicStreamError> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<AnthropicStreamError>().copied())
+}
+
+pub fn classify_stream_error(error: &anyhow::Error) -> Option<ProviderFailureClassification> {
+    if let Some(native) = anthropic_stream_error(error) {
+        return Some(native.classification());
+    }
+    if let Some(native) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<NativeChatStreamError>())
+    {
+        return Some(ProviderFailureClassification::new(native.class));
+    }
+    if let Some(native) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<NativeStreamStatusError>())
+    {
+        return Some(ProviderFailureClassification::new(match native.status {
+            Some(429) => ProviderFailureClass::RateLimit,
+            Some(401 | 403) => ProviderFailureClass::AuthOrPermission,
+            Some(500..=599) => ProviderFailureClass::Provider5xx,
+            _ => ProviderFailureClass::ProviderRejected,
+        }));
+    }
+    provider_stream_incomplete(error)
+        .map(|_| ProviderFailureClassification::new(ProviderFailureClass::StreamTruncated))
+}
+
+/// Classify native Chat error details once, then discard all provider-controlled
+/// text. Numeric event codes are classification hints, never HTTP status metadata.
+pub(crate) fn native_chat_stream_error(detail: &str, native_status: Option<u16>) -> anyhow::Error {
+    let class = classify_provider_failure_class(
+        &detail.to_ascii_lowercase(),
+        ProviderFailureStage::Connect,
+        native_status.filter(|status| (100..600).contains(status)),
+        None,
+    );
+    NativeChatStreamError {
+        class: if class == ProviderFailureClass::Unknown {
+            ProviderFailureClass::ProviderRejected
+        } else {
+            class
+        },
+    }
+    .into()
+}
+
+#[derive(Debug)]
+struct NativeChatStreamError {
+    class: ProviderFailureClass,
+}
+impl std::fmt::Display for NativeChatStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Chat Completions stream failed ({:?})", self.class)
+    }
+}
+impl std::error::Error for NativeChatStreamError {}
+
+/// Numeric native status, without raw provider text or payloads. This is an
+/// event outcome, not the status of the already accepted HTTP response.
+#[derive(Debug)]
+pub(crate) struct NativeStreamStatusError {
+    protocol: &'static str,
+    status: Option<u16>,
+}
+
+impl NativeStreamStatusError {
+    pub(crate) fn new(protocol: &'static str, status: Option<u16>) -> Self {
+        Self {
+            protocol,
+            status: status.filter(|status| (100..600).contains(status)),
+        }
+    }
+}
+
+impl std::fmt::Display for NativeStreamStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} stream failed", self.protocol)?;
+        if let Some(status) = self.status {
+            write!(f, " (native status {status})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for NativeStreamStatusError {}
 
 /// Endpoint redaction retains only this safe typed source, never the raw error.
 pub fn provider_stream_incomplete(error: &anyhow::Error) -> Option<ProviderStreamIncomplete> {
@@ -244,4 +400,25 @@ pub fn extract_retry_after_ms(message_lower: &str) -> Option<u64> {
         .collect::<String>();
     let secs = seconds.parse::<u64>().ok()?;
     Some(secs.saturating_mul(1000))
+}
+
+#[cfg(test)]
+mod native_stream_privacy_tests {
+    use super::*;
+    #[test]
+    fn unknown_native_type_is_safe_rejection_without_invented_provider_code() {
+        let error: anyhow::Error =
+            AnthropicStreamError::from_type(Some("credential=secret")).into();
+        let classification = classify_stream_error(&error).unwrap();
+        assert_eq!(classification.class, ProviderFailureClass::ProviderRejected);
+        assert!(classification.provider_code.is_none());
+        assert!(classification.http_status.is_none());
+        assert!(!format!("{error:?}").contains("secret"));
+        let chat = native_chat_stream_error("unrecognized private payload", None);
+        assert_eq!(
+            classify_stream_error(&chat).unwrap().class,
+            ProviderFailureClass::ProviderRejected
+        );
+        assert!(!format!("{chat:?}").contains("private"));
+    }
 }

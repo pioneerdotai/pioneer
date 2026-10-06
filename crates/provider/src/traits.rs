@@ -37,6 +37,13 @@ pub trait Provider: Send + Sync {
         ProviderCapabilities::default()
     }
 
+    /// Adapter capability is a protocol ceiling; known catalog model support
+    /// can narrow it. Absence remains unknown, not evidence for every model.
+    fn model_tool_calling(&self, model: &str) -> bool {
+        self.capabilities().tool_calling
+            && crate::tools::policy::model_tool_support(self.name(), model) != Some(false)
+    }
+
     /// Selects the native file-tool wire contract for this provider/model.
     /// The decision is provider-owned and fail-closed for unknown families;
     /// callers must use the same result for both catalog and prompt output.
@@ -50,8 +57,8 @@ pub trait Provider: Send + Sync {
     /// Returning `None` is always safe: unknown request rejections are not
     /// retried, while transport/HTTP transient failures are classified by the
     /// shared provider-neutral fallback before endpoint errors are redacted.
-    fn classify_failure(&self, _error: &anyhow::Error) -> Option<ProviderFailureClassification> {
-        None
+    fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
+        crate::failure::classify_stream_error(error)
     }
 
     /// Materialize and locally budget the media that this request will send.

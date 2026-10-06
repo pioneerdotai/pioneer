@@ -7,7 +7,7 @@ use crate::{
     },
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
     tools::parse::parse_tool_calls,
-    tools::stream::{IncrementalLineDecoder, sse_data},
+    tools::stream::IncrementalSseDecoder,
     types::{
         ChatMessage, ChatRequest, ChatResponse, InputContentType, InputTypeSupport,
         ProviderCapabilities, ProviderInputCapabilities, ProviderReplayState, ProviderTermination,
@@ -991,6 +991,7 @@ impl OpenAiCompatibleProvider {
         request: ChatRequest,
         stream: bool,
     ) -> Result<ApiChatRequest> {
+        let request = crate::tools::policy::prepare_request(self.name.as_str(), request)?;
         let capabilities =
             <OpenAiCompatibleProvider as crate::traits::Provider>::capabilities(self);
         let prepared = prepare_messages_for_provider_async(
@@ -1005,6 +1006,7 @@ impl OpenAiCompatibleProvider {
 
     #[cfg(test)]
     fn build_chat_request(&self, request: ChatRequest, stream: bool) -> Result<ApiChatRequest> {
+        let request = crate::tools::policy::prepare_request(self.name.as_str(), request)?;
         let capabilities =
             <OpenAiCompatibleProvider as crate::traits::Provider>::capabilities(self);
         let prepared = prepare_messages_for_provider(
@@ -1027,8 +1029,10 @@ impl OpenAiCompatibleProvider {
         &self,
         request: ChatRequest,
         stream: bool,
-        prepared: PreparedProviderMessages,
+        mut prepared: PreparedProviderMessages,
     ) -> Result<ApiChatRequest> {
+        let request = crate::tools::policy::prepare_request(self.name.as_str(), request)?;
+        crate::tools::policy::prepare_history(self.name.as_str(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name.as_str(), &prepared)?;
         Ok(ApiChatRequest {
             model: request.model,
@@ -1089,6 +1093,210 @@ fn finish_compatible_stream(
 }
 
 // ── Provider trait implementation ───────────────────────────────────────────
+
+// The same decoder is used by HTTP transport and in-memory regression fixtures.
+impl OpenAiCompatibleProvider {
+    pub(super) fn decode_stream(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+        provider_name: String,
+        replay_reasoning_content: bool,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
+
+        tokio::spawn(async move {
+            let mut decoder = IncrementalSseDecoder::default();
+            let mut tool_call_accumulator = StreamToolCallAccumulator::default();
+            let mut terminal_reason = None;
+            let mut response_content: Option<String> = None;
+            let mut response_reasoning_content: Option<String> = None;
+
+            tokio::pin!(byte_stream);
+
+            while let Some(result) = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = byte_stream.next() => result,
+            } {
+                let bytes = match result {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        if tx.send(Err(anyhow!(e))).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+
+                let lines = match decoder.push(bytes.as_ref()) {
+                    Ok(lines) => lines,
+                    Err(error) => {
+                        if tx.send(Err(error)).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+                for frame in lines {
+                    let data = frame.data.as_str();
+
+                    if data.trim() == "[DONE]" {
+                        let terminal = terminal_reason
+                            .take()
+                            .map(StreamChunk::final_chunk_with)
+                            .ok_or_else(|| {
+                                crate::failure::ProviderStreamIncomplete::DoneWithoutFinishReason
+                                    .into()
+                            });
+                        let _ = tx.send(terminal).await;
+                        return;
+                    }
+
+                    match serde_json::from_str::<StreamResponse>(data) {
+                        Ok(resp) => {
+                            if terminal_reason.is_some()
+                                && resp.choices.iter().any(|choice| choice.delta.has_payload())
+                            {
+                                let _ = tx
+                                    .send(Err(anyhow!("provider sent payload after finish_reason")))
+                                    .await;
+                                return;
+                            }
+                            if let Some(usage) = resp.usage {
+                                if tx
+                                    .send(Ok(StreamChunk::usage(TokenUsage {
+                                        input_tokens: usage.prompt_tokens,
+                                        output_tokens: usage.completion_tokens,
+                                    })))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            if let Some(error) = resp.error {
+                                let status = error
+                                    .code
+                                    .as_ref()
+                                    .and_then(serde_json::Value::as_u64)
+                                    .and_then(|code| u16::try_from(code).ok());
+                                let outcome = crate::failure::native_chat_stream_error(
+                                    &error.description(),
+                                    status,
+                                );
+                                let _ = tx.send(Err(outcome)).await;
+                                return;
+                            }
+                            for choice in resp.choices {
+                                if terminal_reason.is_some() {
+                                    if choice.finish_reason.as_deref().is_some_and(|reason| {
+                                        Some(ProviderTermination::from_openai_reason(reason))
+                                            != terminal_reason
+                                    }) {
+                                        let _ = tx
+                                            .send(Err(anyhow!(
+                                                "provider changed finish_reason after completion"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    if choice.delta.has_payload() {
+                                        let _ = tx
+                                            .send(Err(anyhow!(
+                                                "provider sent payload after finish_reason"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                if let Some(rc) =
+                                    choice.delta.reasoning_content.or(choice.delta.reasoning)
+                                {
+                                    response_reasoning_content
+                                        .get_or_insert_with(String::new)
+                                        .push_str(rc.as_str());
+                                    if !rc.is_empty() {
+                                        if tx.send(Ok(StreamChunk::reasoning(rc))).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                if let Some(content) = choice.delta.content {
+                                    response_content
+                                        .get_or_insert_with(String::new)
+                                        .push_str(content.as_str());
+                                    if !content.is_empty() {
+                                        if tx.send(Ok(StreamChunk::delta(content))).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                if let Some(tool_calls) = choice.delta.tool_calls {
+                                    tool_call_accumulator.ingest(tool_calls);
+                                }
+                                if let Some(function_call) = choice.delta.function_call {
+                                    tool_call_accumulator.ingest(vec![StreamToolCallDelta {
+                                        index: Some(0),
+                                        id: None,
+                                        function: Some(function_call),
+                                        name: None,
+                                        arguments: None,
+                                    }]);
+                                }
+                                if let Some(reason) = choice.finish_reason {
+                                    let chunks = match finish_compatible_stream(
+                                        &mut tool_call_accumulator,
+                                        provider_name.as_str(),
+                                        replay_reasoning_content,
+                                        response_content.take(),
+                                        response_reasoning_content.take(),
+                                        ProviderTermination::from_openai_reason(&reason),
+                                    ) {
+                                        Ok(chunks) => chunks,
+                                        Err(error) => {
+                                            if tx.send(Err(error)).await.is_err() {
+                                                return;
+                                            }
+                                            return;
+                                        }
+                                    };
+                                    for chunk in chunks {
+                                        if chunk.is_final {
+                                            terminal_reason = chunk.termination;
+                                        } else if tx.send(Ok(chunk)).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            if tx
+                                .send(Err(anyhow!("malformed {} SSE frame", provider_name)))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let terminal = match decoder.finish() {
+                Err(error) => Err(error),
+                Ok(_) => {
+                    Err(crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into())
+                }
+            };
+            let _ = tx.send(terminal).await;
+        });
+
+        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Box::pin(chunk_stream)
+    }
+}
 
 #[async_trait]
 impl crate::traits::Provider for OpenAiCompatibleProvider {
@@ -1201,196 +1409,11 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
         let provider_name = self.name.clone();
         let replay_reasoning_content = self.replay_reasoning_content;
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
-
-        tokio::spawn(async move {
-            let mut decoder = IncrementalLineDecoder::default();
-            let mut tool_call_accumulator = StreamToolCallAccumulator::default();
-            let mut terminal_reason = None;
-            let mut response_content: Option<String> = None;
-            let mut response_reasoning_content: Option<String> = None;
-
-            tokio::pin!(byte_stream);
-
-            while let Some(result) = tokio::select! {
-                biased;
-                _ = tx.closed() => return,
-                result = byte_stream.next() => result,
-            } {
-                let bytes = match result {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        if tx.send(Err(anyhow!(e))).await.is_err() {
-                            return;
-                        }
-                        return;
-                    }
-                };
-
-                let lines = match decoder.push(bytes.as_ref()) {
-                    Ok(lines) => lines,
-                    Err(error) => {
-                        if tx.send(Err(error)).await.is_err() {
-                            return;
-                        }
-                        return;
-                    }
-                };
-                for line in lines {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    let Some(data) = sse_data(line) else {
-                        continue;
-                    };
-
-                    if data.trim() == "[DONE]" {
-                        let terminal = terminal_reason
-                            .take()
-                            .map(StreamChunk::final_chunk_with)
-                            .ok_or_else(|| {
-                                anyhow!("provider stream ended without a finish_reason")
-                            });
-                        let _ = tx.send(terminal).await;
-                        return;
-                    }
-
-                    match serde_json::from_str::<StreamResponse>(data) {
-                        Ok(resp) => {
-                            if terminal_reason.is_some()
-                                && resp.choices.iter().any(|choice| choice.delta.has_payload())
-                            {
-                                let _ = tx
-                                    .send(Err(anyhow!("provider sent payload after finish_reason")))
-                                    .await;
-                                return;
-                            }
-                            if let Some(usage) = resp.usage {
-                                if tx
-                                    .send(Ok(StreamChunk::usage(TokenUsage {
-                                        input_tokens: usage.prompt_tokens,
-                                        output_tokens: usage.completion_tokens,
-                                    })))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            if let Some(error) = resp.error {
-                                if tx
-                                    .send(Err(anyhow!(
-                                        "{} stream error: {}",
-                                        provider_name,
-                                        error.description()
-                                    )))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                return;
-                            }
-                            for choice in resp.choices {
-                                if terminal_reason.is_some() {
-                                    if choice.delta.has_payload() {
-                                        let _ = tx
-                                            .send(Err(anyhow!(
-                                                "provider sent payload after finish_reason"
-                                            )))
-                                            .await;
-                                        return;
-                                    }
-                                    continue;
-                                }
-                                if let Some(rc) =
-                                    choice.delta.reasoning_content.or(choice.delta.reasoning)
-                                {
-                                    response_reasoning_content
-                                        .get_or_insert_with(String::new)
-                                        .push_str(rc.as_str());
-                                    if !rc.is_empty() {
-                                        if tx.send(Ok(StreamChunk::reasoning(rc))).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                                if let Some(content) = choice.delta.content {
-                                    response_content
-                                        .get_or_insert_with(String::new)
-                                        .push_str(content.as_str());
-                                    if !content.is_empty() {
-                                        if tx.send(Ok(StreamChunk::delta(content))).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                                if let Some(tool_calls) = choice.delta.tool_calls {
-                                    tool_call_accumulator.ingest(tool_calls);
-                                }
-                                if let Some(function_call) = choice.delta.function_call {
-                                    tool_call_accumulator.ingest(vec![StreamToolCallDelta {
-                                        index: Some(0),
-                                        id: None,
-                                        function: Some(function_call),
-                                        name: None,
-                                        arguments: None,
-                                    }]);
-                                }
-                                if let Some(reason) = choice.finish_reason {
-                                    let chunks = match finish_compatible_stream(
-                                        &mut tool_call_accumulator,
-                                        provider_name.as_str(),
-                                        replay_reasoning_content,
-                                        response_content.take(),
-                                        response_reasoning_content.take(),
-                                        ProviderTermination::from_openai_reason(&reason),
-                                    ) {
-                                        Ok(chunks) => chunks,
-                                        Err(error) => {
-                                            if tx.send(Err(error)).await.is_err() {
-                                                return;
-                                            }
-                                            return;
-                                        }
-                                    };
-                                    for chunk in chunks {
-                                        if chunk.is_final {
-                                            terminal_reason = chunk.termination;
-                                        } else if tx.send(Ok(chunk)).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            if tx
-                                .send(Err(anyhow!("malformed {} SSE frame: {e}", provider_name)))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                            return;
-                        }
-                    }
-                }
-            }
-
-            let terminal = match decoder.finish() {
-                Err(error) => Err(error),
-                Ok(_) => terminal_reason
-                    .map(StreamChunk::final_chunk_with)
-                    .ok_or_else(|| anyhow!("provider stream ended before a terminal marker")),
-            };
-            let _ = tx.send(terminal).await;
-        });
-
-        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(Box::pin(chunk_stream))
+        Ok(Self::decode_stream(
+            byte_stream,
+            provider_name,
+            replay_reasoning_content,
+        ))
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -1650,6 +1673,178 @@ mod tests {
     }
 
     #[test]
+    fn mistral_wire_keeps_two_parallel_rounds_and_canonical_ids_separate() {
+        let provider = OpenAiCompatibleProvider::new(
+            "mistral",
+            "https://example.invalid/v1",
+            "unused",
+            AuthStyle::Bearer,
+        );
+        let mut request = crate::tools::policy::test_request();
+        let mut messages = vec![ChatMessage::user("use tools")];
+        for ids in [["foreign/a", "foreign?b"], ["foreign/a", "round-two"]] {
+            let mut assistant = ChatMessage::assistant("");
+            assistant.tool_calls = Some(
+                ids.iter()
+                    .map(|id| ProviderToolCall {
+                        id: (*id).into(),
+                        name: "lookup".into(),
+                        arguments: "{}".into(),
+                    })
+                    .collect(),
+            );
+            messages.push(assistant);
+            messages.extend(
+                ids.iter()
+                    .rev()
+                    .map(|id| ChatMessage::tool_result(*id, "lookup", *id)),
+            );
+        }
+        request.messages = messages.clone();
+        let wire =
+            serde_json::to_value(provider.build_chat_request(request, false).unwrap()).unwrap();
+        for (assistant, result_one, result_two) in [(1, 3, 2), (4, 6, 5)] {
+            assert_eq!(
+                wire["messages"][assistant]["tool_calls"][0]["id"],
+                wire["messages"][result_one]["tool_call_id"]
+            );
+            assert_eq!(
+                wire["messages"][assistant]["tool_calls"][1]["id"],
+                wire["messages"][result_two]["tool_call_id"]
+            );
+            assert_ne!(
+                wire["messages"][assistant]["tool_calls"][0]["id"],
+                wire["messages"][assistant]["tool_calls"][1]["id"]
+            );
+        }
+        assert_eq!(
+            wire["messages"][1]["tool_calls"][0]["id"],
+            wire["messages"][4]["tool_calls"][0]["id"]
+        );
+        assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].id, "foreign/a");
+    }
+
+    #[test]
+    fn each_compatible_profile_serializes_its_own_tool_controls() {
+        let providers = [
+            "groq",
+            "mistral",
+            "xai",
+            "together",
+            "fireworks",
+            "novita",
+            "perplexity",
+            "cohere",
+            "venice",
+            "cerebras",
+            "sambanova",
+            "hyperbolic",
+            "deepinfra",
+            "huggingface",
+            "ai21",
+            "reka",
+            "baseten",
+            "nscale",
+            "anyscale",
+            "nebius",
+            "friendli",
+            "lepton",
+            "siliconflow",
+            "aihubmix",
+            "astrai",
+            "stepfun",
+            "baichuan",
+            "yi",
+            "hunyuan",
+            "ovhcloud",
+            "nvidia",
+            "synthetic",
+            "doubao",
+            "qianfan",
+            "lmstudio",
+            "llamacpp",
+            "sglang",
+            "vllm",
+            "osaurus",
+            "litellm",
+            "custom",
+            "deepseek", // delegates to this builder; replay validation is provider-owned
+        ];
+        for name in providers {
+            let provider = OpenAiCompatibleProvider::new(
+                name,
+                "https://example.invalid/v1",
+                "unused",
+                AuthStyle::Bearer,
+            );
+            for parallel in [None, Some(true), Some(false)] {
+                for choice in [
+                    ToolChoice::Auto,
+                    ToolChoice::None,
+                    ToolChoice::Required,
+                    ToolChoice::Tool {
+                        name: "lookup".into(),
+                    },
+                ] {
+                    let mut request = crate::tools::policy::test_request();
+                    request.tool_choice = Some(choice.clone());
+                    request.parallel_tool_calls = parallel;
+                    let supports_parallel = matches!(
+                        name,
+                        "groq"
+                            | "mistral"
+                            | "xai"
+                            | "fireworks"
+                            | "venice"
+                            | "cerebras"
+                            | "friendli"
+                            | "synthetic"
+                    );
+                    let disabled = matches!(choice, ToolChoice::None);
+                    let forced = matches!(choice, ToolChoice::Required | ToolChoice::Tool { .. });
+                    let unsupported = matches!(name, "cohere" | "novita") && forced
+                        || name == "synthetic" && matches!(choice, ToolChoice::Required)
+                        || parallel == Some(false) && !disabled && !supports_parallel;
+                    let wire = provider.build_chat_request(request, false);
+                    assert_eq!(wire.is_err(), unsupported, "{name} {choice:?} {parallel:?}");
+                    if let Ok(wire) = wire {
+                        let json = serde_json::to_value(wire).unwrap();
+                        assert_eq!(
+                            json.get("parallel_tool_calls")
+                                .and_then(serde_json::Value::as_bool),
+                            if disabled || !supports_parallel {
+                                None
+                            } else {
+                                parallel
+                            },
+                            "{name}"
+                        );
+                        if matches!(name, "cohere" | "novita") {
+                            assert!(json.get("tool_choice").is_none());
+                        } else {
+                            match choice {
+                                ToolChoice::Auto => {
+                                    assert_eq!(json["tool_choice"], "auto", "{name}")
+                                }
+                                ToolChoice::None => {
+                                    assert_eq!(json["tool_choice"], "none", "{name}")
+                                }
+                                ToolChoice::Required => {
+                                    assert_eq!(json["tool_choice"], "required", "{name}")
+                                }
+                                ToolChoice::Tool { .. } => assert_eq!(
+                                    json["tool_choice"]["function"]["name"], "lookup",
+                                    "{name}"
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn creates_with_required_fields() {
         let provider = test_provider();
         assert_eq!(provider.name, "test-provider");
@@ -1877,7 +2072,10 @@ mod tests {
         );
         let request = ChatRequest {
             model: "compatible-model".to_owned(),
-            messages: vec![message],
+            messages: vec![
+                message,
+                ChatMessage::tool_result("call_1", "read_file", "file contents"),
+            ],
             temperature: None,
             max_tokens: None,
             tools: None,
@@ -1893,6 +2091,7 @@ mod tests {
 
         assert_eq!(rendered.messages[0].reasoning_content.as_deref(), Some(""));
         assert_eq!(text_content(&rendered.messages[0].content), Some(""));
+        assert_eq!(rendered.messages[1].tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(
             rendered.messages[0]
                 .tool_calls

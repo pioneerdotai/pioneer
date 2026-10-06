@@ -7,7 +7,7 @@ use rusqlite::types::ToSqlOutput;
 use rusqlite::types::{Value, ValueRef};
 use std::{io::Write, sync::Arc};
 use zstd::bulk::Compressor;
-use zstd::dict::DecoderDictionary;
+use zstd::dict::{DecoderDictionary, EncoderDictionary};
 
 /// null_dict_is_passthrough is only true when called through the `zstd_compress_col` function (for transparent compression)
 /// with null_dict_is_passthrough, the behaviour is slightly changed: When dict is null, the data is passed through without compression.
@@ -112,17 +112,30 @@ pub fn compress_column_value(
 /// Constructing a level-19 compressor with a dictionary is expensive because
 /// zstd builds a CDict. Keep one context for the whole batch instead of paying
 /// that setup cost once per row.
-pub struct ColumnValueCompressor {
-    encoder: Compressor<'static>,
+pub struct ColumnValueCompressor<'a> {
+    encoder: Compressor<'a>,
 }
 
-impl ColumnValueCompressor {
+impl ColumnValueCompressor<'static> {
     pub fn new(level: i32, dictionary: Option<&[u8]>) -> anyhow::Result<Self> {
         let mut encoder = match dictionary {
             Some(dictionary) => Compressor::with_dictionary(level, dictionary),
             None => Compressor::new(level),
         }
         .context("creating zstd encoder")?;
+        configure_compact_encoder(&mut encoder)?;
+        Ok(Self { encoder })
+    }
+}
+
+impl<'a> ColumnValueCompressor<'a> {
+    /// Borrows the worker's shared CDict for this bounded batch. The caller
+    /// retains its dictionary owner until the compressor has been dropped.
+    pub fn with_prepared_dictionary(
+        dictionary: &'a EncoderDictionary<'static>,
+    ) -> anyhow::Result<Self> {
+        let mut encoder = Compressor::with_prepared_dictionary(dictionary)
+            .context("creating prepared zstd encoder")?;
         configure_compact_encoder(&mut encoder)?;
         Ok(Self { encoder })
     }
@@ -284,6 +297,79 @@ fn zstd_decompress_inner<'a>(
 mod tests {
     use super::{ColumnValueCompressor, compress_column_value};
     use rusqlite::{Connection, params};
+
+    #[test]
+    fn prepared_compactor_round_trips_raw_bytes_through_current_compact_decoder() {
+        use std::sync::Arc;
+        use zstd::dict::EncoderDictionary;
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<EncoderDictionary<'static>>();
+        let database = Connection::open_in_memory().unwrap();
+        crate::zstd::load(&database).unwrap();
+        let samples = (0..128)
+            .map(|index| {
+                format!(
+                    "shared payload record {index}: {}",
+                    "dictionary content remains compatible ".repeat(16)
+                )
+                .into_bytes()
+            })
+            .collect::<Vec<_>>();
+        let trained = zstd::dict::from_samples(&samples, 1024).unwrap();
+        for dictionary in [
+            None,
+            Some(b"shared payload dictionary content".as_slice()),
+            Some(trained.as_slice()),
+        ] {
+            let prepared = dictionary.map(|bytes| Arc::new(EncoderDictionary::copy(bytes, 19)));
+            let inputs = [
+                Vec::new(),
+                vec![0, 255, 128, 0, 1, 42],
+                samples[0].clone(),
+                "汉😀 exact UTF-8 bytes".repeat(64).into_bytes(),
+            ];
+            // Independent contexts borrow the very same native dictionary.
+            for _ in 0..2 {
+                let mut compressor = match prepared.as_ref() {
+                    Some(dictionary) => ColumnValueCompressor::with_prepared_dictionary(dictionary),
+                    None => ColumnValueCompressor::new(19, None),
+                }
+                .unwrap();
+                for input in &inputs {
+                    let encoded = compressor.compress(input).unwrap();
+                    assert_eq!(
+                        encoded[0], 0,
+                        "no checksum/content size/dict ID in compact frame header"
+                    );
+                    assert!(
+                        !encoded.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]),
+                        "no frame magic"
+                    );
+                    let old_encoded = super::compress_column_value(input, 19, dictionary).unwrap();
+                    let sql_encoded: Vec<u8> = database
+                        .query_row(
+                            "SELECT zstd_compress(?1, 19, ?2, 1)",
+                            params![input, dictionary],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    for compressed in [encoded, old_encoded, sql_encoded] {
+                        let decoded: Vec<u8> = database
+                            .query_row(
+                                "SELECT zstd_decompress(?1, 0, ?2, 1)",
+                                params![compressed, dictionary],
+                                |row| row.get(0),
+                            )
+                            .unwrap();
+                        assert_eq!(&decoded, input);
+                    }
+                }
+            }
+            if let Some(prepared) = prepared {
+                assert_eq!(Arc::strong_count(&prepared), 1);
+            }
+        }
+    }
 
     #[test]
     fn pure_compactor_matches_the_transparent_column_wire_format() {
