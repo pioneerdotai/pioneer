@@ -38535,6 +38535,7 @@ mod tests {
         pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
             id: Set(turn_id.to_owned()),
             thread_id: Set(thread_id.to_owned()),
+            plugin_selection_json: Set(None),
             status: Set("completed".to_owned()),
             error: Set(None),
             prompt_manifest_json: Set("{}".to_owned()),

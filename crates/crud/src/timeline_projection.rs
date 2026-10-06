@@ -781,6 +781,7 @@ mod tests {
         turn::Model {
             id: "turn_1".to_owned(),
             thread_id: "thread_1".to_owned(),
+            plugin_selection_json: None,
             initiated_by_actor_id: None,
             initiated_by_actor_kind: None,
             status: "in_progress".to_owned(),

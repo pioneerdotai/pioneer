@@ -2359,6 +2359,7 @@ mod tests {
         turn::Model {
             id: "T00000000000000000001".to_owned(),
             thread_id: "H00000000000000000001".to_owned(),
+            plugin_selection_json: None,
             status: "completed".to_owned(),
             error: None,
             prompt_manifest_json: "{}".to_owned(),
