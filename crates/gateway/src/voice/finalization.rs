@@ -29,6 +29,7 @@ pub(crate) async fn with_ack<F: std::future::Future>(
     ACCEPTED.scope(RefCell::new(Some(sender)), future).await
 }
 
+#[derive(Clone)]
 pub(crate) struct VoiceFinalizations {
     slots: Arc<Semaphore>,
     connections: Arc<Mutex<HashSet<ConnectionId>>>,
@@ -69,7 +70,7 @@ impl VoiceFinalizations {
     }
 }
 pub(crate) struct VoiceFinalizationLease {
-    _tracked: tokio_util::task::TaskTrackerToken,
+    _tracked: tokio_util::task::task_tracker::TaskTrackerToken,
     _slot: OwnedSemaphorePermit,
     connection: ConnectionId,
     connections: Arc<Mutex<HashSet<ConnectionId>>>,
@@ -88,15 +89,19 @@ mod tests {
     #[tokio::test]
     async fn voice_finalization_capacity_and_shutdown_retain_owned_slots() {
         let workers = VoiceFinalizations::default();
+        let shared = workers.clone();
         let first = workers.reserve(1).unwrap();
-        assert!(workers.reserve(1).is_none());
+        assert!(shared.reserve(1).is_none());
+        assert!(TaskTracker::ptr_eq(&workers.tasks, &shared.tasks));
         let others: Vec<_> = (2..=4)
-            .map(|owner| workers.reserve(owner).unwrap())
+            .map(|owner| shared.reserve(owner).unwrap())
             .collect();
         assert!(workers.reserve(5).is_none());
-        workers.close();
+        assert!(shared.reserve(5).is_none());
+        shared.close();
         assert!(workers.reserve(5).is_none());
         assert!(workers.shutdown.is_cancelled());
+        assert!(shared.shutdown.is_cancelled());
         // Close does not abort/release a native owner's lease. Draining finishes
         // only when all owned tasks/leases complete (no model/runtime involved).
         assert!(!workers.tasks.is_empty());
