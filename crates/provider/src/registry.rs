@@ -185,6 +185,7 @@ struct RedactedEndpointError {
     message: &'static str,
     classification: ProviderFailureClassification,
     incomplete: Option<crate::failure::ProviderStreamIncomplete>,
+    native: Option<crate::failure::AnthropicStreamError>,
 }
 
 impl Display for RedactedEndpointError {
@@ -198,9 +199,14 @@ impl Display for RedactedEndpointError {
 
 impl Error for RedactedEndpointError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.incomplete
+        self.native
             .as_ref()
             .map(|cause| cause as &(dyn Error + 'static))
+            .or_else(|| {
+                self.incomplete
+                    .as_ref()
+                    .map(|cause| cause as &(dyn Error + 'static))
+            })
     }
 }
 
@@ -268,7 +274,11 @@ fn redacted_endpoint_error(
         .retry_after_ms
         .or_else(|| extract_retry_after_ms(&lower));
     // Provider-supplied codes may themselves contain the endpoint path.
-    classification.provider_code = None;
+    classification.provider_code =
+        crate::failure::anthropic_stream_error(&error).and_then(|native| {
+            (native != crate::failure::AnthropicStreamError::Unknown)
+                .then(|| native.code().to_owned())
+        });
     let message = if is_network {
         "provider network request failed"
     } else if status.is_some() {
@@ -281,6 +291,7 @@ fn redacted_endpoint_error(
         message,
         classification,
         incomplete: crate::failure::provider_stream_incomplete(&error),
+        native: crate::failure::anthropic_stream_error(&error),
     }
     .into();
     match observed {
@@ -3168,5 +3179,34 @@ mod usage_error_retention_tests {
         );
         assert!(!format!("{redacted:#}").contains("SECRET"));
         assert!(!format!("{redacted:#}").contains("private.example"));
+    }
+}
+
+#[cfg(test)]
+mod stream_error_redaction_tests {
+    use super::*;
+    #[test]
+    fn native_cause_survives_endpoint_redaction_without_untrusted_text() {
+        let error = anyhow::Error::from(crate::failure::AnthropicStreamError::Overloaded)
+            .context("credential=secret payload");
+        let redacted = redacted_endpoint_error(
+            &crate::providers::EchoProvider::new(),
+            error,
+            ProviderFailureStage::MidStream,
+        );
+        assert_eq!(
+            crate::failure::anthropic_stream_error(&redacted),
+            Some(crate::failure::AnthropicStreamError::Overloaded)
+        );
+        let classification = &redacted
+            .downcast_ref::<RedactedEndpointError>()
+            .unwrap()
+            .classification;
+        assert_eq!(classification.class, ProviderFailureClass::Provider5xx);
+        assert_eq!(
+            classification.provider_code.as_deref(),
+            Some("overloaded_error")
+        );
+        assert!(!format!("{redacted:#?} {redacted:#}").contains("secret"));
     }
 }

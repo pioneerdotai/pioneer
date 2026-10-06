@@ -106,7 +106,7 @@ struct OllamaChatResponse {
     eval_count: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct OllamaResponseMessage {
     #[serde(default)]
     content: Option<String>,
@@ -149,7 +149,10 @@ struct OllamaModelDetails {
 
 #[derive(Debug, Deserialize)]
 struct OllamaStreamChunk {
+    #[serde(default)]
     message: OllamaResponseMessage,
+    #[serde(default)]
+    error: Option<String>,
     #[serde(default)]
     done: bool,
     #[serde(default)]
@@ -268,11 +271,20 @@ impl OllamaProvider {
     }
 
     fn convert_tool_calls(tool_calls: Vec<OllamaToolCall>) -> Vec<ProviderToolCall> {
+        Self::convert_tool_calls_with_offset(tool_calls, 0)
+    }
+
+    fn convert_tool_calls_with_offset(
+        tool_calls: Vec<OllamaToolCall>,
+        offset: usize,
+    ) -> Vec<ProviderToolCall> {
         tool_calls
             .into_iter()
             .enumerate()
             .map(|(index, call)| ProviderToolCall {
-                id: call.id.unwrap_or_else(|| format!("call_{}", index + 1)),
+                id: call
+                    .id
+                    .unwrap_or_else(|| format!("call_{}", offset + index + 1)),
                 name: call.function.name,
                 arguments: call.function.arguments.to_string(),
             })
@@ -358,6 +370,228 @@ fn normalize_base_url(mut url: String) -> String {
     url
 }
 
+// The same decoder is used by HTTP transport and in-memory regression fixtures.
+impl OllamaProvider {
+    fn normalize_chat_response(api_response: OllamaChatResponse) -> Result<ChatResponse> {
+        if !api_response.done {
+            return Err(crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into());
+        }
+        let usage = match (api_response.prompt_eval_count, api_response.eval_count) {
+            (None, None) => None,
+            (input, output) => Some(TokenUsage {
+                input_tokens: input,
+                output_tokens: output,
+                raw_usage: Some(serde_json::json!({"prompt_eval_count":input,"eval_count":output})),
+                semantics: Some("native_eval_counts".into()),
+                ..Default::default()
+            }),
+        };
+
+        let reasoning_content = api_response.message.thinking.filter(|t| !t.is_empty());
+        let tool_calls =
+            Self::convert_tool_calls(api_response.message.tool_calls.unwrap_or_default());
+        let mut termination = api_response
+            .done_reason
+            .as_deref()
+            .map(ProviderTermination::from_openai_reason)
+            .unwrap_or_else(|| {
+                if tool_calls.is_empty() {
+                    ProviderTermination::Complete
+                } else {
+                    ProviderTermination::ToolCalls
+                }
+            });
+        if !tool_calls.is_empty() && termination == ProviderTermination::Complete {
+            termination = ProviderTermination::ToolCalls;
+        }
+        let text = api_response.message.content.unwrap_or_default();
+
+        if text.is_empty()
+            && tool_calls.is_empty()
+            && reasoning_content.as_deref().unwrap_or_default().is_empty()
+        {
+            return Err(anyhow!("no response from Ollama"));
+        }
+
+        Ok(ChatResponse {
+            text,
+            usage,
+            termination,
+            reasoning_content,
+            tool_calls,
+            provider_replay_state: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn decode_chat_fixture(value: serde_json::Value) -> Result<ChatResponse> {
+        Self::normalize_chat_response(serde_json::from_value(value)?)
+    }
+
+    pub(super) fn decode_stream(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
+
+        tokio::spawn(async move {
+            use std::collections::HashSet;
+
+            let mut decoder = IncrementalLineDecoder::default();
+            let mut emitted_tool_call_keys = HashSet::new();
+            let mut saw_tool_calls = false;
+            let mut tool_call_count = 0;
+
+            tokio::pin!(byte_stream);
+
+            while let Some(result) = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = byte_stream.next() => result,
+            } {
+                let bytes = match result {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        if tx.send(Err(anyhow!(e))).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+
+                let lines = match decoder.push(bytes.as_ref()) {
+                    Ok(lines) => lines,
+                    Err(error) => {
+                        if tx.send(Err(error)).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+                // Ollama streams newline-delimited JSON (not SSE)
+                for line in lines {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    match serde_json::from_str::<OllamaStreamChunk>(&line) {
+                        Ok(chunk) => {
+                            if chunk.error.is_some() {
+                                let _ = tx
+                                    .send(Err(crate::failure::NativeStreamStatusError::new(
+                                        "Ollama", None,
+                                    )
+                                    .into()))
+                                    .await;
+                                return;
+                            }
+
+                            let OllamaResponseMessage {
+                                content,
+                                thinking,
+                                tool_calls,
+                            } = chunk.message;
+
+                            if let Some(tool_calls) = tool_calls {
+                                let count = tool_calls.len();
+                                let converted = Self::convert_tool_calls_with_offset(
+                                    tool_calls,
+                                    tool_call_count,
+                                );
+                                tool_call_count += count;
+                                let mut new_calls = Vec::new();
+                                for call in converted {
+                                    let key =
+                                        format!("{}:{}:{}", call.id, call.name, call.arguments);
+                                    if emitted_tool_call_keys.insert(key) {
+                                        new_calls.push(call);
+                                    }
+                                }
+                                if !new_calls.is_empty() {
+                                    saw_tool_calls = true;
+                                    if tx
+                                        .send(Ok(StreamChunk::tool_calls(new_calls)))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                            if let Some(thinking) = thinking {
+                                if !thinking.is_empty() {
+                                    if tx.send(Ok(StreamChunk::reasoning(thinking))).await.is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                            if let Some(content) = content {
+                                if !content.is_empty() {
+                                    if tx.send(Ok(StreamChunk::delta(content))).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            if chunk.done {
+                                let mut termination = chunk
+                                    .done_reason
+                                    .as_deref()
+                                    .map(ProviderTermination::from_openai_reason)
+                                    .unwrap_or_else(|| {
+                                        if saw_tool_calls {
+                                            ProviderTermination::ToolCalls
+                                        } else {
+                                            ProviderTermination::Complete
+                                        }
+                                    });
+                                if saw_tool_calls && termination == ProviderTermination::Complete {
+                                    termination = ProviderTermination::ToolCalls;
+                                }
+                                if tx
+                                    .send(Ok(StreamChunk::final_chunk_with(termination)
+                                        .with_usage(Some(TokenUsage {
+                                            input_tokens: chunk.prompt_eval_count,
+                                            output_tokens: chunk.eval_count,
+                                            raw_usage: Some(serde_json::json!({"prompt_eval_count":chunk.prompt_eval_count,"eval_count":chunk.eval_count})),
+                                            semantics: Some("native_eval_counts".into()),
+                    ..Default::default()
+                                        }))))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                return;
+                            }
+                        }
+                        Err(_) => {
+                            if tx
+                                .send(Err(anyhow!("malformed Ollama NDJSON frame")))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let error = decoder.finish().err().unwrap_or_else(|| {
+                crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into()
+            });
+            if tx.send(Err(error)).await.is_err() {
+                return;
+            }
+        });
+
+        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Box::pin(chunk_stream)
+    }
+}
+
 #[async_trait]
 impl crate::traits::Provider for OllamaProvider {
     fn usage_api(&self) -> &'static str {
@@ -426,50 +660,7 @@ impl crate::traits::Provider for OllamaProvider {
             "provider_response",
         )
         .await?;
-        let usage = match (api_response.prompt_eval_count, api_response.eval_count) {
-            (None, None) => None,
-            (input, output) => Some(TokenUsage {
-                input_tokens: input,
-                output_tokens: output,
-                raw_usage: Some(serde_json::json!({"prompt_eval_count":input,"eval_count":output})),
-                semantics: Some("native_eval_counts".into()),
-                ..Default::default()
-            }),
-        };
-
-        let reasoning_content = api_response.message.thinking.filter(|t| !t.is_empty());
-        let tool_calls =
-            Self::convert_tool_calls(api_response.message.tool_calls.unwrap_or_default());
-        let termination = api_response
-            .done_reason
-            .as_deref()
-            .map(ProviderTermination::from_openai_reason)
-            .unwrap_or_else(|| {
-                if !api_response.done {
-                    ProviderTermination::Unknown("missing_done_marker".to_owned())
-                } else if tool_calls.is_empty() {
-                    ProviderTermination::Complete
-                } else {
-                    ProviderTermination::ToolCalls
-                }
-            });
-        let text = api_response.message.content.unwrap_or_default();
-
-        if text.is_empty()
-            && tool_calls.is_empty()
-            && reasoning_content.as_deref().unwrap_or_default().is_empty()
-        {
-            return Err(anyhow!("no response from Ollama"));
-        }
-
-        Ok(ChatResponse {
-            text,
-            usage,
-            termination,
-            reasoning_content,
-            tool_calls,
-            provider_replay_state: None,
-        })
+        Self::normalize_chat_response(api_response)
     }
 
     async fn stream_chat(
@@ -512,146 +703,7 @@ impl crate::traits::Provider for OllamaProvider {
             "provider_stream",
         );
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
-
-        tokio::spawn(async move {
-            use std::collections::HashSet;
-
-            let mut decoder = IncrementalLineDecoder::default();
-            let mut emitted_tool_call_keys = HashSet::new();
-            let mut saw_tool_calls = false;
-
-            tokio::pin!(byte_stream);
-
-            while let Some(result) = tokio::select! {
-                biased;
-                _ = tx.closed() => return,
-                result = byte_stream.next() => result,
-            } {
-                let bytes = match result {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        if tx.send(Err(anyhow!(e))).await.is_err() {
-                            return;
-                        }
-                        return;
-                    }
-                };
-
-                let lines = match decoder.push(bytes.as_ref()) {
-                    Ok(lines) => lines,
-                    Err(error) => {
-                        if tx.send(Err(error)).await.is_err() {
-                            return;
-                        }
-                        return;
-                    }
-                };
-                // Ollama streams newline-delimited JSON (not SSE)
-                for line in lines {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    match serde_json::from_str::<OllamaStreamChunk>(&line) {
-                        Ok(chunk) => {
-                            let OllamaResponseMessage {
-                                content,
-                                thinking,
-                                tool_calls,
-                            } = chunk.message;
-
-                            if let Some(tool_calls) = tool_calls {
-                                let converted = Self::convert_tool_calls(tool_calls);
-                                let mut new_calls = Vec::new();
-                                for call in converted {
-                                    let key =
-                                        format!("{}:{}:{}", call.id, call.name, call.arguments);
-                                    if emitted_tool_call_keys.insert(key) {
-                                        new_calls.push(call);
-                                    }
-                                }
-                                if !new_calls.is_empty() {
-                                    saw_tool_calls = true;
-                                    if tx
-                                        .send(Ok(StreamChunk::tool_calls(new_calls)))
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
-                                }
-                            }
-                            if chunk.done {
-                                let termination = chunk
-                                    .done_reason
-                                    .as_deref()
-                                    .map(ProviderTermination::from_openai_reason)
-                                    .unwrap_or_else(|| {
-                                        if saw_tool_calls {
-                                            ProviderTermination::ToolCalls
-                                        } else {
-                                            ProviderTermination::Complete
-                                        }
-                                    });
-                                if tx
-                                    .send(Ok(StreamChunk::final_chunk_with(termination)
-                                        .with_usage(Some(TokenUsage {
-                                            input_tokens: chunk.prompt_eval_count,
-                                            output_tokens: chunk.eval_count,
-                                            raw_usage: Some(serde_json::json!({"prompt_eval_count":chunk.prompt_eval_count,"eval_count":chunk.eval_count})),
-                                            semantics: Some("native_eval_counts".into()),
-                    ..Default::default()
-                                        }))))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                return;
-                            }
-                            if let Some(thinking) = thinking {
-                                if !thinking.is_empty() {
-                                    if tx.send(Ok(StreamChunk::reasoning(thinking))).await.is_err()
-                                    {
-                                        return;
-                                    }
-                                }
-                            }
-                            if let Some(content) = content {
-                                if !content.is_empty() {
-                                    if tx.send(Ok(StreamChunk::delta(content))).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            if tx
-                                .send(Err(anyhow!("malformed Ollama NDJSON frame: {e}")))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                            return;
-                        }
-                    }
-                }
-            }
-
-            let error = decoder
-                .finish()
-                .err()
-                .unwrap_or_else(|| anyhow!("Ollama stream ended before done=true"));
-            if tx.send(Err(error)).await.is_err() {
-                return;
-            }
-        });
-
-        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(Box::pin(chunk_stream))
+        Ok(Self::decode_stream(byte_stream))
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {

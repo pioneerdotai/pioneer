@@ -1067,10 +1067,9 @@ async fn run_gateway_until_shutdown_inner(
                         post_readiness
                             .set_degraded(ReadinessDegradation::DatabaseMaintenance, true);
                     }
-                    tokio::select! {
-                        _ = cancellation.cancelled() => {}
-                        _ = database::maintenance::run(post_crud_store, cancellation.clone()) => {}
-                    }
+                    // Workers observe cancellation themselves. Keep polling them
+                    // so shutdown joins an already-started bounded zstd CPU batch.
+                    database::maintenance::run(post_crud_store, cancellation.clone()).await;
                 },
             ));
             wait_for_shutdown_signal().await
