@@ -86,7 +86,6 @@ mod m20260905_000001_memory_identity;
 mod m20260906_000003_projection_receipt_cleanup;
 
 mod m20261005_000001_plugin_ownership;
-mod m20261005_000002_plugin_turn_selection;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -172,7 +171,6 @@ impl MigratorTrait for Migrator {
             Box::new(m20261004_000007_agent_action_outbox_ranges::Migration),
             Box::new(m20261005_000001_native_cancellation_context::Migration),
             Box::new(m20261005_000001_plugin_ownership::Migration),
-            Box::new(m20261005_000002_plugin_turn_selection::Migration),
         ]
     }
 }

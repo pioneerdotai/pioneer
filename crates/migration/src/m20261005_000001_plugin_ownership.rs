@@ -1,46 +1,117 @@
-use sea_orm_migration::prelude::*;
+use sea_orm_migration::{prelude::*, schema::*};
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
+const INSTALLATION: &str = "plugin_installation";
+const COMPONENT: &str = "plugin_component";
+
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager.get_connection().execute_unprepared(r#"
-CREATE TABLE plugin_installation (
-    id TEXT PRIMARY KEY NOT NULL,
-    workspace_id TEXT NOT NULL REFERENCES workspace(id) ON DELETE RESTRICT,
-    name TEXT NOT NULL,
-    version TEXT,
-    source_upload_id TEXT NOT NULL UNIQUE,
-    package_path TEXT NOT NULL,
-    data_path TEXT NOT NULL,
-    package_fingerprint TEXT NOT NULL,
-    enabled BOOLEAN NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('installing','installed','updating','removing','interrupted')),
-    revision BIGINT NOT NULL CHECK(revision > 0),
-    pending_json TEXT CHECK(pending_json IS NULL OR length(pending_json) <= 65536),
-    last_error TEXT,
-    created_at TIMESTAMP_WITH_TIME_ZONE NOT NULL,
-    updated_at TIMESTAMP_WITH_TIME_ZONE NOT NULL
-);
-CREATE INDEX ix_plugin_workspace ON plugin_installation(workspace_id);
-CREATE TABLE plugin_component (
-    plugin_id TEXT NOT NULL REFERENCES plugin_installation(id) ON DELETE RESTRICT,
-    kind TEXT NOT NULL CHECK(kind IN ('skill','mcp')),
-    member_key TEXT NOT NULL,
-    member_path TEXT,
-    skill_id TEXT UNIQUE REFERENCES skill_installation(id) ON DELETE SET NULL,
-    mcp_installation_id TEXT UNIQUE REFERENCES mcp_server_installation(id) ON DELETE SET NULL,
-    package_fingerprint TEXT,
-    status TEXT NOT NULL CHECK(status IN ('installed','invalid','failed','removed_by_user')),
-    diagnostic TEXT,
-    override_fields_json TEXT NOT NULL DEFAULT '[]',
-    PRIMARY KEY (plugin_id,kind,member_key),
-    CHECK((kind = 'skill' AND mcp_installation_id IS NULL) OR
-          (kind = 'mcp' AND skill_id IS NULL))
-);
-"#).await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(INSTALLATION)
+                    .col(text("id").primary_key())
+                    .col(text("workspace_id"))
+                    .col(text("name"))
+                    .col(text("version").null())
+                    .col(text("source_upload_id").unique_key())
+                    .col(text("package_path"))
+                    .col(text("data_path"))
+                    .col(text("package_fingerprint"))
+                    .col(boolean("enabled"))
+                    .col(text("state").check(Expr::col("state").is_in([
+                        "installing",
+                        "installed",
+                        "updating",
+                        "removing",
+                        "interrupted",
+                    ])))
+                    .col(big_integer("revision").check(Expr::col("revision").gt(0)))
+                    .col(text("pending_json").null().check(Expr::cust(
+                        "pending_json IS NULL OR length(pending_json) <= 65536",
+                    )))
+                    .col(text("last_error").null())
+                    .col(timestamp_with_time_zone("created_at"))
+                    .col(timestamp_with_time_zone("updated_at"))
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(INSTALLATION, "workspace_id")
+                            .to("workspace", "id")
+                            .on_delete(ForeignKeyAction::Restrict),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("ix_plugin_workspace")
+                    .table(INSTALLATION)
+                    .col("workspace_id")
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(COMPONENT)
+                    .col(text("plugin_id"))
+                    .col(text("kind").check(Expr::col("kind").is_in(["skill", "mcp"])))
+                    .col(text("member_key"))
+                    .col(text("member_path").null())
+                    .col(text("skill_id").null().unique_key())
+                    .col(text("mcp_installation_id").null().unique_key())
+                    .col(text("package_fingerprint").null())
+                    .col(text("status").check(Expr::col("status").is_in([
+                        "installed",
+                        "invalid",
+                        "failed",
+                        "removed_by_user",
+                    ])))
+                    .col(text("diagnostic").null())
+                    .col(text("override_fields_json").default("[]"))
+                    .primary_key(
+                        Index::create()
+                            .col("plugin_id")
+                            .col("kind")
+                            .col("member_key"),
+                    )
+                    .check(
+                        Expr::col("kind")
+                            .eq("skill")
+                            .and(Expr::col("mcp_installation_id").is_null())
+                            .or(Expr::col("kind")
+                                .eq("mcp")
+                                .and(Expr::col("skill_id").is_null())),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(COMPONENT, "plugin_id")
+                            .to(INSTALLATION, "id")
+                            .on_delete(ForeignKeyAction::Restrict),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(COMPONENT, "skill_id")
+                            .to("skill_installation", "id")
+                            .on_delete(ForeignKeyAction::SetNull),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(COMPONENT, "mcp_installation_id")
+                            .to("mcp_server_installation", "id")
+                            .on_delete(ForeignKeyAction::SetNull),
+                    )
+                    .to_owned(),
+            )
+            .await?;
         // Gateway deliberately has foreign_keys=OFF. Local triggers implement
         // these new relationships without changing legacy database semantics.
         manager.get_connection().execute_unprepared(r#"
@@ -92,16 +163,72 @@ WHEN NOT EXISTS (SELECT 1 FROM plugin_component WHERE plugin_id=NEW.plugin_id AN
 BEGIN SELECT RAISE(ABORT,'plugin component limit'); END;
 "#).await?;
 
+        if !manager
+            .has_column("skill_upload_session", "purpose")
+            .await?
+        {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table("skill_upload_session")
+                        .add_column(
+                            text("purpose")
+                                .default("skill")
+                                .check(Expr::col("purpose").is_in(["skill", "plugin"])),
+                        )
+                        .to_owned(),
+                )
+                .await?;
+        }
+        if !manager.has_column("turn", "plugin_selection_json").await? {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table("turn")
+                        .add_column(text("plugin_selection_json").null())
+                        .to_owned(),
+                )
+                .await?;
+        }
         Ok(())
     }
+
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .get_connection()
-            .execute_unprepared("DROP TRIGGER plugin_workspace_restrict; DROP TRIGGER plugin_skill_unlink; DROP TRIGGER plugin_mcp_unlink; DROP TRIGGER plugin_skill_scope; DROP TRIGGER plugin_mcp_scope; DROP TABLE plugin_component; DROP TABLE plugin_installation;")
-            .await?;
+        // Remove all triggers, including those attached to existing child tables,
+        // before dropping the parent/links they reference.
+        for name in [
+            "plugin_workspace_insert",
+            "plugin_workspace_immutable",
+            "plugin_workspace_restrict",
+            "plugin_parent_restrict",
+            "plugin_skill_unlink",
+            "plugin_mcp_unlink",
+            "plugin_skill_scope",
+            "plugin_mcp_scope",
+            "plugin_component_insert",
+            "plugin_component_update",
+            "plugin_component_bound",
+        ] {
+            manager
+                .get_connection()
+                .execute_unprepared(&format!("DROP TRIGGER IF EXISTS {name}"))
+                .await?;
+        }
+        for (table, column) in [
+            ("turn", "plugin_selection_json"),
+            ("skill_upload_session", "purpose"),
+        ] {
+            if manager.has_column(table, column).await? {
+                manager
+                    .alter_table(Table::alter().table(table).drop_column(column).to_owned())
+                    .await?;
+            }
+        }
+        for table in [COMPONENT, INSTALLATION] {
+            manager
+                .drop_table(Table::drop().table(table).to_owned())
+                .await?;
+        }
         Ok(())
-    }
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
     }
 }
