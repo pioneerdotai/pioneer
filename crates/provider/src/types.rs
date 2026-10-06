@@ -852,6 +852,8 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     pub tools: Option<Vec<ToolDefinition>>,
     pub tool_choice: Option<ToolChoice>,
+    /// true permits multiple calls (it does not require them); false requires
+    /// at most one call per response and must be enforced or rejected locally.
     pub parallel_tool_calls: Option<bool>,
     pub reasoning: Option<ReasoningConfig>,
     pub compiled_prompt: Option<CompiledPromptPayload>,

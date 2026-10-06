@@ -67,9 +67,10 @@ impl SavedCatalog {
         ensure!(self.version == 1, "unsupported model catalog cache version");
         chrono::DateTime::parse_from_rfc3339(&self.updated_at)?;
         self.catalog.validate()?;
-        ModelCatalog::parse(
+        ModelCatalog::parse_with_capabilities(
             &serde_json::to_string(&self.catalog.models)?,
             &serde_json::to_string(&self.catalog.provenance)?,
+            self.catalog.tool_capabilities.clone(),
         )
     }
 }
@@ -311,6 +312,60 @@ mod tests {
             .name
             .clone()
     }
+    #[test]
+    fn capability_supplement_round_trips_and_refresh_replaces_snapshot_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CatalogStore::default();
+        let source = super::super::tool_tests::source_snapshot();
+        store.publish(prepare_update(dir.path(), source.clone()).unwrap());
+        let old_reader = store.snapshot().unwrap();
+        assert_eq!(
+            old_reader.tool_support("openai", "g03-negative"),
+            Some(false)
+        );
+        let restored = CatalogStore::default();
+        restore_cache(&restored, dir.path()).unwrap();
+        assert_eq!(
+            restored
+                .snapshot()
+                .unwrap()
+                .tool_support("azure_openai", "g03-negative"),
+            Some(false)
+        );
+        let mut newer = source;
+        newer
+            .sources
+            .get_mut(generator::SOURCE_URLS[0])
+            .unwrap()
+            .body["openai"]["models"]["g03-negative"]["tool_call"] = serde_json::json!(true);
+        store.publish(prepare_update(dir.path(), newer.clone()).unwrap());
+        assert_eq!(
+            store
+                .snapshot()
+                .unwrap()
+                .tool_support("openai", "g03-negative"),
+            Some(true)
+        );
+        assert_eq!(
+            old_reader.tool_support("openai", "g03-negative"),
+            Some(false)
+        );
+        let saved_bytes = fs::read(dir.path().join(CACHE_FILE)).unwrap();
+        newer
+            .sources
+            .get_mut(generator::SOURCE_URLS[0])
+            .unwrap()
+            .status = 503;
+        assert!(prepare_update(dir.path(), newer).is_err());
+        assert_eq!(fs::read(dir.path().join(CACHE_FILE)).unwrap(), saved_bytes);
+        let mut legacy: serde_json::Value = serde_json::from_slice(&saved_bytes).unwrap();
+        legacy["catalog"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tool_capabilities");
+        assert!(validate_saved_bytes(&serde_json::to_vec(&legacy).unwrap()).is_ok());
+    }
+
     #[test]
     fn saved_catalog_survives_restart_and_invalid_update_keeps_previous_json() {
         let dir = tempfile::tempdir().unwrap();

@@ -578,6 +578,10 @@ struct ModelsListResponse {
 #[derive(Debug, Deserialize)]
 struct OpenRouterModelEntry {
     id: String,
+    // Retain malformed marker lists as unknown rather than rejecting discovery
+    // or interpreting partial lists as a trustworthy negative.
+    #[serde(default)]
+    supported_parameters: serde_json::Value,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -1104,13 +1108,15 @@ impl crate::traits::Provider for OpenRouterProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider_async(
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let rendered_messages = Self::convert_messages(&prepared)?;
         let reasoning = Self::reasoning_options(request.reasoning);
@@ -1238,13 +1244,15 @@ impl crate::traits::Provider for OpenRouterProvider {
         &self,
         request: ChatRequest,
     ) -> Result<crate::ProviderStream> {
-        let prepared = prepare_messages_for_provider_async(
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let rendered_messages = Self::convert_messages(&prepared)?;
         let reasoning = Self::reasoning_options(request.reasoning);
@@ -1628,7 +1636,13 @@ fn provider_model_from_openrouter_model_entry(m: OpenRouterModelEntry) -> Provid
         }
     });
     let reasoning = m.reasoning.and_then(openrouter_reasoning_capabilities);
-    let mut capabilities = ProviderModelCapabilities::default();
+    let mut capabilities = ProviderModelCapabilities {
+        tool_calling: crate::catalog::tool_support_from_marker_list(
+            &m.supported_parameters,
+            "tools",
+        ),
+        ..Default::default()
+    };
     if let Some(reasoning) = reasoning {
         capabilities.thinking = reasoning.supported;
         capabilities.reasoning = Some(reasoning);
@@ -1653,6 +1667,18 @@ fn provider_model_from_openrouter_model_entry(m: OpenRouterModelEntry) -> Provid
         family: None,
         lifecycle_status: None,
     }
+}
+
+// Test fixtures cross the same native response and normalizer boundary as
+// list_model_entries -> list_models; no precomputed capability is injected.
+#[cfg(test)]
+pub(crate) fn models_from_native_discovery_fixture(json: &str) -> Vec<ProviderModelInfo> {
+    let response: ModelsListResponse = serde_json::from_str(json).expect("native models response");
+    response
+        .data
+        .into_iter()
+        .map(provider_model_from_openrouter_model_entry)
+        .collect()
 }
 
 fn openrouter_embedding_model_from_openrouter_model_entry(
@@ -1752,6 +1778,29 @@ mod tests {
         openrouter_embedding_model_from_openrouter_model_entry(
             response.data.into_iter().next().expect("fixture model"),
         )
+    }
+
+    #[test]
+    fn native_supported_parameters_preserves_tri_state() {
+        for (field, expected) in [
+            (r#", "supported_parameters": ["tools"]"#, Some(true)),
+            (
+                r#", "supported_parameters": ["temperature", "tools"]"#,
+                Some(true),
+            ),
+            (r#", "supported_parameters": ["tool_choice"]"#, Some(false)),
+            (r#", "supported_parameters": []"#, Some(false)),
+            ("", None),
+            (r#", "supported_parameters": null"#, None),
+            (r#", "supported_parameters": "tools""#, None),
+            (r#", "supported_parameters": {}"#, None),
+            (r#", "supported_parameters": [42]"#, None),
+            (r#", "supported_parameters": ["tools", null]"#, None),
+        ] {
+            let json = format!(r#"{{"data":[{{"id":"custom-model"{field}}}]}}"#);
+            let model = models_from_native_discovery_fixture(&json).remove(0);
+            assert_eq!(model.capabilities.tool_calling, expected, "{field}");
+        }
     }
 
     #[test]
