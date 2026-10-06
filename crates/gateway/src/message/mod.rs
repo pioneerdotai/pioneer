@@ -401,6 +401,18 @@ where
         pioneer_observability::turn_startup::current_key(),
         future,
     );
+    // Test-local reporting scopes must follow the same owned request tasks as
+    // the admission path. This does not install a global subscriber or change
+    // production reporting; it only preserves the fixture's local capture.
+    #[cfg(test)]
+    let future = {
+        use sentry::SentryFutureExt;
+        use tracing::instrument::WithSubscriber;
+        let dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
+        future
+            .with_subscriber(dispatch)
+            .bind_hub(sentry::Hub::current())
+    };
     AbortOnDropMessageTask::new(tokio::spawn(future))
         .join()
         .await
@@ -585,6 +597,10 @@ pub struct MessageProcessor {
     predispatch_cli_turn_read_failures: Arc<Mutex<HashSet<String>>>,
     #[cfg(test)]
     claude_boundary_write_failures: Arc<Mutex<HashSet<String>>>,
+    #[cfg(test)]
+    native_cancellation_finish_barrier: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    #[cfg(test)]
+    native_cancellation_materialization_failure: Arc<Mutex<Option<sea_orm::DbErr>>>,
     workspace_compaction_settings: Arc<StdRwLock<std::collections::BTreeMap<String, crate::settings::WorkspaceCompactionSettings>>>,
     agent_listener_tasks: Arc<Mutex<HashMap<String, AgentListenerTask>>>,
     agent_listener_generation: Arc<AtomicU64>,
@@ -1191,6 +1207,10 @@ impl MessageProcessor {
             predispatch_cli_turn_read_failures: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             claude_boundary_write_failures: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            native_cancellation_finish_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            native_cancellation_materialization_failure: Arc::new(Mutex::new(None)),
             workspace_compaction_settings: Arc::new(StdRwLock::new(
                 std::collections::BTreeMap::new(),
             )),
@@ -4636,6 +4656,10 @@ impl MessageProcessor {
             predispatch_cli_turn_read_failures: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             claude_boundary_write_failures: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            native_cancellation_finish_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            native_cancellation_materialization_failure: Arc::new(Mutex::new(None)),
             workspace_compaction_settings: Arc::new(StdRwLock::new(
                 std::collections::BTreeMap::new(),
             )),

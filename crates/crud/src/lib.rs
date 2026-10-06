@@ -959,6 +959,9 @@ pub use crate::repositories::execution_admission_lease::{
     ExecutionAdmissionClass, ExecutionAdmissionQuotaPolicy, ExecutionQuotaBucket,
     ExecutionQuotaCeilings, NewExecutionAdmissionLease,
 };
+pub use crate::repositories::native_cancellation_context::{
+    NativeCancellationContext, NativeCancellationContextUnavailable,
+};
 pub use crate::repositories::native_terminal_effect_outbox::{
     HandlerCheckpointInvalid, NativeTerminalEffectStats,
 };
@@ -1665,6 +1668,14 @@ struct TurnEventProjectionContext {
     item_started_deadlines: Option<TurnItemAttemptDeadlines>,
     #[serde(default)]
     enqueue_optional_deliveries: bool,
+    #[serde(skip)]
+    native_cancellation: Option<PreparedNativeCancellation>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedNativeCancellation {
+    revalidation: sea_orm::Statement,
+    effects: native_terminal_effect_outbox::PreparedNativeTerminalEffectPreparation,
 }
 
 #[derive(Clone, Debug)]
@@ -24271,6 +24282,162 @@ impl CrudStore {
         .await
     }
 
+    /// Persist only a bounded immutable cancellation description, before provider work.
+    pub async fn persist_native_cancellation_context(
+        &self,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        owner_id: &str,
+        now_unix: i64,
+        initial_turn: bool,
+    ) -> Result<()> {
+        native_terminal_effect_outbox::prepare_input(preparation.clone())?;
+        let candidate = repositories::native_cancellation_context::prepare_registration(
+            &preparation,
+            owner_id,
+            unix_to_datetime(now_unix),
+        )?;
+        self.run_serialized_write(|| async {
+            let candidate = candidate.clone();
+            let tx = self.connection.begin().await?;
+            if let Some(execution) = turn_execution::find(&tx, &preparation.turn_id).await? {
+                anyhow::ensure!(
+                    execution.owner_id == owner_id,
+                    "native cancellation context has stale execution owner"
+                );
+            }
+            repositories::native_cancellation_context::insert_once(
+                &tx,
+                &preparation,
+                candidate,
+                initial_turn,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn native_cancellation_context(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<NativeCancellationContext>> {
+        repositories::native_cancellation_context::load(&self.connection, turn_id).await
+    }
+
+    pub async fn native_cancellation_was_accepted(&self, turn_id: &str) -> Result<bool> {
+        repositories::native_cancellation_context::has_accepted(&self.connection, turn_id).await
+    }
+
+    pub async fn native_cancellation_was_accepted_owned(
+        &self,
+        turn_id: &str,
+        owner_id: &str,
+    ) -> Result<bool> {
+        repositories::native_cancellation_context::has_accepted_owned(
+            &self.connection,
+            turn_id,
+            owner_id,
+        )
+        .await
+    }
+
+    pub async fn native_cancellation_receipt_owned(
+        &self,
+        turn_id: &str,
+        owner_id: &str,
+    ) -> Result<Option<pioneer_protocol::NativeDurableCancellationReceipt>> {
+        repositories::native_cancellation_context::receipt_owned(
+            &self.connection,
+            turn_id,
+            owner_id,
+        )
+        .await
+    }
+
+    pub async fn native_cancellation_accepted_notification_owned(
+        &self,
+        turn_id: &str,
+        owner_id: &str,
+    ) -> Result<Option<pioneer_protocol::TurnFailedNotification>> {
+        let Some(receipt) = self
+            .native_cancellation_receipt_owned(turn_id, owner_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let accepted = turn_event::find_event_by_id(&self.connection, &receipt.canonical_event_id)
+            .await?
+            .context("accepted native cancellation has no canonical event")?;
+        let CanonicalTurnEventPayload::TurnFailed(notification) = accepted.payload else {
+            anyhow::bail!("accepted native cancellation has a conflicting canonical event");
+        };
+        anyhow::ensure!(
+            notification.turn.id == receipt.turn_id
+                && notification.thread_id == receipt.thread_id
+                && notification.workspace_id == receipt.workspace_id
+                && notification.turn.status == pioneer_protocol::TurnStatus::Interrupted,
+            "accepted native cancellation has conflicting canonical identity"
+        );
+        Ok(Some(notification))
+    }
+
+    /// Canonical append + prepared obligations + receipt are one transaction.
+    /// Projection and activation retain the existing subsequent atomic boundary.
+    pub async fn materialize_native_cancellation_owned(
+        &self,
+        event: CanonicalTurnEventPayload,
+        now_unix: i64,
+        context: NativeCancellationContext,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        owner_id: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(&event, CanonicalTurnEventPayload::TurnFailed(n)
+            if n.turn.status == pioneer_protocol::TurnStatus::Interrupted
+                && n.turn.id == preparation.turn_id && n.thread_id == preparation.thread_id
+                && n.workspace_id == preparation.workspace_id),
+            "native cancellation event has mismatched scope or status"
+        );
+        repositories::native_cancellation_context::validate_derived_preparation(
+            &context,
+            &preparation,
+        )?;
+        let event = if let Some(event_id) = context.accepted_event_id.as_deref() {
+            let accepted = turn_event::find_event_by_id(&self.connection, event_id)
+                .await?
+                .context("native cancellation receipt has no canonical event")?;
+            anyhow::ensure!(
+                accepted.turn_id == preparation.turn_id
+                    && accepted.thread_id == preparation.thread_id
+                    && matches!(&accepted.payload, CanonicalTurnEventPayload::TurnFailed(n)
+                    if n.turn.status == pioneer_protocol::TurnStatus::Interrupted
+                        && n.workspace_id == preparation.workspace_id),
+                "native cancellation receipt has conflicting canonical result"
+            );
+            accepted.payload
+        } else {
+            event
+        };
+        let effects = native_terminal_effect_outbox::prepare_input(preparation)?;
+        let revalidation =
+            repositories::native_cancellation_context::prepare_revalidation(&context, owner_id);
+        self.materialize_turn_event_with_projection_context_and_owner(
+            event,
+            now_unix,
+            TurnEventProjectionContext {
+                item_started_deadlines: None,
+                enqueue_optional_deliveries: true,
+                native_cancellation: Some(PreparedNativeCancellation {
+                    revalidation,
+                    effects,
+                }),
+            },
+            Some(owner_id),
+        )
+        .await
+    }
+
     pub async fn prepare_native_terminal_effects(
         &self,
         preparation: pioneer_protocol::NativeTerminalEffectPreparation,
@@ -26090,6 +26257,14 @@ impl CrudStore {
             )
             .await?;
 
+            turn_event_projection_stream_state::clear_confirmed_blocked_for_resume(
+                &tx,
+                thread_id,
+                turn_id,
+                now,
+                &turn_model,
+            )
+            .await?;
             let updated = turn::update_turn_status(
                 &tx,
                 thread_id,
@@ -26475,6 +26650,14 @@ impl CrudStore {
                 job.id
             );
 
+            turn_event_projection_stream_state::clear_confirmed_blocked_for_resume(
+                &tx,
+                thread_id,
+                turn_id,
+                now,
+                &turn_model,
+            )
+            .await?;
             anyhow::ensure!(
                 turn::update_turn_status(
                     &tx,
@@ -26827,6 +27010,7 @@ impl CrudStore {
         let projection_context = TurnEventProjectionContext {
             item_started_deadlines,
             enqueue_optional_deliveries: false,
+            native_cancellation: None,
         };
         self.materialize_turn_event_with_projection_context(
             event,
@@ -26883,6 +27067,7 @@ impl CrudStore {
         let projection_context = TurnEventProjectionContext {
             item_started_deadlines,
             enqueue_optional_deliveries: true,
+            native_cancellation: None,
         };
         self.materialize_turn_event_with_projection_context_and_owner(
             event,
@@ -27492,6 +27677,18 @@ impl CrudStore {
             terminal_effect_activation,
         } = prepared;
         validate_turn_event_durable_owner(transaction, event.payload()).await?;
+        if terminal_turn_execution_status_for_event(event.payload()).is_some()
+            && repositories::native_cancellation_context::has_accepted(
+                transaction,
+                event.payload().turn_id(),
+            )
+            .await?
+        {
+            anyhow::ensure!(
+                turn_event::prepared_event_already_exists(transaction, &event).await?,
+                "turn event conflicts with accepted native cancellation"
+            );
+        }
 
         let appended_event =
             turn_event::append_prepared_event(transaction, event, created_at).await?;
@@ -27535,6 +27732,7 @@ impl CrudStore {
             },
         )
         .await?;
+        turn_event_projection_stream_state::accept_terminal(transaction, &appended_event).await?;
         if enqueue_optional_deliveries {
             turn_event_delivery::insert_pending_for_event(transaction, &appended_event, created_at)
                 .await?;
@@ -27629,6 +27827,7 @@ impl CrudStore {
         let event = prepare_turn_event_for_permanent_storage(&self.connection, event).await?;
         let projection_context_json =
             serialize_turn_event_projection_context(&projection_context, event.id())?;
+        let native_cancellation = projection_context.native_cancellation.clone();
         let transaction = self
             .connection
             .begin()
@@ -27638,6 +27837,21 @@ impl CrudStore {
         validate_turn_event_durable_owner(&transaction, event.payload()).await?;
         validate_turn_event_execution_owner(&transaction, event.payload(), execution_owner_id)
             .await?;
+        // Fence execution writes and competing terminal results. Independently
+        // owned service lifecycle and user edits retain their existing guards.
+        if (execution_owner_id.is_some()
+            || terminal_turn_execution_status_for_event(event.payload()).is_some())
+            && repositories::native_cancellation_context::has_accepted(
+                &transaction,
+                event.payload().turn_id(),
+            )
+            .await?
+        {
+            anyhow::ensure!(
+                turn_event::prepared_event_already_exists(&transaction, &event).await?,
+                "turn event conflicts with accepted native cancellation"
+            );
+        }
 
         if let Some(guard) = operation_guard {
             anyhow::ensure!(
@@ -27645,6 +27859,35 @@ impl CrudStore {
                 "compaction lifecycle owner or generation changed"
             );
         }
+
+        let cancellation_turn_id = if let Some(cancellation) = native_cancellation {
+            if !turn_event::prepared_event_already_exists(&transaction, &event).await? {
+                repositories::native_cancellation_context::revalidate(
+                    &transaction,
+                    cancellation.revalidation,
+                )
+                .await?;
+                anyhow::ensure!(
+                    !turn_event_projection_stream_state::has_accepted_terminal(
+                        &transaction,
+                        event.payload().turn_id()
+                    )
+                    .await?,
+                    "native cancellation conflicts with accepted terminal result"
+                );
+                native_terminal_effect_outbox::prepare(
+                    &transaction,
+                    cancellation.effects,
+                    created_at,
+                )
+                .await?;
+                Some(event.payload().turn_id().to_owned())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let appended_event =
             match turn_event::append_prepared_event(&transaction, event, created_at).await {
@@ -27654,6 +27897,15 @@ impl CrudStore {
                     return Err(error);
                 }
             };
+
+        if let Some(turn_id) = cancellation_turn_id {
+            repositories::native_cancellation_context::mark_accepted(
+                &transaction,
+                &turn_id,
+                &appended_event.id,
+            )
+            .await?;
+        }
 
         if !appended_event.was_inserted {
             let projected = turn_event_projection_state::is_projected(
@@ -27667,7 +27919,7 @@ impl CrudStore {
                 .rollback()
                 .await
                 .context("failed to rollback idempotent turn event lookup")?;
-            if projected {
+            if projected || projection_context.native_cancellation.is_some() {
                 return Ok(appended_event);
             }
             anyhow::bail!(
@@ -27694,6 +27946,7 @@ impl CrudStore {
             let _ = transaction.rollback().await;
             return Err(error);
         }
+        turn_event_projection_stream_state::accept_terminal(&transaction, &appended_event).await?;
         if projection_context.enqueue_optional_deliveries
             && let Err(error) = turn_event_delivery::insert_pending_for_event(
                 &transaction,
@@ -33452,6 +33705,11 @@ mod tests {
             .expect("turn lookup should succeed")
             .expect("turn should exist");
         assert_eq!(terminal.status, TurnStatus::Interrupted);
+    }
+
+    mod native_cancellation_tests {
+        use super::*;
+        include!("native_cancellation_tests.rs");
     }
 
     fn cleanup_effect_preparation(

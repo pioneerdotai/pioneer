@@ -91,6 +91,7 @@ pub use super::mcp_audit_event::Entity as McpAuditEvent;
 pub use super::mcp_server_catalog_snapshot::Entity as McpServerCatalogSnapshot;
 pub use super::mcp_server_installation::Entity as McpServerInstallation;
 pub use super::native_agent_config::Entity as NativeAgentConfig;
+pub use super::native_cancellation_context::Entity as NativeCancellationContext;
 pub use super::native_event_cleanup_bootstrap::Entity as NativeEventCleanupBootstrap;
 pub use super::native_event_cleanup_job::Entity as NativeEventCleanupJob;
 pub use super::native_event_cleanup_scheduler::Entity as NativeEventCleanupScheduler;
