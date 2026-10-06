@@ -984,22 +984,39 @@ async fn blocked_observation_fixture_with_receipt(
         .await
         .unwrap()
         .unwrap();
-    let CliRuntimeLaunchSpecRestore::Ready(restored) =
-        processor.restore_cli_runtime_launch_spec(&binding).await
-    else {
-        panic!("the fixture must persist the real CLI launch contract");
-    };
-    manager
-        .get_or_start_with_launch_spec(restored.session_key, restored.launch_spec)
+    let (_, turn) = store
+        .get_turn(BLOCKED_THREAD, BLOCKED_TURN)
         .await
+        .unwrap()
         .unwrap();
+    if turn.status == TurnStatus::InProgress {
+        match processor.restore_cli_runtime_launch_spec(&binding).await {
+            CliRuntimeLaunchSpecRestore::Ready(restored) => {
+                manager
+                    .get_or_start_with_launch_spec(restored.session_key, restored.launch_spec)
+                    .await
+                    .unwrap();
+            }
+            CliRuntimeLaunchSpecRestore::Unavailable { diagnostic }
+            | CliRuntimeLaunchSpecRestore::InvalidBinding { diagnostic } => {
+                panic!("the fixture must persist the real CLI launch contract: {diagnostic}");
+            }
+        }
+    } else {
+        // Cleanup rehydrates a terminal Turn; it does not authorize a new
+        // provider launch. Supply the recorded session only as an effects target.
+        manager
+            .get_or_start(CLIAgentRuntimeSessionKey::new(&workspace, kind, BLOCKED_THREAD).unwrap())
+            .await
+            .unwrap();
+    }
     (processor, store, session, workspace)
 }
 
 async fn blocked_event_count(store: &CrudStore) -> u64 {
     pioneer_entity::turn_event::Entity::find()
         .filter(pioneer_entity::turn_event::Column::TurnId.eq(BLOCKED_TURN))
-        .filter(pioneer_entity::turn_event::Column::EventType.eq("turn_blocked"))
+        .filter(pioneer_entity::turn_event::Column::EventType.eq(events::TURN_BLOCKED))
         .count(&store.database_connection())
         .await
         .unwrap()
@@ -1881,7 +1898,7 @@ async fn cli_native_terminal_waits_outside_lane_and_active_scan_replays_cancelle
         pioneer_protocol::RecoveryTrigger::RuntimeFailure
     );
     assert!(
-        job.last_error
+        job.reason
             .as_deref()
             .unwrap()
             .contains("ordinary native outcome")
@@ -2014,11 +2031,10 @@ async fn cli_saved_native_outcome_reopens_for_codex_and_claude_without_provider_
         );
         assert!(session.turn_starts.lock().await.is_empty());
         use pioneer_entity::turn_execution as execution;
+        let expired_at = chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(1);
         execution::Entity::update_many()
-            .col_expr(
-                execution::Column::LeaseUntil,
-                Expr::value(chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(1)),
-            )
+            .col_expr(execution::Column::HeartbeatAt, Expr::value(expired_at))
+            .col_expr(execution::Column::LeaseUntil, Expr::value(expired_at))
             .filter(execution::Column::TurnId.eq(BLOCKED_TURN))
             .exec(&store.database_connection())
             .await
@@ -2139,7 +2155,7 @@ async fn cli_saved_native_outcome_reopens_for_codex_and_claude_without_provider_
             pioneer_protocol::RecoveryTrigger::RuntimeFailure
         );
         assert!(
-            job.last_error
+            job.reason
                 .as_deref()
                 .unwrap()
                 .contains("ordinary native outcome")
@@ -2686,6 +2702,10 @@ async fn cli_old_native_failed_producer_rejects_owner_generation_aba_at_equal_ti
     }
     execution::Entity::update_many()
         .col_expr(execution::Column::Status, Expr::value("blocked"))
+        .col_expr(
+            execution::Column::CompletedAt,
+            Expr::value(Some(owner.updated_at)),
+        )
         .filter(execution::Column::TurnId.eq(BLOCKED_TURN))
         .exec(&db)
         .await
@@ -2695,7 +2715,14 @@ async fn cli_old_native_failed_producer_rejects_owner_generation_aba_at_equal_ti
             execution::Column::Status,
             Expr::value(owner.status.as_str()),
         )
-        .col_expr(execution::Column::OwnerGeneration, Expr::value(2_i64))
+        .col_expr(
+            execution::Column::CompletedAt,
+            Expr::value(Option::<chrono::DateTime<chrono::FixedOffset>>::None),
+        )
+        .col_expr(
+            execution::Column::OwnerGeneration,
+            Expr::value(owner.owner_generation as i64 + 1),
+        )
         .filter(execution::Column::TurnId.eq(BLOCKED_TURN))
         .exec(&db)
         .await
@@ -2731,6 +2758,17 @@ async fn cli_native_goal_segment_ack_does_not_suppress_canonical_goal_completion
             .existing_session(&key)
             .await
             .unwrap();
+        // Prime the ordinary native binding cache before Goal metadata changes.
+        processor
+            .handle_cli_runtime_timeline_event(
+                handle.instance(),
+                RuntimeEvent::TurnStarted(RuntimeTurnStarted {
+                    native_thread_id: Some(BLOCKED_NATIVE_THREAD.into()),
+                    native_turn_id: BLOCKED_TURN.into(),
+                    native: None,
+                }),
+            )
+            .await;
         processor
             .handle_cli_runtime_timeline_event(
                 handle.instance(),
@@ -2753,6 +2791,16 @@ async fn cli_native_goal_segment_ack_does_not_suppress_canonical_goal_completion
                 }),
             )
             .await;
+        assert_eq!(
+            store
+                .get_cli_runtime_execution_segment_by_native_turn("codex", BLOCKED_TURN)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            pioneer_crud::CliRuntimeExecutionSegmentStatus::Completed,
+            "Goal metadata changes must not discard completion from the cached native binding"
+        );
         assert!(
             store
                 .latest_cli_runtime_turn_attempt(BLOCKED_TURN)
@@ -3407,8 +3455,8 @@ async fn activate_unconfirmed_cli_recovery(
             None,
             None,
             None,
-            if exhaust { 1 } else { 4 },
             0,
+            if exhaust { 1 } else { 4 },
             json!({"max_wall_clock_secs": 3600, "no_progress_limit": 4}),
             json!({}),
             now.timestamp(),
@@ -3604,13 +3652,10 @@ async fn cli_accepted_unconfirmed_recovery_outcome_survives_expiration_takeover_
                     original_owner
                 );
                 use pioneer_entity::turn_execution as execution;
+                let expired_at = chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(1);
                 execution::Entity::update_many()
-                    .col_expr(
-                        execution::Column::LeaseUntil,
-                        Expr::value(
-                            chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(1),
-                        ),
-                    )
+                    .col_expr(execution::Column::HeartbeatAt, Expr::value(expired_at))
+                    .col_expr(execution::Column::LeaseUntil, Expr::value(expired_at))
                     .filter(execution::Column::TurnId.eq(BLOCKED_TURN))
                     .exec(&store.database_connection())
                     .await
@@ -4006,7 +4051,7 @@ async fn cli_common_observation_writer_loses_to_accepted_native_outcome() {
                         .await
                         .unwrap()
                         .unwrap()
-                        .last_error
+                        .reason
                         .unwrap()
                         .contains("ordinary native outcome")
                 );
@@ -4152,13 +4197,13 @@ async fn cli_timeout_poll_and_command_heartbeat_prioritize_saved_native_failure(
             .unwrap()
             .unwrap();
         assert!(
-            job.last_error
+            job.reason
                 .as_deref()
                 .unwrap()
                 .contains("ordinary native outcome")
         );
         assert!(
-            !job.last_error
+            !job.reason
                 .as_deref()
                 .unwrap()
                 .contains("conflicting provider observation")

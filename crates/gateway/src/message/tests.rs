@@ -7972,8 +7972,16 @@ async fn complete_recorded_cli_task_turn_with_recovery(
             message: None,
             reconciliation_events: vec![observed_terminal],
         });
+        // The first lookup may race admission's final context bookkeeping.
+        // Reconciliation receives a fresh discovery snapshot after delivery.
+        let current_binding = processor
+            .crud_store
+            .get_cli_runtime_turn_binding(&pioneer_turn_id)
+            .await
+            .unwrap()
+            .unwrap();
         let recovered = processor
-            .reconcile_cli_runtime_turn_from_runtime(&continuation, workspace_id, &before)
+            .reconcile_cli_runtime_turn_from_runtime(&current_binding, workspace_id, &before)
             .await
             .unwrap();
         assert!(matches!(
@@ -26507,19 +26515,51 @@ async fn cli_predispatch_read_failure_cancel_and_shutdown_release_session_lease_
         )
         .await
         .expect("dispatch should reach its final turn read");
-        if case == "cancel" {
+        let cancel = if case == "cancel" {
             let cancel_id = generate_test_request_id("predispatch", "cancel");
-            processor.process_request_for_connection(connection, &json!({
+            let cancel_processor = processor.clone();
+            let request = json!({
                 "jsonrpc":"2.0","id":cancel_id,"method":"turn/cancel",
                 "params":{"thread_id":thread,"turn_id":turn,"reason":"cancel at dispatch fence"}
-            }).to_string()).await;
+            })
+            .to_string();
+            let cancel = tokio::spawn(async move {
+                cancel_processor
+                    .process_request_for_connection(connection, &request)
+                    .await;
+            });
+            // Admission owns the transition gate at the barrier. Cancellation
+            // records its intent before waiting for that gate; let admission
+            // observe the intent and return before awaiting the cancel response.
+            timeout(Duration::from_secs(10), async {
+                while !processor
+                    .user_turn_cancel_intents
+                    .lock()
+                    .await
+                    .contains_key(&(thread.clone(), turn.clone()))
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancel must register intent before waiting for admission");
+            Some((cancel_id, cancel))
+        } else {
+            if case == "shutdown" {
+                processor.shutdown_cli_runtime_manager().await;
+            }
+            None
+        };
+        processor.release_completed_history_preparation_barrier();
+        if let Some((cancel_id, cancel)) = cancel {
+            timeout(Duration::from_secs(10), cancel)
+                .await
+                .unwrap()
+                .unwrap();
             let response = recv_response_by_id(&mut rx, &cancel_id).await;
             let cancelled: TurnCancelResponse = serde_json::from_value(response.result).unwrap();
             assert_eq!(cancelled.turn.status, TurnStatus::Interrupted);
-        } else if case == "shutdown" {
-            processor.shutdown_cli_runtime_manager().await;
         }
-        processor.release_completed_history_preparation_barrier();
         timeout(Duration::from_secs(10), start)
             .await
             .unwrap()
@@ -43932,6 +43972,101 @@ async fn member_codex_thread_fork_commits_private_creator_membership() {
     assert_eq!(readable.thread.id, FORK_THREAD_ID);
 }
 
+async fn seed_loaded_cli_runtime_turn(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) {
+    let now = chrono::Utc::now().fixed_offset();
+    materialize_cli_runtime_turn_with_execution(
+        processor.crud_store.as_ref(),
+        workspace_id,
+        thread_id,
+        turn_id,
+        "start",
+        Some(pioneer_crud::NewTurnExecution {
+            turn_id: turn_id.into(),
+            thread_id: thread_id.into(),
+            workspace_id: workspace_id.into(),
+            executor_kind: pioneer_crud::TurnExecutorKind::CliRuntime,
+            executor_key: Some("codex".into()),
+            status: pioneer_crud::TurnExecutionStatus::Starting,
+            owner_id: processor.turn_execution_owner_id.to_string(),
+            lease_until: now + chrono::Duration::seconds(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
+            created_at: now,
+        }),
+    )
+    .await;
+    let thread = processor
+        .crud_store
+        .get_thread_model(thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    processor
+        .thread_manager
+        .system_thread_restore_persisted(thread, Some(SandboxMode::FullAccess))
+        .await
+        .unwrap();
+}
+
+// A running CLI fixture needs the same durable attempt/segment as admission.
+async fn seed_running_cli_runtime_binding(
+    store: &CrudStore,
+    mut binding: NewCliRuntimeTurnBinding,
+) {
+    let native_turn_id = binding
+        .native_turn_id
+        .take()
+        .expect("running fixture native turn");
+    let native_thread_id = binding.native_thread_id.clone();
+    let turn_id = binding.turn_id.clone();
+    let codex = binding.runtime_kind == "codex";
+    let started_at = binding.updated_at;
+    binding.status = crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.into();
+    let (_, attempt) = store
+        .prepare_cli_runtime_initial_turn_attempt(binding, pioneer_protocol::generate_id(21), 1)
+        .await
+        .unwrap();
+    if let Some(execution) = store.get_turn_execution(&turn_id).await.unwrap() {
+        store
+            .activate_cli_runtime_turn_attempt_owned(
+                &turn_id,
+                &attempt.id,
+                &native_turn_id,
+                None,
+                started_at,
+                &execution.owner_id,
+                execution.lease_until,
+            )
+            .await
+            .unwrap();
+    } else {
+        store
+            .activate_cli_runtime_turn_attempt(
+                &turn_id,
+                &attempt.id,
+                &native_turn_id,
+                None,
+                started_at,
+            )
+            .await
+            .unwrap();
+    }
+    if codex {
+        store
+            .register_cli_runtime_execution_segment(
+                &turn_id,
+                &native_thread_id,
+                &native_turn_id,
+                started_at,
+            )
+            .await
+            .unwrap();
+    }
+}
+
 async fn start_loaded_thread_and_turn_for_cli_runtime_test(
     processor: &MessageProcessor,
     connection_id: ConnectionId,
@@ -43957,26 +44092,7 @@ async fn start_loaded_thread_and_turn_for_cli_runtime_test(
     let _thread_response = recv_response_by_id(rx, thread_start_id).await;
     let _thread_started = recv_notification_by_method(rx, events::THREAD_STARTED).await;
 
-    let turn_start_id = "cliruntestturn0000001";
-    let turn_start_payload = json!({
-        "jsonrpc": "2.0",
-        "id": turn_start_id,
-        "method": "turn/start",
-        "params": {
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "mode": "Agent",
-            "input": [{
-                "type": "text",
-                "text": "start"
-            }]
-        }
-    })
-    .to_string();
-    message_future(processor.process_request_for_connection(connection_id, &turn_start_payload))
-        .await;
-    let _ =
-        recv_response_and_notification_by_id_method(rx, turn_start_id, events::TURN_STARTED).await;
+    seed_loaded_cli_runtime_turn(processor, workspace_id, thread_id, turn_id).await;
 }
 
 async fn start_loaded_thread_and_turn_for_cli_runtime_test_on_fresh_tasks(
@@ -44012,34 +44128,7 @@ async fn start_loaded_thread_and_turn_for_cli_runtime_test_on_fresh_tasks(
     let _thread_response = recv_response_by_id(rx, thread_start_id).await;
     let _thread_started = recv_notification_by_method(rx, events::THREAD_STARTED).await;
 
-    let turn_start_id = "cliruntestturn0000001";
-    let turn_start_payload = json!({
-        "jsonrpc": "2.0",
-        "id": turn_start_id,
-        "method": "turn/start",
-        "params": {
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "mode": "Agent",
-            "input": [{
-                "type": "text",
-                "text": "start"
-            }]
-        }
-    })
-    .to_string();
-    Arc::clone(processor)
-        .process_owned_request(
-            processor
-                .session_manager
-                .connection_context(connection_id)
-                .await
-                .expect("test connection must be registered with a principal"),
-            turn_start_payload,
-        )
-        .await;
-    let _ =
-        recv_response_and_notification_by_id_method(rx, turn_start_id, events::TURN_STARTED).await;
+    seed_loaded_cli_runtime_turn(processor, workspace_id, thread_id, turn_id).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -44729,8 +44818,9 @@ fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_
         .await;
 
         let old = chrono::Utc::now().fixed_offset() - chrono::Duration::hours(1);
-        crud_store
-            .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+        seed_running_cli_runtime_binding(
+            crud_store.as_ref(),
+            NewCliRuntimeTurnBinding {
                 turn_id: turn_id.to_owned(),
                 thread_id: thread_id.to_owned(),
                 continuation_thread_id: thread_id.to_owned(),
@@ -44749,9 +44839,9 @@ fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_
                 input_mapping_json: "{}".to_owned(),
                 created_at: old,
                 updated_at: old,
-            })
-            .await
-            .expect("turn binding should upsert");
+            },
+        )
+        .await;
         let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
             .expect("session key should build");
         cli_manager
@@ -44945,8 +45035,9 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
     );
 
     let old = chrono::Utc::now().fixed_offset() - chrono::Duration::hours(1);
-    crud_store
-        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+    seed_running_cli_runtime_binding(
+        crud_store.as_ref(),
+        NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
             continuation_thread_id: thread_id.to_owned(),
@@ -44964,9 +45055,9 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
             input_mapping_json: "{}".to_owned(),
             created_at: old,
             updated_at: old,
-        })
-        .await
-        .expect("turn binding should upsert");
+        },
+    )
+    .await;
     let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
         .expect("session key should build");
     cli_manager
@@ -45429,8 +45520,9 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
     )
     .await;
     let now = chrono::Utc::now().fixed_offset();
-    crud_store
-        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+    seed_running_cli_runtime_binding(
+        crud_store.as_ref(),
+        NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
             continuation_thread_id: thread_id.to_owned(),
@@ -45448,9 +45540,9 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
             input_mapping_json: "{}".to_owned(),
             created_at: now,
             updated_at: now,
-        })
-        .await
-        .expect("turn binding should upsert");
+        },
+    )
+    .await;
     let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", thread_id)
         .expect("session key should build");
 
@@ -52089,58 +52181,29 @@ async fn seed_cli_runtime_binding(
     native_thread_id: &str,
 ) {
     let now = chrono::Utc::now().fixed_offset();
-    let (_, attempt) = crud_store
-        .prepare_cli_runtime_initial_turn_attempt(
-            NewCliRuntimeTurnBinding {
-                turn_id: turn_id.to_owned(),
-                thread_id: thread_id.to_owned(),
-                continuation_thread_id: thread_id.to_owned(),
-                workspace_id: workspace_id.to_owned(),
-                runtime_id: runtime_id.to_owned(),
-                runtime_kind: runtime_kind.to_owned(),
-                native_thread_id: native_thread_id.to_owned(),
-                native_turn_id: None,
-                request_id: None,
-                status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING
-                    .to_owned(),
-                model: Some("gpt-5".to_owned()),
-                cwd: Some("/tmp/project".to_owned()),
-                sandbox_json: None,
-                approval_policy: None,
-                input_mapping_json: "{}".to_owned(),
-                created_at: now,
-                updated_at: now,
-            },
-            pioneer_protocol::generate_id(21),
-            1,
-        )
-        .await
-        .expect("CLI approval test turn attempt should prepare");
-    if let Some(execution) = crud_store.get_turn_execution(turn_id).await.unwrap() {
-        crud_store
-            .activate_cli_runtime_turn_attempt_owned(
-                turn_id,
-                &attempt.id,
-                turn_id,
-                None,
-                now,
-                &execution.owner_id,
-                execution.lease_until,
-            )
-            .await
-            .unwrap();
-    } else {
-        crud_store
-            .activate_cli_runtime_turn_attempt(turn_id, &attempt.id, turn_id, None, now)
-            .await
-            .unwrap();
-    }
-    if runtime_kind == "codex" {
-        crud_store
-            .register_cli_runtime_execution_segment(turn_id, native_thread_id, turn_id, now)
-            .await
-            .expect("Codex approval test execution segment should register");
-    }
+    seed_running_cli_runtime_binding(
+        crud_store,
+        NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            runtime_id: runtime_id.to_owned(),
+            runtime_kind: runtime_kind.to_owned(),
+            native_thread_id: native_thread_id.to_owned(),
+            native_turn_id: Some(turn_id.to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await;
 }
 
 async fn materialize_cli_runtime_approval_turn(
@@ -59780,6 +59843,16 @@ async fn cli_runtime_request_respond_for_completed_turn_expires_all_pending_requ
             .expect("pending request should open");
     }
 
+    crud_store
+        .update_turn_status(
+            thread_id,
+            turn_id,
+            TurnStatus::Completed,
+            None,
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .expect("the canonical Turn must also be completed before terminal cleanup");
     crate::cli_runtime::turn_binding::update_cli_runtime_turn_binding_status(
         crud_store.as_ref(),
         turn_id,
@@ -61558,8 +61631,9 @@ async fn cli_runtime_terminal_event_expires_pending_requests_for_turn() {
         setup_execution_window_terminal_turn(thread_id, turn_id).await;
 
     let now = chrono::Utc::now().fixed_offset();
-    crud_store
-        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+    seed_running_cli_runtime_binding(
+        crud_store.as_ref(),
+        NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
             continuation_thread_id: thread_id.to_owned(),
@@ -61577,9 +61651,9 @@ async fn cli_runtime_terminal_event_expires_pending_requests_for_turn() {
             input_mapping_json: "{}".to_owned(),
             created_at: now,
             updated_at: now,
-        })
-        .await
-        .expect("CLI runtime turn binding should upsert");
+        },
+    )
+    .await;
 
     let pending_payload = CLIRuntimePendingRequest {
         kind: CLIRuntimeRequestKind::CommandApproval,

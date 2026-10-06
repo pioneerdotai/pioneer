@@ -5367,9 +5367,28 @@ impl MessageProcessor {
                     None => return Ok(false),
                 },
             };
+            // The lookup cache locates a Turn; its Goal/activity metadata may
+            // precede a legitimate update of the same native execution. Capture
+            // provenance from the durable native owner before preparing/enqueueing.
+            let Some(owner) = self
+                .crud_store
+                .resolve_cli_runtime_native_turn_owner(&turn_binding.runtime_id, &native_turn_id)
+                .await?
+            else {
+                return Ok(false);
+            };
+            if owner.binding.turn_id != turn_binding.turn_id
+                || owner.binding.thread_id != turn_binding.thread_id
+                || owner.binding.workspace_id != turn_binding.workspace_id
+                || owner.binding.continuation_thread_id != turn_binding.continuation_thread_id
+                || owner.binding.native_thread_id != turn_binding.native_thread_id
+                || owner.binding.runtime_kind != turn_binding.runtime_kind
+            {
+                return Ok(false);
+            }
             let Some(source) = self
                 .crud_store
-                .cli_runtime_terminal_event_source(&turn_binding, &native_turn_id)
+                .cli_runtime_terminal_event_source(&owner.binding, &native_turn_id)
                 .await?
             else {
                 return Ok(false);
