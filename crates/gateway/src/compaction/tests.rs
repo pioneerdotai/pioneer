@@ -1566,17 +1566,6 @@ async fn turn_started_and_edited_payload_projection_matches_history_without_even
     assert!(actual_budget > f.runner.summarizer.input_tokens(&text_only).unwrap());
 }
 
-async fn wait_for_sleep(sleeps: &mut tokio::sync::broadcast::Receiver<u64>, expected: u64) {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if sleeps.recv().await.unwrap() == expected {
-                return;
-            }
-        }
-    })
-    .await
-    .expect("runner did not enter the expected validation backoff");
-}
 #[derive(Clone, Copy)]
 enum Reply {
     Success,
@@ -3982,183 +3971,51 @@ async fn seed_active_manifest_entries(store: &CrudStore, entries: &[ManifestEntr
     }
 }
 
-async fn install_publication_retry_probe(fixture: &Fixture) {
-    fixture
-        .store
-        .database_connection()
-        .execute_unprepared(
-            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) \
-         VALUES ('publication-retry-probe','thread','turn',2,'fixture','{}',CURRENT_TIMESTAMP)",
-        )
-        .await
-        .unwrap();
-}
-
 #[tokio::test]
-async fn gateway_retry_validation_reuses_candidate_and_provider_budget() {
+async fn gateway_publishes_completed_summary_after_source_edit_without_retry() {
     let f = fixture("publication source", vec![Reply::Success], true, false).await;
-    install_publication_retry_probe(&f).await;
     let mut sleeps = f.clock.subscribe_sleeps();
     let mut hook =
         arm_publication_test_hook(&f.store, "operation", PublicationTestPause::BeforeWriter);
     let runner = f.runner.clone();
     let run = tokio::spawn(async move { runner.run(CancellationToken::new()).await.unwrap() });
-    f.provider.wait_calls(1).await;
     hook.reached().await;
+    // run() also arms operation/attempt deadlines. Discard those observed
+    // before publication and distinguish them from a publication retry.
+    while sleeps.try_recv().is_ok() {}
     let commit_state = f
         .store
         .compaction_runner_state("operation")
         .await
         .unwrap()
         .unwrap();
-    let checkpoint = match &commit_state.phase {
-        RunnerPhase::Commit { checkpoint } => checkpoint.clone(),
-        _ => panic!("publication hook was reached before Commit"),
-    };
-    let candidate = f
-        .store
-        .compaction_checkpoint(&checkpoint)
-        .await
-        .unwrap()
-        .unwrap();
-    f.store
-        .database_connection()
-        .execute_unprepared(
-            "UPDATE turn_event SET payload='{\"race\":1}' WHERE id='publication-retry-probe'",
-        )
-        .await
-        .unwrap();
-    hook.release();
-    wait_for_sleep(&mut sleeps, 10).await;
-
-    let during_backoff = f
-        .store
-        .compaction_runner_state("operation")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(during_backoff.phase, commit_state.phase);
-    assert_eq!(during_backoff.attempts, commit_state.attempts);
-    assert_eq!(during_backoff.retries, commit_state.retries);
-    assert_eq!(
-        f.store
-            .compaction_checkpoint(&checkpoint)
-            .await
-            .unwrap()
-            .unwrap()
-            .summary,
-        candidate.summary
-    );
-    tokio::time::timeout(Duration::from_secs(1), async {
-        let reader = f.store.database_connection().begin_read().await.unwrap();
-        reader.rollback().await.unwrap();
-        f.store
-            .database_connection()
-            .execute_unprepared(
-                "UPDATE turn_event SET payload='{\"race\":2}' WHERE id='publication-retry-probe'",
-            )
-            .await
-            .unwrap();
-    })
-    .await
-    .expect("validation backoff retained a database reservation");
-
-    f.clock.advance(10);
-    assert!(matches!(run.await.unwrap(), CompactionExit::Applied(_)));
-    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn gateway_retry_validation_cancellation_and_deadline_interrupt_backoff() {
-    let f = fixture("publication source", vec![Reply::Success], true, false).await;
-    install_publication_retry_probe(&f).await;
-    let mut sleeps = f.clock.subscribe_sleeps();
-    let mut hook =
-        arm_publication_test_hook(&f.store, "operation", PublicationTestPause::BeforeWriter);
-    let cancel = CancellationToken::new();
-    let runner = f.runner.clone();
-    let child_cancel = cancel.clone();
-    let run = tokio::spawn(async move { runner.run(child_cancel).await.unwrap() });
-    hook.reached().await;
-    f.store.database_connection().execute_unprepared(
-        "UPDATE turn_event SET payload='{\"cancel_race\":true}' WHERE id='publication-retry-probe'",
-    ).await.unwrap();
-    hook.release();
-    wait_for_sleep(&mut sleeps, 10).await;
-    cancel.cancel();
-    assert!(matches!(
-        run.await.unwrap(),
-        CompactionExit::Reconcile(FailureKind::Cancelled)
-    ));
-    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
-
-    let f = fixture("publication source", vec![Reply::Success], true, false).await;
-    install_publication_retry_probe(&f).await;
-    let mut sleeps = f.clock.subscribe_sleeps();
-    let mut first_hook =
-        arm_publication_test_hook(&f.store, "operation", PublicationTestPause::BeforeWriter);
-    let runner = f.runner.clone();
-    let run = tokio::spawn(async move { runner.run(CancellationToken::new()).await.unwrap() });
-    first_hook.reached().await;
-    f.store.database_connection().execute_unprepared(
-        "UPDATE turn_event SET payload='{\"deadline_race\":1}' WHERE id='publication-retry-probe'",
-    ).await.unwrap();
-    first_hook.release();
-    wait_for_sleep(&mut sleeps, 10).await;
-    let mut second_hook =
-        arm_publication_test_hook(&f.store, "operation", PublicationTestPause::BeforeWriter);
-    f.clock.advance(10);
-    second_hook.reached().await;
-    f.store.database_connection().execute_unprepared(
-        "UPDATE turn_event SET payload='{\"deadline_race\":2}' WHERE id='publication-retry-probe'",
-    ).await.unwrap();
-    second_hook.release();
-    wait_for_sleep(&mut sleeps, 30).await;
-    f.clock.advance(f.runner.snapshot.admission.deadline_ms);
-    assert!(matches!(
-        run.await.unwrap(),
-        CompactionExit::Reconcile(FailureKind::Deadline)
-    ));
-    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn gateway_restart_from_commit_reprepares_publication_proof() {
-    let f = fixture("publication source", vec![Reply::Success], true, false).await;
-    install_publication_retry_probe(&f).await;
-    let mut sleeps = f.clock.subscribe_sleeps();
-    let mut hook =
-        arm_publication_test_hook(&f.store, "operation", PublicationTestPause::BeforeWriter);
-    let runner = f.runner.clone();
-    let run = tokio::spawn(async move { runner.run(CancellationToken::new()).await.unwrap() });
-    hook.reached().await;
-    f.store.database_connection().execute_unprepared(
-        "UPDATE turn_event SET payload='{\"restart_race\":true}' WHERE id='publication-retry-probe'",
-    ).await.unwrap();
-    hook.release();
-    wait_for_sleep(&mut sleeps, 10).await;
-    let before_restart = f
-        .store
-        .compaction_runner_state("operation")
-        .await
-        .unwrap()
-        .unwrap();
-    let commit_checkpoint = match &before_restart.phase {
-        RunnerPhase::Commit { checkpoint } => checkpoint.clone(),
-        _ => panic!("validation retry did not preserve Commit phase"),
+    let RunnerPhase::Commit { checkpoint } = &commit_state.phase else {
+        panic!("publication hook was reached before Commit")
     };
     let summary = f
         .store
-        .compaction_checkpoint(&commit_checkpoint)
+        .compaction_checkpoint(checkpoint)
         .await
         .unwrap()
         .unwrap()
         .summary;
-    run.abort();
-    let _ = run.await;
-
-    let exit = f.runner.run(CancellationToken::new()).await.unwrap();
+    f.store
+        .database_connection()
+        .execute_unprepared("UPDATE turn_event SET payload='{\"edited\":true}' WHERE id='source'")
+        .await
+        .unwrap();
+    hook.release();
+    let exit = tokio::time::timeout(Duration::from_secs(2), run)
+        .await
+        .expect("publication waited for a retry after the source edit")
+        .unwrap();
     assert!(matches!(exit, CompactionExit::Applied(_)));
+    while let Ok(wake) = sleeps.try_recv() {
+        assert_eq!(
+            wake, f.runner.snapshot.admission.deadline_ms,
+            "publication entered retry backoff"
+        );
+    }
     assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
     let applied = f
         .store
@@ -4166,12 +4023,8 @@ async fn gateway_restart_from_commit_reprepares_publication_proof() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(applied.attempts, before_restart.attempts);
-    assert_eq!(applied.retries, before_restart.retries);
-    let RunnerPhase::Applied { checkpoint } = &applied.phase else {
-        panic!("restarted Commit did not publish its candidate")
-    };
-    assert_eq!(checkpoint, &commit_checkpoint);
+    assert_eq!(applied.attempts, commit_state.attempts);
+    assert_eq!(applied.retries, commit_state.retries);
     assert_eq!(
         f.store
             .compaction_checkpoint(checkpoint)
@@ -4181,6 +4034,176 @@ async fn gateway_restart_from_commit_reprepares_publication_proof() {
             .summary,
         summary
     );
+}
+
+#[tokio::test]
+async fn gateway_correction_uses_saved_summary_after_source_delete() {
+    struct DeleteSourceAfterSummary {
+        store: CrudStore,
+        checks: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl CompactionTarget for DeleteSourceAfterSummary {
+        async fn fits(&self, _: &str) -> Result<bool> {
+            if self
+                .checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                self.store
+                    .database_connection()
+                    .execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+                    .await?;
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        }
+    }
+    let mut f = fixture(
+        "publication source",
+        vec![Reply::Success, Reply::Success],
+        true,
+        false,
+    )
+    .await;
+    Arc::get_mut(&mut f.runner).unwrap().target = Arc::new(DeleteSourceAfterSummary {
+        store: f.store.clone(),
+        checks: std::sync::atomic::AtomicUsize::new(0),
+    });
+    assert!(matches!(
+        f.runner.run(CancellationToken::new()).await.unwrap(),
+        CompactionExit::Applied(_)
+    ));
+    let calls = f.provider.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    let correction: SummaryInput = serde_json::from_str(&calls[1].messages[1].content).unwrap();
+    assert!(!correction.previous_summary.is_empty());
+    assert!(correction.compact_units.is_empty());
+}
+
+#[tokio::test]
+async fn gateway_cancellation_still_prevents_publication_of_completed_summary() {
+    let f = fixture("publication source", vec![Reply::Success], true, false).await;
+    let mut hook =
+        arm_publication_test_hook(&f.store, "operation", PublicationTestPause::BeforeWriter);
+    let runner = f.runner.clone();
+    let run = tokio::spawn(async move { runner.run(CancellationToken::new()).await.unwrap() });
+    hook.reached().await;
+    f.store
+        .compaction_finish("operation", "cancelled", "user_stop")
+        .await
+        .unwrap();
+    hook.release();
+    assert!(matches!(
+        run.await.unwrap(),
+        CompactionExit::Reconcile(FailureKind::Cancelled)
+    ));
+    assert_eq!(f.store.compaction_head("owner").await.unwrap(), None);
+    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn gateway_restart_and_deadline_resume_publish_saved_summary_after_source_delete() {
+    for deadline_resume in [false, true] {
+        let f = fixture("publication source", vec![Reply::Success], true, false).await;
+        f.store
+            .compaction_bind_execution_turn("operation", "turn")
+            .await
+            .unwrap();
+        let mut hook =
+            arm_publication_test_hook(&f.store, "operation", PublicationTestPause::BeforeWriter);
+        let runner = f.runner.clone();
+        let run = tokio::spawn(async move { runner.run(CancellationToken::new()).await.unwrap() });
+        hook.reached().await;
+        let before_restart = f
+            .store
+            .compaction_runner_state("operation")
+            .await
+            .unwrap()
+            .unwrap();
+        let RunnerPhase::Commit {
+            checkpoint: commit_checkpoint,
+        } = &before_restart.phase
+        else {
+            panic!("publication did not preserve Commit phase")
+        };
+        let summary = f
+            .store
+            .compaction_checkpoint(commit_checkpoint)
+            .await
+            .unwrap()
+            .unwrap()
+            .summary;
+        f.store
+            .database_connection()
+            .execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+            .await
+            .unwrap();
+        run.abort();
+        let _ = run.await;
+        drop(hook);
+
+        let resumed_runner = if deadline_resume {
+            f.runner.reconcile(FailureKind::Deadline).await.unwrap();
+            assert!(
+                f.store
+                    .compaction_resume_deadline(
+                        "operation",
+                        "turn",
+                        before_restart.deadline_ms + pioneer_compaction::OPERATION_MILLIS,
+                    )
+                    .await
+                    .unwrap(),
+                "completed summary was rejected after its source disappeared"
+            );
+            let snapshot = serde_json::from_str(
+                &f.store
+                    .compaction_operation("operation")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .snapshot,
+            )
+            .unwrap();
+            Arc::new(CompactionRunner::new(
+                f.store.clone(),
+                "ws".into(),
+                "thread".into(),
+                snapshot,
+                f.runner.summarizer.clone(),
+                f.runner.target.clone(),
+                f.observer.clone(),
+                f.clock.clone(),
+            ))
+        } else {
+            f.runner.clone()
+        };
+        let exit = resumed_runner.run(CancellationToken::new()).await.unwrap();
+        assert!(matches!(exit, CompactionExit::Applied(_)));
+        assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+        let applied = f
+            .store
+            .compaction_runner_state("operation")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.attempts, before_restart.attempts);
+        assert_eq!(applied.retries, before_restart.retries);
+        let RunnerPhase::Applied { checkpoint } = &applied.phase else {
+            panic!("restarted Commit did not publish its candidate")
+        };
+        assert_eq!(checkpoint, commit_checkpoint);
+        assert_eq!(
+            f.store
+                .compaction_checkpoint(checkpoint)
+                .await
+                .unwrap()
+                .unwrap()
+                .summary,
+            summary
+        );
+    }
 }
 
 #[tokio::test]
@@ -10276,14 +10299,21 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
         [
             "original request",
             "",
-            "Reasoning recorded for a previous response:\nrecorded reasoning",
             "first completed result",
             "",
-            "Reasoning recorded for a previous response:\nrecorded reasoning",
             "same observed text",
             "same observed text",
             "late result",
         ]
+    );
+    assert_eq!(
+        prepared
+            .messages
+            .iter()
+            .filter(|message| message.reasoning_content.as_deref() == Some("recorded reasoning"))
+            .count(),
+        2,
+        "each completed canonical round owns its reasoning; its exact UI copy is suppressed"
     );
     let prepared_scopes = super::frozen::accepted_history_scopes(
         &f.store,
@@ -10392,11 +10422,9 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
         crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(&f.store, &stored)
             .await
             .unwrap();
-    // Working restore places the reasoning event (t+2) before the tool result
-    // (t+3); literal restore below must retain the frozen message order.
-    let mut expected_runtime_history = frozen.clone();
-    expected_runtime_history.swap(2, 3);
-    assert_eq!(runtime_history, expected_runtime_history);
+    // The canonical round owns its reasoning. Its UI copy is suppressed in
+    // both projections, keeping the call/result pair before unrelated answers.
+    assert_eq!(runtime_history, frozen);
     let legacy = serde_json::to_string(&vec![pioneer_provider::ChatMessage::user(
         "accepted legacy projection",
     )])

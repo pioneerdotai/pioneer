@@ -48,6 +48,35 @@ pub fn pending_origin(
     }
 }
 
+fn execution_turn_key(origin: &pioneer_provider::MessageProvenance) -> Option<(String, String)> {
+    // logical_turn_id identifies Task delivery ownership, not the physical
+    // provider turn. Use exact source scopes, including resolved item sources.
+    let turns = origin
+        .sources
+        .iter()
+        .filter_map(|source| {
+            let (kind, turn) = source.scope.split_once(':')?;
+            matches!(
+                kind,
+                "context"
+                    | "item"
+                    | "event"
+                    | "input"
+                    | "pending-assistant"
+                    | "pending-tool"
+                    | "pending-input"
+            )
+            .then_some(turn)
+        })
+        .collect::<BTreeSet<_>>();
+    (turns.len() == 1).then(|| {
+        (
+            origin.thread_id.clone(),
+            (*turns.first().expect("one turn")).to_owned(),
+        )
+    })
+}
+
 pub struct NativeHistoryLayout {
     pub units: Vec<HistoryUnit>,
     pub message_indexes: Vec<Vec<usize>>,
@@ -170,6 +199,58 @@ impl NativeHistoryLayout {
             }
             unit.complete &= calls == outcomes;
         }
+        // A completed call/result pair is not necessarily the end of the
+        // assistant turn. The selected native continuation profile may still need
+        // state from earlier rounds of that same turn. Mark those units pending
+        // until a final assistant response is present; Emergency respects this
+        // correctness boundary as it already respects incomplete tool pairs.
+        let active_turns = messages
+            .iter()
+            .filter_map(|message| {
+                let origin = message.provenance.as_ref()?;
+                (message.role == Role::User && origin.protected_input)
+                    .then(|| execution_turn_key(origin))
+                    .flatten()
+            })
+            .collect::<BTreeSet<_>>();
+        let mut native_turns = BTreeSet::new();
+        let mut last_assistant = BTreeMap::new();
+        for message in messages {
+            let Some(origin) = message.provenance.as_ref() else {
+                continue;
+            };
+            let Some(key) = execution_turn_key(origin) else {
+                continue;
+            };
+            if message.role == Role::Assistant {
+                last_assistant.insert(
+                    key.clone(),
+                    message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| !calls.is_empty()),
+                );
+                if message.provider_replay_state.as_ref().is_some_and(|state| {
+                    pioneer_provider::continuation::retention(state)
+                        != pioneer_provider::continuation::Retention::Ordinary
+                }) {
+                    native_turns.insert(key);
+                }
+            }
+        }
+        for (unit, indexes) in result.units.iter_mut().zip(&result.message_indexes) {
+            if indexes.iter().any(|index| {
+                messages[*index].provenance.as_ref().is_some_and(|origin| {
+                    execution_turn_key(origin).is_some_and(|key| {
+                        active_turns.contains(&key)
+                            && native_turns.contains(&key)
+                            && last_assistant.get(&key) == Some(&true)
+                    })
+                })
+            }) {
+                unit.complete = false;
+            }
+        }
         let mut seen = BTreeSet::new();
         for unit in &result.units {
             for reference in &unit.sources {
@@ -206,6 +287,304 @@ mod tests {
             inherited: false,
         });
     }
+
+    #[test]
+    fn native_multi_round_turn_stays_pending_until_final_assistant_response() {
+        let mut input = ChatMessage::user("current input");
+        origin(&mut input, "input", "input-source", true);
+        let mut messages = vec![input];
+        for index in 0..2 {
+            let id = format!("call-{index}");
+            let mut assistant = ChatMessage::assistant_tool_calls_with_provider_state(
+                None::<String>,
+                None::<String>,
+                vec![ProviderToolCall {
+                    id: id.clone(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                }],
+                Some(pioneer_provider::ProviderReplayState::for_model(
+                    "anthropic",
+                    "fixture",
+                    serde_json::json!({"schema_version":2,"blocks":[{"type":"thinking","thinking":"","signature":"signed"},{"type":"tool_use","id":id,"name":"read","input":{}}]}),
+                )),
+            );
+            origin(
+                &mut assistant,
+                &format!("round-{index}"),
+                &format!("a-{index}"),
+                false,
+            );
+            let mut result = ChatMessage::tool_result(id, "read", "output");
+            origin(
+                &mut result,
+                &format!("round-{index}"),
+                &format!("r-{index}"),
+                false,
+            );
+            messages.extend([assistant, result]);
+        }
+        let layout =
+            NativeHistoryLayout::from_messages("ws", "thread", &messages, &[1; 5]).unwrap();
+        assert!(layout.units[1..].iter().all(|unit| !unit.complete));
+        let mut final_message = ChatMessage::assistant("final");
+        origin(&mut final_message, "final", "final-source", false);
+        messages.push(final_message);
+        let closed =
+            NativeHistoryLayout::from_messages("ws", "thread", &messages, &[1; 6]).unwrap();
+        assert!(closed.units.iter().all(|unit| unit.complete));
+        assert_eq!(closed.message_indexes[1], [1, 2]);
+        assert_eq!(closed.message_indexes[2], [3, 4]);
+    }
+    #[test]
+    fn retention_uses_actual_state_with_hot_and_cold_scopes_in_both_planner_modes() {
+        use pioneer_compaction::{CompactionMode, CoverageDomain, ModelBudget, plan_compaction};
+        use pioneer_provider::ProviderReplayState;
+        for (provider, model, payload, required) in [
+            (
+                "bedrock",
+                "anthropic.claude-sonnet-4-6",
+                serde_json::json!({"blocks":[{"reasoningText":{"text":"","signature":"signed"}},{"redactedContent":"opaque"}]}),
+                true,
+            ),
+            (
+                "openrouter",
+                "anthropic/claude-sonnet-5.5",
+                serde_json::json!({"reasoning_details":[{"type":"reasoning.encrypted","format":"anthropic-claude-v1","data":"opaque"}]}),
+                true,
+            ),
+            (
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":[{"type":"reasoning.text","text":"readable","signature":null},{"type":"reasoning.summary","summary":"summary"}]}),
+                true,
+            ),
+            (
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":[{"type":"reasoning.native-v-next","data":"opaque"}]}),
+                true,
+            ),
+            (
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":[{"type":"reasoning.summary","summary":"known"},{"type":"reasoning.native-v-next","data":"opaque"}]}),
+                true,
+            ),
+            (
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":[{"data":"opaque"}]}),
+                true,
+            ),
+            (
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":["opaque"]}),
+                true,
+            ),
+            (
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":[]}),
+                false,
+            ),
+            (
+                "anthropic",
+                "claude-sonnet-4-6",
+                serde_json::json!({"schema_version":2,"blocks":[{"type":"text","text":"ordinary"},{"type":"tool_use","id":"call","name":"read","input":{}}]}),
+                false,
+            ),
+            (
+                "gemini",
+                "gemini-2.5-flash",
+                serde_json::json!({"schema_version":2,"parts":[{"functionCall":{"name":"read","args":{}}}]}),
+                false,
+            ),
+            (
+                "anthropic",
+                "unknown-generation",
+                serde_json::json!({"blocks":[{"type":"redacted_thinking","data":"opaque"}]}),
+                true,
+            ),
+            (
+                "deepseek",
+                "deepseek-v4-flash",
+                serde_json::json!({"schema_version":1,"assistant_message":{"reasoning_content":"","content":null,"tool_calls":[]}}),
+                true,
+            ),
+        ] {
+            for hot in [false, true] {
+                let mut input = ChatMessage::user("active");
+                origin(&mut input, "input", "input", true);
+                let mut messages = vec![input];
+                for round in 0..2 {
+                    let id = format!("call-{round}");
+                    let mut assistant = ChatMessage::assistant_tool_calls_with_provider_state(
+                        None::<String>,
+                        None::<String>,
+                        vec![ProviderToolCall {
+                            id: id.clone(),
+                            name: "read".into(),
+                            arguments: "{}".into(),
+                        }],
+                        Some(ProviderReplayState::for_model(
+                            provider,
+                            model,
+                            payload.clone(),
+                        )),
+                    );
+                    origin(
+                        &mut assistant,
+                        &format!("round-{round}"),
+                        &format!("a-{round}"),
+                        false,
+                    );
+                    let mut result = ChatMessage::tool_result(id, "read", "outcome");
+                    origin(
+                        &mut result,
+                        &format!("round-{round}"),
+                        &format!("r-{round}"),
+                        false,
+                    );
+                    messages.extend([assistant, result]);
+                }
+                for message in &mut messages {
+                    let origin = message.provenance.as_mut().unwrap();
+                    origin.sources[0].scope = if hot {
+                        match message.role {
+                            Role::User => "pending-input:turn",
+                            Role::Tool => "pending-tool:turn",
+                            _ => "pending-assistant:turn",
+                        }
+                    } else {
+                        "context:turn"
+                    }
+                    .into();
+                    origin.sources[0].version = if hot { "" } else { "revision:1" }.into();
+                }
+                if hot {
+                    // Hot locators have no durable revision yet. Native policy
+                    // cannot make them eligible, even after a final response.
+                    let unresolved =
+                        NativeHistoryLayout::from_messages("ws", "thread", &messages, &[100; 5])
+                            .unwrap();
+                    assert!(
+                        unresolved.units.iter().all(|unit| !unit.complete),
+                        "unresolved sources: {provider}/{model}"
+                    );
+                    let mut final_message = ChatMessage::assistant("final");
+                    origin(&mut final_message, "final", "final", false);
+                    let mut unresolved_closed = messages.clone();
+                    unresolved_closed.push(final_message);
+                    let closed = NativeHistoryLayout::from_messages(
+                        "ws",
+                        "thread",
+                        &unresolved_closed,
+                        &[100; 6],
+                    )
+                    .unwrap();
+                    assert!(
+                        closed.units[..3].iter().all(|unit| !unit.complete),
+                        "final closure does not resolve earlier sources: {provider}/{model}"
+                    );
+                    assert!(closed.units[3].complete);
+                    for mode in [CompactionMode::Normal, CompactionMode::Emergency] {
+                        assert!(
+                            plan_compaction(
+                                &unresolved.units,
+                                &ModelBudget::new(Some(32768), None, None),
+                                256,
+                                0,
+                                512,
+                                mode,
+                                CoverageDomain::WorkingContext,
+                                true,
+                                "fixture",
+                            )
+                            .is_err(),
+                            "unresolved sources must remain pending: {provider}/{model}/{mode:?}"
+                        );
+                        let plan = plan_compaction(
+                            &closed.units,
+                            &ModelBudget::new(Some(32768), None, None),
+                            256,
+                            0,
+                            512,
+                            mode,
+                            CoverageDomain::WorkingContext,
+                            true,
+                            "fixture",
+                        )
+                        .unwrap();
+                        assert_eq!(plan.compact, [3]);
+                    }
+                    // Represent the metadata returned by Gateway's locator
+                    // resolver: versioned input/context sources, not pending IDs.
+                    for message in &mut messages {
+                        let source = &mut message.provenance.as_mut().unwrap().sources[0];
+                        source.scope = if message.role == Role::User {
+                            "input:turn"
+                        } else {
+                            "context:turn"
+                        }
+                        .into();
+                        source.version = "revision:1".into();
+                    }
+                }
+                let layout =
+                    NativeHistoryLayout::from_messages("ws", "thread", &messages, &[100; 5])
+                        .unwrap();
+                assert_eq!(
+                    layout.units[1].complete, !required,
+                    "resolved active turn: {provider}/{model}/{hot}"
+                );
+                for mode in [CompactionMode::Normal, CompactionMode::Emergency] {
+                    let plan = plan_compaction(
+                        &layout.units,
+                        &ModelBudget::new(Some(32768), None, None),
+                        256,
+                        0,
+                        512,
+                        mode,
+                        CoverageDomain::WorkingContext,
+                        true,
+                        "fixture",
+                    );
+                    assert_eq!(plan.is_err(), required, "{provider}/{hot}/{mode:?}");
+                }
+                let mut final_message = ChatMessage::assistant("final");
+                origin(&mut final_message, "final", "final", false);
+                final_message.provenance.as_mut().unwrap().sources[0].scope = "context:turn".into();
+                messages.push(final_message);
+                let closed =
+                    NativeHistoryLayout::from_messages("ws", "thread", &messages, &[100; 6])
+                        .unwrap();
+                assert!(
+                    closed.units.iter().all(|unit| unit.complete),
+                    "resolved final closure: {provider}/{model}/{hot}"
+                );
+                // Final closure restores pair/unit eligibility, but unknown or
+                // binding state still forbids prefix rewriting while retained.
+                let expected_refusal =
+                    messages[1]
+                        .provider_replay_state
+                        .as_ref()
+                        .is_some_and(|state| {
+                            pioneer_provider::continuation::retention(state).preserves_prefix()
+                        });
+                assert_eq!(
+                    pioneer_provider::continuation::validate_compaction(
+                        &messages,
+                        &BTreeSet::from([0]),
+                    )
+                    .is_err(),
+                    expected_refusal
+                );
+            }
+        }
+    }
+
     #[test]
     fn whole_round_remains_pending_until_outcome_and_preserves_intervening_steering() {
         let mut assistant = ChatMessage::assistant_tool_calls(

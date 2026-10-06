@@ -482,13 +482,16 @@ async fn before_tracking() -> CrudStore {
     CrudStore::new(db)
 }
 async fn install_tracking(store: &CrudStore) {
+    install_tracking_with_migrator::<Migrator>(store).await;
+}
+async fn install_tracking_with_migrator<M: MigratorTrait>(store: &CrudStore) {
     let tx = store
         .with_maintenance_access()
         .connection
         .begin()
         .await
         .unwrap();
-    Migrator::up(&*tx, None).await.unwrap();
+    M::up(&*tx, None).await.unwrap();
     tx.commit().await.unwrap();
 }
 async fn old_history(store: &CrudStore, id: &str) -> Task {
@@ -1028,6 +1031,12 @@ impl pioneer_sqlite::SqliteWriteObserver for Routes {
     }
 }
 async fn disk_store(path: &std::path::Path, routes: Arc<Routes>) -> CrudStore {
+    disk_store_with_migrator::<Migrator>(path, routes).await
+}
+async fn disk_store_with_migrator<M: MigratorTrait>(
+    path: &std::path::Path,
+    routes: Arc<Routes>,
+) -> CrudStore {
     let mut options = sea_orm::ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
     options
         .max_connections(1)
@@ -1036,7 +1045,7 @@ async fn disk_store(path: &std::path::Path, routes: Arc<Routes>) -> CrudStore {
     let writer = Database::connect(options).await.unwrap();
     let executor = pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, routes.clone());
     executor
-        .run_migrations::<Migrator>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
+        .run_migrations::<M>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
         .await
         .unwrap();
     let mut options =
@@ -1415,13 +1424,13 @@ async fn budget_deferral_fences_new_holders_resets_and_keeps_appended_work() {
     assert_eq!(row(&store, &task.id).await.unwrap(), reset);
 }
 
-fn fanout_rollback_steps() -> u32 {
-    let migrations = Migrator::migrations();
-    let target = migrations
-        .iter()
-        .position(|m| m.name() == MIGRATION)
-        .expect("fanout migration registered");
-    (migrations.len() - target) as u32
+// Migration rollback fixtures use the production schema through fanout,
+// excluding later irreversible migrations.
+struct FanoutFixtureMigrator;
+impl MigratorTrait for FanoutFixtureMigrator {
+    fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+        migrations_through(MIGRATION)
+    }
 }
 async fn named_schema_objects(store: &CrudStore) -> Vec<String> {
     store.connection.query_all_raw(Statement::from_string(DatabaseBackend::Sqlite,
@@ -1430,12 +1439,12 @@ async fn named_schema_objects(store: &CrudStore) -> Vec<String> {
 }
 #[tokio::test]
 async fn fanout_partial_ddl_failure_rollback_reinstall_down_and_restart_preserve_coverage() {
-    let store = store().await;
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    FanoutFixtureMigrator::up(&db, None).await.unwrap();
+    let store = CrudStore::new(db);
     let maintenance = store.with_maintenance_access();
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(fanout_rollback_steps()))
-        .await
-        .unwrap();
+    FanoutFixtureMigrator::down(&*tx, Some(1)).await.unwrap();
     tx.commit().await.unwrap();
     let before = named_schema_objects(&store).await;
     // Cursor table/index predate this package and must survive down.
@@ -1463,7 +1472,7 @@ async fn fanout_partial_ddl_failure_rollback_reinstall_down_and_restart_preserve
         .await
         .unwrap();
     let tx = maintenance.connection.begin().await.unwrap();
-    assert!(Migrator::up(&*tx, None).await.is_err());
+    assert!(FanoutFixtureMigrator::up(&*tx, None).await.is_err());
     tx.rollback().await.unwrap();
     let objects = named_schema_objects(&store).await;
     let mut expected = before.clone();
@@ -1490,7 +1499,7 @@ async fn fanout_partial_ddl_failure_rollback_reinstall_down_and_restart_preserve
         .await
         .unwrap();
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::up(&*tx, None).await.unwrap();
+    FanoutFixtureMigrator::up(&*tx, None).await.unwrap();
     tx.commit().await.unwrap();
     assert!(!store.has_pending_task_event_fanout().await.unwrap());
     let task = created(&store, "reinstalled-tracking").await;
@@ -1501,9 +1510,7 @@ async fn fanout_partial_ddl_failure_rollback_reinstall_down_and_restart_preserve
         row(&store, &task.id).await.unwrap()
     );
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(fanout_rollback_steps()))
-        .await
-        .unwrap();
+    FanoutFixtureMigrator::down(&*tx, Some(1)).await.unwrap();
     tx.commit().await.unwrap();
     assert_eq!(named_schema_objects(&store).await, before);
     assert_eq!(
@@ -1514,7 +1521,7 @@ async fn fanout_partial_ddl_failure_rollback_reinstall_down_and_restart_preserve
         foreign
     );
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::up(&*tx, None).await.unwrap();
+    FanoutFixtureMigrator::up(&*tx, None).await.unwrap();
     tx.commit().await.unwrap();
     progress(&store, &task.id, "new append after reinstall").await;
     assert_eq!(row(&store, &task.id).await.unwrap().first_sequence, 2);
@@ -1526,19 +1533,18 @@ async fn floor_survives_physical_restart_before_claim_after_claim_partial_ack_an
         "pioneer-fanout-floor-{}.sqlite",
         uuid::Uuid::new_v4()
     ));
-    let store = disk_store(&path, Arc::new(Routes::default())).await;
+    let store =
+        disk_store_with_migrator::<FanoutFixtureMigrator>(&path, Arc::new(Routes::default())).await;
     let tx = store
         .with_maintenance_access()
         .connection
         .begin()
         .await
         .unwrap();
-    Migrator::down(&*tx, Some(fanout_rollback_steps()))
-        .await
-        .unwrap();
+    FanoutFixtureMigrator::down(&*tx, Some(1)).await.unwrap();
     tx.commit().await.unwrap();
     old_history(&store, "restart-old-task").await;
-    install_tracking(&store).await;
+    install_tracking_with_migrator::<FanoutFixtureMigrator>(&store).await;
     progress(&store, "restart-old-task", "101").await;
     progress(&store, "restart-old-task", "102").await;
     let mut store = store;
@@ -1587,7 +1593,9 @@ async fn floor_survives_physical_restart_before_claim_after_claim_partial_ack_an
         let before = row(&store, "restart-old-task").await.unwrap();
         store.connection.clone().close().await.unwrap();
         drop(store);
-        store = disk_store(&path, Arc::new(Routes::default())).await;
+        store =
+            disk_store_with_migrator::<FanoutFixtureMigrator>(&path, Arc::new(Routes::default()))
+                .await;
         assert_eq!(row(&store, "restart-old-task").await.unwrap(), before);
         let after = store
             .get_task_event_fanout_cursor("restart-old-task")

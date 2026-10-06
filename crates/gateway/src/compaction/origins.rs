@@ -124,6 +124,31 @@ pub(super) async fn resolve_message_origin_locators(
                 _ => anyhow::bail!("unsupported runtime source locator"),
             }
             .ok_or_else(|| anyhow::anyhow!("acknowledged canonical source is missing"))?;
+            if kind == "pending-assistant" {
+                let payload = store
+                    .compaction_reference_payload(workspace, &origin.thread_id, &reference)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("acknowledged assistant envelope is missing"))?;
+                if let Ok(envelope) = serde_json::from_str::<
+                    pioneer_provider::CanonicalProviderRoundEnvelope,
+                >(&payload)
+                {
+                    if envelope.calls.is_empty() {
+                        let evidence = super::final_response_aliases(
+                            store,
+                            workspace,
+                            &origin.thread_id,
+                            turn,
+                            &reference,
+                            &envelope.round_id,
+                            Some(&source.id),
+                        )
+                        .await?;
+                        origin.source_aliases.extend(evidence.aliases);
+                        origin.complete &= evidence.ready;
+                    }
+                }
+            }
             resolved.push(MessageSourceRef {
                 scope: reference.scope,
                 id: reference.id,

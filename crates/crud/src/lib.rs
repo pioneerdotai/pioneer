@@ -31928,10 +31928,14 @@ mod tests {
     }
 
     async fn test_store_with_workspace(workspace_id: &str) -> CrudStore {
+        test_store_with_workspace_migrator::<Migrator>(workspace_id).await
+    }
+
+    async fn test_store_with_workspace_migrator<M: MigratorTrait>(workspace_id: &str) -> CrudStore {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
+        M::up(&connection, None)
             .await
             .expect("migrations must succeed");
 
@@ -43232,6 +43236,13 @@ mod tests {
         occurrence_kind: Option<TurnKind>,
     ) -> (CrudStore, Thread, TaskRun) {
         let store = test_store_with_workspace("ws_task").await;
+        terminal_task_run_occurrence_fixture_with_store(store, occurrence_kind).await
+    }
+
+    async fn terminal_task_run_occurrence_fixture_with_store(
+        store: CrudStore,
+        occurrence_kind: Option<TurnKind>,
+    ) -> (CrudStore, Thread, TaskRun) {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             workspace_id: "ws_task".to_owned(),

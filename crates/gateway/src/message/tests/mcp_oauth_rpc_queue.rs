@@ -34,7 +34,7 @@ async fn authorized_event_cannot_restart_reinstalled_or_replaced_identity_after_
     }
 }
 
-// One async worker makes handing off the synchronous clock barrier essential.
+// One async worker verifies that the post-put async barrier yields to Cancel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn same_websocket_terminal_decision_after_durable_put_preserves_cancel_timeout_and_success() {
     use pioneer_mcp_oauth::OAuthState;
@@ -107,7 +107,8 @@ async fn oauth_queue_cancellation_impl(
         resumed: Default::default(),
     });
     let secrets = Arc::new(GatewaySecrets::new(other_read.clone()));
-    let clock = Arc::new(WireCommitClock::new(secret_store));
+    let clock = Arc::new(WireCommitClock::new());
+    let commit_hooks = Arc::new(pioneer_mcp_oauth::OAuthTestHooks::default());
     let mut processor = MessageProcessor::new(
         Arc::new(ThreadManager::new("o4-mini", "openai")),
         test_provider(),
@@ -128,6 +129,7 @@ async fn oauth_queue_cancellation_impl(
             processor.authorization_invalidation_hub.clone(),
             processor.execution_leases.clone(),
             pioneer_mcp_oauth::OAuthServiceOptions {
+                test_hooks: Some(commit_hooks.clone()),
                 clock: clock.clone(),
                 poll_interval: if replacement.is_some() {
                     Duration::from_millis(10)
@@ -174,7 +176,7 @@ async fn oauth_queue_cancellation_impl(
         }
     }
     let _release_on_exit = QueueFixtureRelease {
-        clock: clock.clone(),
+        commit_hooks: commit_hooks.clone(),
         notifications: vec![token_release.clone(), effect_release.clone()],
         other_read: other_read.clone(),
     };
@@ -243,7 +245,6 @@ async fn oauth_queue_cancellation_impl(
         .unwrap()
         .unwrap();
     let server_id = row.id.unwrap();
-    *clock.id.lock().unwrap() = Some(server_id.clone());
     if replacement.is_some() || stale_rpc.is_some() {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -820,11 +821,16 @@ async fn oauth_queue_cancellation_impl(
                 .unwrap(),
         )
         .unwrap();
-        clock.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        commit_hooks
+            .pause_after_exchange
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         token_release.notify_one();
-        tokio::time::timeout(Duration::from_secs(3), clock.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            commit_hooks.exchange_returned.notified(),
+        )
+        .await
+        .unwrap();
         assert!(
             secrets
                 .mcp_oauth_persistence()
@@ -850,7 +856,7 @@ async fn oauth_queue_cancellation_impl(
         } else if decision == OAuthState::TimedOut {
             *clock.now.lock().unwrap() += Duration::from_secs(4000);
         }
-        clock.resume();
+        commit_hooks.decide_exchange.notify_one();
         let wire_state = match decision {
             OAuthState::Cancelled => "cancelled",
             OAuthState::TimedOut => "timed_out",
@@ -1507,61 +1513,21 @@ impl pioneer_mcp::McpRuntimeConnector for ScopePhaseConnector {
     }
 }
 
-// Reads the actual completed store record: no barrier inside put or token HTTP.
+// Time observation must never block: event validation and cancellation also
+// read this clock while holding their admission mutex. The async service hook
+// above pauses only the exchange owner after the actual SDK store has returned.
 struct WireCommitClock {
-    store: Arc<MemorySecretStore>,
-    id: std::sync::Mutex<Option<String>>,
-    armed: std::sync::atomic::AtomicBool,
     now: std::sync::Mutex<std::time::SystemTime>,
-    entered: tokio::sync::Notify,
-    released: std::sync::Mutex<bool>,
-    release: std::sync::Condvar,
 }
 impl WireCommitClock {
-    fn new(store: Arc<MemorySecretStore>) -> Self {
+    fn new() -> Self {
         Self {
-            store,
-            id: std::sync::Mutex::new(None),
-            armed: std::sync::atomic::AtomicBool::new(false),
             now: std::sync::Mutex::new(std::time::SystemTime::now()),
-            entered: tokio::sync::Notify::new(),
-            released: std::sync::Mutex::new(false),
-            release: std::sync::Condvar::new(),
         }
-    }
-    fn resume(&self) {
-        *self.released.lock().unwrap() = true;
-        self.release.notify_all();
     }
 }
 impl pioneer_mcp_oauth::OAuthClock for WireCommitClock {
     fn now(&self) -> std::time::SystemTime {
-        use pioneer_keystore::SecretStore;
-        let stored = self.id.lock().unwrap().as_ref().is_some_and(|id| {
-            self.store
-                .get_string(&pioneer_keystore::SecretId::mcp_oauth(id).unwrap())
-                .unwrap()
-                .is_some_and(|record| {
-                    serde_json::from_str::<Value>(&record).unwrap()["pending_consent"]["candidate"]
-                        .is_object()
-                })
-        });
-        if stored && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            // This synchronous clock can run on a Tokio worker after the put.
-            // Hand off that worker before parking, so the notified controller
-            // and its WebSocket Cancel can run and release the barrier.
-            tokio::task::block_in_place(|| {
-                self.entered.notify_one();
-                let released = self.released.lock().unwrap();
-                let (released, _) = self
-                    .release
-                    .wait_timeout_while(released, Duration::from_secs(10), |released| !*released)
-                    .unwrap();
-                let completed = *released;
-                drop(released);
-                assert!(completed, "post-put clock barrier was not released");
-            });
-        }
         *self.now.lock().unwrap()
     }
 }
@@ -1634,13 +1600,13 @@ impl pioneer_mcp::McpRuntimeSession for ScopeRefreshSession {
 }
 
 struct QueueFixtureRelease {
-    clock: Arc<WireCommitClock>,
+    commit_hooks: Arc<pioneer_mcp_oauth::OAuthTestHooks>,
     notifications: Vec<Arc<tokio::sync::Notify>>,
     other_read: Arc<OtherInstallationRead>,
 }
 impl Drop for QueueFixtureRelease {
     fn drop(&mut self) {
-        self.clock.resume();
+        self.commit_hooks.decide_exchange.notify_one();
         self.other_read
             .uncertain_promotion
             .store(false, std::sync::atomic::Ordering::SeqCst);
