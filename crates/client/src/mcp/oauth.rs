@@ -109,7 +109,7 @@ pub trait McpOAuthShell: Send + Sync {
         None
     }
 
-    /// Returns only after a loopback listener is ready. Must use the same URI
+    /// Returns only after the shell callback route is ready. Must use the same URI
     /// across restarts so persisted client registrations remain valid.
     fn prepare(&self) -> anyhow::Result<String>;
     /// Open at most one browser tab and relay a parsed callback asynchronously.
@@ -177,6 +177,36 @@ impl ClientCore {
             .presentations
             .get(&(workspace.into(), server.into()))
             .cloned()
+    }
+    /// Shell browser dismissal uses the same native Cancel action, bound to
+    /// the originating transport. Mobile consumes this relay; desktop browser
+    /// adapters can use it when their OS reports session dismissal.
+    pub fn mcp_oauth_cancel_relay(
+        &self,
+        event: &OAuthPresentation,
+    ) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let connection = self.provider_runtime_epoch().2;
+        let sender = self.transport_runtime().ws_command_sender();
+        let event = event.clone();
+        Arc::new(move || {
+            let (Some(connection), Some(flow_id)) = (connection, event.flow_id.clone()) else {
+                return false;
+            };
+            let params = McpOAuthParams {
+                workspace_id: event.workspace_id.clone(),
+                server_id: event.server_id.clone(),
+                name: event.name.clone(),
+                scope_kind: event.scope_kind,
+                action: McpOAuthAction::Cancel { flow_id },
+            };
+            crate::rpc::send_json_rpc_request_typed::<McpOAuthResponse, _, _>(
+                &sender.requests_for_connection(connection),
+                methods::MCP_OAUTH,
+                &params,
+                std::time::Duration::from_secs(60),
+            )
+            .is_ok()
+        })
     }
     pub(crate) fn retry_mcp_oauth_browser(
         &self,
@@ -326,6 +356,7 @@ impl ClientCore {
         }
         self.publish_mcp_oauth_revision(&event);
         self.refresh_mcp(&event.workspace_id);
+        self.refresh_plugin_publication(&event.workspace_id);
     }
     pub(crate) fn forget_mcp_oauth(&self, workspace: &str, server: &str) {
         let mut owner = self.mcp_oauth.lock().expect("MCP OAuth owner poisoned");

@@ -29,6 +29,7 @@ pub enum SkillsIntent {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SkillUploadTarget {
     PluginInstall,
+    PluginPreview,
     PluginUpdatePreview {
         plugin_id: String,
         expected_revision: i64,
@@ -88,6 +89,7 @@ struct Upload {
     epoch: (u64, u64, Option<u64>),
     target: SkillUploadTarget,
     source_kind: Option<SkillUploadSourceKind>,
+    connection_bound: bool,
 }
 enum Work {
     Action(Action),
@@ -379,6 +381,7 @@ impl ClientCore {
             self.apply_skills_policy(&action.workspace, skill_id, enabled, implicit);
         }
         drop(owner);
+        self.refresh_plugin_publication(&action.workspace);
     }
     /// The path is the explicit result of a shell picker. No path or bytes enter publications.
     pub fn start_skill_upload(
@@ -387,16 +390,32 @@ impl ClientCore {
         target: SkillUploadTarget,
         path: PathBuf,
     ) -> anyhow::Result<SkillUploadOperation> {
+        self.start_skill_upload_bound(workspace, target, path, None)
+    }
+    /// File shells bind asynchronous picker results to their original Gateway;
+    /// desktop synchronous pickers may retain the legacy None admission.
+    pub fn start_skill_upload_bound(
+        self: &Arc<Self>,
+        workspace: &str,
+        target: SkillUploadTarget,
+        path: PathBuf,
+        expected_connection: Option<u64>,
+    ) -> anyhow::Result<SkillUploadOperation> {
         anyhow::ensure!(
             self.capability_management_allowed(workspace),
             "capability_access_denied"
         );
         let epoch = self.provider_runtime_epoch();
         anyhow::ensure!(epoch.2.is_some(), "gateway_not_connected");
+        anyhow::ensure!(
+            expected_connection.is_none_or(|c| epoch.2 == Some(c)),
+            "gateway_changed_during_file_selection"
+        );
         if !matches!(
             target,
             SkillUploadTarget::Install
                 | SkillUploadTarget::PluginInstall
+                | SkillUploadTarget::PluginPreview
                 | SkillUploadTarget::PluginUpdatePreview { .. }
         ) {
             let catalog = self
@@ -420,6 +439,7 @@ impl ClientCore {
                 ),
                 SkillUploadTarget::Install
                 | SkillUploadTarget::PluginInstall
+                | SkillUploadTarget::PluginPreview
                 | SkillUploadTarget::PluginUpdatePreview { .. } => {}
             }
         }
@@ -453,7 +473,15 @@ impl ClientCore {
                 path,
             })
             .map_err(|_| anyhow::anyhow!("skills_upload_backpressure"))?;
+        let connection_bound = expected_connection.is_some()
+            || matches!(
+                target,
+                SkillUploadTarget::PluginInstall
+                    | SkillUploadTarget::PluginPreview
+                    | SkillUploadTarget::PluginUpdatePreview { .. }
+            );
         let mut upload = Upload {
+            connection_bound,
             flow: SkillUploadFlow::new(operation, workspace.into()),
             epoch,
             target,
@@ -467,6 +495,47 @@ impl ClientCore {
             workspace: workspace.into(),
             id: operation,
         })
+    }
+    fn skill_upload_connection(&self, workspace: &str, operation: u64) -> Option<u64> {
+        self.skills_controller
+            .lock()
+            .expect("Skills controller poisoned")
+            .uploads
+            .get(&(workspace.into(), operation))
+            .and_then(|u| u.epoch.2)
+    }
+    pub(crate) fn confirm_plugin_upload(
+        &self,
+        workspace: &str,
+        operation: u64,
+        epoch: (u64, u64, Option<u64>),
+    ) -> anyhow::Result<SkillUploadPublication> {
+        anyhow::ensure!(
+            self.provider_runtime_epoch() == epoch,
+            "plugin_preview_stale"
+        );
+        let mut owner = self
+            .skills_controller
+            .lock()
+            .expect("Skills controller poisoned");
+        let u = owner
+            .uploads
+            .get_mut(&(workspace.into(), operation))
+            .ok_or_else(|| anyhow::anyhow!("plugin_preview_required"))?;
+        anyhow::ensure!(
+            u.epoch == epoch && u.flow.publication.state == SkillUploadState::Succeeded,
+            "plugin_preview_stale"
+        );
+        anyhow::ensure!(
+            u.flow.publication.plugin_preview.is_some()
+                || u.flow.publication.plugin_update_preview.is_some(),
+            "plugin_preview_required"
+        );
+        let preview = u.flow.publication.clone();
+        u.flow.publication.plugin_preview = None;
+        u.flow.publication.plugin_update_preview = None;
+        self.publish_skill_upload(workspace, u);
+        Ok(preview)
     }
     fn publish_skill_upload(&self, workspace: &str, upload: &mut Upload) {
         let scope = ClientScope::SkillsUpload {
@@ -507,7 +576,25 @@ impl ClientCore {
         };
         let epoch = upload.epoch;
         upload.flow.terminate(SkillUploadState::Cancelled);
-        let remote = upload.flow.take_cleanup();
+        let remote = upload
+            .flow
+            .take_cleanup()
+            .or_else(|| {
+                upload
+                    .flow
+                    .publication
+                    .plugin_preview
+                    .take()
+                    .map(|p| p.upload_id)
+            })
+            .or_else(|| {
+                upload
+                    .flow
+                    .publication
+                    .plugin_update_preview
+                    .take()
+                    .map(|p| p.upload_id)
+            });
         self.publish_skill_upload(workspace, upload);
         if let Some(remote) = remote
             && let Some(sender) = &owner.sender
@@ -586,7 +673,13 @@ impl ClientCore {
         &self,
         workspace: &str,
         operation: u64,
-    ) -> Option<(UploadEffect, SkillUploadTarget, SkillUploadSourceKind, u64)> {
+    ) -> Option<(
+        UploadEffect,
+        SkillUploadTarget,
+        SkillUploadSourceKind,
+        u64,
+        bool,
+    )> {
         let mut owner = self
             .skills_controller
             .lock()
@@ -600,6 +693,7 @@ impl ClientCore {
             upload.target.clone(),
             upload.source_kind?,
             upload.flow.effect_generation(),
+            upload.connection_bound,
         ))
     }
     fn complete_skill_upload_effect(
@@ -648,6 +742,7 @@ impl ClientCore {
         drop(owner);
         if succeeded {
             self.fence_skills_reads_after_action(workspace);
+            self.refresh_plugin_publication(workspace);
         }
     }
     pub(crate) fn start_skills_operation_controller(self: &Arc<Self>) {
@@ -657,14 +752,15 @@ impl ClientCore {
             match work {
                 Work::Action(action)=>{
                     let Some(core)=weak.upgrade() else{return;};if !core.skills_action_current(&action){continue;}let sender=core.transport_runtime().ws_command_sender();drop(core);
+                    let bound=sender.requests_for_connection(action.epoch.2.expect("admitted Skills action has a connection"));
                     let result=match &action.intent {
-                        SkillsIntent::Policy{skill_id,enabled,allow_implicit_invocation}=>sender.skills_policy_set(super::actions::skills_policy_set_params(&action.workspace,skill_id.clone(),*enabled,*allow_implicit_invocation)).map(|_|()),
-                        SkillsIntent::Remove{skill_id}=>sender.skills_uninstall(super::actions::skills_uninstall_params(&action.workspace,skill_id.clone())).map(|_|()),
-                        SkillsIntent::RemovePack{pack_id}=>sender.skills_pack_uninstall(super::actions::skills_pack_uninstall_params(&action.workspace,pack_id.clone())).map(|_|()),
+                        SkillsIntent::Policy{skill_id,enabled,allow_implicit_invocation}=>crate::transport::ws::command_sender::skills_policy_set(&bound,super::actions::skills_policy_set_params(&action.workspace,skill_id.clone(),*enabled,*allow_implicit_invocation)).map(|_|()),
+                        SkillsIntent::Remove{skill_id}=>crate::transport::ws::command_sender::skills_uninstall(&bound,super::actions::skills_uninstall_params(&action.workspace,skill_id.clone())).map(|_|()),
+                        SkillsIntent::RemovePack{pack_id}=>crate::transport::ws::command_sender::skills_pack_uninstall(&bound,super::actions::skills_pack_uninstall_params(&action.workspace,pack_id.clone())).map(|_|()),
                     };if let Some(core)=weak.upgrade(){core.complete_skills_action(action,result);}
                 }
                 Work::Abort{workspace,upload,epoch}=>{
-                    let Some(core)=weak.upgrade() else{return;};if core.is_stopped()||core.provider_runtime_epoch()!=epoch||!core.capability_management_allowed(&workspace){continue;}let sender=core.transport_runtime().ws_command_sender();drop(core);let _=sender.skills_upload_abort(super::upload::skills_upload_abort_params(workspace,upload));
+                    let Some(core)=weak.upgrade() else{return;};if core.is_stopped()||core.provider_runtime_epoch()!=epoch||!core.capability_management_allowed(&workspace){continue;}let sender=core.transport_runtime().ws_command_sender();drop(core);if let Some(connection)=epoch.2 { let _=crate::transport::ws::command_sender::skills_upload_abort(&sender.requests_for_connection(connection),super::upload::skills_upload_abort_params(workspace,upload)); }
                 }
                 Work::Prepare{workspace,operation,path}=>{
                     let Some(core)=weak.upgrade() else{return;};let target=core.skill_preparation_target(&workspace,operation);drop(core);let Some(target)=target else{continue;};
@@ -672,12 +768,15 @@ impl ClientCore {
                     if let Some(core)=weak.upgrade(){core.complete_skill_preparation(&workspace,operation,prepared);}else{return;}
 
                     loop {
-                        let Some(core)=weak.upgrade() else{return;};let effect=core.next_skill_upload_effect(&workspace,operation);let connection=core.provider_runtime_epoch().2;let sender=core.transport_runtime().ws_command_sender();drop(core);let Some((effect,target,kind,effect_generation))=effect else{break;};
+                        let Some(core)=weak.upgrade() else{return;};let effect=core.next_skill_upload_effect(&workspace,operation);let connection=core.skill_upload_connection(&workspace,operation);let sender=core.transport_runtime().ws_command_sender();drop(core);let Some((effect,target,kind,effect_generation,connection_bound))=effect else{break;};
                         let bound = connection.map(|id| sender.requests_for_connection(id));
                         let result=match effect {
-                            UploadEffect::Start(mut params)=>{ if matches!(target, SkillUploadTarget::PluginInstall | SkillUploadTarget::PluginUpdatePreview { .. }) { params.purpose = pioneer_protocol::SkillUploadPurpose::Plugin; match &bound { Some(bound) => crate::transport::ws::command_sender::skills_upload_start(bound, params), None => Err(anyhow::anyhow!("gateway_not_connected")) } } else { sender.skills_upload_start(params) } }.map(UploadCompletion::Start),
-                            UploadEffect::Chunk{upload_id,offset,bytes}=>sender.send_skill_upload_chunk(workspace.clone(),upload_id,offset,bytes).map(UploadCompletion::Chunk),
-                            UploadEffect::Finish(params)=>{ if matches!(target, SkillUploadTarget::PluginInstall | SkillUploadTarget::PluginUpdatePreview { .. }) { match &bound { Some(bound) => crate::transport::ws::command_sender::skills_upload_finish(bound, params), None => Err(anyhow::anyhow!("gateway_not_connected")) } } else { sender.skills_upload_finish(params) } }.map(UploadCompletion::Finish),
+                            UploadEffect::Start(mut params)=>{
+                                if matches!(target,SkillUploadTarget::PluginInstall|SkillUploadTarget::PluginPreview|SkillUploadTarget::PluginUpdatePreview{..}) {params.purpose=pioneer_protocol::SkillUploadPurpose::Plugin;}
+                                if connection_bound {match &bound {Some(bound)=>crate::transport::ws::command_sender::skills_upload_start(bound,params),None=>Err(anyhow::anyhow!("gateway_not_connected"))}} else {sender.skills_upload_start(params)}
+                            }.map(UploadCompletion::Start),
+                            UploadEffect::Chunk{upload_id,offset,bytes}=>sender.send_skill_upload_chunk_bound(connection,workspace.clone(),upload_id,offset,bytes).map(UploadCompletion::Chunk),
+                            UploadEffect::Finish(params)=>{ if connection_bound { match &bound { Some(bound) => crate::transport::ws::command_sender::skills_upload_finish(bound, params), None => Err(anyhow::anyhow!("gateway_not_connected")) } } else { sender.skills_upload_finish(params) } }.map(UploadCompletion::Finish),
                             UploadEffect::Apply{upload_id} if matches!(&target, SkillUploadTarget::PluginUpdatePreview {..}) => match &target {
                                 SkillUploadTarget::PluginUpdatePreview {plugin_id,expected_revision} => match &bound {
                                     Some(bound)=>crate::transport::ws::command_sender::plugins_update_preview(bound,pioneer_protocol::PluginsUpdatePreviewParams {
@@ -686,11 +785,15 @@ impl ClientCore {
                                     None=>Err(anyhow::anyhow!("gateway_not_connected")),
                                 },_=>unreachable!(),
                             },
+                            UploadEffect::Apply{upload_id} if target == SkillUploadTarget::PluginPreview => match &bound { Some(bound)=>crate::transport::ws::command_sender::plugins_preview(bound,pioneer_protocol::PluginsSourceParams{workspace_id:workspace.clone(),upload_id:upload_id.clone(),target:None}).map(|preview|UploadCompletion::PluginPreviewed(upload_id,preview)),None=>Err(anyhow::anyhow!("gateway_not_connected")) },
                             UploadEffect::Apply{upload_id} if target == SkillUploadTarget::PluginInstall => match &bound { Some(bound) => crate::transport::ws::command_sender::plugins_preview(bound, pioneer_protocol::PluginsSourceParams { workspace_id: workspace.clone(), upload_id: upload_id.clone(), target: None }).and_then(|preview| crate::transport::ws::command_sender::plugins_install(bound, pioneer_protocol::PluginsInstallParams { workspace_id: workspace.clone(), upload_id, expected_fingerprint: preview.fingerprint })), None => Err(anyhow::anyhow!("gateway_not_connected")) }.map(UploadCompletion::PluginApplied),
                             UploadEffect::Apply{upload_id}=>match target {
-                                SkillUploadTarget::PluginInstall|SkillUploadTarget::PluginUpdatePreview {..}=>unreachable!("plugin upload handled above"),
+                                SkillUploadTarget::PluginInstall|SkillUploadTarget::PluginPreview|SkillUploadTarget::PluginUpdatePreview {..}=>unreachable!("plugin upload handled above"),
                                 SkillUploadTarget::Install=>match kind {SkillUploadSourceKind::Skill=>sender.skills_install(super::actions::skills_install_uploaded_archive_params(&workspace,upload_id)).map(|_|()),SkillUploadSourceKind::Plugin=>unreachable!("plugin source uses plugin target"),SkillUploadSourceKind::Pack=>sender.skills_pack_install(super::actions::skills_pack_install_uploaded_archive_params(&workspace,upload_id)).map(|_|())},
-                                SkillUploadTarget::Update{skill_id}=>sender.skills_update(super::actions::skills_update_uploaded_archive_params(&workspace,skill_id,upload_id,None)).map(|_|()),
+                                SkillUploadTarget::Update{skill_id}=>{
+                                    let params=super::actions::skills_update_uploaded_archive_params(&workspace,skill_id,upload_id,None);
+                                    if connection_bound {match &bound {Some(bound)=>crate::transport::ws::command_sender::skills_update(bound,params),None=>Err(anyhow::anyhow!("gateway_not_connected"))}}else{sender.skills_update(params)}.map(|_|())
+                                },
                                 SkillUploadTarget::UpdatePack{pack_id}=>sender.skills_pack_update(super::actions::skills_pack_update_uploaded_archive_params(&workspace,pack_id,upload_id)).map(|_|()),
                             }.map(|_|UploadCompletion::Applied),
                         };if let Some(core)=weak.upgrade(){core.complete_skill_upload_effect(&workspace,operation,effect_generation,result);}
@@ -713,17 +816,32 @@ fn prepare_archive_effect(
     path: PathBuf,
 ) -> anyhow::Result<(SkillUploadSourceKind, SkillUploadArchive)> {
     let kind = match target {
-        SkillUploadTarget::PluginInstall | SkillUploadTarget::PluginUpdatePreview { .. } => {
-            SkillUploadSourceKind::Plugin
-        }
+        SkillUploadTarget::PluginInstall
+        | SkillUploadTarget::PluginPreview
+        | SkillUploadTarget::PluginUpdatePreview { .. } => SkillUploadSourceKind::Plugin,
         SkillUploadTarget::Install => classify_skill_upload_source(&path)?,
         SkillUploadTarget::Update { .. } => SkillUploadSourceKind::Skill,
         SkillUploadTarget::UpdatePack { .. } => SkillUploadSourceKind::Pack,
     };
-    let archive = match kind {
-        SkillUploadSourceKind::Plugin => build_plugin_upload_archive(&path)?,
-        SkillUploadSourceKind::Skill => build_skill_upload_archive(&path)?,
-        SkillUploadSourceKind::Pack => build_skill_pack_upload_archive(&path)?,
+    // A phone can supply a cache file, not a directory. Preserve archive bytes
+    // and defer extraction/security/modes to the same Gateway native installer.
+    let archive = if kind != SkillUploadSourceKind::Plugin && path.is_file() {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        anyhow::ensure!(
+            name.ends_with(".tar.gz") || name.ends_with(".tgz"),
+            "skill_archive_required"
+        );
+        build_plugin_upload_archive(&path)? // Existing bounded opaque archive reader.
+    } else {
+        match kind {
+            SkillUploadSourceKind::Plugin => build_plugin_upload_archive(&path)?,
+            SkillUploadSourceKind::Skill => build_skill_upload_archive(&path)?,
+            SkillUploadSourceKind::Pack => build_skill_pack_upload_archive(&path)?,
+        }
     };
     Ok((kind, archive))
 }
@@ -790,6 +908,57 @@ mod tests {
                 .unwrap()
         ));
     }
+    // NOT_RUN / NOT_COMPILED: phone archives must bind the existing uploader.
+    #[test]
+    fn native_plugin_preview_retains_origin_binding_and_never_auto_installs() {
+        let (core, receiver) = fixture();
+        let connection = core.provider_runtime_epoch().2.unwrap();
+        let operation = core
+            .start_skill_upload_bound(
+                "workspace",
+                SkillUploadTarget::PluginPreview,
+                PathBuf::from("unused-phone-cache.zip"),
+                Some(connection),
+            )
+            .unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(Work::Prepare { .. })));
+        core.complete_skill_preparation(
+            "workspace",
+            operation.id(),
+            Ok((
+                SkillUploadSourceKind::Plugin,
+                SkillUploadArchive {
+                    file_name: "plugin.zip".into(),
+                    bytes: vec![1],
+                    sha256: "digest".into(),
+                    uncompressed_size_bytes: 1,
+                },
+            )),
+        );
+        assert!(matches!(
+            core.next_skill_upload_effect("workspace", operation.id()),
+            Some((
+                UploadEffect::Start(_),
+                SkillUploadTarget::PluginPreview,
+                SkillUploadSourceKind::Plugin,
+                1,
+                true
+            ))
+        ));
+        assert_eq!(
+            core.skill_upload_connection("workspace", operation.id()),
+            Some(connection)
+        );
+        assert!(
+            core.start_skill_upload_bound(
+                "workspace",
+                SkillUploadTarget::PluginPreview,
+                PathBuf::from("unused-phone-cache.zip"),
+                Some(connection + 1)
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn upload_progress_is_operation_only_and_drop_cancels_late_ack() {
         let (core, receiver) = fixture();
@@ -817,7 +986,7 @@ mod tests {
         );
         assert!(matches!(
             core.next_skill_upload_effect("workspace", operation.id()),
-            Some((UploadEffect::Start(_), _, _, _))
+            Some((UploadEffect::Start(_), _, _, _, false))
         ));
         core.complete_skill_upload_effect(
             "workspace",
@@ -836,7 +1005,7 @@ mod tests {
         );
         assert!(matches!(
             core.next_skill_upload_effect("workspace", operation.id()),
-            Some((UploadEffect::Chunk { offset: 0, .. }, _, _, _))
+            Some((UploadEffect::Chunk { offset: 0, .. }, _, _, _, false))
         ));
         core.complete_skill_upload_effect(
             "workspace",
@@ -909,7 +1078,7 @@ mod tests {
             )),
         );
         assert!(
-            matches!(core.next_skill_upload_effect("workspace",op),Some((UploadEffect::Start(_),SkillUploadTarget::Update{skill_id},_,1)) if skill_id==id)
+            matches!(core.next_skill_upload_effect("workspace",op),Some((UploadEffect::Start(_),SkillUploadTarget::Update{skill_id},_,1,false)) if skill_id==id)
         );
         core.complete_skill_upload_effect(
             "workspace",
@@ -928,7 +1097,7 @@ mod tests {
         );
         for (offset, ticket) in [(0, 2), (1, 3)] {
             assert!(
-                matches!(core.next_skill_upload_effect("workspace",op),Some((UploadEffect::Chunk{offset:actual,..},_,_,generation)) if actual==offset&&generation==ticket)
+                matches!(core.next_skill_upload_effect("workspace",op),Some((UploadEffect::Chunk{offset:actual,..},_,_,generation,false)) if actual==offset&&generation==ticket)
             );
             let current = core.skill_upload_snapshot("workspace", op).unwrap();
             core.complete_skill_upload_effect(
@@ -958,7 +1127,7 @@ mod tests {
         }
         assert!(matches!(
             core.next_skill_upload_effect("workspace", op),
-            Some((UploadEffect::Finish(_), _, _, 4))
+            Some((UploadEffect::Finish(_), _, _, 4, false))
         ));
         core.complete_skill_upload_effect(
             "workspace",
@@ -979,7 +1148,8 @@ mod tests {
                 UploadEffect::Apply { .. },
                 SkillUploadTarget::Update { .. },
                 _,
-                5
+                5,
+                false
             ))
         ));
         core.complete_skill_upload_effect("workspace", op, 5, Ok(UploadCompletion::Applied));

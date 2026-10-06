@@ -5,6 +5,9 @@ use std::{
     sync::{Arc, mpsc},
 };
 
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum McpIntent {
     RetryAuthorizationBrowser {
         server_id: String,
@@ -358,6 +361,7 @@ impl ClientCore {
         if refresh_cleanup {
             self.refresh_mcp(&work.workspace);
         }
+        self.refresh_plugin_publication(&work.workspace);
     }
     fn complete_mcp_configuration(
         &self,
@@ -457,6 +461,7 @@ impl ClientCore {
         if refresh {
             self.refresh_mcp(&work.workspace);
         }
+        self.refresh_plugin_publication(&work.workspace);
     }
     pub(crate) fn invalidate_mcp_operations(&self) {
         let mut owner = self.mcp_controller.lock().expect("MCP controller poisoned");
@@ -494,10 +499,14 @@ impl ClientCore {
                         Ok(None)
                     };
                     drop(core);
+                    let bound = sender.requests_for_connection(
+                        work.epoch.2.expect("admitted MCP action has a connection"),
+                    );
                     if let McpIntent::Configure { config_json } = &work.intent {
                         let params =
                             configuration_params(&work.workspace, config_json, oauth_redirect);
-                        let result = sender.mcp_install(params);
+                        let result =
+                            crate::transport::ws::command_sender::mcp_install(&bound, params);
                         if let Some(core) = weak.upgrade() {
                             core.complete_mcp_configuration(work, result);
                         }
@@ -559,26 +568,33 @@ impl ClientCore {
                             enabled,
                             allow_implicit_invocation,
                             ..
-                        } => sender
-                            .mcp_policy_set(super::actions::mcp_policy_set_params(
+                        } => crate::transport::ws::command_sender::mcp_policy_set(
+                            &bound,
+                            super::actions::mcp_policy_set_params(
                                 &work.workspace,
                                 &work.name,
                                 *enabled,
                                 *allow_implicit_invocation,
-                            ))
-                            .map(|_| ()),
-                        McpIntent::Restart { .. } => sender
-                            .mcp_server_restart(super::actions::mcp_server_restart_params(
-                                &work.workspace,
-                                &work.name,
-                            ))
-                            .map(|_| ()),
-                        McpIntent::Remove { .. } => sender
-                            .mcp_uninstall(super::actions::mcp_uninstall_params(
-                                &work.workspace,
-                                &work.name,
-                            ))
-                            .map(|_| ()),
+                            ),
+                        )
+                        .map(|_| ()),
+                        McpIntent::Restart { .. } => {
+                            crate::transport::ws::command_sender::mcp_server_restart(
+                                &bound,
+                                super::actions::mcp_server_restart_params(
+                                    &work.workspace,
+                                    &work.name,
+                                ),
+                            )
+                            .map(|_| ())
+                        }
+                        McpIntent::Remove { .. } => {
+                            crate::transport::ws::command_sender::mcp_uninstall(
+                                &bound,
+                                super::actions::mcp_uninstall_params(&work.workspace, &work.name),
+                            )
+                            .map(|_| ())
+                        }
                         McpIntent::Configure { .. } => {
                             unreachable!("configuration uses typed validation completion")
                         }

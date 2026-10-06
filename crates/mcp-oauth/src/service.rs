@@ -269,9 +269,10 @@ fn resource(installation: &McpServerInstallation) -> Result<&str, AuthError> {
 }
 fn valid_redirect(value: &str) -> bool {
     Url::parse(value).is_ok_and(|u| {
-        u.scheme() == "http"
-            && u.host_str() == Some("127.0.0.1")
-            && u.port().is_some()
+        ((u.scheme() == "http" && u.host_str() == Some("127.0.0.1") && u.port().is_some())
+            // The native app owns these fixed callback schemes/routes. Remote
+            // HTTP and arbitrary custom redirects remain rejected.
+            || (matches!(u.scheme(), "pioneer" | "pioneer-dev") && u.host_str().is_none() && u.port().is_none()))
             && u.path() == "/oauth/mcp/callback"
             && u.query().is_none()
             && u.fragment().is_none()
@@ -603,7 +604,7 @@ impl McpOAuthService {
         }
         if !preparation_failed && !valid_redirect(redirect) {
             return Err(McpRuntimeError::failed(
-                "Invalid OAuth loopback redirect URI",
+                "Invalid OAuth callback redirect URI",
             ));
         }
         let entry = self
@@ -2732,5 +2733,31 @@ impl McpOAuthProvider for McpOAuthService {
             insufficient_scope,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod native_redirect_regressions {
+    // NOT_RUN / NOT_COMPILED. Preserve desktop loopback and constrain phone URI.
+    #[test]
+    fn only_known_native_routes_or_existing_loopback_are_admitted() {
+        for uri in [
+            "http://127.0.0.1:23456/oauth/mcp/callback",
+            "pioneer:///oauth/mcp/callback",
+            "pioneer-dev:///oauth/mcp/callback",
+        ] {
+            assert!(super::valid_redirect(uri), "{uri}");
+        }
+        for uri in [
+            "https://example.com/oauth/mcp/callback",
+            "pioneer://foreign/oauth/mcp/callback",
+            "other:///oauth/mcp/callback",
+            "pioneer:///other",
+            "pioneer:///oauth/mcp/callback?state=x",
+            "pioneer:///oauth/mcp/callback#x",
+            "http://localhost:123/oauth/mcp/callback",
+        ] {
+            assert!(!super::valid_redirect(uri), "{uri}");
+        }
     }
 }

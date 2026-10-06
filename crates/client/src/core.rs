@@ -215,6 +215,9 @@ pub enum ClientScope {
         workspace_id: String,
         target: String,
     },
+    Plugins {
+        workspace_id: String,
+    },
     SkillsUpload {
         workspace_id: String,
         operation_id: u64,
@@ -261,6 +264,11 @@ pub enum ClientDemand {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientIntent {
+    Plugins {
+        workspace_id: String,
+        connection_id: Option<u64>,
+        intent: crate::plugins::runtime::PluginIntent,
+    },
     SessionDemand {
         demand: crate::gateway::session_driver::SessionDemand,
     },
@@ -964,6 +972,7 @@ pub struct ClientCore {
     pub(crate) settings_runtime: Mutex<crate::settings::runtime::SettingsRuntime>,
     pub(crate) agents_documents: Mutex<crate::agents_doc::runtime::DocumentRuntime>,
     pub(crate) plugin_catalog_changes: tokio::sync::watch::Sender<u64>,
+    pub(crate) plugins_controller: Mutex<crate::plugins::runtime::PluginController>,
     pub(crate) skills_controller: Mutex<crate::skills::operations::SkillsController>,
     pub(crate) skills_store: Mutex<crate::skills::store::SkillsStore>,
     pub(crate) mcp_controller: Mutex<crate::mcp::operations::McpController>,
@@ -1183,6 +1192,7 @@ impl ClientCore {
     pub fn new() -> Self {
         Self {
             plugin_catalog_changes: tokio::sync::watch::channel(0).0,
+            plugins_controller: Mutex::default(),
             skills_controller: Mutex::new(crate::skills::operations::SkillsController::default()),
             agents_documents: Mutex::new(Default::default()),
             onboarding: Mutex::new(Default::default()),
@@ -1543,6 +1553,10 @@ impl ClientCore {
             .lock()
             .expect("settings owner poisoned")
             .stop();
+        self.plugins_controller
+            .lock()
+            .expect("plugins poisoned")
+            .stop();
         self.skills_controller
             .lock()
             .expect("Skills controller poisoned")
@@ -1743,23 +1757,37 @@ impl ClientCore {
                 self.plugin_catalog_changes
                     .send_modify(|revision| *revision = revision.saturating_add(1));
             }
-            if matches!(
-                notification,
-                pioneer_protocol::GatewayNotification::PluginsChanged(_)
-            ) {
+            if let pioneer_protocol::GatewayNotification::PluginsChanged(event) = notification {
+                self.refresh_plugin_publication(&event.workspace_id);
                 return None;
             }
             self.observe_administration_notification(notification);
             self.observe_provider_runtime_notification(notification);
             if self.observe_mcp_oauth_notification(notification) {
+                if let pioneer_protocol::GatewayNotification::McpOAuthChanged(event) = notification
+                {
+                    self.refresh_plugin_publication(&event.workspace_id);
+                }
                 return None;
             }
             if self.observe_mcp_notification(notification) {
+                let workspace = match notification {
+                    pioneer_protocol::GatewayNotification::McpChanged(event) => &event.workspace_id,
+                    pioneer_protocol::GatewayNotification::McpServerStatusChanged(event) => {
+                        &event.workspace_id
+                    }
+                    pioneer_protocol::GatewayNotification::McpServerCatalogChanged(event) => {
+                        &event.workspace_id
+                    }
+                    _ => unreachable!("handled MCP notification"),
+                };
+                self.refresh_plugin_publication(workspace);
                 return None;
             }
             if let pioneer_protocol::GatewayNotification::SkillsChanged(notification) = notification
             {
                 self.refresh_skills(&notification.workspace_id);
+                self.refresh_plugin_publication(&notification.workspace_id);
                 return None;
             }
             self.observe_composer_voice_notification(notification);
@@ -1828,6 +1856,7 @@ impl ClientCore {
         core.start_settings_controller();
         core.start_settings_model_picker_controller();
         core.start_onboarding_controller();
+        core.start_plugins_controller();
         core.start_skills_controller();
         core.start_skills_operation_controller();
         core.start_provider_operation_controller();
@@ -2149,6 +2178,17 @@ impl ClientCore {
             ClientIntent::ComposerModelPicker { intent } => {
                 return self.composer_model_picker_intent(intent.clone());
             }
+            ClientIntent::Plugins {
+                workspace_id,
+                connection_id,
+                intent,
+            } => {
+                return if self.current_auth_ticket().1 == *connection_id {
+                    self.plugin_intent(workspace_id, intent.clone())
+                } else {
+                    self.reject_intent()
+                };
+            }
             ClientIntent::ComposerCatalog { intent } => {
                 return self.composer_catalog_intent(intent.clone());
             }
@@ -2260,6 +2300,7 @@ impl ClientCore {
             self.message_revision_demand_changed(&thread_scope, thread_demand);
             self.message_deletion_demand_changed(&thread_scope, thread_demand);
             self.composer_catalog_demand_changed(&thread_scope, thread_demand);
+            self.plugin_demand_changed(&thread_scope, thread_demand);
             self.mcp_binding_demand_changed(&thread_scope, thread_demand);
             self.skills_binding_demand_changed(&thread_scope, thread_demand);
             self.document_demand_changed(&thread_scope, thread_demand);
@@ -2740,6 +2781,7 @@ impl ClientCore {
             self.fence_mcp_oauth();
             self.invalidate_skills();
             self.invalidate_skills_operations();
+            self.invalidate_plugin_publications();
             self.invalidate_provider_operations();
             self.cancel_artifact_downloads(None);
             self.cancel_composer_requests();

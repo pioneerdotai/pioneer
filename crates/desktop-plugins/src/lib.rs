@@ -319,7 +319,8 @@ impl PluginsView {
                     {
                         view.install_failed = publication.state == SkillUploadState::Failed;
                         if let Some(preview) = &publication.plugin_update_preview {
-                            view.update_preview = Some(preview.clone());
+                            view.update_preview =
+                                Some((preview.upload_id.clone(), preview.preview.clone()));
                         }
                         if let Some(item) = &publication.plugin_result {
                             view.selected = Some(item.id.clone());

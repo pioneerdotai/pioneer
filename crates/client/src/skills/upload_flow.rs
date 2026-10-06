@@ -20,11 +20,26 @@ impl SkillUploadState {
         matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
     }
 }
+// Named DTOs are consumed by both desktop upload state and mobile generated
+// contracts. Their wire shape is generated directly (no tuple-schema override).
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct PluginPreviewPublication {
+    pub upload_id: String,
+    pub package: PluginsPreviewResponse,
+}
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct PluginUpdatePreviewPublication {
+    pub upload_id: String,
+    pub preview: PluginsUpdatePreviewResponse,
+}
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SkillUploadPublication {
+    pub plugin_preview: Option<PluginPreviewPublication>,
     pub plugin_result: Option<PluginItem>,
-    pub plugin_update_preview: Option<(String, PluginsUpdatePreviewResponse)>,
+    pub plugin_update_preview: Option<PluginUpdatePreviewPublication>,
     pub operation_id: u64,
     pub generation: u64,
     pub revision: u64,
@@ -52,6 +67,7 @@ pub(crate) enum UploadCompletion {
     Finish(SkillsUploadFinishResponse),
     Applied,
     PluginApplied(PluginItem),
+    PluginPreviewed(String, PluginsPreviewResponse),
     PluginUpdatePreviewed(String, PluginsUpdatePreviewResponse),
 }
 pub(crate) struct SkillUploadFlow {
@@ -69,6 +85,7 @@ impl SkillUploadFlow {
     pub fn new(operation: u64, workspace: String) -> Self {
         Self {
             publication: SkillUploadPublication {
+                plugin_preview: None,
                 plugin_result: None,
                 plugin_update_preview: None,
                 operation_id: operation,
@@ -180,7 +197,8 @@ impl SkillUploadFlow {
             (
                 UploadCompletion::Applied
                 | UploadCompletion::PluginApplied(_)
-                | UploadCompletion::PluginUpdatePreviewed(_, _),
+                | UploadCompletion::PluginUpdatePreviewed(_, _)
+                | UploadCompletion::PluginPreviewed(_, _),
                 SkillUploadState::Applying,
             ) => true,
             _ => return false,
@@ -217,13 +235,22 @@ impl SkillUploadFlow {
             UploadCompletion::Finish(_) => {
                 self.publication.state = SkillUploadState::Applying;
             }
+            UploadCompletion::PluginPreviewed(upload_id, preview) => {
+                self.publication.plugin_preview = Some(PluginPreviewPublication {
+                    upload_id,
+                    package: preview,
+                });
+                self.terminate(SkillUploadState::Succeeded);
+                self.cleanup_upload = None;
+            }
             UploadCompletion::PluginApplied(item) => {
                 self.publication.plugin_result = Some(item);
                 self.terminate(SkillUploadState::Succeeded);
                 self.cleanup_upload = None;
             }
             UploadCompletion::PluginUpdatePreviewed(upload_id, preview) => {
-                self.publication.plugin_update_preview = Some((upload_id, preview));
+                self.publication.plugin_update_preview =
+                    Some(PluginUpdatePreviewPublication { upload_id, preview });
                 self.terminate(SkillUploadState::Succeeded);
                 self.cleanup_upload = None; // Finalized upload is retained for explicit confirmation/expiry.
             }
@@ -365,5 +392,47 @@ mod tests {
         assert!(!f.complete(1, start()));
         assert!(f.effect().is_none());
         assert!(f.archive.is_none());
+    }
+}
+
+#[cfg(test)]
+mod plugin_preview_regressions {
+    use super::*;
+    // NOT_RUN / NOT_COMPILED. A preview completes delivery, never installation.
+    #[test]
+    fn explicit_preview_retains_only_finalized_upload_for_confirmation() {
+        let mut flow = SkillUploadFlow::new(1, "workspace".into());
+        assert!(flow.prepare(SkillUploadArchive {
+            file_name: "mixed.zip".into(),
+            bytes: vec![1, 2, 3],
+            sha256: "digest".into(),
+            uncompressed_size_bytes: 0
+        }));
+        flow.publication.state = SkillUploadState::Applying;
+        flow.upload_id = Some("finalized".into());
+        let _ = flow.effect().unwrap();
+        let generation = flow.effect_generation();
+        assert!(flow.complete(
+            generation,
+            UploadCompletion::PluginPreviewed(
+                "finalized".into(),
+                PluginsPreviewResponse {
+                    name: "mixed".into(),
+                    version: None,
+                    fingerprint: "fingerprint".into(),
+                    components: vec![],
+                    diagnostics: vec![]
+                }
+            )
+        ));
+        assert_eq!(flow.publication.state, SkillUploadState::Succeeded);
+        assert!(flow.publication.plugin_result.is_none());
+        assert_eq!(
+            flow.publication.plugin_preview.as_ref().unwrap().upload_id,
+            "finalized"
+        );
+        assert!(flow.effect().is_none());
+        assert!(flow.take_cleanup().is_none());
+        assert!(!flow.complete(generation, UploadCompletion::Applied));
     }
 }

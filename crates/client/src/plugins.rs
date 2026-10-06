@@ -283,3 +283,137 @@ mod management_tests {
         assert!(state.begin());
     }
 }
+
+pub mod runtime;
+
+/// Parent-only presentation for immediate pickers. Selection retains its original
+/// revision even when catalog labels/revisions refresh. Desktop picker migration:
+/// use these rows in place of shell-local eligibility and selected-key checks.
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct PluginPickerRow {
+    pub plugin_id: String,
+    pub key: String,
+    pub label: String,
+    pub selected: bool,
+    pub selectable: bool,
+    pub stale: bool,
+}
+pub fn plugin_picker_rows(
+    current: &[ComposerCapability],
+    plugins: &[PluginItem],
+    query: &str,
+) -> Vec<PluginPickerRow> {
+    let query = query.trim().to_lowercase();
+    let mut rows:Vec<_>=plugins.iter().filter(|p|p.name.to_lowercase().contains(&query)).map(|p|{
+        let selected=current.iter().find(|c|matches!(&c.kind,ComposerCapabilityKind::Plugin{plugin_id,..} if plugin_id==&p.id));
+        PluginPickerRow{plugin_id:p.id.clone(),key:pioneer_protocol::plugin_capability_key(&p.id),label:p.name.clone(),selected:selected.is_some(),selectable:plugin_capability(p).is_some(),stale:selected.is_some_and(|c|matches!(c.kind,ComposerCapabilityKind::Plugin{expected_revision,..} if expected_revision!=p.revision))}
+    }).collect();
+    for c in current {
+        if let ComposerCapabilityKind::Plugin { plugin_id, .. } = &c.kind {
+            if !plugins.iter().any(|p| &p.id == plugin_id)
+                && c.label.to_lowercase().contains(&query)
+            {
+                rows.push(PluginPickerRow {
+                    plugin_id: plugin_id.clone(),
+                    key: c.id.clone(),
+                    label: c.label.clone(),
+                    selected: true,
+                    selectable: false,
+                    stale: true,
+                });
+            }
+        }
+    }
+    rows
+}
+// Parent selection has no client-provided expansion. Keep already selected
+// parents removable under unsupported providers; new selection uses the same
+// proven Skills/MCP target policy. Gateway checks actual expanded capabilities.
+pub(crate) fn plugin_picker_target_supported(
+    target: crate::composer::capabilities::ComposerCapabilityTarget,
+) -> bool {
+    let policy = target.policy();
+    policy.supports_skills && policy.supports_mcp_tools
+}
+impl crate::core::ClientCore {
+    pub fn composer_plugin_picker(
+        &self,
+        thread: &str,
+        draft: crate::composer::store::DraftId,
+        query: &str,
+    ) -> Vec<PluginPickerRow> {
+        let Some(input) = self
+            .composer_snapshot(thread)
+            .filter(|p| p.draft_id() == draft)
+        else {
+            return vec![];
+        };
+        let catalog = self.composer_catalog_snapshot(thread);
+        let mut rows = plugin_picker_rows(
+            &input.domain().capabilities,
+            catalog
+                .as_ref()
+                .filter(|p| p.draft_id == draft)
+                .map_or(&[], |p| p.plugins.as_slice()),
+            query,
+        );
+        if !plugin_picker_target_supported(input.domain().capability_target) {
+            for row in &mut rows {
+                row.selectable = false;
+            }
+        }
+        rows
+    }
+}
+
+#[cfg(test)]
+mod picker_regressions {
+    use super::*;
+    // NOT_RUN / NOT_COMPILED: parent projection never upgrades authority.
+    #[test]
+    fn parent_picker_requires_proven_combined_target_support() {
+        use crate::composer::capabilities::{ComposerCapabilityPolicy, ComposerCapabilityTarget};
+        assert!(plugin_picker_target_supported(
+            ComposerCapabilityTarget::native()
+        ));
+        for (skills, mcp) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert_eq!(
+                plugin_picker_target_supported(ComposerCapabilityTarget::cli(
+                    ComposerCapabilityPolicy::cli(skills, mcp)
+                )),
+                skills && mcp
+            );
+        }
+    }
+    #[test]
+    fn refreshed_catalog_keeps_selected_revision_and_unknown_parent_removable() {
+        let mut p = PluginItem {
+            id: "P".repeat(21),
+            name: "Mixed".into(),
+            version: None,
+            enabled: true,
+            state: "installed".into(),
+            revision: 7,
+            status: "partial".into(),
+            components: vec![],
+            diagnostics: vec![],
+        };
+        let selected = plugin_capability(&p).unwrap();
+        p.revision = 8;
+        let rows = plugin_picker_rows(&[selected.clone()], &[p.clone()], "");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].selected && rows[0].stale);
+        assert!(matches!(
+            selected.kind,
+            ComposerCapabilityKind::Plugin {
+                expected_revision: 7,
+                ..
+            }
+        ));
+        let unknown = plugin_picker_rows(&[selected], &[], "");
+        assert!(unknown[0].selected && unknown[0].stale && !unknown[0].selectable);
+        p.enabled = false;
+        assert!(!plugin_picker_rows(&[], &[p], "")[0].selectable);
+    }
+}

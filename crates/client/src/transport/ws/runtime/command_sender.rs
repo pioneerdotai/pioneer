@@ -1078,6 +1078,17 @@ impl GatewayWsCommandSender {
         offset: u64,
         chunk: Vec<u8>,
     ) -> Result<SkillsUploadChunkAckNotification> {
+        self.send_skill_upload_chunk_bound(None, workspace_id, upload_id, offset, chunk)
+    }
+    /// Fence binary delivery just like RPC delivery; None preserves legacy callers.
+    pub fn send_skill_upload_chunk_bound(
+        &self,
+        expected_connection: Option<u64>,
+        workspace_id: String,
+        upload_id: String,
+        offset: u64,
+        chunk: Vec<u8>,
+    ) -> Result<SkillsUploadChunkAckNotification> {
         let payload = crate::transport::ws::frames::encode_skill_upload_chunk_frame(
             workspace_id,
             upload_id.clone(),
@@ -1088,6 +1099,7 @@ impl GatewayWsCommandSender {
         let (response_tx, response_rx) = mpsc::channel();
         self.command_tx
             .send(GatewayWsCommand::BinaryUploadChunk {
+                expected_connection,
                 upload_id,
                 offset,
                 payload,

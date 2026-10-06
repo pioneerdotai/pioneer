@@ -42,6 +42,10 @@ pub fn internal_client_schema_exclusions() -> Vec<ClientSchemaInternalExclusion>
 pub fn client_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
         schema_doc!(
+            "plugin_publication.json",
+            crate::plugins::runtime::PluginPublication
+        ),
+        schema_doc!(
             "settings_model_picker_publication.json",
             crate::settings::model_picker::SettingsModelPickerPublication
         ),

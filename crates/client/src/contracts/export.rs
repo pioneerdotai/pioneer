@@ -183,6 +183,13 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "plugin_publication.json",
+            crate::plugins::runtime::PluginPublication,
+            Domain::Skills,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
+        contract_type!(
             "skill_upload_publication.json",
             crate::skills::upload_flow::SkillUploadPublication,
             Domain::Skills,
