@@ -1730,6 +1730,7 @@ fn openrouter_reasoning_capabilities(
     }
 
     Some(ProviderModelReasoningCapabilities {
+        native: Default::default(),
         supported: Some(true),
         effort_options,
         default_effort,

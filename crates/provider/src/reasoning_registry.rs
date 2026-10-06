@@ -182,7 +182,7 @@ pub const REASONING_MODEL_RULES: &[ReasoningModelRule] = &[
         effort_options: GEMINI_THINKING_LOW_TO_HIGH,
         default_effort: Some("high"),
         mandatory: None,
-        source_url: "https://ai.google.dev/gemini-api/docs/thinking",
+        source_url: "https://ai.google.dev/gemini-api/docs/generate-content/thinking",
     },
     ReasoningModelRule {
         provider: "gemini",
@@ -191,7 +191,7 @@ pub const REASONING_MODEL_RULES: &[ReasoningModelRule] = &[
         effort_options: GEMINI_THINKING_MINIMAL_TO_HIGH,
         default_effort: Some("high"),
         mandatory: None,
-        source_url: "https://ai.google.dev/gemini-api/docs/thinking",
+        source_url: "https://ai.google.dev/gemini-api/docs/generate-content/thinking",
     },
     ReasoningModelRule {
         provider: "gemini",
@@ -200,7 +200,7 @@ pub const REASONING_MODEL_RULES: &[ReasoningModelRule] = &[
         effort_options: GEMINI_THINKING_LOW_HIGH,
         default_effort: Some("high"),
         mandatory: None,
-        source_url: "https://ai.google.dev/gemini-api/docs/thinking",
+        source_url: "https://ai.google.dev/gemini-api/docs/generate-content/thinking",
     },
     ReasoningModelRule {
         provider: "gemini",
@@ -244,7 +244,163 @@ pub fn reasoning_capabilities_for_model(
     provider: &str,
     model_id: &str,
 ) -> Option<ProviderModelReasoningCapabilities> {
-    reasoning_capabilities_for_model_with_rules(REASONING_MODEL_RULES, provider, model_id)
+    documented_native_profile(provider, model_id).or_else(|| {
+        reasoning_capabilities_for_model_with_rules(REASONING_MODEL_RULES, provider, model_id)
+    })
+}
+
+// Bounded identities shared with the native builders; original model IDs are
+// never rewritten. These are protocol fallbacks, not a model/limit catalog.
+// https://platform.claude.com/docs/en/build-with-claude/effort
+// https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-adaptive-thinking.html
+// https://ai.google.dev/gemini-api/docs/generate-content/thinking
+fn documented_native_profile(
+    provider: &str,
+    model_id: &str,
+) -> Option<ProviderModelReasoningCapabilities> {
+    let (efforts, default, mandatory) = if matches!(provider, "anthropic" | "bedrock") {
+        let id = crate::generation::claude_id(provider, model_id)?.replace('.', "-");
+        let family = [
+            "claude-opus-4-5",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-mythos-5",
+            "claude-mythos-5-1",
+            "claude-mythos-preview",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+        ]
+        .into_iter()
+        .find(|f| crate::generation::claude_family(&id, f))?;
+        let efforts = if provider == "bedrock" {
+            match family {
+                "claude-opus-4-8" => return None,
+                "claude-opus-4-6" if id == "claude-opus-4-6-v1" => {
+                    ANTHROPIC_EFFORTS_LOW_TO_XHIGH_MAX
+                }
+                "claude-opus-5" => ANTHROPIC_EFFORTS_LOW_TO_XHIGH_MAX,
+                "claude-sonnet-4-6" => ANTHROPIC_EFFORTS_LOW_TO_MAX,
+                _ => ANTHROPIC_EFFORTS_LOW_TO_HIGH,
+            }
+        } else {
+            match family {
+                "claude-opus-4-5" => ANTHROPIC_EFFORTS_LOW_TO_HIGH,
+                "claude-opus-4-6" | "claude-sonnet-4-6" | "claude-mythos-preview" => {
+                    ANTHROPIC_EFFORTS_LOW_TO_MAX
+                }
+                _ => ANTHROPIC_EFFORTS_LOW_TO_XHIGH_MAX,
+            }
+        };
+        (
+            efforts,
+            if provider == "anthropic" && family == "claude-opus-5-5" {
+                "medium"
+            } else {
+                "high"
+            },
+            Some(crate::generation::protocol_mandatory(provider, model_id)),
+        )
+    } else if provider == "gemini" {
+        let id = model_id.strip_suffix("-preview").unwrap_or(model_id);
+        let (efforts, default) = match id {
+            "gemini-3.1-pro" | "gemini-3.1-pro-preview-customtools" => {
+                (GEMINI_THINKING_LOW_TO_HIGH, "high")
+            }
+            "gemini-3-pro" => (GEMINI_THINKING_LOW_HIGH, "high"),
+            "gemini-3.7-flash" | "gemini-3.8-flash" => (GEMINI_THINKING_LOW_TO_HIGH, "medium"),
+            "gemini-3.5-flash" | "gemini-3.6-flash" => (GEMINI_THINKING_MINIMAL_TO_HIGH, "medium"),
+            "gemini-3.1-flash-lite" | "gemini-3.5-flash-lite" => {
+                (GEMINI_THINKING_MINIMAL_TO_HIGH, "minimal")
+            }
+            "gemini-3.1-flash-lite-image" => (&["minimal", "high"][..], "minimal"),
+            "gemini-3-flash" => (GEMINI_THINKING_MINIMAL_TO_HIGH, "high"),
+            _ => return None,
+        };
+        (efforts, default, Some(true))
+    } else {
+        return None;
+    };
+    Some(ProviderModelReasoningCapabilities {
+        supported: Some(true),
+        effort_options: efforts.iter().map(|e| (*e).into()).collect(),
+        default_effort: Some(default.into()),
+        mandatory,
+        source: Some(ReasoningCapabilitySource::StaticRegistry),
+        ..Default::default()
+    })
+}
+
+/// Preserve native unknown/false/true for both aggregates and sublevels.
+pub(crate) fn read_native_supports(
+    value: &serde_json::Value,
+    prefix: &str,
+    facts: &mut std::collections::BTreeMap<String, Option<bool>>,
+) {
+    if value.is_null() {
+        facts.insert(format!("{prefix}.supported"), None);
+    }
+    if let Some(object) = value.as_object() {
+        for (key, value) in object {
+            if key == "supported" {
+                facts.insert(format!("{prefix}.supported"), value.as_bool());
+            } else if let Some(supported) = value.get("supported") {
+                facts.insert(format!("{prefix}.{key}"), supported.as_bool());
+            }
+        }
+    }
+}
+
+pub(crate) fn apply_native_reasoning(
+    capabilities: &mut ProviderModelCapabilities,
+    facts: std::collections::BTreeMap<String, Option<bool>>,
+) {
+    if facts.is_empty() {
+        return;
+    }
+    let had_fallback = capabilities.reasoning.is_some();
+    let mut reasoning = capabilities.reasoning.take().unwrap_or_default();
+    capabilities.thinking = facts
+        .get("thinking.supported")
+        .copied()
+        .flatten()
+        .or(capabilities.thinking);
+    for (key, value) in &facts {
+        let Some(level) = key
+            .strip_prefix("effort.")
+            .filter(|e| crate::ReasoningEffort::from_str(e).is_some())
+        else {
+            continue;
+        };
+        if let Some(supported) = value {
+            reasoning.effort_options.retain(|e| e != level);
+            if *supported {
+                reasoning.effort_options.push(level.into());
+            }
+        }
+    }
+    if facts.get("effort.supported") == Some(&Some(false)) {
+        reasoning.effort_options.retain(|e| e == "none");
+    }
+    if facts.get("thinking.supported") == Some(&Some(false))
+        && facts.get("effort.supported") == Some(&Some(false))
+    {
+        reasoning.supported = Some(false);
+    } else if facts.values().any(|v| *v == Some(true)) {
+        reasoning.supported = Some(true);
+    }
+    reasoning.source = Some(if had_fallback {
+        ReasoningCapabilitySource::Unknown
+    } else {
+        ReasoningCapabilitySource::ProviderMetadata
+    });
+    reasoning.native = facts;
+    capabilities.reasoning = Some(reasoning);
 }
 
 pub fn apply_reasoning_capabilities(
@@ -289,6 +445,7 @@ pub(crate) fn reasoning_capabilities_from_registry_rule(
     rule: &ReasoningModelRule,
 ) -> ProviderModelReasoningCapabilities {
     ProviderModelReasoningCapabilities {
+        native: Default::default(),
         supported: Some(rule.supported),
         effort_options: rule
             .effort_options

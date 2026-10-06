@@ -322,7 +322,14 @@ pub(super) fn apply(c: &mut Candidate) {
     }
     if matches!(api.as_str(), "google-generative-ai" | "google-vertex") {
         if gemini3(&lower, "-pro") {
-            c.thinking(json!({"off":null,"minimal":null,"low":"LOW","medium":null,"high":"HIGH"}));
+            let medium = if api == "google-generative-ai" && lower.starts_with("gemini-3.1-pro") {
+                json!("MEDIUM")
+            } else {
+                Value::Null
+            };
+            c.thinking(
+                json!({"off":null,"minimal":null,"low":"LOW","medium":medium,"high":"HIGH"}),
+            );
         }
         if gemini3(&lower, "-flash")
             || matches!(

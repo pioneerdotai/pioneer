@@ -411,6 +411,18 @@ mod tests {
         let mut expected: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json")).unwrap();
         expected["deepseek"] = deepseek["models"].clone();
+        // Preserve the old reader fixture while the generator fixes 3.1 Pro.
+        for models in expected.as_object_mut().unwrap().values_mut() {
+            for model in models.as_object_mut().unwrap().values_mut() {
+                if model["api"] == "google-generative-ai"
+                    && model["id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("gemini-3.1-pro"))
+                {
+                    model["thinkingLevelMap"]["medium"] = json!("MEDIUM");
+                }
+            }
+        }
         // Pioneer-only profiles augment the pinned Pi transformation; compare
         // every original provider in full, and cover additions separately.
         let mut actual: Value = Value::Object(

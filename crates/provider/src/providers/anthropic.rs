@@ -270,6 +270,8 @@ struct ModelsListResponse {
 struct AnthropicModelEntry {
     id: String,
     #[serde(default)]
+    capabilities: Option<serde_json::Value>,
+    #[serde(default)]
     display_name: Option<String>,
     #[serde(default)]
     created_at: Option<String>,
@@ -1313,6 +1315,19 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
     });
     let mut capabilities = ProviderModelCapabilities::default();
     reasoning_registry::apply_reasoning_capabilities("anthropic", m.id.as_str(), &mut capabilities);
+    if let Some(native) = m.capabilities.as_ref() {
+        let mut facts = std::collections::BTreeMap::new();
+        if let Some(effort) = native.get("effort") {
+            reasoning_registry::read_native_supports(effort, "effort", &mut facts);
+        }
+        if let Some(thinking) = native.get("thinking") {
+            reasoning_registry::read_native_supports(thinking, "thinking", &mut facts);
+            if let Some(types) = thinking.get("types") {
+                reasoning_registry::read_native_supports(types, "thinking.types", &mut facts);
+            }
+        }
+        reasoning_registry::apply_native_reasoning(&mut capabilities, facts);
+    }
 
     ProviderModelInfo {
         id: m.id.clone(),
@@ -1340,6 +1355,185 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn native_reasoning_facts_survive_enrichment_and_reach_both_messages_modes() {
+        for effort_support in [
+            serde_json::json!(true),
+            serde_json::json!(false),
+            serde_json::Value::Null,
+        ] {
+            for adaptive_support in [true, false] {
+                let entry: AnthropicModelEntry = serde_json::from_value(serde_json::json!({
+                    "id":"claude-opus-4-6", "capabilities": {
+                        "effort":{"supported":effort_support,"low":{"supported":true},"medium":{"supported":false},"high":{"supported":true}},
+                        "thinking":{"supported":true,"types":{"adaptive":{"supported":adaptive_support},"enabled":{"supported":null}}}
+                    }
+                })).unwrap();
+                let parsed = provider_model_from_anthropic_model_entry(entry);
+                let native = parsed
+                    .capabilities
+                    .reasoning
+                    .as_ref()
+                    .unwrap()
+                    .native
+                    .clone();
+                assert_eq!(native["thinking.types.enabled"], None);
+                assert_eq!(native["effort.supported"], effort_support.as_bool());
+                let conflict = crate::generation::test_catalog_model(
+                    "anthropic",
+                    "claude-opus-4-6",
+                    "claude-opus-4-6",
+                    serde_json::json!({"reasoning":false,"compat":{"supportsReasoningEffort":false},"thinkingLevelMap":{"low":null,"medium":"medium","high":null}}),
+                );
+                for catalog in [
+                    crate::generation::test_catalog(false),
+                    crate::generation::test_catalog(true),
+                    conflict,
+                ] {
+                    let mut models = vec![parsed.clone()];
+                    catalog.enrich("anthropic", &mut models);
+                    let r = models[0].capabilities.reasoning.as_ref().unwrap();
+                    assert_eq!(r.native, native);
+                    assert_eq!(models[0].capabilities.thinking, Some(true));
+                    assert!(!r.effort_options.contains(&"medium".into()));
+                    let allowed = effort_support != serde_json::json!(false) && adaptive_support;
+                    assert_eq!(r.effort_options.contains(&"low".into()), allowed);
+                    let mut request = crate::generation::test_request("claude-opus-4-6");
+                    for selected in [
+                        None,
+                        Some(ReasoningConfig::Effort(ReasoningEffort::Low)),
+                        Some(ReasoningConfig::Effort(ReasoningEffort::Medium)),
+                    ] {
+                        request.reasoning = selected;
+                        for stream in [false, true] {
+                            let body = crate::generation::with_native_reasoning(
+                                "anthropic",
+                                true,
+                                [(request.model.clone(), native.clone())]
+                                    .into_iter()
+                                    .collect(),
+                                async {
+                                    AnthropicProvider::build_chat_request_with_catalog(
+                                        &request,
+                                        None,
+                                        vec![],
+                                        stream,
+                                        Some(&catalog),
+                                    )
+                                },
+                            )
+                            .await;
+                            assert_eq!(
+                                body.is_ok(),
+                                selected.is_none()
+                                    || selected
+                                        == Some(ReasoningConfig::Effort(ReasoningEffort::Low))
+                                        && allowed
+                            );
+                            if let Ok(body) = body {
+                                let json = serde_json::to_value(body).unwrap();
+                                assert_eq!(json["max_tokens"], 1024);
+                                if selected.is_none() {
+                                    assert!(json.get("thinking").is_none());
+                                } else {
+                                    assert_eq!(json["thinking"]["type"], "adaptive");
+                                    assert_eq!(json["output_config"]["effort"], "low");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn documented_partial_and_missing_claude_maps_keep_base_controls_and_original_ids() {
+        for id in [
+            "claude-fable-5-1",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-opus-4-5-20251101",
+        ] {
+            let parsed = provider_model_from_anthropic_model_entry(
+                serde_json::from_value(serde_json::json!({"id":id})).unwrap(),
+            );
+            let partial = crate::generation::test_catalog_model(
+                "anthropic",
+                id,
+                "claude-opus-4-6",
+                serde_json::json!({"thinkingLevelMap":{"xhigh":"xhigh","max":"max"}}),
+            );
+            for catalog in [
+                crate::generation::test_catalog(false),
+                crate::generation::test_catalog(true),
+                partial,
+            ] {
+                let mut models = vec![parsed.clone()];
+                catalog.enrich("anthropic", &mut models);
+                assert_eq!(models[0].id, id);
+                let r = models[0].capabilities.reasoning.as_ref().unwrap();
+                for base in ["low", "medium", "high"] {
+                    assert!(r.effort_options.contains(&base.into()));
+                }
+                for effort in &r.effort_options {
+                    let mut request = crate::generation::test_request(id);
+                    request.reasoning = Some(ReasoningConfig::Effort(
+                        ReasoningEffort::from_str(effort).unwrap(),
+                    ));
+                    for stream in [false, true] {
+                        let json = serde_json::to_value(
+                            AnthropicProvider::build_chat_request_with_catalog(
+                                &request,
+                                None,
+                                vec![],
+                                stream,
+                                Some(&catalog),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(json["model"], id);
+                        assert_eq!(json["output_config"]["effort"], effort.as_str());
+                        assert_eq!(json["max_tokens"], 1024);
+                    }
+                }
+                if r.mandatory == Some(true) {
+                    for off in [
+                        ReasoningConfig::Disabled,
+                        ReasoningConfig::Effort(ReasoningEffort::None),
+                    ] {
+                        let mut request = crate::generation::test_request(id);
+                        request.reasoning = Some(off);
+                        for stream in [false, true] {
+                            assert!(
+                                AnthropicProvider::build_chat_request_with_catalog(
+                                    &request,
+                                    None,
+                                    vec![],
+                                    stream,
+                                    Some(&catalog)
+                                )
+                                .unwrap_err()
+                                .to_string()
+                                .contains("mandatory")
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Effort and thinking support are distinct: Opus 4.5 needs no thinking mode.
+        let parsed = provider_model_from_anthropic_model_entry(serde_json::from_value(serde_json::json!({"id":"claude-opus-4-5", "capabilities":{"effort":{"supported":true},"thinking":{"supported":false}}})).unwrap());
+        assert_eq!(parsed.capabilities.thinking, Some(false));
+        assert_eq!(
+            parsed.capabilities.reasoning.as_ref().unwrap().supported,
+            Some(true)
+        );
+    }
+
     #[test]
     fn direct_opus_46_vocabulary_is_not_expanded_by_aws_platform_rules() {
         for effort in [ReasoningEffort::XHigh, ReasoningEffort::Max] {

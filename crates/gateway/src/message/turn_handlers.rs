@@ -11023,6 +11023,7 @@ fn provider_model_from_runtime_model_for_reasoning_lookup(
         .supports_reasoning
         .or_else(|| (!model.effort_options.is_empty()).then_some(true));
     let reasoning = supports_reasoning.map(|supported| ProviderModelReasoningCapabilities {
+        native: Default::default(),
         supported: Some(supported),
         effort_options: model.effort_options.clone(),
         default_effort: None,
@@ -11564,6 +11565,7 @@ mod tests {
         effort_options: &[&str],
     ) -> ProviderModelReasoningCapabilities {
         ProviderModelReasoningCapabilities {
+            native: Default::default(),
             supported,
             effort_options: effort_options
                 .iter()

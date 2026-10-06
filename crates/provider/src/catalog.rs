@@ -230,6 +230,11 @@ impl ModelCatalog {
                 model.capabilities.tool_calling =
                     merge_tool_support(model.capabilities.tool_calling, source);
             }
+            enrich_reasoning(
+                provider,
+                model,
+                self.model(provider, &model.id).filter(|_| use_tool_sources),
+            );
             let Some(entry) = self.model(provider, &model.id) else {
                 continue;
             };
@@ -246,109 +251,180 @@ impl ModelCatalog {
             if model.name.is_none() {
                 model.name = Some(entry.name.clone());
             }
-            model.capabilities.thinking.get_or_insert(entry.reasoning);
-            // The same updateable map drives discovery and outgoing bodies.
-            // Requested keys are UI efforts; map values are vendor wire values.
-            let source_efforts = entry
-                .metadata
-                .get("sourceGeneration")
-                .and_then(|s| s["reasoningOptions"].as_array())
-                .map(|options| {
-                    options
-                        .iter()
-                        .filter(|o| o["type"] == "effort")
-                        .flat_map(|o| o["values"].as_array().into_iter().flatten())
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if entry.metadata.get("thinkingLevelMap").is_some() || !source_efforts.is_empty() {
-                let mut reasoning = model.capabilities.reasoning.clone().unwrap_or_default();
-                reasoning.supported = Some(entry.reasoning);
-                if !source_efforts.is_empty() {
-                    reasoning.effort_options = source_efforts;
-                }
-                if let Some(map) = entry
-                    .metadata
-                    .get("thinkingLevelMap")
-                    .and_then(Value::as_object)
-                {
-                    for (key, value) in map {
-                        let effort = if key == "off" { "none" } else { key };
-                        reasoning.effort_options.retain(|e| e != effort);
-                        if value.is_string() {
-                            reasoning.effort_options.push(effort.into());
-                        }
-                    }
-                    reasoning.mandatory = map.get("off").map(|value| value.is_null());
-                }
-                if entry
-                    .metadata
-                    .get("compat")
-                    .is_some_and(|c| c["supportsReasoningEffort"] == false)
-                {
-                    reasoning.effort_options.retain(|e| e == "none");
-                }
-                reasoning.source =
-                    Some(pioneer_protocol::ReasoningCapabilitySource::StaticRegistry);
-                if reasoning
-                    .default_effort
-                    .as_ref()
-                    .is_some_and(|default| !reasoning.effort_options.contains(default))
-                {
-                    reasoning.default_effort = None;
-                }
-                model.capabilities.reasoning = Some(reasoning);
-            }
-            if provider == "gemini" && model.id.starts_with("gemini-2.5-") {
-                // generateContent has budgets, not qualitative levels. There is
-                // no product effort-to-budget policy; do not advertise one.
-                let mut reasoning = model.capabilities.reasoning.clone().unwrap_or_default();
-                reasoning.supported = Some(entry.reasoning);
-                reasoning.effort_options.clear();
-                let supports_off = matches!(
-                    model.id.as_str(),
-                    "gemini-2.5-flash" | "gemini-2.5-flash-lite"
-                );
-                if supports_off {
-                    reasoning.effort_options.push("none".into());
-                }
-                reasoning.default_effort = None;
-                reasoning.mandatory = if supports_off {
-                    Some(false)
-                } else if model.id == "gemini-2.5-pro" {
-                    Some(true)
-                } else {
-                    None // an unknown variant needs its own documented off contract
-                };
-                reasoning.supports_token_budget = Some(false); // no numeric product control yet
-                model.capabilities.reasoning = Some(reasoning);
-            }
-            if let Some(reasoning) = model.capabilities.reasoning.as_mut() {
-                reasoning.effort_options.retain(|effort| {
-                    crate::types::ReasoningEffort::from_str(effort).is_some_and(|effort| {
-                        crate::generation::effort_supported(provider, entry, effort)
-                    })
-                });
-                if reasoning
-                    .default_effort
-                    .as_ref()
-                    .is_some_and(|effort| !reasoning.effort_options.contains(effort))
-                {
-                    reasoning.default_effort = None;
-                }
-                // Absence of an off option alone does not establish mandatory
-                // thinking (an unknown contract might support no controls).
-                if crate::generation::protocol_mandatory(provider, &entry.id) {
-                    reasoning.mandatory = Some(true);
-                }
-            }
             model
                 .capabilities
                 .input_modalities
                 .get_or_insert_with(|| entry.input.clone());
         }
+    }
+}
+
+/// Field priority: native facts > matching catalog keys > documented fallback.
+/// Actual adapter/mode restrictions always bound the result. A partial map
+/// overrides only present keys; omitted off cannot erase known mandatory.
+fn enrich_reasoning(provider: &str, model: &mut ProviderModelInfo, entry: Option<&CatalogModel>) {
+    use pioneer_protocol::ReasoningCapabilitySource as Source;
+    let fallback = crate::reasoning_registry::reasoning_capabilities_for_model(provider, &model.id);
+    let native = model
+        .capabilities
+        .reasoning
+        .as_ref()
+        .map(|r| r.native.clone())
+        .unwrap_or_default();
+    let entry = crate::generation::reasoning_model(provider, entry, &native);
+    if model.capabilities.reasoning.is_none()
+        && fallback.is_none()
+        && entry.as_ref().is_none_or(|e| {
+            !e.metadata.contains_key("thinkingLevelMap")
+                && e.metadata
+                    .get("sourceGeneration")
+                    .is_none_or(|s| s.get("reasoningOptions").is_none())
+        })
+    {
+        if let Some(entry) = entry {
+            model.capabilities.thinking.get_or_insert(entry.reasoning);
+        }
+        return;
+    }
+    let mut reasoning = model
+        .capabilities
+        .reasoning
+        .clone()
+        .or(fallback.clone())
+        .unwrap_or_default();
+    if let Some(fallback) = fallback {
+        for effort in fallback.effort_options {
+            if !reasoning.effort_options.contains(&effort) {
+                reasoning.effort_options.push(effort);
+            }
+        }
+        reasoning.default_effort = reasoning.default_effort.or(fallback.default_effort);
+        reasoning.mandatory = reasoning.mandatory.or(fallback.mandatory);
+        reasoning.supported = reasoning.supported.or(fallback.supported);
+    }
+    if let Some(entry) = entry.as_ref() {
+        reasoning.supported = Some(entry.reasoning);
+        model.capabilities.thinking = native
+            .get("thinking.supported")
+            .copied()
+            .flatten()
+            // Keep the pre-existing discovery bool for adapters outside the
+            // native profiles changed here (for example OpenRouter).
+            .or_else(|| {
+                (!matches!(provider, "anthropic" | "gemini" | "bedrock"))
+                    .then_some(model.capabilities.thinking)
+                    .flatten()
+            })
+            .or(Some(entry.reasoning));
+        let source_efforts = entry
+            .metadata
+            .get("sourceGeneration")
+            .and_then(|s| s["reasoningOptions"].as_array())
+            .map(|options| {
+                options
+                    .iter()
+                    .filter(|o| o["type"] == "effort")
+                    .flat_map(|o| o["values"].as_array().into_iter().flatten())
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !source_efforts.is_empty() {
+            reasoning.effort_options = source_efforts;
+        }
+        if let Some(map) = entry
+            .metadata
+            .get("thinkingLevelMap")
+            .and_then(Value::as_object)
+        {
+            for (key, value) in map {
+                let effort = if key == "off" { "none" } else { key };
+                reasoning.effort_options.retain(|e| e != effort);
+                if value.is_string() {
+                    reasoning.effort_options.push(effort.into());
+                }
+            }
+            if let Some(off) = map.get("off") {
+                reasoning.mandatory = Some(off.is_null());
+            }
+        }
+        if entry
+            .metadata
+            .get("compat")
+            .is_some_and(|c| c["supportsReasoningEffort"] == false)
+        {
+            reasoning.effort_options.retain(|e| e == "none");
+        }
+        // Catalog/mixed fields do not originate in StaticRegistry.
+        reasoning.source = Some(Source::Unknown);
+    }
+    // Restore native sublevels after catalog replacement. Native thinking and
+    // effort support are independent; mode denials are checked by the mapper.
+    for (key, supported) in &native {
+        let Some(level) = key
+            .strip_prefix("effort.")
+            .filter(|e| crate::ReasoningEffort::from_str(e).is_some())
+        else {
+            continue;
+        };
+        if let Some(supported) = supported {
+            reasoning.effort_options.retain(|e| e != level);
+            if *supported {
+                reasoning.effort_options.push(level.into());
+            }
+        }
+    }
+    if native.get("effort.supported") == Some(&Some(false)) {
+        reasoning.effort_options.retain(|e| e == "none");
+    }
+    if provider == "gemini" && model.id.starts_with("gemini-2.5-") {
+        reasoning.effort_options.retain(|e| e == "none");
+        reasoning.default_effort = None;
+        reasoning.supports_token_budget = Some(false); // no numeric product control
+    }
+    reasoning.effort_options.retain(|e| {
+        crate::ReasoningEffort::from_str(e).is_some_and(|e| {
+            crate::generation::effort_supported_with_native(
+                provider,
+                &model.id,
+                entry.as_ref(),
+                e,
+                &native,
+            )
+        })
+    });
+    reasoning.effort_options.sort_by_key(|e| {
+        ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+            .iter()
+            .position(|v| *v == e)
+            .unwrap_or(usize::MAX)
+    });
+    reasoning.effort_options.dedup();
+    if reasoning
+        .default_effort
+        .as_ref()
+        .is_some_and(|e| !reasoning.effort_options.contains(e))
+    {
+        reasoning.default_effort = None;
+    }
+    if crate::generation::protocol_mandatory(provider, &model.id) {
+        reasoning.mandatory = Some(true);
+    }
+    if provider == "gemini" && native.get("thinking.supported") == Some(&Some(false))
+        || native.get("thinking.supported") == Some(&Some(false))
+            && native.get("effort.supported") == Some(&Some(false))
+    {
+        reasoning.supported = Some(false);
+    } else if native.values().any(|v| *v == Some(true)) {
+        reasoning.supported = Some(true);
+    }
+    if !native.is_empty() && reasoning.source == Some(Source::StaticRegistry) {
+        reasoning.source = Some(Source::Unknown);
+    }
+    // Unknown remains absent rather than advertising reasoning from an ID.
+    if reasoning != Default::default() {
+        model.capabilities.reasoning = Some(reasoning);
     }
 }
 

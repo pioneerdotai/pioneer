@@ -1224,6 +1224,91 @@ mod signing_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dated_and_regional_discovery_controls_match_actual_converse_platform_subset() {
+        for (id, expected) in [
+            (
+                "anthropic.claude-opus-4-5-20251101-v1:0",
+                vec!["low", "medium", "high"],
+            ),
+            (
+                "eu.anthropic.claude-opus-4-5-20251101-v1:0",
+                vec!["low", "medium", "high"],
+            ),
+            (
+                "anthropic.claude-opus-4-6-v1",
+                vec!["low", "medium", "high", "xhigh", "max"],
+            ),
+            (
+                "us.anthropic.claude-opus-4-6-v1",
+                vec!["low", "medium", "high", "xhigh", "max"],
+            ),
+            (
+                "anthropic.claude-sonnet-4-6",
+                vec!["low", "medium", "high", "max"],
+            ),
+            (
+                "anthropic.claude-opus-5",
+                vec!["low", "medium", "high", "xhigh", "max"],
+            ),
+        ] {
+            let parsed = provider_model_from_bedrock_model_summary(
+                serde_json::from_value(serde_json::json!({"modelId":id})).unwrap(),
+            );
+            let partial = crate::generation::test_catalog_model(
+                "bedrock",
+                id,
+                "anthropic.claude-opus-4-6-v1",
+                serde_json::json!({"thinkingLevelMap":{"off":null}}),
+            );
+            for catalog in [
+                crate::generation::test_catalog(false),
+                crate::generation::test_catalog(true),
+                partial,
+            ] {
+                let mut models = vec![parsed.clone()];
+                catalog.enrich("bedrock", &mut models);
+                assert_eq!(models[0].id, id);
+                let r = models[0].capabilities.reasoning.as_ref().unwrap();
+                assert_eq!(r.effort_options, expected);
+                let mut request = crate::generation::test_request(id);
+                let prepared = prepared_for(&request.messages);
+                for effort in &r.effort_options {
+                    request.reasoning = Some(ReasoningConfig::Effort(
+                        ReasoningEffort::from_str(effort).unwrap(),
+                    ));
+                    // Existing stream uses chat fallback and this same constructor.
+                    let body = serde_json::to_value(
+                        BedrockProvider::build_request_with_catalog(
+                            &request,
+                            &prepared,
+                            Some(&catalog),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        body["additionalModelRequestFields"]["output_config"]["effort"],
+                        effort.as_str()
+                    );
+                    assert_eq!(body["inferenceConfig"]["maxTokens"], 1024);
+                    if id.contains("4-5") {
+                        assert!(
+                            body["additionalModelRequestFields"]
+                                .get("thinking")
+                                .is_none()
+                        );
+                    } else {
+                        assert_eq!(
+                            body["additionalModelRequestFields"]["thinking"]["type"],
+                            "adaptive"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// A documented AWS platform vocabulary update, represented both as a
     /// saved catalog profile and as a fresh models.dev source update. Limits
     /// remain those of the pinned source; no second limits catalog is created.

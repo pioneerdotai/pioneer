@@ -175,6 +175,7 @@ struct AuthorityBoundProvider {
     revoked: Arc<AtomicBool>,
     redact_endpoint_errors: bool,
     discovery_tools: RwLock<BTreeMap<String, bool>>,
+    discovery_reasoning: RwLock<BTreeMap<String, crate::generation::NativeReasoning>>,
     use_public_catalog: bool,
 }
 
@@ -326,7 +327,27 @@ impl AuthorityBoundProvider {
             .iter()
             .filter_map(|m| m.capabilities.tool_calling.map(|v| (m.id.clone(), v)))
             .collect();
+        *self
+            .discovery_reasoning
+            .write()
+            .expect("discovery reasoning lock") = models
+            .iter()
+            .filter_map(|m| {
+                m.capabilities
+                    .reasoning
+                    .as_ref()
+                    .filter(|r| !r.native.is_empty())
+                    .map(|r| (m.id.clone(), r.native.clone()))
+            })
+            .collect();
         catalog.enrich_for_tool_scope(self.inner.name(), models, self.use_public_catalog);
+    }
+
+    fn discovery_reasoning_snapshot(&self) -> BTreeMap<String, crate::generation::NativeReasoning> {
+        self.discovery_reasoning
+            .read()
+            .expect("discovery reasoning lock")
+            .clone()
     }
 
     fn discovery_tool_snapshot(&self) -> BTreeMap<String, bool> {
@@ -402,7 +423,12 @@ impl Provider for AuthorityBoundProvider {
         self.public_result(
             crate::attachments::runtime::with_async_authority_scope(
                 self.authority_fingerprint.as_str().to_owned(),
-                self.inner.prepare_input_budget(request),
+                crate::generation::with_native_reasoning(
+                    self.name(),
+                    self.use_public_catalog,
+                    self.discovery_reasoning_snapshot(),
+                    self.inner.prepare_input_budget(request),
+                ),
             )
             .await,
         )
@@ -417,7 +443,12 @@ impl Provider for AuthorityBoundProvider {
                     self.name(),
                     self.use_public_catalog,
                     self.discovery_tool_snapshot(),
-                    self.inner.chat(request),
+                    crate::generation::with_native_reasoning(
+                        self.name(),
+                        self.use_public_catalog,
+                        self.discovery_reasoning_snapshot(),
+                        self.inner.chat(request),
+                    ),
                 ),
             )
             .await,
@@ -443,7 +474,12 @@ impl Provider for AuthorityBoundProvider {
                     self.name(),
                     self.use_public_catalog,
                     self.discovery_tool_snapshot(),
-                    self.inner.stream_chat_with_diagnostics(request),
+                    crate::generation::with_native_reasoning(
+                        self.name(),
+                        self.use_public_catalog,
+                        self.discovery_reasoning_snapshot(),
+                        self.inner.stream_chat_with_diagnostics(request),
+                    ),
                 ),
             )
             .await,
@@ -870,6 +906,7 @@ impl ProviderRegistry {
             redact_endpoint_errors: base_url.is_some(),
             use_public_catalog,
             discovery_tools: RwLock::new(BTreeMap::new()),
+            discovery_reasoning: RwLock::new(BTreeMap::new()),
         });
         if !cache.make_room_for_insert(self.limits.max_cached_instances) {
             return Err(ProviderRegistryCapacityExceeded {
@@ -996,6 +1033,7 @@ impl ProviderRegistry {
             redact_endpoint_errors: false,
             use_public_catalog,
             discovery_tools: RwLock::new(BTreeMap::new()),
+            discovery_reasoning: RwLock::new(BTreeMap::new()),
         });
         cache.prune_expired(now, self.limits.idle_ttl);
         if cache.make_room_for_insert(self.limits.max_cached_instances) {
@@ -1234,6 +1272,7 @@ mod tests {
             redact_endpoint_errors: false,
             use_public_catalog: false,
             discovery_tools: RwLock::new(BTreeMap::new()),
+            discovery_reasoning: RwLock::new(BTreeMap::new()),
         };
         let mut public = wrapper("public-authority");
         public.use_public_catalog = true;

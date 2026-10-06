@@ -77,6 +77,153 @@ pub(crate) fn chat_fields(provider: &str, request: &ChatRequest) -> Result<Field
     chat_fields_from_catalog(model_catalog().ok().as_deref(), provider, request)
 }
 
+// Models facts stay in the existing authority-bound provider instance. Scope
+// them only while preparing/sending that provider's request, never globally.
+pub(crate) type NativeReasoning = std::collections::BTreeMap<String, Option<bool>>;
+tokio::task_local! {
+    static NATIVE_REASONING: (String, bool, std::collections::BTreeMap<String, NativeReasoning>);
+}
+pub(crate) async fn with_native_reasoning<T>(
+    provider: &str,
+    public_catalog: bool,
+    models: std::collections::BTreeMap<String, NativeReasoning>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    NATIVE_REASONING
+        .scope((provider.into(), public_catalog, models), future)
+        .await
+}
+fn native_reasoning(provider: &str, model: &str) -> NativeReasoning {
+    NATIVE_REASONING
+        .try_with(|(owner, _, models)| {
+            if owner == provider {
+                models.get(model).cloned().unwrap_or_default()
+            } else {
+                Default::default()
+            }
+        })
+        .unwrap_or_default()
+}
+fn public_reasoning_catalog(provider: &str) -> bool {
+    NATIVE_REASONING
+        .try_with(|(owner, public, _)| owner != provider || *public)
+        .unwrap_or(true)
+}
+
+/// Native facts override matching catalog keys; documented fallback remains in
+/// the protocol mapper. Missing/null native facts cannot erase catalog facts.
+pub(crate) fn reasoning_model(
+    provider: &str,
+    entry: Option<&CatalogModel>,
+    native: &NativeReasoning,
+) -> Option<CatalogModel> {
+    let mut model = entry
+        .filter(|m| match provider {
+            "anthropic" => m.api == "anthropic-messages",
+            "gemini" => m.api == "google-generative-ai",
+            "bedrock" => matches!(
+                m.api.as_str(),
+                "bedrock-converse" | "bedrock-converse-stream"
+            ),
+            _ => true,
+        })
+        .cloned()?;
+    let id = model
+        .metadata
+        .get("sourceGeneration")
+        .and_then(|s| s["resolvedModelId"].as_str())
+        .unwrap_or(&model.id);
+    // The old snapshot wrongly inherited Gemini 3 Pro's medium veto. This
+    // correction applies only to 3.1 Pro generateContent, before native facts.
+    if model.api == "google-generative-ai" && id.starts_with("gemini-3.1-pro") {
+        if let Some(map) = model
+            .metadata
+            .get_mut("thinkingLevelMap")
+            .and_then(Value::as_object_mut)
+        {
+            if map.get("medium") == Some(&Value::Null) {
+                map.insert("medium".into(), json!("MEDIUM"));
+            }
+        }
+    }
+    let effort = native.get("effort.supported").copied().flatten();
+    let thinking = native.get("thinking.supported").copied().flatten();
+    let positive_level = native.iter().any(|(k, v)| {
+        k.strip_prefix("effort.")
+            .is_some_and(|e| ReasoningEffort::from_str(e).is_some())
+            && *v == Some(true)
+    });
+    if effort == Some(true) || effort != Some(false) && positive_level || thinking == Some(true) {
+        model.reasoning = true;
+    } else if provider == "gemini" && thinking == Some(false) {
+        model.reasoning = false;
+    }
+    if let Some(supported) = effort.or((effort != Some(false) && positive_level).then_some(true)) {
+        let compat = model
+            .metadata
+            .entry("compat".into())
+            .or_insert_with(|| json!({}));
+        if !compat.is_object() {
+            *compat = json!({});
+        }
+        compat["supportsReasoningEffort"] = json!(supported);
+    }
+    for (key, supported) in native {
+        let Some(level) = key
+            .strip_prefix("effort.")
+            .filter(|e| ReasoningEffort::from_str(e).is_some())
+        else {
+            continue;
+        };
+        let Some(supported) = supported else { continue };
+        let map = model
+            .metadata
+            .entry("thinkingLevelMap".into())
+            .or_insert_with(|| json!({}));
+        if !map.is_object() {
+            *map = json!({});
+        }
+        map[level] = if *supported {
+            json!(level)
+        } else {
+            Value::Null
+        };
+    }
+    Some(model)
+}
+fn validate_native_reasoning(
+    provider: &str,
+    request: &ChatRequest,
+    fields: &Fields,
+    native: &NativeReasoning,
+) -> Result<()> {
+    let denies = |key: &str| native.get(key) == Some(&Some(false));
+    ensure!(
+        provider != "gemini" || request.reasoning.is_none() || !denies("thinking.supported"),
+        "native Models API denies thinking support"
+    );
+    if let Some(effort) = fields
+        .get("output_config")
+        .and_then(|v| v["effort"].as_str())
+    {
+        ensure!(
+            !denies("effort.supported") && !denies(&format!("effort.{effort}")),
+            "native Models API denies selected effort"
+        );
+    }
+    if let Some(mode) = fields
+        .get("thinking")
+        .and_then(|v| v["type"].as_str())
+        .filter(|mode| *mode != "disabled")
+    {
+        ensure!(
+            !denies("thinking.supported") && !denies(&format!("thinking.types.{mode}")),
+            "native Models API denies selected thinking mode"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn chat_fields_from_catalog(
     catalog: Option<&ModelCatalog>,
     provider: &str,
@@ -611,8 +758,16 @@ pub(crate) fn gemini_thinking_with_catalog(
     request: &ChatRequest,
 ) -> Result<Option<Value>> {
     let model = catalog.and_then(|c| c.model("gemini", &request.model));
-    validate_temperature(model, request)?;
-    gemini_thinking_with_model(model, request)
+    let native = native_reasoning("gemini", &request.model);
+    let model = reasoning_model(
+        "gemini",
+        model.filter(|_| public_reasoning_catalog("gemini")),
+        &native,
+    );
+    validate_temperature(model.as_ref(), request)?;
+    let fields = gemini_thinking_with_model(model.as_ref(), request)?;
+    validate_native_reasoning("gemini", request, &Fields::new(), &native)?;
+    Ok(fields)
 }
 
 fn gemini_thinking_with_model(
@@ -622,6 +777,10 @@ fn gemini_thinking_with_model(
     let Some(reasoning) = request.reasoning else {
         return Ok(None);
     };
+    ensure!(
+        model.is_none_or(|m| m.reasoning),
+        "catalog model does not support thinking controls"
+    );
     let id = request.model.as_str();
     let family_id = model
         .as_ref()
@@ -660,25 +819,12 @@ fn gemini_thinking_with_model(
         matches!(level.as_str(), "MINIMAL" | "LOW" | "MEDIUM" | "HIGH"),
         "invalid native generateContent ThinkingLevel `{level}`"
     );
-    let allowed = if family_id.starts_with("gemini-3.1-flash-lite-image") {
-        matches!(level.as_str(), "MINIMAL" | "HIGH")
-    } else if family_id.starts_with("gemini-3-pro") {
-        matches!(level.as_str(), "LOW" | "HIGH")
-    } else if family_id.starts_with("gemini-3.1-pro")
-        || family_id.starts_with("gemini-3.7-flash")
-        || family_id.starts_with("gemini-3.8-flash")
-    {
-        matches!(level.as_str(), "LOW" | "MEDIUM" | "HIGH")
-    } else {
-        [
-            "gemini-3-flash",
-            "gemini-3.1-flash-lite",
-            "gemini-3.5-flash",
-            "gemini-3.6-flash",
-        ]
-        .iter()
-        .any(|family| family_id == *family || family_id.starts_with(&format!("{family}-")))
-    };
+    let allowed = crate::reasoning_registry::reasoning_capabilities_for_model("gemini", family_id)
+        .is_some_and(|r| {
+            r.effort_options
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(&level))
+        });
     ensure!(
         allowed,
         "Gemini model `{id}` has no documented support for thinking level `{level}`"
@@ -720,7 +866,7 @@ fn validate_temperature(model: Option<&CatalogModel>, request: &ChatRequest) -> 
 
 // Only documented Bedrock model/inference-profile forms are normalized. ARNs
 // and application profile aliases do not establish an underlying Claude family.
-fn claude_id<'a>(provider: &str, id: &'a str) -> Option<&'a str> {
+pub(crate) fn claude_id<'a>(provider: &str, id: &'a str) -> Option<&'a str> {
     if provider != "bedrock" {
         return id.starts_with("claude-").then_some(id);
     }
@@ -742,7 +888,9 @@ fn claude_id<'a>(provider: &str, id: &'a str) -> Option<&'a str> {
         "claude-mythos-5-1",
         "claude-mythos-preview",
         "claude-opus-5",
+        "claude-opus-5-5",
         "claude-sonnet-5",
+        "claude-sonnet-5-5",
     ];
     // Older dated platform IDs may disable manual thinking, but have no
     // qualitative fallback. Catalog API identity supplies their off contract.
@@ -765,7 +913,7 @@ fn claude_id<'a>(provider: &str, id: &'a str) -> Option<&'a str> {
     (known.contains(&id) || legacy_dated).then_some(id)
 }
 
-fn claude_family(id: &str, family: &str) -> bool {
+pub(crate) fn claude_family(id: &str, family: &str) -> bool {
     if id == family {
         return true;
     }
@@ -796,11 +944,17 @@ pub(crate) fn anthropic_fields_with_catalog(
     request: &ChatRequest,
 ) -> Result<Fields> {
     validate_cap_with_catalog(catalog, provider, request)?;
-    anthropic_fields_with_model(
+    let native = native_reasoning(provider, &request.model);
+    let model = reasoning_model(
         provider,
-        request,
-        catalog.and_then(|c| c.model(provider, &request.model)),
-    )
+        catalog
+            .filter(|_| public_reasoning_catalog(provider))
+            .and_then(|c| c.model(provider, &request.model)),
+        &native,
+    );
+    let fields = anthropic_fields_with_model(provider, request, model.as_ref())?;
+    validate_native_reasoning(provider, request, &fields, &native)?;
+    Ok(fields)
 }
 
 fn anthropic_fields_with_model(
@@ -872,23 +1026,13 @@ fn anthropic_fields_with_model(
     if off && model.is_some_and(|m| !m.reasoning) {
         return Ok(fields);
     }
+    ensure!(
+        off || model.is_none_or(|m| m.reasoning),
+        "catalog model does not support effort controls"
+    );
     let mapped = mapped_effort(model, reasoning)?;
-    let normalized = id
-        .strip_suffix("-v1:0")
-        .or_else(|| id.strip_suffix("-v1"))
-        .unwrap_or(id);
-    let registry_id = [
-        "claude-opus-4-5",
-        "claude-opus-4-6",
-        "claude-opus-4-7",
-        "claude-opus-4-8",
-        "claude-sonnet-4-6",
-    ]
-    .into_iter()
-    .find(|family| claude_family(normalized, family))
-    .unwrap_or(normalized);
     let registry =
-        crate::reasoning_registry::reasoning_capabilities_for_model("anthropic", registry_id);
+        crate::reasoning_registry::reasoning_capabilities_for_model(provider, &request.model);
     let adaptive = [
         "claude-opus-4-6",
         "claude-opus-4-7",
@@ -926,28 +1070,8 @@ fn anthropic_fields_with_model(
         matches!(wire.as_str(), "low" | "medium" | "high" | "xhigh" | "max"),
         "invalid Claude effort enum `{wire}`"
     );
-    // Registry supplies documented direct-model vocabulary; a map can remap a
-    // user effort but cannot widen that vocabulary or enable manual-only models.
-    let modern = [
-        "claude-opus-5",
-        "claude-opus-5-5",
-        "claude-sonnet-5",
-        "claude-sonnet-5-5",
-        "claude-fable-5",
-        "claude-fable-5-1",
-        "claude-mythos-5",
-        "claude-mythos-5-1",
-    ]
-    .iter()
-    .any(|family| claude_family(id, family));
-    // AWS Converse documents xhigh for the exact Opus 4.6-v1 platform
-    // profile, whereas direct Messages does not. claude_id has already bounded
-    // exact/regional identity; a map cannot grant this to another model.
-    // https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-adaptive-thinking.html
-    let aws_opus_46 = provider == "bedrock" && id == "claude-opus-4-6-v1";
-    let known_effort = registry.is_some_and(|r| r.effort_options.contains(&wire))
-        || modern
-        || aws_opus_46 && wire == "xhigh";
+    // The subset belongs to the actual platform, not just the Claude brand.
+    let known_effort = registry.is_some_and(|r| r.effort_options.contains(&wire));
     ensure!(
         known_effort,
         "Claude model does not document selected qualitative effort (legacy thinking needs numeric budget)"
@@ -990,19 +1114,21 @@ pub(crate) fn deepseek_effective_thinking(request: &ChatRequest) -> bool {
 /// Discovery uses the very same protocol decision as generation. This request
 /// contains no tools/sampling/cap: those per-request constraints are checked at
 /// send time; catalog limits are still read through ModelCatalog::limits.
-pub(crate) fn effort_supported(
-    provider: &str,
-    model: &CatalogModel,
-    effort: ReasoningEffort,
-) -> bool {
-    effort_supported_for_profile(provider, &model.id, Some(model), effort)
-}
-
 pub(crate) fn effort_supported_for_profile(
     provider: &str,
     id: &str,
     model: Option<&CatalogModel>,
     effort: ReasoningEffort,
+) -> bool {
+    effort_supported_with_native(provider, id, model, effort, &NativeReasoning::new())
+}
+
+pub(crate) fn effort_supported_with_native(
+    provider: &str,
+    id: &str,
+    model: Option<&CatalogModel>,
+    effort: ReasoningEffort,
+    native: &NativeReasoning,
 ) -> bool {
     let request = ChatRequest {
         model: id.into(),
@@ -1015,11 +1141,13 @@ pub(crate) fn effort_supported_for_profile(
         reasoning: Some(ReasoningConfig::Effort(effort)),
         compiled_prompt: None,
     };
-    match provider {
-        "anthropic" | "bedrock" => anthropic_fields_with_model(provider, &request, model).is_ok(),
-        "gemini" => gemini_thinking_with_model(model, &request).is_ok(),
-        _ => chat_fields_with_model(provider, &request, model).is_ok(),
-    }
+    let fields = match provider {
+        "anthropic" | "bedrock" => anthropic_fields_with_model(provider, &request, model),
+        "gemini" => gemini_thinking_with_model(model, &request).map(|_| Fields::new()),
+        _ => chat_fields_with_model(provider, &request, model),
+    };
+    fields
+        .is_ok_and(|fields| validate_native_reasoning(provider, &request, &fields, native).is_ok())
 }
 
 pub(crate) fn protocol_mandatory(provider: &str, id: &str) -> bool {
@@ -1044,6 +1172,8 @@ pub(crate) fn protocol_mandatory(provider: &str, id: &str) -> bool {
             .iter()
             .any(|family| claude_family(&id, family))
         }),
+        "gemini" => crate::reasoning_registry::reasoning_capabilities_for_model(provider, id)
+            .is_some_and(|r| r.mandatory == Some(true)),
         _ => false,
     }
 }

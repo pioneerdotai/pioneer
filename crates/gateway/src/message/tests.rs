@@ -4093,6 +4093,7 @@ impl Provider for PromptParityCaptureProvider {
                 tool_calling: Some(true),
                 thinking: Some(true),
                 reasoning: Some(pioneer_protocol::ProviderModelReasoningCapabilities {
+                    native: Default::default(),
                     supported: Some(true),
                     effort_options: vec![
                         "minimal".to_owned(),

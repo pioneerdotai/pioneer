@@ -101,6 +101,11 @@ pub enum ReasoningCapabilitySource {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ProviderModelReasoningCapabilities {
+    /// Raw Models API reasoning facts. Missing key means absent; null means
+    /// unknown. Effort, thinking support and thinking types remain separate.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub native: std::collections::BTreeMap<String, Option<bool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supported: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -248,6 +253,7 @@ mod tests {
         assert_eq!(
             capabilities.reasoning,
             Some(ProviderModelReasoningCapabilities {
+                native: Default::default(),
                 supported: Some(true),
                 effort_options: vec!["low".to_owned(), "high".to_owned()],
                 default_effort: Some("medium".to_owned()),
