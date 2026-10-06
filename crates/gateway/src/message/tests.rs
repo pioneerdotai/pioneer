@@ -68623,8 +68623,14 @@ async fn setup_pooled_file_workspace_manager_with_observer(
 async fn setup_workspace_manager_with_connection(
     connection: sea_orm::DatabaseConnection,
 ) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
+    setup_workspace_manager_with_connection_migrator::<Migrator>(connection).await
+}
+
+async fn setup_workspace_manager_with_connection_migrator<M: MigratorTrait>(
+    connection: sea_orm::DatabaseConnection,
+) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
     crate::compaction::load_test_catalog();
-    Migrator::up(&connection, None)
+    M::up(&connection, None)
         .await
         .expect("migrations must succeed");
     bootstrap(&connection)
