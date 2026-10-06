@@ -2063,6 +2063,7 @@ mod stream_call_identity_tests {
                 content: Some(ApiContent {
                     role: "model".into(),
                     parts: vec![ApiPart {
+                        extra: Default::default(),
                         text: None,
                         inline_data: None,
                         file_data: None,
@@ -2070,6 +2071,7 @@ mod stream_call_identity_tests {
                         function_response: None,
                         thought_signature: None,
                         function_call: Some(ApiFunctionCall {
+                            extra: Default::default(),
                             id: None,
                             name: "read".into(),
                             args: serde_json::json!({"path":"x"}),
