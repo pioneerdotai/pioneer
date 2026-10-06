@@ -1167,11 +1167,9 @@ async fn container_timeline_limits_and_end_overflow_reject_before_native_project
                 )
                 .await
                 .unwrap_err();
-                assert!(
-                    error
-                        .chain()
-                        .any(|e| e.downcast_ref::<super::MediaInputRejection>().is_some())
-                );
+                // anyhow's downcast traverses typed contexts; std Error::source
+                // exposes the ContextError wrapper rather than its context type.
+                assert!(error.downcast_ref::<super::MediaInputRejection>().is_some());
                 assert!(!error.to_string().contains(&STANDARD.encode(&bytes)));
             }
         }
@@ -1382,11 +1380,7 @@ async fn confirmed_elementary_audio_limits_and_mp4_edit_admission() {
             .await;
             assert_eq!(admission.is_ok(), allowed);
             if let Err(error) = admission {
-                assert!(
-                    error
-                        .chain()
-                        .any(|e| e.downcast_ref::<super::MediaInputRejection>().is_some())
-                );
+                assert!(error.downcast_ref::<super::MediaInputRejection>().is_some());
                 assert!(!error.to_string().contains(&STANDARD.encode(&bytes)));
             }
             if let Ok(budget) = budget {
@@ -1429,11 +1423,7 @@ async fn confirmed_elementary_audio_limits_and_mp4_edit_admission() {
             )
             .await
             .unwrap_err();
-            assert!(
-                error
-                    .chain()
-                    .any(|e| e.downcast_ref::<super::MediaInputRejection>().is_some())
-            );
+            assert!(error.downcast_ref::<super::MediaInputRejection>().is_some());
             assert!(!error.to_string().contains(&STANDARD.encode(&bytes)));
         }
         for mime in ["audio/mpeg", "audio/aac"] {
@@ -1675,11 +1665,7 @@ async fn gemini_aggregate_requires_source_backed_encoder_trim_domain() {
                 )
                 .await
                 .unwrap_err();
-                assert!(
-                    error
-                        .chain()
-                        .any(|e| e.downcast_ref::<super::MediaInputRejection>().is_some())
-                );
+                assert!(error.downcast_ref::<super::MediaInputRejection>().is_some());
                 assert!(!error.to_string().contains(&STANDARD.encode(&bytes)));
             }
         }

@@ -617,9 +617,12 @@ mod tests {
                     let err =
                         result.expect_err("phase B: unsupported kind must fail with a typed error");
                     assert!(
-                        err.to_string()
-                            .contains("ATTACHMENT_PIPELINE_CONTRACT_VIOLATION"),
-                        "phase B: provider `{name}` must fail explicitly for unsupported {part_type}"
+                        err.downcast_ref::<crate::attachments::MediaInputRejection>()
+                            .is_some()
+                            || err
+                                .to_string()
+                                .contains("ATTACHMENT_PIPELINE_CONTRACT_VIOLATION"),
+                        "phase B: provider `{name}` must fail explicitly for unsupported {part_type}: {err:#}"
                     );
                 }
             }

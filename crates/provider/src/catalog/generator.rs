@@ -776,8 +776,8 @@ mod specialized_zero_regressions {
             s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["openrouter"]["models"]["fixture/native-positive"] =
                 conflicting;
             s.sources.get_mut(SOURCE_URLS[1]).unwrap().body = json!({"data":[
-                {"id":"fixture/native-negative","supported_parameters":[],"architecture":{"input_modalities":["text"]}},
-                {"id":"fixture/native-positive","supported_parameters":["tools"],"architecture":{"input_modalities":["text"]},"context_length":64000,"top_provider":{"max_completion_tokens":4000}}
+                {"id":"fixture/native-negative","name":"Native negative","supported_parameters":[],"architecture":{"input_modalities":["text"],"output_modalities":["text"]}},
+                {"id":"fixture/native-positive","name":"Native positive","supported_parameters":["tools"],"architecture":{"input_modalities":["text"],"output_modalities":["text"]},"context_length":64000,"top_provider":{"max_completion_tokens":4000}}
             ]});
             let generated = generate(&s, strict).unwrap();
             assert!(
@@ -815,11 +815,24 @@ mod specialized_zero_regressions {
             changed;
         let generated = generate(&s, true).unwrap();
         let known = &generated.models["deepseek"]["deepseek-v4-flash"];
-        for field in ["contextWindow", "maxTokens", "cost"] {
+        for field in ["contextWindow", "maxTokens"] {
             assert_eq!(
                 known[field],
                 reference["deepseek"]["deepseek-v4-flash"][field]
             );
+        }
+        // Numeric JSON representations such as 0 and 0.0 carry the same rate.
+        // Compare all pinned cost fields without dropping any pricing evidence.
+        let expected_cost = reference["deepseek"]["deepseek-v4-flash"]["cost"]
+            .as_object()
+            .unwrap();
+        let actual_cost = known["cost"].as_object().unwrap();
+        assert_eq!(
+            actual_cost.keys().collect::<Vec<_>>(),
+            expected_cost.keys().collect::<Vec<_>>()
+        );
+        for (field, expected) in expected_cost {
+            assert_eq!(actual_cost[field].as_f64(), expected.as_f64(), "{field}");
         }
         assert_eq!(
             generated.provenance["deepseek"]["deepseek-v4-flash"]["contextWindow"]["kind"],
@@ -828,7 +841,7 @@ mod specialized_zero_regressions {
         let dynamic = &generated.models["deepseek"]["fixture-dynamic"];
         assert_eq!(dynamic["contextWindow"], 64000);
         assert_eq!(dynamic["maxTokens"], 4000);
-        assert_eq!(dynamic["cost"]["input"], 99);
+        assert_eq!(dynamic["cost"]["input"].as_f64(), Some(99.0));
         assert_eq!(
             generated.provenance["deepseek"]["fixture-dynamic"]["contextWindow"]["kind"],
             "source"
