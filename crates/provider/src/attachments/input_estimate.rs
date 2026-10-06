@@ -302,6 +302,48 @@ impl NativeDuration {
         .context("duration resolution exceeds bounded representation")
     }
 }
+/// Signed timestamp in exact seconds. Only subtraction against one proven
+/// container origin yields a duration; raw ticks from different bases never mix.
+#[derive(Clone, Copy)]
+struct TimelineTime {
+    numer: i128,
+    denom: u128,
+}
+impl TimelineTime {
+    fn from_ticks(ticks: i64, base: symphonia::core::units::TimeBase) -> Self {
+        // i64 × u32 fits i128 exactly; no sign/width loss here.
+        Self {
+            numer: i128::from(ticks) * i128::from(base.numer.get()),
+            denom: u128::from(base.denom.get()),
+        }
+    }
+    fn since(self, origin: Self) -> Result<NativeDuration> {
+        let g = gcd(self.denom, origin.denom);
+        let a = i128::try_from(origin.denom / g)?;
+        let b = i128::try_from(self.denom / g)?;
+        let n = self
+            .numer
+            .checked_mul(a)
+            .and_then(|n| origin.numer.checked_mul(b).and_then(|o| n.checked_sub(o)))
+            .context("native timeline subtraction overflow")?;
+        let n = u128::try_from(n).context("media timestamp precedes proven container origin")?;
+        Ok(NativeDuration::new(
+            n,
+            self.denom
+                .checked_mul(origin.denom / g)
+                .context("native timeline denominator overflow")?,
+        ))
+    }
+}
+fn checked_packet_end(
+    pts: symphonia::core::units::Timestamp,
+    dur: symphonia::core::units::Duration,
+) -> Result<i64> {
+    pts.checked_add(dur)
+        .map(|end| end.get())
+        .context("native packet end timestamp overflow")
+}
+
 fn gcd(mut a: u128, mut b: u128) -> u128 {
     while b != 0 {
         let r = a % b;
@@ -326,6 +368,12 @@ pub(super) fn native_duration(bytes: &[u8], mime: &str) -> Result<NativeDuration
             mp4parse::read_mp4(&mut Cursor::new(bytes)).context("MP4 timing is unavailable")?;
         let mut duration = NativeDuration::ZERO;
         for track in &context.tracks {
+            // Existing MP4 track spans are zero-origin bounds. An explicit
+            // leading edit/loop breaks that proof; refuse instead of dropping it.
+            ensure!(
+                !track.looped.unwrap_or(false) && track.empty_duration.is_none_or(|v| v.0 == 0),
+                "MP4 offset/loop timeline is not proven by native track spans"
+            );
             let ticks = track
                 .duration
                 .context("MP4 track duration is unavailable")?;
@@ -358,6 +406,33 @@ pub(super) fn native_duration(bytes: &[u8], mime: &str) -> Result<NativeDuration
         FormatOptions::default(),
         MetadataOptions::default(),
     )?;
+    let webm = matches!(mime, "audio/webm" | "video/webm")
+        .then(|| super::webm::timing(bytes))
+        .transpose()?;
+    let media = format.media_info().clone();
+    let media_base = media
+        .time_base
+        .context("native container time base is unavailable")?;
+    // MKV uses Segment-relative timestamps. Its rounded float duration is only
+    // accepted after exact raw metadata proof and packet-end verification.
+    if let Some(timing) = &webm {
+        ensure!(
+            media.start_ts.get() == 0
+                && u64::from(media_base.numer.get()) * 1_000_000_000
+                    == u64::from(media_base.denom.get()) * u64::from(timing.scale_nanos),
+            "WebM segment origin/time base is not proven"
+        );
+        ensure!(
+            media.duration.map(|d| d.get()) == timing.duration_ticks,
+            "WebM library/raw segment duration mismatch"
+        );
+    } else {
+        ensure!(
+            format.tracks().len() == 1 || media.start_ts.get() == 0,
+            "nonzero multi-track container origin is not proven"
+        );
+    }
+    let origin = TimelineTime::from_ticks(media.start_ts.get(), media_base);
     let mut bases = BTreeMap::new();
     let mut duration = NativeDuration::ZERO;
     let mut unknown = std::collections::BTreeSet::new();
@@ -385,7 +460,12 @@ pub(super) fn native_duration(bytes: &[u8], mime: &str) -> Result<NativeDuration
                         .flatten()
                 })
             {
-                duration = duration.max(ticks_span(ticks, base))?;
+                let end = checked_packet_end(
+                    track.start_ts,
+                    symphonia::core::units::Duration::new(ticks),
+                )?;
+                TimelineTime::from_ticks(track.start_ts.get(), base).since(origin)?;
+                duration = duration.max(TimelineTime::from_ticks(end, base).since(origin)?)?;
             } else {
                 all_known = false;
                 unknown.insert(track.id);
@@ -410,7 +490,8 @@ pub(super) fn native_duration(bytes: &[u8], mime: &str) -> Result<NativeDuration
                         "unknown packet end duration; native span is not established"
                     );
                     let start = packet.pts.get();
-                    let end = packet.pts.saturating_add(packet.dur).get();
+                    let end = checked_packet_end(packet.pts, packet.dur)?;
+                    TimelineTime::from_ticks(start, bases[&packet.track_id]).since(origin)?;
                     ensure!(end >= start, "invalid packet time span");
                     spans
                         .entry(packet.track_id)
@@ -437,16 +518,23 @@ pub(super) fn native_duration(bytes: &[u8], mime: &str) -> Result<NativeDuration
             complete,
             "media timing scan exceeded its bounded packet quantum"
         );
-        for id in unknown {
-            let (start, end) = spans
-                .get(&id)
-                .context("media track timing is unavailable")?;
-            let ticks = end
-                .checked_sub(*start)
-                .and_then(|v| u64::try_from(v).ok())
-                .context("invalid media span")?;
-            ensure!(ticks > 0, "media track duration is unavailable");
-            duration = duration.max(ticks_span(ticks, bases[&id]))?;
+        for id in &unknown {
+            let (start, end) = spans.get(id).context("media track timing is unavailable")?;
+            ensure!(end > start, "media track duration is unavailable");
+        }
+        for (id, (_, end)) in spans {
+            duration = duration.max(TimelineTime::from_ticks(end, bases[&id]).since(origin)?)?;
+        }
+    }
+    if let Some(timing) = webm {
+        if let Some(ticks) = timing.duration_ticks {
+            let declared = ticks_span(ticks, media_base);
+            let bound = declared.max(duration)?;
+            ensure!(
+                bound.numer == declared.numer && bound.denom == declared.denom,
+                "WebM declared segment duration precedes measured packet end"
+            );
+            duration = declared;
         }
     }
     ensure!(duration.numer > 0, "media duration is unavailable");
@@ -513,7 +601,7 @@ mod tests {
         out.resize(44 + length as usize, 0);
         out
     }
-    fn mp4(duration: u32) -> Vec<u8> {
+    pub(super) fn mp4(duration: u32) -> Vec<u8> {
         fn atom(name: &[u8; 4], bytes: &[u8]) -> Vec<u8> {
             let mut out = ((bytes.len() + 8) as u32).to_be_bytes().to_vec();
             out.extend(name);
@@ -735,5 +823,191 @@ mod native_span_rounding_tests {
         assert!(exact.within_millis(1000).unwrap());
         assert!(!exact.within_millis(999).unwrap());
         assert_eq!(exact.ceil(1000).unwrap(), 1000);
+    }
+}
+
+#[cfg(test)]
+mod container_timeline_regressions {
+    use super::*;
+    use crate::attachments::media_fixtures::{TimingFixture, webm_timeline};
+    #[test]
+    fn mixed_shift_overlap_metadata_and_packet_scan_use_segment_timeline() {
+        for declared_duration in [None, Some(11000.0)] {
+            let bytes = webm_timeline(
+                true,
+                true,
+                "webm",
+                TimingFixture {
+                    video_start: 10000,
+                    declared_duration,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(duration_millis(&bytes, "video/webm").unwrap(), 11000);
+        }
+        let half_ms = webm_timeline(
+            false,
+            true,
+            "webm",
+            TimingFixture {
+                video_start: 20000,
+                video_duration: 2000,
+                timestamp_scale: 500_000,
+                declared_duration: Some(22000.0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(duration_millis(&half_ms, "video/webm").unwrap(), 11000);
+        let trailing = webm_timeline(
+            true,
+            true,
+            "webm",
+            TimingFixture {
+                video_start: 10000,
+                declared_duration: Some(12000.0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(duration_millis(&trailing, "video/webm").unwrap(), 12000);
+        for (audio_start, video_start, expected) in [(0, 0, 1000), (0, 500, 1500), (500, 0, 1500)] {
+            let bytes = webm_timeline(
+                true,
+                true,
+                "webm",
+                TimingFixture {
+                    audio_start,
+                    video_start,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(duration_millis(&bytes, "video/webm").unwrap(), expected);
+        }
+        let leading = webm_timeline(
+            false,
+            true,
+            "webm",
+            TimingFixture {
+                cluster_timestamp: 5000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(duration_millis(&leading, "video/webm").unwrap(), 6000); // Segment zero, not per-track reset
+        for timing in [
+            TimingFixture {
+                video_start: -1,
+                ..Default::default()
+            },
+            TimingFixture {
+                codec_delay: 1,
+                ..Default::default()
+            },
+            TimingFixture {
+                track_scale: 2.0,
+                ..Default::default()
+            },
+            TimingFixture {
+                declared_duration: Some(999.5),
+                ..Default::default()
+            },
+            TimingFixture {
+                declared_duration: Some(999.0),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                native_duration(&webm_timeline(true, true, "webm", timing), "video/webm").is_err()
+            );
+        }
+    }
+    #[test]
+    fn container_packet_end_near_i64_boundary_is_checked_not_clamped() {
+        let overflow = webm_timeline(
+            false,
+            true,
+            "webm",
+            TimingFixture {
+                cluster_timestamp: (i64::MAX - 1000) as u64,
+                video_duration: 2000,
+                ..Default::default()
+            },
+        );
+        let error = native_duration(&overflow, "video/webm").unwrap_err();
+        assert!(error.to_string().contains("packet end timestamp overflow"));
+        let valid = webm_timeline(
+            false,
+            true,
+            "webm",
+            TimingFixture {
+                cluster_timestamp: (i64::MAX - 2000) as u64,
+                video_duration: 2000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            duration_millis(&valid, "video/webm").unwrap(),
+            i64::MAX as u64
+        );
+    }
+    #[test]
+    fn rational_origin_and_different_timebases_do_not_add_raw_ticks() {
+        use std::num::NonZeroU32;
+        let ms = symphonia::core::units::TimeBase::new(
+            NonZeroU32::new(1).unwrap(),
+            NonZeroU32::new(1000).unwrap(),
+        );
+        let sec = symphonia::core::units::TimeBase::new(
+            NonZeroU32::new(1).unwrap(),
+            NonZeroU32::new(1).unwrap(),
+        );
+        let origin = TimelineTime::from_ticks(5000, ms);
+        assert_eq!(
+            TimelineTime::from_ticks(11, sec)
+                .since(origin)
+                .unwrap()
+                .ceil(1000)
+                .unwrap(),
+            6000
+        );
+        assert_eq!(
+            TimelineTime::from_ticks(1000, ms)
+                .since(TimelineTime::from_ticks(-1, sec))
+                .unwrap()
+                .ceil(1000)
+                .unwrap(),
+            2000
+        );
+        assert!(TimelineTime::from_ticks(-1, sec).since(origin).is_err());
+    }
+}
+
+#[cfg(test)]
+mod mp4_timeline_boundary_regressions {
+    use super::*;
+    #[test]
+    fn leading_movie_edit_is_not_silently_erased_from_track_duration() {
+        fn atom(id: &[u8; 4], bytes: &[u8]) -> Vec<u8> {
+            [(bytes.len() as u32 + 8).to_be_bytes().as_slice(), id, bytes].concat()
+        }
+        // Valid metadata edit list: a 10s empty segment, then 1s media.
+        // The existing narrow metadata timing fixture supplies the media track;
+        // this negative test claims no complete encoded/endpoint acceptance.
+        let raw = super::tests::mp4(1000);
+        let mut edits = vec![0; 4];
+        edits.extend(2u32.to_be_bytes());
+        for (duration, start) in [(10000u32, -1i32), (1000, 0)] {
+            edits.extend(duration.to_be_bytes());
+            edits.extend(start.to_be_bytes());
+            edits.extend(1i16.to_be_bytes());
+            edits.extend(0i16.to_be_bytes());
+        }
+        let mut track = atom(b"edts", &atom(b"elst", &edits));
+        track.extend(&raw[16..]);
+        let bytes = atom(b"moov", &atom(b"trak", &track));
+        assert!(
+            native_duration(&bytes, "video/mp4")
+                .unwrap_err()
+                .to_string()
+                .contains("MP4 offset/loop timeline")
+        );
     }
 }

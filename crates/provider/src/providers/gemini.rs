@@ -1782,3 +1782,74 @@ mod webm_wire_regressions {
         }
     }
 }
+
+#[cfg(test)]
+mod container_timeline_wire_regressions {
+    use super::*;
+    use crate::{
+        Provider,
+        attachments::{
+            media_fixtures::{TimingFixture, webm_timeline},
+            regression as fixture,
+        },
+    };
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn eleven_second_container_budget_both_modes_and_replay_keep_native_bytes() {
+        let provider = GeminiProvider::new("unused");
+        let bytes = webm_timeline(
+            true,
+            true,
+            "webm",
+            TimingFixture {
+                video_start: 10000,
+                declared_duration: Some(11000.0),
+                ..Default::default()
+            },
+        );
+        let state = Arc::new(fixture::state(
+            "gemini",
+            "media",
+            serde_json::json!({"video":{"maxDurationMillis":11000}}),
+        ));
+        let budget = fixture::scoped(
+            state.clone(),
+            provider.prepare_input_budget(fixture::request(
+                "media",
+                vec![fixture::part(InputContentType::Video, "video/webm", &bytes)],
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(budget.media[0].input_tokens, 3850);
+        for _stream in [false, true] {
+            // both GenerateContent modes share this typed builder
+            let replay = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(budget.request.clone()),
+            )
+            .await
+            .unwrap();
+            let prepared = fixture::scoped(
+                state.clone(),
+                crate::attachments::prepare_messages_for_provider_async(
+                    "gemini",
+                    "media",
+                    &provider.capabilities(),
+                    &replay.request.messages,
+                ),
+            )
+            .await
+            .unwrap();
+            let wire =
+                GeminiProvider::build_request_from_prepared(&replay.request, &prepared).unwrap();
+            let native = wire.contents[0]
+                .parts
+                .iter()
+                .find_map(|p| p.inline_data.as_ref())
+                .unwrap();
+            assert_eq!(native.mime_type, "video/webm");
+            assert_eq!(native.data, BASE64.encode(&bytes));
+        }
+    }
+}

@@ -1044,3 +1044,115 @@ async fn native_gemini_aggregate_keeps_exact_thirds_at_the_audio_boundary() {
         .is_err()
     );
 }
+
+#[tokio::test]
+async fn container_timeline_limits_and_end_overflow_reject_before_native_projection() {
+    use super::media_fixtures::{TimingFixture, webm_timeline};
+    use crate::Provider;
+    for name in ["bedrock", "gemini", "openrouter"] {
+        let provider: Arc<dyn Provider> = match name {
+            "bedrock" => Arc::new(crate::providers::BedrockProvider::new(
+                "unused",
+                "unused",
+                "us-east-1",
+            )),
+            "gemini" => Arc::new(crate::providers::GeminiProvider::new("unused")),
+            _ => Arc::new(crate::providers::OpenRouterProvider::new("unused")),
+        };
+        for declared_duration in [None, Some(11000.0)] {
+            let bytes = webm_timeline(
+                true,
+                true,
+                "webm",
+                TimingFixture {
+                    video_start: 10000,
+                    declared_duration,
+                    ..Default::default()
+                },
+            );
+            for (limit, allowed) in [(1000, false), (10999, false), (11000, true)] {
+                let s = Arc::new(state(
+                    name,
+                    "media",
+                    json!({"video":{"maxDurationMillis":limit}}),
+                ));
+                let req = request(
+                    "media",
+                    vec![part(InputContentType::Video, "video/webm", &bytes)],
+                );
+                let budget = scoped(s.clone(), provider.prepare_input_budget(req.clone())).await;
+                assert_eq!(budget.is_ok(), allowed, "{name}, limit={limit}");
+                for _stream in [false, true] {
+                    let admission = scoped(
+                        s.clone(),
+                        super::prepare_messages_for_provider_async(
+                            name,
+                            "media",
+                            &provider.capabilities(),
+                            &req.messages,
+                        ),
+                    )
+                    .await;
+                    assert_eq!(admission.is_ok(), allowed);
+                }
+                if let Ok(budget) = budget {
+                    assert_eq!(budget.media[0].input_tokens, 3850); // 11 seconds × local 350/sec heuristic
+                    let replay = scoped(s, provider.prepare_input_budget(budget.request))
+                        .await
+                        .unwrap();
+                    assert_eq!(replay.media[0].input_tokens, 3850);
+                }
+            }
+        }
+        for timing in [
+            TimingFixture {
+                cluster_timestamp: (i64::MAX - 1000) as u64,
+                video_duration: 2000,
+                ..Default::default()
+            },
+            TimingFixture {
+                video_start: -1,
+                ..Default::default()
+            },
+            TimingFixture {
+                track_scale: 2.0,
+                ..Default::default()
+            },
+        ] {
+            let bytes = webm_timeline(false, true, "webm", timing);
+            let s = Arc::new(state(
+                name,
+                "media",
+                json!({"video":{"maxDurationMillis":1000}}),
+            ));
+            let req = request(
+                "media",
+                vec![part(InputContentType::Video, "video/webm", &bytes)],
+            );
+            assert!(
+                scoped(s.clone(), provider.prepare_input_budget(req.clone()))
+                    .await
+                    .is_err()
+            );
+            for _stream in [false, true] {
+                let error = scoped(
+                    s.clone(),
+                    super::prepare_messages_for_provider_async(
+                        name,
+                        "media",
+                        &provider.capabilities(),
+                        &req.messages,
+                    ),
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    error
+                        .chain()
+                        .any(|e| e.downcast_ref::<super::MediaInputRejection>().is_some())
+                );
+                assert!(!error.to_string().contains(&STANDARD.encode(&bytes)));
+            }
+        }
+    }
+}

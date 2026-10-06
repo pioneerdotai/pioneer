@@ -138,3 +138,84 @@ pub(super) fn actual_mime(bytes: &[u8]) -> Result<&'static str> {
     ensure!(audio || video, "WebM has no identifiable media tracks");
     Ok(if video { "video/webm" } else { "audio/webm" })
 }
+
+/// Exact timing metadata boundary: segment origin is zero in TimestampScale
+/// units. Reject scaling/delay and floating durations we cannot prove exactly.
+/// Packet scan must still establish ends; rounded MediaInfo is not sufficient.
+pub(super) struct Timing {
+    pub scale_nanos: u32,
+    pub duration_ticks: Option<u64>,
+}
+pub(super) fn timing(bytes: &[u8]) -> Result<Timing> {
+    actual_mime(bytes)?;
+    let mut budget = 100_000;
+    let top = elements(bytes, &mut budget, true)?;
+    let segment = elements(
+        top.iter().find(|e| e.id == 0x18538067).unwrap().data,
+        &mut budget,
+        false,
+    )?;
+    let infos = segment
+        .iter()
+        .filter(|e| e.id == 0x1549a966)
+        .collect::<Vec<_>>();
+    ensure!(infos.len() == 1, "missing/duplicate WebM timing Info");
+    let info = elements(infos[0].data, &mut budget, false)?;
+    let scales = info.iter().filter(|e| e.id == 0x2ad7b1).collect::<Vec<_>>();
+    ensure!(scales.len() <= 1, "duplicate WebM timestamp scale");
+    let scale = scales
+        .first()
+        .map(|e| uint(e.data))
+        .transpose()?
+        .unwrap_or(1_000_000);
+    let scale_nanos = u32::try_from(scale)?;
+    ensure!(scale_nanos > 0, "WebM timestamp scale is zero");
+    let durations = info.iter().filter(|e| e.id == 0x4489).collect::<Vec<_>>();
+    ensure!(durations.len() <= 1, "duplicate WebM segment duration");
+    let duration_ticks = durations
+        .first()
+        .map(|e| {
+            let duration = ebml_float(e.data)?;
+            ensure!(
+                duration.is_finite()
+                    && duration > 0.0
+                    && duration.fract() == 0.0
+                    && duration <= 9_007_199_254_740_992.0,
+                "fractional/unbounded WebM segment duration is not proven exactly"
+            );
+            Ok(duration as u64)
+        })
+        .transpose()?;
+    for tracks in segment.iter().filter(|e| e.id == 0x1654ae6b) {
+        for entry in elements(tracks.data, &mut budget, false)?
+            .into_iter()
+            .filter(|e| e.id == 0xae)
+        {
+            for field in elements(entry.data, &mut budget, false)? {
+                if field.id == 0x23314f {
+                    ensure!(
+                        ebml_float(field.data)? == 1.0,
+                        "scaled WebM track timing is not supported exactly"
+                    );
+                }
+                if field.id == 0x56aa {
+                    ensure!(
+                        uint(field.data)? == 0,
+                        "WebM codec-delay timing is not supported exactly"
+                    );
+                }
+            }
+        }
+    }
+    Ok(Timing {
+        scale_nanos,
+        duration_ticks,
+    })
+}
+fn ebml_float(bytes: &[u8]) -> Result<f64> {
+    match bytes.len() {
+        4 => Ok(f64::from(f32::from_be_bytes(bytes.try_into()?))),
+        8 => Ok(f64::from_be_bytes(bytes.try_into()?)),
+        _ => anyhow::bail!("invalid WebM timing float"),
+    }
+}

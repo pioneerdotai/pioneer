@@ -1,11 +1,42 @@
 //! Valid containers built only during future authorized tests; no codecs run.
 #[cfg(test)]
 pub(crate) fn webm(audio: bool, video: bool, doc: &str) -> Vec<u8> {
+    webm_timeline(audio, video, doc, TimingFixture::default())
+}
+#[derive(Clone, Copy)]
+pub(crate) struct TimingFixture {
+    pub cluster_timestamp: u64,
+    pub audio_start: i16,
+    pub video_start: i16,
+    pub video_duration: u64,
+    pub declared_duration: Option<f64>,
+    pub timestamp_scale: u32,
+    pub track_scale: f64,
+    pub codec_delay: u64,
+}
+impl Default for TimingFixture {
+    fn default() -> Self {
+        Self {
+            cluster_timestamp: 0,
+            audio_start: 0,
+            video_start: 0,
+            video_duration: 1000,
+            declared_duration: None,
+            timestamp_scale: 1_000_000,
+            track_scale: 1.0,
+            codec_delay: 0,
+        }
+    }
+}
+pub(crate) fn webm_timeline(audio: bool, video: bool, doc: &str, timing: TimingFixture) -> Vec<u8> {
     fn element(id: &[u8], data: &[u8]) -> Vec<u8> {
         assert!(data.len() < 16383);
         [id, &((data.len() as u16) | 0x4000).to_be_bytes(), data].concat()
     }
     fn number(id: &[u8], value: u32) -> Vec<u8> {
+        element(id, &value.to_be_bytes())
+    }
+    fn number64(id: &[u8], value: u64) -> Vec<u8> {
         element(id, &value.to_be_bytes())
     }
     let mut header = element(&[0x42, 0x82], doc.as_bytes());
@@ -17,13 +48,13 @@ pub(crate) fn webm(audio: bool, video: bool, doc: &str) -> Vec<u8> {
     header.extend(number(&[0x42, 0x85], 2));
     let mut tracks = vec![];
     let mut blocks = Vec::new();
-    let mut block = |track: u8, pts: i16, duration: u32, frame: &[u8]| {
+    let mut block = |track: u8, pts: i16, duration: u64, frame: &[u8]| {
         let mut bytes = vec![0x80 | track];
         bytes.extend(pts.to_be_bytes());
         bytes.push(0);
         bytes.extend(frame);
         let mut group = element(&[0xa1], &bytes);
-        group.extend(number(&[0x9b], duration));
+        group.extend(number64(&[0x9b], duration));
         blocks.push((pts, element(&[0xa0], &group)));
     };
     if audio {
@@ -39,10 +70,16 @@ pub(crate) fn webm(audio: bool, video: bool, doc: &str) -> Vec<u8> {
         let mut a = element(&[0xb5], &48000f64.to_be_bytes());
         a.extend(number(&[0x9f], 1));
         t.extend(element(&[0xe1], &a));
+        t.extend(number64(&[0x56, 0xaa], timing.codec_delay));
         tracks.extend(element(&[0xae], &t));
         // Fifty valid 20ms Opus silence packets, exactly one second.
         for n in 0..50 {
-            block(1, n * 20, 20, &[0xf8, 0xff, 0xfe]);
+            block(
+                1,
+                timing.audio_start.checked_add(n * 20).unwrap(),
+                20,
+                &[0xf8, 0xff, 0xfe],
+            );
         }
     }
     if video {
@@ -59,15 +96,22 @@ pub(crate) fn webm(audio: bool, video: bool, doc: &str) -> Vec<u8> {
         let mut v = number(&[0xb0], 128);
         v.extend(number(&[0xba], 128));
         t.extend(element(&[0xe0], &v));
+        t.extend(element(
+            &[0x23, 0x31, 0x4f],
+            &timing.track_scale.to_be_bytes(),
+        ));
         tracks.extend(element(&[0xae], &t));
-        block(2, 0, 1000, frame);
+        block(2, timing.video_start, timing.video_duration, frame);
     }
     blocks.sort_by_key(|(pts, _)| *pts);
-    let mut cluster = number(&[0xe7], 0);
+    let mut cluster = number64(&[0xe7], timing.cluster_timestamp);
     for (_, block) in blocks {
         cluster.extend(block);
     }
-    let mut info = number(&[0x2a, 0xd7, 0xb1], 1_000_000);
+    let mut info = number(&[0x2a, 0xd7, 0xb1], timing.timestamp_scale);
+    if let Some(d) = timing.declared_duration {
+        info.extend(element(&[0x44, 0x89], &d.to_be_bytes()));
+    }
     info.extend(element(&[0x4d, 0x80], b"Pioneer fixture"));
     info.extend(element(&[0x57, 0x41], b"Pioneer fixture"));
     let segment = [
