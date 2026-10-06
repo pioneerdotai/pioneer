@@ -128,6 +128,8 @@ pub mod task_delivery_recovery_retry;
 pub mod task_dependency;
 pub mod task_event;
 pub mod task_event_fanout_cursor;
+pub mod task_event_fanout_pending;
+pub mod task_event_fanout_sequence;
 pub mod task_execution_admission;
 pub mod task_occurrence_contract;
 pub mod task_occurrence_reconcile_pending;

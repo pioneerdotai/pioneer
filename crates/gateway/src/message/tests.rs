@@ -32618,9 +32618,9 @@ async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_hi
         Some(0)
     );
 
-    let mut first_process_cursors = HashMap::new();
     processor
-        .emit_committed_task_events_after_cursor(task_id.as_str(), &mut first_process_cursors)
+        .for_background_reconciliation()
+        .task_event_fanout_quantum()
         .await
         .expect("initial fanout should succeed");
     assert_eq!(
@@ -32632,12 +32632,11 @@ async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_hi
     );
     while rx.try_recv().is_ok() {}
 
-    // An empty in-memory map models a freshly restarted Gateway process. The
-    // durable high-watermark must prevent the historical task log from being
-    // emitted again.
-    let mut restarted_process_cursors = HashMap::new();
+    // A restarted dispatcher uses only pending work; completed work has no
+    // pending row and requires no historic per-Task memory map.
     processor
-        .emit_committed_task_events_after_cursor(task_id.as_str(), &mut restarted_process_cursors)
+        .for_background_reconciliation()
+        .task_event_fanout_quantum()
         .await
         .expect("post-restart fanout scan should succeed");
     assert!(
@@ -32659,7 +32658,8 @@ async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_hi
         .await
         .expect("task update should append a new event");
     processor
-        .emit_committed_task_events_after_cursor(task_id.as_str(), &mut restarted_process_cursors)
+        .for_background_reconciliation()
+        .task_event_fanout_quantum()
         .await
         .expect("new post-restart event should fan out");
     let updated = recv_notification_by_method(&mut rx, events::TASK_UPDATED).await;
@@ -32679,21 +32679,27 @@ async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_hi
         .exec(&crud_store.database_connection())
         .await
         .expect("durable cursor fixture should delete");
-    let mut missing_cursor_process_state = HashMap::new();
-    let error = processor
-        .emit_committed_task_events_after_cursor(
-            task_id.as_str(),
-            &mut missing_cursor_process_state,
-        )
+    let summary = processor
+        .for_background_reconciliation()
+        .task_event_fanout_quantum()
         .await
-        .expect_err("a missing durable cursor must violate the listener invariant");
-    assert!(
-        format!("{error:#}").contains("missing durable task event fanout cursor"),
-        "unexpected invariant error: {error:#}"
+        .unwrap();
+    assert_eq!(
+        summary.errors, 0,
+        "cursor deletion without pending must not discover historical events"
+    );
+    assert_eq!(summary.pending, Some(false));
+    assert_eq!(
+        crud_store
+            .get_task_event_fanout_cursor(&task_id)
+            .await
+            .unwrap(),
+        None,
+        "dispatcher must not synthesize a cursor that skips the first event"
     );
     assert!(
         rx.try_recv().is_err(),
-        "an invariant failure must not replay historical task events"
+        "cursor deletion alone must not replay historical task events"
     );
 }
 
@@ -78720,6 +78726,277 @@ mod task_delivery_cancellation;
 #[path = "tests/memory_post_turn_recovery.rs"]
 mod memory_post_turn_recovery;
 
+async fn fanout_test_processor() -> (Arc<MessageProcessor>, String) {
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    (
+        Arc::new(MessageProcessor::new(
+            Arc::new(ThreadManager::new("test-model", "openai")),
+            test_provider(),
+            Arc::new(SessionManager::new()),
+            workspace_manager,
+            crud_store,
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        )),
+        workspace_id,
+    )
+}
+fn fanout_test_task(id: &str, workspace_id: &str) -> pioneer_protocol::Task {
+    pioneer_protocol::Task {
+        id: id.into(),
+        workspace_id: workspace_id.into(),
+        owner_kind: TaskOwnerKind::Workspace,
+        owner_id: Some(workspace_id.into()),
+        created_by_thread_id: None,
+        created_by_turn_id: None,
+        root_task_id: None,
+        parent_task_id: None,
+        executor_kind: TaskExecutorKind::System,
+        status: TaskStatus::Scheduled,
+        title: "Fanout".into(),
+        goal: "Bounded delivery".into(),
+        priority: 0,
+        lifecycle_policy: None,
+        delivery_policy: None,
+        retry_policy: None,
+        timeout_policy: None,
+        concurrency_policy: None,
+        metadata: None,
+        result: None,
+        error: None,
+        revision: 0,
+        created_at: 1_700_000_000,
+        updated_at: 1_700_000_000,
+        completed_at: None,
+    }
+}
+async fn fanout_test_append(processor: &MessageProcessor, id: &str, message: &str) {
+    processor
+        .crud_store
+        .append_task_event(
+            TaskEventPayload::Progress {
+                task_id: id.into(),
+                run_id: None,
+                message: message.into(),
+                details: None,
+            },
+            1_700_000_001,
+        )
+        .await
+        .unwrap();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fanout_quantum_shares_total_event_budget_and_leaves_large_backlogs_ready() {
+    let (processor, workspace) = fanout_test_processor().await;
+    for n in 0..70 {
+        let id = format!("fanout_{n:014}");
+        let task = fanout_test_task(&id, &workspace);
+        processor
+            .crud_store
+            .append_task_event(TaskEventPayload::TaskCreated { task }, 1_700_000_000)
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            fanout_test_append(&processor, &id, "small").await;
+        }
+    }
+    // Source triggers already covered these new Tasks; exercise a full due budget.
+    let summary = processor
+        .for_background_reconciliation()
+        .task_event_fanout_quantum()
+        .await
+        .unwrap();
+    assert_eq!(summary.selected, 64);
+    assert_eq!(summary.event_inputs, 128);
+    assert_eq!(summary.emitted, 128);
+    assert_eq!(summary.errors, 0);
+    assert_eq!(summary.pending, Some(true));
+    let id = "fanout_00000000000000";
+    assert_eq!(
+        processor
+            .crud_store
+            .get_task_event_fanout_cursor(id)
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    for _ in 0..140 {
+        fanout_test_append(&processor, id, "large backlog").await;
+    }
+    for _ in 0..10 {
+        let summary = processor
+            .for_background_reconciliation()
+            .task_event_fanout_quantum()
+            .await
+            .unwrap();
+        assert!(summary.emitted <= 128);
+        assert_eq!(summary.errors, 0);
+    }
+    assert!(
+        processor
+            .crud_store
+            .get_task_event_fanout_cursor(id)
+            .await
+            .unwrap()
+            .unwrap()
+            > 128
+    );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fanout_failure_n_preserves_prefix_and_allows_another_task_to_progress() {
+    use pioneer_entity::task_event;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    let (processor, workspace) = fanout_test_processor().await;
+    for id in ["fanout_bad", "fanout_good"] {
+        processor
+            .crud_store
+            .append_task_event(
+                TaskEventPayload::TaskCreated {
+                    task: fanout_test_task(id, &workspace),
+                },
+                1_700_000_000,
+            )
+            .await
+            .unwrap();
+        fanout_test_append(&processor, id, "N").await;
+        fanout_test_append(&processor, id, "N+1").await;
+    }
+    // Malformed immutable payload models a poison stored event, not ingress.
+    task_event::Entity::update_many()
+        .col_expr(
+            task_event::Column::PayloadJson,
+            sea_orm::sea_query::Expr::val("{invalid"),
+        )
+        .filter(task_event::Column::TaskId.eq("fanout_bad"))
+        .filter(task_event::Column::Sequence.eq(2_i64))
+        .exec(&processor.crud_store.database_connection())
+        .await
+        .unwrap();
+    let summary = processor
+        .for_background_reconciliation()
+        .task_event_fanout_quantum()
+        .await
+        .unwrap();
+    assert_eq!(summary.errors, 1);
+    assert_eq!(summary.emitted, 4);
+    assert_eq!(summary.pending, Some(true));
+    assert_eq!(
+        processor
+            .crud_store
+            .get_task_event_fanout_cursor("fanout_bad")
+            .await
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        processor
+            .crud_store
+            .get_task_event_fanout_cursor("fanout_good")
+            .await
+            .unwrap(),
+        Some(3)
+    );
+    let next = processor
+        .for_background_reconciliation()
+        .task_event_fanout_quantum()
+        .await
+        .unwrap();
+    assert_eq!(next.emitted, 0);
+    assert_eq!(
+        next.pending,
+        Some(true),
+        "future poison retry is not true empty"
+    );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fanout_periodic_dispatcher_recovers_commit_without_any_bus_publication() {
+    let (processor, workspace) = fanout_test_processor().await;
+    // CrudStore append deliberately has no TaskService bus publication.
+    processor
+        .crud_store
+        .append_task_event(
+            TaskEventPayload::TaskCreated {
+                task: fanout_test_task("fanout_lost_wake", &workspace),
+            },
+            1_700_000_000,
+        )
+        .await
+        .unwrap();
+    processor.start_task_event_listener().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if processor
+                .crud_store
+                .get_task_event_fanout_cursor("fanout_lost_wake")
+                .await
+                .unwrap()
+                == Some(1)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    processor.shutdown_resilience_workers().await;
+    assert!(processor.task_event_listener_worker.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn fanout_lagged_and_duplicate_wakes_do_not_create_competing_emitters() {
+    let (processor, workspace) = fanout_test_processor().await;
+    let event = processor
+        .crud_store
+        .append_task_event(
+            TaskEventPayload::TaskCreated {
+                task: fanout_test_task("fanout_lagged_wake", &workspace),
+            },
+            1_700_000_000,
+        )
+        .await
+        .unwrap();
+    let bus = processor.task_runtime.event_bus();
+    let mut probe = bus.subscribe(pioneer_tasks::TaskEventFilter::default());
+    processor.start_task_event_listener().await;
+    // publish performs no yielding I/O: both subscriptions lag before the
+    // single-thread runtime can first poll the owned dispatcher.
+    for _ in 0..1040 {
+        bus.publish(event.clone()).await;
+    }
+    assert!(matches!(
+        probe.recv().await,
+        pioneer_tasks::TaskEventWakeDelivery::Lagged(_)
+    ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if processor
+                .crud_store
+                .get_task_event_fanout_cursor("fanout_lagged_wake")
+                .await
+                .unwrap()
+                == Some(1)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    processor.shutdown_resilience_workers().await;
+    assert!(
+        !processor
+            .crud_store
+            .has_pending_task_event_fanout()
+            .await
+            .unwrap()
+    );
+}
+
+#[path = "tests/task_event_fanout_review.rs"]
+mod fanout_review;
 struct CancellationEffectBarrier {
     hook_entered: Notify,
     cleanup_entered: Notify,
