@@ -33054,11 +33054,14 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 #[cfg(test)]
 mod tests {
     use crate::{
-        NewThreadEpisodicExclusionRecord, THREAD_EPISODIC_PROJECTION_CHANGED_ERROR,
+        NewThreadEpisodicExclusionRecord, PROJECTION_META_STATUS_PENDING,
+        ProjectionMetaConfigRecord, ProjectionMetaRecord, THREAD_EPISODIC_PROJECTION_CHANGED_ERROR,
         THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR, THREAD_EPISODIC_USER_DELETED_ERROR,
         THREAD_EPISODIC_USER_EXCLUDED_ERROR, ThreadEpisodicExclusionReason,
-        ThreadEpisodicIndexAttemptOutcome, ThreadEpisodicIndexJobRecord,
-        ThreadEpisodicIndexJobStatus,
+        ThreadEpisodicIndexAttemptOutcome, ThreadEpisodicIndexJobFailureUpdate,
+        ThreadEpisodicIndexJobRecord, ThreadEpisodicIndexJobStatus,
+        ThreadEpisodicProjectionResetProgress, find_projection_meta,
+        thread_episodic_projection_reset_key, upsert_projection_meta_with_config,
     };
     #[path = "cli_runtime_active_bindings.rs"]
     mod cli_runtime_active_bindings;
