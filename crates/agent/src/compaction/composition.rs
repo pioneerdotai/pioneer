@@ -300,8 +300,9 @@ fn collect_checkpoint_aliases(
                         id: represented.1.id.clone(),
                         version: represented.1.version.clone(),
                     },
-                }) && represented.1.scope.starts_with("input:")
-                    && alias.source.scope.starts_with("input:"),
+                }) && ((represented.1.scope.starts_with("input:")
+                    && alias.source.scope.starts_with("input:"))
+                    || alias.is_response_copy()),
                 "checkpoint input alias is outside its exact leaf closure"
             );
             claims.add_alias(alias);

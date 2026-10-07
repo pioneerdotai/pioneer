@@ -7801,7 +7801,7 @@ mod tests {
                 origin: Set("task".to_owned()),
                 mentions_json: Set("[]".to_owned()),
                 message_revision: Set(1),
-                work_owner: Set("agent".to_owned()),
+                work_owner: Set("turn".to_owned()),
                 ..Default::default()
             }
             .insert(&db)

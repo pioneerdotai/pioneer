@@ -223,6 +223,7 @@ pub(crate) struct CliMcpBridgeLaunch {
     grant_ref: CliMcpGrantRef,
     endpoint: BridgeEndpoint,
     bootstrap_path: PathBuf,
+    cleanup_completed: Arc<AtomicBool>,
     #[cfg(test)]
     cancellation: CancellationToken,
 }
@@ -258,6 +259,12 @@ impl CliMcpBridgeLaunch {
         self.bootstrap_path.as_path()
     }
 
+    /// Proof for this exact launch, published only after strict cleanup succeeds.
+    /// Cancellation and absence from the session map are not completion.
+    pub(crate) fn cleanup_confirmed(&self) -> bool {
+        self.cleanup_completed.load(Ordering::Acquire)
+    }
+
     #[cfg(test)]
     pub(crate) fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
@@ -283,6 +290,7 @@ struct CliMcpBridgeSession {
     bootstrap_directory: Option<PrivateSessionDirectory>,
     endpoint_directory: Option<PrivateSessionDirectory>,
     cancellation: CancellationToken,
+    cleanup_completed: Arc<AtomicBool>,
     cleanup: Option<Arc<Mutex<CliMcpBridgeCleanup>>>,
 }
 // Cleanup resources stay in the same supervisor session entry across awaits.
@@ -445,6 +453,7 @@ impl CliMcpBridgeSupervisor {
         let endpoint = document.endpoint;
         let bootstrap_path = bootstrap.path().to_path_buf();
         let cancellation = CancellationToken::new();
+        let cleanup_completed = Arc::new(AtomicBool::new(false));
         #[cfg(test)]
         let launch_cancellation = cancellation.clone();
         let session = CliMcpBridgeSession {
@@ -460,6 +469,7 @@ impl CliMcpBridgeSupervisor {
             bootstrap_directory,
             endpoint_directory: Some(endpoint_directory),
             cancellation,
+            cleanup_completed: cleanup_completed.clone(),
             cleanup: None,
         };
         let mut sessions = self.sessions.lock().await;
@@ -476,6 +486,7 @@ impl CliMcpBridgeSupervisor {
             grant_ref,
             endpoint,
             bootstrap_path,
+            cleanup_completed,
             #[cfg(test)]
             cancellation: launch_cancellation,
         })
@@ -656,7 +667,7 @@ impl CliMcpBridgeSupervisor {
         &self,
         process_instance: &CliSessionInstanceId,
     ) -> anyhow::Result<bool> {
-        let cleanup = {
+        let (cleanup, cleanup_completed) = {
             let mut sessions = self.sessions.lock().await;
             let Some(session) = sessions.get_mut(process_instance) else {
                 return Ok(false);
@@ -666,7 +677,7 @@ impl CliMcpBridgeSupervisor {
             }
             session.cancellation.cancel();
             session.state = CliMcpBridgeSessionState::Revoking;
-            session
+            let cleanup = session
                 .cleanup
                 .get_or_insert_with(|| {
                     Arc::new(Mutex::new(CliMcpBridgeCleanup {
@@ -680,7 +691,8 @@ impl CliMcpBridgeSupervisor {
                         finished: false,
                     }))
                 })
-                .clone()
+                .clone();
+            (cleanup, session.cleanup_completed.clone())
         };
         let mut resources = cleanup.lock().await;
         if !resources.finished {
@@ -722,6 +734,7 @@ impl CliMcpBridgeSupervisor {
             .is_some_and(|current| Arc::ptr_eq(current, &cleanup))
         {
             sessions.remove(process_instance);
+            cleanup_completed.store(true, Ordering::Release);
         }
         Ok(true)
     }
@@ -1065,6 +1078,7 @@ mod tests {
         ));
         assert!(supervisor.state(launch.process_instance()).await.is_none());
         assert!(!launch.bootstrap_path().exists());
+        assert!(launch.cleanup_confirmed());
     }
 
     #[tokio::test]
@@ -1072,6 +1086,7 @@ mod tests {
         let root = temporary_root();
         let supervisor = CliMcpBridgeSupervisor::new(root.path().join("sessions"));
         let launch = supervisor.prepare(scope(1), expiry()).await.unwrap();
+        assert!(!launch.cleanup_confirmed());
         let directory = launch.bootstrap_path().parent().unwrap().to_path_buf();
         let blocker = directory.join("unexpected-file");
         std::fs::write(&blocker, b"cleanup failure injection").unwrap();
@@ -1086,6 +1101,10 @@ mod tests {
             Some(CliMcpBridgeSessionState::Revoking)
         );
         assert!(directory.exists());
+        assert!(
+            !launch.cleanup_confirmed(),
+            "failed cleanup is not completion"
+        );
         std::fs::remove_file(blocker).unwrap();
         assert!(
             supervisor
@@ -1095,6 +1114,7 @@ mod tests {
         );
         assert!(supervisor.state(launch.process_instance()).await.is_none());
         assert!(!directory.exists());
+        assert!(launch.cleanup_confirmed());
     }
 
     #[tokio::test]

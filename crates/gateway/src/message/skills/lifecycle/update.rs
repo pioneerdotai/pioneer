@@ -44,7 +44,7 @@ impl MessageProcessor {
             None => SkillInstallSource::UploadedSkill(params.source.clone()),
         };
         let owned = native.is_some();
-        let work = self.update_skill_source(
+        let work = self.update_skill_source_deferred(
             request_context,
             request_id.clone(),
             SkillUpdateInput {
@@ -98,29 +98,34 @@ impl MessageProcessor {
             (result, None) => result,
         };
         match result {
-            Ok(payload) => match JsonRpcResponse::from_result(request_id, &payload) {
-                Ok(response) => {
-                    if let Err(error) = self
-                        .send_json(request_context.connection_id(), &response)
+            Ok((payload, publication)) => {
+                match JsonRpcResponse::from_result(request_id, &payload) {
+                    Ok(response) => {
+                        if let Err(error) = self
+                            .send_json(request_context.connection_id(), &response)
+                            .await
+                        {
+                            warn!(error = %error, "failed to send skills/update response");
+                        }
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            request_context.connection_id(),
+                            skills_error(
+                                None,
+                                INVALID_REQUEST_CODE,
+                                SKILLS_ERROR_INTERNAL,
+                                "failed to encode skills/update response",
+                                json!({"error": format!("{error:#}")}),
+                            ),
+                        )
                         .await
-                    {
-                        warn!(error = %error, "failed to send skills/update response");
                     }
                 }
-                Err(error) => {
-                    self.send_error(
-                        request_context.connection_id(),
-                        skills_error(
-                            None,
-                            INVALID_REQUEST_CODE,
-                            SKILLS_ERROR_INTERNAL,
-                            "failed to encode skills/update response",
-                            json!({"error": format!("{error:#}")}),
-                        ),
-                    )
-                    .await
+                if let Some(publication) = publication {
+                    self.publish_skill_change(publication).await;
                 }
-            },
+            }
             Err(error) => {
                 self.send_error(request_context.connection_id(), error)
                     .await
@@ -135,6 +140,25 @@ impl MessageProcessor {
         params: SkillUpdateInput,
         source: SkillInstallSource,
     ) -> std::result::Result<SkillsUpdateResponse, JsonRpcErrorResponse> {
+        let (response, publication) = self
+            .update_skill_source_deferred(request_context, request_id, params, source)
+            .await?;
+        if let Some(publication) = publication {
+            self.publish_skill_change(publication).await;
+        }
+        Ok(response)
+    }
+
+    async fn update_skill_source_deferred(
+        &self,
+        request_context: &RequestContext,
+        request_id: RequestId,
+        params: SkillUpdateInput,
+        source: SkillInstallSource,
+    ) -> std::result::Result<
+        (SkillsUpdateResponse, Option<SkillChangePublication>),
+        JsonRpcErrorResponse,
+    > {
         let connection_id = request_context.connection_id();
         let authenticated_owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let workspace_id = match self
@@ -408,7 +432,7 @@ impl MessageProcessor {
                 },
                 audit: SkillLifecycleAuditSummary { events_written: 0 },
             };
-            return Ok(payload);
+            return Ok((payload, None));
         }
 
         let update_result = match pioneer_skills::commit_prepared_skill(
@@ -525,22 +549,24 @@ impl MessageProcessor {
                 events_written: audit_records.len(),
             },
         };
-        self.notify_skills_changed(
-            workspace_id.as_str(),
-            "updated",
-            vec![SkillChangedItem {
-                skill_id: params.skill_id,
-                owner: updated_owner,
-                slug: updated_slug,
-                source_kind: existing.source_kind,
-                change_type: "update".to_owned(),
-                fingerprint_before: Some(existing.fingerprint),
-                fingerprint_after: Some(updated_fingerprint),
-            }],
-            now,
-        )
-        .await;
-        Ok(payload)
+        Ok((
+            payload,
+            Some(SkillChangePublication {
+                workspace_id,
+                reason: "updated",
+                changes: vec![SkillChangedItem {
+                    skill_id: params.skill_id,
+                    owner: updated_owner,
+                    slug: updated_slug,
+                    source_kind: existing.source_kind,
+                    change_type: "update".to_owned(),
+                    fingerprint_before: Some(existing.fingerprint),
+                    fingerprint_after: Some(updated_fingerprint),
+                }],
+                pack_changes: Vec::new(),
+                created_at: now,
+            }),
+        ))
     }
 }
 

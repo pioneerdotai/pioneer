@@ -43,7 +43,8 @@ pub(crate) async fn garbage_collection_orphan_mcp_secrets(
     for (kind, owner, payload) in retention {
         if kind == "native" {
             active_ids.insert(owner);
-            let refs: Vec<McpSecretRef> = serde_json::from_str(&payload)?;
+            let refs: Vec<McpSecretRef> =
+                serde_json::from_str(&payload).context("failed to decode MCP secret refs")?;
             active_refs.extend(refs.into_iter().map(|entry| entry.ref_id));
         } else {
             anyhow::ensure!(
@@ -131,7 +132,7 @@ mod tests {
     use sea_orm::Database;
     use std::sync::Arc;
 
-    // NOT_RUN / NOT_COMPILED. In-memory fixture only; no user's keystore.
+    // In-memory fixture only; no user's keystore.
     #[tokio::test]
     async fn interrupted_parent_retains_uncertain_refs_until_explicit_cleanup() {
         use sea_orm::{EntityTrait, Set};
@@ -163,13 +164,17 @@ mod tests {
                 data_path: "/managed/data".into(),
                 package_fingerprint: "fixture".into(),
                 enabled: true,
-                state: "interrupted".into(),
+                state: "installing".into(),
                 revision: 1,
                 pending_json: Some(pending.clone()),
                 last_error: None,
                 created_at: now,
                 updated_at: now,
             })
+            .await
+            .unwrap();
+        store
+            .interrupt_plugin_mutation(&id, 1, &pending, "fixture interruption")
             .await
             .unwrap();
         secrets

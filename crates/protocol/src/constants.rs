@@ -101,7 +101,7 @@ pub mod methods {
     pub const PLUGINS_REMOVE: &str = "plugins/remove";
     pub const PLUGINS_RETRY: &str = "plugins/retry";
     pub const PLUGINS_CONTINUE: &str = "plugins/continue";
-    pub const PLUGINS_SET_ENABLED: &str = "plugins/setEnabled";
+    pub const PLUGINS_SET_ENABLED: &str = "plugins/set_enabled";
     pub const PLUGINS_LIST: &str = "plugins/list";
     pub const PLUGINS_DETAILS: &str = "plugins/details";
     pub const PLUGINS_CHANGED: &str = "plugins/changed";
@@ -264,6 +264,15 @@ pub mod methods {
         CLI_RUNTIME_REQUEST_RESPOND,
         SETTINGS_GET,
         SETTINGS_UPDATE,
+        PLUGINS_PREVIEW,
+        PLUGINS_INSTALL,
+        PLUGINS_UPDATE,
+        PLUGINS_REMOVE,
+        PLUGINS_RETRY,
+        PLUGINS_CONTINUE,
+        PLUGINS_SET_ENABLED,
+        PLUGINS_LIST,
+        PLUGINS_DETAILS,
         SKILLS_LIST,
         SKILLS_INSTALL,
         SKILLS_UPDATE,

@@ -160,6 +160,25 @@ impl GatewayMemoryRuntime {
 
 #[cfg(test)]
 impl GatewayMemoryRuntime {
+    pub(crate) fn enabled_with_backend_for_test(
+        store: Arc<CrudStore>,
+        backend: Arc<dyn pioneer_memory::MemoryBackend>,
+    ) -> Self {
+        Self {
+            enabled: true,
+            service: Arc::new(MemoryService::new(
+                store,
+                backend,
+                MemoryServiceConfig::default(),
+            )),
+            context_defaults: GatewayMemoryContextDefaults {
+                allow_global_user: true,
+                allow_global_agent: false,
+            },
+            capsules_root: None,
+        }
+    }
+
     pub(crate) fn disabled(store: Arc<CrudStore>) -> Self {
         Self {
             enabled: false,

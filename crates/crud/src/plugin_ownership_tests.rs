@@ -1,4 +1,4 @@
-//! Plugin regressions. NOT_RUN; test targets have not been compiled.
+//! Plugin ownership and native lifecycle regressions.
 use super::tests::{pack_skill_record, skill_pack_record, test_store_with_workspace};
 use super::*;
 use pioneer_entity::plugin_installation;
@@ -117,7 +117,7 @@ async fn package_update_retains_native_identity_policy_overrides_and_successful_
             .install_skill_lifecycle_with_ownership(
                 row,
                 &policy(row),
-                &[],
+                &[skill_audit(row)],
                 None,
                 Some(&ownership(&id, row.skill_id.as_str(), key)),
                 1,
@@ -180,7 +180,11 @@ async fn package_update_retains_native_identity_policy_overrides_and_successful_
             .update_skill_lifecycle_with_plugin_change(
                 &first.skill_id,
                 &patch,
-                &[],
+                &[SkillAuditEventRecord {
+                    action: "update".into(),
+                    created_at_unix: 3,
+                    ..skill_audit(&first)
+                }],
                 None,
                 Some(&owned),
                 None,
@@ -243,12 +247,18 @@ async fn interrupted_package_removal_is_repairable_and_cannot_forget_a_live_nati
         .install_skill_lifecycle_with_ownership(
             &child,
             &policy(&child),
-            &[],
+            &[skill_audit(&child)],
             None,
             Some(&ownership(&id, child.skill_id.as_str(), "one")),
             1,
         )
         .await
+        .unwrap();
+    // Uninstall revalidates the full stored record, including installer timestamps.
+    let child = store
+        .find_skill_installation(&child.skill_id)
+        .await
+        .unwrap()
         .unwrap();
     store
         .settle_plugin_installation(&id, 1, "installed", None)
@@ -281,7 +291,16 @@ async fn interrupted_package_removal_is_repairable_and_cannot_forget_a_live_nati
     };
     assert!(
         store
-            .uninstall_skill_installation_lifecycle_with_plugin_change(&child, &[], Some(&write), 2)
+            .uninstall_skill_installation_lifecycle_with_plugin_change(
+                &child,
+                &[SkillAuditEventRecord {
+                    action: "uninstall".into(),
+                    created_at_unix: 2,
+                    ..skill_audit(&child)
+                }],
+                Some(&write),
+                2,
+            )
             .await
             .unwrap()
     );
@@ -440,7 +459,7 @@ async fn plugin_ready_keeps_resolved_siblings_and_rejects_real_missing_bindings(
             .install_skill_lifecycle_with_ownership(
                 row,
                 &restriction,
-                &[],
+                &[skill_audit(row)],
                 None,
                 Some(&ownership(
                     &parent_id,
@@ -1219,7 +1238,6 @@ async fn install_failure_preserves_native_sibling_and_closes_failed_child() {
     );
 }
 
-// C1 source regressions: NOT_RUN / NOT_COMPILED.
 #[tokio::test]
 async fn closed_gate_reconciliation_and_enable_preserve_native_restrictions() {
     let store = test_store_with_workspace("ws-c1").await;
@@ -1231,7 +1249,14 @@ async fn closed_gate_reconciliation_and_enable_preserve_native_restrictions() {
     let child = skill('S', "ws-c1");
     let write = ownership(&id, child.skill_id.as_str(), "one");
     store
-        .install_skill_lifecycle_with_ownership(&child, &policy(&child), &[], None, Some(&write), 1)
+        .install_skill_lifecycle_with_ownership(
+            &child,
+            &policy(&child),
+            &[skill_audit(&child)],
+            None,
+            Some(&write),
+            1,
+        )
         .await
         .unwrap();
     store
@@ -1362,7 +1387,14 @@ async fn failed_assets_only_update_preserves_the_last_committed_tree_for_retry()
     let child = skill('S', "ws-c1-assets");
     let write = ownership(&id, child.skill_id.as_str(), "one");
     store
-        .install_skill_lifecycle_with_ownership(&child, &policy(&child), &[], None, Some(&write), 1)
+        .install_skill_lifecycle_with_ownership(
+            &child,
+            &policy(&child),
+            &[skill_audit(&child)],
+            None,
+            Some(&write),
+            1,
+        )
         .await
         .unwrap();
     let mut failed = write.clone();
@@ -1638,12 +1670,17 @@ async fn owned_skill_policy_and_user_removal_revalidate_in_the_native_writer() {
         .install_skill_lifecycle_with_ownership(
             &child,
             &policy(&child),
-            &[],
+            &[skill_audit(&child)],
             None,
             Some(&ownership(&parent_id, child.skill_id.as_str(), "one")),
             1,
         )
         .await
+        .unwrap();
+    let child = store
+        .find_skill_installation(&child.skill_id)
+        .await
+        .unwrap()
         .unwrap();
     store
         .settle_plugin_installation(&parent_id, 1, "installed", None)

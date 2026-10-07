@@ -8,6 +8,17 @@ use sea_orm::{
 };
 
 const MIGRATION: &str = "m20261004_000006_task_delivery_recovery";
+
+// Keep schema tests on the recovery release, so down(1) targets recovery
+// rather than a later, potentially irreversible migration.
+struct RecoveryFixtureMigrator;
+impl MigratorTrait for RecoveryFixtureMigrator {
+    fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+        let mut migrations = Migrator::migrations();
+        migrations.truncate(migration_position() + 1);
+        migrations
+    }
+}
 const OBJECTS: [&str; 8] = [
     "idx_task_delivery_recovery_source",
     "task_delivery_recovery_retry",
@@ -49,7 +60,7 @@ async fn up(database: &SqliteDatabase, steps: Option<u32>) -> Result<(), DbErr> 
     // Production executor: schema DDL and its completion marker share a writer
     // transaction. Failure rolls back even DDL installed before the failure.
     let tx = database.begin().await?;
-    match Migrator::up(&*tx, steps).await {
+    match RecoveryFixtureMigrator::up(&*tx, steps).await {
         Ok(()) => tx.commit().await,
         Err(error) => {
             tx.rollback().await?;
@@ -195,9 +206,8 @@ async fn recovery_migration_ddl_failure_rolls_back_objects_and_marker_then_retri
 async fn recovery_migration_down_then_up_restores_all_physical_cleanup_coverage() {
     let (_directory, database) = before_recovery().await;
     up(&database, None).await.unwrap();
-    let suffix = (Migrator::migrations().len() - migration_position()) as u32;
     let tx = database.begin().await.unwrap();
-    Migrator::down(&*tx, Some(suffix)).await.unwrap();
+    RecoveryFixtureMigrator::down(&*tx, Some(1)).await.unwrap();
     tx.commit().await.unwrap();
     assert!(objects(&database).await.is_empty());
     assert!(!marker(&database).await);

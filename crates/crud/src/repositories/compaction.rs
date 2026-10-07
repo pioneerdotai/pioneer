@@ -273,9 +273,6 @@ impl From<compaction_operation::Model> for OperationRecord {
 pub enum CommitOutcome {
     Applied,
     AlreadyApplied,
-    /// A reader proof raced a relevant mutation. The candidate and successful
-    /// provider result remain durable; only publication validation is retried.
-    RetryValidation,
     Stale,
     Cancelled,
 }

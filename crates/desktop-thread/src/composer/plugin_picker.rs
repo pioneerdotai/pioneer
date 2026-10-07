@@ -1,10 +1,16 @@
-use super::*;
 use gpui_kit::component::{
+    button::*,
     dialog::DialogFooter,
     input::{Input, InputEvent, InputState},
+    scroll::ScrollableElement,
+    theme::ActiveTheme,
+    *,
 };
-use pioneer_client::composer::capabilities::ComposerCapability;
-use std::{collections::BTreeSet, rc::Rc};
+use gpui_kit::{prelude::*, *};
+use pioneer_client::{
+    composer::capabilities::ComposerCapability, core::ClientCore, plugins::PluginCatalogState,
+};
+use std::{collections::BTreeSet, rc::Rc, sync::Arc};
 
 type Completion = Rc<dyn Fn(Option<Vec<ComposerCapability>>, &mut Window, &mut App)>;
 struct PluginPicker {
@@ -16,8 +22,8 @@ struct PluginPicker {
     done: bool,
 }
 /// Separate modal: its rows, selection and result contain parents only. The
-/// dialog retains the Entity until dismissal; the shell retains draft identity.
-pub fn open_plugin_picker(
+/// dialog retains the Entity until dismissal; the composer retains draft identity.
+pub(super) fn open_plugin_picker(
     client: Arc<ClientCore>,
     workspace: String,
     selected: BTreeSet<String>,
@@ -183,4 +189,26 @@ pub fn open_plugin_picker(
                 ]))
     });
     search.update(cx, |search, cx| search.focus(window, cx));
+}
+
+fn status_label(status: &str) -> String {
+    match status {
+        "active" => t!("plugins.active"),
+        "blocked" => t!("plugins.blocked"),
+        "unavailable" => t!("plugins.unavailable"),
+        "installed" => t!("plugins.installed"),
+        "partial" => t!("plugins.partial"),
+        "installing" | "starting" => t!("plugins.installing"),
+        "interrupted" => t!("plugins.interrupted"),
+        "updating" => t!("plugins.updating"),
+        "removing" => t!("plugins.removing"),
+        "failed" => t!("plugins.failed"),
+        "disabled" => t!("plugins.disabled"),
+        "authrequired" | "auth_required" => t!("plugins.auth_required"),
+        "ready" => t!("plugins.authorized"),
+        "notstarted" | "not_started" => t!("plugins.pending"),
+        "error" | "stopped" | "offline" => t!("plugins.offline"),
+        _ => t!("plugins.unavailable"),
+    }
+    .to_string()
 }

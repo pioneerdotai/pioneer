@@ -673,9 +673,9 @@ fn unit_identity_cache_and_cross_shell_policies_match_the_contract() {
     assert_eq!(c.version, 1);
     assert_eq!(c.platforms, ["desktop", "ios", "android"]);
     assert_eq!(c.ui_cases.iter().collect::<BTreeSet<_>>().len(), 47);
-    assert_eq!(c.units.len(), 47);
+    assert_eq!(c.units.len(), 48);
     assert_eq!(c.divergence_owners.len(), 10);
-    for number in 1..=47 {
+    for number in 1..=48 {
         let unit = &c.units[&format!("TUI-{number:02}")];
         assert!(!unit.owner.is_empty());
         let text = source(&unit.file);

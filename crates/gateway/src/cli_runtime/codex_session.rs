@@ -944,10 +944,12 @@ impl CodexRequiredMcpBridge {
         }
         outcome.clone().unwrap().map_err(|e| anyhow!("{e}"))?;
         if !*cleanup_done {
-            if !self
-                .supervisor
-                .revoke_session_result(&self.process_instance)
-                .await?
+            if !self.launch.cleanup_confirmed()
+                && !self
+                    .supervisor
+                    .revoke_session_result(&self.process_instance)
+                    .await?
+                && !self.launch.cleanup_confirmed()
             {
                 bail!("CLI MCP cleanup owner is unknown");
             }
@@ -3615,8 +3617,14 @@ mod tests {
         assert!(!supervisor.revoke_session(&process_instance).await);
         assert!(matches!(
             *bridge.state.lock().await,
-            CodexRequiredMcpBridgeState::Failed
+            CodexRequiredMcpBridgeState::Stopping {
+                server: None,
+                outcome: Some(Ok(())),
+                cleanup_done: true,
+                ..
+            }
         ));
+        bridge.stop_and_wait().await.expect("cleanup is idempotent");
     }
 
     #[tokio::test]

@@ -1,13 +1,14 @@
-//! Retained Plugins management and a separate parent-only selection dialog.
+//! Retained Plugins management.
 #[macro_use]
 extern crate rust_i18n;
 rust_i18n::i18n!("locales", fallback = "en");
 mod management;
-mod picker;
 use gpui_kit::component::{button::*, scroll::ScrollableElement, theme::ActiveTheme, *};
 use gpui_kit::{prelude::*, *};
-pub use picker::open_plugin_picker;
-use pioneer_client::plugins::PluginManagementState;
+use pioneer_client::plugins::{
+    PluginComponentItem, PluginComponentKey, PluginItem, PluginManagementState,
+    PluginsSetEnabledParams, PluginsUpdatePreviewResponse,
+};
 use pioneer_client::{
     core::ClientCore,
     plugins::PluginCatalogState,
@@ -18,10 +19,6 @@ use pioneer_client::{
 };
 use pioneer_desktop_foundation::{
     ClientBindingRegistrar, ClientBindingRegistration, ClientPublicationSink,
-};
-use pioneer_protocol::{
-    PluginComponentItem, PluginComponentKey, PluginItem, PluginsSetEnabledParams,
-    PluginsUpdatePreviewResponse,
 };
 use std::sync::Arc;
 struct UploadChanges(tokio::sync::watch::Sender<u64>);
@@ -55,7 +52,6 @@ pub(crate) fn status_label(status: &str) -> String {
 
 #[cfg(test)]
 mod status_tests {
-    // Regression sources only: NOT_RUN / NOT_COMPILED.
     #[::core::prelude::v1::test]
     fn skill_runtime_states_have_real_labels_and_mcp_labels_stay_distinct() {
         for (state, label) in [
@@ -94,6 +90,9 @@ fn diagnostic_label(code: &str) -> String {
     .to_string()
 }
 
+pub type PluginComponentDetailsFactory =
+    Box<dyn Fn(&str, &str, &PluginComponentItem, &mut Window, &mut App) -> Option<AnyView>>;
+
 pub struct PluginsView {
     registrar: Arc<dyn ClientBindingRegistrar>,
     upload_changes: Arc<UploadChanges>,
@@ -117,12 +116,14 @@ pub struct PluginsView {
     update_preview: Option<(String, PluginsUpdatePreviewResponse)>,
     remove_confirmation: bool,
     purge_data: bool,
-    child_details: Option<management::ChildDetails>,
+    component_details: PluginComponentDetailsFactory,
+    child_details: Option<AnyView>,
 }
 impl PluginsView {
     pub fn new(
         client: Arc<ClientCore>,
         registrar: Arc<dyn ClientBindingRegistrar>,
+        component_details: PluginComponentDetailsFactory,
         cx: &mut App,
     ) -> Entity<Self> {
         let mut changes = client.watch_plugin_catalog();
@@ -144,6 +145,7 @@ impl PluginsView {
             Self {
                 _changes: task,
                 registrar,
+                component_details,
                 upload_changes: Arc::new(UploadChanges(tokio::sync::watch::channel(0).0)),
                 upload_registration: None,
                 client,
@@ -366,7 +368,7 @@ impl Render for PluginsView {
                             cx.notify();
                         })),
                 )
-                .child(child.element())
+                .child(div().flex_1().min_h_0().child(child))
                 .into_any_element();
         }
         let busy = self.upload_active()

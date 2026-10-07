@@ -260,6 +260,24 @@ pub async fn upsert_candidate<C: ConnectionTrait>(
     Ok(())
 }
 
+/// Mirrors the legacy projector's creation eligibility, without loading JSON.
+/// This is not a terminal-effect gate predicate.
+pub(crate) async fn has_accepted_candidate_by_run<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+) -> Result<bool> {
+    Ok(task_result_candidate::Entity::find()
+        .select_only()
+        .column(task_result_candidate::Column::Id)
+        .filter(task_result_candidate::Column::RunId.eq(run_id.to_owned()))
+        .filter(Expr::cust("status = 'accepted'"))
+        .limit(1)
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .is_some())
+}
+
 pub async fn find_candidate_by_id<C: ConnectionTrait>(
     db: &C,
     id: &str,

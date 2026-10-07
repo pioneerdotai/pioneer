@@ -68,7 +68,10 @@ mod tests {
         ]);
         let portable = configured_headers(&values, true).unwrap();
         assert_eq!(portable.len(), 1);
-        assert_eq!(portable["x-context"], "${PLUGIN_ROOT}");
+        assert_eq!(
+            portable[&HeaderName::from_static("x-context")],
+            "${PLUGIN_ROOT}"
+        );
         let legacy = configured_headers(&values, false).unwrap();
         assert_eq!(legacy.len(), 4);
     }

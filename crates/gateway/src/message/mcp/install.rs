@@ -73,7 +73,7 @@ impl MessageProcessor {
         };
 
         match self
-            .install_mcp_plan(
+            .install_mcp_plan_deferred(
                 request_context,
                 request_id.clone(),
                 &workspace_id,
@@ -84,32 +84,34 @@ impl MessageProcessor {
             )
             .await
         {
-            Ok(payload) => match JsonRpcResponse::from_result(request_id, &payload) {
-                Ok(response) => {
-                    if let Err(error) = self.send_json(connection_id, &response).await {
-                        warn!(connection_id, error = %error, "failed to send mcp/install response");
+            Ok((payload, changed)) => {
+                match JsonRpcResponse::from_result(request_id, &payload) {
+                    Ok(response) => {
+                        if let Err(error) = self.send_json(connection_id, &response).await {
+                            warn!(connection_id, error = %error, "failed to send mcp/install response");
+                        }
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            mcp_error(
+                                None,
+                                INVALID_REQUEST_CODE,
+                                MCP_ERROR_INTERNAL,
+                                "failed to encode mcp/install response",
+                                json!({"error": format!("{error:#}")}),
+                            ),
+                        )
+                        .await
                     }
                 }
-                Err(error) => {
-                    self.send_error(
-                        connection_id,
-                        mcp_error(
-                            None,
-                            INVALID_REQUEST_CODE,
-                            MCP_ERROR_INTERNAL,
-                            "failed to encode mcp/install response",
-                            json!({"error": format!("{error:#}")}),
-                        ),
-                    )
-                    .await
-                }
-            },
+                self.publish_mcp_changes(&workspace_id, changed).await;
+            }
             Err(error) => self.send_error(connection_id, error).await,
         }
     }
 
-    /// The genuine native installer, shared by the legacy parser and portable
-    /// package adapter. Ownership is committed with the native row and audit.
+    /// Plugin operations publish native changes before returning to their parent.
     pub(crate) async fn install_mcp_plan(
         &self,
         request_context: &RequestContext,
@@ -120,6 +122,33 @@ impl MessageProcessor {
         oauth_redirect_uri: Option<&str>,
         oauth_callback_unavailable: bool,
     ) -> std::result::Result<McpInstallResponse, JsonRpcErrorResponse> {
+        let (response, changed) = self
+            .install_mcp_plan_deferred(
+                request_context,
+                request_id,
+                workspace_id,
+                plan,
+                ownership,
+                oauth_redirect_uri,
+                oauth_callback_unavailable,
+            )
+            .await?;
+        self.publish_mcp_changes(workspace_id, changed).await;
+        Ok(response)
+    }
+
+    /// The genuine native installer, shared by the legacy parser and portable
+    /// package adapter. Ownership is committed with the native row and audit.
+    async fn install_mcp_plan_deferred(
+        &self,
+        request_context: &RequestContext,
+        request_id: RequestId,
+        workspace_id: &str,
+        plan: pioneer_mcp::McpInstallPlan,
+        ownership: Option<&pioneer_crud::PluginOwnershipWrite>,
+        oauth_redirect_uri: Option<&str>,
+        oauth_callback_unavailable: bool,
+    ) -> std::result::Result<(McpInstallResponse, Vec<McpChangedItem>), JsonRpcErrorResponse> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
         let mut owned_id = None;
         if ownership.is_none() {
@@ -271,7 +300,7 @@ impl MessageProcessor {
         mut native: Option<&mut super::super::plugins::NativePluginMutation>,
         oauth_redirect_uri: Option<&str>,
         oauth_callback_unavailable: bool,
-    ) -> std::result::Result<McpInstallResponse, JsonRpcErrorResponse> {
+    ) -> std::result::Result<(McpInstallResponse, Vec<McpChangedItem>), JsonRpcErrorResponse> {
         let connection_id = request_context.connection_id();
         let workspace_id = self
             .validate_mcp_workspace(
@@ -811,29 +840,7 @@ impl MessageProcessor {
             audit: McpLifecycleAuditSummary { events_written },
         };
 
-        if !changed.is_empty() {
-            let snapshot_version = self.next_mcp_snapshot_version();
-            let notification = McpChangedNotification {
-                workspace_id: workspace_id.clone(),
-                snapshot_version,
-                changed,
-            };
-            self.send_gateway_management_notification(events::MCP_CHANGED, &notification)
-                .await;
-        }
-
-        if let Err(error) = self
-            .mcp_service
-            .reload_workspace(workspace_id.as_str())
-            .await
-        {
-            warn!(
-                workspace_id = workspace_id.as_str(),
-                error = %format!("{error:#}"),
-                "failed to reload MCP runtime after install"
-            );
-        }
-        Ok(response_payload)
+        Ok((response_payload, changed))
     }
 }
 

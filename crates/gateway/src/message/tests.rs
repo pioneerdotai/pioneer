@@ -1,6 +1,9 @@
 #[path = "tests/agent_action_outbox.rs"]
 mod agent_action_outbox;
 
+#[path = "tests/history_continuation.rs"]
+mod history_continuation;
+
 #[path = "tests/compaction_lifecycle_poll.rs"]
 mod compaction_lifecycle_poll;
 
@@ -1360,7 +1363,26 @@ async fn setup_cli_runtime_security_harness_for_principal(
     }
 }
 
-// Stage B regression source; NOT_RUN / NOT_COMPILED.
+fn fixture_skill_lifecycle_audit(
+    skill_id: &pioneer_protocol::SkillId,
+    slug: &str,
+    action: &str,
+    now: i64,
+) -> pioneer_crud::SkillAuditEventRecord {
+    pioneer_crud::SkillAuditEventRecord {
+        turn_id: None,
+        skill_id: skill_id.clone(),
+        skill_owner: None,
+        skill_slug: slug.into(),
+        source_kind: "user".into(),
+        action: action.into(),
+        decision: "accepted".into(),
+        reason_code: None,
+        details_json: "{}".into(),
+        created_at_unix: now,
+    }
+}
+
 #[test]
 fn plugin_turn_normalization_keeps_parent_and_rejects_raw_owned_skill() {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
@@ -1380,7 +1402,7 @@ fn plugin_turn_normalization_keeps_parent_and_rejects_raw_owned_skill() {
         let skill_id = pioneer_protocol::SkillId::new("S".repeat(21)).unwrap();
         let child = pioneer_crud::SkillInstallationRecord { skill_id: skill_id.clone(), owner: None, slug: "bundled".into(), version: None, source_kind: "user".into(), scope_key: harness.workspace_id.clone(), source_ref: "plugin".into(), install_path: member.to_string_lossy().into(), trust_level: "community".into(), fingerprint: "member".into(), updated_at_unix: 1, pack_id: None, pack_member_key: None };
         let policy = pioneer_crud::WorkspaceSkillPolicyRecord { id: "policy-plugin".into(), workspace_id: harness.workspace_id.clone(), skill_id: skill_id.clone(), enabled: Some(true), allow_implicit_invocation: Some(false) };
-        harness.crud_store.install_skill_lifecycle_with_ownership(&child, &policy, &[], None, Some(&pioneer_crud::PluginOwnershipWrite { plugin_id: parent_id.clone(), expected_revision: 1, member_key: "bundled".into(), member_path: Some("skills/bundled".into()), package_fingerprint: "member".into(), child_id: skill_id.to_string() }), 1).await.unwrap();
+        harness.crud_store.install_skill_lifecycle_with_ownership(&child, &policy, &[fixture_skill_lifecycle_audit(&skill_id, "bundled", "install", 1)], None, Some(&pioneer_crud::PluginOwnershipWrite { plugin_id: parent_id.clone(), expected_revision: 1, member_key: "bundled".into(), member_path: Some("skills/bundled".into()), package_fingerprint: "member".into(), child_id: skill_id.to_string() }), 1).await.unwrap();
         harness.crud_store.settle_plugin_installation(&parent_id, 1, "installed", None).await.unwrap();
         let result = harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[selected.clone()]).await.unwrap();
         assert_eq!(result.presentation.len(), 1);
@@ -1410,7 +1432,7 @@ fn plugin_turn_normalization_keeps_parent_and_rejects_raw_owned_skill() {
 }
 
 // B-03 regression source: real native list projections and both plugin RPCs.
-// NOT_RUN / NOT_COMPILED. Installation records are fixtures, no MCP is started.
+// Installation records are fixtures, no MCP is started.
 #[tokio::test]
 async fn plugins_list_and_details_preserve_native_member_disclosure() {
     use sea_orm::ConnectionTrait;
@@ -1480,7 +1502,7 @@ async fn plugins_list_and_details_preserve_native_member_disclosure() {
                     enabled: Some(enabled),
                     allow_implicit_invocation: Some(false),
                 },
-                &[],
+                &[fixture_skill_lifecycle_audit(id, key, "install", 1)],
                 None,
                 Some(&pioneer_crud::PluginOwnershipWrite {
                     plugin_id: parent_id.clone(),
@@ -27173,6 +27195,18 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
                 .status,
             TurnStatus::Blocked | TurnStatus::Interrupted | TurnStatus::Failed
         ));
+        let (_, local_terminal) = processor
+            .thread_manager
+            .turn_get(&thread, &turn)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                local_terminal.status,
+                TurnStatus::Blocked | TurnStatus::Interrupted | TurnStatus::Failed
+            ),
+            "{case}: rollback of a competing terminal candidate must not revive the cancelled Turn"
+        );
         summary.release_paused_call();
 
         let next_processor = if case == "shutdown" {
@@ -45910,6 +45944,7 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let cli_manager = test_cli_runtime_manager(Arc::new(RecordingCliRuntimeSession::default()));
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -45919,7 +45954,8 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
         test_gateway_secrets(),
         test_summary_config(),
         test_tool_loop_config(),
-    );
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
     let thread_id = "thread_cli_projection_backlog";
     let turn_id = "turn_cli_projection_backlog";
     let native_thread_id = "native_thread_cli_projection_backlog";
@@ -46015,9 +46051,13 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
 
     let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", thread_id)
         .expect("session key should build");
+    let handle = cli_manager
+        .get_or_start(key)
+        .await
+        .expect("recording CLI session should own its projection listener");
     processor
         .handle_cli_runtime_timeline_event(
-            &key,
+            handle.instance(),
             RuntimeEvent::ItemStarted(RuntimeItemStarted {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: native_turn_id.to_owned(),
@@ -46103,6 +46143,12 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
             .expect("replayed item lookup should succeed")
             .is_some(),
         "replay should project the deferred native event"
+    );
+    assert!(
+        cli_manager
+            .close_session_instance(handle.instance())
+            .await
+            .expect("recording session and its projection listener should stop")
     );
 }
 
@@ -46271,6 +46317,7 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let cli_manager = test_cli_runtime_manager(Arc::new(RecordingCliRuntimeSession::default()));
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -46280,7 +46327,8 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
         test_gateway_secrets(),
         test_summary_config(),
         test_tool_loop_config(),
-    );
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
     let thread_id = "thread_cli_runtime_failure_recovery";
     let turn_id = "turn_cli_runtime_failure_recovery";
     let native_thread_id = "native_thread_cli_runtime_failure_recovery";
@@ -46319,10 +46367,16 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
         .expect("turn binding should upsert");
     let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", thread_id)
         .expect("session key should build");
+    // Durable listeners belong to a real manager-owned session; a binding row
+    // alone must not admit unowned background work.
+    let handle = cli_manager
+        .get_or_start(key)
+        .await
+        .expect("recording CLI session should start");
 
     processor
         .handle_cli_runtime_timeline_event(
-            &key,
+            handle.instance(),
             RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: Some(native_turn_id.to_owned()),
@@ -46359,7 +46413,7 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
 
     processor
         .handle_cli_runtime_timeline_event(
-            &key,
+            handle.instance(),
             RuntimeEvent::TurnFailed(pioneer_cli_agent_runtime::event::RuntimeTurnFailed {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: Some(native_turn_id.to_owned()),
@@ -46391,6 +46445,12 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
         .expect("pending recovery jobs should load");
     assert_eq!(pending_jobs.len(), 1);
     assert_eq!(pending_jobs[0].trigger, RecoveryTrigger::RuntimeFailure);
+    assert!(
+        cli_manager
+            .close_session_instance(handle.instance())
+            .await
+            .expect("recording session and its durable listener should stop")
+    );
 }
 
 #[test]
@@ -46971,6 +47031,7 @@ async fn closed_cli_runtime_durable_hub_is_replaced() {
     register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let cli_manager = test_cli_runtime_manager(Arc::new(RecordingCliRuntimeSession::default()));
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -46980,19 +47041,20 @@ async fn closed_cli_runtime_durable_hub_is_replaced() {
         test_gateway_secrets(),
         test_summary_config(),
         test_tool_loop_config(),
-    );
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
     let key = CLIAgentRuntimeSessionKey::new(
         workspace_id,
         "codex",
         "thread_closed_cli_runtime_durable_hub",
     )
     .expect("session key should build");
-    let instance = crate::cli_runtime::session_instance::CliSessionInstanceId::unmanaged_for_test(
-        key,
-        u64::MAX,
-    )
-    .expect("test session instance should build");
-    let poisoned = Arc::new(pioneer_runtime_events::ExecutionEventHub::new());
+    let handle = cli_manager
+        .get_or_start(key)
+        .await
+        .expect("recording CLI session should own the replacement listener");
+    let instance = handle.instance().clone();
+    let poisoned = Arc::new(pioneer_runtime_events::ExecutionEventHub::new_with_owned_progress());
     let receiver = poisoned
         .take_durable_receiver()
         .await
@@ -47019,6 +47081,12 @@ async fn closed_cli_runtime_durable_hub_is_replaced() {
         .expect("replacement hub should remain cached");
     active.shutdown_progress().await;
     drop(replacement);
+    assert!(
+        cli_manager
+            .close_session_instance(&instance)
+            .await
+            .expect("replacement listener should stop with its session")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -47867,10 +47935,14 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .expect("recovery execution window should exist");
     assert_eq!(latest_window.window_index, 2);
     assert_eq!(latest_window.status, ExecutionWindowStatus::Running);
+    let recovery_handle = cli_manager
+        .existing_session(&key)
+        .await
+        .expect("recovery must retain the manager-owned process that emits progress");
 
     processor
         .handle_cli_runtime_timeline_event(
-            &key,
+            recovery_handle.instance(),
             RuntimeEvent::ItemStarted(RuntimeItemStarted {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: "native_turn_default".to_owned(),
@@ -47918,7 +47990,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
 
     processor
         .handle_cli_runtime_timeline_event(
-            &key,
+            recovery_handle.instance(),
             RuntimeEvent::ItemStarted(RuntimeItemStarted {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: "native_turn_default".to_owned(),
@@ -47970,7 +48042,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
     if fail_after_confirmation {
         processor
             .handle_cli_runtime_timeline_event(
-                &key,
+                recovery_handle.instance(),
                 RuntimeEvent::TurnFailed(RuntimeTurnFailed {
                     native_thread_id: Some(native_thread_id.to_owned()),
                     native_turn_id: Some("native_turn_default".to_owned()),
@@ -47999,12 +48071,16 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
             .expect("prior recovery job should load")
             .expect("prior recovery job should exist");
         assert_eq!(prior_job.status, RecoveryJobStatus::Succeeded);
+        cli_manager
+            .close_session_instance(recovery_handle.instance())
+            .await
+            .expect("recovery listener should stop with its exact process");
         return;
     }
 
     processor
         .handle_cli_runtime_timeline_event(
-            &key,
+            recovery_handle.instance(),
             RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: "native_turn_default".to_owned(),
@@ -48042,6 +48118,10 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .expect("completed recovery execution window should exist");
     assert_eq!(completed_window.window_index, 2);
     assert_eq!(completed_window.status, ExecutionWindowStatus::Completed);
+    cli_manager
+        .close_session_instance(recovery_handle.instance())
+        .await
+        .expect("completed recovery listener should stop with its exact process");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -48289,6 +48369,56 @@ async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
         .expect("pending recovery jobs should load");
     assert_eq!(pending_jobs.len(), 1);
     assert_eq!(pending_jobs[0].trigger, RecoveryTrigger::RuntimeFailure);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unbound_native_listener_owns_processor_until_abort() {
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = Box::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        Arc::new(SessionManager::new()),
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    assert!(processor.task_agent_executor.processor_weak().is_err());
+    // This fixture-only field is held exclusively by processor instances.
+    let owner_state = Arc::downgrade(&processor.native_cancellation_materialization_failure);
+    let agent_manager = processor.agent_manager.clone();
+    let thread_id = "unbound-listener-owner";
+    processor
+        .agent_manager
+        .ensure_thread(thread_id, &workspace_id)
+        .await
+        .unwrap();
+    processor
+        .ensure_agent_listener_task(thread_id)
+        .await
+        .unwrap();
+    let listener = processor
+        .agent_listener_tasks
+        .lock()
+        .await
+        .remove(thread_id)
+        .unwrap();
+    drop(processor);
+    assert!(
+        owner_state.upgrade().is_some(),
+        "the spawned listener must own its processor after the fixture is dropped"
+    );
+    listener.handle.abort();
+    let stopped = tokio::time::timeout(Duration::from_secs(2), listener.handle)
+        .await
+        .unwrap();
+    assert!(stopped.unwrap_err().is_cancelled());
+    assert!(
+        owner_state.upgrade().is_none(),
+        "joining the aborted listener must release its owned processor"
+    );
+    agent_manager.remove_thread(thread_id).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -55250,13 +55380,12 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 cleanup_calls.lock().unwrap().len(),
                 if resume_direct { 2 } else { 1 }
             );
-            assert_eq!(
-                processor
-                    .process_due_native_terminal_effects(chrono::Utc::now().timestamp(), 8)
-                    .await
-                    .unwrap(),
-                0
-            );
+            let replay_dispatch = processor
+                .process_due_native_terminal_effects(chrono::Utc::now().timestamp(), 8)
+                .await
+                .unwrap();
+            assert!(!replay_dispatch.storage_failed);
+            assert_eq!(replay_dispatch.count, 0);
         } else {
             assert_eq!(
                 crud_store_for_assert
@@ -55292,14 +55421,12 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
         }
         let restarted = pioneer_crud::CrudStore::new(crud_store_for_assert.database_connection());
         let now = now_timestamp_secs();
-        assert_eq!(
-            restarted
-                .claim_due_native_terminal_effects(now, 30, 2)
-                .await
-                .unwrap()
-                .len(),
-            0
-        );
+        let replay_claims = restarted
+            .claim_due_native_terminal_effects_at(now, 30, 2)
+            .await
+            .unwrap();
+        assert!(!replay_claims.storage_failed);
+        assert_eq!(replay_claims.records.len(), 0);
         for before in &preserved_blocked_rows {
             let after = pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(
                 before.effect_id.clone(),
@@ -62789,6 +62916,8 @@ async fn cli_runtime_terminal_event_expires_pending_requests_for_turn() {
     let native_turn_id = "codex-turn-terminal-event-expires-pending";
     let (processor, crud_store, workspace_id) =
         setup_execution_window_terminal_turn(thread_id, turn_id).await;
+    let cli_manager = test_cli_runtime_manager(Arc::new(RecordingCliRuntimeSession::default()));
+    let processor = processor.with_cli_runtime_manager_for_tests(cli_manager.clone());
 
     let now = chrono::Utc::now().fixed_offset();
     crud_store
@@ -62846,9 +62975,13 @@ async fn cli_runtime_terminal_event_expires_pending_requests_for_turn() {
 
     let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
         .expect("session key should build");
+    let handle = cli_manager
+        .get_or_start(key)
+        .await
+        .expect("recording CLI session should own its terminal listener");
     processor
         .handle_cli_runtime_timeline_event(
-            &key,
+            handle.instance(),
             RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: native_turn_id.to_owned(),
@@ -62889,6 +63022,12 @@ async fn cli_runtime_terminal_event_expires_pending_requests_for_turn() {
             .await
             .expect("finalization intent lookup should succeed"),
         "a live CLI success without a final AgentMessage must use the atomic terminal-only path"
+    );
+    assert!(
+        cli_manager
+            .close_session_instance(handle.instance())
+            .await
+            .expect("terminal listener should stop with its session")
     );
 }
 
@@ -66592,7 +66731,16 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
         .process_request_for_connection(connection_id, &install_request.to_string())
         .await;
 
-    let install_response = recv_response_by_id(&mut rx, "skillslifecycle000001").await;
+    let first_payload = recv_text_timeout(&mut rx, Duration::from_secs(2)).await;
+    let first_message: serde_json::Value =
+        serde_json::from_str(&first_payload).expect("first skill install message should decode");
+    assert_eq!(
+        first_message.get("id").and_then(serde_json::Value::as_str),
+        Some("skillslifecycle000001"),
+        "standalone skill install must respond before publishing notifications"
+    );
+    let install_response: JsonRpcResponse = serde_json::from_value(first_message)
+        .expect("standalone skill install response should decode");
     let install_payload: SkillsInstallResponse =
         serde_json::from_value(install_response.result).expect("skills/install payload decode");
     assert_eq!(install_payload.status, "installed");
@@ -68100,7 +68248,18 @@ async fn mcp_list_empty_then_install_stdio_persists_redacts_and_notifies() {
         .process_request_for_connection(connection_id, &install_request.to_string())
         .await;
 
-    let install_response = recv_response_by_id(&mut rx, "mcp_install_stdio0001").await;
+    // The standalone acknowledgement must precede change/status fanout. Do
+    // not use the filtering helper here: it would hide an ordering regression.
+    let first_payload = recv_text_timeout(&mut rx, Duration::from_secs(2)).await;
+    let first_message: serde_json::Value =
+        serde_json::from_str(&first_payload).expect("first install message should decode");
+    assert_eq!(
+        first_message.get("id").and_then(serde_json::Value::as_str),
+        Some("mcp_install_stdio0001"),
+        "standalone install must respond before publishing notifications"
+    );
+    let install_response: JsonRpcResponse =
+        serde_json::from_value(first_message).expect("standalone install response should decode");
     let install_response_json =
         serde_json::to_string(&install_response).expect("mcp/install response serialize");
     assert!(!install_response_json.contains(secret));
@@ -69022,8 +69181,14 @@ async fn setup_pooled_file_workspace_manager_with_observer(
 async fn setup_workspace_manager_with_connection(
     connection: sea_orm::DatabaseConnection,
 ) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
+    setup_workspace_manager_with_connection_migrator::<Migrator>(connection).await
+}
+
+async fn setup_workspace_manager_with_connection_migrator<M: MigratorTrait>(
+    connection: sea_orm::DatabaseConnection,
+) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
     crate::compaction::load_test_catalog();
-    Migrator::up(&connection, None)
+    M::up(&connection, None)
         .await
         .expect("migrations must succeed");
     bootstrap(&connection)
@@ -69993,6 +70158,14 @@ struct MemoryAgentE2eHarness {
 }
 
 async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGatewayHarness {
+    setup_memory_gateway_harness_with_backend(case_id, enabled, None).await
+}
+
+async fn setup_memory_gateway_harness_with_backend(
+    case_id: &str,
+    enabled: bool,
+    backend: Option<Arc<dyn pioneer_memory::MemoryBackend>>,
+) -> MemoryGatewayHarness {
     let session_manager = Arc::new(SessionManager::new());
     let (tx, rx) = mpsc::channel(32);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -70003,8 +70176,13 @@ async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGat
         .await;
     let runtime_home = unique_temp_dir(&format!("memory_{case_id}"));
     std::fs::create_dir_all(runtime_home.as_path()).expect("create memory runtime home");
-    let memory_runtime = Arc::new(
-        GatewayMemoryRuntime::from_config(
+    let uses_memvid = backend.is_none();
+    let memory_runtime = Arc::new(match backend {
+        Some(backend) => {
+            assert!(enabled, "custom memory backend requires an enabled runtime");
+            GatewayMemoryRuntime::enabled_with_backend_for_test(crud_store.clone(), backend)
+        }
+        None => GatewayMemoryRuntime::from_config(
             crud_store.clone(),
             runtime_home.as_path(),
             &GatewayMemoryConfig {
@@ -70016,10 +70194,12 @@ async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGat
             },
         )
         .expect("memory runtime should initialize"),
-    );
+    });
 
     if enabled {
         assert!(memory_runtime.is_enabled());
+    }
+    if enabled && uses_memvid {
         assert!(
             memory_runtime
                 .capsules_root()
@@ -71712,7 +71892,15 @@ async fn memory_tool_remember_writes_memory_with_turn_provenance() {
 
 #[tokio::test]
 async fn supervised_memory_mutations_prompt_before_real_database_side_effects() {
-    let harness = setup_memory_gateway_harness("tool_supervised_consent", true).await;
+    // Exercise the real approval broker, tools, memory service and SQLite writes.
+    // Memvid indexing is covered separately; its Tantivy writer lifecycle must
+    // not make this permission regression depend on filesystem lock timing.
+    let harness = setup_memory_gateway_harness_with_backend(
+        "tool_supervised_consent",
+        true,
+        Some(Arc::new(pioneer_memory::InMemoryMemoryBackend::default())),
+    )
+    .await;
     let context = memory_tool_context(&harness, "tool_supervised_consent");
     let materialization = materialize_memory_tools_for_context(&harness, context.clone()).await;
     let permission_profile = pioneer_protocol::system_turn_permission_profile_snapshot(
@@ -71739,6 +71927,7 @@ async fn supervised_memory_mutations_prompt_before_real_database_side_effects() 
         crate::permissions::GatewayPermissionApprovalBroker::channel();
     let opened = Arc::new(AtomicUsize::new(0));
     let opened_for_worker = opened.clone();
+    let store_for_worker = harness.crud_store.clone();
     let approval_worker = tokio::spawn(async move {
         while let Some(event) = approval_events.recv().await {
             match event {
@@ -71752,6 +71941,15 @@ async fn supervised_memory_mutations_prompt_before_real_database_side_effects() 
                         pioneer_tools::PermissionActionKind::MemoryWrite
                     );
                     let index = opened_for_worker.fetch_add(1, Ordering::SeqCst);
+                    let rows_before_decision = store_for_worker
+                        .list_agent_memory_records(AgentMemoryListFilter::default())
+                        .await
+                        .expect("read memory before approval decision");
+                    assert_eq!(
+                        rows_before_decision.len(),
+                        index,
+                        "memory writes must wait for the approval decision"
+                    );
                     let resolution = if index == 0 {
                         pioneer_tools::PermissionApprovalResolution::AllowOnce
                     } else {
@@ -71821,6 +72019,23 @@ async fn supervised_memory_mutations_prompt_before_real_database_side_effects() 
     assert_eq!(opened.load(Ordering::SeqCst), 2);
     assert_eq!(rows.len(), 1, "denied mutation must not create a DB row");
     assert_eq!(rows[0].key.as_deref(), Some("supervised_allowed"));
+
+    let runtime = harness.processor.memory_runtime();
+    let stored = runtime
+        .service()
+        .get(
+            runtime.operation_context_for_authorized_turn(&context, None, false),
+            MemoryGetParams {
+                memory_id: rows[0].id.clone(),
+                include_deleted: false,
+            },
+        )
+        .await
+        .expect("read approved memory through the service");
+    assert_eq!(
+        stored.record.expect("approved memory should exist").content,
+        "approved supervised memory"
+    );
 
     drop(tools);
     approval_worker.abort();
@@ -79428,11 +79643,40 @@ async fn persisted_interrupted_turn_cannot_hide_accepted_direct_checkpoint_start
         &processor, connection, &mut rx, &workspace, thread, turn, "Chat", "delayed",
     )
     .await;
-    assert!(
-        processor
-            .mark_turn_interrupted(thread.into(), turn.into(), "user stop committed".into())
-            .await
-    );
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if processor
+                .crud_store
+                .native_cancellation_context(turn)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initial native actor must publish cancellation context before stop");
+    // Establish interruption through the cancellation operation, which owns
+    // the durable native acknowledgement and terminal effects. The materializer
+    // alone cannot manufacture that accepted context.
+    let stop_id = generate_test_request_id("checkpoint", "stop");
+    processor
+        .process_request_for_connection(
+            connection,
+            &json!({
+                "jsonrpc": "2.0", "id": stop_id, "method": "turn/cancel",
+                "params": {"thread_id": thread, "turn_id": turn, "reason": "user stop committed"}
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut rx, &stop_id).await;
+    let cancelled: pioneer_protocol::TurnCancelResponse =
+        serde_json::from_value(response.result).expect("native cancellation must succeed");
+    assert_eq!(cancelled.turn.status, TurnStatus::Interrupted);
     processor.agent_manager.remove_thread(thread).await;
     processor
         .agent_manager
@@ -79581,7 +79825,6 @@ async fn native_snapshot_after_publication(
     .unwrap()
 }
 
-// C1 regression source only: NOT_RUN / NOT_COMPILED.
 #[tokio::test]
 async fn plugin_mutation_and_final_native_start_share_the_parent_admission_barrier() {
     use sea_orm::ConnectionTrait;

@@ -1655,7 +1655,7 @@ impl ComposerView {
             })
             .collect();
         let view = cx.entity().downgrade();
-        pioneer_desktop_plugins::open_plugin_picker(
+        super::plugin_picker::open_plugin_picker(
             self.client.clone(),
             workspace,
             selected,

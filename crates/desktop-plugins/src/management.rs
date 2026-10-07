@@ -28,7 +28,6 @@ fn confirmed_restore_intent(
 
 #[cfg(test)]
 mod restore_tests {
-    // Regression sources only: NOT_RUN / NOT_COMPILED; no native prompt run.
     use super::*;
     #[::core::prelude::v1::test]
     fn cancelled_stale_and_failed_retry_targets_cannot_send_identity_reset() {
@@ -86,7 +85,7 @@ mod restore_tests {
         parent = expected.clone();
         parent.components[0].status = "failed".into();
         parent.components[0].skill_id =
-            Some(pioneer_protocol::SkillId::new("S".repeat(21)).unwrap());
+            Some(pioneer_client::skills::types::SkillId::new("S".repeat(21)).unwrap());
         assert!(confirmed_restore_intent(true, &expected, &key, Some(&parent)).is_none());
         parent = expected.clone();
         parent.state = "interrupted".into();
@@ -96,19 +95,6 @@ mod restore_tests {
 }
 use gpui_kit::base::{Checkbox, CheckboxState};
 use pioneer_client::plugins::{PluginManagementIntent, PluginsMutateParams};
-#[derive(Clone)]
-pub(super) enum ChildDetails {
-    Mcp(Entity<pioneer_desktop_mcp::McpCatalogView>),
-    Skills(Entity<pioneer_desktop_skills::SkillsCatalogView>),
-}
-impl ChildDetails {
-    pub(super) fn element(self) -> AnyElement {
-        match self {
-            Self::Mcp(view) => div().flex_1().min_h_0().child(view).into_any_element(),
-            Self::Skills(view) => div().flex_1().min_h_0().child(view).into_any_element(),
-        }
-    }
-}
 impl PluginsView {
     fn mutate(
         &mut self,
@@ -195,37 +181,8 @@ impl PluginsView {
         let Some(workspace) = self.workspace.clone() else {
             return;
         };
-        self.child_details = if let Some(id) = component.mcp_installation_id.clone() {
-            Some(ChildDetails::Mcp(
-                pioneer_desktop_mcp::McpCatalogView::new_plugin_details(
-                    pioneer_desktop_mcp::McpCatalogConfig::new(
-                        self.client.clone(),
-                        self.registrar.clone(),
-                    ),
-                    workspace,
-                    plugin.id.clone(),
-                    id,
-                    window,
-                    cx,
-                ),
-            ))
-        } else if let Some(id) = component.skill_id.clone() {
-            Some(ChildDetails::Skills(
-                pioneer_desktop_skills::SkillsCatalogView::new_plugin_details(
-                    pioneer_desktop_skills::SkillsCatalogConfig::new(
-                        self.client.clone(),
-                        self.registrar.clone(),
-                    ),
-                    workspace,
-                    plugin.id.clone(),
-                    id,
-                    window,
-                    cx,
-                ),
-            ))
-        } else {
-            None
-        };
+        self.child_details =
+            (self.component_details)(&workspace, &plugin.id, component, window, cx);
         cx.notify();
     }
     pub(super) fn component_controls(

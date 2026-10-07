@@ -1,5 +1,5 @@
-//! C2 regression sources only: NOT_RUN / NOT_COMPILED. Existing in-memory
-//! Gateway/native-session harnesses; no provider executable is launched.
+//! Plugin projections through in-memory Gateway/native-session harnesses.
+//! No provider executable is launched.
 use super::*;
 use pioneer_protocol::{
     AgentExecutionProfileId, AgentExecutionProfileSelection, AgentExecutionSelection,
@@ -63,7 +63,9 @@ async fn seed_owned_c2_skill(
                 enabled: Some(true),
                 allow_implicit_invocation: Some(false),
             },
-            &[],
+            &[fixture_skill_lifecycle_audit(
+                &skill, "bundled", "install", 1,
+            )],
             None,
             Some(&pioneer_crud::PluginOwnershipWrite {
                 plugin_id: parent.clone(),
@@ -372,7 +374,7 @@ fn ordinary_owned_cli_start_uses_native_skill_and_ready_parent_for_both_provider
     run_standard_stack_message_test("C2 owned native projection", async {
         for kind in [CLIAgentRuntimeKind::Claude, CLIAgentRuntimeKind::Codex] {
             for explicit_agent in [false, true] {
-                let harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
+                let mut harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
                 let root = harness.user_root.join("owned-context");
                 let (parent, skill, selected) =
                     seed_owned_c2_skill(&harness.crud_store, &harness.workspace_id, &root).await;
@@ -389,7 +391,7 @@ fn ordinary_owned_cli_start_uses_native_skill_and_ready_parent_for_both_provider
                 );
                 let mut envelope: JsonValue = serde_json::from_str(&request).unwrap();
                 if explicit_agent {
-                    let launch = exact_cli_task_launch_for_test(
+                    let mut launch = exact_cli_task_launch_for_test(
                         &harness.processor,
                         &harness.workspace_id,
                         "openai",
@@ -402,6 +404,8 @@ fn ordinary_owned_cli_start_uses_native_skill_and_ready_parent_for_both_provider
                     )
                     .await
                     .unwrap();
+                    launch.execution.permission_profile =
+                        Some(pioneer_protocol::TurnPermissionProfileSelection::full_access());
                     envelope["params"]["agent_launch"] = serde_json::to_value(launch).unwrap();
                 }
                 let request = envelope.to_string();
@@ -409,6 +413,13 @@ fn ordinary_owned_cli_start_uses_native_skill_and_ready_parent_for_both_provider
                     .processor
                     .process_request_for_connection(harness.connection_id, &request)
                     .await;
+                let request_id = envelope["id"].as_str().unwrap();
+                let response = recv_jsonrpc_payload_by_id(&mut harness.rx, request_id).await;
+                let response: JsonValue = serde_json::from_str(&response).unwrap();
+                assert!(
+                    response.get("error").is_none(),
+                    "{kind:?}, explicit_agent={explicit_agent}: native plugin launch rejected: {response}"
+                );
                 let native = wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
                 let selection = harness
                     .crud_store

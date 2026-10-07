@@ -382,8 +382,46 @@ impl DesktopShellView {
             window,
             cx,
         );
-        let plugins =
-            pioneer_desktop_plugins::PluginsView::new(client.clone(), registrar.clone(), cx);
+        let details_client = client.clone();
+        let details_registrar = registrar.clone();
+        let plugins = pioneer_desktop_plugins::PluginsView::new(
+            client.clone(),
+            registrar.clone(),
+            Box::new(move |workspace, plugin, component, window, cx| {
+                if let Some(id) = component.mcp_installation_id.clone() {
+                    Some(
+                        pioneer_desktop_mcp::McpCatalogView::new_plugin_details(
+                            pioneer_desktop_mcp::McpCatalogConfig::new(
+                                details_client.clone(),
+                                details_registrar.clone(),
+                            ),
+                            workspace.to_owned(),
+                            plugin.to_owned(),
+                            id,
+                            window,
+                            cx,
+                        )
+                        .into(),
+                    )
+                } else {
+                    component.skill_id.clone().map(|id| {
+                        pioneer_desktop_skills::SkillsCatalogView::new_plugin_details(
+                            pioneer_desktop_skills::SkillsCatalogConfig::new(
+                                details_client.clone(),
+                                details_registrar.clone(),
+                            ),
+                            workspace.to_owned(),
+                            plugin.to_owned(),
+                            id,
+                            window,
+                            cx,
+                        )
+                        .into()
+                    })
+                }
+            }),
+            cx,
+        );
         let identity = crate::gateway::IdentityAuthorizationBinding::new(registrar.as_ref());
         let mut identity_changes = identity.watch();
         let identity_task = cx.spawn(async move |view, cx| {

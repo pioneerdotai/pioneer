@@ -1,4 +1,4 @@
-//! Review regressions. Compile only until orchestrator acceptance.
+//! Task event fanout scheduling and cutover regressions.
 use super::*;
 use crate::message::TaskEventFanoutSummary;
 use pioneer_crud::{TASK_EVENT_FANOUT_BYTE_BUDGET as BYTES, TaskEventFanoutOutcome};
@@ -7,6 +7,21 @@ use pioneer_sqlite::{SqliteWriteClass, SqliteWriteEvent, SqliteWriteObserver};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
 use std::sync::atomic::{AtomicI64, AtomicUsize};
 const NOW: i64 = 4_000_000_000;
+
+// Gateway setup reads the current Turn, including nullable plugin selections.
+// Keep that schema prefix, excluding later irreversible migrations before rollback.
+struct FanoutCutoverFixtureMigrator;
+impl MigratorTrait for FanoutCutoverFixtureMigrator {
+    fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+        let mut migrations = Migrator::migrations();
+        let target = migrations
+            .iter()
+            .position(|migration| migration.name() == "m20261005_000001_plugin_ownership")
+            .expect("plugin selection migration remains registered");
+        migrations.truncate(target + 1);
+        migrations
+    }
+}
 
 fn processor_with_store(
     manager: Arc<WorkspaceManager>,
@@ -576,7 +591,10 @@ async fn cutover_quantum_never_reads_history_and_only_delivers_post_install_even
     let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
     options.max_connections(1).sqlx_logging(false);
     let writer = Database::connect(options).await.unwrap();
-    let (_, _, workspace) = setup_workspace_manager_with_connection(writer.clone()).await;
+    let (_, _, workspace) = setup_workspace_manager_with_connection_migrator::<
+        FanoutCutoverFixtureMigrator,
+    >(writer.clone())
+    .await;
     writer
         .execute_unprepared("PRAGMA journal_mode=WAL")
         .await
@@ -617,7 +635,7 @@ async fn cutover_quantum_never_reads_history_and_only_delivers_post_install_even
         ))
     };
     let processor = make_processor();
-    let migrations = Migrator::migrations();
+    let migrations = FanoutCutoverFixtureMigrator::migrations();
     let boundary = migrations
         .iter()
         .position(|m| m.name() == "m20261004_000008_task_event_fanout_pending")
@@ -628,7 +646,7 @@ async fn cutover_quantum_never_reads_history_and_only_delivers_post_install_even
         .begin()
         .await
         .unwrap();
-    Migrator::down(&*tx, Some((migrations.len() - boundary) as u32))
+    FanoutCutoverFixtureMigrator::down(&*tx, Some((migrations.len() - boundary) as u32))
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -670,7 +688,7 @@ async fn cutover_quantum_never_reads_history_and_only_delivers_post_install_even
         .begin()
         .await
         .unwrap();
-    Migrator::up(&*tx, None).await.unwrap();
+    FanoutCutoverFixtureMigrator::up(&*tx, None).await.unwrap();
     tx.commit().await.unwrap();
     observed.reads.lock().unwrap().clear();
     observed.writes.lock().unwrap().clear();

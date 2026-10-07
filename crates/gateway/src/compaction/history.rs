@@ -446,6 +446,135 @@ async fn metadata(
     }
     Ok(records)
 }
+/// Exact UI copies for one durable final envelope. Event identity/version is
+/// captured through the repository's released, bounded metadata pages.
+pub(crate) struct FinalResponseAliasEvidence {
+    pub(crate) aliases: Vec<MessageSourceAlias>,
+    pub(crate) ready: bool,
+}
+
+pub(crate) async fn final_response_aliases(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    represented: &SourceRef,
+    final_id: &str,
+    reasoning_id: Option<&str>,
+) -> Result<FinalResponseAliasEvidence> {
+    let fence = store.compaction_history_read_fence().await?;
+    let mut events = Vec::new();
+    let mut after = 0;
+    loop {
+        let page = store
+            .compaction_source_metadata_page_at_fence(
+                workspace,
+                thread,
+                turn,
+                PagedSource::Event,
+                after,
+                fence.event_order,
+            )
+            .await?;
+        events.extend(page.entries.into_iter().filter(|event| {
+            event
+                .item_id
+                .as_deref()
+                .is_some_and(|id| id == final_id || Some(id) == reasoning_id)
+        }));
+        if page.next_sequence <= after {
+            break;
+        }
+        after = page.next_sequence;
+    }
+    final_response_evidence_at_fence(
+        store,
+        workspace,
+        thread,
+        turn,
+        represented,
+        final_id,
+        reasoning_id,
+        &events,
+    )
+    .await
+}
+
+/// Completion and model projection are separate facts. In particular, an empty
+/// completed Reasoning/AgentMessage is omitted, but still completes its exact UI
+/// identity. Read only matching completed revisions; never infer completion from
+/// a technical classification or a started/updated item. The caller's captured
+/// metadata fence selects revisions, and the repository authenticates each read.
+#[allow(clippy::too_many_arguments)]
+async fn final_response_evidence_at_fence(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    represented: &SourceRef,
+    final_id: &str,
+    reasoning_id: Option<&str>,
+    events: &[SourceRecord],
+) -> Result<FinalResponseAliasEvidence> {
+    ensure!(
+        represented.scope == format!("context:{turn}") && !represented.version.is_empty(),
+        "final response source authority mismatch"
+    );
+    let mut aliases = Vec::new();
+    let mut final_seen = false;
+    let mut reasoning_seen = reasoning_id.is_none();
+    for row in events {
+        if row.source_type != pioneer_protocol::constants::events::ITEM_COMPLETED
+            || row.reference.scope != format!("event:{turn}")
+            || row.reference.version.is_empty()
+            || !row
+                .item_id
+                .as_deref()
+                .is_some_and(|id| id == final_id || Some(id) == reasoning_id)
+        {
+            continue;
+        }
+        // Released exact repository read, then typed decoding outside DB access.
+        // This also works with legacy cached `technical` or missing metadata.
+        let payload = reference_payload(store, workspace, thread, &row.reference).await?;
+        let event: Event = serde_json::from_str(&payload)?;
+        ensure!(
+            event.workspace_id() == workspace
+                && event.thread_id() == thread
+                && event.turn_id() == turn,
+            "final UI completion scope mismatch"
+        );
+        let Event::ItemCompleted(completed) = &event else {
+            continue;
+        };
+        let item = &completed.item;
+        if row.item_id.as_deref() != Some(item.item_id()) {
+            continue;
+        }
+        let is_final = matches!(item, pioneer_protocol::TurnItem::AgentMessage {id, phase: pioneer_protocol::AgentMessagePhase::FinalAnswer, ..} if id == final_id);
+        let is_reasoning = matches!(item, pioneer_protocol::TurnItem::Reasoning {id, ..} if Some(id.as_str()) == reasoning_id);
+        if !is_final && !is_reasoning {
+            continue;
+        }
+        final_seen |= is_final;
+        reasoning_seen |= is_reasoning;
+        // Omitted UI copies need no model-facing suppression edge. Visible
+        // copies retain exact source/version aliases for checkpoint publication.
+        if !pioneer_crud::canonical_event_model_projection(&event).is_omitted() {
+            aliases.push(MessageSourceAlias {
+                represented_thread_id: thread.into(),
+                represented_source: runtime_source_ref(represented),
+                thread_id: thread.into(),
+                source: runtime_source_ref(&row.reference),
+            });
+        }
+    }
+    Ok(FinalResponseAliasEvidence {
+        aliases,
+        ready: final_seen && reasoning_seen,
+    })
+}
+
 fn origin(
     workspace: &str,
     thread: &str,
@@ -650,10 +779,20 @@ fn historical_artifact_part(artifact: pioneer_protocol::ArtifactRef) -> MessageC
         MessageContentPart::File { file: attachment }
     }
 }
+fn runtime_source_ref(source: &SourceRef) -> MessageSourceRef {
+    MessageSourceRef {
+        scope: source.scope.clone(),
+        id: source.id.clone(),
+        version: source.version.clone(),
+    }
+}
+
 struct Round {
     sequence: i64,
     envelope: CanonicalProviderRoundEnvelope,
     assistant_source: SourceRef,
+    response_aliases: Vec<MessageSourceAlias>,
+    response_copies_ready: bool,
     results: BTreeMap<String, (SourceRef, ChatMessage)>,
 }
 fn finish_round(
@@ -664,6 +803,38 @@ fn finish_round(
     active: bool,
     output: &mut Vec<(i64, Vec<ChatMessage>)>,
 ) -> Result<()> {
+    if round
+        .envelope
+        .message
+        .tool_calls
+        .as_ref()
+        .is_none_or(|calls| calls.is_empty())
+    {
+        ensure!(
+            round.envelope.version == 1
+                && !round.envelope.round_id.trim().is_empty()
+                && round.envelope.message.role == Role::Assistant
+                && round.envelope.termination == pioneer_provider::ProviderTermination::Complete
+                && round.envelope.calls.is_empty()
+                && round.results.is_empty(),
+            "invalid canonical assistant response"
+        );
+        let mut message = round.envelope.message;
+        message.provenance = Some(origin(
+            workspace,
+            thread,
+            turn,
+            &round.envelope.round_id,
+            vec![round.assistant_source],
+        ));
+        let origin = message.provenance.as_mut().expect("canonical origin");
+        origin.source_aliases = round.response_aliases;
+        // The ACK precedes UI append. A concurrent capture must not publish a
+        // checkpoint before exact copy revisions exist; later reads retry it.
+        origin.complete &= round.response_copies_ready;
+        output.push((round.sequence, vec![message]));
+        return Ok(());
+    }
     let calls = round
         .envelope
         .message
@@ -987,8 +1158,9 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
                             version: represented.1.version.clone(),
                         },
                     }
-                ) && represented.1.scope.starts_with("input:")
-                    && alias.source.scope.starts_with("input:"),
+                ) && ((represented.1.scope.starts_with("input:")
+                    && alias.source.scope.starts_with("input:"))
+                    || alias.is_response_copy()),
                 "checkpoint input alias is outside its exact leaf closure"
             );
             checkpoint_evidence.add_alias(alias);
@@ -1666,6 +1838,9 @@ async fn load_line_history_inner(
                     Some("input" | "input_revision")
                 )
             });
+        // Exact relationship discovery may use all captured metadata, even
+        // when the selected view excludes the UI copy's payload.
+        let mut alias_events = events.clone();
         events.retain(|event| {
             !is_covered(&event.reference)
                 && !event.item_id.as_ref().is_some_and(|item| {
@@ -1723,10 +1898,25 @@ async fn load_line_history_inner(
                 Some("input" | "input_revision")
             )
         });
-        events_by_turn.push((events, has_event_input, has_authoritative_event_input));
+        let refreshed: BTreeMap<_, _> = events
+            .iter()
+            .map(|event| (event.reference.clone(), event))
+            .collect();
+        for original in &mut alias_events {
+            if let Some(event) = refreshed.get(&original.reference) {
+                original.item_id = event.item_id.clone();
+                original.projection_kind = event.projection_kind.clone();
+            }
+        }
+        events_by_turn.push((
+            events,
+            alias_events,
+            has_event_input,
+            has_authoritative_event_input,
+        ));
     }
     let mut history = Vec::new();
-    for (turn, (events, has_event_input, has_authoritative_event_input)) in
+    for (turn, (events, alias_events, has_event_input, has_authoritative_event_input)) in
         turns.into_iter().zip(events_by_turn)
     {
         // A later terminal transition cannot expose the pending portion of an
@@ -1931,13 +2121,39 @@ async fn load_line_history_inner(
                             aliases.extend(
                                 envelope.calls.iter().map(|call| call.turn_item_id.clone()),
                             );
+                            // Native content owns the model history. Suppress its
+                            // exact reasoning/final UI copies, keeping stored events.
+                            aliases.insert(envelope.round_id.clone());
+                            if let Some(item) = row.item_id.as_ref() {
+                                aliases.insert(item.clone());
+                            }
+                            let evidence = if envelope.calls.is_empty() {
+                                final_response_evidence_at_fence(
+                                    store,
+                                    workspace,
+                                    thread,
+                                    &turn.id,
+                                    &row.reference,
+                                    &envelope.round_id,
+                                    row.item_id.as_deref(),
+                                    &alias_events,
+                                )
+                                .await?
+                            } else {
+                                FinalResponseAliasEvidence {
+                                    aliases: Vec::new(),
+                                    ready: true,
+                                }
+                            };
                             pending = Some(Round {
                                 sequence: starts
                                     .get(&envelope.round_id)
                                     .copied()
                                     .unwrap_or(row.sequence),
-                                envelope,
+                                response_copies_ready: evidence.ready,
+                                response_aliases: evidence.aliases,
                                 assistant_source: row.reference,
+                                envelope,
                                 results: BTreeMap::new(),
                             });
                         } else {
@@ -2421,6 +2637,51 @@ fn event_message_with_input_copy_policy(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn canonical_no_tool_response_keeps_native_state_in_cold_history() {
+        let mut message = ChatMessage::assistant("answer");
+        let state = pioneer_provider::ProviderReplayState::for_model(
+            "gemini",
+            "fixture",
+            serde_json::json!({"schema_version":2,"parts":[{"text":"answer","thoughtSignature":"signed"}]}),
+        );
+        message.provider_replay_state = Some(state.clone());
+        let envelope = CanonicalProviderRoundEnvelope {
+            version: 1,
+            round_id: "final-item".into(),
+            termination: pioneer_provider::ProviderTermination::Complete,
+            message,
+            calls: vec![],
+        };
+        let mut output = Vec::new();
+        finish_round(
+            "ws",
+            "thread",
+            "turn",
+            Round {
+                sequence: 10,
+                envelope,
+                assistant_source: SourceRef {
+                    scope: "context:turn".into(),
+                    id: "source".into(),
+                    version: "revision:1".into(),
+                },
+                response_aliases: vec![],
+                response_copies_ready: true,
+                results: BTreeMap::new(),
+            },
+            false,
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].1[0].provider_replay_state.as_ref(), Some(&state));
+        assert_eq!(
+            output[0].1[0].provenance.as_ref().unwrap().unit_id,
+            "turn:final-item"
+        );
+    }
+
     use super::*;
 
     fn completed_command_event(output: &str) -> Event {
@@ -2603,6 +2864,8 @@ mod tests {
                     version: "revision:1".into(),
                 },
                 results: BTreeMap::new(),
+                response_aliases: vec![],
+                response_copies_ready: true,
             };
             assert!(finish_round("ws", "thread", "turn", round, true, &mut Vec::new()).is_err());
         }
@@ -2662,6 +2925,8 @@ mod tests {
                 version: "revision:1".into(),
             },
             results: BTreeMap::new(),
+            response_aliases: vec![],
+            response_copies_ready: true,
         };
         let mut output = Vec::new();
         finish_round("ws", "thread", "turn", round, false, &mut output).unwrap();

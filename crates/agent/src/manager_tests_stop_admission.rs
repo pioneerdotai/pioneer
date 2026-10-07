@@ -121,6 +121,7 @@ async fn accepted_start_with_cancelled_expired_ack_waiter_is_unknown_until_actua
         .ensure_thread("admission", "workspace")
         .await
         .unwrap();
+    let _events = subscribe_agent_events(&manager, "admission").await;
     let dependencies = manager.runtime_dependencies.state.write().await;
     let native = manager.clone();
     let waiter =
@@ -364,7 +365,23 @@ async fn continuation_of_drained_run_is_unknown_until_next_actual_run_is_publish
         .await
         .unwrap();
     let mut durable = manager.take_durable_receiver("continuation").await.unwrap();
-    let _events = start_loop_budget_turn(&manager, "continuation", "turn").await;
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            "continuation",
+            "turn",
+            ThreadMode::Agent,
+            "test-model",
+            "loop-budget",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "run loop budget test".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start with the retained durable receiver");
     timeout(Duration::from_secs(3), async {
         loop {
             let event = durable.recv().await.unwrap();

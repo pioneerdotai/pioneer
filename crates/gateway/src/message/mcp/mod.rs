@@ -380,6 +380,24 @@ impl MessageProcessor {
             .await;
     }
 
+    /// Standalone RPCs acknowledge the write before notifications and runtime
+    /// reload, preserving their existing ordering without a second installer.
+    pub(super) async fn publish_mcp_changes(
+        &self,
+        workspace_id: &str,
+        changed: Vec<McpChangedItem>,
+    ) {
+        self.notify_mcp_changed(workspace_id, changed, now_timestamp_secs())
+            .await;
+        if let Err(error) = self.mcp_service.reload_workspace(workspace_id).await {
+            warn!(
+                workspace_id,
+                error = %format!("{error:#}"),
+                "failed to reload MCP runtime after configuration change"
+            );
+        }
+    }
+
     async fn validate_mcp_workspace(
         &self,
         connection_id: ConnectionId,

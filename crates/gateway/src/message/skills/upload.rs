@@ -2616,11 +2616,18 @@ mod tests {
             TestEntryKind::Symlink(target) => {
                 header.set_entry_type(EntryType::Symlink);
                 header.set_size(0);
-                header.set_link_name(target).expect("set symlink target");
-                header.set_cksum();
-                builder
-                    .append(&header, Cursor::new(Vec::<u8>::new()))
-                    .expect("append symlink");
+                if header.set_link_name(target).is_err() {
+                    // macOS temporary roots can exceed GNU's fixed link field.
+                    // Let the builder encode the long-link extension for them.
+                    builder
+                        .append_link(&mut header, entry.path, target)
+                        .expect("append long symlink");
+                } else {
+                    header.set_cksum();
+                    builder
+                        .append(&header, Cursor::new(Vec::<u8>::new()))
+                        .expect("append symlink");
+                }
             }
             TestEntryKind::Hardlink(target) => {
                 header.set_entry_type(EntryType::Link);

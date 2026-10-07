@@ -62,7 +62,7 @@ impl MessageProcessor {
     ) {
         let connection_id = request_context.connection_id();
         let result = self
-            .install_skill_source(
+            .install_skill_source_deferred(
                 request_context,
                 request_id.clone(),
                 params.workspace_id,
@@ -71,26 +71,29 @@ impl MessageProcessor {
             )
             .await;
         match result {
-            Ok(payload) => match JsonRpcResponse::from_result(request_id, &payload) {
-                Ok(response) => {
-                    if let Err(error) = self.send_json(connection_id, &response).await {
-                        warn!(connection_id, error = %error, "failed to send skills/install response");
+            Ok((payload, publication)) => {
+                match JsonRpcResponse::from_result(request_id, &payload) {
+                    Ok(response) => {
+                        if let Err(error) = self.send_json(connection_id, &response).await {
+                            warn!(connection_id, error = %error, "failed to send skills/install response");
+                        }
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            skills_error(
+                                None,
+                                INVALID_REQUEST_CODE,
+                                SKILLS_ERROR_INTERNAL,
+                                "failed to encode skills/install response",
+                                json!({"error": format!("{error:#}")}),
+                            ),
+                        )
+                        .await
                     }
                 }
-                Err(error) => {
-                    self.send_error(
-                        connection_id,
-                        skills_error(
-                            None,
-                            INVALID_REQUEST_CODE,
-                            SKILLS_ERROR_INTERNAL,
-                            "failed to encode skills/install response",
-                            json!({"error": format!("{error:#}")}),
-                        ),
-                    )
-                    .await
-                }
-            },
+                self.publish_skill_change(publication).await;
+            }
             Err(error) => self.send_error(connection_id, error).await,
         }
     }
@@ -103,6 +106,28 @@ impl MessageProcessor {
         target_kind: String,
         source: SkillInstallSource,
     ) -> std::result::Result<SkillsInstallResponse, JsonRpcErrorResponse> {
+        let (response, publication) = self
+            .install_skill_source_deferred(
+                request_context,
+                request_id,
+                workspace,
+                target_kind,
+                source,
+            )
+            .await?;
+        self.publish_skill_change(publication).await;
+        Ok(response)
+    }
+
+    async fn install_skill_source_deferred(
+        &self,
+        request_context: &RequestContext,
+        request_id: RequestId,
+        workspace: String,
+        target_kind: String,
+        source: SkillInstallSource,
+    ) -> std::result::Result<(SkillsInstallResponse, SkillChangePublication), JsonRpcErrorResponse>
+    {
         let connection_id = request_context.connection_id();
         let authenticated_owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let workspace_id = match self
@@ -400,22 +425,24 @@ impl MessageProcessor {
                 events_written: audit_records.len(),
             },
         };
-        self.notify_skills_changed(
-            workspace_id.as_str(),
-            "installed",
-            vec![SkillChangedItem {
-                skill_id,
-                owner: installation_record.owner,
-                slug: installation_record.slug,
-                source_kind: installation_record.source_kind,
-                change_type: "install".to_owned(),
-                fingerprint_before: None,
-                fingerprint_after: Some(installation_record.fingerprint),
-            }],
-            now,
-        )
-        .await;
-        Ok(payload)
+        Ok((
+            payload,
+            SkillChangePublication {
+                workspace_id,
+                reason: "installed",
+                changes: vec![SkillChangedItem {
+                    skill_id,
+                    owner: installation_record.owner,
+                    slug: installation_record.slug,
+                    source_kind: installation_record.source_kind,
+                    change_type: "install".to_owned(),
+                    fingerprint_before: None,
+                    fingerprint_after: Some(installation_record.fingerprint),
+                }],
+                pack_changes: Vec::new(),
+                created_at: now,
+            },
+        ))
     }
 }
 

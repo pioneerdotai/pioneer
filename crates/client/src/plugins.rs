@@ -1,7 +1,7 @@
 //! Parent-only plugin state and selection. Desktop consumes these Rust types
 //! directly; mobile can reuse the reducer/selector without shell dependencies.
 use crate::composer::capabilities::{ComposerCapability, ComposerCapabilityKind};
-use pioneer_protocol::{PluginItem, PluginsListResponse};
+use pioneer_protocol::PluginsListResponse;
 
 #[derive(Clone, Debug, Default)]
 pub struct PluginCatalogState {
@@ -208,7 +208,8 @@ mod tests {
 }
 
 pub use pioneer_protocol::{
-    PluginComponentKey, PluginManagementIntent, PluginsMutateParams, PluginsUpdatePreviewResponse,
+    PluginComponentItem, PluginComponentKey, PluginItem, PluginManagementIntent,
+    PluginsMutateParams, PluginsSetEnabledParams, PluginsUpdatePreviewResponse,
 };
 /// UI-neutral current-action state. An error is an uncertain Gateway outcome;
 /// the caller must refetch before enabling another mutation. No operation polling.

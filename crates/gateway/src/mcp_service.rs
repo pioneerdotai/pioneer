@@ -510,6 +510,16 @@ impl McpService {
     }
 
     #[cfg(test)]
+    pub(crate) async fn task_stop_requested_for_tests(&self, id: &str) -> bool {
+        self.inner
+            .tasks
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|task| task.shutdown_tx.is_none())
+    }
+
+    #[cfg(test)]
     pub(crate) async fn persist_resolved_mcp_turn_projection(
         &self,
         projection: &ResolvedMcpTurnProjection,
@@ -2088,6 +2098,9 @@ impl McpService {
         let scope_key = row.scope_key.clone();
         let task_installation_id = installation_id.clone();
         let runtime_generation = self.next_runtime_generation();
+        // Publish the actor and its admission together, so a completed legacy
+        // stop cannot remove a replacement actor's runtime generation.
+        let mut tasks = self.inner.tasks.lock().await;
         self.inner
             .runtime_generations
             .lock()
@@ -2119,7 +2132,7 @@ impl McpService {
         });
         let join = McpTaskJoin::new(join);
 
-        self.inner.tasks.lock().await.insert(
+        tasks.insert(
             installation_id,
             McpServerTaskHandle {
                 name,
@@ -2163,8 +2176,25 @@ impl McpService {
         if !self.task_exists(installation_id).await {
             return;
         }
-        if let Err(error) = self.stop_task_result(installation_id, final_state).await {
-            warn!(error = %error, "MCP server task join failed");
+        match self.stop_task_owner(installation_id, final_state).await {
+            Ok(completion) => {
+                // Legacy stop releases a successfully joined actor. Lifecycle
+                // stop_task_result retains the outcome for repair/idempotence.
+                // Match the exact owner under the same lock as start publication.
+                let mut tasks = self.inner.tasks.lock().await;
+                if tasks
+                    .get(installation_id)
+                    .is_some_and(|task| Arc::ptr_eq(&task.completed, &completion))
+                {
+                    tasks.remove(installation_id);
+                    self.inner
+                        .runtime_generations
+                        .lock()
+                        .await
+                        .remove(installation_id);
+                }
+            }
+            Err(error) => warn!(error = %error, "MCP server task join failed"),
         }
     }
 
@@ -2175,6 +2205,16 @@ impl McpService {
         installation_id: &str,
         final_state: DomainRuntimeState,
     ) -> Result<()> {
+        self.stop_task_owner(installation_id, final_state)
+            .await
+            .map(|_| ())
+    }
+
+    async fn stop_task_owner(
+        &self,
+        installation_id: &str,
+        final_state: DomainRuntimeState,
+    ) -> Result<Arc<tokio_util::sync::CancellationToken>> {
         let (completion, join, session) = {
             let mut tasks = self.inner.tasks.lock().await;
             let handle = tasks
@@ -2220,7 +2260,7 @@ impl McpService {
         {
             anyhow::bail!("MCP runtime changed during shutdown");
         }
-        Ok(())
+        Ok(completion)
     }
 
     async fn run_server_task(
@@ -2270,6 +2310,29 @@ impl McpService {
                     now,
                 )
                 .await;
+
+            // Startup retains the connector until its real owner completes.
+            // If stop arrived meanwhile, clean that owner and use the stop
+            // caller's scoped store before publishing any startup outcome.
+            if let Ok(request) = shutdown_rx.try_recv() {
+                if let Ok(session) = connect {
+                    let mut owner = retained_session.lock().await;
+                    *owner = Some(session);
+                    let session = owner.as_mut().expect("native startup cleanup owner");
+                    let startup_cleanup_failed = session.startup_failure().is_some();
+                    session
+                        .shutdown_result()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("MCP startup cleanup unconfirmed"))?;
+                    if startup_cleanup_failed {
+                        anyhow::bail!(
+                            "MCP startup cleanup previously failed; native stop outcome unknown"
+                        );
+                    }
+                }
+                self.publish_scoped_shutdown(&row, request).await;
+                return Ok(());
+            }
 
             let session = match connect {
                 Ok(session) => session,
@@ -4632,6 +4695,11 @@ mod tests {
             .stop_task_result(id, DomainRuntimeState::Stopped)
             .await
             .expect("same retained result on repeat");
+        service.stop_task(id, DomainRuntimeState::Stopped).await;
+        assert!(
+            !service.task_exists(id).await,
+            "legacy stop releases only the confirmed actor"
+        );
         service.shutdown().await;
     }
 

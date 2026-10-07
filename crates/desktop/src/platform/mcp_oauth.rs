@@ -263,6 +263,11 @@ impl Drop for DesktopMcpOAuthShell {
     }
 }
 fn handle_callback(mut stream: TcpStream, listener: &Listener) {
+    // BSD accept inherits the listener's nonblocking mode. The callback reader
+    // needs blocking reads with its bounded deadline on every platform.
+    if stream.set_nonblocking(false).is_err() {
+        return;
+    }
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     let mut bytes = [0u8; 8192];
@@ -383,6 +388,63 @@ mod tests {
         client.read_to_string(&mut response).unwrap();
         worker.join().unwrap();
         response
+    }
+    #[test]
+    fn inherited_nonblocking_socket_waits_for_a_fragmented_callback() {
+        use std::sync::{atomic::AtomicUsize, mpsc};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let received = calls.clone();
+        let listener = Listener {
+            callback_port: 49152,
+            pending: Mutex::new(HashMap::from([(
+                "fragmented-state".into(),
+                Pending {
+                    flow: "fragmented-flow".into(),
+                    deadline: SystemTime::now() + Duration::from_secs(30),
+                    admission: OAuthBrowserAdmission::default(),
+                    relay: Arc::new(move |fields| {
+                        assert_eq!(fields.state.expose_secret(), "fragmented-state");
+                        assert_eq!(fields.code.unwrap().expose_secret(), "fragmented-code");
+                        received.fetch_add(1, Ordering::SeqCst);
+                        true
+                    }),
+                },
+            )])),
+            stopped: AtomicBool::new(false),
+            prepared: Mutex::new(SystemTime::now()),
+        };
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let (ready, accepted) = mpsc::sync_channel(0);
+        let worker = std::thread::spawn(move || {
+            let stream = socket.accept().unwrap().0;
+            stream.set_nonblocking(true).unwrap();
+            ready.send(()).unwrap();
+            handle_callback(stream, &listener);
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        accepted.recv_timeout(Duration::from_secs(3)).unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        client
+            .write_all(b"GET /oauth/mcp/callback?state=fragmented-state&co")
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        client
+            .write_all(b"de=fragmented-code HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        worker.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 202 Accepted"));
+        assert!(!response.contains("fragmented-state"));
+        assert!(!response.contains("fragmented-code"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
     #[test]
     fn loopback_callback_relays_once_and_never_echoes_code_or_state() {

@@ -38,6 +38,10 @@ pub struct Model {
     pub prepared_at: DateTimeWithTimeZone,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    pub gate_probe_at: i64,
+    pub gate_probe_attempts: i64,
+    #[sea_orm(unique)]
+    pub gate_probe_token: Option<String>,
     #[sea_orm(
         belongs_to,
         from = "turn_id",

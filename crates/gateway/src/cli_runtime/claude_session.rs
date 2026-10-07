@@ -487,10 +487,12 @@ impl ClaudeRequiredMcpBridge {
         }
         outcome.clone().unwrap().map_err(|e| anyhow!("{e}"))?;
         if !*cleanup_done {
-            if !self
-                .supervisor
-                .revoke_session_result(&self.process_instance)
-                .await?
+            if !self.launch.cleanup_confirmed()
+                && !self
+                    .supervisor
+                    .revoke_session_result(&self.process_instance)
+                    .await?
+                && !self.launch.cleanup_confirmed()
             {
                 bail!("CLI MCP cleanup owner is unknown");
             }

@@ -9692,9 +9692,6 @@ dependencies = [
  "gpui-kit",
  "pioneer-client",
  "pioneer-desktop-foundation",
- "pioneer-desktop-mcp",
- "pioneer-desktop-skills",
- "pioneer-protocol",
  "rust-i18n",
  "tokio",
 ]
@@ -9760,7 +9757,6 @@ dependencies = [
  "image",
  "pioneer-client",
  "pioneer-desktop-foundation",
- "pioneer-desktop-plugins",
  "pioneer-observability",
  "rust-i18n",
  "serde",

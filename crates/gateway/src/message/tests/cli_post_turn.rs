@@ -251,7 +251,8 @@ async fn cli_post_turn_replay_preserves_first_snapshot_and_executes_once_after_c
         processor
             .process_due_native_terminal_effects(chrono::Utc::now().timestamp(), 8)
             .await
-            .unwrap(),
+            .unwrap()
+            .count,
         0
     );
     assert!(calls.lock().unwrap().is_empty());
@@ -365,4 +366,167 @@ async fn cli_post_turn_without_subscribers_is_noop_and_user_preview_is_bounded()
         .unwrap();
     assert_eq!(text, "approval");
     assert!(!truncated);
+}
+
+#[tokio::test]
+async fn failed_gate_bookkeeping_dispatches_independent_hooks_and_defers_worker() {
+    use pioneer_entity::native_terminal_effect_outbox as effect;
+    use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, sea_query::Expr};
+
+    let (processor, _, _rx, workspace, store, _) = cli_runtime_approval_processor().await;
+    let processor = Arc::new(processor);
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    install_recoverable_test_hook_runtime(
+        &processor,
+        task_post_turn_recording_hook_runtime(calls.clone()),
+    )
+    .await;
+    for suffix in ["poison", "healthy"] {
+        let turn_id = format!("gate-bookkeeping-{suffix}");
+        seed_cli_runtime_turn_with_text(
+            &store,
+            &workspace,
+            "codex",
+            "codex",
+            &format!("thread-{turn_id}"),
+            &turn_id,
+            &format!("native-{turn_id}"),
+            "input",
+        )
+        .await;
+        let binding = store
+            .get_cli_runtime_turn_binding(&turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        processor
+            .prepare_cli_post_turn_hook(&binding, 1, Some(&final_answer("done")))
+            .await
+            .unwrap();
+        commit_turn(&store, &binding).await;
+    }
+    let poison = "gate-bookkeeping-poison:terminal-effect:post-turn";
+    effect::Entity::update_many()
+        .col_expr(effect::Column::Status, Expr::value("waiting_acceptance"))
+        .col_expr(
+            effect::Column::NextRunAt,
+            Expr::value(Option::<chrono::DateTime<chrono::FixedOffset>>::None),
+        )
+        .col_expr(
+            effect::Column::GateKind,
+            Expr::value("accepted_task_result"),
+        )
+        .filter(effect::Column::EffectId.eq(poison))
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+    // Reject reservation AND conditional deferral permanently. Healthy claims
+    // must still reach the actual hook executor, not just return from CRUD.
+    store.database_connection().execute_unprepared(
+        "CREATE TRIGGER reject_gate_bookkeeping BEFORE UPDATE OF gate_probe_at ON native_terminal_effect_outbox
+         WHEN OLD.effect_id='gate-bookkeeping-poison:terminal-effect:post-turn'
+         BEGIN SELECT RAISE(ABORT,'local bookkeeping fault'); END"
+    ).await.unwrap();
+    let outcome = processor
+        .process_due_native_terminal_effects(chrono::Utc::now().timestamp(), 8)
+        .await
+        .unwrap();
+    assert!(outcome.storage_failed);
+    assert_eq!(outcome.count, 1);
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert_eq!(
+        store
+            .native_terminal_effect_status("gate-bookkeeping-healthy:terminal-effect:post-turn")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "succeeded"
+    );
+
+    // Put another independently executable hook through the real kick loop.
+    let turn_id = "gate-bookkeeping-next";
+    seed_cli_runtime_turn_with_text(
+        &store,
+        &workspace,
+        "codex",
+        "codex",
+        "thread-gate-next",
+        turn_id,
+        "native-gate-next",
+        "input",
+    )
+    .await;
+    let binding = store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    processor
+        .prepare_cli_post_turn_hook(&binding, 1, Some(&final_answer("done")))
+        .await
+        .unwrap();
+    commit_turn(&store, &binding).await;
+    processor.kick_native_terminal_effects();
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if store
+                .native_terminal_effect_status("gate-bookkeeping-next:terminal-effect:post-turn")
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                == "succeeded"
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 2);
+    // Let completion return to the worker before freezing its five-second sleep.
+    for _ in 0..128 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::pause();
+    processor.kick_native_terminal_effects();
+    tokio::time::advance(Duration::from_secs(4)).await;
+    for _ in 0..128 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        processor
+            .native_terminal_effect_kick_running
+            .load(Ordering::Acquire)
+    );
+    assert!(
+        processor
+            .native_terminal_effect_kick_pending
+            .load(Ordering::Acquire)
+    );
+    tokio::time::resume();
+    store
+        .database_connection()
+        .execute_unprepared("DROP TRIGGER reject_gate_bookkeeping")
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        while processor
+            .native_terminal_effect_kick_running
+            .load(Ordering::Acquire)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let row = effect::Entity::find_by_id(poison)
+        .one(&store.database_connection())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.attempt_count, 0);
+    assert_eq!(row.status, "waiting_acceptance");
 }

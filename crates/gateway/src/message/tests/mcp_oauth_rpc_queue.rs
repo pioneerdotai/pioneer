@@ -34,7 +34,8 @@ async fn authorized_event_cannot_restart_reinstalled_or_replaced_identity_after_
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// One async worker verifies that the post-put async barrier yields to Cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn same_websocket_terminal_decision_after_durable_put_preserves_cancel_timeout_and_success() {
     use pioneer_mcp_oauth::OAuthState;
     for decision in [
@@ -106,7 +107,8 @@ async fn oauth_queue_cancellation_impl(
         resumed: Default::default(),
     });
     let secrets = Arc::new(GatewaySecrets::new(other_read.clone()));
-    let clock = Arc::new(WireCommitClock::new(secret_store));
+    let clock = Arc::new(WireCommitClock::new());
+    let commit_hooks = Arc::new(pioneer_mcp_oauth::OAuthTestHooks::default());
     let mut processor = MessageProcessor::new(
         Arc::new(ThreadManager::new("o4-mini", "openai")),
         test_provider(),
@@ -127,6 +129,7 @@ async fn oauth_queue_cancellation_impl(
             processor.authorization_invalidation_hub.clone(),
             processor.execution_leases.clone(),
             pioneer_mcp_oauth::OAuthServiceOptions {
+                test_hooks: Some(commit_hooks.clone()),
                 clock: clock.clone(),
                 poll_interval: if replacement.is_some() {
                     Duration::from_millis(10)
@@ -173,7 +176,7 @@ async fn oauth_queue_cancellation_impl(
         }
     }
     let _release_on_exit = QueueFixtureRelease {
-        clock: clock.clone(),
+        commit_hooks: commit_hooks.clone(),
         notifications: vec![token_release.clone(), effect_release.clone()],
         other_read: other_read.clone(),
     };
@@ -242,7 +245,6 @@ async fn oauth_queue_cancellation_impl(
         .unwrap()
         .unwrap();
     let server_id = row.id.unwrap();
-    *clock.id.lock().unwrap() = Some(server_id.clone());
     if replacement.is_some() || stale_rpc.is_some() {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -819,11 +821,16 @@ async fn oauth_queue_cancellation_impl(
                 .unwrap(),
         )
         .unwrap();
-        clock.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        commit_hooks
+            .pause_after_exchange
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         token_release.notify_one();
-        tokio::time::timeout(Duration::from_secs(3), clock.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            commit_hooks.exchange_returned.notified(),
+        )
+        .await
+        .unwrap();
         assert!(
             secrets
                 .mcp_oauth_persistence()
@@ -849,7 +856,7 @@ async fn oauth_queue_cancellation_impl(
         } else if decision == OAuthState::TimedOut {
             *clock.now.lock().unwrap() += Duration::from_secs(4000);
         }
-        clock.resume();
+        commit_hooks.decide_exchange.notify_one();
         let wire_state = match decision {
             OAuthState::Cancelled => "cancelled",
             OAuthState::TimedOut => "timed_out",
@@ -1300,6 +1307,7 @@ async fn oauth_scope_phase(phase: &'static str) {
         .await
         .unwrap();
     }
+    let startup_release = Arc::new(tokio::sync::Notify::new());
     if phase != "live" && phase != "recovery" {
         let entered = Arc::new(tokio::sync::Notify::new());
         processor
@@ -1307,6 +1315,7 @@ async fn oauth_scope_phase(phase: &'static str) {
             .set_connector_for_tests(Arc::new(ScopePhaseConnector {
                 phase,
                 entered: entered.clone(),
+                release: startup_release.clone(),
             }));
         processor
             .mcp_service
@@ -1380,9 +1389,33 @@ async fn oauth_scope_phase(phase: &'static str) {
             .mcp_service
             .set_connector_for_tests(Arc::new(FakeMcpRuntimeConnector));
     }
-    service
-        .restart_server("workspace", &workspace_id, "resend")
+    let restart = {
+        let service = service.clone();
+        let workspace_id = workspace_id.clone();
+        tokio::spawn(async move {
+            service
+                .restart_server("workspace", &workspace_id, "resend")
+                .await
+        })
+    };
+    if phase == "startup" {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !service.task_stop_requested_for_tests(id).await {
+                tokio::task::yield_now().await;
+            }
+        })
         .await
+        .expect("restart must request stop from the retained startup owner");
+        assert!(
+            !restart.is_finished(),
+            "startup cannot acknowledge stop before completion"
+        );
+        startup_release.notify_one();
+    }
+    tokio::time::timeout(Duration::from_secs(3), restart)
+        .await
+        .expect("restart should finish after real connector completion")
+        .unwrap()
         .unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -1481,19 +1514,28 @@ async fn await_oauth_wire_response(
 struct ScopePhaseConnector {
     phase: &'static str,
     entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
 }
 #[async_trait::async_trait]
 impl pioneer_mcp::McpRuntimeConnector for ScopePhaseConnector {
     async fn connect(
         &self,
-        _: pioneer_mcp::McpServerInstallation,
-        _: String,
-        _: Arc<dyn pioneer_mcp::McpSecretResolver>,
-        _: i64,
+        installation: pioneer_mcp::McpServerInstallation,
+        id: String,
+        resolver: Arc<dyn pioneer_mcp::McpSecretResolver>,
+        now: i64,
     ) -> Result<Box<dyn pioneer_mcp::McpRuntimeSession>, pioneer_mcp::McpRuntimeError> {
         self.entered.notify_one();
         if self.phase == "startup" {
-            std::future::pending().await
+            self.release.notified().await;
+            pioneer_mcp::McpRuntimeConnector::connect(
+                &FakeMcpRuntimeConnector,
+                installation,
+                id,
+                resolver,
+                now,
+            )
+            .await
         } else if self.phase == "backoff" {
             Err(pioneer_mcp::McpRuntimeError::failed(
                 "controlled retry backoff",
@@ -1506,52 +1548,21 @@ impl pioneer_mcp::McpRuntimeConnector for ScopePhaseConnector {
     }
 }
 
-// Reads the actual completed store record: no barrier inside put or token HTTP.
+// Time observation must never block: event validation and cancellation also
+// read this clock while holding their admission mutex. The async service hook
+// above pauses only the exchange owner after the actual SDK store has returned.
 struct WireCommitClock {
-    store: Arc<MemorySecretStore>,
-    id: std::sync::Mutex<Option<String>>,
-    armed: std::sync::atomic::AtomicBool,
     now: std::sync::Mutex<std::time::SystemTime>,
-    entered: tokio::sync::Notify,
-    released: std::sync::Mutex<bool>,
-    release: std::sync::Condvar,
 }
 impl WireCommitClock {
-    fn new(store: Arc<MemorySecretStore>) -> Self {
+    fn new() -> Self {
         Self {
-            store,
-            id: std::sync::Mutex::new(None),
-            armed: std::sync::atomic::AtomicBool::new(false),
             now: std::sync::Mutex::new(std::time::SystemTime::now()),
-            entered: tokio::sync::Notify::new(),
-            released: std::sync::Mutex::new(false),
-            release: std::sync::Condvar::new(),
         }
-    }
-    fn resume(&self) {
-        *self.released.lock().unwrap() = true;
-        self.release.notify_all();
     }
 }
 impl pioneer_mcp_oauth::OAuthClock for WireCommitClock {
     fn now(&self) -> std::time::SystemTime {
-        use pioneer_keystore::SecretStore;
-        let stored = self.id.lock().unwrap().as_ref().is_some_and(|id| {
-            self.store
-                .get_string(&pioneer_keystore::SecretId::mcp_oauth(id).unwrap())
-                .unwrap()
-                .is_some_and(|record| {
-                    serde_json::from_str::<Value>(&record).unwrap()["pending_consent"]["candidate"]
-                        .is_object()
-                })
-        });
-        if stored && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            self.entered.notify_one();
-            let mut released = self.released.lock().unwrap();
-            while !*released {
-                released = self.release.wait(released).unwrap();
-            }
-        }
         *self.now.lock().unwrap()
     }
 }
@@ -1627,13 +1638,13 @@ impl pioneer_mcp::McpRuntimeSession for ScopeRefreshSession {
 }
 
 struct QueueFixtureRelease {
-    clock: Arc<WireCommitClock>,
+    commit_hooks: Arc<pioneer_mcp_oauth::OAuthTestHooks>,
     notifications: Vec<Arc<tokio::sync::Notify>>,
     other_read: Arc<OtherInstallationRead>,
 }
 impl Drop for QueueFixtureRelease {
     fn drop(&mut self) {
-        self.clock.resume();
+        self.commit_hooks.decide_exchange.notify_one();
         self.other_read
             .uncertain_promotion
             .store(false, std::sync::atomic::Ordering::SeqCst);

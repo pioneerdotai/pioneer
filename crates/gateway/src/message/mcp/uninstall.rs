@@ -8,32 +8,35 @@ impl MessageProcessor {
         params: McpUninstallParams,
     ) {
         match self
-            .uninstall_mcp(request_context, request_id.clone(), params)
+            .uninstall_mcp_deferred(request_context, request_id.clone(), params)
             .await
         {
-            Ok(payload) => match JsonRpcResponse::from_result(request_id, &payload) {
-                Ok(response) => {
-                    if let Err(error) = self
-                        .send_json(request_context.connection_id(), &response)
+            Ok((payload, workspace, changed)) => {
+                match JsonRpcResponse::from_result(request_id, &payload) {
+                    Ok(response) => {
+                        if let Err(error) = self
+                            .send_json(request_context.connection_id(), &response)
+                            .await
+                        {
+                            warn!(error = %error, "failed to send mcp_uninstall response");
+                        }
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            request_context.connection_id(),
+                            mcp_error(
+                                None,
+                                INVALID_REQUEST_CODE,
+                                MCP_ERROR_INTERNAL,
+                                "failed to encode uninstall response",
+                                json!({"error": format!("{error:#}")}),
+                            ),
+                        )
                         .await
-                    {
-                        warn!(error = %error, "failed to send mcp_uninstall response");
                     }
                 }
-                Err(error) => {
-                    self.send_error(
-                        request_context.connection_id(),
-                        mcp_error(
-                            None,
-                            INVALID_REQUEST_CODE,
-                            MCP_ERROR_INTERNAL,
-                            "failed to encode uninstall response",
-                            json!({"error": format!("{error:#}")}),
-                        ),
-                    )
-                    .await
-                }
-            },
+                self.publish_mcp_changes(&workspace, changed).await;
+            }
             Err(error) => {
                 self.send_error(request_context.connection_id(), error)
                     .await
@@ -41,12 +44,15 @@ impl MessageProcessor {
         }
     }
 
-    pub(crate) async fn uninstall_mcp(
+    async fn uninstall_mcp_deferred(
         &self,
         request_context: &RequestContext,
         request_id: RequestId,
         params: McpUninstallParams,
-    ) -> std::result::Result<McpUninstallResponse, JsonRpcErrorResponse> {
+    ) -> std::result::Result<
+        (McpUninstallResponse, String, Vec<McpChangedItem>),
+        JsonRpcErrorResponse,
+    > {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
         let scope = if params.scope_kind.as_str() == "workspace" {
             params.workspace_id.as_str()
@@ -91,7 +97,7 @@ impl MessageProcessor {
             None => None,
         };
         let owned = native.is_some();
-        let work = self.uninstall_mcp_with_plugin_change(
+        let work = self.uninstall_mcp_deferred_with_plugin_change(
             request_context,
             request_id.clone(),
             params,
@@ -150,6 +156,23 @@ impl MessageProcessor {
         params: McpUninstallParams,
         native: Option<&pioneer_crud::PluginNativeWrite>,
     ) -> std::result::Result<McpUninstallResponse, JsonRpcErrorResponse> {
+        let (response, workspace, changed) = self
+            .uninstall_mcp_deferred_with_plugin_change(request_context, request_id, params, native)
+            .await?;
+        self.publish_mcp_changes(&workspace, changed).await;
+        Ok(response)
+    }
+
+    async fn uninstall_mcp_deferred_with_plugin_change(
+        &self,
+        request_context: &RequestContext,
+        request_id: RequestId,
+        params: McpUninstallParams,
+        native: Option<&pioneer_crud::PluginNativeWrite>,
+    ) -> std::result::Result<
+        (McpUninstallResponse, String, Vec<McpChangedItem>),
+        JsonRpcErrorResponse,
+    > {
         let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_mcp_workspace(
@@ -330,33 +353,16 @@ impl MessageProcessor {
             audit: McpLifecycleAuditSummary { events_written: 1 },
         };
 
-        self.notify_mcp_changed(
-            workspace_id.as_str(),
-            vec![McpChangedItem {
-                name: row.name,
-                source_kind: McpSourceKind::Config,
-                action: McpChangedAction::Uninstall,
-            }],
-            now,
-        )
-        .await;
-
-        if let Err(error) = self
-            .mcp_service
-            .reload_workspace(workspace_id.as_str())
-            .await
-        {
-            warn!(
-                workspace_id = workspace_id.as_str(),
-                error = %format!("{error:#}"),
-                "failed to reload MCP runtime after uninstall"
-            );
-        }
+        let changed = vec![McpChangedItem {
+            name: row.name,
+            source_kind: McpSourceKind::Config,
+            action: McpChangedAction::Uninstall,
+        }];
 
         let cleanup_report = self
             .gateway_secrets
             .delete_mcp_secrets(secret_ref_ids.iter().map(String::as_str));
         warn_mcp_secret_delete_report("mcp_uninstall", &cleanup_report);
-        Ok(response_payload)
+        Ok((response_payload, workspace_id, changed))
     }
 }

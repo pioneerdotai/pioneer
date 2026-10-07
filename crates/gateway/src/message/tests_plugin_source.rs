@@ -1,4 +1,4 @@
-//! C1-01 regression sources only: NOT_RUN / NOT_COMPILED.
+//! Plugin native source overrides and package context regressions.
 use super::*;
 use std::path::Path;
 
@@ -84,7 +84,12 @@ async fn owned_source_context_keeps_native_override_and_bundled_siblings_separat
         .install_skill_lifecycle_with_ownership(
             &child,
             &policy,
-            &[],
+            &[fixture_skill_lifecycle_audit(
+                &child.skill_id,
+                "member",
+                "install",
+                1,
+            )],
             None,
             Some(&PluginOwnershipWrite {
                 plugin_id: id.clone(),
@@ -179,7 +184,12 @@ async fn owned_source_context_keeps_native_override_and_bundled_siblings_separat
                     fingerprint: Some("uploaded-v1".into()),
                     ..Default::default()
                 },
-                &[],
+                &[fixture_skill_lifecycle_audit(
+                    &child.skill_id,
+                    "member",
+                    "update",
+                    3
+                )],
                 Some(&upload.upload_id),
                 None,
                 Some(&write),

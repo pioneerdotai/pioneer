@@ -477,7 +477,7 @@ mod tests {
         assert_eq!(client.request_headers(None, headers.clone()), headers);
         let generated = client.request_headers(Some("generated"), headers);
         assert!(!generated.contains_key(&http::header::AUTHORIZATION));
-        assert_eq!(generated["x-context"], "keep");
+        assert_eq!(generated[&HeaderName::from_static("x-context")], "keep");
     }
 
     struct CauseProvider {

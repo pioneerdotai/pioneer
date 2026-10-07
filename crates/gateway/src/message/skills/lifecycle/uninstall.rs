@@ -8,32 +8,35 @@ impl MessageProcessor {
         params: SkillsUninstallParams,
     ) {
         match self
-            .uninstall_skill(request_context, request_id.clone(), params)
+            .uninstall_skill_deferred(request_context, request_id.clone(), params)
             .await
         {
-            Ok(payload) => match JsonRpcResponse::from_result(request_id, &payload) {
-                Ok(response) => {
-                    if let Err(error) = self
-                        .send_json(request_context.connection_id(), &response)
+            Ok((payload, publication)) => {
+                match JsonRpcResponse::from_result(request_id, &payload) {
+                    Ok(response) => {
+                        if let Err(error) = self
+                            .send_json(request_context.connection_id(), &response)
+                            .await
+                        {
+                            warn!(error = %error, "failed to send skills_uninstall response");
+                        }
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            request_context.connection_id(),
+                            skills_error(
+                                None,
+                                INVALID_REQUEST_CODE,
+                                SKILLS_ERROR_INTERNAL,
+                                "failed to encode uninstall response",
+                                json!({"error": format!("{error:#}")}),
+                            ),
+                        )
                         .await
-                    {
-                        warn!(error = %error, "failed to send skills_uninstall response");
                     }
                 }
-                Err(error) => {
-                    self.send_error(
-                        request_context.connection_id(),
-                        skills_error(
-                            None,
-                            INVALID_REQUEST_CODE,
-                            SKILLS_ERROR_INTERNAL,
-                            "failed to encode uninstall response",
-                            json!({"error": format!("{error:#}")}),
-                        ),
-                    )
-                    .await
-                }
-            },
+                self.publish_skill_change(publication).await;
+            }
             Err(error) => {
                 self.send_error(request_context.connection_id(), error)
                     .await
@@ -41,12 +44,13 @@ impl MessageProcessor {
         }
     }
 
-    pub(crate) async fn uninstall_skill(
+    async fn uninstall_skill_deferred(
         &self,
         request_context: &RequestContext,
         request_id: RequestId,
         params: SkillsUninstallParams,
-    ) -> std::result::Result<SkillsUninstallResponse, JsonRpcErrorResponse> {
+    ) -> std::result::Result<(SkillsUninstallResponse, SkillChangePublication), JsonRpcErrorResponse>
+    {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
         let native = self
             .begin_native_plugin_change(
@@ -70,7 +74,7 @@ impl MessageProcessor {
                 )
             })?;
         let owned = native.is_some();
-        let work = self.uninstall_skill_with_plugin_change(
+        let work = self.uninstall_skill_deferred_with_plugin_change(
             request_context,
             request_id.clone(),
             params,
@@ -129,6 +133,26 @@ impl MessageProcessor {
         params: SkillsUninstallParams,
         native: Option<&pioneer_crud::PluginNativeWrite>,
     ) -> std::result::Result<SkillsUninstallResponse, JsonRpcErrorResponse> {
+        let (response, publication) = self
+            .uninstall_skill_deferred_with_plugin_change(
+                request_context,
+                request_id,
+                params,
+                native,
+            )
+            .await?;
+        self.publish_skill_change(publication).await;
+        Ok(response)
+    }
+
+    async fn uninstall_skill_deferred_with_plugin_change(
+        &self,
+        request_context: &RequestContext,
+        request_id: RequestId,
+        params: SkillsUninstallParams,
+        native: Option<&pioneer_crud::PluginNativeWrite>,
+    ) -> std::result::Result<(SkillsUninstallResponse, SkillChangePublication), JsonRpcErrorResponse>
+    {
         let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_skills_workspace(
@@ -348,29 +372,24 @@ impl MessageProcessor {
             fingerprint_before: Some(existing.fingerprint),
             fingerprint_after: None,
         };
-        if let Some(parent) = parent {
-            self.notify_skill_projection_changed(
-                workspace_id.as_str(),
-                "uninstalled",
-                vec![child_change],
-                vec![SkillPackChangedItem {
-                    pack_id: parent.pack_id,
-                    change_type: "updated".to_owned(),
-                    name_before: Some(parent.name.clone()),
-                    name_after: Some(parent.name),
-                }],
-                now,
-            )
-            .await;
-        } else {
-            self.notify_skills_changed(
-                workspace_id.as_str(),
-                "uninstalled",
-                vec![child_change],
-                now,
-            )
-            .await;
-        }
-        Ok(payload)
+        let pack_changes = parent
+            .map(|parent| SkillPackChangedItem {
+                pack_id: parent.pack_id,
+                change_type: "updated".to_owned(),
+                name_before: Some(parent.name.clone()),
+                name_after: Some(parent.name),
+            })
+            .into_iter()
+            .collect();
+        Ok((
+            payload,
+            SkillChangePublication {
+                workspace_id,
+                reason: "uninstalled",
+                changes: vec![child_change],
+                pack_changes,
+                created_at: now,
+            },
+        ))
     }
 }
