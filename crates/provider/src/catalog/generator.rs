@@ -1126,9 +1126,11 @@ mod specialized_zero_regressions {
         // reintroduce stale pinned limits/prices to exercise override priority.
         assert_eq!(known["contextWindow"], 64000);
         assert_eq!(known["maxTokens"], 4000);
+        // The source supplies input/output rates only; missing cache rates
+        // remain unknown rather than being interpreted as free caching.
         assert_eq!(
             known["cost"],
-            json!({"input":99,"output":99,"cacheRead":0,"cacheWrite":0})
+            json!({"input":99,"output":99,"cacheRead":null,"cacheWrite":null})
         );
         assert_eq!(
             generated.provenance["deepseek"]["deepseek-v4-flash"]["contextWindow"]["kind"],
