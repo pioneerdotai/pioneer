@@ -45,6 +45,37 @@ impl NativeRequestProjection {
                 "summary cannot replace system instructions"
             );
         }
+        pioneer_provider::continuation::validate_compaction(&request.messages, &compact)?;
+        if !compact.is_empty() {
+            let mut pending = BTreeMap::new();
+            for (index, message) in request.messages.iter().enumerate() {
+                for call in message.tool_calls.iter().flatten() {
+                    ensure!(
+                        pending
+                            .insert((call.id.clone(), call.name.clone()), index)
+                            .is_none(),
+                        "ambiguous compaction tool call"
+                    );
+                }
+                if message.role == Role::Tool {
+                    let key = (
+                        message.tool_call_id.clone().unwrap_or_default(),
+                        message.name.clone().unwrap_or_default(),
+                    );
+                    let call = pending
+                        .remove(&key)
+                        .ok_or_else(|| anyhow::anyhow!("orphan compaction tool result"))?;
+                    ensure!(
+                        compact.contains(&call) == compact.contains(&index),
+                        "compaction splits a call/result pair"
+                    );
+                }
+            }
+            ensure!(
+                pending.values().all(|index| !compact.contains(index)),
+                "compaction selects an unfinished tool round"
+            );
+        }
         let mut estimates = BTreeMap::new();
         for value in media {
             ensure!(value.input_tokens > 0, "unknown media input estimate");
@@ -191,6 +222,182 @@ impl NativeRequestProjection {
 
 #[cfg(test)]
 mod tests {
+    fn replay_round(id: &str) -> Vec<ChatMessage> {
+        let state = pioneer_provider::ProviderReplayState::for_model(
+            "deepseek",
+            "fixture",
+            serde_json::json!({
+                "schema_version":1,"assistant_message":{"content":null,"reasoning_content":"native thinking",
+                    "tool_calls":[{"id":id,"type":"function","function":{"name":"read","arguments":"{}"}}]}
+            }),
+        );
+        vec![
+            ChatMessage::assistant_tool_calls_with_provider_state(
+                None::<String>,
+                Some("native thinking"),
+                vec![pioneer_provider::ProviderToolCall {
+                    id: id.into(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                }],
+                Some(state),
+            ),
+            ChatMessage::tool_result(id, "read", "outcome"),
+        ]
+    }
+
+    #[test]
+    fn compaction_rejects_boundary_between_call_and_result() {
+        let mut req = request();
+        req.messages = replay_round("call");
+        for selected in [vec![0], vec![1]] {
+            assert!(
+                NativeRequestProjection::new(
+                    req.clone(),
+                    selected,
+                    vec![],
+                    ModelBudget::new(Some(32768), None, None),
+                    false
+                )
+                .is_err()
+            );
+        }
+        req.messages.pop();
+        assert!(
+            NativeRequestProjection::new(
+                req,
+                [0],
+                vec![],
+                ModelBudget::new(Some(32768), None, None),
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn summary_replaces_whole_old_round_and_retains_native_tail_unchanged() {
+        let mut req = request();
+        req.messages = replay_round("old");
+        let tail = replay_round("tail");
+        req.messages.extend(tail.clone());
+        req.messages.push(ChatMessage::user("current"));
+        let result = NativeRequestProjection::new(
+            req,
+            [0, 1],
+            vec![],
+            ModelBudget::new(Some(32768), None, None),
+            false,
+        )
+        .unwrap()
+        .evaluate("completed old work")
+        .unwrap();
+        assert!(
+            result.request.messages[0]
+                .content
+                .contains("completed old work")
+        );
+        assert_eq!(&result.request.messages[1..3], tail.as_slice());
+        assert_eq!(result.request.messages[3].content, "current");
+        assert!(result.output_reserve > 0);
+    }
+
+    #[test]
+    fn summary_signed_tail_requires_a_documented_non_binding_profile() {
+        for (owner, model, payload, accepted) in [
+            (
+                "anthropic",
+                "claude-sonnet-5-5",
+                serde_json::json!({"schema_version":2,"blocks":[{"type":"thinking","thinking":"","signature":"signed"},{"type":"redacted_thinking","data":"opaque"},{"type":"text","text":"answer"}]}),
+                false,
+            ),
+            (
+                "anthropic",
+                "claude-sonnet-4-6",
+                serde_json::json!({"schema_version":2,"blocks":[{"type":"thinking","thinking":"","signature":"signed"}]}),
+                true,
+            ),
+            (
+                "bedrock",
+                "anthropic.claude-sonnet-4-6",
+                serde_json::json!({"blocks":[{"reasoningText":{"text":"","signature":"signed"}}]}),
+                false,
+            ),
+            (
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":[{"type":"reasoning.native-v-next","data":"opaque"}]}),
+                false,
+            ),
+            (
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":[{"type":"reasoning.text","text":"readable","signature":null},{"type":"reasoning.summary","summary":"summary"}]}),
+                true,
+            ),
+            (
+                "openrouter",
+                "selected",
+                serde_json::json!({"reasoning_details":[]}),
+                true,
+            ),
+            (
+                "gemini",
+                "gemini-3-flash",
+                serde_json::json!({"schema_version":2,"parts":[{"text":"answer"},{"text":"","thoughtSignature":"signed"}]}),
+                true,
+            ),
+        ] {
+            let mut req = request();
+            let mut tail = ChatMessage::assistant("answer");
+            tail.provider_replay_state = Some(pioneer_provider::ProviderReplayState::for_model(
+                owner, model, payload,
+            ));
+            req.messages = vec![
+                ChatMessage::user("original prefix"),
+                tail.clone(),
+                ChatMessage::user("new turn"),
+            ];
+            let unchanged = NativeRequestProjection::full(
+                req.clone(),
+                vec![],
+                ModelBudget::new(Some(32768), None, None),
+                false,
+            )
+            .unwrap();
+            assert_eq!(unchanged.request.messages[1], tail);
+            let rewrite = NativeRequestProjection::new(
+                req.clone(),
+                [0],
+                vec![],
+                ModelBudget::new(Some(32768), None, None),
+                false,
+            );
+            assert_eq!(rewrite.is_ok(), accepted);
+            if let Ok(projection) = rewrite {
+                assert_eq!(
+                    projection
+                        .evaluate("changed prefix")
+                        .unwrap()
+                        .request
+                        .messages[1],
+                    tail
+                );
+            }
+            // No old signed state left: ordinary whole-history summary remains supported.
+            assert!(
+                NativeRequestProjection::new(
+                    req,
+                    [0, 1],
+                    vec![],
+                    ModelBudget::new(Some(32768), None, None),
+                    false
+                )
+                .is_ok()
+            );
+        }
+    }
+
     use super::*;
     use pioneer_provider::{CompiledPromptPayload, MessageAttachment, ToolDefinition};
     fn request() -> ChatRequest {

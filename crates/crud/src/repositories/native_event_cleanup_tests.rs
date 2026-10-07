@@ -614,6 +614,7 @@ async fn migration_bootstrap_restart_vacuum_and_live_events_before_cursor() -> R
         )
         .await?;
     }
+    assert_eq!(f.prepared("legacy").await?.ids.len(), 128);
     let f = f.migrate(false).await?;
     assert_eq!(
         f.scalar("SELECT COUNT(*) FROM native_event_cleanup_job")
@@ -1096,6 +1097,7 @@ async fn bootstrap_cursor_rolls_back_with_job_registration_failure() -> Result<(
     f.historical_completed_turn("legacy").await?;
     f.event("legacy", Some("legacy"), "codex", "item/completed", 8)
         .await?;
+    assert_eq!(f.prepared("legacy").await?.ids.len(), 1);
     let f = f.migrate(false).await?;
     f.sql("CREATE TRIGGER fail_bootstrap BEFORE INSERT ON native_event_cleanup_job BEGIN SELECT RAISE(ABORT,'injected bootstrap failure'); END").await?;
     assert!(bootstrap(&f.db).await.is_err());

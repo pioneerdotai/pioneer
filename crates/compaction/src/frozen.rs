@@ -200,7 +200,8 @@ impl FrozenMessageRef {
             if (alias.represented_thread == self.source_thread
                 && alias.represented_source == *source)
                 || (source.scope.starts_with("checkpoint:")
-                    && alias.represented_source.scope.starts_with("input:"))
+                    && (alias.represented_source.scope.starts_with("input:")
+                        || alias.represented_source.scope.starts_with("context:")))
             {
                 edges.push(FrozenReplayEdge {
                     covered_thread: alias.represented_thread.clone(),
@@ -296,9 +297,21 @@ impl FrozenMessageRef {
                         && self.sources.contains(&alias.represented_source))
                         || (self.sources.len() == 1
                             && self.sources[0].scope.starts_with("checkpoint:")
-                            && alias.represented_source.scope.starts_with("input:")))
-                    && alias.represented_source.scope.starts_with("input:")
-                    && alias.source.scope.starts_with("input:")
+                            && (alias.represented_source.scope.starts_with("input:")
+                                || alias.represented_source.scope.starts_with("context:"))))
+                    && ((alias.represented_source.scope.starts_with("input:")
+                        && alias.source.scope.starts_with("input:"))
+                        || (alias.represented_thread == alias.source_thread
+                            && alias
+                                .represented_source
+                                .scope
+                                .strip_prefix("context:")
+                                .is_some_and(|turn| {
+                                    !turn.is_empty()
+                                        && alias.source.scope.strip_prefix("event:") == Some(turn)
+                                })
+                            && !alias.source.version.is_empty()
+                            && !alias.represented_source.version.is_empty()))
                     && (alias.represented_thread != alias.source_thread
                         || alias.represented_source != alias.source)
             }),

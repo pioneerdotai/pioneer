@@ -129,6 +129,15 @@ fn portable_reasoning(state: &ProviderReplayState) -> Option<String> {
                 string_at(block, &["thinking"]).or_else(|| string_at(block, &["text"]))
             })
             .collect::<Vec<_>>(),
+        "gemini" => state
+            .payload
+            .get("parts")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|part| part.get("thought").and_then(serde_json::Value::as_bool) == Some(true))
+            .filter_map(|part| string_at(part, &["text"]))
+            .collect::<Vec<_>>(),
         "bedrock" => state
             .payload
             .get("blocks")
@@ -160,7 +169,7 @@ fn portable_reasoning(state: &ProviderReplayState) -> Option<String> {
     // without a separator when populating common reasoning_content.
     (!parts.is_empty()).then(|| {
         parts.join(
-            if matches!(state.provider.as_str(), "anthropic" | "bedrock") {
+            if matches!(state.provider.as_str(), "anthropic" | "bedrock" | "gemini") {
                 ""
             } else {
                 "\n"
@@ -568,6 +577,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn v2_native_history_switches_models_and_all_registered_profiles_without_leaking_signatures() {
+        for owner in ["anthropic", "gemini"] {
+            let payload = if owner == "anthropic" {
+                serde_json::json!({"schema_version":2,"blocks":[{"type":"thinking","thinking":"rationale","signature":"secret-signature"},{"type":"redacted_thinking","data":"secret-redacted"},{"type":"text","text":"answer"}]})
+            } else {
+                serde_json::json!({"schema_version":2,"parts":[{"text":"rationale","thought":true,"thoughtSignature":"secret-signature"},{"text":"answer","thoughtSignature":"secret-redacted"}]})
+            };
+            let mut message = ChatMessage::assistant("answer");
+            message.provider_replay_state =
+                Some(ProviderReplayState::for_model(owner, "source", payload));
+            let active = message.clone();
+            let mut stored: ChatMessage =
+                serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+            assert!(
+                stored.provenance.is_none(),
+                "stored JSON cannot grant completion authority"
+            );
+            let unattributed = stored.clone();
+            // The trusted cold loader reconstructs provenance from exact durable
+            // source revisions; ChatMessage serialization intentionally omits it.
+            complete(&mut stored, "final");
+            let same = project_messages_for_provider(owner, "source", &[stored.clone()]).unwrap();
+            assert_eq!(same[0], stored);
+            for profile in crate::definition::provider_definitions() {
+                let switched =
+                    project_messages_for_provider(profile.name, "target", &[stored.clone()])
+                        .unwrap();
+                let wire = serde_json::to_string(&switched).unwrap();
+                assert!(!wire.contains("secret-signature") && !wire.contains("secret-redacted"));
+                assert!(wire.contains("rationale"));
+                assert!(
+                    project_messages_for_provider(profile.name, "target", &[active.clone()])
+                        .is_err()
+                );
+                assert!(
+                    project_messages_for_provider(profile.name, "target", &[unattributed.clone()])
+                        .is_err(),
+                    "a JSON roundtrip cannot authorize a foreign provider/model projection"
+                );
+            }
+            // A fork keeps native source ownership; it does not mint signatures.
+            let mut inherited = stored.clone();
+            inherited.provenance.as_mut().unwrap().inherited = true;
+            inherited.provenance.as_mut().unwrap().context_thread = Some("fork-thread".into());
+            assert!(
+                project_messages_for_provider(owner, "source", &[inherited.clone()]).unwrap()[0]
+                    .provider_replay_state
+                    .is_some()
+            );
+            assert!(
+                project_messages_for_provider(owner, "target", &[inherited]).unwrap()[0]
+                    .provider_replay_state
+                    .is_none()
+            );
+            let mut legacy = stored.clone();
+            legacy.provider_replay_state.as_mut().unwrap().model = None;
+            let projected = project_messages_for_provider(owner, "source", &[legacy]).unwrap();
+            assert!(projected[0].provider_replay_state.is_none());
+            assert!(stored.provider_replay_state.is_some());
+        }
+    }
     #[test]
     fn foreign_completed_replay_becomes_portable_without_mutating_canonical_message() {
         let replay = ProviderReplayState::new(

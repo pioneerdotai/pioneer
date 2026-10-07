@@ -1,6 +1,9 @@
 #[path = "tests/agent_action_outbox.rs"]
 mod agent_action_outbox;
 
+#[path = "tests/history_continuation.rs"]
+mod history_continuation;
+
 #[path = "tests/compaction_lifecycle_poll.rs"]
 mod compaction_lifecycle_poll;
 
@@ -47935,6 +47938,56 @@ async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unbound_native_listener_owns_processor_until_abort() {
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = Box::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        Arc::new(SessionManager::new()),
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    assert!(processor.task_agent_executor.processor_weak().is_err());
+    // This fixture-only field is held exclusively by processor instances.
+    let owner_state = Arc::downgrade(&processor.native_cancellation_materialization_failure);
+    let agent_manager = processor.agent_manager.clone();
+    let thread_id = "unbound-listener-owner";
+    processor
+        .agent_manager
+        .ensure_thread(thread_id, &workspace_id)
+        .await
+        .unwrap();
+    processor
+        .ensure_agent_listener_task(thread_id)
+        .await
+        .unwrap();
+    let listener = processor
+        .agent_listener_tasks
+        .lock()
+        .await
+        .remove(thread_id)
+        .unwrap();
+    drop(processor);
+    assert!(
+        owner_state.upgrade().is_some(),
+        "the spawned listener must own its processor after the fixture is dropped"
+    );
+    listener.handle.abort();
+    let stopped = tokio::time::timeout(Duration::from_secs(2), listener.handle)
+        .await
+        .unwrap();
+    assert!(stopped.unwrap_err().is_cancelled());
+    assert!(
+        owner_state.upgrade().is_none(),
+        "joining the aborted listener must release its owned processor"
+    );
+    agent_manager.remove_thread(thread_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
     let (tx, _rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
@@ -54893,13 +54946,12 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 cleanup_calls.lock().unwrap().len(),
                 if resume_direct { 2 } else { 1 }
             );
-            assert_eq!(
-                processor
-                    .process_due_native_terminal_effects(chrono::Utc::now().timestamp(), 8)
-                    .await
-                    .unwrap(),
-                0
-            );
+            let replay_dispatch = processor
+                .process_due_native_terminal_effects(chrono::Utc::now().timestamp(), 8)
+                .await
+                .unwrap();
+            assert!(!replay_dispatch.storage_failed);
+            assert_eq!(replay_dispatch.count, 0);
         } else {
             assert_eq!(
                 crud_store_for_assert
@@ -54935,14 +54987,12 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
         }
         let restarted = pioneer_crud::CrudStore::new(crud_store_for_assert.database_connection());
         let now = now_timestamp_secs();
-        assert_eq!(
-            restarted
-                .claim_due_native_terminal_effects(now, 30, 2)
-                .await
-                .unwrap()
-                .len(),
-            0
-        );
+        let replay_claims = restarted
+            .claim_due_native_terminal_effects_at(now, 30, 2)
+            .await
+            .unwrap();
+        assert!(!replay_claims.storage_failed);
+        assert_eq!(replay_claims.records.len(), 0);
         for before in &preserved_blocked_rows {
             let after = pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(
                 before.effect_id.clone(),
@@ -68624,8 +68674,14 @@ async fn setup_pooled_file_workspace_manager_with_observer(
 async fn setup_workspace_manager_with_connection(
     connection: sea_orm::DatabaseConnection,
 ) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
+    setup_workspace_manager_with_connection_migrator::<Migrator>(connection).await
+}
+
+async fn setup_workspace_manager_with_connection_migrator<M: MigratorTrait>(
+    connection: sea_orm::DatabaseConnection,
+) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
     crate::compaction::load_test_catalog();
-    Migrator::up(&connection, None)
+    M::up(&connection, None)
         .await
         .expect("migrations must succeed");
     bootstrap(&connection)
@@ -69595,6 +69651,14 @@ struct MemoryAgentE2eHarness {
 }
 
 async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGatewayHarness {
+    setup_memory_gateway_harness_with_backend(case_id, enabled, None).await
+}
+
+async fn setup_memory_gateway_harness_with_backend(
+    case_id: &str,
+    enabled: bool,
+    backend: Option<Arc<dyn pioneer_memory::MemoryBackend>>,
+) -> MemoryGatewayHarness {
     let session_manager = Arc::new(SessionManager::new());
     let (tx, rx) = mpsc::channel(32);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -69605,8 +69669,13 @@ async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGat
         .await;
     let runtime_home = unique_temp_dir(&format!("memory_{case_id}"));
     std::fs::create_dir_all(runtime_home.as_path()).expect("create memory runtime home");
-    let memory_runtime = Arc::new(
-        GatewayMemoryRuntime::from_config(
+    let uses_memvid = backend.is_none();
+    let memory_runtime = Arc::new(match backend {
+        Some(backend) => {
+            assert!(enabled, "custom memory backend requires an enabled runtime");
+            GatewayMemoryRuntime::enabled_with_backend_for_test(crud_store.clone(), backend)
+        }
+        None => GatewayMemoryRuntime::from_config(
             crud_store.clone(),
             runtime_home.as_path(),
             &GatewayMemoryConfig {
@@ -69618,10 +69687,12 @@ async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGat
             },
         )
         .expect("memory runtime should initialize"),
-    );
+    });
 
     if enabled {
         assert!(memory_runtime.is_enabled());
+    }
+    if enabled && uses_memvid {
         assert!(
             memory_runtime
                 .capsules_root()
@@ -71314,7 +71385,15 @@ async fn memory_tool_remember_writes_memory_with_turn_provenance() {
 
 #[tokio::test]
 async fn supervised_memory_mutations_prompt_before_real_database_side_effects() {
-    let harness = setup_memory_gateway_harness("tool_supervised_consent", true).await;
+    // Exercise the real approval broker, tools, memory service and SQLite writes.
+    // Memvid indexing is covered separately; its Tantivy writer lifecycle must
+    // not make this permission regression depend on filesystem lock timing.
+    let harness = setup_memory_gateway_harness_with_backend(
+        "tool_supervised_consent",
+        true,
+        Some(Arc::new(pioneer_memory::InMemoryMemoryBackend::default())),
+    )
+    .await;
     let context = memory_tool_context(&harness, "tool_supervised_consent");
     let materialization = materialize_memory_tools_for_context(&harness, context.clone()).await;
     let permission_profile = pioneer_protocol::system_turn_permission_profile_snapshot(
@@ -71341,6 +71420,7 @@ async fn supervised_memory_mutations_prompt_before_real_database_side_effects() 
         crate::permissions::GatewayPermissionApprovalBroker::channel();
     let opened = Arc::new(AtomicUsize::new(0));
     let opened_for_worker = opened.clone();
+    let store_for_worker = harness.crud_store.clone();
     let approval_worker = tokio::spawn(async move {
         while let Some(event) = approval_events.recv().await {
             match event {
@@ -71354,6 +71434,15 @@ async fn supervised_memory_mutations_prompt_before_real_database_side_effects() 
                         pioneer_tools::PermissionActionKind::MemoryWrite
                     );
                     let index = opened_for_worker.fetch_add(1, Ordering::SeqCst);
+                    let rows_before_decision = store_for_worker
+                        .list_agent_memory_records(AgentMemoryListFilter::default())
+                        .await
+                        .expect("read memory before approval decision");
+                    assert_eq!(
+                        rows_before_decision.len(),
+                        index,
+                        "memory writes must wait for the approval decision"
+                    );
                     let resolution = if index == 0 {
                         pioneer_tools::PermissionApprovalResolution::AllowOnce
                     } else {
@@ -71423,6 +71512,23 @@ async fn supervised_memory_mutations_prompt_before_real_database_side_effects() 
     assert_eq!(opened.load(Ordering::SeqCst), 2);
     assert_eq!(rows.len(), 1, "denied mutation must not create a DB row");
     assert_eq!(rows[0].key.as_deref(), Some("supervised_allowed"));
+
+    let runtime = harness.processor.memory_runtime();
+    let stored = runtime
+        .service()
+        .get(
+            runtime.operation_context_for_authorized_turn(&context, None, false),
+            MemoryGetParams {
+                memory_id: rows[0].id.clone(),
+                include_deleted: false,
+            },
+        )
+        .await
+        .expect("read approved memory through the service");
+    assert_eq!(
+        stored.record.expect("approved memory should exist").content,
+        "approved supervised memory"
+    );
 
     drop(tools);
     approval_worker.abort();
