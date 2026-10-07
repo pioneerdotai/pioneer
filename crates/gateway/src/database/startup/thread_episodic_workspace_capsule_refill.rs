@@ -6785,7 +6785,7 @@ mod tests {
             .unwrap();
         let workspace_id = WorkspaceManager::new(writer.clone())
             .create_workspace(
-                &pioneer_protocol::generate_id(),
+                &pioneer_protocol::generate_id(21),
                 Some("Concurrent refill test"),
             )
             .await
@@ -8829,7 +8829,7 @@ mod tests {
             .unwrap();
         let workspace_manager = WorkspaceManager::new(connection.clone());
         let workspace_id = workspace_manager
-            .create_workspace(&pioneer_protocol::generate_id(), Some("Refill test"))
+            .create_workspace(&pioneer_protocol::generate_id(21), Some("Refill test"))
             .await
             .expect("isolated workspace should exist")
             .id;

@@ -13243,7 +13243,7 @@ mod tests {
             .unwrap();
         let workspace = WorkspaceManager::new(writer.clone())
             .create_workspace(
-                &pioneer_protocol::generate_id(),
+                &pioneer_protocol::generate_id(21),
                 Some("Physical episodic test"),
             )
             .await
@@ -13622,7 +13622,7 @@ mod tests {
             .unwrap();
         let workspace = WorkspaceManager::new(writer.clone())
             .create_workspace(
-                &pioneer_protocol::generate_id(),
+                &pioneer_protocol::generate_id(21),
                 Some("Physical episodic test"),
             )
             .await
@@ -14742,7 +14742,7 @@ mod tests {
             .unwrap();
         let workspace_manager = WorkspaceManager::new(connection.clone());
         let workspace_id = workspace_manager
-            .create_workspace(&pioneer_protocol::generate_id(), Some("Episodic test"))
+            .create_workspace(&pioneer_protocol::generate_id(21), Some("Episodic test"))
             .await
             .expect("isolated workspace should exist")
             .id;
