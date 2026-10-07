@@ -31,6 +31,7 @@ fn canonical_tool_rounds_keep_native_block_ids_and_object_inputs() {
         let prepared = prepare_messages_for_provider_model(provider.name(), "claude-sonnet-4-5", &provider.capabilities(), &history).unwrap();
         let (system, messages) = AnthropicProvider::prepare_messages(&prepared).unwrap();
         let wire = serde_json::to_value(ApiChatRequest {
+            generation: Default::default(),
             model: "claude-sonnet-4-5".into(), messages, max_tokens: 128, temperature: None,
             system, tools: None, tool_choice: None, output_config: None, stream: false,
             cache_control: None,

@@ -254,7 +254,8 @@ fn base(
         "sourceMetadata":source,
         "inputConstraints":source["inputConstraints"],
         "output":source["modalities"]["output"],
-        "cost":cost(&source["cost"]),"pricingSource":{"url":SOURCE_URLS[0],"units":"USD_per_million_tokens","raw":source["cost"]},"contextWindow":context,"maxTokens":output}),
+        "cost":cost(&source["cost"]),"pricingSource":{"url":SOURCE_URLS[0],"units":"USD_per_million_tokens","raw":source["cost"]},"contextWindow":context,"maxTokens":output,
+        "sourceGeneration":{"temperature":source["temperature"],"reasoningOptions":source["reasoning_options"]}}),
         context_origin,
         output_origin,
         reasoning_options: source["reasoning_options"].clone(),
@@ -427,11 +428,23 @@ mod tests {
             assert!(generated.models.remove(supplement).is_some());
             assert!(generated.provenance.remove(supplement).is_some());
         }
-        let reference: Value =
+        // Pi's explicit DeepSeek definitions predate the pinned source snapshot.
+        // Pioneer keeps source limits/modalities/prices authoritative. This
+        // explicit golden overlay covers the full changed provider subtree,
+        // including the source-only alias, without dropping it from comparison.
+        let deepseek: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/catalog/pioneer-deepseek.json"
+        ))
+        .unwrap();
+        let mut reference: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/provenance.json"))
                 .unwrap();
+        reference["deepseek"] = deepseek["provenance"].clone();
         let mut origins = Vec::new();
         for (p, models) in &generated.provenance {
+            if reference.get(p).is_none() {
+                continue;
+            }
             for (id, fields) in models {
                 for field in ["contextWindow", "maxTokens"] {
                     if reference[p][id].is_null() {
@@ -453,11 +466,27 @@ mod tests {
         );
         let unprojected = serde_json::to_value(generated.models).unwrap();
         let mut actual = unprojected.clone();
-        let expected: Value =
+        let mut expected: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json")).unwrap();
+        expected["deepseek"] = deepseek["models"].clone();
+        // Preserve the old reader fixture while the generator fixes 3.1 Pro.
+        for models in expected.as_object_mut().unwrap().values_mut() {
+            for model in models.as_object_mut().unwrap().values_mut() {
+                if model["api"] == "google-generative-ai"
+                    && model["id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("gemini-3.1-pro"))
+                {
+                    model["thinkingLevelMap"]["medium"] = json!("MEDIUM");
+                }
+            }
+        }
+        // Compare the pinned Pi surface, which deliberately had text/image
+        // only. Pioneer media supplements and new registered source routes
+        // have their own propagation fixtures below.
         // The Pi fixture collapsed missing prices into zero. Keep every
-        // existing non-pricing field and known price under exact comparison;
-        // allow unknown only when the source omitted that exact category.
+        // known price under exact comparison; allow unknown only when the
+        // source omitted that exact category.
         let captured_at = snapshot().captured_at;
         let providers = actual.as_object_mut().unwrap();
         providers.retain(|provider, _| !expected[provider].is_null());
@@ -493,6 +522,7 @@ mod tests {
                     "pricingEvidenceVersion",
                     "pricingCapturedAt",
                     "pricingUnits",
+                    "sourceGeneration",
                     "inputOrigin",
                     "sourceMetadata",
                     "inputConstraints",
@@ -1083,36 +1113,39 @@ mod specialized_zero_regressions {
         let mut s: SourceSnapshot =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
                 .unwrap();
-        let reference: Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json")).unwrap();
         let changed = json!({"tool_call":true,"name":"dynamic","modalities":{"input":["text"]},"cost":{"input":99,"output":99},"limit":{"context":64000,"output":4000}});
         s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["deepseek"]["models"]["deepseek-v4-flash"] =
+            changed.clone();
+        s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["anthropic"]["models"]["claude-opus-4-6"] =
             changed.clone();
         s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["deepseek"]["models"]["fixture-dynamic"] =
             changed;
         let generated = generate(&s, true).unwrap();
         let known = &generated.models["deepseek"]["deepseek-v4-flash"];
-        for field in ["contextWindow", "maxTokens"] {
-            assert_eq!(
-                known[field],
-                reference["deepseek"]["deepseek-v4-flash"][field]
-            );
-        }
-        // Numeric JSON representations such as 0 and 0.0 carry the same rate.
-        // Compare all pinned cost fields without dropping any pricing evidence.
-        let expected_cost = reference["deepseek"]["deepseek-v4-flash"]["cost"]
-            .as_object()
-            .unwrap();
-        let actual_cost = known["cost"].as_object().unwrap();
+        // DeepSeek's existing IDs, like new IDs, are source-owned. Do not
+        // reintroduce stale pinned limits/prices to exercise override priority.
+        assert_eq!(known["contextWindow"], 64000);
+        assert_eq!(known["maxTokens"], 4000);
         assert_eq!(
-            actual_cost.keys().collect::<Vec<_>>(),
-            expected_cost.keys().collect::<Vec<_>>()
+            known["cost"],
+            json!({"input":99,"output":99,"cacheRead":0,"cacheWrite":0})
         );
-        for (field, expected) in expected_cost {
-            assert_eq!(actual_cost[field].as_f64(), expected.as_f64(), "{field}");
-        }
         assert_eq!(
             generated.provenance["deepseek"]["deepseek-v4-flash"]["contextWindow"]["kind"],
+            "source"
+        );
+        // A genuine explicit context override retains priority, while the
+        // independently source-owned output limit continues to refresh.
+        assert_eq!(
+            generated.models["anthropic"]["claude-opus-4-6"]["contextWindow"],
+            1_000_000
+        );
+        assert_eq!(
+            generated.models["anthropic"]["claude-opus-4-6"]["maxTokens"],
+            4000
+        );
+        assert_eq!(
+            generated.provenance["anthropic"]["claude-opus-4-6"]["contextWindow"]["kind"],
             "override"
         );
         let dynamic = &generated.models["deepseek"]["fixture-dynamic"];

@@ -49,6 +49,8 @@ struct ApiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
     stream: bool,
+    #[serde(flatten)]
+    generation: crate::generation::Fields,
 }
 
 #[derive(Debug, Serialize)]
@@ -312,6 +314,28 @@ struct ApiModelEntry {
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl CopilotProvider {
+    fn build_chat_request(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        let generation = crate::generation::chat_fields("copilot", request)?;
+        Ok(ApiChatRequest {
+            generation,
+            model: request.model.clone(),
+            messages,
+            temperature: None,
+            max_tokens: None,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: request.tool_choice.clone().map(Self::convert_tool_choice),
+            parallel_tool_calls: request.parallel_tool_calls,
+            stream,
+        })
+    }
+
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_timeout_policy(api_key, ProviderTimeoutPolicy::default())
     }
@@ -783,19 +807,8 @@ impl crate::traits::Provider for CopilotProvider {
         .await?;
         crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages: Self::convert_messages(&prepared)?,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            stream: false,
-        };
+        let api_request =
+            Self::build_chat_request(&request, Self::convert_messages(&prepared)?, false)?;
 
         let request_builder = self
             .client
@@ -873,19 +886,8 @@ impl crate::traits::Provider for CopilotProvider {
         .await?;
         crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages: Self::convert_messages(&prepared)?,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            stream: true,
-        };
+        let api_request =
+            Self::build_chat_request(&request, Self::convert_messages(&prepared)?, true)?;
 
         let request_builder = self
             .client
@@ -959,6 +961,26 @@ impl crate::traits::Provider for CopilotProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn actual_chat_bodies_apply_generation_rules_and_reject_unknown_chosen_controls() {
+        let mut request = crate::generation::test_request("gpt-5.4");
+        request.reasoning = Some(crate::types::ReasoningConfig::Disabled);
+        for stream in [false, true] {
+            assert!(
+                CopilotProvider::build_chat_request(&request, vec![], stream).is_err(),
+                "direct OpenAI documentation does not verify private Copilot reasoning controls"
+            );
+        }
+        request.model = "unverified-private-model".into();
+        assert!(CopilotProvider::build_chat_request(&request, vec![], false).is_err());
+        request.reasoning = None;
+        let body = serde_json::to_value(
+            CopilotProvider::build_chat_request(&request, vec![], true).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["max_tokens"], 1024);
+        assert!(body.get("reasoning_effort").is_none());
+    }
     use super::*;
     use crate::attachments::prepare_messages_for_provider;
     use crate::traits::Provider;

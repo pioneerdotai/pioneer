@@ -492,6 +492,7 @@ fn provider_model_from_runtime_model(
         .supports_reasoning
         .or_else(|| (!model.effort_options.is_empty()).then_some(true));
     let reasoning = supports_reasoning.map(|supported| ProviderModelReasoningCapabilities {
+        native: Default::default(),
         supported: Some(supported),
         effort_options: model.effort_options.clone(),
         default_effort: None,
