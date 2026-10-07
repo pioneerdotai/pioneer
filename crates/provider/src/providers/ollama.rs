@@ -145,6 +145,27 @@ struct OllamaModelDetails {
     quantization_level: Option<String>,
 }
 
+// Metadata only: /api/show capabilities are the instance's explicit model
+// contract (https://github.com/ollama/ollama/blob/main/docs/api.md).
+#[derive(Debug, Deserialize)]
+struct OllamaShowResponse {
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
+}
+fn apply_show_input(model: &mut ProviderModelInfo, response: OllamaShowResponse) {
+    if let Some(capabilities) = response.capabilities {
+        let vision = capabilities.iter().any(|v| v == "vision");
+        model.capabilities.vision = Some(vision);
+        // This native Chat renderer accepts text and images; audio products
+        // do not become /api/chat attachments.
+        model.capabilities.input_modalities = Some(if vision {
+            vec!["text".into(), "image".into()]
+        } else {
+            vec!["text".into()]
+        });
+    }
+}
+
 // ── Streaming response types ───────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -710,7 +731,7 @@ impl crate::traits::Provider for OllamaProvider {
         )
         .await?;
 
-        Ok(api_response
+        let mut models: Vec<ProviderModelInfo> = api_response
             .models
             .into_iter()
             .map(|m| {
@@ -756,7 +777,30 @@ impl crate::traits::Provider for OllamaProvider {
                     lifecycle_status: None,
                 }
             })
-            .collect())
+            .collect();
+        // Only explicit discovery performs metadata reads. Chat/admission never
+        // loads a model or discovers implicitly. A failed/missing show contract
+        // leaves that model Unknown; there is no family-name vision heuristic.
+        for model in &mut models {
+            let builder = self
+                .client
+                .post(format!("{}/api/show", self.base_url))
+                .json(&serde_json::json!({"model":model.id}));
+            if let Ok(response) = crate::http::non_stream_request(builder, self.timeout_policy)
+                .send()
+                .await
+                && response.status().is_success()
+                && let Ok(show) = crate::http::read_response_json_bounded::<OllamaShowResponse>(
+                    response,
+                    Default::default(),
+                    "provider_model_metadata",
+                )
+                .await
+            {
+                apply_show_input(model, show);
+            }
+        }
+        Ok(models)
     }
 
     async fn warmup(&self) -> Result<crate::ProviderWarmupOutcome> {
@@ -1046,6 +1090,34 @@ mod tests {
         let caps = provider.capabilities();
         assert!(caps.streaming);
         assert!(caps.vision);
+    }
+}
+
+#[cfg(test)]
+mod discovery_input_tests {
+    use super::*;
+    #[test]
+    fn show_missing_is_unknown_and_explicit_capabilities_are_instance_input_evidence() {
+        let mut model:ProviderModelInfo=serde_json::from_value(serde_json::json!({"id":"instance-model","provider":"ollama","limits":{},"capabilities":{}})).unwrap();
+        apply_show_input(
+            &mut model,
+            serde_json::from_value(serde_json::json!({})).unwrap(),
+        );
+        assert_eq!(model.capabilities.vision, None);
+        apply_show_input(
+            &mut model,
+            serde_json::from_value(serde_json::json!({"capabilities":["completion","vision"]}))
+                .unwrap(),
+        );
+        assert_eq!(
+            model.capabilities.input_modalities,
+            Some(vec!["text".into(), "image".into()])
+        );
+        apply_show_input(
+            &mut model,
+            serde_json::from_value(serde_json::json!({"capabilities":["completion"]})).unwrap(),
+        );
+        assert_eq!(model.capabilities.vision, Some(false));
     }
 }
 

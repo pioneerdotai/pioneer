@@ -12,10 +12,15 @@ pub(crate) use coverage::{CheckpointGraphResolver, observe_preparation_work};
 mod delivered;
 pub(crate) mod frozen;
 mod history;
+pub(crate) use history::final_response_aliases;
+#[cfg(test)]
+pub(crate) use history::load_exact_line_history;
 #[cfg(test)]
 pub(crate) use history::pause_selected_turn_load;
 mod native;
 mod origins;
+#[cfg(test)]
+pub(crate) use origins::resolve_message_origins;
 mod result_budget;
 mod service;
 #[cfg(test)]
@@ -690,7 +695,6 @@ impl CompactionRunner {
                 tracing::warn!("compaction observer unavailable");
             }
         }
-        let mut publication_validation_retries = 0_u32;
         loop {
             let durable = self
                 .store
@@ -747,10 +751,13 @@ impl CompactionRunner {
                     state = self.persist(&state, next, None).await?;
                 }
                 RunnerAction::Prepare(purpose) => {
-                    if !self
-                        .store
-                        .compaction_manifest_sources_current(operation)
-                        .await?
+                    // Corrections consume only the saved summary. Raw source
+                    // freshness matters when preparing another raw portion.
+                    if purpose == AttemptPurpose::Portion
+                        && !self
+                            .store
+                            .compaction_manifest_sources_current(operation)
+                            .await?
                     {
                         state = self
                             .persist(
@@ -932,26 +939,10 @@ impl CompactionRunner {
                         CommitOutcome::Cancelled => {
                             return Ok(CompactionExit::Reconcile(FailureKind::Cancelled));
                         }
-                        CommitOutcome::RetryValidation => {
-                            // The proof raced a dependency mutation. Keep the
-                            // Commit phase and its durable summary; this delay
-                            // occurs after both reader and writer resources are
-                            // released and consumes no provider retry budget.
-                            let shift = publication_validation_retries.min(5);
-                            let delay_ms = 10_u64.saturating_mul(1_u64 << shift);
-                            publication_validation_retries =
-                                publication_validation_retries.saturating_add(1);
-                            let wake = self
-                                .clock
-                                .now_ms()
-                                .saturating_add(delay_ms)
-                                .min(self.snapshot.admission.deadline_ms);
-                            self.clock.sleep_until(wake).await;
-                        }
                         CommitOutcome::Stale => {
                             state = self
                                 .persist(&state, Self::diagnose(state.terminate(FailureKind::Permanent)?,
-                                    FailureDiagnostic::new("checkpoint_commit", "checkpoint_stale", "Checkpoint was not applied: source revision, accepted import, coverage or context head no longer matches admission")), None)
+                                    FailureDiagnostic::new("checkpoint_commit", "checkpoint_stale", "Checkpoint was not applied: saved candidate, coverage, runner generation or context head no longer matches")), None)
                                 .await?;
                         }
                     }

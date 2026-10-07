@@ -441,7 +441,10 @@ async fn checkpoint_message_from_expanded(
         source_aliases: expanded
             .replay_aliases
             .iter()
-            .filter(|(replay, _)| expanded.input_replay_aliases.contains(*replay))
+            .filter(|(replay, _)| {
+                expanded.input_replay_aliases.contains(*replay)
+                    || replay.source.scope.starts_with("event:")
+            })
             .map(|(replay, represented)| MessageSourceAlias {
                 represented_thread_id: represented.thread.clone(),
                 represented_source: MessageSourceRef {
@@ -494,23 +497,22 @@ pub(super) fn append_graph_input_evidence(
             .replay_aliases
             .iter()
             .filter_map(|(copy, represented)| {
-                graph
-                    .input_replay_aliases
-                    .contains(copy)
-                    .then(|| MessageSourceAlias {
-                        represented_thread_id: represented.thread.clone(),
-                        represented_source: MessageSourceRef {
-                            scope: represented.source.scope.clone(),
-                            id: represented.source.id.clone(),
-                            version: represented.source.version.clone(),
-                        },
-                        thread_id: copy.thread.clone(),
-                        source: MessageSourceRef {
-                            scope: copy.source.scope.clone(),
-                            id: copy.source.id.clone(),
-                            version: copy.source.version.clone(),
-                        },
-                    })
+                (graph.input_replay_aliases.contains(copy)
+                    || copy.source.scope.starts_with("event:"))
+                .then(|| MessageSourceAlias {
+                    represented_thread_id: represented.thread.clone(),
+                    represented_source: MessageSourceRef {
+                        scope: represented.source.scope.clone(),
+                        id: represented.source.id.clone(),
+                        version: represented.source.version.clone(),
+                    },
+                    thread_id: copy.thread.clone(),
+                    source: MessageSourceRef {
+                        scope: copy.source.scope.clone(),
+                        id: copy.source.id.clone(),
+                        version: copy.source.version.clone(),
+                    },
+                })
             }),
     );
     ambiguous.extend(
@@ -563,10 +565,14 @@ pub(super) fn transferred_input_evidence<'a>(
                 version: alias.represented_source.version.clone(),
             },
         };
-        if represented.source.scope.starts_with("input:")
-            && alias.source.scope.starts_with("input:")
+        if (represented.source.scope.starts_with("input:")
+            && alias.source.scope.starts_with("input:"))
+            || alias.is_response_copy()
         {
             if !leaves.contains(&represented) {
+                if alias.is_response_copy() {
+                    continue;
+                }
                 claims
                     .ambiguous
                     .insert((alias.thread_id.clone(), alias.source.clone()));
@@ -720,8 +726,9 @@ async fn projection_input_claims(
         for alias in &origin.source_aliases {
             let represented = scoped_input(&alias.represented_thread_id, &alias.represented_source);
             ensure!(
-                alias.source.scope.starts_with("input:")
-                    && represented.source.scope.starts_with("input:")
+                ((alias.source.scope.starts_with("input:")
+                    && represented.source.scope.starts_with("input:"))
+                    || alias.is_response_copy())
                     && leaves.contains(&represented),
                 "input alias is outside its carrier coverage"
             );

@@ -91,6 +91,9 @@ struct ApiPart {
     )]
     // REST bytes fields are base64 strings; retain the opaque representation.
     thought_signature: Option<String>,
+    // Retain native union members/metadata even if they have no common UI part.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -98,6 +101,8 @@ struct ApiPart {
 struct ApiInlineData {
     mime_type: String,
     data: String,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -110,6 +115,8 @@ struct ApiFileData {
     )]
     mime_type: String,
     file_uri: String,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -123,6 +130,8 @@ struct ApiFunctionCall {
         deserialize_with = "deserialize_function_arguments"
     )]
     args: serde_json::Value,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -132,6 +141,8 @@ struct ApiFunctionResponse {
     id: Option<String>,
     name: String,
     response: serde_json::Value,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -332,12 +343,14 @@ impl GeminiProvider {
             PreparedAttachmentSource::Reference { reference } => (
                 None,
                 Some(ApiFileData {
+                    extra: Default::default(),
                     mime_type: attachment.mime_type.clone(),
                     file_uri: reference.clone(),
                 }),
             ),
             _ => (
                 Some(ApiInlineData {
+                    extra: Default::default(),
                     mime_type: attachment.mime_type.clone(),
                     data: BASE64.encode(attachment_bytes(attachment)?),
                 }),
@@ -346,6 +359,7 @@ impl GeminiProvider {
         };
 
         Ok(ApiPart {
+            extra: Default::default(),
             text: None,
             inline_data,
             file_data,
@@ -354,6 +368,48 @@ impl GeminiProvider {
             function_response: None,
             thought_signature: None,
         })
+    }
+
+    fn native_result_id(
+        message: &crate::ChatMessage,
+        messages: &[crate::ChatMessage],
+    ) -> Result<Option<String>> {
+        let Some(id) = message.tool_call_id.as_deref() else {
+            return Ok(None);
+        };
+        // Search backwards: old models may reuse generated local call IDs.
+        let boundary = messages
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, message))
+            .unwrap_or(messages.len());
+        for assistant in messages[..boundary].iter().rev() {
+            let Some(index) = assistant
+                .tool_calls
+                .as_ref()
+                .and_then(|calls| calls.iter().position(|call| call.id == id))
+            else {
+                continue;
+            };
+            if let Some(payload) = assistant
+                .provider_replay_state
+                .as_ref()
+                .and_then(|state| state.payload_for("gemini"))
+                && payload
+                    .get("schema_version")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(2)
+            {
+                let parts: Vec<ApiPart> = serde_json::from_value(payload["parts"].clone())?;
+                let call = parts
+                    .into_iter()
+                    .filter_map(|part| part.function_call)
+                    .nth(index)
+                    .ok_or_else(|| anyhow!("Gemini native call/result mapping is incomplete"))?;
+                return Ok(call.id);
+            }
+            return Ok(Some(id.to_owned()));
+        }
+        Ok(Some(id.to_owned()))
     }
 
     fn build_request_from_prepared(
@@ -365,11 +421,14 @@ impl GeminiProvider {
         crate::tools::policy::prepare_history("gemini", &mut prepared.messages)?;
         let mut system_parts: Vec<ApiPart> = Vec::new();
         let mut contents: Vec<ApiContent> = Vec::new();
+        let mut previous_was_tool = false;
 
         for (message_index, msg) in prepared.messages.iter().enumerate() {
             match msg.role {
                 Role::System => {
+                    previous_was_tool = false;
                     system_parts.push(ApiPart {
+                        extra: Default::default(),
                         text: Some(msg.content.clone()),
                         inline_data: None,
                         file_data: None,
@@ -387,6 +446,45 @@ impl GeminiProvider {
                         Role::System => unreachable!(),
                     };
                     let mut parts = Vec::new();
+                    if msg.role == Role::Assistant
+                        && let Some(state) = msg.provider_replay_state.as_ref()
+                    {
+                        if crate::continuation::retention(state)
+                            == crate::continuation::Retention::Unsupported
+                        {
+                            anyhow::bail!(
+                                "Gemini native continuation profile/signature requirement is unproven; unsigned required state cannot be replayed"
+                            );
+                        }
+                        let payload = state
+                            .payload_for("gemini")
+                            .ok_or_else(|| anyhow!("foreign Gemini replay state"))?;
+                        if payload
+                            .get("schema_version")
+                            .is_some_and(|version| version != 1 && version != 2)
+                        {
+                            return Err(anyhow!("unsupported gemini replay schema version"));
+                        }
+                        if payload
+                            .get("schema_version")
+                            .and_then(serde_json::Value::as_u64)
+                            == Some(2)
+                        {
+                            let native = payload
+                                .get("parts")
+                                .cloned()
+                                .ok_or_else(|| anyhow!("gemini replay state is missing parts"))?;
+                            parts = serde_json::from_value(native).map_err(|error| {
+                                anyhow!("invalid Gemini native replay: {error}")
+                            })?;
+                            contents.push(ApiContent {
+                                role: role.to_owned(),
+                                parts,
+                            });
+                            previous_was_tool = false;
+                            continue;
+                        }
+                    }
 
                     if msg.role == Role::Tool {
                         let name = msg.name.clone().unwrap_or_else(|| "tool".to_owned());
@@ -399,13 +497,15 @@ impl GeminiProvider {
                                 Err(_) => serde_json::json!({ "content": msg.content }),
                             };
                         parts.push(ApiPart {
+                            extra: Default::default(),
                             text: None,
                             inline_data: None,
                             file_data: None,
                             thought: None,
                             function_call: None,
                             function_response: Some(ApiFunctionResponse {
-                                id: msg.tool_call_id.clone(),
+                                extra: Default::default(),
+                                id: Self::native_result_id(msg, &prepared.messages)?,
                                 name,
                                 response: response_payload,
                             }),
@@ -413,6 +513,7 @@ impl GeminiProvider {
                         });
                     } else if !msg.content.is_empty() {
                         parts.push(ApiPart {
+                            extra: Default::default(),
                             text: Some(msg.content.clone()),
                             inline_data: None,
                             file_data: None,
@@ -457,11 +558,13 @@ impl GeminiProvider {
                     if let Some(tool_calls) = msg.tool_calls.as_ref() {
                         for (call_index, call) in tool_calls.iter().enumerate() {
                             parts.push(ApiPart {
+                                extra: Default::default(),
                                 text: None,
                                 inline_data: None,
                                 file_data: None,
                                 thought: None,
                                 function_call: Some(ApiFunctionCall {
+                                    extra: Default::default(),
                                     id: Some(call.id.clone()),
                                     name: call.name.clone(),
                                     args: parse_function_arguments(call.arguments.as_str())?,
@@ -492,10 +595,19 @@ impl GeminiProvider {
                         }
                     }
 
-                    contents.push(ApiContent {
-                        role: role.into(),
-                        parts,
-                    });
+                    if msg.role == Role::Tool && previous_was_tool {
+                        contents
+                            .last_mut()
+                            .expect("previous tool content")
+                            .parts
+                            .extend(parts);
+                    } else {
+                        contents.push(ApiContent {
+                            role: role.into(),
+                            parts,
+                        });
+                    }
+                    previous_was_tool = msg.role == Role::Tool;
                 }
             }
         }
@@ -666,6 +778,10 @@ impl GeminiProvider {
             None => return Vec::new(),
         };
 
+        Self::tool_calls_from_parts(parts, offset)
+    }
+
+    fn tool_calls_from_parts(parts: &[ApiPart], offset: usize) -> Vec<ProviderToolCall> {
         parts
             .iter()
             .filter_map(|part| part.function_call.as_ref())
@@ -689,15 +805,14 @@ impl GeminiProvider {
             .first()
             .and_then(|candidate| candidate.content.as_ref())
             .map(|content| &content.parts)?;
-        let signatures = parts
-            .iter()
-            .filter(|part| part.function_call.is_some())
-            .map(|part| part.thought_signature.clone())
-            .collect::<Vec<_>>();
-        signatures.iter().any(Option::is_some).then(|| {
+        Self::replay_state_from_parts(parts)
+    }
+
+    fn replay_state_from_parts(parts: &[ApiPart]) -> Option<ProviderReplayState> {
+        (!parts.is_empty()).then(|| {
             ProviderReplayState::new(
                 "gemini",
-                serde_json::json!({ "function_call_signatures": signatures }),
+                serde_json::json!({ "schema_version": 2, "parts": parts }),
             )
         })
     }
@@ -767,7 +882,7 @@ impl GeminiProvider {
             let mut terminal_reason = None;
             let mut native_terminal_reason: Option<String> = None;
             let mut tool_call_count = 0;
-            let mut provider_replay_state = None;
+            let mut replay_parts: Vec<ApiPart> = Vec::new();
 
             tokio::pin!(byte_stream);
 
@@ -799,7 +914,7 @@ impl GeminiProvider {
                     let data = frame.data.as_str();
 
                     match serde_json::from_str::<ApiGenerateResponse>(data) {
-                        Ok(resp) => {
+                        Ok(mut resp) => {
                             if let Some(error) = &resp.error {
                                 let _ = tx.send(Err(error.outcome())).await;
                                 return;
@@ -837,9 +952,6 @@ impl GeminiProvider {
                                     return;
                                 }
                             }
-                            if let Some(state) = Self::extract_provider_replay_state(&resp) {
-                                provider_replay_state = Some(state);
-                            }
                             if let Some(reasoning) = Self::extract_reasoning(&resp) {
                                 if !reasoning.is_empty() {
                                     if tx
@@ -871,6 +983,15 @@ impl GeminiProvider {
                                     return;
                                 }
                             }
+                            if let Some(content) = resp
+                                .candidates
+                                .first_mut()
+                                .and_then(|candidate| candidate.content.as_mut())
+                            {
+                                // Stream parts are ordered deltas, including signatures on
+                                // non-tool parts and empty text. Preserve every round part.
+                                replay_parts.append(&mut content.parts);
+                            }
                             if let Some(reason) = resp
                                 .candidates
                                 .first()
@@ -886,19 +1007,10 @@ impl GeminiProvider {
                                     return;
                                 }
                                 native_terminal_reason = Some(reason.to_owned());
-                                if let Some(state) = provider_replay_state.take() {
-                                    if tx
-                                        .send(Ok(StreamChunk::provider_replay_state(state)))
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
-                                }
                                 let mut termination =
                                     ProviderTermination::from_openai_reason(reason);
                                 if termination == ProviderTermination::Complete
-                                    && !last_tool_calls.is_empty()
+                                    && tool_call_count > 0
                                 {
                                     termination = ProviderTermination::ToolCalls;
                                 }
@@ -926,6 +1038,15 @@ impl GeminiProvider {
                         crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into()
                     })
             });
+            if terminal.is_ok()
+                && let Some(state) = Self::replay_state_from_parts(&replay_parts)
+                && tx
+                    .send(Ok(StreamChunk::provider_replay_state(state)))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
             let _ = tx.send(terminal).await;
         });
 
@@ -972,6 +1093,7 @@ impl crate::traits::Provider for GeminiProvider {
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let api_request = Self::build_request_from_prepared(&request, &prepared)?;
 
+        crate::attachments::validate_inline_payload("gemini", &api_request)?;
         let request_builder = self
             .client
             .post(self.generate_content_url(&model))
@@ -1041,6 +1163,7 @@ impl crate::traits::Provider for GeminiProvider {
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let api_request = Self::build_request_from_prepared(&request, &prepared)?;
 
+        crate::attachments::validate_inline_payload("gemini", &api_request)?;
         let request_builder = self
             .client
             .post(self.stream_generate_content_url(&model))
@@ -1174,6 +1297,146 @@ fn canonical_gemini_thinking_level(level: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn all_signed_native_parts_survive_storage_and_builder() {
+        use super::super::history_test_support::request;
+        let raw: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/history/gemini-signed-parts.json"
+        ))
+        .unwrap();
+        let response: ApiGenerateResponse = serde_json::from_value(raw.clone()).unwrap();
+        let mut state = GeminiProvider::extract_provider_replay_state(&response).unwrap();
+        state.model = Some("fixture".into());
+        let message = ChatMessage::assistant_tool_calls_with_provider_state(
+            GeminiProvider::extract_text(&response),
+            GeminiProvider::extract_reasoning(&response),
+            GeminiProvider::extract_tool_calls(&response),
+            Some(state),
+        );
+        let stored: ChatMessage =
+            serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+        let projected =
+            crate::history::project_messages_for_provider("gemini", "fixture", &[stored]).unwrap();
+        let mut req = request(projected);
+        let calls = req.messages[0].tool_calls.clone().unwrap();
+        for call in calls {
+            req.messages
+                .push(ChatMessage::tool_result(call.id, call.name, "{}"));
+        }
+        let prepared = prepare_messages_for_provider(
+            "gemini",
+            &GeminiProvider::new("key").capabilities(),
+            &req.messages,
+        )
+        .unwrap();
+        let wire = GeminiProvider::build_request_from_prepared(&req, &prepared).unwrap();
+        assert_eq!(
+            serde_json::to_value(&wire.contents[0]).unwrap(),
+            raw["candidates"][0]["content"]
+        );
+    }
+
+    #[test]
+    fn non_tool_signature_is_retained_instead_of_collapsing_text_parts() {
+        let response: ApiGenerateResponse = serde_json::from_value(
+            serde_json::json!({"candidates":[{"content":{"role":"model","parts":[
+                {"text":"first"},{"text":"second","thoughtSignature":"opaque"}
+            ]}}]}),
+        )
+        .unwrap();
+        let replay = GeminiProvider::extract_provider_replay_state(&response).unwrap();
+        assert_eq!(replay.payload["parts"].as_array().unwrap().len(), 2);
+        assert_eq!(replay.payload["parts"][1]["thoughtSignature"], "opaque");
+    }
+
+    #[tokio::test]
+    async fn two_streamed_parallel_rounds_keep_all_calls_and_native_result_ids() {
+        use super::super::history_test_support::{request, serve_sse};
+        let mut history = vec![ChatMessage::user("start")];
+        for _ in 0..2 {
+            let (base, server) = serve_sse(include_str!(
+                "../../tests/fixtures/history/gemini-parallel.sse"
+            ))
+            .await;
+            let provider = crate::ProviderRegistry::with_provider(
+                "gemini",
+                std::sync::Arc::new(GeminiProvider::with_base_url_and_timeout_policy(
+                    "key",
+                    base,
+                    Default::default(),
+                )),
+            )
+            .get_or_create("gemini")
+            .unwrap();
+            let mut stream = provider
+                .stream_chat(request(history.clone()))
+                .await
+                .unwrap();
+            let mut calls = Vec::new();
+            let mut state = None;
+            let mut final_count = 0;
+            let mut output_tokens = None;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.unwrap();
+                final_count += usize::from(chunk.is_final);
+                if let Some(usage) = chunk.usage {
+                    output_tokens = usage.output_tokens;
+                }
+                calls.extend(chunk.tool_calls);
+                if chunk.provider_replay_state.is_some() {
+                    state = chunk.provider_replay_state;
+                }
+            }
+            server.await.unwrap();
+            assert_eq!(final_count, 1);
+            assert_eq!(
+                output_tokens,
+                Some(9),
+                "usage after finishReason must be consumed"
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| call.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["call_1", "call_2"]
+            );
+            let mut state = state.unwrap();
+            assert_eq!(state.payload["parts"].as_array().unwrap().len(), 4);
+            assert_eq!(
+                state.payload["parts"][3]["thoughtSignature"],
+                "empty-text-sig"
+            );
+            state.model = Some("fixture".into());
+            history.push(ChatMessage::assistant_tool_calls_with_provider_state(
+                Some("before"),
+                None::<String>,
+                calls.clone(),
+                Some(state),
+            ));
+            for call in calls {
+                history.push(ChatMessage::tool_result(call.id, call.name, "{}"));
+            }
+        }
+        let req = request(history);
+        let prepared = prepare_messages_for_provider(
+            "gemini",
+            &GeminiProvider::new("key").capabilities(),
+            &req.messages,
+        )
+        .unwrap();
+        let wire = GeminiProvider::build_request_from_prepared(&req, &prepared).unwrap();
+        let raw = serde_json::to_value(wire).unwrap();
+        assert_eq!(raw["contents"].as_array().unwrap().len(), 5);
+        for index in [2, 4] {
+            let results = raw["contents"][index]["parts"].as_array().unwrap();
+            assert_eq!(results.len(), 2);
+            for part in results {
+                assert!(part["functionResponse"].get("id").is_none());
+            }
+        }
+    }
+
     #[test]
     fn tool_modes_and_parallel_limit_use_native_config_or_error() {
         for (choice, expected) in [
@@ -1790,6 +2053,289 @@ mod tests {
 }
 
 #[cfg(test)]
+mod media_contract_tests {
+    use super::*;
+    use crate::{
+        AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart, Provider,
+    };
+    #[test]
+    fn every_declared_kind_uses_native_inline_bytes_and_mime_not_chat_content_parts() {
+        let provider = GeminiProvider::new("unused");
+        for (mime, kind) in [
+            ("image/png", 0),
+            ("application/pdf", 1),
+            ("audio/wav", 2),
+            ("video/mp4", 3),
+        ] {
+            let bytes = match kind {
+                0 => crate::attachments::regression::image(image::ImageFormat::Png, 1, 1),
+                1 => crate::attachments::regression::pdf(1),
+                2 => crate::attachments::regression::wav(),
+                _ => crate::attachments::regression::video().to_vec(),
+            };
+            let attachment = MessageAttachment {
+                mime_type: mime.into(),
+                name: None,
+                size_bytes: None,
+                sha256: None,
+                source: AttachmentDataSource::Bytes {
+                    base64_data: BASE64.encode(&bytes),
+                },
+                artifact: None,
+            };
+            let part = match kind {
+                0 => MessageContentPart::image(attachment),
+                1 => MessageContentPart::file(attachment),
+                2 => MessageContentPart::audio(attachment),
+                _ => MessageContentPart::video(attachment),
+            };
+            let prepared = crate::attachments::prepare_messages_for_provider(
+                "gemini",
+                &provider.capabilities(),
+                &[ChatMessage::user_parts(vec![part])],
+            )
+            .unwrap();
+            let native = GeminiProvider::attachment_part(&prepared.attachments[0]).unwrap();
+            assert!(native.file_data.is_none());
+            let inline = native.inline_data.unwrap();
+            assert_eq!(inline.mime_type, mime);
+            assert_eq!(inline.data, BASE64.encode(&bytes));
+            // Canonical ApiPart JSON field names are the g02 dependency. This
+            // fixture asserts representation without blessing snake_case wire.
+        }
+    }
+}
+
+#[cfg(test)]
+mod async_media_admission_regressions {
+    use super::*;
+    use crate::Provider;
+    use crate::attachments::regression as fixture;
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn four_typed_inputs_are_budgeted_pinned_and_rendered_on_generate_content() {
+        let provider = GeminiProvider::new("unused");
+        let state = Arc::new(fixture::state("gemini", "media", serde_json::json!({})));
+        let req = fixture::request(
+            "media",
+            vec![
+                fixture::part(
+                    InputContentType::Image,
+                    "image/png",
+                    &fixture::image(image::ImageFormat::Png, 1, 1),
+                ),
+                fixture::part(InputContentType::File, "application/pdf", &fixture::pdf(1)),
+                fixture::part(InputContentType::Audio, "audio/wav", &fixture::wav()),
+                fixture::part(InputContentType::Video, "video/mp4", &fixture::video()),
+            ],
+        );
+        let budget = fixture::scoped(state.clone(), provider.prepare_input_budget(req))
+            .await
+            .unwrap();
+        assert_eq!(budget.media.len(), 4);
+        let prepared = fixture::scoped(
+            state,
+            crate::attachments::prepare_messages_for_provider_async(
+                "gemini",
+                "media",
+                &provider.capabilities(),
+                &budget.request.messages,
+            ),
+        )
+        .await
+        .unwrap();
+        let body = GeminiProvider::build_request_from_prepared(&budget.request, &prepared).unwrap();
+        let parts = &body.contents[0].parts;
+        for (index, mime) in ["image/png", "application/pdf", "audio/wav", "video/mp4"]
+            .into_iter()
+            .enumerate()
+        {
+            let native = parts[index + 1].inline_data.as_ref().unwrap();
+            assert_eq!(native.mime_type, mime);
+            let crate::AttachmentDataSource::Bytes { base64_data } =
+                &fixture::attachment(&budget.request.messages[0].content_parts[index]).source
+            else {
+                panic!("must pin")
+            };
+            assert_eq!(&native.data, base64_data);
+        }
+        // Canonical ApiPart JSON field casing remains the explicit G02
+        // dependency; this fixture verifies typed representation, not acceptance.
+    }
+}
+
+#[cfg(test)]
+mod webm_wire_regressions {
+    use super::*;
+    use crate::{
+        Provider,
+        attachments::{media_fixtures::webm, regression as fixture},
+    };
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn identified_webm_video_budget_and_generate_content_keep_mime_and_bytes() {
+        let provider = GeminiProvider::new("unused");
+        for audio in [false, true] {
+            let bytes = webm(audio, true, "webm");
+            let state = Arc::new(fixture::state("gemini", "media", serde_json::json!({})));
+            let budget = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(fixture::request(
+                    "media",
+                    vec![fixture::part(InputContentType::Video, "video/webm", &bytes)],
+                )),
+            )
+            .await
+            .unwrap();
+            let prepared = fixture::scoped(
+                state,
+                crate::attachments::prepare_messages_for_provider_async(
+                    "gemini",
+                    "media",
+                    &provider.capabilities(),
+                    &budget.request.messages,
+                ),
+            )
+            .await
+            .unwrap();
+            let wire =
+                GeminiProvider::build_request_from_prepared(&budget.request, &prepared).unwrap();
+            let native = wire.contents[0]
+                .parts
+                .iter()
+                .find_map(|p| p.inline_data.as_ref())
+                .unwrap();
+            assert_eq!(native.mime_type, "video/webm");
+            assert_eq!(native.data, BASE64.encode(&bytes));
+        }
+    }
+}
+
+#[cfg(test)]
+mod container_timeline_wire_regressions {
+    use super::*;
+    use crate::{
+        Provider,
+        attachments::{
+            media_fixtures::{TimingFixture, webm_timeline},
+            regression as fixture,
+        },
+    };
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn eleven_second_container_budget_both_modes_and_replay_keep_native_bytes() {
+        let provider = GeminiProvider::new("unused");
+        let bytes = webm_timeline(
+            true,
+            true,
+            "webm",
+            TimingFixture {
+                video_start: 10000,
+                declared_duration: Some(11000.0),
+                ..Default::default()
+            },
+        );
+        let state = Arc::new(fixture::state(
+            "gemini",
+            "media",
+            serde_json::json!({"video":{"maxDurationMillis":11000}}),
+        ));
+        let budget = fixture::scoped(
+            state.clone(),
+            provider.prepare_input_budget(fixture::request(
+                "media",
+                vec![fixture::part(InputContentType::Video, "video/webm", &bytes)],
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(budget.media[0].input_tokens, 3850);
+        for _stream in [false, true] {
+            // both GenerateContent modes share this typed builder
+            let replay = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(budget.request.clone()),
+            )
+            .await
+            .unwrap();
+            let prepared = fixture::scoped(
+                state.clone(),
+                crate::attachments::prepare_messages_for_provider_async(
+                    "gemini",
+                    "media",
+                    &provider.capabilities(),
+                    &replay.request.messages,
+                ),
+            )
+            .await
+            .unwrap();
+            let wire =
+                GeminiProvider::build_request_from_prepared(&replay.request, &prepared).unwrap();
+            let native = wire.contents[0]
+                .parts
+                .iter()
+                .find_map(|p| p.inline_data.as_ref())
+                .unwrap();
+            assert_eq!(native.mime_type, "video/webm");
+            assert_eq!(native.data, BASE64.encode(&bytes));
+        }
+    }
+}
+
+#[cfg(test)]
+mod confirmed_duration_wire_regressions {
+    use super::*;
+    use crate::{Provider, attachments::regression as fixture};
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn confirmed_elementary_audio_and_no_edit_mp4_keep_native_bytes_in_both_modes() {
+        let provider = GeminiProvider::new("unused");
+        for (kind, mime, bytes) in fixture::confirmed_wire_inputs("gemini") {
+            let state = Arc::new(fixture::state("gemini", "media", serde_json::json!({})));
+            let budget = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(fixture::request(
+                    "media",
+                    vec![fixture::part(kind, mime, &bytes)],
+                )),
+            )
+            .await
+            .unwrap();
+            for _stream in [false, true] {
+                let replay = fixture::scoped(
+                    state.clone(),
+                    provider.prepare_input_budget(budget.request.clone()),
+                )
+                .await
+                .unwrap();
+                let prepared = fixture::scoped(
+                    state.clone(),
+                    crate::attachments::prepare_messages_for_provider_async(
+                        "gemini",
+                        "media",
+                        &provider.capabilities(),
+                        &replay.request.messages,
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(prepared.attachments[0].kind, kind);
+                assert_eq!(prepared.attachments[0].mime_type, mime);
+                let wire = GeminiProvider::build_request_from_prepared(&replay.request, &prepared)
+                    .unwrap();
+                let native = wire.contents[0]
+                    .parts
+                    .iter()
+                    .find_map(|p| p.inline_data.as_ref())
+                    .unwrap();
+                assert_eq!(native.mime_type, mime);
+                assert_eq!(native.data, BASE64.encode(&bytes));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod stream_call_identity_tests {
     use super::*;
     #[test]
@@ -1802,6 +2348,7 @@ mod stream_call_identity_tests {
                 content: Some(ApiContent {
                     role: "model".into(),
                     parts: vec![ApiPart {
+                        extra: Default::default(),
                         text: None,
                         inline_data: None,
                         file_data: None,
@@ -1809,6 +2356,7 @@ mod stream_call_identity_tests {
                         function_response: None,
                         thought_signature: None,
                         function_call: Some(ApiFunctionCall {
+                            extra: Default::default(),
                             id: None,
                             name: "read".into(),
                             args: serde_json::json!({"path":"x"}),

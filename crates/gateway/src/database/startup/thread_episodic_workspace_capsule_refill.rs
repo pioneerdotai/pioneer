@@ -80,6 +80,8 @@ struct ThreadEpisodicWorkspaceCapsuleRefillProjectionPayload {
     model: Option<String>,
     dimension: Option<u32>,
     normalized: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preparation_version: Option<String>,
     config_hash: String,
 }
 
@@ -163,6 +165,15 @@ impl ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget {
                 dimension,
                 normalized.unwrap_or(false),
             );
+        let preparation_version = (vector_search_enabled && provider.as_deref() == Some("local"))
+            .then(|| {
+                pioneer_provider::providers::local_embedding_model_info(
+                    model.as_deref().unwrap_or(""),
+                )
+                .and_then(|info| info.preparation_version())
+                .map(str::to_owned)
+            })
+            .flatten();
         let payload = ThreadEpisodicWorkspaceCapsuleRefillProjectionPayload {
             schema_version: THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_CONFIG_VERSION,
             vector_search_enabled,
@@ -170,6 +181,7 @@ impl ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget {
             model,
             dimension,
             normalized,
+            preparation_version,
             config_hash: config_hash.clone(),
         };
         let payload_json = serde_json::to_string(&payload)
@@ -210,6 +222,7 @@ impl ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget {
                     && payload.provider == self.payload.provider
                     && payload.model == self.payload.model
                     && payload.normalized == self.payload.normalized
+                    && payload.preparation_version == self.payload.preparation_version
                     && match self.payload.dimension {
                         Some(dimension) => payload.dimension == Some(dimension),
                         None => true,
@@ -3131,6 +3144,51 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[test]
+    fn nomic_preparation_version_invalidates_legacy_projection_and_resume_gate() {
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_projection_parts(
+            true,
+            Some("local".to_owned()),
+            Some("nomic-embed-text-v1.5".to_owned()),
+            Some(768),
+            Some(true),
+        );
+        let mut legacy = serde_json::to_value(&target.payload).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("preparation_version");
+        let legacy_json = legacy.to_string();
+        let legacy_meta = ProjectionMetaRecordLike {
+            projection_config_hash: Some("legacy"),
+            projection_config_json: Some(&legacy_json),
+        };
+        assert!(!target.matches_projection_meta(&legacy_meta));
+        assert!(!target.matches_projection_meta_selection(&legacy_meta));
+        let current_meta = ProjectionMetaRecordLike {
+            projection_config_hash: Some(&target.config_hash),
+            projection_config_json: Some(&target.payload_json),
+        };
+        assert!(target.matches_projection_meta(&current_meta));
+        assert!(target.matches_projection_meta_selection(&current_meta));
+        for model in ["bge-small-en-v1.5", "bge-base-en-v1.5", "gte-large"] {
+            let target =
+                ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_projection_parts(
+                    true,
+                    Some("local".to_owned()),
+                    Some(model.to_owned()),
+                    Some(
+                        pioneer_provider::providers::local_embedding_model_info(model)
+                            .unwrap()
+                            .dimension as u32,
+                    ),
+                    Some(true),
+                );
+            assert!(target.payload.preparation_version.is_none());
+            assert!(!target.payload_json.contains("preparation_version"));
+        }
+    }
 
     #[test]
     fn local_model_progress_events_carry_bytes_and_terminal_status_clears_them() {

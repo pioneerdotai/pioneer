@@ -761,7 +761,7 @@ impl OpenAiCompatibleProvider {
                 role: role.to_owned(),
                 content: replay.content.map(ApiMessageContent::Text),
                 reasoning_content: replay.reasoning_content,
-                tool_calls: Some(replay.tool_calls),
+                tool_calls: (!replay.tool_calls.is_empty()).then_some(replay.tool_calls),
                 tool_call_id: None,
                 name: None,
             });
@@ -948,6 +948,10 @@ impl OpenAiCompatibleProvider {
                 state.provider
             )
         })?;
+        anyhow::ensure!(
+            crate::continuation::retention(state) != crate::continuation::Retention::Unsupported,
+            "unsupported {provider_name} continuation: unrecognized native state must not be discarded by the readable replay schema"
+        );
         let replay = serde_json::from_value::<CompatibleAssistantReplayState>(payload.clone())
             .map_err(|error| anyhow!("invalid {provider_name} replay state: {error}"))?;
         if replay.schema_version != COMPATIBLE_REPLAY_STATE_SCHEMA_VERSION {
@@ -1001,7 +1005,25 @@ impl OpenAiCompatibleProvider {
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
-        self.build_chat_request_from_prepared(request, stream, prepared)
+        let has_image = prepared
+            .attachments
+            .iter()
+            .any(|a| a.kind == InputContentType::Image);
+        let body = self.build_chat_request_from_prepared(request, stream, prepared)?;
+        if self.name == "groq" && has_image {
+            crate::attachments::validate_inline_payload("groq", &body)?;
+        }
+        Ok(body)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn render_chat_request_async_for_test(
+        &self,
+        request: ChatRequest,
+        stream: bool,
+    ) -> Result<serde_json::Value> {
+        serde_json::to_value(self.build_chat_request_async(request, stream).await?)
+            .map_err(Into::into)
     }
 
     #[cfg(test)]
@@ -1075,7 +1097,7 @@ fn finish_compatible_stream(
 ) -> Result<Vec<StreamChunk>> {
     let tool_calls = tool_call_accumulator.take_tool_calls()?;
     let mut chunks = Vec::new();
-    if replay_reasoning_content && !tool_calls.is_empty() {
+    if replay_reasoning_content && (provider_name == "deepseek" || !tool_calls.is_empty()) {
         chunks.push(StreamChunk::provider_replay_state(
             OpenAiCompatibleProvider::assistant_replay_state(
                 provider_name,
@@ -1365,15 +1387,16 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
             return Err(anyhow!("no response from {}", self.name));
         }
 
-        let provider_replay_state =
-            (self.replay_reasoning_content && !tool_calls.is_empty()).then(|| {
-                Self::assistant_replay_state(
-                    self.name.as_str(),
-                    raw_content,
-                    reasoning_content.clone(),
-                    tool_calls.as_slice(),
-                )
-            });
+        let provider_replay_state = (self.replay_reasoning_content
+            && (self.name == "deepseek" || !tool_calls.is_empty()))
+        .then(|| {
+            Self::assistant_replay_state(
+                self.name.as_str(),
+                raw_content,
+                reasoning_content.clone(),
+                tool_calls.as_slice(),
+            )
+        });
 
         Ok(ChatResponse {
             text,
@@ -1463,6 +1486,53 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unknown_signed_extension_is_refused_by_production_compatible_decoder() {
+        let state = ProviderReplayState::for_model(
+            "deepseek",
+            "deepseek-reasoner",
+            serde_json::json!({"schema_version":1,"assistant_message":{"content":"answer","reasoning_content":"readable","tool_calls":[],"signature":"unknown opaque"}}),
+        );
+        assert!(OpenAiCompatibleProvider::decode_replay_state(&state, "deepseek").is_err());
+        assert_eq!(
+            state.payload["assistant_message"]["signature"],
+            "unknown opaque"
+        );
+    }
+
+    #[test]
+    fn deepseek_non_tool_stream_keeps_native_empty_reasoning_field() {
+        let chunks = finish_compatible_stream(
+            &mut StreamToolCallAccumulator::default(),
+            "deepseek",
+            true,
+            Some("answer".into()),
+            Some(String::new()),
+            ProviderTermination::Complete,
+        )
+        .unwrap();
+        let state = chunks
+            .iter()
+            .find_map(|chunk| chunk.provider_replay_state.as_ref())
+            .unwrap();
+        assert_eq!(state.payload["assistant_message"]["reasoning_content"], "");
+        assert!(chunks.last().unwrap().is_final);
+        let ordinary = finish_compatible_stream(
+            &mut StreamToolCallAccumulator::default(),
+            "groq",
+            true,
+            Some("answer".into()),
+            None,
+            ProviderTermination::Complete,
+        )
+        .unwrap();
+        assert!(
+            ordinary
+                .iter()
+                .all(|chunk| chunk.provider_replay_state.is_none())
+        );
+    }
+
     use super::*;
     use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
     use crate::traits::Provider;
@@ -1520,7 +1590,7 @@ mod tests {
     #[tokio::test]
     async fn completed_transcript_keeps_typed_media_through_preflight_budget_and_wire() {
         let provider = OpenAiCompatibleProvider::new(
-            "deepseek",
+            "fixture-media-renderer",
             "https://api.example.com/v1",
             "test-key",
             AuthStyle::Bearer,
@@ -1583,7 +1653,7 @@ mod tests {
         let canonical = messages.clone();
         let prepared = prepare_messages_for_provider_model(
             provider.name(),
-            "deepseek-reasoner",
+            "fixture-media",
             &provider.capabilities(),
             &messages,
         )
@@ -1605,7 +1675,7 @@ mod tests {
             Some("artifact-file")
         );
         let request = ChatRequest {
-            model: "deepseek-reasoner".into(),
+            model: "fixture-media".into(),
             messages: messages.clone(),
             temperature: None,
             max_tokens: None,
@@ -1643,7 +1713,7 @@ mod tests {
         ));
         let prepared_wire = prepare_messages_for_provider_model(
             provider.name(),
-            "deepseek-reasoner",
+            "fixture-media",
             &provider.capabilities(),
             &budgeted.request.messages,
         )
@@ -1656,16 +1726,21 @@ mod tests {
             .build_chat_request_from_prepared(budgeted.request, false, prepared_wire)
             .unwrap();
         let json = serde_json::to_value(&wire).unwrap();
-        assert_eq!(json["messages"].as_array().unwrap().len(), 2);
-        assert!(json["messages"][0].get("tool_calls").is_none());
-        assert!(json["messages"][1].get("tool_call_id").is_none());
+        assert_eq!(json["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(json["messages"][0]["role"], "assistant");
+        assert_eq!(json["messages"][0]["tool_calls"][0]["id"], "call");
+        assert_eq!(json["messages"][1]["role"], "tool");
+        assert_eq!(json["messages"][1]["tool_call_id"], "call");
+        assert_eq!(json["messages"][1]["content"], "tool result");
+        assert_eq!(json["messages"][2]["role"], "user");
+        assert!(json["messages"][2].get("tool_call_id").is_none());
         assert!(
-            json["messages"][1]["content"]
+            json["messages"][2]["content"]
                 .to_string()
                 .contains("image_url")
         );
         assert!(
-            json["messages"][1]["content"]
+            json["messages"][2]["content"]
                 .to_string()
                 .contains("file_data")
         );

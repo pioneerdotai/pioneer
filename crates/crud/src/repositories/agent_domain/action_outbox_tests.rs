@@ -438,19 +438,24 @@ async fn action_outbox_rollback_preserves_source_and_partial_index_membership() 
 
 #[tokio::test]
 async fn action_outbox_index_migration_and_marker_rollback_and_retry_are_atomic() {
-    let db = database().await;
-    let now = utc_now();
-    seed(&db, "existing-immediate", "pending", 0, now, None).await;
-    seed(&db, "existing-final", "pending", 8, now, Some(now)).await;
     const MIGRATION: &str = "m20261004_000007_agent_action_outbox_ranges";
     let migrations = Migrator::migrations();
     let target = migrations
         .iter()
         .position(|migration| migration.name() == MIGRATION)
         .unwrap();
-    Migrator::down(&db, Some((migrations.len() - target) as u32))
+    // Start at this migration, without applying later irreversible changes.
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    Migrator::up(&db, Some((target + 1).try_into().unwrap()))
         .await
         .unwrap();
+    db.execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    let now = utc_now();
+    seed(&db, "existing-immediate", "pending", 0, now, None).await;
+    seed(&db, "existing-final", "pending", 8, now, Some(now)).await;
+    Migrator::down(&db, Some(1)).await.unwrap();
     async fn index_count<C: ConnectionTrait>(db: &C) -> i64 {
         db.query_one_raw(Statement::from_string(DatabaseBackend::Sqlite,
             "SELECT count(*) AS count FROM sqlite_master WHERE type='index' AND name IN ('idx_agent_action_outbox_immediate','idx_agent_action_outbox_timed')"))
@@ -458,7 +463,7 @@ async fn action_outbox_index_migration_and_marker_rollback_and_retry_are_atomic(
     }
     assert_eq!(index_count(&db).await, 0);
     let transaction = db.begin().await.unwrap();
-    Migrator::up(&transaction, None).await.unwrap();
+    Migrator::up(&transaction, Some(1)).await.unwrap();
     assert_eq!(index_count(&transaction).await, 2);
     transaction.rollback().await.unwrap();
     assert_eq!(index_count(&db).await, 0);
@@ -476,7 +481,7 @@ async fn action_outbox_index_migration_and_marker_rollback_and_retry_are_atomic(
     db.execute_unprepared("CREATE TABLE idx_agent_action_outbox_timed(id INTEGER)")
         .await
         .unwrap();
-    assert!(Migrator::up(&db, None).await.is_err());
+    assert!(Migrator::up(&db, Some(1)).await.is_err());
     assert_eq!(index_count(&db).await, 0);
     assert!(
         !Migrator::get_applied_migrations(&db)
@@ -491,7 +496,7 @@ async fn action_outbox_index_migration_and_marker_rollback_and_retry_are_atomic(
         .await
         .unwrap();
     // Retry must see the reverted marker and rebuild both ranges from source.
-    Migrator::up(&db, None).await.unwrap();
+    Migrator::up(&db, Some(1)).await.unwrap();
     assert!(
         Migrator::get_applied_migrations(&db)
             .await

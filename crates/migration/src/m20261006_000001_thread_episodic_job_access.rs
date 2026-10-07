@@ -34,6 +34,22 @@ impl MigrationTrait for Migration {
             .table("thread_episodic_index_jobs").col("workspace_id")
             .cond_where(Expr::cust("status = 'canceled' AND (last_error IS NULL OR last_error NOT IN ('thread episodic source version superseded during reconciliation', 'thread episodic source deleted by user', 'thread episodic source excluded by user'))"))
             .to_owned()).await?;
+        // Row-value seek, abandoned Running settlement and the next-run timer
+        // use this same partial index.
+        // ID bounds timestamp ties; ready/canceled history is outside its range.
+        // Each index build reads existing jobs once; no table/data rewrite.
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_thread_episodic_jobs_runnable_seek")
+                    .table("thread_episodic_index_jobs")
+                    .col("next_run_at")
+                    .col("created_at")
+                    .col("id")
+                    .cond_where(Expr::cust("status IN ('queued','failed','running')"))
+                    .to_owned(),
+            )
+            .await?;
         Ok(())
     }
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -41,6 +57,7 @@ impl MigrationTrait for Migration {
             "idx_thread_episodic_jobs_workspace_due",
             "idx_thread_episodic_jobs_workspace_recovery",
             "idx_thread_episodic_jobs_workspace_terminal",
+            "idx_thread_episodic_jobs_runnable_seek",
         ] {
             manager
                 .drop_index(
@@ -66,6 +83,10 @@ mod tests {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         for (name, columns) in [
+            (
+                "idx_thread_episodic_jobs_runnable_seek",
+                vec!["next_run_at", "created_at", "id"],
+            ),
             (
                 "idx_thread_episodic_index_jobs_due",
                 vec!["status", "next_run_at"],
@@ -106,7 +127,7 @@ mod tests {
         Migrator::down(&db, Some((migrations.len() - position) as u32))
             .await
             .unwrap();
-        assert!(db.query_all_raw(Statement::from_string(db.get_database_backend(), "SELECT name FROM sqlite_master WHERE type='index' AND name IN ('idx_thread_episodic_jobs_workspace_due','idx_thread_episodic_jobs_workspace_recovery','idx_thread_episodic_jobs_workspace_terminal')".to_owned())).await.unwrap().is_empty());
+        assert!(db.query_all_raw(Statement::from_string(db.get_database_backend(), "SELECT name FROM sqlite_master WHERE type='index' AND name IN ('idx_thread_episodic_jobs_workspace_due','idx_thread_episodic_jobs_workspace_recovery','idx_thread_episodic_jobs_workspace_terminal','idx_thread_episodic_jobs_runnable_seek')".to_owned())).await.unwrap().is_empty());
         assert!(db.query_one_raw(Statement::from_string(db.get_database_backend(), "SELECT name FROM sqlite_master WHERE type='table' AND name='thread_episodic_index_jobs'".to_owned())).await.unwrap().is_some());
         assert!(db.query_one_raw(Statement::from_string(db.get_database_backend(), "SELECT name FROM sqlite_master WHERE name='idx_thread_episodic_jobs_runnable_seek'".to_owned())).await.unwrap().is_none());
         let global_columns = db
@@ -118,6 +139,56 @@ mod tests {
             .unwrap();
         assert_eq!(
             global_columns
+                .into_iter()
+                .map(|row| row.try_get::<String>("", "name").unwrap())
+                .collect::<Vec<_>>(),
+            vec!["status", "next_run_at"]
+        );
+    }
+
+    #[tokio::test]
+    async fn runnable_seek_has_full_cursor_and_partial_predicate_and_rolls_back_named_suffix() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let columns = db
+            .query_all_raw(Statement::from_string(
+                db.get_database_backend(),
+                "PRAGMA index_info('idx_thread_episodic_jobs_runnable_seek')".to_owned(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            columns
+                .into_iter()
+                .map(|row| row.try_get::<String>("", "name").unwrap())
+                .collect::<Vec<_>>(),
+            vec!["next_run_at", "created_at", "id"]
+        );
+        let definition = db.query_one_raw(Statement::from_string(db.get_database_backend(), "SELECT sql FROM sqlite_master WHERE name = 'idx_thread_episodic_jobs_runnable_seek'".to_owned())).await.unwrap().unwrap();
+        assert!(
+            definition
+                .try_get::<String>("", "sql")
+                .unwrap()
+                .contains("status IN ('queued','failed','running')")
+        );
+        let migrations = Migrator::migrations();
+        let position = migrations
+            .iter()
+            .position(|migration| migration.name() == "m20261006_000001_thread_episodic_job_access")
+            .unwrap();
+        Migrator::down(&db, Some((migrations.len() - position) as u32))
+            .await
+            .unwrap();
+        assert!(db.query_one_raw(Statement::from_string(db.get_database_backend(), "SELECT name FROM sqlite_master WHERE name = 'idx_thread_episodic_jobs_runnable_seek'".to_owned())).await.unwrap().is_none());
+        let columns = db
+            .query_all_raw(Statement::from_string(
+                db.get_database_backend(),
+                "PRAGMA index_info('idx_thread_episodic_index_jobs_due')".to_owned(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            columns
                 .into_iter()
                 .map(|row| row.try_get::<String>("", "name").unwrap())
                 .collect::<Vec<_>>(),

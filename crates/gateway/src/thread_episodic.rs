@@ -5642,6 +5642,7 @@ mod tests {
         ) -> anyhow::Result<pioneer_provider::EmbeddingResponse> {
             self.embed_calls.fetch_add(1, Ordering::SeqCst);
             Ok(pioneer_provider::EmbeddingResponse {
+                usage: None,
                 embeddings: vec![vec![0.5; 4]; request.input.len()],
             })
         }

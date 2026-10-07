@@ -5,6 +5,7 @@ mod compatible;
 pub(crate) mod copilot;
 pub(crate) mod deepseek;
 mod echo;
+pub mod embedding;
 pub(crate) mod gemini;
 pub(crate) mod glm;
 mod local;
@@ -35,6 +36,9 @@ pub use telnyx::TelnyxProvider;
 
 #[cfg(test)]
 mod usage_tests;
+
+#[cfg(test)]
+mod history_test_support;
 
 #[cfg(test)]
 mod streaming_tests;

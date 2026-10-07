@@ -494,6 +494,22 @@ pub struct MessageSourceAlias {
     pub thread_id: String,
     pub source: MessageSourceRef,
 }
+impl MessageSourceAlias {
+    /// Exact canonical response -> model-facing UI copy. Never a turn-wide alias.
+    pub fn is_response_copy(&self) -> bool {
+        self.thread_id == self.represented_thread_id
+            && self
+                .represented_source
+                .scope
+                .strip_prefix("context:")
+                .is_some_and(|turn| {
+                    !turn.is_empty() && self.source.scope.strip_prefix("event:") == Some(turn)
+                })
+            && !self.source.version.is_empty()
+            && !self.represented_source.version.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MessageSourceIdentity {
     pub thread_id: String,
@@ -861,6 +877,7 @@ impl EmbeddingRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddingResponse {
     pub embeddings: Vec<Vec<f32>>,
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1008,7 +1025,7 @@ impl ProviderTermination {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TokenUsage {
     /// Full effective input, including cache reads/writes exactly once.
     /// None means unreported, never zero by implication.

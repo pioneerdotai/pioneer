@@ -13,9 +13,13 @@ mod m20261001_000001_delivery_authority_spec_indexes;
 mod m20261002_000001_task_run_occurrence_reconcile;
 mod m20261004_000001_task_occurrence_reconcile;
 mod m20261004_000004_compaction_lifecycle_pending;
+mod m20261004_000005_terminal_effect_gates;
+mod m20261004_000006_task_delivery_recovery;
 mod m20261004_000007_agent_action_outbox_ranges;
+mod m20261004_000008_task_event_fanout_pending;
+mod m20261005_000001_native_cancellation_context;
+mod m20261006_000001_retire_compaction_publication_fences;
 mod m20261006_000001_thread_episodic_job_access;
-mod m20261006_000002_thread_episodic_runnable_seek;
 pub use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
@@ -84,6 +88,8 @@ mod m20260902_000003_turn_work_owner;
 mod m20260904_000001_recovery_episode_invariant;
 mod m20260905_000001_memory_identity;
 mod m20260906_000003_projection_receipt_cleanup;
+
+mod m20261004_000001_cli_runtime_active_binding_index;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -163,11 +169,16 @@ impl MigratorTrait for Migrator {
             Box::new(m20260930_000001_recovery_diagnostic::Migration),
             Box::new(m20261001_000001_delivery_authority_spec_indexes::Migration),
             Box::new(m20261002_000001_task_run_occurrence_reconcile::Migration),
+            Box::new(m20261004_000001_cli_runtime_active_binding_index::Migration),
             Box::new(m20261004_000001_task_occurrence_reconcile::Migration),
             Box::new(m20261004_000004_compaction_lifecycle_pending::Migration),
+            Box::new(m20261004_000005_terminal_effect_gates::Migration),
+            Box::new(m20261004_000006_task_delivery_recovery::Migration),
             Box::new(m20261004_000007_agent_action_outbox_ranges::Migration),
+            Box::new(m20261004_000008_task_event_fanout_pending::Migration),
+            Box::new(m20261005_000001_native_cancellation_context::Migration),
+            Box::new(m20261006_000001_retire_compaction_publication_fences::Migration),
             Box::new(m20261006_000001_thread_episodic_job_access::Migration),
-            Box::new(m20261006_000002_thread_episodic_runnable_seek::Migration),
         ]
     }
 }

@@ -9856,6 +9856,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tiktoken-rs",
+ "tokenizers",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tokio-util",
