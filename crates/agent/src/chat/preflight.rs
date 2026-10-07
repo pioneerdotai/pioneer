@@ -257,12 +257,21 @@ pub(crate) struct TurnPreflightProviderEndpoint {
 }
 
 #[derive(Clone)]
+pub(crate) struct PreflightUsageContext {
+    pub events: Arc<super::AgentEventHub>,
+    pub workspace: String,
+    pub thread: String,
+    pub turn: String,
+}
+
+#[derive(Clone)]
 pub(crate) struct TurnPreflightProviderCallInput {
     pub local_modules: TurnPreflightLocalModulePlans,
     pub turn: TurnPreflightTurnInput,
     pub endpoint: TurnPreflightProviderEndpoint,
     pub timeout_ms: u64,
     pub max_output_chars: usize,
+    pub usage_context: Option<PreflightUsageContext>,
 }
 
 #[derive(Clone)]
@@ -280,6 +289,7 @@ pub(crate) struct TurnPreflightOrchestratorInput {
     pub active_recall: MemoryActiveRecallLocalPlan,
     pub timeout_ms: Option<u64>,
     pub max_output_chars: Option<usize>,
+    pub usage_context: Option<PreflightUsageContext>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -316,6 +326,7 @@ pub(crate) async fn run_turn_preflight_orchestrator(
     ) {
         Ok(endpoint) => {
             call_turn_preflight_provider(TurnPreflightProviderCallInput {
+                usage_context: input.usage_context,
                 local_modules: local_modules.clone(),
                 turn: input.turn,
                 endpoint,
@@ -673,6 +684,7 @@ pub(crate) async fn call_turn_preflight_provider(
 
     let result = call_turn_preflight_provider_once(
         &input.endpoint,
+        input.usage_context.as_ref(),
         prompt.as_str(),
         1,
         timeout_ms,
@@ -720,6 +732,7 @@ fn prompt_provider_sections(
 
 async fn call_turn_preflight_provider_once(
     endpoint: &TurnPreflightProviderEndpoint,
+    usage_context: Option<&PreflightUsageContext>,
     prompt: &str,
     attempt: u32,
     timeout_ms: u64,
@@ -728,17 +741,70 @@ async fn call_turn_preflight_provider_once(
 ) -> Result<TurnPreflightProviderSuccess, TurnPreflightProviderAttemptFailure> {
     let started = Instant::now();
     let request = turn_preflight_chat_request(endpoint.model.as_str(), prompt.to_owned());
+    let observation = super::provider::ProviderAttemptObservation::new(
+        endpoint.provider.as_ref(),
+        &endpoint.model,
+    );
+    if let Some(context) = usage_context {
+        if observation
+            .publish(
+                &context.events,
+                &context.workspace,
+                &context.thread,
+                &context.turn,
+                None,
+            )
+            .await
+            .is_err()
+        {
+            return Err(turn_preflight_attempt_failure(
+                TurnPreflightFallbackReason::ProviderError,
+                "preflight.usage.persistence_failed",
+                "usage observation could not be persisted".into(),
+                endpoint,
+                attempt,
+                input_chars,
+                0,
+                elapsed_ms(started),
+            ));
+        }
+    }
     let response = tokio::time::timeout(
         Duration::from_millis(timeout_ms.max(1)),
         request_turn_preflight_provider_json(
             endpoint.provider.as_ref(),
             request,
+            Some(&observation),
             max_output_chars,
             attempt,
         ),
     )
     .await;
 
+    if let Some(context) = usage_context {
+        if observation
+            .publish(
+                &context.events,
+                &context.workspace,
+                &context.thread,
+                &context.turn,
+                Some(matches!(&response, Ok(Ok(_)))),
+            )
+            .await
+            .is_err()
+        {
+            return Err(turn_preflight_attempt_failure(
+                TurnPreflightFallbackReason::ProviderError,
+                "preflight.usage.persistence_failed",
+                "usage observation could not be persisted".into(),
+                endpoint,
+                attempt,
+                input_chars,
+                0,
+                elapsed_ms(started),
+            ));
+        }
+    }
     let elapsed_ms = elapsed_ms(started);
     let raw = match response {
         Err(_) => {
@@ -907,6 +973,7 @@ fn turn_preflight_chat_request(model: &str, prompt: String) -> ChatRequest {
 async fn request_turn_preflight_provider_json(
     provider: &dyn Provider,
     request: ChatRequest,
+    observation: Option<&super::provider::ProviderAttemptObservation>,
     max_output_chars: usize,
     _attempt: u32,
 ) -> anyhow::Result<String> {
@@ -935,6 +1002,9 @@ async fn request_turn_preflight_provider_json(
     let limits = ProviderResponseLimits::default();
     if provider.capabilities().streaming {
         let mut stream = provider.stream_chat(request).await.map_err(|error| {
+            if let Some(observation) = observation {
+                observation.observe_error(&error);
+            }
             TurnPreflightProviderRequestFailure::provider_error(
                 provider,
                 "provider_stream_start",
@@ -946,6 +1016,9 @@ async fn request_turn_preflight_provider_json(
         let mut completed = false;
         while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
             let chunk = chunk.map_err(|error| {
+                if let Some(observation) = observation {
+                    observation.observe_error(&error);
+                }
                 let failure_stage = if text.is_empty() {
                     ProviderFailureStage::FirstChunk
                 } else {
@@ -959,6 +1032,9 @@ async fn request_turn_preflight_provider_json(
                 )
                 .with_response_prefix(text.as_str())
             })?;
+            if let (Some(observation), Some(usage)) = (observation, &chunk.usage) {
+                observation.observe(usage);
+            }
             limits.validate_stream_chunk(&chunk).map_err(|error| {
                 TurnPreflightProviderRequestFailure::response_validation(
                     "stream_chunk_validation",
@@ -1021,6 +1097,9 @@ async fn request_turn_preflight_provider_json(
     }
 
     let response = provider.chat(request).await.map_err(|error| {
+        if let Some(observation) = observation {
+            observation.observe_error(&error);
+        }
         TurnPreflightProviderRequestFailure::provider_error(
             provider,
             "provider_non_stream_response",
@@ -1028,6 +1107,9 @@ async fn request_turn_preflight_provider_json(
             error,
         )
     })?;
+    if let (Some(observation), Some(usage)) = (observation, &response.usage) {
+        observation.observe(usage);
+    }
     validate_preflight_completion(Some(&response.termination), !response.tool_calls.is_empty())
         .map_err(|error| {
             TurnPreflightProviderRequestFailure::response_validation(
@@ -2839,6 +2921,7 @@ mod tests {
             local_modules: sample_provider_needed_modules(),
             turn: sample_turn_input(),
             endpoint,
+            usage_context: None,
             timeout_ms: TURN_PREFLIGHT_PROVIDER_DEFAULT_TIMEOUT_MS,
             max_output_chars: TURN_PREFLIGHT_PROVIDER_DEFAULT_MAX_OUTPUT_CHARS,
         }
@@ -4534,19 +4617,29 @@ mod tests {
 }
 
 #[cfg(test)]
-fn load_test_catalog() {
+pub(crate) fn load_test_catalog() {
     static READY: std::sync::Once = std::sync::Once::new();
     READY.call_once(|| {
         let directory = tempfile::tempdir().unwrap();
+        // The Pi comparison fixture retains legacy negative router prices.
+        // Restore a catalog generated from native source evidence instead.
+        let source: pioneer_provider::catalog::generator::SourceSnapshot =
+            serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../provider/tests/fixtures/catalog/sources.json"
+            )))
+            .unwrap();
+        let catalog = pioneer_provider::catalog::generator::generate(&source, true).unwrap();
         let saved = serde_json::json!({
             "version": 1,
-            "updated_at": "2026-09-12T00:00:00Z",
-            "catalog": {
-                "models": serde_json::from_str::<serde_json::Value>(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../provider/tests/fixtures/catalog/models.json"))).unwrap(),
-                "provenance": serde_json::from_str::<serde_json::Value>(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../provider/tests/fixtures/catalog/provenance.json"))).unwrap(),
-            }
+            "updated_at": source.captured_at,
+            "catalog": catalog,
         });
-        std::fs::write(directory.path().join("catalog.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
+        std::fs::write(
+            directory.path().join("catalog.json"),
+            serde_json::to_vec(&saved).unwrap(),
+        )
+        .unwrap();
         pioneer_provider::catalog::runtime::restore_cached_catalog(directory.path()).unwrap();
     });
 }

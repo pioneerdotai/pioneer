@@ -9,7 +9,7 @@ use crate::{
     types::{
         ChatRequest, ChatResponse, InputContentType, ProviderCapabilities,
         ProviderInputCapabilities, ProviderTermination, ProviderTimeoutPolicy, Role, StreamChunk,
-        TokenUsage, ToolChoice, ToolDefinition,
+        ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -159,6 +159,10 @@ struct ApiToolCallFunction {
 
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
     choices: Vec<ApiChoice>,
     #[serde(default)]
     usage: Option<ApiUsage>,
@@ -191,18 +195,16 @@ impl ApiResponseMessage {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiUsage {
-    #[serde(default)]
-    prompt_tokens: Option<u64>,
-    #[serde(default)]
-    completion_tokens: Option<u64>,
-}
+type ApiUsage = crate::usage::ChatUsage;
 
 // ── SSE streaming response types ────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct StreamResponse {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     usage: Option<ApiUsage>,
     #[serde(default)]
@@ -627,15 +629,14 @@ impl TelnyxProvider {
                                     .await;
                                 return;
                             }
-                            if let Some(usage) = resp.usage {
-                                if tx
-                                    .send(Ok(StreamChunk::usage(TokenUsage {
-                                        input_tokens: usage.prompt_tokens,
-                                        output_tokens: usage.completion_tokens,
-                                    })))
-                                    .await
-                                    .is_err()
-                                {
+                            if resp.usage.is_some() || resp.id.is_some() {
+                                let usage = resp
+                                    .usage
+                                    .map(|u| u.normalized())
+                                    .unwrap_or_default()
+                                    .with_native_id(resp.id.as_deref())
+                                    .with_reported_model(resp.model.as_deref());
+                                if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
                                     return;
                                 }
                             }
@@ -762,6 +763,13 @@ impl TelnyxProvider {
 
 #[async_trait]
 impl crate::traits::Provider for TelnyxProvider {
+    fn usage_api(&self) -> &'static str {
+        "chat_completions"
+    }
+    fn usage_route(&self) -> Option<String> {
+        crate::usage::route(&self.base_url, "/chat/completions")
+    }
+
     fn name(&self) -> &str {
         "telnyx"
     }
@@ -810,10 +818,14 @@ impl crate::traits::Provider for TelnyxProvider {
             "provider_response",
         )
         .await?;
-        let usage = api_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-        });
+        let usage = Some(
+            api_response
+                .usage
+                .map(|u| u.normalized())
+                .unwrap_or_default()
+                .with_native_id(api_response.id.as_deref())
+                .with_reported_model(api_response.model.as_deref()),
+        );
 
         let choice = api_response
             .choices

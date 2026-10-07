@@ -37,6 +37,7 @@ impl From<ApiEmbeddingUsage> for TokenUsage {
             input_tokens: usage.prompt_tokens,
             // Embeddings have no generated output tokens.
             output_tokens: Some(0),
+            ..Default::default()
         }
     }
 }

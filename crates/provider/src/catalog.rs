@@ -114,6 +114,7 @@ pub(crate) fn catalog_provider(provider: &str) -> String {
 pub struct ModelCatalog {
     models: BTreeMap<String, BTreeMap<String, CatalogModel>>,
     origins: BTreeMap<String, BTreeMap<String, ModelOrigins>>,
+    snapshot_id: String,
     tool_capabilities: Option<ToolCapabilities>,
 }
 
@@ -149,6 +150,10 @@ impl ModelCatalog {
         let catalog = Self {
             models: serde_json::from_str(models)?,
             origins: serde_json::from_str(origins)?,
+            snapshot_id: {
+                use sha2::{Digest, Sha256};
+                hex::encode(Sha256::digest(models.as_bytes()))
+            },
             tool_capabilities,
         };
         anyhow::ensure!(!catalog.models.is_empty(), "empty model catalog");
@@ -180,6 +185,10 @@ impl ModelCatalog {
             }
         }
         Ok(catalog)
+    }
+
+    pub fn snapshot_id(&self) -> &str {
+        &self.snapshot_id
     }
 
     pub fn model(&self, provider: &str, id: &str) -> Option<&CatalogModel> {

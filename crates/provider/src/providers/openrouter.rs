@@ -180,6 +180,10 @@ struct ApiToolCallFunction {
 
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
     choices: Vec<ApiChoice>,
     #[serde(default)]
     usage: Option<ApiUsage>,
@@ -215,13 +219,7 @@ impl ApiResponseMessage {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiUsage {
-    #[serde(default)]
-    prompt_tokens: Option<u64>,
-    #[serde(default)]
-    completion_tokens: Option<u64>,
-}
+type ApiUsage = crate::usage::ChatUsage;
 
 #[derive(Debug, Serialize)]
 struct ApiEmbeddingRequest {
@@ -236,6 +234,8 @@ type ApiEmbeddingResponse = super::embedding::IndexedEmbeddingResponse;
 
 #[derive(Debug, Deserialize)]
 struct StreamResponse {
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -1103,10 +1103,27 @@ impl OpenRouterProvider {
         request_id: Option<String>,
         diagnostics: crate::ProviderStreamDiagnostics,
     ) -> crate::ProviderStream {
+        Self::decode_stream_with_usage(byte_stream, request_id, diagnostics, TokenUsage::default())
+    }
+
+    fn decode_stream_with_usage(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+        request_id: Option<String>,
+        diagnostics: crate::ProviderStreamDiagnostics,
+        header_usage: TokenUsage,
+    ) -> crate::ProviderStream {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
         let stream_diagnostics = diagnostics.clone();
         tokio::spawn(async move {
+            if header_usage.generation_id.is_some()
+                && tx
+                    .send(Ok(StreamChunk::usage(header_usage.clone())))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
             let mut decoder = IncrementalSseDecoder::default();
             let mut tool_call_accumulator = StreamToolCallAccumulator::default();
             let mut terminal_reason = None;
@@ -1196,15 +1213,19 @@ impl OpenRouterProvider {
                                     .await;
                                 return;
                             }
-                            if let Some(usage) = resp.usage {
-                                if tx
-                                    .send(Ok(StreamChunk::usage(TokenUsage {
-                                        input_tokens: usage.prompt_tokens,
-                                        output_tokens: usage.completion_tokens,
-                                    })))
-                                    .await
-                                    .is_err()
-                                {
+                            if resp.usage.is_some() || resp.id.is_some() || resp.model.is_some() {
+                                let usage = resp
+                                    .usage
+                                    .map(|u| u.normalized())
+                                    .unwrap_or_default()
+                                    .with_native_id(
+                                        header_usage
+                                            .generation_id
+                                            .as_deref()
+                                            .or(resp.id.as_deref()),
+                                    )
+                                    .with_reported_model(resp.model.as_deref());
+                                if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
                                     return;
                                 }
                             }
@@ -1363,6 +1384,13 @@ impl OpenRouterProvider {
 
 #[async_trait]
 impl crate::traits::Provider for OpenRouterProvider {
+    fn usage_api(&self) -> &'static str {
+        "chat_completions"
+    }
+    fn usage_route(&self) -> Option<String> {
+        crate::usage::route(&self.base_url, "/chat/completions")
+    }
+
     fn classify_failure(
         &self,
         error: &anyhow::Error,
@@ -1444,90 +1472,126 @@ impl crate::traits::Provider for OpenRouterProvider {
             .send()
             .await?;
 
+        let header_usage = TokenUsage::default().with_native_id(
+            response
+                .headers()
+                .get("X-Generation-Id")
+                .and_then(|value| value.to_str().ok()),
+        );
         if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
+            let error = Self::api_error(response).await;
+            return Err(if header_usage.generation_id.is_some() {
+                crate::usage::with_error_usage(error, &header_usage)
+            } else {
+                error
+            });
         }
 
-        let mut facts = ResponseFailureFacts::capture(&response);
-        let body: serde_json::Value = crate::http::read_response_json_bounded(
-            response,
-            Default::default(),
-            "provider_response",
-        )
-        .await
-        .map_err(|error| facts.failure(error, ProviderFailureStage::Connect))?;
-        facts.observe_body_id(&body);
-        // Chat Completions can report generation failure inside HTTP 200,
-        // either at the top level or in a choice. The envelope code, not 200,
-        // is the failure status in this case.
-        if let Some(error) = body
-            .get("error")
-            .filter(|error| !error.is_null())
-            .or_else(|| {
-                body.get("choices")
-                    .and_then(serde_json::Value::as_array)
-                    .and_then(|choices| {
-                        choices
-                            .iter()
-                            .find_map(|choice| choice.get("error").filter(|error| !error.is_null()))
-                    })
-            })
-        {
-            let error: StreamError = serde_json::from_value(error.clone())
+        let mut observed = header_usage.clone();
+        let result = async {
+            let mut facts = ResponseFailureFacts::capture(&response);
+            let body: serde_json::Value = crate::http::read_response_json_bounded(
+                response,
+                Default::default(),
+                "provider_response",
+            )
+            .await
+            .map_err(|error| facts.failure(error, ProviderFailureStage::Connect))?;
+            facts.observe_body_id(&body);
+            // Retain bounded usage before validating the response or error envelope.
+            let usage = body
+                .get("usage")
+                .and_then(|value| serde_json::from_value::<ApiUsage>(value.clone()).ok())
+                .map(|usage| usage.normalized())
+                .unwrap_or_default()
+                .with_native_id(
+                    header_usage
+                        .generation_id
+                        .as_deref()
+                        .or_else(|| body.get("id").and_then(serde_json::Value::as_str)),
+                )
+                .with_reported_model(body.get("model").and_then(serde_json::Value::as_str));
+            observed.update(&usage);
+            // Chat Completions can report generation failure inside HTTP 200,
+            // either at the top level or in a choice. The envelope code, not 200,
+            // is the failure status in this case.
+            if let Some(error) = body
+                .get("error")
+                .filter(|error| !error.is_null())
+                .or_else(|| {
+                    body.get("choices")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|choices| {
+                            choices.iter().find_map(|choice| {
+                                choice.get("error").filter(|error| !error.is_null())
+                            })
+                        })
+                })
+            {
+                let error: StreamError = serde_json::from_value(error.clone())
+                    .map_err(|error| facts.failure(error.into(), ProviderFailureStage::Connect))?;
+                return Err(OpenRouterFailure::generation(
+                    error,
+                    facts.request_id,
+                    ProviderFailureStage::Connect,
+                    facts.retry_after_ms,
+                )
+                .into());
+            }
+            let api_response: ApiChatResponse = serde_json::from_value(body)
                 .map_err(|error| facts.failure(error.into(), ProviderFailureStage::Connect))?;
-            return Err(OpenRouterFailure::generation(
-                error,
-                facts.request_id,
-                ProviderFailureStage::Connect,
-                facts.retry_after_ms,
-            )
-            .into());
+            let usage = Some(usage);
+
+            let choice = api_response.choices.into_iter().next().ok_or_else(|| {
+                facts.failure(
+                    anyhow!("no response from OpenRouter"),
+                    ProviderFailureStage::Connect,
+                )
+            })?;
+            let termination = choice
+                .finish_reason
+                .as_deref()
+                .map(ProviderTermination::from_openai_reason)
+                .unwrap_or_else(|| {
+                    ProviderTermination::Unknown("missing_finish_reason".to_owned())
+                });
+            let message = choice.message;
+
+            let provider_replay_state = Self::reasoning_details_state(
+                message.reasoning_details.clone().unwrap_or_default(),
+            );
+            let text = message.effective_content();
+            let tool_calls =
+                parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())
+                    .map_err(|error| facts.failure(error, ProviderFailureStage::Connect))?;
+            let reasoning_content = message.reasoning_content.or(message.reasoning);
+
+            if text.is_empty()
+                && tool_calls.is_empty()
+                && reasoning_content.as_deref().unwrap_or_default().is_empty()
+            {
+                return Err(facts.failure(
+                    anyhow!("no response from OpenRouter"),
+                    ProviderFailureStage::Connect,
+                ));
+            }
+
+            Ok(ChatResponse {
+                text,
+                usage,
+                termination,
+                reasoning_content,
+                tool_calls,
+                provider_replay_state,
+            })
         }
-        let api_response: ApiChatResponse = serde_json::from_value(body)
-            .map_err(|error| facts.failure(error.into(), ProviderFailureStage::Connect))?;
-        let usage = api_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-        });
-
-        let choice = api_response.choices.into_iter().next().ok_or_else(|| {
-            facts.failure(
-                anyhow!("no response from OpenRouter"),
-                ProviderFailureStage::Connect,
-            )
-        })?;
-        let termination = choice
-            .finish_reason
-            .as_deref()
-            .map(ProviderTermination::from_openai_reason)
-            .unwrap_or_else(|| ProviderTermination::Unknown("missing_finish_reason".to_owned()));
-        let message = choice.message;
-
-        let provider_replay_state =
-            Self::reasoning_details_state(message.reasoning_details.clone().unwrap_or_default());
-        let text = message.effective_content();
-        let tool_calls =
-            parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())
-                .map_err(|error| facts.failure(error, ProviderFailureStage::Connect))?;
-        let reasoning_content = message.reasoning_content.or(message.reasoning);
-
-        if text.is_empty()
-            && tool_calls.is_empty()
-            && reasoning_content.as_deref().unwrap_or_default().is_empty()
-        {
-            return Err(facts.failure(
-                anyhow!("no response from OpenRouter"),
-                ProviderFailureStage::Connect,
-            ));
-        }
-
-        Ok(ChatResponse {
-            text,
-            usage,
-            termination,
-            reasoning_content,
-            tool_calls,
-            provider_replay_state,
+        .await;
+        result.map_err(|error| {
+            if observed != TokenUsage::default() {
+                crate::usage::with_error_usage(error, &observed)
+            } else {
+                error
+            }
         })
     }
 
@@ -1563,8 +1627,21 @@ impl crate::traits::Provider for OpenRouterProvider {
         let response =
             crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
 
+        // Header is authoritative correlation evidence. If body disagrees,
+        // retain the header; never invent a combined ID. Body is fallback only.
+        let header_usage = TokenUsage::default().with_native_id(
+            response
+                .headers()
+                .get("X-Generation-Id")
+                .and_then(|v| v.to_str().ok()),
+        );
         if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
+            let error = Self::api_error(response).await;
+            return Err(if header_usage.generation_id.is_some() {
+                crate::usage::with_error_usage(error, &header_usage)
+            } else {
+                error
+            });
         }
 
         let request_id = Self::response_request_id(&response);
@@ -1581,10 +1658,11 @@ impl crate::traits::Provider for OpenRouterProvider {
             "provider_stream",
         );
 
-        Ok(Self::decode_stream_with_diagnostics(
+        Ok(Self::decode_stream_with_usage(
             byte_stream,
             request_id,
             diagnostics,
+            header_usage,
         ))
     }
 
@@ -2770,9 +2848,9 @@ mod tests {
             "usage": {"prompt_tokens": 42, "completion_tokens": 15}
         }"#;
         let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        let usage = response.usage.unwrap();
-        assert_eq!(usage.prompt_tokens, Some(42));
-        assert_eq!(usage.completion_tokens, Some(15));
+        let usage = response.usage.unwrap().normalized();
+        assert_eq!(usage.input_tokens, Some(42));
+        assert_eq!(usage.output_tokens, Some(15));
     }
 
     #[test]

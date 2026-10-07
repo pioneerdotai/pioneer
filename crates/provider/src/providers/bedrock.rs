@@ -6,7 +6,7 @@ use crate::reasoning_registry;
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
     ProviderInputCapabilities, ProviderReplayState, ProviderTermination, ProviderTimeoutPolicy,
-    ProviderToolCall, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+    ProviderToolCall, Role, StreamChunk, ToolChoice, ToolDefinition,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -213,31 +213,7 @@ struct BedrockToolResultContent {
     text: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BedrockUsage {
-    #[serde(default)]
-    input_tokens: Option<u64>,
-    #[serde(default)]
-    output_tokens: Option<u64>,
-    #[serde(default)]
-    cache_read_input_tokens: Option<u64>,
-    #[serde(default)]
-    cache_write_input_tokens: Option<u64>,
-}
-
-impl BedrockUsage {
-    fn normalized(&self) -> TokenUsage {
-        TokenUsage {
-            input_tokens: self.input_tokens.and_then(|input| {
-                input
-                    .checked_add(self.cache_read_input_tokens?)?
-                    .checked_add(self.cache_write_input_tokens?)
-            }),
-            output_tokens: self.output_tokens,
-        }
-    }
-}
+type BedrockUsage = crate::usage::BedrockUsage;
 
 // ── List models response types ─────────────────────────────────────────────
 
@@ -1060,6 +1036,13 @@ fn is_leap_year(y: u64) -> bool {
 
 #[async_trait]
 impl crate::traits::Provider for BedrockProvider {
+    fn usage_api(&self) -> &'static str {
+        "bedrock_converse"
+    }
+    fn usage_route(&self) -> Option<String> {
+        Some("bedrock-runtime:/model/{model}/converse".into())
+    }
+
     fn name(&self) -> &str {
         "bedrock"
     }
@@ -1133,6 +1116,12 @@ impl crate::traits::Provider for BedrockProvider {
             return Err(Self::api_error(response).await);
         }
 
+        let native_request_id = crate::usage::native_id(
+            response
+                .headers()
+                .get("x-amzn-requestid")
+                .and_then(|v| v.to_str().ok()),
+        );
         let api_response: BedrockResponse = crate::http::read_response_json_bounded(
             response,
             Default::default(),
@@ -1140,6 +1129,10 @@ impl crate::traits::Provider for BedrockProvider {
         )
         .await?;
         let mut response = Self::parse_response(api_response)?;
+        response
+            .usage
+            .get_or_insert_with(Default::default)
+            .request_id = crate::usage::native_id(native_request_id.as_deref());
         if let Some(state) = response.provider_replay_state.as_mut() {
             crate::continuation::bind_prefix(
                 state,
@@ -2045,7 +2038,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_normalization_requires_complete_separate_cache_counters() {
+    fn usage_normalization_preserves_input_without_optional_cache_counters() {
         let complete: super::BedrockUsage = serde_json::from_value(serde_json::json!({
             "inputTokens":10,"cacheReadInputTokens":100,"cacheWriteInputTokens":20,"outputTokens":8
         }))
@@ -2056,7 +2049,7 @@ mod tests {
             "inputTokens":10,"outputTokens":8
         }))
         .unwrap();
-        assert_eq!(missing.normalized().input_tokens, None);
+        assert_eq!(missing.normalized().input_tokens, Some(10));
         assert_eq!(missing.normalized().output_tokens, Some(8));
     }
 
@@ -2866,7 +2859,7 @@ mod tests {
             response.output.message.content[0].text.as_deref(),
             Some("Hello from Bedrock")
         );
-        let usage = response.usage.unwrap();
+        let usage = response.usage.unwrap().normalized();
         assert_eq!(usage.input_tokens, Some(42));
         assert_eq!(usage.output_tokens, Some(15));
     }

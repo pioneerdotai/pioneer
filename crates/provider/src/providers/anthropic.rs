@@ -61,6 +61,8 @@ struct ApiChatRequest {
     output_config: Option<AnthropicOutputConfig>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<serde_json::Value>,
     #[serde(flatten)]
     generation: crate::generation::Fields,
 }
@@ -154,6 +156,10 @@ enum AnthropicToolChoiceMode {
 
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
     content: Vec<ContentBlock>,
     #[serde(default)]
     stop_reason: Option<String>,
@@ -183,30 +189,7 @@ struct ContentBlock {
     extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiUsage {
-    #[serde(default)]
-    input_tokens: Option<u64>,
-    #[serde(default)]
-    output_tokens: Option<u64>,
-    #[serde(default)]
-    cache_creation_input_tokens: Option<u64>,
-    #[serde(default)]
-    cache_read_input_tokens: Option<u64>,
-}
-
-impl ApiUsage {
-    fn normalized(&self) -> TokenUsage {
-        TokenUsage {
-            input_tokens: self.input_tokens.and_then(|input| {
-                input
-                    .checked_add(self.cache_creation_input_tokens?)?
-                    .checked_add(self.cache_read_input_tokens?)
-            }),
-            output_tokens: self.output_tokens,
-        }
-    }
-}
+type ApiUsage = crate::usage::AnthropicUsage;
 
 // ── SSE streaming response types ────────────────────────────────────────────
 
@@ -238,6 +221,10 @@ struct StreamNativeError {
 
 #[derive(Debug, Deserialize)]
 struct StreamMessage {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     usage: Option<ApiUsage>,
 }
@@ -335,6 +322,7 @@ impl AnthropicProvider {
             crate::generation::anthropic_fields_with_catalog(catalog, "anthropic", request)?;
         Ok(ApiChatRequest {
             generation,
+            cache_control: None,
             model: request.model.clone(),
             messages,
             max_tokens: crate::generation::required_cap_with_catalog(
@@ -408,7 +396,14 @@ impl AnthropicProvider {
             .as_deref()
             .map(ProviderTermination::from_openai_reason)
             .unwrap_or_else(|| ProviderTermination::Unknown("missing_stop_reason".to_owned()));
-        let usage = api_response.usage.map(|u| u.normalized());
+        let usage = Some(
+            api_response
+                .usage
+                .map(|u| u.normalized())
+                .unwrap_or_default()
+                .with_native_id(api_response.id.as_deref())
+                .with_reported_model(api_response.model.as_deref()),
+        );
 
         let mut text_parts = Vec::new();
         let mut thinking_parts = Vec::new();
@@ -497,7 +492,8 @@ impl AnthropicProvider {
             );
         }
         let (system, messages) = Self::prepare_messages(prepared)?;
-        let body = Self::build_chat_request(request, system, messages, stream)?;
+        let mut body = Self::build_chat_request(request, system, messages, stream)?;
+        body.cache_control = crate::usage::anthropic_cache_control(&self.base_url, &request.model);
         crate::continuation::validate_prefix(
             &serde_json::to_value(&body)?,
             prepared
@@ -813,16 +809,27 @@ impl AnthropicProvider {
     pub(super) fn decode_stream(
         byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
     ) -> BoxStream<'static, Result<StreamChunk>> {
-        Self::decode_stream_with_replay(byte_stream, None)
+        Self::decode_stream_with_replay(byte_stream, None, None)
     }
 
     fn decode_stream_with_replay(
         byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
         replay_context: Option<StreamReplayContext>,
+        native_request_id: Option<String>,
     ) -> BoxStream<'static, Result<StreamChunk>> {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
         tokio::spawn(async move {
+            if native_request_id.is_some()
+                && tx
+                    .send(Ok(StreamChunk::usage(
+                        TokenUsage::default().with_request_id(native_request_id.as_deref()),
+                    )))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
             use std::collections::{BTreeMap, HashMap, HashSet};
 
             let mut decoder = IncrementalSseDecoder::default();
@@ -890,6 +897,23 @@ impl AnthropicProvider {
                                     return;
                                 }
                                 message_started = true;
+                            }
+                            if let Some(message) = event
+                                .message
+                                .as_ref()
+                                .filter(|_| event.event_type == "message_start")
+                            {
+                                if tx
+                                    .send(Ok(StreamChunk::usage(
+                                        TokenUsage::default()
+                                            .with_native_id(message.id.as_deref())
+                                            .with_reported_model(message.model.as_deref()),
+                                    )))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
                             }
                             if matches!(
                                 event.event_type.as_str(),
@@ -1316,6 +1340,13 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl crate::traits::Provider for AnthropicProvider {
+    fn usage_api(&self) -> &'static str {
+        "messages"
+    }
+    fn usage_route(&self) -> Option<String> {
+        crate::usage::route(&self.base_url, "/v1/messages")
+    }
+
     fn name(&self) -> &str {
         "anthropic"
     }
@@ -1367,6 +1398,12 @@ impl crate::traits::Provider for AnthropicProvider {
             return Err(Self::api_error(response).await);
         }
 
+        let native_request_id = crate::usage::native_id(
+            response
+                .headers()
+                .get("request-id")
+                .and_then(|v| v.to_str().ok()),
+        );
         let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
             response,
             Default::default(),
@@ -1374,6 +1411,10 @@ impl crate::traits::Provider for AnthropicProvider {
         )
         .await?;
         let mut response = Self::parse_response(api_response)?;
+        response
+            .usage
+            .get_or_insert_with(Default::default)
+            .request_id = crate::usage::native_id(native_request_id.as_deref());
         if let Some(state) = response.provider_replay_state.as_mut() {
             if self.base_url != BASE_URL
                 && crate::continuation::retention(state) != crate::continuation::Retention::Ordinary
@@ -1422,6 +1463,12 @@ impl crate::traits::Provider for AnthropicProvider {
             return Err(Self::api_error(response).await);
         }
 
+        let native_request_id = crate::usage::native_id(
+            response
+                .headers()
+                .get("request-id")
+                .and_then(|v| v.to_str().ok()),
+        );
         let byte_stream = crate::http::bounded_response_stream(
             response,
             crate::types::ProviderResponseLimits::default().max_transport_bytes,
@@ -1436,6 +1483,7 @@ impl crate::traits::Provider for AnthropicProvider {
                 unverified_relay: self.base_url != BASE_URL,
                 prefix_body,
             }),
+            native_request_id,
         ))
     }
 
@@ -2444,12 +2492,25 @@ mod tests {
                 unverified_relay: false,
                 prefix_body: sent.clone(),
             }),
+            Some("native-header-request".into()),
         )
         .collect::<Vec<_>>()
         .await
         .into_iter()
         .collect::<Result<Vec<_>>>()
         .unwrap();
+        assert_eq!(
+            chunks
+                .first()
+                .unwrap()
+                .usage
+                .as_ref()
+                .unwrap()
+                .request_id
+                .as_deref(),
+            Some("native-header-request"),
+            "binding native replay must preserve the independently observed request header"
+        );
         assert_eq!(
             chunks.last().unwrap().termination,
             Some(ProviderTermination::ToolCalls)
@@ -2520,7 +2581,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_normalization_requires_complete_separate_cache_counters() {
+    fn usage_normalization_preserves_input_without_optional_cache_counters() {
         let complete: super::ApiUsage = serde_json::from_value(serde_json::json!({
             "input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":20,"output_tokens":8
         })).unwrap();
@@ -2530,7 +2591,7 @@ mod tests {
             "input_tokens":10,"output_tokens":8
         }))
         .unwrap();
-        assert_eq!(missing.normalized().input_tokens, None);
+        assert_eq!(missing.normalized().input_tokens, Some(10));
         assert_eq!(missing.normalized().output_tokens, Some(8));
     }
 
@@ -2873,6 +2934,7 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ApiChatRequest {
+            cache_control: None,
             generation: Default::default(),
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![ApiMessage {
@@ -2905,6 +2967,7 @@ mod tests {
     #[test]
     fn api_request_serializes_stream_true() {
         let request = ApiChatRequest {
+            cache_control: None,
             generation: Default::default(),
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![ApiMessage {
@@ -2987,7 +3050,7 @@ mod tests {
             response.content[0].text.as_deref(),
             Some("Hello from Claude")
         );
-        let usage = response.usage.unwrap();
+        let usage = response.usage.unwrap().normalized();
         assert_eq!(usage.input_tokens, Some(10));
         assert_eq!(usage.output_tokens, Some(25));
     }

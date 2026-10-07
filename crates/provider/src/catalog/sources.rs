@@ -211,7 +211,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
                 "google-vertex"=>{candidate.model["cost"]["cacheWrite"]=json!(0);if id=="gemini-2.5-flash"{candidate.model["cost"]["cacheRead"]=json!(0.03);}},
                 "cloudflare-workers-ai"=>candidate.compat(json!({"sendSessionAffinityHeaders":true})),
                 "xai"=>candidate.compat(json!({"supportsLongCacheRetention":false})),
-                "mistral"=>{if m["cost"]["cache_read"].is_null(){candidate.model["cost"]["cacheRead"]=json!(round(number(&m["cost"]["input"])*0.1));}},
+                "mistral"=>{if m["cost"]["cache_read"].is_null(){candidate.model["cost"]["cacheRead"]=m["cost"]["input"].as_f64().map(|v|json!(round(v*0.1))).unwrap_or(Value::Null);}},
                 "huggingface"=>candidate.compat(json!({"supportsDeveloperRole":false})),
                 p if p.starts_with("xiaomi")=>candidate.compat(json!({"requiresReasoningContentOnAssistantMessages":true,"thinkingFormat":"deepseek"})),
                 _=>{}
@@ -794,6 +794,22 @@ pub(super) fn registered_supplements(
     result
 }
 
+// Shared source-unit conversion, not a tariff table. Invalid known values
+// remain invalid through validation instead of overflow serializing as null.
+fn per_token_rate(value: &Value) -> Value {
+    let converted = value
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| value.as_f64())
+        .filter(|v| v.is_finite() && *v >= 0.)
+        .map(|v| round(v * 1_000_000.));
+    match converted {
+        Some(v) if v.is_finite() => json!(v),
+        Some(_) => json!("invalid_scaled_source_rate"),
+        None => value.clone(),
+    }
+}
+
 pub(super) fn openrouter(data: &Value) -> Vec<Candidate> {
     data["data"]
         .as_array()
@@ -851,7 +867,35 @@ pub(super) fn openrouter(data: &Value) -> Vec<Candidate> {
                 ("cacheRead", "input_cache_read"),
                 ("cacheWrite", "input_cache_write"),
             ] {
-                c.model["cost"][key] = json!(round(number(&m["pricing"][source]) * 1_000_000.));
+                c.model["cost"][key] = match &m["pricing"][source] {
+                    Value::Null => Value::Null,
+                    // The pinned Models API snapshot uses -1 for Auto Router's
+                    // dynamic selected-model tariff, not a negative/free rate.
+                    // Contract: https://openrouter.ai/docs/guides/routing/routers/auto-router
+                    // Scope this exception to documented auto slugs and token
+                    // input/output fields; other negative/malformed rates fail validation.
+                    value
+                        if matches!(id, "openrouter/auto" | "openrouter/auto-beta")
+                            && matches!(source, "prompt" | "completion")
+                            && (value.as_str() == Some("-1") || value.as_f64() == Some(-1.)) =>
+                    {
+                        Value::Null
+                    }
+                    value => per_token_rate(value),
+                };
+            }
+            c.model["pricingSource"] =
+                json!({"url":SOURCE_URLS[1],"units":"USD_per_token","raw":m["pricing"]});
+            if matches!(id, "openrouter/auto" | "openrouter/auto-beta")
+                && ["prompt", "completion"].iter().any(|key| {
+                    m["pricing"][key].as_str() == Some("-1")
+                        || m["pricing"][key].as_f64() == Some(-1.)
+                })
+            {
+                c.model["pricingSource"]["unknownRateContract"] = json!({
+                    "reason":"dynamic_selected_model_tariff", "sentinel":-1,
+                    "url":"https://openrouter.ai/docs/guides/routing/routers/auto-router"
+                });
             }
             let reasoning = &m["reasoning"];
             let mandatory = reasoning["mandatory"] == true;
@@ -887,6 +931,8 @@ pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
                 m,
                 (4096, 4096),
             );
+            c.model["pricingSource"] =
+                json!({"url":SOURCE_URLS[2],"units":"USD_per_token","raw":m["pricing"]});
             c.model["reasoning"] = json!(has(&m["tags"], "reasoning"));
             c.tool_calling = Some(has(&m["tags"], "tool-use"));
             c.model["input"] = m["input_modalities"].as_array().map(|v| json!(v))
@@ -904,7 +950,10 @@ pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
                 ("cacheRead", "input_cache_read"),
                 ("cacheWrite", "input_cache_write"),
             ] {
-                c.model["cost"][key] = json!(round(number(&m["pricing"][source]) * 1_000_000.));
+                c.model["cost"][key] = match &m["pricing"][source] {
+                    Value::Null => Value::Null,
+                    value => per_token_rate(value),
+                };
             }
             c
         })

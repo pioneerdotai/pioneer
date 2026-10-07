@@ -199,6 +199,10 @@ struct ApiThinkingConfig {
 #[serde(rename_all = "camelCase")]
 struct ApiGenerateResponse {
     #[serde(default)]
+    response_id: Option<String>,
+    #[serde(default)]
+    model_version: Option<String>,
+    #[serde(default)]
     candidates: Vec<ApiCandidate>,
     #[serde(default)]
     usage_metadata: Option<ApiUsageMetadata>,
@@ -235,14 +239,7 @@ struct ApiCandidate {
     finish_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ApiUsageMetadata {
-    #[serde(default)]
-    prompt_token_count: Option<u64>,
-    #[serde(default)]
-    candidates_token_count: Option<u64>,
-}
+type ApiUsageMetadata = crate::usage::GeminiUsage;
 
 // ── List models response types ─────────────────────────────────────────────
 
@@ -741,9 +738,17 @@ impl GeminiProvider {
     }
 
     fn extract_usage(response: &ApiGenerateResponse) -> Option<TokenUsage> {
-        response.usage_metadata.as_ref().map(|u| TokenUsage {
-            input_tokens: u.prompt_token_count,
-            output_tokens: u.candidates_token_count,
+        (response.usage_metadata.is_some()
+            || response.response_id.is_some()
+            || response.model_version.is_some())
+        .then(|| {
+            response
+                .usage_metadata
+                .as_ref()
+                .map(|u| u.normalized())
+                .unwrap_or_default()
+                .with_native_id(response.response_id.as_deref())
+                .with_reported_model(response.model_version.as_deref())
         })
     }
 
@@ -1044,6 +1049,13 @@ impl GeminiProvider {
 
 #[async_trait]
 impl crate::traits::Provider for GeminiProvider {
+    fn usage_api(&self) -> &'static str {
+        "generate_content"
+    }
+    fn usage_route(&self) -> Option<String> {
+        crate::usage::route(&self.base_url, "/models/{model}:generateContent")
+    }
+
     fn name(&self) -> &str {
         "gemini"
     }
@@ -1675,6 +1687,20 @@ mod tests {
         request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::Low));
         assert!(GeminiProvider::build_request_result(&request).is_err());
     }
+    #[test]
+    fn model_version_only_frame_retains_metadata_without_counters_or_arbitrary_ids() {
+        let response: super::ApiGenerateResponse = serde_json::from_value(serde_json::json!({
+            "modelVersion":"gemini-returned", "arbitrary":{"id":"SECRET"}
+        }))
+        .unwrap();
+        let usage = super::GeminiProvider::extract_usage(&response).unwrap();
+        assert_eq!(usage.reported_model.as_deref(), Some("gemini-returned"));
+        assert_eq!(usage.generation_id, None);
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, None);
+        assert!(!serde_json::to_string(&usage).unwrap().contains("SECRET"));
+    }
+
     #[test]
     fn all_signed_native_parts_survive_storage_and_builder() {
         use super::super::history_test_support::request;
@@ -2718,6 +2744,8 @@ mod stream_call_identity_tests {
         // Construct the native struct so this identity test is independent of
         // the JSON casing correction owned by remediation group 2.
         let response = ApiGenerateResponse {
+            response_id: None,
+            model_version: None,
             candidates: vec![ApiCandidate {
                 finish_reason: None,
                 content: Some(ApiContent {

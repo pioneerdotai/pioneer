@@ -11,7 +11,7 @@ use crate::{
     types::{
         ChatMessage, ChatRequest, ChatResponse, InputContentType, InputTypeSupport,
         ProviderCapabilities, ProviderInputCapabilities, ProviderReplayState, ProviderTermination,
-        ProviderTimeoutPolicy, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+        ProviderTimeoutPolicy, Role, StreamChunk, ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -87,6 +87,8 @@ struct ApiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<serde_json::Value>,
     #[serde(flatten)]
     generation: crate::generation::Fields,
 }
@@ -197,6 +199,12 @@ struct ApiToolCallFunction {
 
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
+    #[serde(default)]
+    x_groq: Option<serde_json::Value>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
     choices: Vec<ApiChoice>,
     #[serde(default)]
     usage: Option<ApiUsage>,
@@ -232,18 +240,16 @@ impl ApiResponseMessage {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiUsage {
-    #[serde(default)]
-    prompt_tokens: Option<u64>,
-    #[serde(default)]
-    completion_tokens: Option<u64>,
-}
+type ApiUsage = crate::usage::ChatUsage;
 
 // ── SSE streaming response types ────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct StreamResponse {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     usage: Option<ApiUsage>,
     #[serde(default)]
@@ -1084,6 +1090,9 @@ impl OpenAiCompatibleProvider {
         let generation =
             crate::generation::chat_fields_from_catalog(catalog, &self.name, &request)?;
         Ok(ApiChatRequest {
+            stream_options: stream
+                .then(|| crate::usage::stream_options(&self.name, &request.model))
+                .flatten(),
             generation,
             model: request.model,
             messages: self.convert_messages(&prepared)?,
@@ -1211,15 +1220,14 @@ impl OpenAiCompatibleProvider {
                                     .await;
                                 return;
                             }
-                            if let Some(usage) = resp.usage {
-                                if tx
-                                    .send(Ok(StreamChunk::usage(TokenUsage {
-                                        input_tokens: usage.prompt_tokens,
-                                        output_tokens: usage.completion_tokens,
-                                    })))
-                                    .await
-                                    .is_err()
-                                {
+                            if resp.usage.is_some() || resp.id.is_some() {
+                                let usage = resp
+                                    .usage
+                                    .map(|u| u.normalized())
+                                    .unwrap_or_default()
+                                    .with_native_id(resp.id.as_deref())
+                                    .with_reported_model(resp.model.as_deref());
+                                if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
                                     return;
                                 }
                             }
@@ -1350,6 +1358,13 @@ impl OpenAiCompatibleProvider {
 
 #[async_trait]
 impl crate::traits::Provider for OpenAiCompatibleProvider {
+    fn usage_api(&self) -> &'static str {
+        "chat_completions"
+    }
+    fn usage_route(&self) -> Option<String> {
+        crate::usage::route(&self.base_url, "/chat/completions")
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -1385,10 +1400,23 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
             "provider_response",
         )
         .await?;
-        let usage = api_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-        });
+        let usage = Some(
+            api_response
+                .usage
+                .map(|u| u.normalized())
+                .unwrap_or_default()
+                .with_native_id(api_response.id.as_deref())
+                .with_reported_model(api_response.model.as_deref())
+                .with_request_id(if self.name == "groq" {
+                    api_response
+                        .x_groq
+                        .as_ref()
+                        .and_then(|m| m.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                } else {
+                    None
+                }),
+        );
 
         let choice = api_response
             .choices
@@ -3098,6 +3126,7 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ApiChatRequest {
+            stream_options: None,
             generation: Default::default(),
             model: "gpt-4".into(),
             messages: vec![
@@ -3172,9 +3201,9 @@ mod tests {
             "usage": {"prompt_tokens": 42, "completion_tokens": 15}
         }"#;
         let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        let usage = response.usage.unwrap();
-        assert_eq!(usage.prompt_tokens, Some(42));
-        assert_eq!(usage.completion_tokens, Some(15));
+        let usage = response.usage.unwrap().normalized();
+        assert_eq!(usage.input_tokens, Some(42));
+        assert_eq!(usage.output_tokens, Some(15));
     }
 
     #[test]

@@ -36,6 +36,8 @@ pub async fn generate_thread_title(
     let provider =
         registry.get_or_create_for_workspace(thread.workspace_id.as_str(), model_provider)?;
 
+    let provider =
+        crate::usage_journal::observe(provider, crud, &thread.workspace_id, "title", thread_id);
     let request = title_generation_chat_request(model, prompt);
 
     let response = provider.chat(request).await?;

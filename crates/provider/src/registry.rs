@@ -292,13 +292,18 @@ fn redacted_endpoint_error(
     } else {
         "provider request failed"
     };
-    RedactedEndpointError {
+    let observed = crate::usage::error_usage(&error).cloned();
+    let redacted: anyhow::Error = RedactedEndpointError {
         message,
         classification,
         incomplete: crate::failure::provider_stream_incomplete(&error),
         native: crate::failure::anthropic_stream_error(&error),
     }
-    .into()
+    .into();
+    match observed {
+        Some(usage) => crate::usage::with_error_usage(redacted, &usage),
+        None => redacted,
+    }
 }
 
 impl AuthorityBoundProvider {
@@ -392,6 +397,16 @@ impl AuthorityBoundProvider {
 
 #[async_trait]
 impl Provider for AuthorityBoundProvider {
+    fn usage_api(&self) -> &'static str {
+        self.inner.usage_api()
+    }
+    fn usage_api_version(&self) -> Option<String> {
+        self.inner.usage_api_version()
+    }
+    fn usage_route(&self) -> Option<String> {
+        self.inner.usage_route()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -447,26 +462,32 @@ impl Provider for AuthorityBoundProvider {
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         self.ensure_not_revoked()?;
-        self.public_result(
-            crate::attachments::admission::scope(
-                self.input_admission.clone(),
-                crate::attachments::runtime::with_async_authority_scope(
-                    self.authority_fingerprint.as_str().to_owned(),
-                    crate::tools::policy::with_discovery_tools(
-                        self.name(),
-                        self.use_public_catalog,
-                        self.discovery_tool_snapshot(),
-                        crate::generation::with_native_reasoning(
+        let context = crate::usage::UsageContext::capture(self.inner.as_ref(), &request.model);
+        let mut response = self
+            .public_result(
+                crate::attachments::admission::scope(
+                    self.input_admission.clone(),
+                    crate::attachments::runtime::with_async_authority_scope(
+                        self.authority_fingerprint.as_str().to_owned(),
+                        crate::tools::policy::with_discovery_tools(
                             self.name(),
                             self.use_public_catalog,
-                            self.discovery_reasoning_snapshot(),
-                            self.inner.chat(request),
+                            self.discovery_tool_snapshot(),
+                            crate::generation::with_native_reasoning(
+                                self.name(),
+                                self.use_public_catalog,
+                                self.discovery_reasoning_snapshot(),
+                                self.inner.chat(request),
+                            ),
                         ),
                     ),
-                ),
+                )
+                .await,
             )
-            .await,
-        )
+            .map_err(|error| context.enrich_error(error))?;
+        let usage = response.usage.get_or_insert_with(Default::default);
+        context.enrich(usage);
+        Ok(response)
     }
 
     async fn stream_chat(
@@ -481,34 +502,62 @@ impl Provider for AuthorityBoundProvider {
         request: ChatRequest,
     ) -> Result<crate::ProviderStream> {
         self.ensure_not_revoked()?;
-        let mut response = self.public_result(
-            crate::attachments::admission::scope(
-                self.input_admission.clone(),
-                crate::attachments::runtime::with_async_authority_scope(
-                    self.authority_fingerprint.as_str().to_owned(),
-                    crate::tools::policy::with_discovery_tools(
-                        self.name(),
-                        self.use_public_catalog,
-                        self.discovery_tool_snapshot(),
-                        crate::generation::with_native_reasoning(
+        let context = crate::usage::UsageContext::capture(self.inner.as_ref(), &request.model);
+        let mut response = self
+            .public_result(
+                crate::attachments::admission::scope(
+                    self.input_admission.clone(),
+                    crate::attachments::runtime::with_async_authority_scope(
+                        self.authority_fingerprint.as_str().to_owned(),
+                        crate::tools::policy::with_discovery_tools(
                             self.name(),
                             self.use_public_catalog,
-                            self.discovery_reasoning_snapshot(),
-                            self.inner.stream_chat_with_diagnostics(request),
+                            self.discovery_tool_snapshot(),
+                            crate::generation::with_native_reasoning(
+                                self.name(),
+                                self.use_public_catalog,
+                                self.discovery_reasoning_snapshot(),
+                                self.inner.stream_chat_with_diagnostics(request),
+                            ),
                         ),
                     ),
-                ),
+                )
+                .await,
             )
-            .await,
-        )?;
-        if self.redact_endpoint_errors {
-            let inner = self.inner.clone();
-            response.stream = Box::pin(response.stream.map(move |result| {
+            .map_err(|error| context.enrich_error(error))?;
+        let inner = self.inner.clone();
+        let redact = self.redact_endpoint_errors;
+        let mut accumulated = crate::TokenUsage::default();
+        response.stream = Box::pin(response.stream.map(move |result| {
+            let result = if redact {
                 result.map_err(|error| {
                     redacted_endpoint_error(inner.as_ref(), error, ProviderFailureStage::MidStream)
                 })
-            }));
-        }
+            } else {
+                result
+            };
+            let result = result.map_err(|error| {
+                if let Some(snapshot) = crate::usage::error_usage(&error) {
+                    accumulated.update(snapshot);
+                }
+                if accumulated != crate::TokenUsage::default() {
+                    context.enrich(&mut accumulated);
+                    crate::usage::with_error_usage(error, &accumulated)
+                } else {
+                    error
+                }
+            });
+            result.map(|mut chunk| {
+                if let Some(snapshot) = &chunk.usage {
+                    accumulated.update(snapshot);
+                }
+                if chunk.usage.is_some() || chunk.is_final {
+                    context.enrich(&mut accumulated);
+                    chunk.usage = Some(accumulated.clone());
+                }
+                chunk
+            })
+        }));
         Ok(response)
     }
 
@@ -3564,6 +3613,40 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod usage_error_retention_tests {
+    #[test]
+    fn endpoint_redaction_retains_explicit_usage_context_without_original_error() {
+        let provider = crate::providers::OpenRouterProvider::with_base_url(
+            "fixture",
+            "https://private.example/SECRET",
+        );
+        let snapshot = crate::TokenUsage::default().with_native_id(Some("gen-header"));
+        let error = crate::usage::with_error_usage(
+            anyhow::anyhow!("HTTP request failed: private.example/SECRET"),
+            &snapshot,
+        );
+        let redacted = super::redacted_endpoint_error(
+            &provider,
+            error,
+            pioneer_protocol::ProviderFailureStage::Connect,
+        );
+        assert_eq!(
+            crate::usage::error_usage(&redacted)
+                .unwrap()
+                .generation_id
+                .as_deref(),
+            Some("gen-header")
+        );
+        assert_eq!(
+            crate::usage::error_usage(&redacted).unwrap().input_tokens,
+            None
+        );
+        assert!(!format!("{redacted:#}").contains("SECRET"));
+        assert!(!format!("{redacted:#}").contains("private.example"));
     }
 }
 

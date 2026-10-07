@@ -7,6 +7,7 @@ mod memory;
 mod model_history;
 mod projector;
 mod repositories;
+pub use repositories::provider_usage::ProviderUsageObservation;
 mod task_delivery_lifecycle;
 mod task_delivery_recovery;
 mod task_event_context;
@@ -29039,10 +29040,18 @@ impl CrudStore {
             if projected || projection_context.native_cancellation.is_some() {
                 return Ok(appended_event);
             }
-            anyhow::bail!(
-                "idempotent turn event `{}` exists but its authoritative projection is incomplete",
-                appended_event.id
-            );
+            // Another producer may have committed this exact canonical event
+            // and still be projecting it. Its durable append is just as
+            // authoritative as our own: callers must not roll back local
+            // terminal state while the original projection is in flight.
+            return Err(TurnEventProjectionAfterAppendError::new(
+                appended_event.id,
+                appended_event.turn_id,
+                appended_event.sequence,
+                "idempotent canonical event is waiting for its authoritative projection".to_owned(),
+                None,
+            )
+            .into());
         }
 
         if let Err(error) = turn_event_projection_state::insert_claimed(
@@ -45577,6 +45586,134 @@ mod tests {
             2,
             "turn/items must still read full durable item events"
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_interruption_during_projection_preserves_canonical_acceptance() {
+        let workspace_id = "ws_interruption_projection_race";
+        let thread_id = "thr_interruption_projection_race";
+        let turn_id = "turn_interruption_projection_race";
+        let store = test_store_with_workspace(workspace_id).await;
+        let timestamp = 1_700_000_000;
+        let thread = sample_thread(workspace_id, thread_id, timestamp);
+        let turn = sample_turn(turn_id);
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .unwrap();
+        let mut turn = store.get_turn(thread_id, turn_id).await.unwrap().unwrap().1;
+        turn.status = TurnStatus::Interrupted;
+        turn.error = Some("cancel with pending heartbeat writer".to_owned());
+        let event = CanonicalTurnEventPayload::TurnFailed(TurnFailedNotification {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn: turn.clone(),
+        });
+        let context = super::TurnEventProjectionContext {
+            item_started_deadlines: None,
+            enqueue_optional_deliveries: true,
+            native_cancellation: None,
+        };
+        // Stop the first producer at the real append/projection boundary.
+        // A CLI cancellation before runtime binding has no native receipt;
+        // cleanup can concurrently replay this same terminal notification.
+        let appended = store
+            .append_claimed_turn_event_projection_once(
+                event.clone(),
+                unix_to_datetime(timestamp + 1),
+                context.clone(),
+                "interruption_projection_owner".to_owned(),
+                unix_to_datetime(timestamp + 61),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(appended.was_inserted);
+        assert_eq!(appended.sequence, 2);
+        assert!(
+            store
+                .native_cancellation_context(turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let duplicate_error = store
+            .materialize_native_agent_turn_event(event.clone(), timestamp + 2, None)
+            .await
+            .expect_err("projection remains pending behind the original producer");
+        assert!(
+            super::turn_event_was_appended_before_error(&duplicate_error),
+            "Gateway must preserve the terminal state and ACK the already committed event"
+        );
+        assert_eq!(
+            store
+                .get_turn(thread_id, turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            TurnStatus::InProgress,
+            "duplicate acceptance must not pretend the read model was projected"
+        );
+        assert_eq!(
+            pioneer_entity::turn_event::Entity::find()
+                .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id))
+                .count(&store.connection)
+                .await
+                .unwrap(),
+            2,
+            "duplicate cancellation must not append a second terminal event"
+        );
+
+        let mut conflicting_turn = turn.clone();
+        conflicting_turn.status = TurnStatus::Completed;
+        conflicting_turn.error = None;
+        let conflict_error = store
+            .materialize_native_agent_turn_event(
+                CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: conflicting_turn,
+                }),
+                timestamp + 3,
+                None,
+            )
+            .await
+            .expect_err("a different terminal result must still fail before append");
+        assert!(!super::turn_event_was_appended_before_error(
+            &conflict_error
+        ));
+
+        assert!(matches!(
+            store
+                .project_claimed_turn_event_once(
+                    appended,
+                    context,
+                    "interruption_projection_owner".to_owned(),
+                    unix_to_datetime(timestamp + 4),
+                )
+                .await
+                .unwrap(),
+            super::TurnEventProjectionOutcome::Projected
+        ));
+        assert_eq!(
+            store.get_turn(thread_id, turn_id).await.unwrap().unwrap().1,
+            turn,
+            "original producer must retain its projection claim and finish normally"
+        );
+        store
+            .materialize_native_agent_turn_event(event, timestamp + 5, None)
+            .await
+            .expect("replay after projection remains fully idempotent");
     }
 
     #[tokio::test]

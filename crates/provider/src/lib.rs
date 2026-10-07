@@ -21,6 +21,7 @@ pub mod registry;
 pub mod tools;
 pub mod traits;
 pub mod types;
+pub mod usage;
 
 pub use attachments::{
     ArtifactExternalRefCacheBackend, ArtifactExternalRefCachePolicy,
