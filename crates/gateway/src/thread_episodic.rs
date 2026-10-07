@@ -7,13 +7,14 @@ use async_trait::async_trait;
 use pioneer_config::{
     GatewayThreadEpisodicVectorProviderConfig, GatewayThreadEpisodicVectorSearchConfig,
 };
+pub(crate) use pioneer_crud::thread_episodic_source::*;
 use pioneer_crud::{
     CrudStore, NewThreadEpisodicEmbeddingArtifactRecord, NewThreadEpisodicExclusionRecord,
-    NewThreadEpisodicIndexJobRecord, NewThreadEpisodicItemRecord,
-    NewThreadEpisodicRecallEventRecord, THREAD_EPISODIC_USER_DELETED_ERROR,
-    THREAD_EPISODIC_USER_EXCLUDED_ERROR, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
-    ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleRecord, ThreadEpisodicCapsuleStatus,
-    ThreadEpisodicCapsuleWriteState, ThreadEpisodicExclusionReason, ThreadEpisodicExclusionRecord,
+    NewThreadEpisodicIndexJobRecord, NewThreadEpisodicRecallEventRecord,
+    THREAD_EPISODIC_USER_DELETED_ERROR, THREAD_EPISODIC_USER_EXCLUDED_ERROR,
+    THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID, ThreadEpisodicCapsuleCapacityUpdate,
+    ThreadEpisodicCapsuleRecord, ThreadEpisodicCapsuleStatus, ThreadEpisodicCapsuleWriteState,
+    ThreadEpisodicExclusionReason, ThreadEpisodicExclusionRecord,
     ThreadEpisodicGraphEnrichmentState, ThreadEpisodicIndexAttemptOutcome,
     ThreadEpisodicIndexJobCompletionUpdate, ThreadEpisodicIndexJobFailureUpdate,
     ThreadEpisodicIndexJobRecord, ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate,
@@ -33,16 +34,16 @@ use pioneer_memory::{
     ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidIndexRequest,
     ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidSearchRequest,
     ThreadEpisodicMemvidSearchSegment, ThreadEpisodicMemvidStats, ThreadEpisodicRankedSearchHit,
-    ThreadEpisodicSearchProfile, ThreadEpisodicSearchProfileKind, thread_episodic_memvid_metadata,
+    ThreadEpisodicSearchProfile, ThreadEpisodicSearchProfileKind, ThreadEpisodicWorkspaceOwnership,
+    thread_episodic_memvid_metadata, try_lock_thread_episodic_workspace,
 };
 use pioneer_protocol::{
-    AgentMessagePhase, TaskRunTurnKind, TaskStatus, TaskTurnItem,
     ThreadEpisodicAdaptiveDiagnostics, ThreadEpisodicHit, ThreadEpisodicIndexItemId,
     ThreadEpisodicItemId, ThreadEpisodicRecallDiagnostic, ThreadEpisodicRecallDiagnosticCode,
     ThreadEpisodicRecallInput, ThreadEpisodicRecallOutput, ThreadEpisodicRecallPolicyContext,
     ThreadEpisodicSourceActorRole, ThreadEpisodicSourceContext, ThreadEpisodicSourceProvenance,
     ThreadEpisodicThreadId, ThreadEpisodicTurnId, ThreadEpisodicWorkspaceId,
-    ThreadHistoryEventPayload, TurnItem, TurnItemType, task_delivery_id_from_result_item_id,
+    ThreadHistoryEventPayload,
 };
 use pioneer_provider::ProviderRegistry;
 use serde::{Deserialize, Serialize};
@@ -56,58 +57,11 @@ use tokio::sync::Mutex as AsyncMutex;
 const THREAD_EPISODIC_INDEX_ERROR_MAX_CHARS: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ThreadEpisodicCommittedItem {
-    pub workspace_id: String,
-    pub thread_id: String,
-    pub turn_id: String,
-    pub item_id: String,
-    pub item_type: TurnItemType,
-    pub source_actor_role: Option<ThreadEpisodicSourceActorRole>,
-    pub source_context: ThreadEpisodicSourceContext,
-    pub item: TurnItem,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ThreadEpisodicIngestionOutcome {
     Accepted,
     Skipped {
         reason: ThreadEpisodicIngestionSkipReason,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ThreadEpisodicIngestionSkipReason {
-    EmptyText,
-    HiddenPrompt,
-    SystemPrompt,
-    DeveloperPrompt,
-    ReasoningTrace,
-    RawToolOutput,
-    ToolItemsDisabled,
-    AgentCommentary,
-    InternalHookRuntime,
-    TaskRuntimePrivate,
-    UnsupportedSourceContext,
-    IngestionNotConfigured,
-}
-
-impl ThreadEpisodicIngestionSkipReason {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::EmptyText => "empty_text",
-            Self::HiddenPrompt => "hidden_prompt",
-            Self::SystemPrompt => "system_prompt",
-            Self::DeveloperPrompt => "developer_prompt",
-            Self::ReasoningTrace => "reasoning_trace",
-            Self::RawToolOutput => "raw_tool_output",
-            Self::ToolItemsDisabled => "tool_items_disabled",
-            Self::AgentCommentary => "agent_commentary",
-            Self::InternalHookRuntime => "internal_hook_runtime",
-            Self::TaskRuntimePrivate => "task_runtime_private",
-            Self::UnsupportedSourceContext => "unsupported_source_context",
-            Self::IngestionNotConfigured => "thread_episodic_ingestion_not_configured",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -165,9 +119,19 @@ impl Default for ThreadEpisodicIndexExecutorConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ThreadEpisodicIndexExecutorRunSummary {
     pub claimed: usize,
+    pub settlements: usize,
+    pub settled: usize,
+    pub storage_error: bool,
+    pub storage_errors: Vec<String>,
+    pub round_now_unix: Option<i64>,
+    pub discovery_round_started: bool,
     pub completed: usize,
     pub failed_retryable: usize,
     pub failed_terminal: usize,
+    pub discovered: usize,
+    pub discovery_has_more: bool,
+    pub blocked_workspace: Option<String>,
+    pub projection_deferred: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1105,6 +1069,11 @@ impl StoreThreadEpisodicIndexPayloadProvider {
                     "canonical thread item is missing for thread episodic indexing",
                 )
             })?;
+        if !canonical.committed {
+            return Err(ThreadEpisodicIndexResolutionError::source_changed(
+                "canonical source is not committed",
+            ));
+        }
         let committed = ThreadEpisodicCommittedItem {
             workspace_id: index_item.workspace_id.clone(),
             thread_id: index_item.thread_id.clone(),
@@ -3130,11 +3099,98 @@ fn looks_secret_like(text: &str) -> bool {
         })
 }
 
+#[derive(Default)]
+struct EpisodicDiscoveryRound {
+    after: Option<ThreadEpisodicIndexJobRecord>,
+    through: Option<ThreadEpisodicIndexJobRecord>,
+    now_unix: i64,
+}
+
+struct OwnedEpisodicAttempt {
+    job: ThreadEpisodicIndexJobRecord,
+    ownership: ThreadEpisodicWorkspaceOwnership,
+    mutation_started: Arc<std::sync::atomic::AtomicBool>,
+}
+
 pub(crate) struct ThreadEpisodicIndexExecutor {
     crud_store: Arc<CrudStore>,
     backend: Arc<dyn ThreadEpisodicMemvidBackend>,
     payload_provider: Arc<dyn ThreadEpisodicIndexPayloadProvider>,
     config: StdRwLock<ThreadEpisodicIndexExecutorConfig>,
+    indexing_enabled: std::sync::atomic::AtomicBool,
+    discovery_cursor: AsyncMutex<EpisodicDiscoveryRound>,
+    in_flight: StdMutex<Option<OwnedEpisodicAttempt>>,
+    recovery_retry_at: StdMutex<Option<tokio::time::Instant>>,
+    stopping: tokio_util::sync::CancellationToken,
+    wake_notification: Arc<tokio::sync::Notify>,
+    runner: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    projection_runtime: Option<(
+        PathBuf,
+        Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>,
+        Arc<crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor>,
+    )>,
+    #[cfg(test)]
+    quantum_observer:
+        StdMutex<Option<tokio::sync::mpsc::Sender<ThreadEpisodicIndexExecutorRunSummary>>>,
+    #[cfg(test)]
+    discovery_page_failure: AsyncMutex<
+        Option<(
+            String,
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    wake_consumed_notice: AsyncMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    after_round_fixed_pause: AsyncMutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    candidate_panic: StdMutex<Option<(String, &'static str)>>,
+    #[cfg(test)]
+    transition_recovery_pause: AsyncMutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    transition_recovery_waiting: AsyncMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    quantum_finished_notice:
+        AsyncMutex<Option<tokio::sync::oneshot::Sender<ThreadEpisodicIndexExecutorRunSummary>>>,
+    #[cfg(test)]
+    pending_notification: tokio::sync::Notify,
+    #[cfg(test)]
+    before_claim_notice: AsyncMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    readiness_read_failure: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    clock_origin: StdMutex<Option<(i64, tokio::time::Instant)>>,
+    #[cfg(test)]
+    projection_claim_pause: AsyncMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    after_claim_pause: AsyncMutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    before_idle_pause: AsyncMutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    progress_notification: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    blocked_notification: tokio::sync::Notify,
     #[cfg(test)]
     primary_persistence_faults:
         AsyncMutex<std::collections::VecDeque<ThreadEpisodicPrimaryPersistenceFault>>,
@@ -3144,6 +3200,17 @@ pub(crate) struct ThreadEpisodicIndexExecutor {
     reconciliation_transition_faults: AsyncMutex<std::collections::VecDeque<String>>,
     #[cfg(test)]
     targeted_reconciliation_faults: AsyncMutex<std::collections::VecDeque<String>>,
+}
+
+impl Drop for ThreadEpisodicIndexExecutor {
+    fn drop(&mut self) {
+        self.stopping.cancel();
+        if let Ok(runner) = self.runner.get_mut() {
+            if let Some(task) = runner.take() {
+                task.abort();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3158,6 +3225,7 @@ impl ThreadEpisodicIndexExecutor {
         backend: Arc<dyn ThreadEpisodicMemvidBackend>,
         payload_provider: Arc<dyn ThreadEpisodicIndexPayloadProvider>,
     ) -> Self {
+        let wake_notification = crud_store.thread_episodic_work_notification();
         Self {
             // Index discovery and projection are always background work,
             // regardless of which runtime event wakes this executor.
@@ -3165,6 +3233,48 @@ impl ThreadEpisodicIndexExecutor {
             backend,
             payload_provider,
             config: StdRwLock::new(ThreadEpisodicIndexExecutorConfig::default()),
+            indexing_enabled: std::sync::atomic::AtomicBool::new(true),
+            discovery_cursor: AsyncMutex::new(EpisodicDiscoveryRound::default()),
+            in_flight: StdMutex::new(None),
+            recovery_retry_at: StdMutex::new(None),
+            stopping: tokio_util::sync::CancellationToken::new(),
+            wake_notification,
+            runner: StdMutex::new(None),
+            projection_runtime: None,
+            #[cfg(test)]
+            quantum_observer: StdMutex::new(None),
+            #[cfg(test)]
+            discovery_page_failure: AsyncMutex::new(None),
+            #[cfg(test)]
+            wake_consumed_notice: AsyncMutex::new(None),
+            #[cfg(test)]
+            after_round_fixed_pause: AsyncMutex::new(None),
+            #[cfg(test)]
+            candidate_panic: StdMutex::new(None),
+            #[cfg(test)]
+            transition_recovery_pause: AsyncMutex::new(None),
+            #[cfg(test)]
+            transition_recovery_waiting: AsyncMutex::new(None),
+            #[cfg(test)]
+            quantum_finished_notice: AsyncMutex::new(None),
+            #[cfg(test)]
+            pending_notification: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            before_claim_notice: AsyncMutex::new(None),
+            #[cfg(test)]
+            readiness_read_failure: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            clock_origin: StdMutex::new(None),
+            #[cfg(test)]
+            projection_claim_pause: AsyncMutex::new(None),
+            #[cfg(test)]
+            after_claim_pause: AsyncMutex::new(None),
+            #[cfg(test)]
+            before_idle_pause: AsyncMutex::new(None),
+            #[cfg(test)]
+            progress_notification: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            blocked_notification: tokio::sync::Notify::new(),
             #[cfg(test)]
             primary_persistence_faults: AsyncMutex::new(std::collections::VecDeque::new()),
             #[cfg(test)]
@@ -3173,6 +3283,338 @@ impl ThreadEpisodicIndexExecutor {
             reconciliation_transition_faults: AsyncMutex::new(std::collections::VecDeque::new()),
             #[cfg(test)]
             targeted_reconciliation_faults: AsyncMutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    pub(crate) fn with_projection_runtime(
+        mut self,
+        root: PathBuf,
+        resolver: Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>,
+        supervisor: Arc<crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor>,
+    ) -> Self {
+        self.projection_runtime = Some((root, resolver, supervisor));
+        self
+    }
+
+    fn now_unix(&self) -> i64 {
+        #[cfg(test)]
+        if let Some((unix, instant)) = *self.clock_origin.lock().unwrap() {
+            return unix.saturating_add(instant.elapsed().as_secs() as i64);
+        }
+        chrono::Utc::now().timestamp()
+    }
+
+    #[cfg(test)]
+    fn use_managed_time_for_test(&self) {
+        *self.clock_origin.lock().unwrap() =
+            Some((chrono::Utc::now().timestamp(), tokio::time::Instant::now()));
+    }
+
+    // One owned runner; the permit survives the empty-read -> idle boundary.
+    pub(crate) fn wake(self: &Arc<Self>) {
+        if self.stopping.is_cancelled() {
+            return;
+        }
+        self.wake_notification.notify_one();
+        let mut runner = self.runner.lock().expect("episodic runner lock poisoned");
+        if self.stopping.is_cancelled() || runner.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let notification = self.wake_notification.clone();
+        let stopping = self.stopping.clone();
+        *runner = Some(tokio::spawn(async move {
+            let mut releases = pioneer_memory::thread_episodic_workspace_releases();
+            loop {
+                tokio::select! { biased;
+                    _ = stopping.cancelled() => return,
+                    _ = notification.notified() => {}
+                }
+                let mut blocked = false;
+                let mut deferred = false;
+                let mut round_storage_error = false;
+                let mut rediscover_after_round = true;
+                loop {
+                    let Some(executor) = weak.upgrade() else {
+                        return;
+                    };
+                    if !executor
+                        .indexing_enabled
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        break;
+                    }
+                    let delay = executor
+                        .config
+                        .read()
+                        .map(|c| c.retry_base_delay_secs.max(1) as u64)
+                        .unwrap_or(30);
+                    let result = tokio::select! { biased;
+                        _ = stopping.cancelled() => return,
+                        result = crate::database::attribution::scope_database_workload_result(
+                            pioneer_observability::DatabaseWorkload::EpisodicMaintenance,
+                            executor.run_once(executor.now_unix()),
+                        ) => result
+                    };
+                    let mut deadline = None;
+                    let mut storage_error = round_storage_error;
+                    let mut scheduling_after = executor.now_unix();
+                    match result {
+                        Ok(summary) => {
+                            if summary.discovery_round_started {
+                                rediscover_after_round = false;
+                            }
+                            scheduling_after = summary.round_now_unix.unwrap_or(scheduling_after);
+                            blocked |= summary.blocked_workspace.is_some();
+                            deferred |= summary.projection_deferred;
+                            round_storage_error |= summary.storage_error;
+                            storage_error |= summary.storage_error;
+                            if !summary.discovery_has_more && rediscover_after_round {
+                                // A wake accepted while resuming a fixed round
+                                // owes a new discovery even for same-second appends.
+                                rediscover_after_round = false;
+                                blocked = false;
+                                deferred = false;
+                                round_storage_error = false;
+                                tokio::task::yield_now().await;
+                                continue;
+                            }
+                            if summary.discovery_has_more
+                                || (summary.claimed > 0 || summary.settled > 0)
+                                    && !round_storage_error
+                            {
+                                tokio::task::yield_now().await;
+                                continue;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %format!("{error:#}"), "thread episodic index run failed");
+                            storage_error = true;
+                        }
+                    }
+                    // Handoff uses the frozen round time, not the later clock.
+                    // A deadline crossed during discovery must start a new round.
+                    // Rows already due in that round (including busy ones) are
+                    // excluded, so they cannot themselves supply a zero timer.
+                    let next = tokio::select! { biased;
+                        _ = stopping.cancelled() => return,
+                        next = executor.crud_store.next_future_thread_episodic_index_job_at(scheduling_after) => next
+                    };
+                    match next {
+                        Ok(Some(at)) => {
+                            deadline = Some(
+                                tokio::time::Instant::now()
+                                    + std::time::Duration::from_secs(
+                                        at.saturating_sub(executor.now_unix()).max(0) as u64,
+                                    ),
+                            )
+                        }
+                        Ok(None) => {}
+                        Err(_) => storage_error = true,
+                    }
+                    if deferred || storage_error {
+                        let retry =
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(delay);
+                        deadline = Some(deadline.map_or(retry, |at| at.min(retry)));
+                    }
+                    if let Some(retry) = *executor.recovery_retry_at.lock().unwrap() {
+                        if retry > tokio::time::Instant::now() {
+                            deadline = Some(deadline.map_or(retry, |at| at.min(retry)));
+                        }
+                    }
+                    #[cfg(test)]
+                    if deadline.is_none() && !blocked {
+                        if let Some((started, release)) =
+                            executor.before_idle_pause.lock().await.take()
+                        {
+                            let _ = started.send(());
+                            tokio::select! { biased; _ = stopping.cancelled() => return, _ = release => {} }
+                        }
+                    }
+                    drop(executor);
+                    if deadline.is_none() && !blocked {
+                        break;
+                    }
+                    // Provider/transition retry already has a bounded deadline.
+                    // Ignore its own admission-lease releases to avoid hot retry.
+                    tokio::select! { biased;
+                        _ = stopping.cancelled() => return,
+                        _ = notification.notified() => {
+                            rediscover_after_round = true;
+                            #[cfg(test)] if let Some(executor) = weak.upgrade() {
+                                if let Some(notice) = executor.wake_consumed_notice.lock().await.take() { let _ = notice.send(()); }
+                            }
+                        },
+                        _ = releases.changed(), if blocked && !deferred && !storage_error => {},
+                        _ = async { match deadline { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {}
+                    }
+                    releases.borrow_and_update();
+                    blocked = false;
+                    deferred = false;
+                    round_storage_error = false;
+                }
+            }
+        }));
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.indexing_enabled
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.stopping.cancel();
+        let runner = self.runner.lock().unwrap().take();
+        if let Some(runner) = runner {
+            let _ = runner.await;
+        }
+        // Release every async owner's clone before joining transitions. A
+        // transition's cancellation cleanup may itself need this workspace.
+        let attempts = self
+            .in_flight
+            .lock()
+            .unwrap()
+            .take()
+            .into_iter()
+            .map(|attempt| {
+                let started = attempt
+                    .mutation_started
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let job = attempt.job;
+                drop(attempt.ownership);
+                (job, started)
+            })
+            .collect::<Vec<_>>();
+        if let Some((_, _, supervisor)) = &self.projection_runtime {
+            supervisor.shutdown().await;
+        }
+        // Reacquisition waits for actual blocking completion, outside DB
+        // capacity. Canceled shutdown admits no new DB settlement reservation.
+        for (job, started) in attempts {
+            if !started {
+                continue;
+            }
+            let ownership = pioneer_memory::lock_thread_episodic_workspace(&job.workspace_id).await;
+            tracing::warn!(
+                failure_class = "shutdown_unsettled_attempt",
+                "episodic durable attempt retained for inherited recovery; shutdown does not admit another writer reservation"
+            );
+            drop(ownership);
+        }
+    }
+
+    async fn settle_owned_attempt(
+        &self,
+        job: &ThreadEpisodicIndexJobRecord,
+        now_unix: i64,
+    ) -> Result<()> {
+        let config = self.config.read().map(|c| *c).unwrap_or_default();
+        self.crud_store
+            .settle_thread_episodic_owned_index_attempt(
+                job,
+                None,
+                ThreadEpisodicIndexJobFailureUpdate {
+                    retryable: job.attempt_count < config.max_attempts,
+                    next_run_at_unix: Some(self.next_retry_at(job, now_unix)),
+                    last_error: Some(
+                        "episodic executor attempt interrupted before durable settlement"
+                            .to_owned(),
+                    ),
+                    capacity_error: false,
+                    last_attempt_latency_ms: None,
+                },
+                now_unix,
+            )
+            .await?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn panic_candidate_for_test(&self, id: &str, stage: &'static str) {
+        let trigger = {
+            let mut fault = self.candidate_panic.lock().unwrap();
+            if fault
+                .as_ref()
+                .is_some_and(|(job, point)| job == id && *point == stage)
+            {
+                fault.take();
+                true
+            } else {
+                false
+            }
+        };
+        if trigger {
+            panic!("controlled candidate unwind");
+        }
+    }
+
+    #[cfg(test)]
+    async fn pause_projection_claim_for_test(&self, started: tokio::sync::oneshot::Sender<()>) {
+        *self.projection_claim_pause.lock().await = Some(started);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_busy_workspace_for_test(&self) {
+        self.blocked_notification.notified().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_after_claim_for_test(
+        &self,
+        started: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.after_claim_pause.lock().await = Some((started, release));
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_before_idle_for_test(
+        &self,
+        started: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.before_idle_pause.lock().await = Some((started, release));
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_completed_job_for_test(
+        &self,
+        id: &str,
+    ) -> ThreadEpisodicIndexJobRecord {
+        loop {
+            let changed = self.progress_notification.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let job = self
+                .crud_store
+                .find_thread_episodic_index_job(id)
+                .await
+                .unwrap()
+                .unwrap();
+            if job.status == ThreadEpisodicIndexJobStatus::Completed {
+                return job;
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_completed_source_for_test(
+        &self,
+        id: &str,
+    ) -> ThreadEpisodicIndexJobRecord {
+        loop {
+            let changed = self.progress_notification.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(job) = self
+                .crud_store
+                .find_thread_episodic_index_job_by_item(id)
+                .await
+                .unwrap()
+            {
+                if job.status == ThreadEpisodicIndexJobStatus::Completed {
+                    return job;
+                }
+            }
+            changed.await;
         }
     }
 
@@ -3287,8 +3729,17 @@ impl ThreadEpisodicIndexExecutor {
 
     pub(crate) fn apply_config(&self, config: ThreadEpisodicIndexExecutorConfig) {
         if let Ok(mut current) = self.config.write() {
-            *current = config;
+            *current = ThreadEpisodicIndexExecutorConfig {
+                batch_limit: config.batch_limit.max(1),
+                ..config
+            };
         }
+    }
+
+    pub(crate) fn set_indexing_enabled(&self, enabled: bool) {
+        self.indexing_enabled
+            .store(enabled, std::sync::atomic::Ordering::Release);
+        self.wake_notification.notify_one();
     }
 
     #[allow(dead_code)]
@@ -3398,51 +3849,397 @@ impl ThreadEpisodicIndexExecutor {
         &self,
         now_unix: i64,
     ) -> Result<ThreadEpisodicIndexExecutorRunSummary> {
+        if self.stopping.is_cancelled()
+            || !self
+                .indexing_enabled
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(ThreadEpisodicIndexExecutorRunSummary::default());
+        }
         let config = self.config.read().map(|config| *config).unwrap_or_default();
-        let jobs = self
+        let mut round = self.discovery_cursor.lock().await;
+        // Acquiring this mutex proves a previous quantum is no longer polling.
+        // Its canceled intent is represented by actual job state, not memory.
+        drop(self.in_flight.lock().unwrap().take());
+        let mut summary = ThreadEpisodicIndexExecutorRunSummary::default();
+        let remaining = config.batch_limit;
+        if round.through.is_none() {
+            summary.discovery_round_started = true;
+            round.now_unix = now_unix;
+            summary.round_now_unix = Some(now_unix);
+            round.through = self
+                .crud_store
+                .thread_episodic_discovery_round_end(now_unix)
+                .await?;
+            #[cfg(test)]
+            if let Some((started, release)) = self.after_round_fixed_pause.lock().await.take() {
+                let _ = started.send(());
+                let _ = release.await;
+            }
+            if round.through.is_none() {
+                return Ok(summary);
+            }
+        }
+        #[cfg(test)]
+        {
+            let fault = {
+                let mut fault = self.discovery_page_failure.lock().await;
+                if fault.as_ref().is_some_and(|(id, _, _)| {
+                    round.after.as_ref().is_some_and(|after| &after.id == id)
+                }) {
+                    fault.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((_, started, release)) = fault {
+                let _ = started.send(());
+                let _ = release.await;
+                anyhow::bail!("controlled discovery page storage failure");
+            }
+        }
+        let candidates = self
             .crud_store
-            .claim_due_thread_episodic_index_jobs(now_unix, config.batch_limit)
+            .list_due_thread_episodic_index_jobs_after(
+                round.now_unix,
+                round.after.as_ref(),
+                round.through.as_ref(),
+                remaining,
+            )
             .await?;
-        let mut summary = ThreadEpisodicIndexExecutorRunSummary {
-            claimed: jobs.len(),
-            ..ThreadEpisodicIndexExecutorRunSummary::default()
-        };
-        let mut unpersisted_errors = Vec::new();
-
-        for job in jobs {
-            let job_id = job.id.clone();
-            match self.process_claimed_job(job, now_unix, config).await {
-                ThreadEpisodicIndexJobProcessOutcome::Completed => {
-                    summary.completed += 1;
+        summary.round_now_unix = Some(round.now_unix);
+        summary.discovered = candidates
+            .iter()
+            .filter(|job| job.status != ThreadEpisodicIndexJobStatus::Running)
+            .count();
+        summary.settlements = candidates.len() - summary.discovered;
+        summary.discovery_has_more = candidates.len() as u64 == remaining
+            && candidates.last().map(|job| job.id.as_str())
+                != round.through.as_ref().map(|job| job.id.as_str());
+        // Advancing before execution prevents replay of an unknown claim in
+        // this quantum. Each poison candidate is isolated, including future creation.
+        for candidate in candidates {
+            if self.stopping.is_cancelled()
+                || !self
+                    .indexing_enabled
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                summary.discovery_has_more = false;
+                break;
+            }
+            round.after = Some(candidate.clone());
+            use futures_util::FutureExt;
+            let result = std::panic::AssertUnwindSafe(async {
+                self.run_candidate(candidate.clone(), now_unix, config, &mut summary)
+                    .await
+            })
+            .catch_unwind()
+            .await;
+            // Only the active attempt is kept in memory. Running itself is the
+            // durable recovery obligation. A detached FS operation retains its
+            // own ownership clone, so another owner cannot settle it too early.
+            drop(self.in_flight.lock().unwrap().take());
+            if !matches!(&result, Ok(Ok(()))) {
+                let retry = tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(config.retry_base_delay_secs.max(1) as u64);
+                let mut deadline = self.recovery_retry_at.lock().unwrap();
+                // One bounded recovery backoff survives unrelated wakes. New
+                // failures cannot keep moving an already scheduled retry away.
+                *deadline = Some(
+                    (*deadline)
+                        .filter(|at| *at > tokio::time::Instant::now())
+                        .map_or(retry, |at| at.min(retry)),
+                );
+            }
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    summary.storage_error = true;
+                    summary.storage_errors.push(format!("{error:#}"));
+                    tracing::warn!(
+                        failure_class = "candidate_bookkeeping",
+                        "episodic candidate bookkeeping deferred"
+                    );
                 }
-                ThreadEpisodicIndexJobProcessOutcome::RetryableFailure => {
-                    summary.failed_retryable += 1;
-                }
-                ThreadEpisodicIndexJobProcessOutcome::TerminalFailure => {
-                    summary.failed_terminal += 1;
-                }
-                ThreadEpisodicIndexJobProcessOutcome::StaleAttempt => {}
-                ThreadEpisodicIndexJobProcessOutcome::Requeued => {}
-                ThreadEpisodicIndexJobProcessOutcome::RetryablePersistenceFailure => {
-                    summary.failed_retryable += 1;
-                }
-                ThreadEpisodicIndexJobProcessOutcome::TerminalPersistenceFailure => {
-                    summary.failed_terminal += 1;
-                }
-                ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(error) => {
-                    unpersisted_errors.push(format!("job `{job_id}`: {error:#}"));
+                Err(_) => {
+                    summary.storage_error = true;
+                    summary.storage_errors.push("candidate_unwind".to_owned());
+                    tracing::warn!(
+                        failure_class = "candidate_unwind",
+                        "episodic candidate interrupted; durable state will be observed before recovery"
+                    );
                 }
             }
         }
-
-        if !unpersisted_errors.is_empty() {
-            anyhow::bail!(
-                "thread episodic executor could not durably finish {} claimed job(s): {}",
-                unpersisted_errors.len(),
-                unpersisted_errors.join("; ")
-            );
+        #[cfg(test)]
+        if let Some(observer) = self.quantum_observer.lock().unwrap().as_ref() {
+            let _ = observer.try_send(summary.clone());
         }
+        #[cfg(test)]
+        if let Some(notice) = self.quantum_finished_notice.lock().await.take() {
+            let _ = notice.send(summary.clone());
+        }
+        #[cfg(test)]
+        self.progress_notification.notify_waiters();
+        if !summary.discovery_has_more {
+            *round = EpisodicDiscoveryRound::default();
+        }
+
         Ok(summary)
+    }
+
+    async fn run_candidate(
+        &self,
+        candidate: ThreadEpisodicIndexJobRecord,
+        now_unix: i64,
+        config: ThreadEpisodicIndexExecutorConfig,
+        summary: &mut ThreadEpisodicIndexExecutorRunSummary,
+    ) -> Result<()> {
+        let workspace = &candidate.workspace_id;
+        if candidate.status == ThreadEpisodicIndexJobStatus::Running
+            && self
+                .recovery_retry_at
+                .lock()
+                .unwrap()
+                .is_some_and(|at| at > tokio::time::Instant::now())
+        {
+            summary.storage_error = true;
+            summary
+                .storage_errors
+                .push("running_recovery_backoff".to_owned());
+            return Ok(());
+        }
+        let Some(ownership) = try_lock_thread_episodic_workspace(workspace).await else {
+            #[cfg(test)]
+            self.blocked_notification.notify_one();
+            summary
+                .blocked_workspace
+                .get_or_insert_with(|| workspace.clone());
+            return Ok(());
+        };
+        if let Some((_, _, supervisor)) = &self.projection_runtime {
+            if supervisor.workspace_refill_is_active(workspace).await {
+                // Dropping this admission lease signals a release itself. Use
+                // the generation wake/backoff instead of retrying that signal.
+                summary.projection_deferred = true;
+                return Ok(());
+            }
+        }
+        if candidate.status == ThreadEpisodicIndexJobStatus::Running {
+            #[cfg(test)]
+            self.panic_candidate_for_test(&candidate.id, "settlement");
+            self.settle_owned_attempt(&candidate, now_unix).await?;
+            summary.settled += 1;
+            return Ok(());
+        }
+        let exhausted = candidate.attempt_count >= config.max_attempts
+            || candidate.attempt_count.checked_add(1).is_none();
+        let projection_changed = candidate.last_error.as_deref()
+            == Some(pioneer_crud::THREAD_EPISODIC_PROJECTION_CHANGED_ERROR);
+        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        if let Some((root, resolver, supervisor)) = self
+            .projection_runtime
+            .as_ref()
+            .filter(|_| !exhausted || projection_changed)
+        {
+            // Resolve readiness before claim: waiting for a provider or
+            // replacement never spends a job's execution budget.
+            let provider = match resolver.resolve_active_embedding_provider(workspace).await {
+                Ok(provider) => provider,
+                Err(error) => {
+                    tracing::warn!(error = %error.message, "episodic projection provider unavailable before claim");
+                    summary.projection_deferred = true;
+                    return Ok(());
+                }
+            };
+            let target = if let Some(provider) = &provider {
+                refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(provider.as_ref())?
+            } else {
+                refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only()
+            };
+            if !refill::projection_accepts_index_target(&self.crud_store, workspace, &target)
+                .await?
+            {
+                // The ordinary quantum only requests a managed transition.
+                // Refill claims, preparation and retry waits belong to its
+                // supervisor lease, never to this runner's batch budget.
+                drop(ownership);
+                let store = self.crud_store.clone();
+                let root = root.clone();
+                let resolver = resolver.clone();
+                let workspace = workspace.clone();
+                let stopping = self.stopping.clone();
+                let wake = self.wake_notification.clone();
+                #[cfg(test)]
+                let progress = self.progress_notification.clone();
+                #[cfg(test)]
+                let after_claim = self.projection_claim_pause.lock().await.take();
+                #[cfg(test)]
+                let recovery_pause = self.transition_recovery_pause.lock().await.take();
+                #[cfg(test)]
+                let mut recovery_waiting = self.transition_recovery_waiting.lock().await.take();
+                if self.stopping.is_cancelled() {
+                    return Ok(());
+                }
+                supervisor.spawn_runtime(&candidate.workspace_id, move |cancellation| async move {
+                        use futures_util::FutureExt;
+                        let ownership_acquired = std::sync::atomic::AtomicBool::new(false);
+                        let transition = async {
+                            let provider = resolver.resolve_active_embedding_provider(&workspace).await
+                                .map_err(|error| anyhow::anyhow!(error.message))?;
+                            let target = if let Some(provider) = &provider {
+                                refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(provider.as_ref())?
+                            } else { refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only() };
+                            refill::refill_once_with_projection_resolver_and_config(
+                                store.clone(), &root, &workspace, target,
+                                provider.map(|_| resolver), None, config, Some(&ownership_acquired),
+                                #[cfg(test)] after_claim,
+                            ).await
+                        };
+                        let result = tokio::select! { biased;
+                            _ = stopping.cancelled() => None,
+                            _ = cancellation.cancelled() => None,
+                            result = std::panic::AssertUnwindSafe(transition).catch_unwind() => Some(result)
+                        };
+                        let ready = matches!(&result, Some(Ok(Ok(summary))) if !summary.lock_contended);
+                        if !ready && let Some(ownership) = refill::join_owned_refill_execution(&workspace, &ownership_acquired).await {
+                            // The canceled/error future has dropped before this
+                            // acquisition. A detached blocking write retains its
+                            // lease until actual completion. No live claim can
+                            // remain under this exclusive ownership.
+                            // FS completion is mandatory; DB admission belongs to
+                            // the canceled generation and must remain cancelable.
+                            #[cfg(test)] if let Some((notice, release)) = recovery_pause { let _ = notice.send(()); let _ = release.await; }
+                            let recovery_write = async {
+                                let write = store.requeue_running_thread_episodic_index_jobs_for_workspace(&workspace, chrono::Utc::now().timestamp(), config.max_attempts);
+                                #[cfg(not(test))] { write.await }
+                                #[cfg(test)] {
+                                    tokio::pin!(write);
+                                    std::future::poll_fn(|cx| {
+                                        let result = std::future::Future::poll(write.as_mut(), cx);
+                                        if result.is_pending() { if let Some(notice) = recovery_waiting.take() { let _ = notice.send(()); } }
+                                        result
+                                    }).await
+                                }
+                            };
+                            let recovery = tokio::select! { biased;
+                                _ = stopping.cancelled() => None,
+                                _ = cancellation.cancelled() => None,
+                                result = recovery_write => Some(result)
+                            };
+                            match recovery {
+                                Some(Ok(_)) => {},
+                                Some(Err(_)) => tracing::warn!(failure_class = "transition_recovery_storage", "episodic Running work remains durable for guarded recovery"),
+                                None => tracing::warn!(failure_class = "transition_recovery_cancelled", "episodic Running work remains durable for guarded recovery"),
+                            }
+                            drop(ownership);
+                        }
+                        if ready || result.is_none() { wake.notify_one(); }
+                        #[cfg(test)] progress.notify_waiters();
+                    }).await;
+                summary.projection_deferred = true;
+                return Ok(());
+            }
+        } else if !exhausted
+            && refill::projection_reset_is_pending(&self.crud_store, workspace).await?
+        {
+            summary.projection_deferred = true;
+            return Ok(());
+        }
+        if exhausted {
+            // Ordinary exhaustion needs no provider. An actual request mismatch
+            // first continues its transition; a matching target closes the old budget.
+            // The writer rereads the snapshot and enforces the actual budget;
+            // this path cannot admit a new execution or an unknown dispatch.
+            self.crud_store
+                .claim_thread_episodic_index_job_from_snapshot(
+                    &candidate,
+                    now_unix,
+                    config.max_attempts,
+                    None,
+                    Some(&self.indexing_enabled),
+                )
+                .await?;
+            summary.settled += 1;
+            return Ok(());
+        }
+        let mut prospective = candidate.clone();
+        prospective.attempt_count = candidate.attempt_count.saturating_add(1);
+        prospective.updated_at = fixed_datetime_from_unix(now_unix);
+        let mutation_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *self.in_flight.lock().unwrap() = Some(OwnedEpisodicAttempt {
+            job: prospective,
+            ownership: ownership.clone(),
+            mutation_started: mutation_started.clone(),
+        });
+        #[cfg(test)]
+        if let Some(notice) = self.before_claim_notice.lock().await.take() {
+            let _ = notice.send(());
+        }
+        let claim = self
+            .crud_store
+            .claim_thread_episodic_index_job_from_snapshot(
+                &candidate,
+                now_unix,
+                config.max_attempts,
+                Some(mutation_started.as_ref()),
+                Some(&self.indexing_enabled),
+            )
+            .await;
+        #[cfg(test)]
+        self.panic_candidate_for_test(&candidate.id, "claim");
+        let job = match claim {
+            Ok(Some(job)) => job,
+            Ok(None) => {
+                drop(self.in_flight.lock().unwrap().take());
+                return Ok(());
+            }
+            Err(error) => {
+                // No dispatch or assumption about commit. A later bounded
+                // discovery observes actual Running under exclusive ownership.
+                #[cfg(test)]
+                self.pending_notification.notify_one();
+                return Err(error.context("episodic claim could not be confirmed"));
+            }
+        };
+        self.in_flight.lock().unwrap().as_mut().unwrap().job = job.clone();
+        summary.claimed += 1;
+        #[cfg(test)]
+        if let Some((started, release)) = self.after_claim_pause.lock().await.take() {
+            let _ = started.send(());
+            let _ = release.await;
+        }
+        let job_id = job.id.clone();
+        let outcome = self
+            .process_claimed_job(job, now_unix, config, ownership)
+            .await;
+        if !matches!(
+            &outcome,
+            ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(_)
+        ) {
+            drop(self.in_flight.lock().unwrap().take());
+        }
+        match outcome {
+            ThreadEpisodicIndexJobProcessOutcome::Completed => summary.completed += 1,
+            ThreadEpisodicIndexJobProcessOutcome::RetryableFailure
+            | ThreadEpisodicIndexJobProcessOutcome::RetryablePersistenceFailure => {
+                summary.failed_retryable += 1
+            }
+            ThreadEpisodicIndexJobProcessOutcome::TerminalFailure
+            | ThreadEpisodicIndexJobProcessOutcome::TerminalPersistenceFailure => {
+                summary.failed_terminal += 1
+            }
+            ThreadEpisodicIndexJobProcessOutcome::StaleAttempt
+            | ThreadEpisodicIndexJobProcessOutcome::Requeued => {}
+            ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(error) => {
+                #[cfg(test)]
+                self.pending_notification.notify_one();
+                return Err(error);
+            }
+        }
+        #[cfg(test)]
+        self.panic_candidate_for_test(&job_id, "result");
+        Ok(())
     }
 
     async fn process_claimed_job(
@@ -3450,7 +4247,20 @@ impl ThreadEpisodicIndexExecutor {
         job: ThreadEpisodicIndexJobRecord,
         now_unix: i64,
         config: ThreadEpisodicIndexExecutorConfig,
+        ownership: ThreadEpisodicWorkspaceOwnership,
     ) -> ThreadEpisodicIndexJobProcessOutcome {
+        // No request from a replaced execution may reach provider or filesystem.
+        match self
+            .crud_store
+            .find_thread_episodic_index_job(&job.id)
+            .await
+        {
+            Ok(Some(current))
+                if current.status == ThreadEpisodicIndexJobStatus::Running
+                    && current.attempt_count == job.attempt_count => {}
+            Ok(_) => return ThreadEpisodicIndexJobProcessOutcome::StaleAttempt,
+            Err(error) => return ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(error),
+        }
         let attempt_started_at = Instant::now();
         let resolved = match self.payload_provider.resolve_index_request(&job).await {
             Ok(resolved) => resolved,
@@ -3466,7 +4276,72 @@ impl ThreadEpisodicIndexExecutor {
             }
         };
 
-        match self.backend.index_item(resolved.request.clone()).await {
+        #[cfg(test)]
+        if self
+            .readiness_read_failure
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(anyhow::anyhow!(
+                "controlled readiness read failure before filesystem"
+            ));
+        }
+
+        if self.projection_runtime.is_some() {
+            use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+            let target = match resolved.request.embedding.as_ref() {
+                Some(embedding) => refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_identity(&embedding.identity),
+                None => Ok(refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only()),
+            };
+            match target {
+                Ok(target) => match refill::projection_accepts_index_target(
+                    &self.crud_store,
+                    &job.workspace_id,
+                    &target,
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return match self
+                            .crud_store
+                            .requeue_thread_episodic_index_attempt(
+                                &job.id,
+                                job.attempt_count,
+                                now_unix,
+                                Some(pioneer_crud::THREAD_EPISODIC_PROJECTION_CHANGED_ERROR),
+                            )
+                            .await
+                        {
+                            Ok(ThreadEpisodicIndexAttemptOutcome::Applied) => {
+                                ThreadEpisodicIndexJobProcessOutcome::Requeued
+                            }
+                            Ok(_) => ThreadEpisodicIndexJobProcessOutcome::StaleAttempt,
+                            Err(error) => {
+                                ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(error)
+                            }
+                        };
+                    }
+                    Err(error) => {
+                        return ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(error);
+                    }
+                },
+                Err(error) => {
+                    return ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(error);
+                }
+            }
+        }
+
+        if self.stopping.is_cancelled() {
+            return ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(anyhow::anyhow!(
+                "episodic executor stopped before filesystem dispatch"
+            ));
+        }
+
+        match self
+            .backend
+            .index_item_with_workspace_ownership(resolved.request.clone(), ownership.clone())
+            .await
+        {
             Ok(output) => {
                 self.complete_successful_index(
                     &job,
@@ -3709,7 +4584,12 @@ impl ThreadEpisodicIndexExecutor {
             }
             Ok(_) => match self
                 .crud_store
-                .requeue_thread_episodic_index_attempt(job.id.as_str(), job.attempt_count, now_unix)
+                .requeue_thread_episodic_index_attempt(
+                    job.id.as_str(),
+                    job.attempt_count,
+                    now_unix,
+                    None,
+                )
                 .await
             {
                 Ok(ThreadEpisodicIndexAttemptOutcome::Applied) => {
@@ -4143,21 +5023,6 @@ enum ThreadEpisodicIndexJobProcessOutcome {
     PersistenceFailure(anyhow::Error),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ThreadEpisodicIndexableSource {
-    pub text: String,
-    pub source_actor_role: ThreadEpisodicSourceActorRole,
-    pub source_context: ThreadEpisodicSourceContext,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ThreadEpisodicSourceSelection {
-    Indexable(ThreadEpisodicIndexableSource),
-    Rejected {
-        reason: ThreadEpisodicIngestionSkipReason,
-    },
-}
-
 #[async_trait]
 pub(crate) trait ThreadEpisodicIngestor: Send + Sync {
     async fn ingest_committed_item(
@@ -4239,6 +5104,12 @@ impl StoreThreadEpisodicIngestor {
                 }
                 continue;
             };
+            if !canonical.committed {
+                return Ok((
+                    ThreadEpisodicSourceReconcileOutcome::Current,
+                    Some(ThreadEpisodicIngestionSkipReason::UnsupportedSourceContext),
+                ));
+            }
             let Some(committed) = committed_item_ingestion_input_from_parts(
                 workspace_id,
                 thread_id,
@@ -4275,33 +5146,14 @@ impl StoreThreadEpisodicIngestor {
             let source = source.expect("checked indexable source");
             let source_text = source.text.trim();
             let source_text_hash = source_text_hash(source_text);
-            let projection_group_id = self
-                .projection_group_id(&committed, source_text_hash.as_str())
-                .await;
-            let prepared = NewThreadEpisodicItemRecord {
-                id: None,
-                workspace_id: committed.workspace_id.clone(),
-                thread_id: committed.thread_id.clone(),
-                turn_id: committed.turn_id.clone(),
-                item_id: committed.item_id.clone(),
-                source_actor_role: store_source_actor_role(source.source_actor_role),
-                source_runtime_kind: store_source_runtime_kind(committed.item_type),
-                source_context: source.source_context,
-                visibility: ThreadEpisodicItemVisibility::UserVisible,
-                status: ThreadEpisodicItemStatus::PendingIndex,
-                text_hash: item_text_hash(&committed, source_text),
-                source_text_hash,
-                projection_group_id,
-                language_hint: None,
-                token_estimate: estimate_tokens(source_text),
-                capsule_id: None,
-                capsule_ref: None,
-                segment_index: None,
-                frame_id: None,
-                frame_uri: None,
-                indexed_at: None,
-                deleted_at: None,
-            };
+            let projection_group_id = occurrence_projection_group_id(
+                &committed.workspace_id,
+                &committed.thread_id,
+                &committed.turn_id,
+                &committed.item_id,
+                &source_text_hash,
+            );
+            let prepared = prepare_source_record(&committed, source, projection_group_id);
             for _ in 0..MAX_VERSION_QUANTA {
                 match self
                     .crud_store
@@ -4333,94 +5185,6 @@ impl StoreThreadEpisodicIngestor {
             crud_store: Arc::new(crud_store.with_maintenance_access()),
             enabled,
         }
-    }
-
-    async fn projection_group_id(
-        &self,
-        item: &ThreadEpisodicCommittedItem,
-        source_text_hash: &str,
-    ) -> String {
-        match self
-            .resolve_task_projection_group_id(item, source_text_hash)
-            .await
-        {
-            Ok(Some(group_id)) => group_id,
-            Ok(None) => occurrence_projection_group_id(
-                item.workspace_id.as_str(),
-                item.thread_id.as_str(),
-                item.turn_id.as_str(),
-                item.item_id.as_str(),
-                source_text_hash,
-            ),
-            Err(error) => {
-                tracing::warn!(
-                    workspace_id = %item.workspace_id,
-                    thread_id = %item.thread_id,
-                    turn_id = %item.turn_id,
-                    item_id = %item.item_id,
-                    error = %format!("{error:#}"),
-                    "failed to resolve thread episodic task projection group; using occurrence identity"
-                );
-                occurrence_projection_group_id(
-                    item.workspace_id.as_str(),
-                    item.thread_id.as_str(),
-                    item.turn_id.as_str(),
-                    item.item_id.as_str(),
-                    source_text_hash,
-                )
-            }
-        }
-    }
-
-    async fn resolve_task_projection_group_id(
-        &self,
-        item: &ThreadEpisodicCommittedItem,
-        source_text_hash: &str,
-    ) -> Result<Option<String>> {
-        if let Some(task_run_turn) = self
-            .crud_store
-            .get_task_run_turn_by_turn(item.thread_id.as_str(), item.turn_id.as_str())
-            .await?
-        {
-            if item.item_type == TurnItemType::UserMessage
-                && task_run_turn.kind == TaskRunTurnKind::Initial
-                && let Some(snapshot) = self
-                    .crud_store
-                    .get_task_run_conversation_snapshot(task_run_turn.run_id.as_str())
-                    .await?
-                && let Some(source_turn_id) = snapshot
-                    .source_turn_id
-                    .as_deref()
-                    .filter(|source_turn_id| !source_turn_id.trim().is_empty())
-            {
-                return Ok(Some(occurrence_projection_group_id(
-                    item.workspace_id.as_str(),
-                    snapshot.conversation_thread_id.as_str(),
-                    source_turn_id,
-                    format!("user_{source_turn_id}").as_str(),
-                    source_text_hash,
-                )));
-            }
-            if item.item_type == TurnItemType::AgentMessage {
-                return Ok(Some(task_result_projection_group_id(
-                    item.workspace_id.as_str(),
-                    task_run_turn.run_id.as_str(),
-                    source_text_hash,
-                )));
-            }
-        }
-
-        if item.item_type == TurnItemType::AgentMessage
-            && let Some(delivery_id) = task_delivery_id_from_result_item_id(item.item_id.as_str())
-            && let Some(delivery) = self.crud_store.get_task_delivery(delivery_id).await?
-        {
-            return Ok(Some(task_result_projection_group_id(
-                item.workspace_id.as_str(),
-                delivery.run_id.as_str(),
-                source_text_hash,
-            )));
-        }
-        Ok(None)
     }
 
     pub(crate) async fn reindex_thread_from_history(
@@ -4519,6 +5283,10 @@ impl StoreThreadEpisodicIngestor {
                     reconciled = true;
                     break;
                 };
+                if !canonical.committed {
+                    reconciled = true;
+                    break;
+                }
                 let Some(committed) = committed_item_ingestion_input_from_parts(
                     request.workspace_id.as_str(),
                     request.thread_id.as_str(),
@@ -4564,37 +5332,18 @@ impl StoreThreadEpisodicIngestor {
                 };
                 let source_text = source.text.trim();
                 let source_text_hash = source_text_hash(source_text);
-                let projection_group_id = self
-                    .projection_group_id(&committed, source_text_hash.as_str())
-                    .await;
+                let projection_group_id = occurrence_projection_group_id(
+                    &committed.workspace_id,
+                    &committed.thread_id,
+                    &committed.turn_id,
+                    &committed.item_id,
+                    &source_text_hash,
+                );
                 let outcome = self
                     .crud_store
                     .reconcile_thread_episodic_source_version(
                         canonical.source_payload.as_str(),
-                        NewThreadEpisodicItemRecord {
-                            id: None,
-                            workspace_id: committed.workspace_id.clone(),
-                            thread_id: committed.thread_id.clone(),
-                            turn_id: committed.turn_id.clone(),
-                            item_id: committed.item_id.clone(),
-                            source_actor_role: store_source_actor_role(source.source_actor_role),
-                            source_runtime_kind: store_source_runtime_kind(committed.item_type),
-                            source_context: source.source_context,
-                            visibility: ThreadEpisodicItemVisibility::UserVisible,
-                            status: ThreadEpisodicItemStatus::PendingIndex,
-                            text_hash: item_text_hash(&committed, source_text),
-                            source_text_hash,
-                            projection_group_id,
-                            language_hint: None,
-                            token_estimate: estimate_tokens(source_text),
-                            capsule_id: None,
-                            capsule_ref: None,
-                            segment_index: None,
-                            frame_id: None,
-                            frame_uri: None,
-                            indexed_at: None,
-                            deleted_at: None,
-                        },
+                        prepare_source_record(&committed, source, projection_group_id),
                         request.now_unix,
                     )
                     .await?;
@@ -4707,11 +5456,9 @@ impl ThreadEpisodicIngestor for StoreThreadEpisodicIngestor {
         &self,
         item: ThreadEpisodicCommittedItem,
     ) -> Result<ThreadEpisodicIngestionOutcome> {
-        if !self.enabled {
-            return Ok(ThreadEpisodicIngestionOutcome::Skipped {
-                reason: ThreadEpisodicIngestionSkipReason::IngestionNotConfigured,
-            });
-        }
+        // Durable source bookkeeping is required even while execution is
+        // disabled. Startup/history discovery and the embedding executor retain
+        // their enable guards; a later enable must not lose acknowledged saves.
         let now_unix = chrono::Utc::now().timestamp();
         let (_, skip_reason) = self
             .reconcile_canonical_source_occurrence_with_disposition(
@@ -4726,38 +5473,6 @@ impl ThreadEpisodicIngestor for StoreThreadEpisodicIngestor {
             Some(reason) => ThreadEpisodicIngestionOutcome::Skipped { reason },
             None => ThreadEpisodicIngestionOutcome::Accepted,
         })
-    }
-}
-
-fn store_source_actor_role(
-    role: ThreadEpisodicSourceActorRole,
-) -> StoreThreadEpisodicSourceActorRole {
-    match role {
-        ThreadEpisodicSourceActorRole::User => StoreThreadEpisodicSourceActorRole::User,
-        ThreadEpisodicSourceActorRole::Assistant => StoreThreadEpisodicSourceActorRole::Assistant,
-        ThreadEpisodicSourceActorRole::TaskSummary => StoreThreadEpisodicSourceActorRole::Task,
-        ThreadEpisodicSourceActorRole::GeneratedSummary => {
-            StoreThreadEpisodicSourceActorRole::SystemVisible
-        }
-    }
-}
-
-fn store_source_runtime_kind(item_type: TurnItemType) -> ThreadEpisodicSourceRuntimeKind {
-    match item_type {
-        TurnItemType::UserMessage => ThreadEpisodicSourceRuntimeKind::UserTurn,
-        TurnItemType::AgentMessage => ThreadEpisodicSourceRuntimeKind::AssistantTurn,
-        TurnItemType::Task => ThreadEpisodicSourceRuntimeKind::TaskResult,
-        TurnItemType::CommandExecution
-        | TurnItemType::FileChange
-        | TurnItemType::WebSearch
-        | TurnItemType::WebFetch
-        | TurnItemType::Download
-        | TurnItemType::DynamicToolCall => {
-            unreachable!("tool turn items are not accepted by thread episodic indexing")
-        }
-        TurnItemType::Reasoning | TurnItemType::SystemEvent => {
-            ThreadEpisodicSourceRuntimeKind::CompactionSummary
-        }
     }
 }
 
@@ -4779,77 +5494,6 @@ fn store_source_runtime_kind_db(kind: ThreadEpisodicSourceRuntimeKind) -> &'stat
     }
 }
 
-fn sha256_hex(text: &str) -> String {
-    hex::encode(Sha256::digest(text.as_bytes()))
-}
-
-pub(crate) fn source_text_hash(text: &str) -> String {
-    sha256_hex(normalize_for_thread_episodic_hash(text).as_str())
-}
-
-fn occurrence_projection_group_id(
-    workspace_id: &str,
-    thread_id: &str,
-    turn_id: &str,
-    item_id: &str,
-    source_text_hash: &str,
-) -> String {
-    sha256_hex(
-        format!(
-            "thread_episodic_projection_v1\noccurrence\nworkspace={}\nthread={}\nturn={}\nitem={}\nsource_text_hash={}\n",
-            workspace_id.trim(),
-            thread_id.trim(),
-            turn_id.trim(),
-            item_id.trim(),
-            source_text_hash.trim()
-        )
-        .as_str(),
-    )
-}
-
-fn task_result_projection_group_id(
-    workspace_id: &str,
-    run_id: &str,
-    source_text_hash: &str,
-) -> String {
-    sha256_hex(
-        format!(
-            "thread_episodic_projection_v1\ntask_result\nworkspace={}\nrun={}\nsource_text_hash={}\n",
-            workspace_id.trim(),
-            run_id.trim(),
-            source_text_hash.trim()
-        )
-        .as_str(),
-    )
-}
-
-fn item_text_hash(item: &ThreadEpisodicCommittedItem, item_text: &str) -> String {
-    let source_id = normalized_item_source_id(item);
-    let normalized_item_text = normalize_for_thread_episodic_hash(item_text);
-    sha256_hex(format!("{source_id}\n{normalized_item_text}").as_str())
-}
-
-fn normalized_item_source_id(item: &ThreadEpisodicCommittedItem) -> String {
-    format!(
-        "workspace:{}/thread:{}/turn:{}/item:{}",
-        item.workspace_id.trim(),
-        item.thread_id.trim(),
-        item.turn_id.trim(),
-        item.item_id.trim()
-    )
-}
-
-fn normalize_for_thread_episodic_hash(text: &str) -> String {
-    text.replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .lines()
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_owned()
-}
-
 fn sanitize_thread_episodic_index_error(message: &str) -> String {
     let mut sanitized = message.split_whitespace().collect::<Vec<_>>().join(" ");
     if sanitized.chars().count() > THREAD_EPISODIC_INDEX_ERROR_MAX_CHARS {
@@ -4865,270 +5509,6 @@ fn fixed_datetime_from_unix(value: i64) -> chrono::DateTime<chrono::FixedOffset>
     chrono::DateTime::from_timestamp(value, 0)
         .unwrap_or_else(chrono::Utc::now)
         .fixed_offset()
-}
-
-pub(crate) fn committed_item_source_actor_role(
-    item: &TurnItem,
-) -> Option<ThreadEpisodicSourceActorRole> {
-    match item {
-        TurnItem::UserMessage { .. } => Some(ThreadEpisodicSourceActorRole::User),
-        TurnItem::AgentMessage {
-            phase: AgentMessagePhase::FinalAnswer,
-            ..
-        } => Some(ThreadEpisodicSourceActorRole::Assistant),
-        TurnItem::AgentMessage {
-            phase: AgentMessagePhase::Commentary,
-            ..
-        } => None,
-        TurnItem::CommandExecution { .. }
-        | TurnItem::FileChange { .. }
-        | TurnItem::WebSearch { .. }
-        | TurnItem::WebFetch { .. }
-        | TurnItem::Download { .. }
-        | TurnItem::DynamicToolCall { .. } => None,
-        TurnItem::Task { .. } => Some(ThreadEpisodicSourceActorRole::TaskSummary),
-        TurnItem::Reasoning { .. } | TurnItem::SystemEvent { .. } => None,
-    }
-}
-
-pub(crate) fn committed_item_source_context(item: &TurnItem) -> ThreadEpisodicSourceContext {
-    match item {
-        TurnItem::UserMessage { .. }
-        | TurnItem::AgentMessage {
-            phase: AgentMessagePhase::FinalAnswer,
-            ..
-        } => ThreadEpisodicSourceContext::UserVisibleThreadItem,
-        TurnItem::AgentMessage {
-            phase: AgentMessagePhase::Commentary,
-            ..
-        } => ThreadEpisodicSourceContext::InternalHookRuntime,
-        TurnItem::CommandExecution { .. }
-        | TurnItem::FileChange { .. }
-        | TurnItem::WebSearch { .. }
-        | TurnItem::WebFetch { .. }
-        | TurnItem::Download { .. }
-        | TurnItem::DynamicToolCall { .. } => ThreadEpisodicSourceContext::RawToolOutput,
-        TurnItem::Task { .. } => ThreadEpisodicSourceContext::UserVisibleTaskSummary,
-        TurnItem::Reasoning { .. } => ThreadEpisodicSourceContext::ReasoningTrace,
-        TurnItem::SystemEvent { .. } => ThreadEpisodicSourceContext::InternalHookRuntime,
-    }
-}
-
-pub(crate) fn committed_item_ingestion_input(
-    notification: &pioneer_protocol::ItemCompletedNotification,
-) -> Option<ThreadEpisodicCommittedItem> {
-    committed_item_ingestion_input_from_parts(
-        notification.workspace_id.as_str(),
-        notification.thread_id.as_str(),
-        notification.turn_id.as_str(),
-        notification.item.clone(),
-    )
-}
-
-fn committed_item_ingestion_input_from_parts(
-    workspace_id: &str,
-    thread_id: &str,
-    turn_id: &str,
-    item: TurnItem,
-) -> Option<ThreadEpisodicCommittedItem> {
-    let item_id = item.item_id().trim().to_owned();
-    if workspace_id.trim().is_empty()
-        || thread_id.trim().is_empty()
-        || turn_id.trim().is_empty()
-        || item_id.is_empty()
-    {
-        return None;
-    }
-    Some(ThreadEpisodicCommittedItem {
-        workspace_id: workspace_id.to_owned(),
-        thread_id: thread_id.to_owned(),
-        turn_id: turn_id.to_owned(),
-        item_id,
-        item_type: item.item_type(),
-        source_actor_role: committed_item_source_actor_role(&item),
-        source_context: committed_item_source_context(&item),
-        item,
-    })
-}
-
-pub(crate) fn select_committed_item_source(
-    item: &ThreadEpisodicCommittedItem,
-) -> ThreadEpisodicSourceSelection {
-    if matches!(
-        item.item,
-        TurnItem::CommandExecution { .. }
-            | TurnItem::FileChange { .. }
-            | TurnItem::WebSearch { .. }
-            | TurnItem::WebFetch { .. }
-            | TurnItem::Download { .. }
-            | TurnItem::DynamicToolCall { .. }
-    ) {
-        return ThreadEpisodicSourceSelection::Rejected {
-            reason: ThreadEpisodicIngestionSkipReason::ToolItemsDisabled,
-        };
-    }
-    if matches!(
-        item.item,
-        TurnItem::AgentMessage {
-            phase: AgentMessagePhase::Commentary,
-            ..
-        }
-    ) {
-        return ThreadEpisodicSourceSelection::Rejected {
-            reason: ThreadEpisodicIngestionSkipReason::AgentCommentary,
-        };
-    }
-
-    if let Some(reason) = hard_reject_source_context(&item.source_context) {
-        return ThreadEpisodicSourceSelection::Rejected { reason };
-    }
-
-    match &item.item {
-        TurnItem::UserMessage { text, .. } => indexable_text(
-            text,
-            ThreadEpisodicSourceActorRole::User,
-            item.source_context.clone(),
-        ),
-        TurnItem::AgentMessage {
-            text,
-            phase: AgentMessagePhase::FinalAnswer,
-            ..
-        } => indexable_text(
-            text,
-            ThreadEpisodicSourceActorRole::Assistant,
-            item.source_context.clone(),
-        ),
-        TurnItem::AgentMessage {
-            phase: AgentMessagePhase::Commentary,
-            ..
-        } => ThreadEpisodicSourceSelection::Rejected {
-            reason: ThreadEpisodicIngestionSkipReason::AgentCommentary,
-        },
-        TurnItem::Reasoning { .. } => ThreadEpisodicSourceSelection::Rejected {
-            reason: ThreadEpisodicIngestionSkipReason::ReasoningTrace,
-        },
-        TurnItem::SystemEvent { .. } => ThreadEpisodicSourceSelection::Rejected {
-            reason: ThreadEpisodicIngestionSkipReason::InternalHookRuntime,
-        },
-        TurnItem::CommandExecution { .. }
-        | TurnItem::FileChange { .. }
-        | TurnItem::WebSearch { .. }
-        | TurnItem::WebFetch { .. }
-        | TurnItem::Download { .. }
-        | TurnItem::DynamicToolCall { .. } => unreachable!("tool items are rejected above"),
-        TurnItem::Task { item } => {
-            select_task_summary_source(item, ThreadEpisodicSourceContext::UserVisibleTaskSummary)
-        }
-    }
-}
-
-fn select_task_summary_source(
-    item: &TaskTurnItem,
-    source_context: ThreadEpisodicSourceContext,
-) -> ThreadEpisodicSourceSelection {
-    let Some(text) = task_summary_text(item) else {
-        return ThreadEpisodicSourceSelection::Rejected {
-            reason: ThreadEpisodicIngestionSkipReason::TaskRuntimePrivate,
-        };
-    };
-    indexable_text(
-        text.as_str(),
-        ThreadEpisodicSourceActorRole::TaskSummary,
-        source_context,
-    )
-}
-
-fn task_summary_text(item: &TaskTurnItem) -> Option<String> {
-    let title = item.title.trim();
-    let result_preview = item.result_preview.as_deref().map(str::trim);
-    if let Some(result_preview) = result_preview.filter(|preview| !preview.is_empty()) {
-        return Some(format_task_summary_line(title, item.status, result_preview));
-    }
-
-    let error_preview = item.error_preview.as_deref().map(str::trim);
-    if let Some(error_preview) = error_preview.filter(|preview| !preview.is_empty()) {
-        return Some(format_task_summary_line(title, item.status, error_preview));
-    }
-
-    None
-}
-
-fn format_task_summary_line(title: &str, status: TaskStatus, preview: &str) -> String {
-    if title.is_empty() {
-        return preview.to_owned();
-    }
-    format!("{title}: {preview} ({})", task_status_label(status))
-}
-
-const fn task_status_label(status: TaskStatus) -> &'static str {
-    match status {
-        TaskStatus::Draft => "draft",
-        TaskStatus::Scheduled => "scheduled",
-        TaskStatus::Queued => "queued",
-        TaskStatus::Running => "running",
-        TaskStatus::Waiting => "waiting",
-        TaskStatus::WaitingReview => "waiting_review",
-        TaskStatus::Completed => "completed",
-        TaskStatus::Failed => "failed",
-        TaskStatus::Blocked => "blocked",
-        TaskStatus::Cancelled => "cancelled",
-    }
-}
-
-fn indexable_text(
-    text: &str,
-    source_actor_role: ThreadEpisodicSourceActorRole,
-    source_context: ThreadEpisodicSourceContext,
-) -> ThreadEpisodicSourceSelection {
-    if text.trim().is_empty() {
-        return ThreadEpisodicSourceSelection::Rejected {
-            reason: ThreadEpisodicIngestionSkipReason::EmptyText,
-        };
-    }
-    ThreadEpisodicSourceSelection::Indexable(ThreadEpisodicIndexableSource {
-        text: text.to_owned(),
-        source_actor_role,
-        source_context,
-    })
-}
-
-fn estimate_tokens(text: &str) -> i64 {
-    let char_count = text.chars().count();
-    std::cmp::max(1, char_count.div_ceil(4)) as i64
-}
-
-fn hard_reject_source_context(
-    source_context: &ThreadEpisodicSourceContext,
-) -> Option<ThreadEpisodicIngestionSkipReason> {
-    match source_context {
-        ThreadEpisodicSourceContext::UserVisibleThreadItem
-        | ThreadEpisodicSourceContext::UserVisibleTaskSummary
-        | ThreadEpisodicSourceContext::ThreadCompactionSummary => None,
-        ThreadEpisodicSourceContext::HiddenPrompt => {
-            Some(ThreadEpisodicIngestionSkipReason::HiddenPrompt)
-        }
-        ThreadEpisodicSourceContext::SystemPrompt => {
-            Some(ThreadEpisodicIngestionSkipReason::SystemPrompt)
-        }
-        ThreadEpisodicSourceContext::DeveloperPrompt => {
-            Some(ThreadEpisodicIngestionSkipReason::DeveloperPrompt)
-        }
-        ThreadEpisodicSourceContext::ReasoningTrace => {
-            Some(ThreadEpisodicIngestionSkipReason::ReasoningTrace)
-        }
-        ThreadEpisodicSourceContext::RawToolOutput => {
-            Some(ThreadEpisodicIngestionSkipReason::RawToolOutput)
-        }
-        ThreadEpisodicSourceContext::RawTaskRuntime => {
-            Some(ThreadEpisodicIngestionSkipReason::TaskRuntimePrivate)
-        }
-        ThreadEpisodicSourceContext::InternalHookRuntime => {
-            Some(ThreadEpisodicIngestionSkipReason::InternalHookRuntime)
-        }
-        ThreadEpisodicSourceContext::Unknown => {
-            Some(ThreadEpisodicIngestionSkipReason::UnsupportedSourceContext)
-        }
-    }
 }
 
 fn thread_episodic_source_context_is_recallable(
@@ -5149,10 +5529,10 @@ mod tests {
     use crate::workspace::WorkspaceManager;
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{
-        CrudStore, NewThreadEpisodicExclusionRecord, NewThreadEpisodicThreadDirectoryRecord,
-        THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR, ThreadEpisodicCapsuleWriteState,
-        ThreadEpisodicExclusionReason, ThreadEpisodicIndexJobStatus,
-        ThreadEpisodicThreadDirectorySelection,
+        CrudStore, NewThreadEpisodicExclusionRecord, NewThreadEpisodicItemRecord,
+        NewThreadEpisodicThreadDirectoryRecord, THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR,
+        ThreadEpisodicCapsuleWriteState, ThreadEpisodicExclusionReason,
+        ThreadEpisodicIndexJobStatus, ThreadEpisodicThreadDirectorySelection,
     };
     use pioneer_entity::turn;
     use pioneer_memory::{
@@ -5165,6 +5545,7 @@ mod tests {
         ThreadEpisodicSearchDiagnostics, ThreadEpisodicSearchProfileKind,
         thread_episodic_storage_uri_from_path,
     };
+    use pioneer_protocol::{AgentMessagePhase, TaskStatus, TaskTurnItem, TurnItem, TurnItemType};
     use pioneer_protocol::{
         ItemCompletedNotification, ItemUpdatedNotification, MemoryCategory, MemoryForgetParams,
         MemoryForgetTarget, MemoryRememberParams, MemoryScope, MemoryScopeKind, MemorySensitivity,
@@ -5290,36 +5671,7 @@ mod tests {
         source_update_during_index: Mutex<Option<(Arc<CrudStore>, ItemUpdatedNotification, i64)>>,
         exclusion_during_index:
             Mutex<Option<(Arc<CrudStore>, NewThreadEpisodicExclusionRecord, i64)>>,
-    }
-
-    struct RestoreSourceAfterResolutionMismatchProvider {
-        inner: StoreThreadEpisodicIndexPayloadProvider,
-        crud_store: Arc<CrudStore>,
-        restore: Mutex<Option<(ItemUpdatedNotification, i64)>>,
-    }
-
-    #[async_trait]
-    impl ThreadEpisodicIndexPayloadProvider for RestoreSourceAfterResolutionMismatchProvider {
-        async fn resolve_index_request(
-            &self,
-            job: &ThreadEpisodicIndexJobRecord,
-        ) -> std::result::Result<
-            ThreadEpisodicResolvedIndexRequest,
-            ThreadEpisodicIndexResolutionError,
-        > {
-            let result = self.inner.resolve_index_request(job).await;
-            if result.as_ref().is_err_and(|error| {
-                error.kind == ThreadEpisodicIndexResolutionFailureKind::SourceChanged
-            }) {
-                if let Some((update, now_unix)) = self.restore.lock().await.take() {
-                    self.crud_store
-                        .materialize_item_snapshot_updated(update, now_unix)
-                        .await
-                        .expect("test source restoration should materialize");
-                }
-            }
-            result
-        }
+        index_barriers: Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
     }
 
     #[derive(Debug, Clone)]
@@ -5349,6 +5701,7 @@ mod tests {
                 scoped_search_hits: Mutex::new(BTreeMap::new()),
                 source_update_during_index: Mutex::new(None),
                 exclusion_during_index: Mutex::new(None),
+                index_barriers: Mutex::new(None),
             }
         }
 
@@ -5370,6 +5723,7 @@ mod tests {
                 scoped_search_hits: Mutex::new(BTreeMap::new()),
                 source_update_during_index: Mutex::new(None),
                 exclusion_during_index: Mutex::new(None),
+                index_barriers: Mutex::new(None),
             }
         }
 
@@ -5391,6 +5745,7 @@ mod tests {
                 scoped_search_hits: Mutex::new(BTreeMap::new()),
                 source_update_during_index: Mutex::new(None),
                 exclusion_during_index: Mutex::new(None),
+                index_barriers: Mutex::new(None),
             }
         }
 
@@ -5415,6 +5770,7 @@ mod tests {
                 scoped_search_hits: Mutex::new(BTreeMap::new()),
                 source_update_during_index: Mutex::new(None),
                 exclusion_during_index: Mutex::new(None),
+                index_barriers: Mutex::new(None),
             }
         }
 
@@ -5469,6 +5825,11 @@ mod tests {
         ) -> std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>
         {
             self.requests.lock().await.push(request.clone());
+            let barriers = self.index_barriers.lock().await.take();
+            if let Some((started, release)) = barriers {
+                started.wait().await;
+                release.wait().await;
+            }
             if let Some((crud_store, update, now_unix)) =
                 self.source_update_during_index.lock().await.take()
             {
@@ -6177,9 +6538,11 @@ mod tests {
                 workspace_id.as_str(),
                 1_700_000_020,
                 1,
+                5,
             )
             .await
             .expect("old job should claim")
+            .assert_no_failures_for_test()
             .into_iter()
             .next()
             .expect("old job should be running");
@@ -6211,7 +6574,7 @@ mod tests {
             .expect_err("old source hash must be rejected after the canonical update");
         assert_eq!(
             resolution_error.message,
-            "thread episodic source text hash changed before indexing"
+            "thread episodic item is not indexable"
         );
         crud_store
             .fail_thread_episodic_index_job(
@@ -6368,9 +6731,11 @@ mod tests {
                 workspace_id.as_str(),
                 1_700_010_002,
                 1,
+                5,
             )
             .await
             .expect("W1 claim should succeed")
+            .assert_no_failures_for_test()
             .pop()
             .expect("W1 should claim A");
 
@@ -6403,9 +6768,11 @@ mod tests {
                 workspace_id.as_str(),
                 1_700_010_007,
                 10,
+                5,
             )
             .await
             .expect("W2 claim should succeed")
+            .assert_no_failures_for_test()
             .into_iter()
             .find(|job| job.id == w1.id)
             .expect("restored A should reuse and reclaim its durable job");
@@ -6734,290 +7101,398 @@ mod tests {
             .expect("mismatch should reconcile");
         assert_eq!(first.claimed, 1);
         assert_eq!(first.failed_terminal, 0);
-        assert!(
-            backend.requests().await.is_empty(),
-            "stale payload must not reach backend"
-        );
+        assert_eq!(first.completed, 1);
         let second = executor
             .run_once(1_700_016_004)
             .await
-            .expect("current source should index");
-        assert_eq!(second.completed, 1);
+            .expect("no repeat work for current source");
+        assert_eq!(second.claimed, 0);
         let requests = backend.requests().await;
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].text, "current version");
     }
 
     #[tokio::test]
-    async fn thread_episodic_executor_requeues_same_claim_when_source_returns_a_before_reconcile() {
+    async fn direct_snapshot_restores_unfinished_a_version_before_next_claim() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
-        let thread_id = "thread_source_a_b_a_during_resolution";
-        let turn_id = "turn_source_a_b_a_during_resolution";
-        let item_id = "item_source_a_b_a_during_resolution";
         let item = |text: &str| TurnItem::UserMessage {
-            id: item_id.to_owned(),
+            id: "restore_item".to_owned(),
             text: text.to_owned(),
-            attachments: Vec::new(),
+            attachments: vec![],
         };
         materialize_thread_with_item(
             crud_store.as_ref(),
-            workspace_id.as_str(),
-            thread_id,
-            turn_id,
-            item("version A"),
+            &workspace_id,
+            "restore_thread",
+            "restore_turn",
+            item("A"),
             1_700_016_100,
-        )
-        .await;
-        StoreThreadEpisodicIngestor::new(crud_store.clone())
-            .reconcile_canonical_source_occurrence(
-                workspace_id.as_str(),
-                thread_id,
-                turn_id,
-                item_id,
-                1_700_016_101,
-            )
-            .await
-            .expect("version A should enqueue");
-        crud_store
-            .materialize_item_snapshot_updated(
-                ItemUpdatedNotification {
-                    workspace_id: workspace_id.clone(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: item("version B"),
-                },
-                1_700_016_102,
-            )
-            .await
-            .expect("resolver should observe version B");
-
-        let provider = Arc::new(RestoreSourceAfterResolutionMismatchProvider {
-            inner: StoreThreadEpisodicIndexPayloadProvider::new(
-                crud_store.clone(),
-                "file:///tmp/pioneer-thread-episodic-resolution-a-b-a".to_owned(),
-            ),
-            crud_store: crud_store.clone(),
-            restore: Mutex::new(Some((
-                ItemUpdatedNotification {
-                    workspace_id: workspace_id.clone(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: item("version A"),
-                },
-                1_700_016_103,
-            ))),
-        });
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
-        let executor =
-            ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend.clone(), provider);
-
-        let first = executor
-            .run_once(1_700_016_104)
-            .await
-            .expect("source restoration should release the original claim");
-        assert_eq!(first.claimed, 1);
-        assert_eq!(first.completed, 0);
-        let queued = crud_store
-            .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10)
-            .await
-            .expect("job should list");
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].status, ThreadEpisodicIndexJobStatus::Queued);
-
-        let second = executor
-            .run_once(1_700_016_105)
-            .await
-            .expect("restored version A should index");
-        assert_eq!(second.completed, 1);
-        let requests = backend.requests().await;
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].text, "version A");
-        let completed = crud_store
-            .find_thread_episodic_index_job(queued[0].id.as_str())
-            .await
-            .expect("job lookup should succeed")
-            .expect("job should remain");
-        assert_eq!(completed.status, ThreadEpisodicIndexJobStatus::Completed);
-        assert!(completed.attempt_count > queued[0].attempt_count);
-    }
-
-    #[tokio::test]
-    async fn ordinary_ingest_restores_completed_superseded_source_without_reindexing() {
-        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
-        let thread_id = "thread_ingest_restore_completed";
-        let turn_id = "turn_ingest_restore_completed";
-        let item_id = "item_ingest_restore_completed";
-        let source_item = |text: &str| TurnItem::UserMessage {
-            id: item_id.to_owned(),
-            text: text.to_owned(),
-            attachments: Vec::new(),
-        };
-        materialize_thread_with_item(
-            crud_store.as_ref(),
-            workspace_id.as_str(),
-            thread_id,
-            turn_id,
-            source_item("version A"),
-            1_700_016_120,
         )
         .await;
         let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
         ingestor
-            .ingest_committed_item(
-                committed_item_ingestion_input_from_parts(
-                    workspace_id.as_str(),
-                    thread_id,
-                    turn_id,
-                    source_item("version A"),
-                )
-                .expect("version A event should be valid"),
+            .reconcile_canonical_source_occurrence(
+                &workspace_id,
+                "restore_thread",
+                "restore_turn",
+                "restore_item",
+                1_700_016_101,
             )
             .await
-            .expect("ordinary ingest should enqueue version A");
+            .unwrap();
+        let original = crud_store
+            .list_thread_episodic_index_jobs_for_thread(&workspace_id, "restore_thread", 10)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        for (text, time) in [("B", 1_700_016_102), ("A", 1_700_016_103)] {
+            crud_store
+                .materialize_item_snapshot_updated(
+                    ItemUpdatedNotification {
+                        workspace_id: workspace_id.clone(),
+                        thread_id: "restore_thread".to_owned(),
+                        turn_id: "restore_turn".to_owned(),
+                        item: item(text),
+                    },
+                    time,
+                )
+                .await
+                .unwrap();
+        }
         let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
         let executor = ThreadEpisodicIndexExecutor::new(
             crud_store.clone(),
             backend.clone(),
             Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
                 crud_store.clone(),
-                "file:///tmp/pioneer-thread-episodic-ingest-restore-completed".to_owned(),
+                "file:///tmp/pioneer-restore-source".to_owned(),
             )),
         );
-        let claim_now = chrono::Utc::now().timestamp().saturating_add(60);
-        assert_eq!(
-            executor
-                .run_once(claim_now)
-                .await
-                .expect("version A should index")
-                .completed,
-            1
-        );
-        let version_a = crud_store
-            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
-            .await
-            .expect("version A should list")
-            .pop()
-            .expect("version A should exist");
-        let version_a_job = crud_store
-            .find_thread_episodic_index_job_by_item(version_a.id.as_str())
-            .await
-            .expect("version A job lookup should succeed")
-            .expect("version A job should exist");
-
-        crud_store
-            .materialize_item_snapshot_updated(
-                ItemUpdatedNotification {
-                    workspace_id: workspace_id.clone(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: source_item("version B"),
-                },
-                1_700_016_122,
-            )
-            .await
-            .expect("canonical source should become B");
-        ingestor
-            .ingest_committed_item(
-                committed_item_ingestion_input_from_parts(
-                    workspace_id.as_str(),
-                    thread_id,
-                    turn_id,
-                    source_item("delayed version A event"),
-                )
-                .expect("delayed event should be valid"),
-            )
-            .await
-            .expect("ordinary ingest must select canonical version B");
-        assert_eq!(
-            executor
-                .run_once(claim_now.saturating_add(1))
-                .await
-                .expect("version B should index")
-                .completed,
-            1
-        );
-
-        crud_store
-            .materialize_item_snapshot_updated(
-                ItemUpdatedNotification {
-                    workspace_id: workspace_id.clone(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: source_item("version A"),
-                },
-                1_700_016_124,
-            )
-            .await
-            .expect("canonical source should return to A");
-        ingestor
-            .ingest_committed_item(
-                committed_item_ingestion_input_from_parts(
-                    workspace_id.as_str(),
-                    thread_id,
-                    turn_id,
-                    source_item("stale version B event"),
-                )
-                .expect("stale event should be valid"),
-            )
-            .await
-            .expect("ordinary ingest should restore canonical version A");
-        ingestor
-            .ingest_committed_item(
-                committed_item_ingestion_input_from_parts(
-                    workspace_id.as_str(),
-                    thread_id,
-                    turn_id,
-                    source_item("another stale event"),
-                )
-                .expect("repeated stale event should be valid"),
-            )
-            .await
-            .expect("repeated ordinary ingest should be idempotent");
-
-        let versions = crud_store
-            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
-            .await
-            .expect("restored versions should list");
-        assert_eq!(versions.len(), 2);
-        let restored_a = versions
-            .iter()
-            .find(|item| item.source_text_hash == source_text_hash("version A"))
-            .expect("version A should remain unique");
-        let retired_b = versions
-            .iter()
-            .find(|item| item.source_text_hash == source_text_hash("version B"))
-            .expect("version B should remain unique");
-        assert_eq!(restored_a.id, version_a.id);
-        assert_eq!(restored_a.status, ThreadEpisodicItemStatus::Active);
-        assert!(restored_a.frame_id.is_some());
-        assert_eq!(retired_b.status, ThreadEpisodicItemStatus::Superseded);
-        let restored_a_job = crud_store
-            .find_thread_episodic_index_job_by_item(restored_a.id.as_str())
-            .await
-            .expect("restored version A job lookup should succeed")
-            .expect("restored version A job should remain");
-        assert_eq!(
-            restored_a_job.status,
-            ThreadEpisodicIndexJobStatus::Completed
-        );
-        assert_eq!(restored_a_job.attempt_count, version_a_job.attempt_count);
+        assert_eq!(executor.run_once(1_700_016_104).await.unwrap().completed, 1);
+        assert_eq!(backend.requests().await[0].text, "A");
         assert_eq!(
             crud_store
-                .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10,)
+                .find_thread_episodic_index_job(&original.id)
                 .await
-                .expect("completed source jobs should list")
-                .len(),
-            2
+                .unwrap()
+                .unwrap()
+                .status,
+            ThreadEpisodicIndexJobStatus::Completed
         );
-        assert_eq!(backend.requests().await.len(), 2);
+        let jobs = crud_store
+            .list_thread_episodic_index_jobs_for_thread(&workspace_id, "restore_thread", 10)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 2);
         assert_eq!(
-            executor
-                .run_once(claim_now.saturating_add(2))
-                .await
-                .expect("restored completed version must not reindex")
-                .claimed,
-            0
+            jobs.iter()
+                .filter(|job| job.status == ThreadEpisodicIndexJobStatus::Canceled)
+                .count(),
+            1
         );
+    }
+
+    #[tokio::test]
+    async fn direct_snapshot_of_ready_content_ignores_timestamp_and_markdown_changes() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let item = |markdown: Option<String>| TurnItem::AgentMessage {
+            id: "ready_content".to_owned(),
+            text: "same indexed text".to_owned(),
+            phase: AgentMessagePhase::FinalAnswer,
+            markdown: markdown.map(pioneer_protocol::MarkdownDocument::from_plain_text),
+            markdown_version: None,
+        };
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            &workspace_id,
+            "ready_thread",
+            "ready_turn",
+            item(None),
+            1_700_000_000,
+        )
+        .await;
+        let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
+        ingestor
+            .reconcile_canonical_source_occurrence(
+                &workspace_id,
+                "ready_thread",
+                "ready_turn",
+                "ready_content",
+                1_700_000_001,
+            )
+            .await
+            .unwrap();
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let executor = ThreadEpisodicIndexExecutor::new(
+            crud_store.clone(),
+            backend.clone(),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                crud_store.clone(),
+                "file:///tmp/pioneer-same-ready-content".to_owned(),
+            )),
+        );
+        assert_eq!(executor.run_once(1_700_000_002).await.unwrap().completed, 1);
+        let before = crud_store
+            .list_thread_episodic_index_jobs_for_thread(&workspace_id, "ready_thread", 10)
+            .await
+            .unwrap();
+        crud_store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: "ready_thread".to_owned(),
+                    turn_id: "ready_turn".to_owned(),
+                    item: item(Some("display markup changed".to_owned())),
+                },
+                1_700_000_100,
+            )
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            ingestor
+                .reconcile_canonical_source_occurrence(
+                    &workspace_id,
+                    "ready_thread",
+                    "ready_turn",
+                    "ready_content",
+                    1_700_000_101,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            crud_store
+                .list_thread_episodic_index_jobs_for_thread(&workspace_id, "ready_thread", 10)
+                .await
+                .unwrap(),
+            before
+        );
+        assert_eq!(executor.run_once(1_700_000_102).await.unwrap().claimed, 0);
+        assert_eq!(backend.requests().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ordinary_ingest_restores_completed_superseded_source_without_reindexing() {
+        for projection_replaced in [false, true] {
+            let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+            let thread_id = "thread_ingest_restore_completed";
+            let turn_id = "turn_ingest_restore_completed";
+            let item_id = "item_ingest_restore_completed";
+            let source_item = |text: &str| TurnItem::UserMessage {
+                id: item_id.to_owned(),
+                text: text.to_owned(),
+                attachments: Vec::new(),
+            };
+            materialize_thread_with_item(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                source_item("version A"),
+                1_700_016_120,
+            )
+            .await;
+            let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
+            ingestor
+                .ingest_committed_item(
+                    committed_item_ingestion_input_from_parts(
+                        workspace_id.as_str(),
+                        thread_id,
+                        turn_id,
+                        source_item("version A"),
+                    )
+                    .expect("version A event should be valid"),
+                )
+                .await
+                .expect("ordinary ingest should enqueue version A");
+            let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+            let executor = ThreadEpisodicIndexExecutor::new(
+                crud_store.clone(),
+                backend.clone(),
+                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                    crud_store.clone(),
+                    "file:///tmp/pioneer-thread-episodic-ingest-restore-completed".to_owned(),
+                )),
+            );
+            let claim_now = chrono::Utc::now().timestamp().saturating_add(60);
+            assert_eq!(
+                executor
+                    .run_once(claim_now)
+                    .await
+                    .expect("version A should index")
+                    .completed,
+                1
+            );
+            let version_a = crud_store
+                .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+                .await
+                .expect("version A should list")
+                .pop()
+                .expect("version A should exist");
+            let version_a_job = crud_store
+                .find_thread_episodic_index_job_by_item(version_a.id.as_str())
+                .await
+                .expect("version A job lookup should succeed")
+                .expect("version A job should exist");
+
+            crud_store
+                .materialize_item_snapshot_updated(
+                    ItemUpdatedNotification {
+                        workspace_id: workspace_id.clone(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: source_item("version B"),
+                    },
+                    1_700_016_122,
+                )
+                .await
+                .expect("canonical source should become B");
+            ingestor
+                .ingest_committed_item(
+                    committed_item_ingestion_input_from_parts(
+                        workspace_id.as_str(),
+                        thread_id,
+                        turn_id,
+                        source_item("delayed version A event"),
+                    )
+                    .expect("delayed event should be valid"),
+                )
+                .await
+                .expect("ordinary ingest must select canonical version B");
+            assert_eq!(
+                executor
+                    .run_once(claim_now.saturating_add(1))
+                    .await
+                    .expect("version B should index")
+                    .completed,
+                1
+            );
+
+            if projection_replaced {
+                crate::database::startup::thread_episodic_workspace_capsule_refill::mark_projection_reset(&crud_store.database_connection(), &workspace_id, pioneer_crud::PROJECTION_META_STATUS_PENDING, &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only()).await.unwrap();
+                crud_store
+                    .reset_thread_episodic_projection(&workspace_id, claim_now + 2)
+                    .await
+                    .unwrap();
+                assert!(
+                    crud_store
+                        .find_thread_episodic_index_job(&version_a_job.id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                let inactive = crud_store
+                    .find_thread_episodic_index_job_by_item(&version_a.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(inactive.status, ThreadEpisodicIndexJobStatus::Canceled);
+                assert_eq!(
+                    inactive.last_error.as_deref(),
+                    Some(THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR)
+                );
+                assert_eq!(inactive.attempt_count, 0);
+            }
+            crud_store
+                .materialize_item_snapshot_updated(
+                    ItemUpdatedNotification {
+                        workspace_id: workspace_id.clone(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: source_item("version A"),
+                    },
+                    1_700_016_124,
+                )
+                .await
+                .expect("canonical source should return to A");
+            ingestor
+                .ingest_committed_item(
+                    committed_item_ingestion_input_from_parts(
+                        workspace_id.as_str(),
+                        thread_id,
+                        turn_id,
+                        source_item("stale version B event"),
+                    )
+                    .expect("stale event should be valid"),
+                )
+                .await
+                .expect("ordinary ingest should restore canonical version A");
+            ingestor
+                .ingest_committed_item(
+                    committed_item_ingestion_input_from_parts(
+                        workspace_id.as_str(),
+                        thread_id,
+                        turn_id,
+                        source_item("another stale event"),
+                    )
+                    .expect("repeated stale event should be valid"),
+                )
+                .await
+                .expect("repeated ordinary ingest should be idempotent");
+
+            if projection_replaced {
+                assert_eq!(executor.run_once(claim_now + 3).await.unwrap().completed, 1);
+            }
+            let versions = crud_store
+                .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+                .await
+                .expect("restored versions should list");
+            assert_eq!(versions.len(), 2);
+            let restored_a = versions
+                .iter()
+                .find(|item| item.source_text_hash == source_text_hash("version A"))
+                .expect("version A should remain unique");
+            let retired_b = versions
+                .iter()
+                .find(|item| item.source_text_hash == source_text_hash("version B"))
+                .expect("version B should remain unique");
+            assert_eq!(restored_a.id, version_a.id);
+            assert_eq!(restored_a.status, ThreadEpisodicItemStatus::Active);
+            assert!(restored_a.frame_id.is_some());
+            assert_eq!(retired_b.status, ThreadEpisodicItemStatus::Superseded);
+            let restored_a_job = crud_store
+                .find_thread_episodic_index_job_by_item(restored_a.id.as_str())
+                .await
+                .expect("restored version A job lookup should succeed")
+                .expect("restored version A job should remain");
+            assert_eq!(
+                restored_a_job.status,
+                ThreadEpisodicIndexJobStatus::Completed
+            );
+            assert_eq!(
+                restored_a_job.attempt_count,
+                if projection_replaced {
+                    1
+                } else {
+                    version_a_job.attempt_count
+                }
+            );
+            assert_eq!(
+                crud_store
+                    .list_thread_episodic_index_jobs_for_thread(
+                        workspace_id.as_str(),
+                        thread_id,
+                        10,
+                    )
+                    .await
+                    .expect("completed source jobs should list")
+                    .len(),
+                2
+            );
+            assert_eq!(
+                backend.requests().await.len(),
+                2 + usize::from(projection_replaced)
+            );
+            assert_eq!(
+                executor
+                    .run_once(claim_now.saturating_add(2))
+                    .await
+                    .expect("restored completed version must not reindex")
+                    .claimed,
+                0
+            );
+        }
     }
 
     #[tokio::test]
@@ -7399,9 +7874,11 @@ mod tests {
                 workspace_id.as_str(),
                 1_700_019_002,
                 1,
+                5,
             )
             .await
             .expect("legacy job should claim")
+            .assert_no_failures_for_test()
             .pop()
             .expect("legacy job should exist");
         crud_store
@@ -7497,9 +7974,11 @@ mod tests {
                 workspace_id.as_str(),
                 1_700_019_101,
                 1,
+                5,
             )
             .await
             .expect("job should claim")
+            .assert_no_failures_for_test()
             .pop()
             .expect("job should exist");
         crud_store
@@ -7561,9 +8040,11 @@ mod tests {
                     workspace_id.as_str(),
                     1_700_019_104,
                     10,
+                    5,
                 )
                 .await
                 .expect("excluded claim scan should succeed")
+                .assert_no_failures_for_test()
                 .is_empty()
         );
 
@@ -7588,9 +8069,11 @@ mod tests {
                 workspace_id.as_str(),
                 1_700_019_106,
                 1,
+                5,
             )
             .await
             .expect("unrelated job should claim")
+            .assert_no_failures_for_test()
             .pop()
             .expect("unrelated job should exist");
         crud_store
@@ -7665,9 +8148,11 @@ mod tests {
                 workspace_id.as_str(),
                 1_700_019_201,
                 1,
+                5,
             )
             .await
             .expect("first attempt should claim")
+            .assert_no_failures_for_test()
             .pop()
             .expect("first attempt should exist");
         assert_eq!(
@@ -7694,9 +8179,11 @@ mod tests {
                     workspace_id.as_str(),
                     1_700_019_299,
                     1,
+                    5,
                 )
                 .await
                 .expect("early claim scan should succeed")
+                .assert_no_failures_for_test()
                 .is_empty()
         );
         let second = crud_store
@@ -7704,9 +8191,11 @@ mod tests {
                 workspace_id.as_str(),
                 1_700_019_300,
                 1,
+                5,
             )
             .await
             .expect("second attempt should claim")
+            .assert_no_failures_for_test()
             .pop()
             .expect("second attempt should exist");
         assert!(second.attempt_count > first.attempt_count);
@@ -7811,9 +8300,11 @@ mod tests {
                 workspace_id.as_str(),
                 1_700_020_004,
                 1,
+                5,
             )
             .await
             .expect("current projection should claim before tombstone")
+            .assert_no_failures_for_test()
             .pop()
             .expect("current projection job should exist");
         crud_store
@@ -7900,9 +8391,11 @@ mod tests {
                     workspace_id.as_str(),
                     1_700_020_010,
                     10,
+                    5,
                 )
                 .await
                 .expect("deleted occurrence claim scan should succeed")
+                .assert_no_failures_for_test()
                 .is_empty()
         );
     }
@@ -7944,9 +8437,11 @@ mod tests {
                 workspace_id.as_str(),
                 1_700_025_001,
                 1,
+                5,
             )
             .await
-            .expect("claim scan should recover partial completion");
+            .expect("claim scan should recover partial completion")
+            .assert_no_failures_for_test();
         assert!(
             claimed.is_empty(),
             "recovered projection must not be indexed twice"
@@ -7986,9 +8481,11 @@ mod tests {
                 workspace_id.as_str(),
                 1_700_025_002,
                 1,
+                5,
             )
             .await
-            .expect("repeat claim scan should succeed");
+            .expect("repeat claim scan should succeed")
+            .assert_no_failures_for_test();
         assert!(repeated.is_empty());
     }
 
@@ -8565,6 +9062,7 @@ mod tests {
         .await;
         mark_thread_episodic_workspace_refill_status_for_test(
             crud_store.as_ref(),
+            &workspace_id,
             pioneer_crud::PROJECTION_META_STATUS_BACKFILLING,
         )
         .await;
@@ -8738,6 +9236,7 @@ mod tests {
         };
         mark_thread_episodic_workspace_vector_refill_complete_for_test(
             crud_store.as_ref(),
+            &workspace_id,
             &vector_config,
         )
         .await;
@@ -8828,6 +9327,7 @@ mod tests {
         };
         mark_thread_episodic_workspace_vector_refill_complete_for_test(
             crud_store.as_ref(),
+            &workspace_id,
             &vector_config,
         )
         .await;
@@ -8905,6 +9405,7 @@ mod tests {
         };
         mark_thread_episodic_workspace_vector_refill_complete_for_test(
             crud_store.as_ref(),
+            &workspace_id,
             &vector_config,
         )
         .await;
@@ -8979,6 +9480,7 @@ mod tests {
         };
         mark_thread_episodic_workspace_vector_refill_complete_for_test(
             crud_store.as_ref(),
+            &workspace_id,
             &vector_config,
         )
         .await;
@@ -9054,6 +9556,7 @@ mod tests {
         };
         mark_thread_episodic_workspace_vector_refill_complete_for_test(
             crud_store.as_ref(),
+            &workspace_id,
             &vector_config,
         )
         .await;
@@ -9128,6 +9631,7 @@ mod tests {
         .await;
         mark_thread_episodic_workspace_refill_status_for_test(
             crud_store.as_ref(),
+            &workspace_id,
             pioneer_crud::PROJECTION_META_STATUS_BACKFILLING,
         )
         .await;
@@ -9336,6 +9840,7 @@ mod tests {
         };
         mark_thread_episodic_workspace_vector_refill_complete_for_test(
             crud_store.as_ref(),
+            &workspace_id,
             &vector_config,
         )
         .await;
@@ -10321,6 +10826,3144 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn ordinary_discovery_is_bounded_and_busy_prefix_cannot_starve_other_workspaces() {
+        use sea_orm::{EntityTrait, Set};
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let root = TempDir::new().unwrap();
+        let now: chrono::DateTime<chrono::FixedOffset> = chrono::Utc::now().into();
+        for index in 0..256 {
+            pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+                id: Set(format!("empty_catalog_{index:03}")),
+                name: Set("Empty".to_owned()),
+                is_active: Set(false),
+                is_current: Set(false),
+                created_at: Set(now),
+                updated_at: Set(now),
+            })
+            .exec(&store.database_connection())
+            .await
+            .unwrap();
+        }
+        let backend = Arc::new(MemvidThreadEpisodicBackend::new());
+        let executor = ThreadEpisodicIndexExecutor::new(
+            store.clone(),
+            backend,
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                store.clone(),
+                thread_episodic_storage_uri_from_path(root.path()),
+            )),
+        );
+        executor.apply_config(ThreadEpisodicIndexExecutorConfig {
+            batch_limit: 2,
+            ..Default::default()
+        });
+        let other_workspace = "independent_due_workspace";
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set(other_workspace.to_owned()),
+            name: Set("Independent".to_owned()),
+            is_active: Set(true),
+            is_current: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+        })
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+        let other = seed_pending_thread_episodic_item(
+            &store,
+            other_workspace,
+            "fair_other",
+            "fair_other_turn",
+            "fair_other_item",
+        )
+        .await;
+        let other_job = seed_thread_episodic_job(
+            &store,
+            other_workspace,
+            "fair_other",
+            &other.id,
+            1_700_000_001,
+        )
+        .await;
+        let one = executor
+            .run_once(chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        assert_eq!(one.discovered, 1);
+        assert_eq!(one.completed, 1);
+        assert!(!one.discovery_has_more);
+        // A second actual source in the independent workspace waits behind a
+        // large busy prefix. Every quantum advances its keyset, even if A keeps
+        // receiving new earlier jobs while its ownership is unavailable.
+        let waiting = seed_pending_thread_episodic_item(
+            &store,
+            other_workspace,
+            "fair_waiting",
+            "waiting_turn",
+            "waiting_item",
+        )
+        .await;
+        let waiting_job = seed_thread_episodic_job(
+            &store,
+            other_workspace,
+            "fair_waiting",
+            &waiting.id,
+            1_700_000_002,
+        )
+        .await;
+        let mut prefix = Vec::new();
+        for index in 0..20 {
+            let source = seed_pending_thread_episodic_item(
+                &store,
+                &workspace,
+                "fair_busy",
+                &format!("busy_turn_{index}"),
+                &format!("busy_item_{index}"),
+            )
+            .await;
+            prefix.push(
+                seed_thread_episodic_job(
+                    &store,
+                    &workspace,
+                    "fair_busy",
+                    &source.id,
+                    1_700_000_000,
+                )
+                .await,
+            );
+        }
+        let owner = pioneer_memory::lock_thread_episodic_workspace(&workspace).await;
+        for quantum in 0..11 {
+            let result = executor
+                .run_once(chrono::Utc::now().timestamp())
+                .await
+                .unwrap();
+            assert!(result.discovered <= 2);
+            assert!(result.claimed <= result.discovered);
+            if quantum < 10 {
+                assert_eq!(result.claimed, 0);
+                assert!(result.discovery_has_more);
+                let source = seed_pending_thread_episodic_item(
+                    &store,
+                    &workspace,
+                    "fair_busy",
+                    &format!("replenish_turn_{quantum}"),
+                    &format!("replenish_item_{quantum}"),
+                )
+                .await;
+                seed_thread_episodic_job(
+                    &store,
+                    &workspace,
+                    "fair_busy",
+                    &source.id,
+                    1_699_999_999,
+                )
+                .await;
+            } else {
+                assert_eq!(result.completed, 1);
+                assert!(!result.discovery_has_more);
+            }
+        }
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&waiting_job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .attempt_count,
+            1
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&other_job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .attempt_count,
+            1
+        );
+        for job in prefix {
+            assert_eq!(
+                store
+                    .find_thread_episodic_index_job(&job.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                job
+            );
+        }
+        drop(owner);
+
+        // The same cursor must make progress with a healthy, continuously
+        // replenished first workspace, not only while that workspace is busy.
+        let healthy_waiting = seed_pending_thread_episodic_item(
+            &store,
+            other_workspace,
+            "fair_healthy_waiting",
+            "healthy_waiting_turn",
+            "healthy_waiting_item",
+        )
+        .await;
+        let healthy_waiting_job = seed_thread_episodic_job(
+            &store,
+            other_workspace,
+            "fair_healthy_waiting",
+            &healthy_waiting.id,
+            1_700_000_003,
+        )
+        .await;
+        let mut completed_waiting = false;
+        for quantum in 0..32 {
+            let result = executor
+                .run_once(chrono::Utc::now().timestamp())
+                .await
+                .unwrap();
+            assert!(result.discovered <= 2);
+            assert!(result.claimed <= result.discovered);
+            let waiting = store
+                .find_thread_episodic_index_job(&healthy_waiting_job.id)
+                .await
+                .unwrap()
+                .unwrap();
+            if waiting.status == ThreadEpisodicIndexJobStatus::Completed {
+                assert_eq!(waiting.attempt_count, 1);
+                completed_waiting = true;
+                break;
+            }
+            let source = seed_pending_thread_episodic_item(
+                &store,
+                &workspace,
+                "fair_busy",
+                &format!("healthy_replenish_turn_{quantum}"),
+                &format!("healthy_replenish_item_{quantum}"),
+            )
+            .await;
+            seed_thread_episodic_job(&store, &workspace, "fair_busy", &source.id, 1_699_999_999)
+                .await;
+        }
+        assert!(
+            completed_waiting,
+            "healthy backlog starved another workspace"
+        );
+        assert!(
+            store
+                .list_thread_episodic_index_jobs_for_thread(&workspace, "fair_busy", 100)
+                .await
+                .unwrap()
+                .iter()
+                .all(|job| job.attempt_count <= 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_request_identity_change_after_claim_cannot_write_old_capsule() {
+        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        for dimension_b in [3, 4] {
+            let (store, workspace) = setup_thread_episodic_store().await;
+            let root = TempDir::new().unwrap();
+            let a = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+                "openrouter",
+                "vendor/a",
+                vec![0.1; 3],
+            ));
+            let target_a =
+                ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+                    a.as_ref(),
+                )
+                .unwrap();
+            let ready = seed_pending_thread_episodic_item(
+                &store,
+                &workspace,
+                "identity_race",
+                "ready_turn",
+                "ready_item",
+            )
+            .await;
+            seed_thread_episodic_job(
+                &store,
+                &workspace,
+                "identity_race",
+                &ready.id,
+                1_700_000_000,
+            )
+            .await;
+            refill::refill_once_with_workspace_projection(
+                store.clone(),
+                root.path(),
+                &workspace,
+                target_a.clone(),
+                Some(a.clone()),
+            )
+            .await
+            .unwrap();
+            let capsules = store
+                .list_all_thread_episodic_capsules_for_workspace(&workspace)
+                .await
+                .unwrap();
+            let old_file = capsules[0].storage_uri.strip_prefix("file://").unwrap();
+            let before = std::fs::read(old_file).unwrap();
+            let extra = seed_pending_thread_episodic_item(
+                &store,
+                &workspace,
+                "identity_race",
+                "extra_turn",
+                "extra_item",
+            )
+            .await;
+            let job = seed_thread_episodic_job(
+                &store,
+                &workspace,
+                "identity_race",
+                &extra.id,
+                1_700_000_000,
+            )
+            .await;
+            let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+            resolver.set_active_provider(Some(a));
+            let executor = Arc::new(
+                ThreadEpisodicIndexExecutor::new(
+                    store.clone(),
+                    Arc::new(MemvidThreadEpisodicBackend::new()),
+                    Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                        Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                            store.clone(),
+                            thread_episodic_storage_uri_from_path(root.path()),
+                        )),
+                        resolver.clone(),
+                        store.clone(),
+                    )),
+                )
+                .with_projection_runtime(
+                    root.path().to_owned(),
+                    resolver.clone(),
+                    Arc::new(
+                        crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor::default(
+                        ),
+                    ),
+                ),
+            );
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            executor
+                .pause_after_claim_for_test(started_tx, release_rx)
+                .await;
+            executor.apply_config(ThreadEpisodicIndexExecutorConfig {
+                max_attempts: 1,
+                ..Default::default()
+            });
+            let (quantum_tx, quantum_rx) = tokio::sync::oneshot::channel();
+            *executor.quantum_finished_notice.lock().await = Some(quantum_tx);
+            executor.wake();
+            started_rx.await.unwrap();
+            let old_claim = store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(old_claim.attempt_count, 1);
+            assert_eq!(old_claim.status, ThreadEpisodicIndexJobStatus::Running);
+            // Hold the following ordinary round before transition admission so
+            // preservation of A is asserted before any permitted destructive reset.
+            let (next_round_tx, next_round_rx) = tokio::sync::oneshot::channel();
+            let (_next_release_tx, next_release_rx) = tokio::sync::oneshot::channel();
+            *executor.after_round_fixed_pause.lock().await = Some((next_round_tx, next_release_rx));
+            let b = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+                "openrouter",
+                "vendor/b",
+                vec![0.2; dimension_b],
+            ));
+            resolver.set_active_provider(Some(b.clone()));
+            release_tx.send(()).unwrap();
+            let result = quantum_rx.await.unwrap();
+            next_round_rx.await.unwrap();
+            assert_eq!(result.claimed, 1);
+            assert_eq!(result.completed, 0);
+            assert_eq!(result.failed_terminal, 0);
+            // The real payload provider attached B, but the guarded executor
+            // released its claim without calling actual capsule FS for B.
+            assert_eq!(b.calls(), 1);
+            assert_eq!(std::fs::read(old_file).unwrap(), before);
+            let released = store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(released.status, ThreadEpisodicIndexJobStatus::Queued);
+            assert_eq!(released.attempt_count, 1);
+            assert_eq!(
+                released.last_error.as_deref(),
+                Some(pioneer_crud::THREAD_EPISODIC_PROJECTION_CHANGED_ERROR)
+            );
+            assert_eq!(
+                store
+                    .list_due_thread_episodic_index_jobs_after(
+                        chrono::Utc::now().timestamp(),
+                        None,
+                        None,
+                        10
+                    )
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(
+                refill::refill_is_current_for_workspace_target(&store, &workspace, &target_a)
+                    .await
+                    .unwrap()
+            );
+            executor.shutdown().await;
+            // A newly reconstructed executor (restart/canceled waiter) resolves
+            // B and performs a real replacement before indexing saved work.
+            let resumed = Arc::new(
+                ThreadEpisodicIndexExecutor::new(
+                    store.clone(),
+                    Arc::new(MemvidThreadEpisodicBackend::new()),
+                    Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                        Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                            store.clone(),
+                            thread_episodic_storage_uri_from_path(root.path()),
+                        )),
+                        resolver.clone(),
+                        store.clone(),
+                    )),
+                )
+                .with_projection_runtime(
+                    root.path().to_owned(),
+                    resolver,
+                    Arc::new(
+                        crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor::default(
+                        ),
+                    ),
+                ),
+            );
+            resumed.apply_config(ThreadEpisodicIndexExecutorConfig {
+                max_attempts: 1,
+                ..Default::default()
+            });
+            resumed.wake();
+            let completed = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                resumed.wait_for_completed_source_for_test(&extra.id),
+            )
+            .await
+            .unwrap();
+            assert_ne!(completed.id, job.id);
+            assert_eq!(completed.attempt_count, 1);
+            assert_eq!(
+                store
+                    .fail_thread_episodic_index_attempt_without_source_validation(
+                        &old_claim.id,
+                        old_claim.attempt_count,
+                        ThreadEpisodicIndexJobFailureUpdate {
+                            retryable: false,
+                            next_run_at_unix: None,
+                            last_error: Some("late A callback".to_owned()),
+                            capacity_error: false,
+                            last_attempt_latency_ms: None
+                        },
+                        chrono::Utc::now().timestamp(),
+                    )
+                    .await
+                    .unwrap(),
+                ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+            );
+            assert_eq!(
+                store
+                    .find_thread_episodic_index_job(&completed.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                completed
+            );
+
+            let target_b =
+                ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+                    b.as_ref(),
+                )
+                .unwrap();
+            assert!(
+                refill::refill_is_current_for_workspace_target(&store, &workspace, &target_b)
+                    .await
+                    .unwrap()
+            );
+            let current = store
+                .list_all_thread_episodic_capsules_for_workspace(&workspace)
+                .await
+                .unwrap();
+            let capsule = memvid_core::Memvid::open_read_only(
+                current[0].storage_uri.strip_prefix("file://").unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                capsule.effective_vec_index_dimension().unwrap(),
+                Some(dimension_b)
+            );
+            for id in [&ready.id, &extra.id] {
+                let source = store.find_thread_episodic_item(id).await.unwrap().unwrap();
+                let frame = capsule
+                    .frame_by_uri(source.frame_uri.as_deref().unwrap())
+                    .unwrap();
+                assert_eq!(
+                    frame
+                        .extra_metadata
+                        .get("pioneer.thread_episodic.embedding.model")
+                        .map(String::as_str),
+                    Some("vendor/b")
+                );
+            }
+            resumed.shutdown().await;
+        }
+    }
+
+    struct UnavailableExhaustionResolver {
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl ThreadEpisodicIndexEmbeddingProviderResolver for UnavailableExhaustionResolver {
+        async fn resolve_active_embedding_provider(
+            &self,
+            _: &str,
+        ) -> std::result::Result<
+            Option<Arc<dyn ThreadEpisodicEmbeddingProvider>>,
+            ThreadEpisodicIndexResolutionError,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ThreadEpisodicIndexResolutionError::retryable(
+                "same identity provider unavailable",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_same_identity_exhaustion_is_provider_free_and_preserves_ready_capsule() {
+        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        for status in [
+            ThreadEpisodicIndexJobStatus::Queued,
+            ThreadEpisodicIndexJobStatus::Failed,
+        ] {
+            let (store, workspace) = setup_thread_episodic_store().await;
+            let root = TempDir::new().unwrap();
+            let a = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+                "openrouter",
+                "vendor/a",
+                vec![0.1; 3],
+            ));
+            let target_a =
+                ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+                    a.as_ref(),
+                )
+                .unwrap();
+            let ready =
+                runner_source_job_for_test(&store, &workspace, "exhaustion_ready_a", 1_700_000_000)
+                    .await;
+            refill::refill_once_with_workspace_projection(
+                store.clone(),
+                root.path(),
+                &workspace,
+                target_a.clone(),
+                Some(a),
+            )
+            .await
+            .unwrap();
+            let capsule = store
+                .list_thread_episodic_workspace_capsules(&workspace, 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            let path = PathBuf::from(capsule.storage_uri.strip_prefix("file://").unwrap());
+            let before = std::fs::read(&path).unwrap();
+            let now = chrono::Utc::now().timestamp();
+            let extra =
+                runner_source_job_for_test(&store, &workspace, "same_identity_exhausted", now)
+                    .await;
+            let claimed = store
+                .claim_thread_episodic_index_job_if_due(&extra.id, now, 1)
+                .await
+                .unwrap()
+                .unwrap();
+            if status == ThreadEpisodicIndexJobStatus::Queued {
+                store
+                    .requeue_thread_episodic_index_attempt(
+                        &claimed.id,
+                        1,
+                        now,
+                        Some("interrupted old attempt"),
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                store
+                    .fail_thread_episodic_index_attempt_without_source_validation(
+                        &claimed.id,
+                        1,
+                        ThreadEpisodicIndexJobFailureUpdate {
+                            retryable: true,
+                            next_run_at_unix: Some(now),
+                            last_error: Some("provider unavailable".to_owned()),
+                            capacity_error: false,
+                            last_attempt_latency_ms: None,
+                        },
+                        now,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let resolver = Arc::new(UnavailableExhaustionResolver {
+                calls: AtomicUsize::new(0),
+            });
+            let executor = Arc::new(
+                ThreadEpisodicIndexExecutor::new(
+                    store.clone(),
+                    Arc::new(MemvidThreadEpisodicBackend::new()),
+                    Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                        Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                            store.clone(),
+                            thread_episodic_storage_uri_from_path(root.path()),
+                        )),
+                        resolver.clone(),
+                        store.clone(),
+                    )),
+                )
+                .with_projection_runtime(
+                    root.path().to_owned(),
+                    resolver.clone(),
+                    Arc::new(
+                        crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor::default(
+                        ),
+                    ),
+                ),
+            );
+            executor.apply_config(ThreadEpisodicIndexExecutorConfig {
+                max_attempts: 1,
+                ..Default::default()
+            });
+            let (notice, finished) = tokio::sync::oneshot::channel();
+            *executor.quantum_finished_notice.lock().await = Some(notice);
+            executor.wake();
+            let result = finished.await.unwrap();
+            assert_eq!(result.claimed, 0);
+            assert_eq!(result.settled, 1);
+            executor.shutdown().await;
+            let terminal = store
+                .find_thread_episodic_index_job(&extra.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(terminal.status, ThreadEpisodicIndexJobStatus::Canceled);
+            assert_eq!(terminal.attempt_count, 1);
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                store
+                    .find_thread_episodic_index_job(&ready.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .attempt_count,
+                1
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(
+                refill::refill_is_current_for_workspace_target(&store, &workspace, &target_a)
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_cancel_runtime_transition_releases_its_claim_without_renewing_budget() {
+        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let root = TempDir::new().unwrap();
+        let ready = seed_pending_thread_episodic_item(
+            &store,
+            &workspace,
+            "cancel_transition",
+            "ready_turn",
+            "ready_item",
+        )
+        .await;
+        let a = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+            "openrouter",
+            "vendor/a",
+            vec![0.1; 3],
+        ));
+        let target_a =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+                a.as_ref(),
+            )
+            .unwrap();
+        refill::refill_once_with_workspace_projection(
+            store.clone(),
+            root.path(),
+            &workspace,
+            target_a,
+            Some(a),
+        )
+        .await
+        .unwrap();
+        let extra = seed_pending_thread_episodic_item(
+            &store,
+            &workspace,
+            "cancel_transition",
+            "extra_turn",
+            "extra_item",
+        )
+        .await;
+        seed_thread_episodic_job(
+            &store,
+            &workspace,
+            "cancel_transition",
+            &extra.id,
+            1_700_000_000,
+        )
+        .await;
+        let b = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+            "openrouter",
+            "vendor/b",
+            vec![0.2; 4],
+        ));
+        let target_b =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+                b.as_ref(),
+            )
+            .unwrap();
+        let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+        resolver.set_active_provider(Some(b.clone()));
+        let supervisor =
+            Arc::new(crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor::default());
+        let executor = Arc::new(
+            ThreadEpisodicIndexExecutor::new(
+                store.clone(),
+                Arc::new(MemvidThreadEpisodicBackend::new()),
+                Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                    Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                        store.clone(),
+                        thread_episodic_storage_uri_from_path(root.path()),
+                    )),
+                    resolver.clone(),
+                    store.clone(),
+                )),
+            )
+            .with_projection_runtime(
+                root.path().to_owned(),
+                resolver,
+                supervisor.clone(),
+            ),
+        );
+        executor.apply_config(ThreadEpisodicIndexExecutorConfig {
+            batch_limit: 1,
+            ..Default::default()
+        });
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        executor.pause_projection_claim_for_test(started_tx).await;
+        let runtime = tokio::spawn({
+            let executor = executor.clone();
+            async move { executor.run_once(chrono::Utc::now().timestamp()).await }
+        });
+        started_rx.await.unwrap();
+        let claimed = store
+            .list_thread_episodic_index_jobs_for_thread(&workspace, "cancel_transition", 10)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(
+            claimed
+                .iter()
+                .filter(|job| job.status == ThreadEpisodicIndexJobStatus::Running)
+                .count(),
+            1
+        );
+        assert_eq!(claimed.iter().map(|job| job.attempt_count).sum::<i64>(), 1);
+        let independent_workspace = "ready_b_during_model_transition";
+        runner_workspace_for_test(&store, independent_workspace).await;
+        refill::refill_once_with_workspace_projection(
+            store.clone(),
+            root.path(),
+            independent_workspace,
+            target_b.clone(),
+            Some(b.clone()),
+        )
+        .await
+        .unwrap();
+        let independent = runner_source_job_for_test(
+            &store,
+            independent_workspace,
+            "independent_transition",
+            chrono::Utc::now().timestamp() - 100,
+        )
+        .await;
+        let quantum = executor
+            .run_once(chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        assert!(quantum.discovered + quantum.settlements <= 1);
+        assert_eq!(quantum.claimed, 1);
+        assert_eq!(quantum.completed, 1);
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&independent.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .attempt_count,
+            1
+        );
+        let paused_a = store
+            .list_thread_episodic_index_jobs_for_thread(&workspace, "cancel_transition", 10)
+            .await
+            .unwrap();
+        assert_eq!(paused_a, claimed);
+        let settings = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            supervisor.begin_settings(&workspace),
+        )
+        .await
+        .unwrap();
+        let canceled = runtime.await.unwrap().unwrap();
+        assert!(canceled.projection_deferred);
+        assert!(
+            !refill::refill_is_current_for_workspace_target(&store, &workspace, &target_b)
+                .await
+                .unwrap()
+        );
+        for job in &claimed {
+            let released = store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(released.status, job.status);
+            assert_eq!(released.attempt_count, job.attempt_count);
+        }
+        // Prepared same-B replacement resumes jobs only, after cancellation
+        // released the exact abandoned claims under exclusive workspace ownership.
+        store
+            .database_connection()
+            .execute_unprepared("DROP VIEW turn_event")
+            .await
+            .unwrap();
+        let resumed = refill::refill_once_with_workspace_projection(
+            store.clone(),
+            root.path(),
+            &workspace,
+            target_b.clone(),
+            Some(b),
+        )
+        .await
+        .unwrap();
+        assert!(resumed.resumed);
+        assert_eq!(resumed.source_threads_reindexed, 0);
+        for job in claimed {
+            let completed = store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(completed.status, ThreadEpisodicIndexJobStatus::Completed);
+            assert_eq!(completed.attempt_count, job.attempt_count + 1);
+        }
+        assert!(
+            refill::refill_is_current_for_workspace_target(&store, &workspace, &target_b)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_item(&ready.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ThreadEpisodicItemStatus::Active
+        );
+        drop(settings);
+    }
+
+    struct OncePanickingTransitionEmbeddingProvider(std::sync::atomic::AtomicBool);
+    impl ThreadEpisodicEmbeddingProvider for OncePanickingTransitionEmbeddingProvider {
+        fn provider_id(&self) -> &str {
+            "openrouter"
+        }
+        fn model(&self) -> &str {
+            "vendor/cancel-recovery"
+        }
+        fn dimension(&self) -> usize {
+            3
+        }
+        fn normalized(&self) -> bool {
+            true
+        }
+        fn embed_text(
+            &self,
+            _: &str,
+        ) -> std::result::Result<Vec<f32>, ThreadEpisodicEmbeddingError> {
+            if self.0.swap(false, Ordering::AcqRel) {
+                panic!("controlled transition preparation unwind");
+            }
+            Ok(vec![0.1; 3])
+        }
+    }
+
+    #[tokio::test]
+    async fn canceled_generation_drops_recovery_admission_and_does_not_retry_rejected_storage() {
+        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        use sea_orm::TransactionTrait;
+        for queued_admission in [true, false] {
+            let database_root = TempDir::new().unwrap();
+            let (store, workspace) =
+                physical_runner_store_for_test(&database_root.path().join("generation.sqlite"))
+                    .await;
+            let root = TempDir::new().unwrap();
+            let source_job = runner_source_job_for_test(
+                &store,
+                &workspace,
+                "generation_recovery",
+                chrono::Utc::now().timestamp(),
+            )
+            .await;
+            let provider = Arc::new(OncePanickingTransitionEmbeddingProvider(
+                std::sync::atomic::AtomicBool::new(true),
+            ));
+            let target =
+                ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+                    provider.as_ref(),
+                )
+                .unwrap();
+            let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+            resolver.set_active_provider(Some(provider.clone()));
+            let supervisor = Arc::new(
+                crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor::default(),
+            );
+            let executor = Arc::new(
+                ThreadEpisodicIndexExecutor::new(
+                    store.clone(),
+                    Arc::new(MemvidThreadEpisodicBackend::new()),
+                    Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                        Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                            store.clone(),
+                            thread_episodic_storage_uri_from_path(root.path()),
+                        )),
+                        resolver.clone(),
+                        store.clone(),
+                    )),
+                )
+                .with_projection_runtime(
+                    root.path().to_owned(),
+                    resolver,
+                    supervisor.clone(),
+                ),
+            );
+            let (recovery_tx, recovery_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+            *executor.transition_recovery_pause.lock().await = Some((recovery_tx, release_rx));
+            *executor.transition_recovery_waiting.lock().await = Some(waiting_tx);
+            // Only launches a supervisor-owned transition; this call does not
+            // await preparation or claim/embedding execution for the workspace.
+            assert!(
+                executor
+                    .run_once(chrono::Utc::now().timestamp())
+                    .await
+                    .unwrap()
+                    .projection_deferred
+            );
+            recovery_rx.await.unwrap();
+            let running = store
+                .find_thread_episodic_index_job_by_item(&source_job.index_item_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(running.status, ThreadEpisodicIndexJobStatus::Running);
+            assert_eq!(running.attempt_count, 1);
+            let writer = if queued_admission {
+                Some(store.database_connection().begin().await.unwrap())
+            } else {
+                store.database_connection().execute_unprepared("CREATE TRIGGER reject_generation_recovery BEFORE UPDATE ON thread_episodic_index_jobs WHEN OLD.status = 'running' BEGIN SELECT RAISE(ABORT, 'controlled permanent recovery failure'); END").await.unwrap();
+                None
+            };
+            let completion = executor.progress_notification.notified();
+            tokio::pin!(completion);
+            completion.as_mut().enable();
+            release_tx.send(()).unwrap();
+            if queued_admission {
+                // Notification comes from the first Pending poll of the real
+                // recovery future while the physical writer is occupied.
+                waiting_rx.await.unwrap();
+            } else {
+                // One rejected recovery is diagnosed and completes its lease.
+                // The old unconditional retry loop would never reach completion.
+                completion.await;
+            }
+            let settings = supervisor.begin_settings(&workspace).await;
+            assert_eq!(
+                store
+                    .find_thread_episodic_index_job(&running.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                running
+            );
+            assert!(
+                try_lock_thread_episodic_workspace(&workspace)
+                    .await
+                    .is_some()
+            );
+            if let Some(writer) = writer {
+                writer.rollback().await.unwrap();
+            } else {
+                store
+                    .database_connection()
+                    .execute_unprepared("DROP TRIGGER reject_generation_recovery")
+                    .await
+                    .unwrap();
+            }
+            store
+                .database_connection()
+                .begin()
+                .await
+                .unwrap()
+                .rollback()
+                .await
+                .unwrap();
+            // Same prepared B continues its exact IDs/budget after cancellation,
+            // recovering durable Running only under exclusive ownership.
+            let resumed = refill::refill_once_with_workspace_projection(
+                store.clone(),
+                root.path(),
+                &workspace,
+                target,
+                Some(provider),
+            )
+            .await
+            .unwrap();
+            assert!(resumed.resumed);
+            assert_eq!(resumed.source_threads_reindexed, 0);
+            let completed = store
+                .find_thread_episodic_index_job(&running.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(completed.status, ThreadEpisodicIndexJobStatus::Completed);
+            assert_eq!(completed.attempt_count, 2);
+            drop(settings);
+            executor.shutdown().await;
+        }
+    }
+
+    struct RefillBackoffEmbeddingProvider;
+    impl ThreadEpisodicEmbeddingProvider for RefillBackoffEmbeddingProvider {
+        fn provider_id(&self) -> &str {
+            "openrouter"
+        }
+        fn model(&self) -> &str {
+            "vendor/refill-next"
+        }
+        fn dimension(&self) -> usize {
+            3
+        }
+        fn normalized(&self) -> bool {
+            true
+        }
+        fn embed_text(
+            &self,
+            text: &str,
+        ) -> std::result::Result<Vec<f32>, ThreadEpisodicEmbeddingError> {
+            if text.contains("backoff_a") {
+                Err(ThreadEpisodicEmbeddingError::retryable_provider_failure(
+                    "openrouter",
+                    "vendor/refill-next",
+                    "controlled A provider backoff",
+                ))
+            } else {
+                Ok(vec![0.1; 3])
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_refill_retry_wait_does_not_block_ready_workspace_runner() {
+        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        let (store, a) = setup_thread_episodic_store().await;
+        let root = TempDir::new().unwrap();
+        let b = "ready_b_during_refill_backoff";
+        runner_workspace_for_test(&store, b).await;
+        runner_source_job_for_test(
+            &store,
+            &a,
+            "backoff_a_initial",
+            chrono::Utc::now().timestamp(),
+        )
+        .await;
+        let old = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+            "openrouter",
+            "vendor/refill-old",
+            vec![0.1; 3],
+        ));
+        let old_target =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+                old.as_ref(),
+            )
+            .unwrap();
+        refill::refill_once_with_workspace_projection(
+            store.clone(),
+            root.path(),
+            &a,
+            old_target,
+            Some(old),
+        )
+        .await
+        .unwrap();
+        runner_source_job_for_test(
+            &store,
+            &a,
+            "backoff_a_extra",
+            chrono::Utc::now().timestamp(),
+        )
+        .await;
+        let provider = Arc::new(RefillBackoffEmbeddingProvider);
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            provider.as_ref(),
+        )
+        .unwrap();
+        refill::refill_once_with_workspace_projection(
+            store.clone(),
+            root.path(),
+            b,
+            target,
+            Some(provider.clone()),
+        )
+        .await
+        .unwrap();
+        let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+        resolver.set_active_provider(Some(provider));
+        let supervisor =
+            Arc::new(crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor::default());
+        let executor = Arc::new(
+            ThreadEpisodicIndexExecutor::new(
+                store.clone(),
+                Arc::new(MemvidThreadEpisodicBackend::new()),
+                Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                    Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                        store.clone(),
+                        thread_episodic_storage_uri_from_path(root.path()),
+                    )),
+                    resolver.clone(),
+                    store.clone(),
+                )),
+            )
+            .with_projection_runtime(
+                root.path().to_owned(),
+                resolver,
+                supervisor.clone(),
+            ),
+        );
+        executor.apply_config(ThreadEpisodicIndexExecutorConfig {
+            batch_limit: 1,
+            retry_base_delay_secs: 600,
+            ..Default::default()
+        });
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        refill::notify_next_retry_wait_for_test(&a, waiting_tx);
+        let launch = executor
+            .run_once(chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        assert_eq!(launch.claimed, 0);
+        assert_eq!(launch.discovered, 1);
+        waiting_rx.await.unwrap();
+        let waiting = store
+            .list_thread_episodic_index_jobs_for_thread(&a, "backoff_a_initial", 10)
+            .await
+            .unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert!(
+            waiting
+                .iter()
+                .all(|job| job.status == ThreadEpisodicIndexJobStatus::Failed
+                    && job.attempt_count == 1
+                    && job.next_run_at.timestamp() > chrono::Utc::now().timestamp())
+        );
+        let independent = runner_source_job_for_test(
+            &store,
+            b,
+            "backoff_b_ready",
+            chrono::Utc::now().timestamp(),
+        )
+        .await;
+        executor.wake();
+        assert_eq!(
+            executor
+                .wait_for_completed_job_for_test(&independent.id)
+                .await
+                .attempt_count,
+            1
+        );
+        assert_eq!(
+            store
+                .list_thread_episodic_index_jobs_for_thread(&a, "backoff_a_initial", 10)
+                .await
+                .unwrap(),
+            waiting
+        );
+        let settings = supervisor.begin_settings(&a).await;
+        assert_eq!(
+            store
+                .list_thread_episodic_index_jobs_for_thread(&a, "backoff_a_initial", 10)
+                .await
+                .unwrap(),
+            waiting
+        );
+        drop(settings);
+        executor.shutdown().await;
+    }
+
+    fn native_runner_for_test(
+        store: Arc<CrudStore>,
+        root: &std::path::Path,
+        limit: u64,
+    ) -> Arc<ThreadEpisodicIndexExecutor> {
+        let executor = Arc::new(
+            ThreadEpisodicIndexExecutor::new(
+                store.clone(),
+                Arc::new(MemvidThreadEpisodicBackend::new()),
+                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                    store,
+                    thread_episodic_storage_uri_from_path(root),
+                )),
+            )
+            .with_projection_runtime(
+                root.to_owned(),
+                Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new()),
+                Arc::new(
+                    crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor::default(),
+                ),
+            ),
+        );
+        executor.apply_config(ThreadEpisodicIndexExecutorConfig {
+            batch_limit: limit,
+            ..Default::default()
+        });
+        executor
+    }
+
+    async fn runner_source_job_for_test(
+        store: &CrudStore,
+        workspace: &str,
+        name: &str,
+        due: i64,
+    ) -> ThreadEpisodicIndexJobRecord {
+        let source = seed_pending_thread_episodic_item(
+            store,
+            workspace,
+            name,
+            &format!("{name}_turn"),
+            &format!("{name}_item"),
+        )
+        .await;
+        seed_thread_episodic_job(store, workspace, name, &source.id, due).await
+    }
+
+    async fn runner_workspace_for_test(store: &CrudStore, name: &str) {
+        use sea_orm::{EntityTrait, Set};
+        let now: chrono::DateTime<chrono::FixedOffset> = chrono::Utc::now().into();
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set(name.to_owned()),
+            name: Set(name.to_owned()),
+            is_active: Set(true),
+            is_current: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+        })
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+        // Empty workspace has a prepared lexical projection before new work.
+        mark_thread_episodic_workspace_refill_complete_for_test(store, name).await;
+    }
+
+    #[tokio::test]
+    async fn runner_observes_other_workspace_release_and_future_deadline_while_a_stays_busy() {
+        let (store, a) = setup_thread_episodic_store().await;
+        let root = TempDir::new().unwrap();
+        let b = "release_and_deadline_b";
+        runner_workspace_for_test(&store, b).await;
+        let executor = native_runner_for_test(store.clone(), root.path(), 2);
+        executor.use_managed_time_for_test();
+        let now = executor.now_unix();
+        let a_job = runner_source_job_for_test(&store, &a, "busy_a", now).await;
+        let b_job = runner_source_job_for_test(&store, b, "busy_b", now).await;
+        let a_owner = pioneer_memory::lock_thread_episodic_workspace(&a).await;
+        let b_owner = pioneer_memory::lock_thread_episodic_workspace(b).await;
+        executor.wake();
+        executor.wait_for_busy_workspace_for_test().await;
+        // No source/config wake accompanies B's release, and A remains locked.
+        drop(b_owner);
+        let b_done = executor.wait_for_completed_job_for_test(&b_job.id).await;
+        assert_eq!(b_done.attempt_count, 1);
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&a_job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .attempt_count,
+            0
+        );
+        let later = runner_source_job_for_test(&store, b, "future_b", executor.now_unix()).await;
+        let first_attempt = store
+            .claim_thread_episodic_index_job_if_due(&later.id, executor.now_unix(), 5)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .fail_thread_episodic_index_attempt_without_source_validation(
+                &later.id,
+                first_attempt.attempt_count,
+                ThreadEpisodicIndexJobFailureUpdate {
+                    retryable: true,
+                    next_run_at_unix: Some(executor.now_unix() + 60),
+                    last_error: Some("controlled future retry".to_owned()),
+                    capacity_error: false,
+                    last_attempt_latency_ms: None,
+                },
+                executor.now_unix(),
+            )
+            .await
+            .unwrap();
+        // This wake only informs scheduling of the saved future retry; there is
+        // no notification at its deadline. The same runner must use its timer.
+        executor.wake();
+        executor.wait_for_busy_workspace_for_test().await;
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        assert_eq!(
+            executor
+                .wait_for_completed_job_for_test(&later.id)
+                .await
+                .attempt_count,
+            2
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&a_job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .attempt_count,
+            0
+        );
+        executor.shutdown().await;
+        drop(a_owner);
+    }
+
+    #[tokio::test]
+    async fn claim_budget_terminal_write_set_rolls_back_and_rechecks_current_snapshot() {
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let now = chrono::Utc::now().timestamp();
+        let original =
+            runner_source_job_for_test(&store, &workspace, "claim_budget_atomic", now).await;
+        let first = store
+            .claim_thread_episodic_index_job_if_due(&original.id, now, 2)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .requeue_thread_episodic_index_attempt(&first.id, first.attempt_count, now, None)
+            .await
+            .unwrap();
+        let stale = store
+            .find_thread_episodic_index_job(&original.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = store
+            .claim_thread_episodic_index_job_if_due(&original.id, now, 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.attempt_count, 2);
+        store
+            .requeue_thread_episodic_index_attempt(&second.id, 2, now, None)
+            .await
+            .unwrap();
+        let current = store
+            .find_thread_episodic_index_job(&original.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .claim_thread_episodic_index_job_from_snapshot(&stale, now, 2, None, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&original.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            current
+        );
+        store.database_connection().execute_unprepared("CREATE TRIGGER reject_budget_item_terminal BEFORE UPDATE ON thread_episodic_items WHEN NEW.status = 'failed' BEGIN SELECT RAISE(ABORT, 'controlled terminal item bookkeeping failure'); END").await.unwrap();
+        let before_item = store
+            .find_thread_episodic_item(&original.index_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .claim_thread_episodic_index_job_from_snapshot(&current, now, 2, None, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&original.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            current
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_item(&original.index_item_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            before_item
+        );
+        store
+            .database_connection()
+            .execute_unprepared("DROP TRIGGER reject_budget_item_terminal")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .claim_thread_episodic_index_job_from_snapshot(&current, now, 2, None, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let terminal = store
+            .find_thread_episodic_index_job(&original.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, ThreadEpisodicIndexJobStatus::Canceled);
+        assert_eq!(terminal.attempt_count, 2);
+        assert_eq!(
+            store
+                .find_thread_episodic_item(&original.index_item_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ThreadEpisodicItemStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_preserves_same_second_source_wake_across_failed_discovery_page() {
+        let (store, first_workspace) = setup_thread_episodic_store().await;
+        let root = TempDir::new().unwrap();
+        let executor = native_runner_for_test(store.clone(), root.path(), 1);
+        executor.use_managed_time_for_test();
+        let (quanta_tx, mut quanta_rx) = tokio::sync::mpsc::channel(16);
+        *executor.quantum_observer.lock().unwrap() = Some(quanta_tx);
+        tokio::time::pause();
+        let now = executor.now_unix();
+        let mut owners = Vec::new();
+        let mut old_jobs = Vec::new();
+        for (index, workspace) in [first_workspace.as_str(), "wake_old_2", "wake_old_3"]
+            .into_iter()
+            .enumerate()
+        {
+            if index > 0 {
+                runner_workspace_for_test(&store, workspace).await;
+            }
+            let job = runner_source_job_for_test(
+                &store,
+                workspace,
+                &format!("wake_old_{index}"),
+                now - 30 + index as i64 * 10,
+            )
+            .await;
+            let claim = store
+                .claim_thread_episodic_index_job_if_due(&job.id, now, 5)
+                .await
+                .unwrap()
+                .unwrap();
+            store
+                .fail_thread_episodic_index_attempt_without_source_validation(
+                    &claim.id,
+                    claim.attempt_count,
+                    ThreadEpisodicIndexJobFailureUpdate {
+                        retryable: true,
+                        next_run_at_unix: Some(now),
+                        last_error: Some("due old retry".to_owned()),
+                        capacity_error: false,
+                        last_attempt_latency_ms: None,
+                    },
+                    now,
+                )
+                .await
+                .unwrap();
+            owners.push(pioneer_memory::lock_thread_episodic_workspace(workspace).await);
+            old_jobs.push(job);
+        }
+        let b_workspace = "same_second_wake_b";
+        runner_workspace_for_test(&store, b_workspace).await;
+        // ItemCompleted has its durable delivery, but B's direct snapshot save
+        // will be the source/job commit and the production coalesced notification.
+        materialize_thread_with_item(
+            &store,
+            b_workspace,
+            "same_second_b",
+            "same_second_b_turn",
+            TurnItem::UserMessage {
+                id: "same_second_b_item".to_owned(),
+                text: "before direct save".to_owned(),
+                attachments: Vec::new(),
+            },
+            now,
+        )
+        .await;
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        *executor.quantum_finished_notice.lock().await = Some(first_tx);
+        let (failed_tx, failed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *executor.discovery_page_failure.lock().await =
+            Some((old_jobs[0].id.clone(), failed_tx, release_rx));
+        executor.wake();
+        let first = first_rx.await.unwrap();
+        assert_eq!(first.discovered + first.settlements, 1);
+        assert!(first.discovery_has_more);
+        assert_eq!(first.claimed, 0);
+        failed_rx.await.unwrap();
+        let (consumed_tx, consumed_rx) = tokio::sync::oneshot::channel();
+        *executor.wake_consumed_notice.lock().await = Some(consumed_tx);
+        store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: b_workspace.to_owned(),
+                    thread_id: "same_second_b".to_owned(),
+                    turn_id: "same_second_b_turn".to_owned(),
+                    item: TurnItem::UserMessage {
+                        id: "same_second_b_item".to_owned(),
+                        text: "committed direct source B".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        let b = store
+            .list_thread_episodic_index_jobs_for_thread(b_workspace, "same_second_b", 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(b.next_run_at.timestamp(), now);
+        assert!(b.created_at > old_jobs.last().unwrap().created_at);
+        release_tx.send(()).unwrap();
+        consumed_rx.await.unwrap();
+        // The consumed notification belongs to the continuation of the old
+        // frozen round. B cannot be reached by either its through or > T0 timer.
+        assert_eq!(
+            executor
+                .wait_for_completed_job_for_test(&b.id)
+                .await
+                .attempt_count,
+            1
+        );
+        assert_eq!(executor.now_unix(), now);
+        for job in old_jobs {
+            let current = store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.attempt_count, 1);
+            assert_eq!(current.status, ThreadEpisodicIndexJobStatus::Failed);
+        }
+        executor.shutdown().await;
+        let mut observed = Vec::new();
+        while let Ok(summary) = quanta_rx.try_recv() {
+            observed.push(summary);
+        }
+        assert!(
+            observed
+                .iter()
+                .all(|summary| summary.discovered + summary.settlements <= 1)
+        );
+        assert!(
+            observed
+                .iter()
+                .filter(|summary| summary.discovery_round_started)
+                .count()
+                >= 2
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .map(|summary| summary.claimed)
+                .sum::<usize>(),
+            1
+        );
+        // Three finite old pages, a fresh four-page round and at most the
+        // bounded return to busy rows; the observer must not overflow from spin.
+        assert!(observed.len() < 16);
+        drop(owners);
+    }
+
+    #[tokio::test]
+    async fn runner_hands_off_deadline_crossed_between_frozen_round_and_idle() {
+        let (store, a) = setup_thread_episodic_store().await;
+        let root = TempDir::new().unwrap();
+        let b = "crossed_deadline_b";
+        runner_workspace_for_test(&store, b).await;
+        let executor = native_runner_for_test(store.clone(), root.path(), 1);
+        executor.use_managed_time_for_test();
+        let now = executor.now_unix();
+        let a_job = runner_source_job_for_test(&store, &a, "deadline_busy_a", now - 10).await;
+        let b_job = runner_source_job_for_test(&store, b, "crossed_retry_b", now).await;
+        let first = store
+            .claim_thread_episodic_index_job_if_due(&b_job.id, now, 5)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .fail_thread_episodic_index_attempt_without_source_validation(
+                &b_job.id,
+                first.attempt_count,
+                ThreadEpisodicIndexJobFailureUpdate {
+                    retryable: true,
+                    next_run_at_unix: Some(now + 60),
+                    last_error: Some("future retry".to_owned()),
+                    capacity_error: false,
+                    last_attempt_latency_ms: None,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        let owner = pioneer_memory::lock_thread_episodic_workspace(&a).await;
+        let (fixed_tx, fixed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *executor.after_round_fixed_pause.lock().await = Some((fixed_tx, release_rx));
+        executor.wake();
+        fixed_rx.await.unwrap();
+        // The real round has frozen T0 and its end at A; B is outside it.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            executor
+                .wait_for_completed_job_for_test(&b_job.id)
+                .await
+                .attempt_count,
+            2
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&a_job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .attempt_count,
+            0
+        );
+        executor.shutdown().await;
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn confirmed_provider_claim_shutdown_drops_settlement_writer_admission() {
+        use sea_orm::TransactionTrait;
+        let database_root = TempDir::new().unwrap();
+        let (store, workspace) =
+            physical_runner_store_for_test(&database_root.path().join("confirmed.sqlite")).await;
+        let root = TempDir::new().unwrap();
+        let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel();
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
+            store.clone(),
+            Arc::new(MemvidThreadEpisodicBackend::new()),
+            Arc::new(PausedNativePayloadProvider {
+                inner: StoreThreadEpisodicIndexPayloadProvider::new(
+                    store.clone(),
+                    thread_episodic_storage_uri_from_path(root.path()),
+                ),
+                pause: AsyncMutex::new(Some((claimed_tx, release_rx))),
+            }),
+        ));
+        let job = runner_source_job_for_test(
+            &store,
+            &workspace,
+            "confirmed_shutdown",
+            executor.now_unix(),
+        )
+        .await;
+        executor.wake();
+        claimed_rx.await.unwrap();
+        let claimed = store
+            .find_thread_episodic_index_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.status, ThreadEpisodicIndexJobStatus::Running);
+        assert_eq!(claimed.attempt_count, 1);
+        let writer = store.database_connection().begin().await.unwrap();
+        // A live writer is deliberately held until shutdown returns. Any new
+        // unconditional settlement reservation would deadlock this scenario.
+        executor.shutdown().await;
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            claimed
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        writer.rollback().await.unwrap();
+        assert_eq!(
+            crate::database::startup::recover_inherited_thread_episodic_jobs(&store, 5)
+                .await
+                .unwrap(),
+            1
+        );
+        let recovered = store
+            .find_thread_episodic_index_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.status, ThreadEpisodicIndexJobStatus::Queued);
+        assert_eq!(recovered.attempt_count, 1);
+        let resumed = native_runner_for_test(store.clone(), root.path(), 1);
+        resumed.wake();
+        assert_eq!(
+            resumed
+                .wait_for_completed_job_for_test(&job.id)
+                .await
+                .attempt_count,
+            2
+        );
+        resumed.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn permanently_rejected_a_settlement_does_not_prohibit_b_c_with_quantum_one() {
+        use sea_orm::TransactionTrait;
+        let (store, a) = setup_thread_episodic_store().await;
+        let root = TempDir::new().unwrap();
+        let b = "healthy_retained_b";
+        let c = "healthy_retained_c";
+        runner_workspace_for_test(&store, b).await;
+        runner_workspace_for_test(&store, c).await;
+        let executor = native_runner_for_test(store.clone(), root.path(), 1);
+        executor.use_managed_time_for_test();
+        let now = executor.now_unix();
+        let a_job = runner_source_job_for_test(&store, &a, "poison_bookkeeping_a", now - 30).await;
+        let b_job = runner_source_job_for_test(&store, b, "healthy_bookkeeping_b", now - 20).await;
+        let c_job = runner_source_job_for_test(&store, c, "healthy_bookkeeping_c", now - 10).await;
+        store.database_connection().execute_unprepared("CREATE TRIGGER reject_only_a_bookkeeping BEFORE UPDATE ON thread_episodic_index_jobs WHEN OLD.thread_id = 'poison_bookkeeping_a' AND OLD.status = 'running' BEGIN SELECT RAISE(ABORT, 'controlled A bookkeeping rejection'); END").await.unwrap();
+        executor.wake();
+        executor.wait_for_completed_job_for_test(&b_job.id).await;
+        executor.wait_for_completed_job_for_test(&c_job.id).await;
+        let running = store
+            .find_thread_episodic_index_job(&a_job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.status, ThreadEpisodicIndexJobStatus::Running);
+        assert_eq!(running.attempt_count, 1);
+        assert!(
+            executor
+                .in_flight
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_none_or(|attempt| attempt.job.id == c_job.id)
+        );
+        // Freeze the clock after A/B/C have finished their real execution. If
+        // the first recovery deadline elapsed during FS work, this bounded probe
+        // either observes its backoff or records the still-rejected writer once.
+        tokio::time::pause();
+        let probe = executor.run_once(executor.now_unix()).await.unwrap();
+        assert!(probe.storage_error);
+        assert_eq!(probe.discovered + probe.settlements, 1);
+        // An unrelated wake/quantum cannot bypass or postpone A's recovery
+        // backoff. Running input is counted, but no new writer retry is made.
+        let deadline = *executor.recovery_retry_at.lock().unwrap();
+        let early = executor.run_once(executor.now_unix()).await.unwrap();
+        assert_eq!(early.discovered + early.settlements, 1);
+        assert_eq!(early.claimed, 0);
+        assert_eq!(early.storage_errors, vec!["running_recovery_backoff"]);
+        assert_eq!(*executor.recovery_retry_at.lock().unwrap(), deadline);
+        // Keep the rejection in place through multiple real recovery quanta.
+        tokio::time::advance(std::time::Duration::from_secs(90)).await;
+        let quantum = executor.run_once(executor.now_unix()).await.unwrap();
+        assert!(quantum.discovered + quantum.settlements <= 1);
+        assert_eq!(quantum.claimed, 0);
+        assert!(quantum.storage_error);
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&a_job.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            running
+        );
+        store
+            .database_connection()
+            .begin()
+            .await
+            .unwrap()
+            .rollback()
+            .await
+            .unwrap();
+        executor.shutdown().await;
+        store
+            .database_connection()
+            .execute_unprepared("DROP TRIGGER reject_only_a_bookkeeping")
+            .await
+            .unwrap();
+        store
+            .requeue_thread_episodic_index_attempt(&a_job.id, 1, executor.now_unix(), None)
+            .await
+            .unwrap();
+        let newer = store
+            .claim_thread_episodic_index_job_if_due(&a_job.id, executor.now_unix(), 5)
+            .await
+            .unwrap()
+            .unwrap();
+        executor
+            .settle_owned_attempt(&running, executor.now_unix())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&a_job.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            newer
+        );
+        assert_eq!(newer.attempt_count, 2);
+        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        let next_model = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+            "openrouter",
+            "vendor/replacement-after-local-error",
+            vec![0.1; 3],
+        ));
+        let next_target =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+                next_model.as_ref(),
+            )
+            .unwrap();
+        refill::refill_once_with_workspace_projection(
+            store.clone(),
+            root.path(),
+            &a,
+            next_target,
+            Some(next_model),
+        )
+        .await
+        .unwrap();
+        let replacement = store
+            .find_thread_episodic_index_job_by_item(&a_job.index_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(replacement.id, newer.id);
+        assert_eq!(replacement.status, ThreadEpisodicIndexJobStatus::Completed);
+        assert_eq!(replacement.attempt_count, 1);
+        executor
+            .settle_owned_attempt(&newer, executor.now_unix())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&replacement.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            replacement
+        );
+    }
+
+    #[tokio::test]
+    async fn fixed_round_revisits_busy_b_despite_continuously_appended_suffix() {
+        let (store, a) = setup_thread_episodic_store().await;
+        let b = "round_busy_b";
+        runner_workspace_for_test(&store, b).await;
+        let root = TempDir::new().unwrap();
+        let executor = native_runner_for_test(store.clone(), root.path(), 1);
+        let now = executor.now_unix();
+        let b_job = runner_source_job_for_test(&store, b, "round_b", now - 100).await;
+        runner_source_job_for_test(&store, &a, "initial_suffix", now - 99).await;
+        let owner = pioneer_memory::lock_thread_episodic_workspace(b).await;
+        let first = executor.run_once(now).await.unwrap();
+        assert_eq!(first.discovered, 1);
+        assert_eq!(first.claimed, 0);
+        assert!(first.discovery_has_more);
+        drop(owner);
+        let mut revisited = false;
+        for quantum in 0..4 {
+            // All new rows sort AFTER the old cursor, not behind it. The
+            // fixed end excludes them from the current finite round.
+            for suffix in 0..2 {
+                runner_source_job_for_test(
+                    &store,
+                    &a,
+                    &format!("appended_{quantum}_{suffix}"),
+                    now - 98 + quantum,
+                )
+                .await;
+            }
+            let summary = executor.run_once(now).await.unwrap();
+            assert!(summary.discovered + summary.settlements <= 1);
+            assert!(summary.claimed <= 1);
+            let b_now = store
+                .find_thread_episodic_index_job(&b_job.id)
+                .await
+                .unwrap()
+                .unwrap();
+            if b_now.status == ThreadEpisodicIndexJobStatus::Completed {
+                assert_eq!(b_now.attempt_count, 1);
+                revisited = true;
+                break;
+            }
+        }
+        assert!(revisited);
+        executor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn owned_attempts_recover_readiness_failure_and_ambiguous_commit_without_new_wake() {
+        for ambiguous in [false, true] {
+            let (store, a) = setup_thread_episodic_store().await;
+            let root = TempDir::new().unwrap();
+            let executor = native_runner_for_test(store.clone(), root.path(), 2);
+            executor.use_managed_time_for_test();
+            let job =
+                runner_source_job_for_test(&store, &a, "recover_local", executor.now_unix()).await;
+            let b = "healthy_during_settlement";
+            runner_workspace_for_test(&store, b).await;
+            let healthy = runner_source_job_for_test(
+                &store,
+                b,
+                "healthy_settlement",
+                executor.now_unix() + 1,
+            )
+            .await;
+            if ambiguous {
+                store.make_next_episodic_claim_commit_ambiguous_for_test();
+            } else {
+                executor
+                    .readiness_read_failure
+                    .store(true, Ordering::Release);
+            }
+            executor.wake();
+            executor.pending_notification.notified().await;
+            let running = store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(running.status, ThreadEpisodicIndexJobStatus::Running);
+            assert_eq!(running.attempt_count, 1);
+            // Readiness failed before FS, or claim commit was not acknowledged.
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+            tokio::time::pause();
+            tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            assert_eq!(
+                executor
+                    .wait_for_completed_job_for_test(&healthy.id)
+                    .await
+                    .attempt_count,
+                1
+            );
+            tokio::time::advance(std::time::Duration::from_secs(180)).await;
+            let completed = executor.wait_for_completed_job_for_test(&job.id).await;
+            assert_eq!(completed.attempt_count, 2);
+            assert!(executor.in_flight.lock().unwrap().is_none());
+            executor.shutdown().await;
+            tokio::time::resume();
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_attempt_recovers_both_failed_bookkeeping_paths_and_fences_late_recovery() {
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let root = TempDir::new().unwrap();
+        let executor = native_runner_for_test(store.clone(), root.path(), 1);
+        executor.use_managed_time_for_test();
+        let job =
+            runner_source_job_for_test(&store, &workspace, "both_writes", executor.now_unix())
+                .await;
+        executor
+            .inject_primary_persistence_failure("first write unavailable", None)
+            .await;
+        executor
+            .inject_fallback_persistence_failure("fallback unavailable")
+            .await;
+        // Force an actual attempt result through both existing failure writers.
+        executor
+            .readiness_read_failure
+            .store(false, Ordering::Release);
+        store.database_connection().execute_unprepared("CREATE TRIGGER reject_completion_once BEFORE UPDATE ON thread_episodic_index_jobs WHEN NEW.status = 'completed' BEGIN SELECT RAISE(ABORT, 'controlled completion write failure'); END").await.unwrap();
+        executor.wake();
+        executor.pending_notification.notified().await;
+        let running = store
+            .find_thread_episodic_index_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.status, ThreadEpisodicIndexJobStatus::Running);
+        assert_eq!(running.attempt_count, 1);
+        store
+            .database_connection()
+            .execute_unprepared("DROP TRIGGER reject_completion_once")
+            .await
+            .unwrap();
+        // A late recovery cannot overwrite a newer attempt. The explicit CRUD
+        // retry here supplies that competing generation; no old callback runs.
+        store
+            .requeue_thread_episodic_index_attempt(&job.id, 1, executor.now_unix(), None)
+            .await
+            .unwrap();
+        let newer = store
+            .claim_thread_episodic_index_job_if_due(&job.id, executor.now_unix(), 5)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(newer.attempt_count, 2);
+        executor
+            .settle_owned_attempt(&running, executor.now_unix())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            newer
+        );
+        // Release that competing fixture attempt explicitly, then leave only the
+        // original wake to continue this source after storage is restored.
+        store
+            .requeue_thread_episodic_index_attempt(&job.id, 2, executor.now_unix(), None)
+            .await
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(180)).await;
+        assert_eq!(
+            executor
+                .wait_for_completed_job_for_test(&job.id)
+                .await
+                .attempt_count,
+            3
+        );
+        executor.shutdown().await;
+    }
+
+    // Deliberately manual async-trait signature: this exercises a panic while
+    // creating a preparation future as well as a panic while polling it.
+    struct UnwindingNativePayloadProvider {
+        inner: StoreThreadEpisodicIndexPayloadProvider,
+        job_id: String,
+        creation: bool,
+        armed: std::sync::atomic::AtomicBool,
+    }
+    impl ThreadEpisodicIndexPayloadProvider for UnwindingNativePayloadProvider {
+        fn resolve_index_request<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            job: &'life1 ThreadEpisodicIndexJobRecord,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<
+                            ThreadEpisodicResolvedIndexRequest,
+                            ThreadEpisodicIndexResolutionError,
+                        >,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            if self.creation && job.id == self.job_id && self.armed.swap(false, Ordering::AcqRel) {
+                panic!("controlled preparation factory unwind");
+            }
+            Box::pin(async move {
+                if !self.creation
+                    && job.id == self.job_id
+                    && self.armed.swap(false, Ordering::AcqRel)
+                {
+                    panic!("controlled preparation poll unwind");
+                }
+                self.inner.resolve_index_request(job).await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_candidate_unwinds_preserve_a_c_and_observe_b_before_recovery() {
+        use sea_orm::TransactionTrait;
+        for stage in ["claim", "creation", "poll", "result", "settlement"] {
+            let (store, a) = setup_thread_episodic_store().await;
+            let root = TempDir::new().unwrap();
+            let b = format!("unwind_b_{stage}");
+            let c = format!("unwind_c_{stage}");
+            runner_workspace_for_test(&store, &b).await;
+            runner_workspace_for_test(&store, &c).await;
+            let now = chrono::Utc::now().timestamp();
+            let a_job = runner_source_job_for_test(&store, &a, "unwind_a", now - 30).await;
+            let b_job = runner_source_job_for_test(&store, &b, "unwind_b", now - 20).await;
+            let c_job = runner_source_job_for_test(&store, &c, "unwind_c", now - 10).await;
+            if stage == "settlement" {
+                assert_eq!(
+                    store
+                        .claim_thread_episodic_index_job_if_due(&b_job.id, now, 5)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .attempt_count,
+                    1
+                );
+            }
+            let payload: Arc<dyn ThreadEpisodicIndexPayloadProvider> =
+                if matches!(stage, "creation" | "poll") {
+                    Arc::new(UnwindingNativePayloadProvider {
+                        inner: StoreThreadEpisodicIndexPayloadProvider::new(
+                            store.clone(),
+                            thread_episodic_storage_uri_from_path(root.path()),
+                        ),
+                        job_id: b_job.id.clone(),
+                        creation: stage == "creation",
+                        armed: std::sync::atomic::AtomicBool::new(true),
+                    })
+                } else {
+                    Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                        store.clone(),
+                        thread_episodic_storage_uri_from_path(root.path()),
+                    ))
+                };
+            let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
+                store.clone(),
+                Arc::new(MemvidThreadEpisodicBackend::new()),
+                payload,
+            ));
+            executor.use_managed_time_for_test();
+            executor.apply_config(ThreadEpisodicIndexExecutorConfig {
+                batch_limit: 3,
+                ..Default::default()
+            });
+            if matches!(stage, "claim" | "result" | "settlement") {
+                let point = match stage {
+                    "claim" => "claim",
+                    "result" => "result",
+                    _ => "settlement",
+                };
+                *executor.candidate_panic.lock().unwrap() = Some((b_job.id.clone(), point));
+            }
+            let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+            *executor.quantum_finished_notice.lock().await = Some(finished_tx);
+            executor.wake();
+            let quantum = finished_rx.await.unwrap();
+            assert!(quantum.storage_error);
+            assert!(quantum.discovered + quantum.settlements <= 3);
+            assert_eq!(
+                executor
+                    .wait_for_completed_job_for_test(&a_job.id)
+                    .await
+                    .attempt_count,
+                1
+            );
+            assert_eq!(
+                executor
+                    .wait_for_completed_job_for_test(&c_job.id)
+                    .await
+                    .attempt_count,
+                1
+            );
+            let interrupted = store
+                .find_thread_episodic_index_job(&b_job.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(interrupted.attempt_count, 1);
+            assert_eq!(
+                interrupted.status,
+                if stage == "result" {
+                    ThreadEpisodicIndexJobStatus::Completed
+                } else {
+                    ThreadEpisodicIndexJobStatus::Running
+                }
+            );
+            let item = store
+                .find_thread_episodic_item(&b_job.index_item_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(item.frame_id.is_some(), stage == "result");
+            assert!(executor.in_flight.lock().unwrap().is_none());
+            assert!(try_lock_thread_episodic_workspace(&b).await.is_some());
+            store
+                .database_connection()
+                .begin()
+                .await
+                .unwrap()
+                .rollback()
+                .await
+                .unwrap();
+            // No manual wake or run_once: the surviving runner observes durable
+            // Running on its next bounded round and respects existing retry policy.
+            if stage != "result" {
+                tokio::time::pause();
+                tokio::time::advance(std::time::Duration::from_secs(180)).await;
+                assert_eq!(
+                    executor
+                        .wait_for_completed_job_for_test(&b_job.id)
+                        .await
+                        .attempt_count,
+                    2
+                );
+                tokio::time::resume();
+            }
+            executor.shutdown().await;
+        }
+    }
+
+    struct BlockingNativeRunnerBackend {
+        native: Arc<MemvidThreadEpisodicBackend>,
+        barrier: AsyncMutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                std::sync::mpsc::Receiver<()>,
+            )>,
+        >,
+    }
+    #[async_trait]
+    impl ThreadEpisodicMemvidBackend for BlockingNativeRunnerBackend {
+        fn capabilities(&self) -> pioneer_memory::ThreadEpisodicMemvidBackendCapabilities {
+            self.native.capabilities()
+        }
+        async fn index_item(
+            &self,
+            request: ThreadEpisodicMemvidIndexRequest,
+        ) -> std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>
+        {
+            self.native.index_item(request).await
+        }
+        async fn index_item_with_workspace_ownership(
+            &self,
+            request: ThreadEpisodicMemvidIndexRequest,
+            ownership: ThreadEpisodicWorkspaceOwnership,
+        ) -> std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>
+        {
+            let barrier = self.barrier.lock().await.take();
+            let Some((started, release)) = barrier else {
+                return self
+                    .native
+                    .index_item_with_workspace_ownership(request, ownership)
+                    .await;
+            };
+            let runtime = tokio::runtime::Handle::current();
+            let native = self.native.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = started.send(());
+                // Sender drop on panic releases this blocking task as well.
+                release.recv().map_err(|_| {
+                    ThreadEpisodicMemvidError::retryable("blocking test release dropped")
+                })?;
+                runtime.block_on(native.index_item_with_workspace_ownership(request, ownership))
+            })
+            .await
+            .map_err(|error| ThreadEpisodicMemvidError::retryable(error.to_string()))?
+        }
+        async fn search(
+            &self,
+            request: ThreadEpisodicMemvidSearchRequest,
+        ) -> std::result::Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError>
+        {
+            self.native.search(request).await
+        }
+    }
+
+    struct PausedNativePayloadProvider {
+        inner: StoreThreadEpisodicIndexPayloadProvider,
+        pause: AsyncMutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
+    }
+    #[async_trait]
+    impl ThreadEpisodicIndexPayloadProvider for PausedNativePayloadProvider {
+        async fn resolve_index_request(
+            &self,
+            job: &ThreadEpisodicIndexJobRecord,
+        ) -> std::result::Result<
+            ThreadEpisodicResolvedIndexRequest,
+            ThreadEpisodicIndexResolutionError,
+        > {
+            let pause = self.pause.lock().await.take();
+            if let Some((started, release)) = pause {
+                let _ = started.send(());
+                let _ = release.await;
+            }
+            self.inner.resolve_index_request(job).await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runner_shutdown_joins_blocking_write_and_rejects_subsequent_wakes() {
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let root = TempDir::new().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let backend = Arc::new(BlockingNativeRunnerBackend {
+            native: Arc::new(MemvidThreadEpisodicBackend::new()),
+            barrier: AsyncMutex::new(Some((started_tx, release_rx))),
+        });
+        let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
+            store.clone(),
+            backend,
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                store.clone(),
+                thread_episodic_storage_uri_from_path(root.path()),
+            )),
+        ));
+        let job = runner_source_job_for_test(
+            &store,
+            &workspace,
+            "blocking_shutdown",
+            executor.now_unix(),
+        )
+        .await;
+        executor.wake();
+        started_rx.await.unwrap();
+        let shutdown = executor.shutdown();
+        tokio::pin!(shutdown);
+        assert!(futures_util::poll!(shutdown.as_mut()).is_pending());
+        assert!(
+            try_lock_thread_episodic_workspace(&workspace)
+                .await
+                .is_none()
+        );
+        // Release BEFORE joining, even though the async index waiter is canceled.
+        release_tx.send(()).unwrap();
+        shutdown.await;
+        let settled = store
+            .find_thread_episodic_index_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.status, ThreadEpisodicIndexJobStatus::Running);
+        assert_eq!(settled.attempt_count, 1);
+        let source = store
+            .find_thread_episodic_item(&job.index_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let capsules = store
+            .list_all_thread_episodic_capsules_for_workspace(&workspace)
+            .await
+            .unwrap();
+        let bytes = capsules
+            .iter()
+            .map(|capsule| {
+                std::fs::read(capsule.storage_uri.strip_prefix("file://").unwrap()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        executor.wake();
+        assert!(
+            executor
+                .run_once(executor.now_unix() + 3600)
+                .await
+                .unwrap()
+                .claimed
+                == 0
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            settled
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_item(&source.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            source
+        );
+        for (capsule, bytes) in capsules.iter().zip(bytes) {
+            assert_eq!(
+                std::fs::read(capsule.storage_uri.strip_prefix("file://").unwrap()).unwrap(),
+                bytes
+            );
+        }
+        assert!(
+            try_lock_thread_episodic_workspace(&workspace)
+                .await
+                .is_some()
+        );
+    }
+
+    async fn physical_runner_store_for_test(path: &std::path::Path) -> (Arc<CrudStore>, String) {
+        use sea_orm::ConnectOptions;
+        let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
+        options.max_connections(1).sqlx_logging(false);
+        let writer = Database::connect(options).await.unwrap();
+        Migrator::up(&writer, None).await.unwrap();
+        bootstrap(&writer).await.unwrap();
+        writer
+            .execute_unprepared("PRAGMA journal_mode=WAL")
+            .await
+            .unwrap();
+        let workspace = WorkspaceManager::new(writer.clone())
+            .list_workspaces()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|workspace| workspace.is_active && workspace.is_current)
+            .unwrap()
+            .id;
+        let mut options =
+            ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(path));
+        options
+            .max_connections(2)
+            .sqlx_logging(false)
+            .map_sqlx_sqlite_opts(|options| {
+                options
+                    .read_only(true)
+                    .create_if_missing(false)
+                    .pragma("query_only", "ON")
+            });
+        let reader = Database::connect(options).await.unwrap();
+        let database = pioneer_sqlite::SqliteDatabase::new(reader, writer);
+        database.validate_reader().await.unwrap();
+        let store = Arc::new(CrudStore::new(database));
+        mark_thread_episodic_workspace_refill_complete_for_test(&store, &workspace).await;
+        (store, workspace)
+    }
+
+    #[tokio::test]
+    async fn runner_shutdown_cancels_idle_ownership_writer_and_provider_waits() {
+        use sea_orm::TransactionTrait;
+        for phase in ["idle", "ownership", "writer", "provider"] {
+            let database_root = TempDir::new().unwrap();
+            let (store, workspace) = if phase == "writer" {
+                physical_runner_store_for_test(&database_root.path().join("shutdown.sqlite")).await
+            } else {
+                setup_thread_episodic_store().await
+            };
+            let root = TempDir::new().unwrap();
+            let (notice_tx, notice_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let payload = Arc::new(PausedNativePayloadProvider {
+                inner: StoreThreadEpisodicIndexPayloadProvider::new(
+                    store.clone(),
+                    thread_episodic_storage_uri_from_path(root.path()),
+                ),
+                pause: AsyncMutex::new((phase == "provider").then_some((notice_tx, release_rx))),
+            });
+            let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
+                store.clone(),
+                Arc::new(MemvidThreadEpisodicBackend::new()),
+                payload,
+            ));
+            let job = if phase == "idle" {
+                None
+            } else {
+                Some(
+                    runner_source_job_for_test(
+                        &store,
+                        &workspace,
+                        &format!("shutdown_{phase}"),
+                        executor.now_unix(),
+                    )
+                    .await,
+                )
+            };
+            let owner = if phase == "ownership" {
+                Some(pioneer_memory::lock_thread_episodic_workspace(&workspace).await)
+            } else {
+                None
+            };
+            let transaction = if phase == "writer" {
+                Some(store.database_connection().begin().await.unwrap())
+            } else {
+                None
+            };
+            let (before_claim_tx, before_claim_rx) = tokio::sync::oneshot::channel();
+            if phase == "writer" {
+                *executor.before_claim_notice.lock().await = Some(before_claim_tx);
+            }
+            let (idle_tx, idle_rx) = tokio::sync::oneshot::channel();
+            let (_idle_release_tx, idle_release_rx) = tokio::sync::oneshot::channel();
+            if phase == "idle" {
+                executor
+                    .pause_before_idle_for_test(idle_tx, idle_release_rx)
+                    .await;
+            }
+            executor.wake();
+            match phase {
+                "idle" => idle_rx.await.unwrap(),
+                "ownership" => executor.wait_for_busy_workspace_for_test().await,
+                "writer" => before_claim_rx.await.unwrap(),
+                "provider" => notice_rx.await.unwrap(),
+                _ => unreachable!(),
+            }
+            executor.shutdown().await;
+            drop(release_tx);
+            drop(owner);
+            if let Some(transaction) = transaction {
+                transaction.rollback().await.unwrap();
+                // A canceled admission left neither a reservation nor a permit.
+                store
+                    .database_connection()
+                    .begin()
+                    .await
+                    .unwrap()
+                    .rollback()
+                    .await
+                    .unwrap();
+            }
+            if let Some(job) = job {
+                let settled = store
+                    .find_thread_episodic_index_job(&job.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    settled.status,
+                    if phase == "provider" {
+                        ThreadEpisodicIndexJobStatus::Running
+                    } else {
+                        ThreadEpisodicIndexJobStatus::Queued
+                    }
+                );
+                assert_eq!(
+                    settled.attempt_count,
+                    if phase == "provider" { 1 } else { 0 }
+                );
+                executor.wake();
+                assert_eq!(
+                    executor
+                        .run_once(executor.now_unix() + 3600)
+                        .await
+                        .unwrap()
+                        .claimed,
+                    0
+                );
+                assert_eq!(
+                    store
+                        .find_thread_episodic_index_job(&job.id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    settled
+                );
+            }
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+            assert!(
+                try_lock_thread_episodic_workspace(&workspace)
+                    .await
+                    .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_candidate_claim_rechecks_due_and_never_dispatches_failed_commit() {
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let root = TempDir::new().unwrap();
+        let source = seed_pending_thread_episodic_item(
+            &store,
+            &workspace,
+            "claim_recheck",
+            "claim_turn",
+            "claim_item",
+        )
+        .await;
+        let job = seed_thread_episodic_job(
+            &store,
+            &workspace,
+            "claim_recheck",
+            &source.id,
+            1_700_000_000,
+        )
+        .await;
+        let executor = ThreadEpisodicIndexExecutor::new(
+            store.clone(),
+            Arc::new(MemvidThreadEpisodicBackend::new()),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                store.clone(),
+                thread_episodic_storage_uri_from_path(root.path()),
+            )),
+        );
+        store.database_connection().execute_unprepared("CREATE TRIGGER reject_candidate_claim BEFORE UPDATE ON thread_episodic_index_jobs WHEN NEW.status = 'running' BEGIN SELECT RAISE(ABORT, 'controlled claim rollback'); END").await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        assert!(executor.run_once(now).await.unwrap().storage_error);
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            job
+        );
+        assert!(
+            store
+                .list_all_thread_episodic_capsules_for_workspace(&workspace)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        store
+            .database_connection()
+            .execute_unprepared("DROP TRIGGER reject_candidate_claim")
+            .await
+            .unwrap();
+        let selected = store
+            .list_due_thread_episodic_index_jobs_after(now, None, None, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let claim = store
+            .claim_thread_episodic_index_job_if_due(&selected.id, now, 5)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.attempt_count, 1);
+        store
+            .fail_thread_episodic_index_attempt_without_source_validation(
+                &claim.id,
+                claim.attempt_count,
+                ThreadEpisodicIndexJobFailureUpdate {
+                    retryable: true,
+                    next_run_at_unix: Some(now + 600),
+                    last_error: Some("backoff after selected snapshot".to_owned()),
+                    capacity_error: false,
+                    last_attempt_latency_ms: None,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        let delayed = store
+            .find_thread_episodic_index_job(&claim.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .claim_thread_episodic_index_job_if_due(&selected.id, now, 5)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&claim.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            delayed
+        );
+        assert_eq!(
+            store
+                .next_scheduled_thread_episodic_index_job_at()
+                .await
+                .unwrap(),
+            Some(now + 600)
+        );
+        assert!(
+            store
+                .list_due_thread_episodic_index_jobs_after(now, None, None, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let retry = store
+            .claim_thread_episodic_index_job_if_due(&selected.id, now + 600, 5)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.attempt_count, 2);
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&retry.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            retry
+        );
+        assert!(
+            store
+                .claim_thread_episodic_index_job_if_due(&selected.id, now + 600, 5)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&retry.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .attempt_count,
+            2
+        );
+    }
+
+    // Pause asynchronously after the real provider has prepared its request.
+    // Canceling the executor drops this future; there is no blocking barrier to
+    // release before joining, including when an assertion panics.
+    struct PausedIndexPayloadProvider {
+        inner: Arc<dyn ThreadEpisodicIndexPayloadProvider>,
+        started: AsyncMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    #[async_trait]
+    impl ThreadEpisodicIndexPayloadProvider for PausedIndexPayloadProvider {
+        async fn resolve_index_request(
+            &self,
+            job: &ThreadEpisodicIndexJobRecord,
+        ) -> std::result::Result<
+            ThreadEpisodicResolvedIndexRequest,
+            ThreadEpisodicIndexResolutionError,
+        > {
+            let resolved = self.inner.resolve_index_request(job).await?;
+            if let Some(started) = self.started.lock().await.take() {
+                let _ = started.send(());
+                std::future::pending::<()>().await;
+            }
+            Ok(resolved)
+        }
+    }
+
+    struct PausedEmbeddingResolver {
+        provider: Arc<dyn ThreadEpisodicEmbeddingProvider>,
+        started: AsyncMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: AsyncMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl ThreadEpisodicIndexEmbeddingProviderResolver for PausedEmbeddingResolver {
+        async fn resolve_active_embedding_provider(
+            &self,
+            _workspace: &str,
+        ) -> std::result::Result<
+            Option<Arc<dyn ThreadEpisodicEmbeddingProvider>>,
+            ThreadEpisodicIndexResolutionError,
+        > {
+            if let Some(started) = self.started.lock().await.take() {
+                let _ = started.send(());
+                self.release
+                    .lock()
+                    .await
+                    .take()
+                    .unwrap()
+                    .await
+                    .map_err(|_| {
+                        ThreadEpisodicIndexResolutionError::retryable(
+                            "controlled resolution canceled",
+                        )
+                    })?;
+            }
+            Ok(Some(self.provider.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn projection_reset_owns_prepared_requests_and_new_source_claims() {
+        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        use pioneer_sqlite::{SqliteDatabase, sqlite_read_only_connection_url};
+        use sea_orm::{ConnectOptions, TransactionTrait};
+        let root = TempDir::new().unwrap();
+        let db_path = root.path().join("ownership.sqlite");
+        let mut writer_options =
+            ConnectOptions::new(format!("sqlite://{}?mode=rwc", db_path.display()));
+        writer_options.max_connections(1).sqlx_logging(false);
+        let writer = Database::connect(writer_options).await.unwrap();
+        Migrator::up(&writer, None).await.unwrap();
+        bootstrap(&writer).await.unwrap();
+        writer
+            .execute_unprepared("PRAGMA journal_mode=WAL")
+            .await
+            .unwrap();
+        let workspace = WorkspaceManager::new(writer.clone())
+            .list_workspaces()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|workspace| workspace.is_active && workspace.is_current)
+            .unwrap()
+            .id;
+        let mut reader_options = ConnectOptions::new(sqlite_read_only_connection_url(&db_path));
+        reader_options
+            .max_connections(2)
+            .sqlx_logging(false)
+            .map_sqlx_sqlite_opts(|options| {
+                options
+                    .read_only(true)
+                    .create_if_missing(false)
+                    .pragma("query_only", "ON")
+            });
+        let reader = Database::connect(reader_options).await.unwrap();
+        let database = SqliteDatabase::new(reader, writer);
+        database.validate_reader().await.unwrap();
+        let store = Arc::new(CrudStore::new(database.clone()));
+        let maintenance = Arc::new(store.with_maintenance_access());
+        mark_thread_episodic_workspace_refill_complete_for_test(&store, &workspace).await;
+        let model_a = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+            "openrouter",
+            "vendor/model-a",
+            vec![0.1; 3],
+        ));
+        let target_a =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+                model_a.as_ref(),
+            )
+            .unwrap();
+        let ready = seed_pending_thread_episodic_item(
+            &store,
+            &workspace,
+            "ownership_thread",
+            "ready_turn",
+            "ready_item",
+        )
+        .await;
+        seed_thread_episodic_job(
+            &store,
+            &workspace,
+            "ownership_thread",
+            &ready.id,
+            1_700_000_000,
+        )
+        .await;
+        refill::refill_once_with_workspace_projection(
+            maintenance.clone(),
+            root.path(),
+            &workspace,
+            target_a.clone(),
+            Some(model_a.clone()),
+        )
+        .await
+        .unwrap();
+        let extra = seed_pending_thread_episodic_item(
+            &store,
+            &workspace,
+            "ownership_thread",
+            "extra_turn",
+            "extra_item",
+        )
+        .await;
+        let old_job = seed_thread_episodic_job(
+            &store,
+            &workspace,
+            "ownership_thread",
+            &extra.id,
+            1_700_000_000,
+        )
+        .await;
+        let resolver_a = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+        resolver_a.set_active_provider(Some(model_a.clone()));
+        let (prepared_tx, prepared_rx) = tokio::sync::oneshot::channel();
+        let executor_a = Arc::new(ThreadEpisodicIndexExecutor::new(
+            store.clone(),
+            Arc::new(MemvidThreadEpisodicBackend::new()),
+            Arc::new(PausedIndexPayloadProvider {
+                inner: Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                    Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                        store.clone(),
+                        thread_episodic_storage_uri_from_path(root.path()),
+                    )),
+                    resolver_a,
+                    store.clone(),
+                )),
+                started: AsyncMutex::new(Some(prepared_tx)),
+            }),
+        ));
+        let old_work = tokio::spawn({
+            let executor = executor_a.clone();
+            async move { executor.run_once(chrono::Utc::now().timestamp()).await }
+        });
+        prepared_rx.await.unwrap();
+        let old_claim = store
+            .find_thread_episodic_index_job(&old_job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_claim.status, ThreadEpisodicIndexJobStatus::Running);
+        let model_b = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+            "openrouter",
+            "vendor/model-b",
+            vec![0.1; 4],
+        ));
+        let target_b =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+                model_b.as_ref(),
+            )
+            .unwrap();
+        let (reset_started_tx, reset_started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let reset_resolver = Arc::new(PausedEmbeddingResolver {
+            provider: model_b.clone(),
+            started: AsyncMutex::new(Some(reset_started_tx)),
+            release: AsyncMutex::new(Some(release_rx)),
+        });
+        let reset = tokio::spawn({
+            let store = maintenance.clone();
+            let workspace = workspace.clone();
+            let target = target_b.clone();
+            let root = root.path().to_owned();
+            async move {
+                refill::refill_once_with_projection_resolver(
+                    store,
+                    &root,
+                    &workspace,
+                    target,
+                    Some(reset_resolver),
+                    None,
+                )
+                .await
+            }
+        });
+        // The real A request is already prepared, but no filesystem write has
+        // begun. Replacement cannot obtain ownership until cancellation drops
+        // this request; an already-running blocking write is covered in memory.
+        assert!(
+            pioneer_memory::try_lock_thread_episodic_workspace(&workspace)
+                .await
+                .is_none()
+        );
+        assert_eq!(model_b.calls(), 0);
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&old_claim.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            old_claim
+        );
+        // Even while replacement awaits workspace ownership, the sole writer
+        // remains available for an unrelated critical transaction.
+        let unrelated = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            database.with_critical_writes().begin(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        unrelated.rollback().await.unwrap();
+        old_work.abort();
+        assert!(old_work.await.unwrap_err().is_cancelled());
+        reset_started_rx.await.unwrap();
+        // The transition owns this workspace, but canonical source/job writes
+        // remain available. Ordinary indexing cannot claim the new durable job.
+        let during = seed_pending_thread_episodic_item(
+            &store,
+            &workspace,
+            "ownership_thread",
+            "during_turn",
+            "during_item",
+        )
+        .await;
+        let canonical = store
+            .get_turn_item("during_turn", "during_item")
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: workspace.clone(),
+                    thread_id: "ownership_thread".to_owned(),
+                    turn_id: "during_turn".to_owned(),
+                    item: canonical,
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+        let during_job = store
+            .find_thread_episodic_index_job_by_item(&during.id)
+            .await
+            .unwrap()
+            .unwrap();
+        // Another workspace must still execute, even when all the earlier due
+        // jobs belong to the workspace whose transition currently owns it.
+        use sea_orm::{EntityTrait, Set};
+        let other_workspace = "ownership_other_workspace";
+        let now: chrono::DateTime<chrono::FixedOffset> = chrono::Utc::now().into();
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set(other_workspace.to_owned()),
+            name: Set("Independent workspace".to_owned()),
+            is_active: Set(true),
+            is_current: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+        })
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+        let other = seed_pending_thread_episodic_item(
+            &store,
+            other_workspace,
+            "other_thread",
+            "other_turn",
+            "other_item",
+        )
+        .await;
+        seed_thread_episodic_job(
+            &store,
+            other_workspace,
+            "other_thread",
+            &other.id,
+            1_700_000_000,
+        )
+        .await;
+        assert_eq!(
+            executor_a
+                .run_once(chrono::Utc::now().timestamp())
+                .await
+                .unwrap()
+                .completed,
+            1
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&during_job.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            during_job
+        );
+        let a_calls = model_a.calls();
+        let unrelated = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            database.with_critical_writes().begin(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // B's provider is paused outside DB capacity. Bounded discovery uses
+        // the physical reader, and busy workspace admission requires no writer.
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                executor_a.run_once(chrono::Utc::now().timestamp())
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .claimed,
+            0
+        );
+        unrelated.rollback().await.unwrap();
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&during_job.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            during_job
+        );
+        release_tx.send(()).unwrap();
+        let result = reset.await.unwrap().unwrap();
+        assert_eq!(result.completed_jobs, 3);
+        assert_eq!(model_b.calls(), 3);
+        for source in [&ready, &extra, &during] {
+            let active = store
+                .find_thread_episodic_item(&source.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(active.status, ThreadEpisodicItemStatus::Active);
+            let artifact = store
+                .find_thread_episodic_embedding_artifact(
+                    active.embedding_artifact_id.as_deref().unwrap(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(artifact.model, "vendor/model-b");
+            assert_eq!(artifact.dimension, 4);
+            let job = store
+                .find_thread_episodic_index_job_by_item(&source.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.status, ThreadEpisodicIndexJobStatus::Completed);
+            assert_eq!(job.attempt_count, 1);
+        }
+        let capsules = store
+            .list_all_thread_episodic_capsules_for_workspace(&workspace)
+            .await
+            .unwrap();
+        let before =
+            std::fs::read(capsules[0].storage_uri.strip_prefix("file://").unwrap()).unwrap();
+        let late = executor_a
+            .process_claimed_job(
+                old_claim,
+                chrono::Utc::now().timestamp(),
+                ThreadEpisodicIndexExecutorConfig::default(),
+                pioneer_memory::lock_thread_episodic_workspace(&workspace).await,
+            )
+            .await;
+        assert!(matches!(
+            late,
+            ThreadEpisodicIndexJobProcessOutcome::StaleAttempt
+        ));
+        assert_eq!(model_a.calls(), a_calls);
+        assert_eq!(
+            std::fs::read(capsules[0].storage_uri.strip_prefix("file://").unwrap()).unwrap(),
+            before
+        );
+        let idle = refill::refill_once_with_projection_resolver(
+            store.clone(),
+            root.path(),
+            &workspace,
+            target_b.clone(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(idle.skipped);
+        assert_eq!(model_b.calls(), 3);
+        assert!(
+            refill::refill_is_current_for_workspace_target(&store, &workspace, &target_b)
+                .await
+                .unwrap()
+        );
+        database.close().await.unwrap();
+    }
+
     fn committed_item(item: TurnItem) -> ThreadEpisodicCommittedItem {
         ThreadEpisodicCommittedItem {
             workspace_id: "workspace_1".to_owned(),
@@ -10332,6 +13975,735 @@ mod tests {
             source_context: committed_item_source_context(&item),
             item,
         }
+    }
+
+    #[tokio::test]
+    async fn late_refill_preserves_live_executor_claim_and_complete_recall() {
+        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let root = TempDir::new().unwrap();
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![]));
+        let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
+            store.clone(),
+            backend.clone(),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                store.clone(),
+                thread_episodic_storage_uri_from_path(root.path()),
+            )),
+        ));
+        let ready = seed_pending_thread_episodic_item(
+            &store,
+            &workspace,
+            "live_thread",
+            "ready_turn",
+            "ready_item",
+        )
+        .await;
+        seed_thread_episodic_job(&store, &workspace, "live_thread", &ready.id, 1_700_000_000).await;
+        assert_eq!(
+            executor
+                .run_once(chrono::Utc::now().timestamp())
+                .await
+                .unwrap()
+                .completed,
+            1
+        );
+        let ready = store
+            .find_thread_episodic_item(&ready.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let source = seed_pending_thread_episodic_item(
+            &store,
+            &workspace,
+            "live_thread",
+            "live_turn",
+            "live_item",
+        )
+        .await;
+        let job =
+            seed_thread_episodic_job(&store, &workspace, "live_thread", &source.id, 1_700_000_000)
+                .await;
+        let inherited = store
+            .claim_due_thread_episodic_index_jobs(chrono::Utc::now().timestamp(), 1, 5)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        // This is the real pre-admission recovery, before any current executor.
+        assert_eq!(
+            crate::database::startup::recover_inherited_thread_episodic_jobs(&store, 5)
+                .await
+                .unwrap(),
+            1
+        );
+        let started = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *backend.index_barriers.lock().await = Some((started.clone(), release));
+        // Use the actual committed recovery second for the executor claim:
+        // equality at the admission boundary is deterministic, even if the
+        // wall clock crosses a second while this test is being scheduled.
+        let recovered = store
+            .find_thread_episodic_index_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let claim_second = recovered.updated_at.timestamp();
+        let running = tokio::spawn({
+            let executor = executor.clone();
+            async move { executor.run_once(claim_second).await }
+        });
+        started.wait().await;
+        let live = store
+            .find_thread_episodic_index_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.status, ThreadEpisodicIndexJobStatus::Running);
+        assert_eq!(live.updated_at.timestamp(), claim_second);
+        assert_eq!(
+            live.updated_at.timestamp(),
+            recovered.updated_at.timestamp()
+        );
+        assert_eq!(live.attempt_count, inherited.attempt_count + 1);
+        // Late maintenance runs while real index execution is blocked. There is
+        // no +1-second ownership trick: its admission cannot recover any claim.
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only();
+        let summary = refill::refill_once_with_projection_resolver(
+            store.clone(),
+            root.path(),
+            &workspace,
+            target.clone(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(summary.skipped);
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            live
+        );
+        assert_eq!(
+            store
+                .fail_thread_episodic_index_attempt_without_source_validation(
+                    &inherited.id,
+                    inherited.attempt_count,
+                    ThreadEpisodicIndexJobFailureUpdate {
+                        retryable: false,
+                        next_run_at_unix: None,
+                        last_error: Some("old callback".to_owned()),
+                        capacity_error: false,
+                        last_attempt_latency_ms: None
+                    },
+                    claim_second
+                )
+                .await
+                .unwrap(),
+            ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+        );
+        let scope = thread_episodic_thread_uri_prefix(&workspace, "live_thread").unwrap();
+        backend
+            .set_scoped_search_hits(
+                scope,
+                vec![ranked_hit_for_item(&ready, "ready old frame", 0.9)],
+            )
+            .await;
+        let recall = ThreadEpisodicRecallService::new(store.clone(), backend.clone());
+        assert!(
+            recall
+                .resolve_recall_projection_gate(&workspace, false, &target)
+                .await
+                .unwrap()
+                .search_allowed
+        );
+        let output = recall
+            .search_current_thread(
+                recall_input(&workspace, "live_thread", "live_turn", "ready"),
+                None,
+            )
+            .await;
+        assert_eq!(output.hits.len(), 1);
+        assert_eq!(output.hits[0].provenance.index_item_id.0, ready.id);
+        running.abort();
+        assert!(running.await.unwrap_err().is_cancelled());
+        assert!(
+            refill::refill_is_current_for_workspace_target(&store, &workspace, &target)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            live
+        );
+        // A simulated next runtime may recover the now-abandoned claim. A
+        // terminal failure of this extra job still leaves the old projection ready.
+        assert_eq!(
+            crate::database::startup::recover_inherited_thread_episodic_jobs(&store, 5)
+                .await
+                .unwrap(),
+            1
+        );
+        let failed_backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Err(
+            ThreadEpisodicMemvidError::non_retryable("extra source provider failure"),
+        )]));
+        let failed_executor = ThreadEpisodicIndexExecutor::new(
+            store.clone(),
+            failed_backend,
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                store.clone(),
+                thread_episodic_storage_uri_from_path(root.path()),
+            )),
+        );
+        assert_eq!(
+            failed_executor
+                .run_once(chrono::Utc::now().timestamp())
+                .await
+                .unwrap()
+                .failed_terminal,
+            1
+        );
+        let terminal = store
+            .find_thread_episodic_index_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, ThreadEpisodicIndexJobStatus::Canceled);
+        assert!(
+            refill::refill_once_with_projection_resolver(
+                store.clone(),
+                root.path(),
+                &workspace,
+                target.clone(),
+                None,
+                None
+            )
+            .await
+            .unwrap()
+            .skipped
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            terminal
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_item(&ready.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            ready
+        );
+        assert_eq!(
+            recall
+                .search_current_thread(
+                    recall_input(&workspace, "live_thread", "live_turn", "ready"),
+                    None
+                )
+                .await
+                .hits
+                .len(),
+            1
+        );
+        mark_thread_episodic_workspace_refill_status_for_test(
+            &store,
+            &workspace,
+            pioneer_crud::PROJECTION_META_STATUS_BACKFILLING,
+        )
+        .await;
+        assert!(
+            !recall
+                .resolve_recall_projection_gate(&workspace, false, &target)
+                .await
+                .unwrap()
+                .search_allowed
+        );
+        mark_thread_episodic_workspace_refill_complete_for_test(&store, &workspace).await;
+        refill::mark_projection_reset(
+            &store.database_connection(),
+            &workspace,
+            pioneer_crud::PROJECTION_META_STATUS_PENDING,
+            &target,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !recall
+                .resolve_recall_projection_gate(&workspace, false, &target)
+                .await
+                .unwrap()
+                .search_allowed
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_custom_projection_keeps_old_frames_through_preflight_and_retry_errors() {
+        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let root = TempDir::new().unwrap();
+        let config = pioneer_config::GatewayThreadEpisodicVectorSearchConfig {
+            enabled: true,
+            provider: Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::OpenRouter),
+            model: Some("vendor/custom-embed".to_owned()),
+            local_model: None,
+            embedding_normalized: true,
+            use_search_instructions: false,
+        };
+        let provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+            "openrouter",
+            "vendor/custom-embed",
+            vec![0.1, 0.2, 0.3],
+        ));
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            provider.as_ref(),
+        )
+        .unwrap();
+        let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+        resolver.set_active_provider(Some(provider));
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![]));
+        let executor = ThreadEpisodicIndexExecutor::new(
+            store.clone(),
+            backend.clone(),
+            Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                    store.clone(),
+                    thread_episodic_storage_uri_from_path(root.path()),
+                )),
+                resolver.clone(),
+                store.clone(),
+            )),
+        );
+        executor.apply_config(ThreadEpisodicIndexExecutorConfig {
+            retry_base_delay_secs: 600,
+            retry_max_delay_secs: 600,
+            ..Default::default()
+        });
+        let ready = seed_pending_thread_episodic_item(
+            &store,
+            &workspace,
+            "preflight_thread",
+            "ready_turn",
+            "ready_item",
+        )
+        .await;
+        seed_thread_episodic_job(
+            &store,
+            &workspace,
+            "preflight_thread",
+            &ready.id,
+            1_700_000_000,
+        )
+        .await;
+        assert_eq!(
+            executor
+                .run_once(chrono::Utc::now().timestamp())
+                .await
+                .unwrap()
+                .completed,
+            1
+        );
+        let ready = store
+            .find_thread_episodic_item(&ready.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let key = refill::refill_projection_key_for_workspace(&workspace).unwrap();
+        let mut marker = pioneer_crud::find_projection_meta(&store.database_connection(), &key)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_active_model();
+        let identity = target.meta_config_record();
+        marker.projection_config_hash = Set(identity.projection_config_hash);
+        marker.projection_config_json = Set(identity.projection_config_json);
+        marker.update(&store.database_connection()).await.unwrap();
+        let pending = seed_pending_thread_episodic_item(
+            &store,
+            &workspace,
+            "preflight_thread",
+            "extra_turn",
+            "extra_item",
+        )
+        .await;
+        let job = seed_thread_episodic_job(
+            &store,
+            &workspace,
+            "preflight_thread",
+            &pending.id,
+            1_700_000_000,
+        )
+        .await;
+        resolver.set_active_provider_unavailable_reason("provider preflight unavailable");
+        let configured_target =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+                &config,
+            );
+        assert!(
+            refill::refill_once_with_projection_resolver(
+                store.clone(),
+                root.path(),
+                &workspace,
+                configured_target.clone(),
+                Some(resolver.clone()),
+                None
+            )
+            .await
+            .is_err()
+        );
+        let marker = pioneer_crud::find_projection_meta(&store.database_connection(), &key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(marker.status, pioneer_crud::PROJECTION_META_STATUS_COMPLETE);
+        assert!(marker.last_error.is_some());
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            job
+        );
+        let mut failing_provider = StaticThreadEpisodicEmbeddingProvider::with_identity(
+            "openrouter",
+            "vendor/custom-embed",
+            vec![0.1, 0.2, 0.3],
+        );
+        failing_provider.error = Some(ThreadEpisodicEmbeddingError::retryable_provider_failure(
+            "openrouter",
+            "vendor/custom-embed",
+            "rate limited",
+        ));
+        resolver.set_active_provider(Some(Arc::new(failing_provider)));
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(executor.run_once(now).await.unwrap().failed_retryable, 1);
+        let deferred = store
+            .find_thread_episodic_index_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deferred.status, ThreadEpisodicIndexJobStatus::Failed);
+        assert_eq!(deferred.next_run_at.timestamp(), now + 600);
+        resolver.set_active_provider_unavailable_reason("provider unavailable during retry");
+        assert!(
+            refill::refill_once_with_projection_resolver(
+                store.clone(),
+                root.path(),
+                &workspace,
+                configured_target.clone(),
+                Some(resolver.clone()),
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            deferred
+        );
+        let scope = thread_episodic_thread_uri_prefix(&workspace, "preflight_thread").unwrap();
+        backend
+            .set_scoped_search_hits(
+                scope,
+                vec![ranked_hit_for_item(&ready, "old ready vector frame", 0.9)],
+            )
+            .await;
+        let recall = ThreadEpisodicRecallService::with_config_and_embedding_provider_resolver(
+            store.clone(),
+            backend,
+            ThreadEpisodicRecallServiceConfig {
+                vector_search_enabled: true,
+                vector_search: config,
+                ..Default::default()
+            },
+            Some(resolver),
+        );
+        assert!(
+            recall
+                .resolve_recall_projection_gate(&workspace, true, &configured_target)
+                .await
+                .unwrap()
+                .search_allowed
+        );
+        let output = recall
+            .search_current_thread(
+                recall_input(&workspace, "preflight_thread", "extra_turn", "ready"),
+                None,
+            )
+            .await;
+        assert_eq!(output.hits.len(), 1);
+        assert_eq!(output.hits[0].provenance.index_item_id.0, ready.id);
+        assert_eq!(
+            store
+                .find_thread_episodic_item(&ready.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            ready
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn additional_refill_cancellation_after_embedding_claim_keeps_complete_recall_gate() {
+        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let root = TempDir::new().unwrap();
+        let config = pioneer_config::GatewayThreadEpisodicVectorSearchConfig {
+            enabled: true,
+            provider: Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::OpenRouter),
+            model: Some("vendor/custom-embed".to_owned()),
+            local_model: None,
+            embedding_normalized: true,
+            use_search_instructions: false,
+        };
+        let ready = seed_pending_thread_episodic_item(
+            &store,
+            &workspace,
+            "cancel_refill_thread",
+            "ready_turn",
+            "ready_item",
+        )
+        .await;
+        seed_thread_episodic_job(
+            &store,
+            &workspace,
+            "cancel_refill_thread",
+            &ready.id,
+            1_700_000_000,
+        )
+        .await;
+        let provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+            "openrouter",
+            "vendor/custom-embed",
+            vec![0.1, 0.2, 0.3],
+        ));
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            provider.as_ref(),
+        )
+        .unwrap();
+        let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+        resolver.set_active_provider(Some(provider));
+        // Build real frames through the production refill before extra work.
+        refill::refill_once_with_projection_resolver(
+            store.clone(),
+            root.path(),
+            &workspace,
+            target.clone(),
+            Some(resolver.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+        let ready = store
+            .find_thread_episodic_item(&ready.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let extra = seed_pending_thread_episodic_item(
+            &store,
+            &workspace,
+            "cancel_refill_thread",
+            "extra_turn",
+            "extra_item",
+        )
+        .await;
+        let job = seed_thread_episodic_job(
+            &store,
+            &workspace,
+            "cancel_refill_thread",
+            &extra.id,
+            1_700_000_000,
+        )
+        .await;
+        let provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+            "openrouter",
+            "vendor/custom-embed",
+            vec![0.1, 0.2, 0.3],
+        ));
+        resolver.set_active_provider(Some(provider));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let work = tokio::spawn({
+            let store = store.clone();
+            let workspace = workspace.clone();
+            let target = target.clone();
+            let path = root.path().to_owned();
+            async move {
+                refill::refill_once_with_projection_resolver_and_config(
+                    store,
+                    &path,
+                    &workspace,
+                    target,
+                    Some(resolver),
+                    None,
+                    ThreadEpisodicIndexExecutorConfig::default(),
+                    None,
+                    Some(started_tx),
+                )
+                .await
+            }
+        });
+        started_rx.await.unwrap();
+        let claimed = store
+            .find_thread_episodic_index_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.status, ThreadEpisodicIndexJobStatus::Running);
+        let recall = ThreadEpisodicRecallService::with_config_and_embedding_provider_resolver(
+            store.clone(),
+            Arc::new(MemvidThreadEpisodicBackend::new()),
+            ThreadEpisodicRecallServiceConfig {
+                vector_search_enabled: true,
+                vector_search: config,
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(
+            recall
+                .resolve_recall_projection_gate(&workspace, true, &target)
+                .await
+                .unwrap()
+                .search_allowed
+        );
+        let marker = pioneer_crud::find_projection_meta(
+            &store.database_connection(),
+            &refill::refill_projection_key_for_workspace(&workspace).unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(marker.status, pioneer_crud::PROJECTION_META_STATUS_COMPLETE);
+        work.abort();
+        assert!(work.await.unwrap_err().is_cancelled());
+        assert!(
+            recall
+                .resolve_recall_projection_gate(&workspace, true, &target)
+                .await
+                .unwrap()
+                .search_allowed
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            claimed
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_item(&ready.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            ready
+        );
+        assert!(ready.frame_id.is_some());
+
+        // On the next startup this canceled execution future is inherited.
+        // A terminal provider failure inside refill must retain the ready gate,
+        // just as cancellation did, while persisting the extra job's failure.
+        assert_eq!(
+            crate::database::startup::recover_inherited_thread_episodic_jobs(&store, 5)
+                .await
+                .unwrap(),
+            1
+        );
+        let mut provider = StaticThreadEpisodicEmbeddingProvider::with_identity(
+            "openrouter",
+            "vendor/custom-embed",
+            vec![0.1, 0.2, 0.3],
+        );
+        provider.error = Some(
+            ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                "openrouter",
+                "vendor/custom-embed",
+                "terminal failure of additional source",
+            ),
+        );
+        let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+        resolver.set_active_provider(Some(Arc::new(provider)));
+        assert!(
+            refill::refill_once_with_projection_resolver(
+                store.clone(),
+                root.path(),
+                &workspace,
+                target.clone(),
+                Some(resolver),
+                None,
+            )
+            .await
+            .is_err()
+        );
+        let failed = store
+            .find_thread_episodic_index_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, ThreadEpisodicIndexJobStatus::Canceled);
+        assert_eq!(failed.attempt_count, claimed.attempt_count + 1);
+        assert!(
+            failed
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("terminal failure")
+        );
+        let marker = pioneer_crud::find_projection_meta(
+            &store.database_connection(),
+            &refill::refill_projection_key_for_workspace(&workspace).unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(marker.status, pioneer_crud::PROJECTION_META_STATUS_COMPLETE);
+        assert!(marker.last_error.is_some());
+        assert!(
+            recall
+                .resolve_recall_projection_gate(&workspace, true, &target)
+                .await
+                .unwrap()
+                .search_allowed
+        );
+        let output = recall
+            .search_current_thread(
+                recall_input(
+                    &workspace,
+                    "cancel_refill_thread",
+                    "extra_turn",
+                    "canonical source",
+                ),
+                None,
+            )
+            .await;
+        assert_eq!(output.hits.len(), 1);
+        assert_eq!(output.hits[0].provenance.index_item_id.0, ready.id);
+        assert_eq!(
+            store
+                .find_thread_episodic_item(&ready.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            ready
+        );
     }
 
     async fn setup_thread_episodic_store() -> (Arc<CrudStore>, String) {
@@ -10354,13 +14726,18 @@ mod tests {
             .expect("current workspace should exist")
             .id;
         let crud_store = Arc::new(CrudStore::new(connection));
-        mark_thread_episodic_workspace_refill_complete_for_test(crud_store.as_ref()).await;
+        mark_thread_episodic_workspace_refill_complete_for_test(crud_store.as_ref(), &workspace_id)
+            .await;
         (crud_store, workspace_id)
     }
 
-    async fn mark_thread_episodic_workspace_refill_complete_for_test(crud_store: &CrudStore) {
+    async fn mark_thread_episodic_workspace_refill_complete_for_test(
+        crud_store: &CrudStore,
+        workspace_id: &str,
+    ) {
         mark_thread_episodic_workspace_refill_status_for_test(
             crud_store,
+            &workspace_id,
             pioneer_crud::PROJECTION_META_STATUS_COMPLETE,
         )
         .await;
@@ -10368,6 +14745,7 @@ mod tests {
 
     async fn mark_thread_episodic_workspace_vector_refill_complete_for_test(
         crud_store: &CrudStore,
+        workspace_id: &str,
         config: &pioneer_config::GatewayThreadEpisodicVectorSearchConfig,
     ) {
         let now = fixed_datetime_from_unix(1_700_000_000);
@@ -10376,7 +14754,7 @@ mod tests {
         pioneer_crud::upsert_projection_meta_with_config(
             &crud_store.database_connection(),
             pioneer_crud::ProjectionMetaRecord {
-                projection_key: crate::database::startup::thread_episodic_workspace_capsule_refill::THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY.to_owned(),
+                projection_key: crate::database::startup::thread_episodic_workspace_capsule_refill::refill_projection_key_for_workspace(workspace_id).unwrap(),
                 projection_version: crate::database::startup::thread_episodic_workspace_capsule_refill::THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
                 status: pioneer_crud::PROJECTION_META_STATUS_COMPLETE.to_owned(),
                 source_thread_count: 0,
@@ -10397,6 +14775,7 @@ mod tests {
 
     async fn mark_thread_episodic_workspace_refill_status_for_test(
         crud_store: &CrudStore,
+        workspace_id: &str,
         status: &str,
     ) {
         let now = fixed_datetime_from_unix(1_700_000_000);
@@ -10405,7 +14784,7 @@ mod tests {
         pioneer_crud::upsert_projection_meta_with_config(
             &crud_store.database_connection(),
             pioneer_crud::ProjectionMetaRecord {
-                projection_key: crate::database::startup::thread_episodic_workspace_capsule_refill::THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY.to_owned(),
+                projection_key: crate::database::startup::thread_episodic_workspace_capsule_refill::refill_projection_key_for_workspace(workspace_id).unwrap(),
                 projection_version: crate::database::startup::thread_episodic_workspace_capsule_refill::THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
                 status: status.to_owned(),
                 source_thread_count: 0,
@@ -11850,9 +16229,11 @@ mod tests {
                     workspace_id.as_str(),
                     1_700_070_002,
                     1,
+                    5,
                 )
                 .await
                 .expect("job should claim")
+                .assert_no_failures_for_test()
                 .pop()
                 .expect("claimed job");
             if deleted {
@@ -11920,6 +16301,7 @@ mod tests {
                     claim.clone(),
                     1_700_070_004,
                     ThreadEpisodicIndexExecutorConfig::default(),
+                    pioneer_memory::lock_thread_episodic_workspace(&workspace_id).await,
                 )
                 .await;
             assert!(matches!(
@@ -12015,8 +16397,11 @@ mod tests {
         let error = executor
             .run_once(1_700_061_001)
             .await
-            .expect_err("unpersisted claimed result must be returned to the caller");
-        let rendered = format!("{error:#}");
+            .expect("partial quantum accounting must survive candidate storage failure");
+        assert!(error.storage_error);
+        assert_eq!(error.claimed, 2);
+        assert_eq!(error.failed_retryable, 1);
+        let rendered = error.storage_errors.join("; ");
         assert!(rendered.contains("primary persistence unavailable"));
         assert!(rendered.contains("fallback persistence unavailable"));
         assert_eq!(backend.requests().await.len(), 2);
@@ -12089,8 +16474,14 @@ mod tests {
         let target_error = target_executor
             .run_once(1_700_061_101)
             .await
-            .expect_err("failed mandatory targeted reconciliation must surface");
-        assert!(format!("{target_error:#}").contains("targeted reconciliation unavailable"));
+            .expect("partial quantum accounting must be returned");
+        assert!(target_error.storage_error);
+        assert!(
+            target_error
+                .storage_errors
+                .join("; ")
+                .contains("targeted reconciliation unavailable")
+        );
         let target_job = target_store
             .find_thread_episodic_index_job(target_job.id.as_str())
             .await
@@ -12115,8 +16506,11 @@ mod tests {
             1_700_061_200,
         )
         .await;
+        // Event-driven canonical update commits durable delivery before its
+        // consumer reconciles sources. Exercise that real SourceChanged window,
+        // rather than snapshot's already-atomic source/job reconciliation.
         transition_store
-            .materialize_item_snapshot_updated(
+            .materialize_item_updated(
                 ItemUpdatedNotification {
                     workspace_id: transition_workspace.clone(),
                     thread_id: transition_item.thread_id.clone(),
@@ -12147,8 +16541,14 @@ mod tests {
         let transition_error = transition_executor
             .run_once(1_700_061_202)
             .await
-            .expect_err("failed post-reconciliation transition must surface");
-        assert!(format!("{transition_error:#}").contains("requeue transition unavailable"));
+            .expect("partial quantum accounting must be returned");
+        assert!(transition_error.storage_error);
+        assert!(
+            transition_error
+                .storage_errors
+                .join("; ")
+                .contains("requeue transition unavailable")
+        );
         assert!(transition_backend.requests().await.is_empty());
     }
 

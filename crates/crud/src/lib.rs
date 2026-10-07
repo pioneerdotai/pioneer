@@ -33,6 +33,8 @@ pub use task_terminal::{
 };
 mod task_projector;
 mod thread_episodic;
+pub mod thread_episodic_source;
+mod thread_episodic_source_store;
 mod timeline_live_projection;
 mod timeline_projection;
 mod timeline_projection_model;
@@ -1379,7 +1381,7 @@ pub use crate::thread_episodic::{
     NewThreadEpisodicCapsuleRecord, NewThreadEpisodicEmbeddingArtifactRecord,
     NewThreadEpisodicExclusionRecord, NewThreadEpisodicIndexJobRecord, NewThreadEpisodicItemRecord,
     NewThreadEpisodicRecallEventRecord, NewThreadEpisodicThreadDirectoryRecord,
-    THREAD_EPISODIC_LEGACY_SOURCE_HASH_MISMATCH_ERROR,
+    THREAD_EPISODIC_LEGACY_SOURCE_HASH_MISMATCH_ERROR, THREAD_EPISODIC_PROJECTION_CHANGED_ERROR,
     THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR, THREAD_EPISODIC_USER_DELETED_ERROR,
     THREAD_EPISODIC_USER_EXCLUDED_ERROR, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
     THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES, ThreadEpisodicActiveWriteSegmentRequest,
@@ -1387,10 +1389,11 @@ pub use crate::thread_episodic::{
     ThreadEpisodicCapsuleStatus, ThreadEpisodicCapsuleWriteState,
     ThreadEpisodicEmbeddingArtifactRecord, ThreadEpisodicExclusionReason,
     ThreadEpisodicExclusionRecord, ThreadEpisodicGraphEnrichmentState,
-    ThreadEpisodicIndexAttemptOutcome, ThreadEpisodicIndexJobCompletionUpdate,
-    ThreadEpisodicIndexJobFailureUpdate, ThreadEpisodicIndexJobRecord,
-    ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate, ThreadEpisodicItemRecord,
-    ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility, ThreadEpisodicRecallEventRecord,
+    ThreadEpisodicIndexAttemptOutcome, ThreadEpisodicIndexClaimBatch,
+    ThreadEpisodicIndexJobCompletionUpdate, ThreadEpisodicIndexJobFailureUpdate,
+    ThreadEpisodicIndexJobRecord, ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate,
+    ThreadEpisodicItemRecord, ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility,
+    ThreadEpisodicProjectionResetProgress, ThreadEpisodicRecallEventRecord,
     ThreadEpisodicRefillSourceCounts, ThreadEpisodicRefillThread, ThreadEpisodicRepairStatus,
     ThreadEpisodicSourceActorRole, ThreadEpisodicSourceReconcileOutcome,
     ThreadEpisodicSourceRuntimeKind, ThreadEpisodicThreadDirectoryRecord,
@@ -1398,9 +1401,10 @@ pub use crate::thread_episodic::{
     ThreadEpisodicThreadDirectoryVisibility, ThreadEpisodicWorkspaceActiveWriteSegmentRequest,
     deterministic_thread_episodic_capsule_id, deterministic_thread_episodic_workspace_capsule_id,
     thread_episodic_capsule_ref, thread_episodic_capsule_storage_uri, thread_episodic_frame_uri,
-    thread_episodic_item_uri, thread_episodic_key_hash, thread_episodic_thread_uri_prefix,
-    thread_episodic_turn_uri_prefix, thread_episodic_workspace_capsule_ref,
-    thread_episodic_workspace_capsule_storage_uri, thread_episodic_workspace_uri_prefix,
+    thread_episodic_item_uri, thread_episodic_key_hash, thread_episodic_projection_reset_key,
+    thread_episodic_thread_uri_prefix, thread_episodic_turn_uri_prefix,
+    thread_episodic_workspace_capsule_ref, thread_episodic_workspace_capsule_storage_uri,
+    thread_episodic_workspace_uri_prefix,
 };
 use crate::util::{optional_typed_json_from_db, typed_json_from_db, unix_to_datetime};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
@@ -2525,6 +2529,13 @@ pub struct CrudStore {
     delivery_commit_test_gate: std::sync::Arc<
         std::sync::Mutex<Option<task_delivery_lifecycle::TaskDeliveryCommitTestGate>>,
     >,
+    #[cfg(any(test, feature = "test-support"))]
+    episodic_ambiguous_claim_commit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(any(test, feature = "test-support"))]
+    episodic_claim_fault: std::sync::Arc<std::sync::Mutex<Option<(String, &'static str)>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    episodic_claim_discoveries: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    episodic_work: std::sync::Arc<tokio::sync::Notify>,
     connection: SqliteDatabase,
     projector: TurnProjector,
     task_projector: TaskProjector,
@@ -4108,11 +4119,57 @@ impl CrudStore {
     pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
         Self {
             connection: connection.into(),
+            episodic_work: std::sync::Arc::new(tokio::sync::Notify::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            episodic_claim_fault: Default::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            episodic_claim_discoveries: Default::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            episodic_ambiguous_claim_commit: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
             #[cfg(any(test, feature = "test-support"))]
             delivery_commit_test_gate: std::sync::Arc::new(std::sync::Mutex::new(None)),
             projector: TurnProjector::new(),
             task_projector: TaskProjector::new(),
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn make_next_episodic_claim_commit_ambiguous_for_test(&self) {
+        self.episodic_ambiguous_claim_commit
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inject_episodic_claim_fault_for_test(&self, job_id: &str, point: &'static str) {
+        *self.episodic_claim_fault.lock().unwrap() = Some((job_id.to_owned(), point));
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn episodic_claim_discoveries_for_test(&self) -> u64 {
+        self.episodic_claim_discoveries
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn take_episodic_claim_fault_for_test(&self, id: &str, point: &str) -> bool {
+        let mut fault = self.episodic_claim_fault.lock().unwrap();
+        if fault
+            .as_ref()
+            .is_some_and(|(job, stage)| job == id && *stage == point)
+        {
+            fault.take();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Coalesced post-commit wake shared by scoped handles. Durable jobs remain
+    /// the recovery obligation; this notification only advances a live runtime.
+    pub fn thread_episodic_work_notification(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.episodic_work.clone()
     }
 
     /// Returns a store whose reads and writes are both classified as
@@ -4599,42 +4656,44 @@ impl CrudStore {
         limit: u64,
     ) -> Result<Vec<ClaimedTurnEventDeliveryRecord>> {
         let consumer = consumer.to_owned();
-        self.run_serialized_write(|| {
-            let consumer = consumer.clone();
-            async move {
-                let now = unix_to_datetime(now_unix);
-                let claim_expires_at = unix_to_datetime(now_unix.saturating_add(120));
-                let claimed = turn_event_delivery::claim_due(
-                    &self.connection,
-                    consumer.as_str(),
-                    now,
-                    claim_expires_at,
-                    limit,
-                )
-                .await?;
-                let mut records = Vec::with_capacity(claimed.len());
-                for claim in claimed {
-                    let event =
-                        turn_event::find_event_by_id(&self.connection, claim.row.event_id.as_str())
-                            .await?
-                            .with_context(|| {
-                                format!(
-                                    "turn event `{}` is missing for delivery `{}`",
-                                    claim.row.event_id, claim.row.id
-                                )
-                            })?;
-                    records.push(ClaimedTurnEventDeliveryRecord {
-                        id: claim.row.id,
-                        consumer: claim.row.consumer,
-                        attempt_count: claim.row.attempt_count,
-                        claim_token: claim.claim_token,
-                        event,
-                    });
+        let claimed = self
+            .run_serialized_write(|| {
+                let consumer = consumer.clone();
+                async move {
+                    let now = unix_to_datetime(now_unix);
+                    let claim_expires_at = unix_to_datetime(now_unix.saturating_add(120));
+                    turn_event_delivery::claim_due(
+                        &self.connection,
+                        &consumer,
+                        now,
+                        claim_expires_at,
+                        limit,
+                    )
+                    .await
                 }
-                Ok(records)
-            }
-        })
-        .await
+            })
+            .await?;
+        // Claim writes are committed before event reads/JSON decoding. A read
+        // error leaves the durable lease recoverable and dispatches no claim.
+        let mut records = Vec::with_capacity(claimed.len());
+        for claim in claimed {
+            let event = turn_event::find_event_by_id(&self.connection, claim.row.event_id.as_str())
+                .await?
+                .with_context(|| {
+                    format!(
+                        "turn event `{}` is missing for delivery `{}`",
+                        claim.row.event_id, claim.row.id
+                    )
+                })?;
+            records.push(ClaimedTurnEventDeliveryRecord {
+                id: claim.row.id,
+                consumer: claim.row.consumer,
+                attempt_count: claim.row.attempt_count,
+                claim_token: claim.claim_token,
+                event,
+            });
+        }
+        Ok(records)
     }
 
     pub async fn complete_turn_event_delivery(
@@ -10078,12 +10137,31 @@ impl CrudStore {
     pub async fn reconcile_thread_episodic_source_version(
         &self,
         expected_source_payload: &str,
-        item: NewThreadEpisodicItemRecord,
+        mut item: NewThreadEpisodicItemRecord,
         now_unix: i64,
     ) -> Result<ThreadEpisodicSourceReconcileOutcome> {
+        let source_item: TurnItem = serde_json::from_str(expected_source_payload)?;
+        let committed = thread_episodic_source::committed_item_ingestion_input_from_parts(
+            &item.workspace_id,
+            &item.thread_id,
+            &item.turn_id,
+            source_item,
+        )
+        .context("invalid episodic source identity")?;
+        let context = thread_episodic_repository::load_source_projection_context(
+            &self.connection,
+            &item.thread_id,
+            &item.turn_id,
+            &item.item_id,
+            committed.item_type,
+        )
+        .await?;
+        item.projection_group_id = context.projection_group_id(&committed, &item.source_text_hash);
         self.run_serialized_write(|| {
             let expected_source_payload = expected_source_payload.to_owned();
             let item = item.clone();
+            let context = context.clone();
+            let item_type = committed.item_type;
             async move {
                 let transaction =
                     self.connection.begin().await.context(
@@ -10119,7 +10197,20 @@ impl CrudStore {
                     else {
                         return Ok(ThreadEpisodicSourceReconcileOutcome::SourceChanged);
                     };
-                    if source.payload != expected_source_payload {
+                    if source.payload != expected_source_payload
+                        || !thread_episodic_source::source_status_is_committed(
+                            source.status.as_deref(),
+                        )
+                        || context
+                            != thread_episodic_repository::load_source_projection_context(
+                                &transaction,
+                                &item.thread_id,
+                                &item.turn_id,
+                                &item.item_id,
+                                item_type,
+                            )
+                            .await?
+                    {
                         return Ok(ThreadEpisodicSourceReconcileOutcome::SourceChanged);
                     }
                     thread_episodic_repository::reconcile_item_source_version(
@@ -10562,6 +10653,28 @@ impl CrudStore {
         .await
     }
 
+    pub async fn terminal_thread_episodic_index_job_exists_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<bool> {
+        thread_episodic_repository::terminal_index_job_exists_for_workspace(
+            &self.connection,
+            workspace_id,
+        )
+        .await
+    }
+
+    pub async fn unfinished_thread_episodic_index_job_exists_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<bool> {
+        thread_episodic_repository::unfinished_index_job_exists_for_workspace(
+            &self.connection,
+            workspace_id,
+        )
+        .await
+    }
+
     pub async fn thread_episodic_index_job_exists_for_workspace(
         &self,
         workspace_id: &str,
@@ -10733,24 +10846,193 @@ impl CrudStore {
         .await
     }
 
+    /// Recover only under exclusive workspace ownership or before runtime
+    /// admission. Each bounded transaction confirms durable results, closes
+    /// exhausted attempts, and requeues only the remaining execution budget.
+    /// The count includes all three recovery outcomes.
     pub async fn requeue_running_thread_episodic_index_jobs_for_workspace(
         &self,
         workspace_id: &str,
-        interrupted_before_unix: i64,
         now_unix: i64,
+        max_attempts: i64,
     ) -> Result<u64> {
-        self.run_serialized_write(|| {
-            let workspace_id = workspace_id.to_owned();
-            async move {
-                thread_episodic_repository::requeue_running_index_jobs_for_workspace(
-                    &self.connection,
-                    workspace_id.as_str(),
-                    unix_to_datetime(interrupted_before_unix),
-                    unix_to_datetime(now_unix),
-                )
-                .await
+        let mut total = 0u64;
+        loop {
+            let requeued = self
+                .run_serialized_write(|| {
+                    let workspace_id = workspace_id.to_owned();
+                    async move {
+                        let transaction = self.connection.begin().await?;
+                        let recovered =
+                            thread_episodic_repository::requeue_running_index_jobs_for_workspace(
+                                &transaction,
+                                workspace_id.as_str(),
+                                unix_to_datetime(now_unix),
+                                max_attempts,
+                            )
+                            .await?;
+                        transaction.commit().await?;
+                        Ok(recovered)
+                    }
+                })
+                .await?;
+            total = total.saturating_add(requeued);
+            if requeued == 0 {
+                return Ok(total);
             }
-        })
+        }
+    }
+
+    pub async fn list_due_thread_episodic_index_jobs_after(
+        &self,
+        now_unix: i64,
+        after: Option<&ThreadEpisodicIndexJobRecord>,
+        through: Option<&ThreadEpisodicIndexJobRecord>,
+        limit: u64,
+    ) -> Result<Vec<ThreadEpisodicIndexJobRecord>> {
+        thread_episodic_repository::list_due_index_jobs_after(
+            &self.connection,
+            unix_to_datetime(now_unix),
+            after,
+            through,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::thread_episodic::thread_episodic_index_job_record_from_model)
+        .collect()
+    }
+
+    pub async fn thread_episodic_discovery_round_end(
+        &self,
+        now_unix: i64,
+    ) -> Result<Option<ThreadEpisodicIndexJobRecord>> {
+        thread_episodic_repository::discovery_round_end(
+            &self.connection,
+            unix_to_datetime(now_unix),
+        )
+        .await?
+        .map(crate::thread_episodic::thread_episodic_index_job_record_from_model)
+        .transpose()
+    }
+
+    pub async fn next_scheduled_thread_episodic_index_job_at(&self) -> Result<Option<i64>> {
+        Ok(
+            thread_episodic_repository::next_scheduled_index_job_at(&self.connection, None)
+                .await?
+                .map(|at| at.timestamp()),
+        )
+    }
+
+    /// Round-to-wait handoff: use the frozen discovery time as the lower bound,
+    /// so deadlines crossed while processing the round are still returned.
+    pub async fn next_future_thread_episodic_index_job_at(
+        &self,
+        after_unix: i64,
+    ) -> Result<Option<i64>> {
+        Ok(thread_episodic_repository::next_scheduled_index_job_at(
+            &self.connection,
+            Some(unix_to_datetime(after_unix)),
+        )
+        .await?
+        .map(|at| at.timestamp()))
+    }
+
+    pub async fn claim_thread_episodic_index_job_if_due(
+        &self,
+        job_id: &str,
+        now_unix: i64,
+        max_attempts: i64,
+    ) -> Result<Option<ThreadEpisodicIndexJobRecord>> {
+        let Some(snapshot) = self.find_thread_episodic_index_job(job_id).await? else {
+            return Ok(None);
+        };
+        self.claim_thread_episodic_index_job_from_snapshot(
+            &snapshot,
+            now_unix,
+            max_attempts,
+            None,
+            None,
+        )
+        .await
+    }
+
+    // The caller owns the workspace and records this exact prospective attempt
+    // before awaiting admission. Unknown commit/cancellation can therefore be
+    // settled by ID/attempt only after reading its actual durable state.
+    pub async fn claim_thread_episodic_index_job_from_snapshot(
+        &self,
+        snapshot: &ThreadEpisodicIndexJobRecord,
+        now_unix: i64,
+        max_attempts: i64,
+        mutation_started: Option<&std::sync::atomic::AtomicBool>,
+        accepting_claims: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<ThreadEpisodicIndexJobRecord>> {
+        // Do not replay this transaction after an ambiguous commit. Physical
+        // serialization is provided by SqliteDatabase at begin/statement level.
+        async {
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                if self.take_episodic_claim_fault_for_test(&snapshot.id, "panic_poll") {
+                    panic!("controlled claim polling unwind");
+                }
+                if self.take_episodic_claim_fault_for_test(&snapshot.id, "storage") {
+                    anyhow::bail!("controlled claim storage failure");
+                }
+                if self.take_episodic_claim_fault_for_test(&snapshot.id, "lock") {
+                    anyhow::bail!("database is locked");
+                }
+            }
+            let now = unix_to_datetime(now_unix);
+            let transaction = self.connection.begin().await?;
+            let current =
+                thread_episodic_repository::find_index_job_by_id(&transaction, &snapshot.id)
+                    .await?
+                    .map(crate::thread_episodic::thread_episodic_index_job_record_from_model)
+                    .transpose()?;
+            if current.as_ref() != Some(snapshot)
+                || snapshot.next_run_at > now
+                || !matches!(
+                    snapshot.status,
+                    ThreadEpisodicIndexJobStatus::Queued | ThreadEpisodicIndexJobStatus::Failed
+                )
+                || accepting_claims
+                    .is_some_and(|accepting| !accepting.load(std::sync::atomic::Ordering::Acquire))
+            {
+                transaction.rollback().await?;
+                return Ok(None);
+            }
+            if let Some(started) = mutation_started {
+                started.store(true, std::sync::atomic::Ordering::Release);
+            }
+            let claimed = thread_episodic_repository::mark_index_job_running(
+                &transaction,
+                &snapshot.id,
+                now,
+                max_attempts,
+            )
+            .await?;
+            transaction.commit().await?;
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                if self.take_episodic_claim_fault_for_test(&snapshot.id, "panic_commit") {
+                    panic!("controlled claim acknowledgement unwind");
+                }
+                if self.take_episodic_claim_fault_for_test(&snapshot.id, "commit_unknown") {
+                    anyhow::bail!("controlled loss of claim acknowledgement");
+                }
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            if self
+                .episodic_ambiguous_claim_commit
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                anyhow::bail!("controlled loss of episodic claim commit acknowledgement");
+            }
+            claimed
+                .map(crate::thread_episodic::thread_episodic_index_job_record_from_model)
+                .transpose()
+        }
         .await
     }
 
@@ -10758,6 +11040,7 @@ impl CrudStore {
         &self,
         now_unix: i64,
         limit: u64,
+        max_attempts: i64,
     ) -> Result<Vec<ThreadEpisodicIndexJobRecord>> {
         self.run_serialized_write(|| async move {
             let now = unix_to_datetime(now_unix);
@@ -10775,6 +11058,7 @@ impl CrudStore {
                     &transaction,
                     row.id.as_str(),
                     now,
+                    max_attempts,
                 )
                 .await?;
                 transaction
@@ -10792,49 +11076,56 @@ impl CrudStore {
         .await
     }
 
+    /// Discover one bounded portion under a reader, then commit each candidate
+    /// separately. Do not replay the portion after a lock/ambiguous commit error.
+    /// Caller owns workspace execution; failures carry input snapshots only.
     pub async fn claim_due_thread_episodic_index_jobs_for_workspace(
         &self,
         workspace_id: &str,
         now_unix: i64,
         limit: u64,
-    ) -> Result<Vec<ThreadEpisodicIndexJobRecord>> {
-        self.run_serialized_write(|| {
-            let workspace_id = workspace_id.to_owned();
-            async move {
-                let now = unix_to_datetime(now_unix);
-                let rows = thread_episodic_repository::list_due_index_jobs_for_workspace(
-                    &self.connection,
-                    workspace_id.as_str(),
-                    now,
-                    limit,
-                )
-                .await?;
-                let mut claimed = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let transaction = self.connection.begin().await.context(
-                        "failed to begin workspace thread episodic index claim transaction",
-                    )?;
-                    let claimed_row = thread_episodic_repository::mark_index_job_running(
-                        &transaction,
-                        row.id.as_str(),
-                        now,
-                    )
-                    .await?;
-                    transaction.commit().await.context(
-                        "failed to commit workspace thread episodic index claim transaction",
-                    )?;
-                    if let Some(row) = claimed_row {
-                        claimed.push(
-                            crate::thread_episodic::thread_episodic_index_job_record_from_model(
-                                row,
-                            )?,
-                        );
-                    }
+        max_attempts: i64,
+    ) -> Result<ThreadEpisodicIndexClaimBatch> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.episodic_claim_discoveries
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let candidates = thread_episodic_repository::list_due_index_jobs_for_workspace(
+            &self.connection,
+            workspace_id,
+            unix_to_datetime(now_unix),
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::thread_episodic::thread_episodic_index_job_record_from_model)
+        .collect::<Result<Vec<_>>>()?;
+        let mut batch = ThreadEpisodicIndexClaimBatch::default();
+        for candidate in candidates {
+            use futures_util::FutureExt;
+            let result = std::panic::AssertUnwindSafe(async {
+                #[cfg(any(test, feature = "test-support"))]
+                if self.take_episodic_claim_fault_for_test(&candidate.id, "panic_create") {
+                    panic!("controlled claim creation unwind");
                 }
-                Ok(claimed)
+                self.claim_thread_episodic_index_job_from_snapshot(
+                    &candidate,
+                    now_unix,
+                    max_attempts,
+                    None,
+                    None,
+                )
+                .await
+            })
+            .catch_unwind()
+            .await;
+            match result {
+                Ok(Ok(Some(claim))) => batch.claimed.push(claim),
+                Ok(Ok(None)) => {}
+                Ok(Err(_)) => batch.failures.push((candidate, "claim_storage")),
+                Err(_) => batch.failures.push((candidate, "claim_unwind")),
             }
-        })
-        .await
+        }
+        Ok(batch)
     }
 
     pub async fn complete_thread_episodic_index_job(
@@ -10966,17 +11257,32 @@ impl CrudStore {
         job_id: &str,
         expected_attempt_count: i64,
         now_unix: i64,
+        last_error: Option<&str>,
     ) -> Result<ThreadEpisodicIndexAttemptOutcome> {
         self.run_serialized_write(|| {
             let job_id = job_id.to_owned();
             async move {
-                thread_episodic_repository::requeue_index_attempt(
-                    &self.connection,
+                // Canonical source saves do not acquire workspace ownership.
+                // Reserve the writer across the attempt guard and transition so
+                // their Superseded/deletion outcomes cannot be overwritten.
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin thread episodic attempt requeue")?;
+                let outcome = thread_episodic_repository::requeue_index_attempt(
+                    &transaction,
                     job_id.as_str(),
                     expected_attempt_count,
                     unix_to_datetime(now_unix),
+                    last_error,
                 )
-                .await
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit thread episodic attempt requeue")?;
+                Ok(outcome)
             }
         })
         .await
@@ -11033,6 +11339,77 @@ impl CrudStore {
                     "failed to commit thread episodic reconciliation failure transaction",
                 )?;
                 Ok(outcome)
+            }
+        })
+        .await
+    }
+
+    /// Writer-side state observation serializes with a possibly ambiguous claim
+    /// commit. A reader-pool snapshot alone could still precede that commit.
+    /// An unchanged input may only receive scheduling backoff; an observed
+    /// Running attempt is settled using its exact identity and attempt fence.
+    pub async fn settle_thread_episodic_owned_index_attempt(
+        &self,
+        expected: &ThreadEpisodicIndexJobRecord,
+        input: Option<&ThreadEpisodicIndexJobRecord>,
+        update: ThreadEpisodicIndexJobFailureUpdate,
+        now_unix: i64,
+    ) -> Result<()> {
+        use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
+        self.run_serialized_write(|| {
+            let expected = expected.clone();
+            let input = input.cloned();
+            let update = update.clone();
+            async move {
+                let transaction = self.connection.begin().await?;
+                let current =
+                    thread_episodic_repository::find_index_job_by_id(&transaction, &expected.id)
+                        .await?;
+                if current.as_ref().is_some_and(|current| {
+                    current.status == "running"
+                        && current.attempt_count == expected.attempt_count
+                        && current.index_item_id == expected.index_item_id
+                        && current.updated_at == expected.updated_at
+                }) {
+                    if !thread_episodic_repository::confirm_index_job_if_indexed(
+                        &transaction,
+                        current.as_ref().unwrap(),
+                        unix_to_datetime(now_unix),
+                    )
+                    .await?
+                    {
+                        thread_episodic_repository::recover_index_attempt_after_persistence_error(
+                            &transaction,
+                            &expected.id,
+                            expected.attempt_count,
+                            update,
+                            unix_to_datetime(now_unix),
+                        )
+                        .await?;
+                    }
+                } else if let (Some(input), Some(row)) = (input, current)
+                    && matches!(row.status.as_str(), "queued" | "failed")
+                    && crate::thread_episodic::thread_episodic_index_job_record_from_model(
+                        row.clone(),
+                    )? == input
+                {
+                    // Writer observation proves this exact input was not
+                    // claimed. Defer only its scheduling; never spend budget or
+                    // assume rollback from the error alone.
+                    if let Some(next) = update.next_run_at_unix {
+                        let mut active = row.into_active_model();
+                        active.next_run_at = Set(unix_to_datetime(next));
+                        if input.last_error.as_deref()
+                            != Some(THREAD_EPISODIC_PROJECTION_CHANGED_ERROR)
+                        {
+                            active.last_error = Set(update.last_error);
+                        }
+                        active.updated_at = Set(unix_to_datetime(now_unix));
+                        active.update(&transaction).await?;
+                    }
+                }
+                transaction.commit().await?;
+                Ok(())
             }
         })
         .await
@@ -13090,10 +13467,19 @@ impl CrudStore {
             updated_at,
             updated_at,
         )?;
+        let episodic_source = self
+            .prepare_episodic_source_save(
+                &notification.workspace_id,
+                &notification.thread_id,
+                &notification.turn_id,
+                &notification.item,
+            )
+            .await?;
         self.run_serialized_write(|| {
             let notification = notification.clone();
             let connection = self.connection.clone();
-            let prepared_item = prepared_item.clone();
+            let mut prepared_item = prepared_item.clone();
+            let episodic_source = episodic_source.clone();
             async move {
                 let transaction = connection
                     .begin()
@@ -13139,7 +13525,9 @@ impl CrudStore {
                     .await?
                     .map(|event| event.sequence)
                     .unwrap_or(0);
+                    prepared_item.preserve_uncommitted_source_status(&transaction).await?;
                     turn::upsert_prepared_turn_item(&transaction, prepared_item).await?;
+                    self.commit_episodic_source_save(&transaction, &episodic_source, updated_at).await?;
                     self.project_semantic_timeline_snapshot_turn_item(
                         &transaction,
                         notification.turn_id.as_str(),
@@ -13179,7 +13567,9 @@ impl CrudStore {
                 }
             }
         })
-        .await
+        .await?;
+        self.episodic_work.notify_one();
+        Ok(())
     }
 
     pub async fn materialize_item_timeout_detected(
@@ -17162,6 +17552,7 @@ impl CrudStore {
             );
         }
         Ok(Some(ThreadEpisodicCanonicalItem {
+            committed: thread_episodic_source::source_status_is_committed(model.status.as_deref()),
             item,
             source_payload: model.payload,
         }))
@@ -22587,7 +22978,15 @@ impl CrudStore {
             )?;
             summary.detected = summary.detected.saturating_add(repairs.len());
 
-            let repairs_for_write = repairs.clone();
+            let repair_count = repairs.len();
+            let mut prepared_repairs = Vec::with_capacity(repair_count);
+            for (row, payload_json) in repairs {
+                let episodic = self
+                    .prepare_terminal_payload_episodic_save(&row, &payload_json)
+                    .await?;
+                prepared_repairs.push((row, payload_json, episodic));
+            }
+            let repairs_for_write = prepared_repairs;
             let cursor_for_write = next_cursor.clone();
             let repaired = timings
                 .observe(
@@ -22618,9 +23017,12 @@ impl CrudStore {
                 )
                 .await?;
             summary.repaired = summary.repaired.saturating_add(repaired);
+            if repaired > 0 {
+                self.episodic_work.notify_one();
+            }
             summary.remaining = summary
                 .remaining
-                .saturating_add(repairs.len().saturating_sub(repaired));
+                .saturating_add(repair_count.saturating_sub(repaired));
             cursor = Some(next_cursor);
         }
 
@@ -22777,6 +23179,14 @@ impl CrudStore {
             )?;
             summary.detected = summary.detected.saturating_add(repairs.len());
 
+            let mut prepared_repairs = HashMap::with_capacity(repairs.len());
+            for (id, (row, payload_json)) in repairs {
+                let episodic = self
+                    .prepare_terminal_payload_episodic_save(&row, &payload_json)
+                    .await?;
+                prepared_repairs.insert(id, (row, payload_json, episodic));
+            }
+            let repairs = prepared_repairs;
             let dirty_for_write = dirty_rows.clone();
             let repairs_for_write = repairs.clone();
             let previous_cursor = cursor;
@@ -22792,12 +23202,13 @@ impl CrudStore {
                             )?;
                             let mut repaired = 0usize;
                             for dirty in &dirty_rows {
-                                if let Some((row, payload_json)) = repairs.get(&dirty.turn_item_id) {
+                                if let Some((row, payload_json, episodic)) = repairs.get(&dirty.turn_item_id) {
                                     let applied = self
                                         .apply_one_terminal_turn_item_payload_repair(
                                             &transaction,
                                             row,
                                             payload_json,
+                                            episodic.as_ref(),
                                         )
                                         .await?;
                                     if applied {
@@ -22850,6 +23261,9 @@ impl CrudStore {
                 )
                 .await?;
             summary.repaired = summary.repaired.saturating_add(repaired);
+            if repaired > 0 {
+                self.episodic_work.notify_one();
+            }
             summary.remaining = summary
                 .remaining
                 .saturating_add(repairs.len().saturating_sub(repaired));
@@ -22886,12 +23300,21 @@ impl CrudStore {
     async fn apply_terminal_turn_item_payload_repairs(
         &self,
         transaction: &DatabaseTransaction,
-        repairs: Vec<(pioneer_entity::turn_item::Model, String)>,
+        repairs: Vec<(
+            pioneer_entity::turn_item::Model,
+            String,
+            Option<thread_episodic_source_store::PreparedSourceSave>,
+        )>,
     ) -> Result<usize> {
         let mut repaired = 0usize;
-        for (row, payload_json) in repairs {
+        for (row, payload_json, episodic) in repairs {
             let applied = self
-                .apply_one_terminal_turn_item_payload_repair(transaction, &row, &payload_json)
+                .apply_one_terminal_turn_item_payload_repair(
+                    transaction,
+                    &row,
+                    &payload_json,
+                    episodic.as_ref(),
+                )
                 .await?;
             if applied {
                 repaired = repaired.saturating_add(1);
@@ -22900,11 +23323,32 @@ impl CrudStore {
         Ok(repaired)
     }
 
+    async fn prepare_terminal_payload_episodic_save(
+        &self,
+        row: &pioneer_entity::turn_item::Model,
+        payload_json: &str,
+    ) -> Result<Option<thread_episodic_source_store::PreparedSourceSave>> {
+        let item: TurnItem = serde_json::from_str(payload_json)?;
+        // Terminalization of private tool output changes no admissible indexed
+        // source. Do not discover the surrounding history for such repairs.
+        if thread_episodic_source::committed_item_source_actor_role(&item).is_none() {
+            return Ok(None);
+        }
+        let (thread_id, workspace_id) = self
+            .get_turn_location(&row.turn_id)
+            .await?
+            .context("payload repair source ownership missing")?;
+        self.prepare_episodic_source_save(&workspace_id, &thread_id, &row.turn_id, &item)
+            .await
+            .map(Some)
+    }
+
     async fn apply_one_terminal_turn_item_payload_repair(
         &self,
         transaction: &DatabaseTransaction,
         row: &pioneer_entity::turn_item::Model,
         payload_json: &str,
+        episodic: Option<&thread_episodic_source_store::PreparedSourceSave>,
     ) -> Result<bool> {
         let now: DateTimeWithTimeZone = chrono::Utc::now().into();
         pioneer_entity::turn_item::Entity::update_many()
@@ -22934,6 +23378,10 @@ impl CrudStore {
                 current.status.as_deref() == row.status.as_deref()
                     && current.payload == payload_json
             });
+        if applied && let Some(episodic) = episodic {
+            self.commit_episodic_source_save(transaction, episodic, now)
+                .await?;
+        }
         Ok(applied)
     }
 
@@ -27535,10 +27983,13 @@ impl CrudStore {
             },
         )
         .await?;
-        if enqueue_optional_deliveries {
-            turn_event_delivery::insert_pending_for_event(transaction, &appended_event, created_at)
-                .await?;
-        }
+        turn_event_delivery::insert_pending_for_event(
+            transaction,
+            &appended_event,
+            created_at,
+            enqueue_optional_deliveries,
+        )
+        .await?;
         if !turn_event_projection_state::is_next_projection_sequence(
             transaction,
             appended_event.turn_id.as_str(),
@@ -27694,13 +28145,13 @@ impl CrudStore {
             let _ = transaction.rollback().await;
             return Err(error);
         }
-        if projection_context.enqueue_optional_deliveries
-            && let Err(error) = turn_event_delivery::insert_pending_for_event(
-                &transaction,
-                &appended_event,
-                created_at,
-            )
-            .await
+        if let Err(error) = turn_event_delivery::insert_pending_for_event(
+            &transaction,
+            &appended_event,
+            created_at,
+            projection_context.enqueue_optional_deliveries,
+        )
+        .await
         {
             let _ = transaction.rollback().await;
             return Err(error);
@@ -31118,6 +31569,13 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        NewThreadEpisodicExclusionRecord, THREAD_EPISODIC_PROJECTION_CHANGED_ERROR,
+        THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR, THREAD_EPISODIC_USER_DELETED_ERROR,
+        THREAD_EPISODIC_USER_EXCLUDED_ERROR, ThreadEpisodicExclusionReason,
+        ThreadEpisodicIndexAttemptOutcome, ThreadEpisodicIndexJobRecord,
+        ThreadEpisodicIndexJobStatus,
+    };
     #[path = "task_run_occurrence.rs"]
     mod occurrence_tracker;
     #[path = "task_occurrence_reconcile.rs"]
@@ -32992,6 +33450,65 @@ mod tests {
             observer.events.lock().unwrap().clear();
         }
 
+        let source = |text: &str| TurnItem::UserMessage {
+            id: "route_source".to_owned(),
+            text: text.to_owned(),
+            attachments: vec![],
+        };
+        interactive
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: source("initial"),
+                },
+                1_700_000_120,
+            )
+            .await
+            .unwrap();
+        for (store, text, read, write) in [
+            (
+                &interactive,
+                "interactive save",
+                SqliteReadClass::Interactive,
+                SqliteWriteClass::Interactive,
+            ),
+            (
+                &maintenance,
+                "maintenance save",
+                SqliteReadClass::Maintenance,
+                SqliteWriteClass::Maintenance,
+            ),
+        ] {
+            observer.reads.lock().unwrap().clear();
+            observer.events.lock().unwrap().clear();
+            store
+                .materialize_item_snapshot_updated(
+                    ItemUpdatedNotification {
+                        workspace_id: thread.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn_id: turn.id.clone(),
+                        item: source(text),
+                    },
+                    1_700_000_121,
+                )
+                .await
+                .unwrap();
+            assert!(
+                observer
+                    .reads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|class| *class == read)
+            );
+            let events = observer.events.lock().unwrap();
+            assert!(events.iter().any(
+                |event| matches!(event, SqliteWriteEvent::Acquired { class, .. } if *class == write)
+            ));
+            assert!(events.iter().all(|event| !matches!(event, SqliteWriteEvent::Acquired { class, .. } if *class != write)));
+        }
         let transaction = database.with_critical_writes().begin().await.unwrap();
         observer.events.lock().unwrap().clear();
         let cancelled = tokio::spawn({
@@ -33013,6 +33530,31 @@ mod tests {
                 ..
             } if queue.maintenance == 0
         )));
+        let snapshot_cancelled = tokio::spawn({
+            let store = maintenance.clone();
+            let update = ItemUpdatedNotification {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn_id: turn.id.clone(),
+                item: source("cancelled save"),
+            };
+            async move {
+                store
+                    .materialize_item_snapshot_updated(update, 1_700_000_122)
+                    .await
+            }
+        });
+        observer.wait_for_enqueued(2).await;
+        snapshot_cancelled.abort();
+        assert!(snapshot_cancelled.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            interactive
+                .get_turn_item(&turn.id, "route_source")
+                .await
+                .unwrap()
+                .unwrap(),
+            source("maintenance save")
+        );
         let mut pending = Vec::new();
         for (store, consumer) in [
             (interactive, "live_notification"),
@@ -33024,7 +33566,7 @@ mod tests {
                     .await
             }));
         }
-        observer.wait_for_enqueued(3).await;
+        observer.wait_for_enqueued(4).await;
         transaction.rollback().await.unwrap();
         for claim in pending {
             assert_eq!(claim.await.unwrap().unwrap().len(), 1);
@@ -33045,6 +33587,66 @@ mod tests {
             Some(SqliteWriteEvent::Released { queue, .. })
                 if queue.interactive == 0 && queue.maintenance == 0 && queue.critical == 0
         ));
+        drop(events);
+        let recovery_store = CrudStore::new(database.clone()).with_maintenance_access();
+        let running = recovery_store
+            .claim_due_thread_episodic_index_jobs(1_700_000_130, 1, 5)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let transaction = database.with_critical_writes().begin().await.unwrap();
+        observer.events.lock().unwrap().clear();
+        let recovery = tokio::spawn({
+            let store = recovery_store.clone();
+            let workspace_id = thread.workspace_id.clone();
+            async move {
+                store
+                    .requeue_running_thread_episodic_index_jobs_for_workspace(
+                        &workspace_id,
+                        1_700_000_131,
+                        5,
+                    )
+                    .await
+            }
+        });
+        observer.wait_for_enqueued(1).await;
+        recovery.abort();
+        assert!(recovery.await.unwrap_err().is_cancelled());
+        assert!(observer.events.lock().unwrap().iter().any(|event| matches!(event, SqliteWriteEvent::Cancelled { class: SqliteWriteClass::Maintenance, queue, .. } if queue.maintenance == 0)));
+        transaction.rollback().await.unwrap();
+        assert_eq!(
+            recovery_store
+                .find_thread_episodic_index_job(&running.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            running
+        );
+        assert_eq!(
+            recovery_store
+                .requeue_running_thread_episodic_index_jobs_for_workspace(
+                    &thread.workspace_id,
+                    1_700_000_131,
+                    5
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        let recovered = recovery_store
+            .claim_due_thread_episodic_index_jobs(1_700_000_131, 1, 5)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(recovered.id, running.id);
+        assert_eq!(recovered.attempt_count, running.attempt_count + 1);
+        let events = observer.events.lock().unwrap();
+        assert!(events.iter().all(|event| !matches!(event, SqliteWriteEvent::Acquired { class, .. } if *class == SqliteWriteClass::Interactive)));
+        assert!(
+            matches!(events.last(), Some(SqliteWriteEvent::Released { queue, .. }) if queue.maintenance == 0 && queue.critical == 0 && queue.interactive == 0)
+        );
         drop(events);
         database.close().await.unwrap();
     }
@@ -43308,6 +43910,1414 @@ mod tests {
         }
     }
 
+    async fn episodic_requeue_source_fixture() -> (
+        CrudStore,
+        Thread,
+        Turn,
+        ThreadEpisodicIndexJobRecord,
+        Arc<OptionalDeliveryDatabaseObserver>,
+        OptionalDeliveryDatabasePath,
+    ) {
+        use pioneer_sqlite::{
+            SqliteDatabase, SqliteWriteExecutor, sqlite_read_only_connection_url,
+        };
+        use sea_orm::ConnectOptions;
+        let path = OptionalDeliveryDatabasePath(std::env::temp_dir().join(format!(
+            "pioneer-requeue-source-{}.sqlite",
+            uuid::Uuid::new_v4()
+        )));
+        let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.0.display()));
+        options.max_connections(1);
+        let writer = Database::connect(options).await.unwrap();
+        Migrator::up(&writer, None).await.unwrap();
+        writer
+            .execute_unprepared("PRAGMA journal_mode=WAL")
+            .await
+            .unwrap();
+        let mut options = ConnectOptions::new(sqlite_read_only_connection_url(&path.0));
+        options.max_connections(2);
+        options.map_sqlx_sqlite_opts(|options| {
+            options
+                .read_only(true)
+                .create_if_missing(false)
+                .pragma("query_only", "ON")
+        });
+        let reader = Database::connect(options).await.unwrap();
+        let observer = Arc::new(OptionalDeliveryDatabaseObserver::default());
+        let database = SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            observer.clone(),
+        );
+        database.validate_reader().await.unwrap();
+        let store = CrudStore::new(database);
+        let now = unix_to_datetime(1_700_000_000);
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set("ws_requeue_source".to_owned()),
+            name: Set("Requeue source fixture".to_owned()),
+            is_active: Set(true),
+            is_current: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        })
+        .exec(&store.connection)
+        .await
+        .unwrap();
+        let (store, thread, turn) = start_test_turn(
+            store,
+            "ws_requeue_source",
+            "thr_requeue_source",
+            "turn_requeue_source",
+        )
+        .await;
+        let item = TurnItem::UserMessage {
+            id: "requeue_source".to_owned(),
+            text: "A".to_owned(),
+            attachments: vec![],
+        };
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: item.clone(),
+                },
+                1_700_000_010,
+            )
+            .await
+            .unwrap();
+        store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item,
+                },
+                1_700_000_010,
+            )
+            .await
+            .unwrap();
+        let job = store
+            .list_thread_episodic_index_jobs_for_thread(&thread.workspace_id, &thread.id, 10)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let running = store
+            .with_maintenance_access()
+            .claim_thread_episodic_index_job_if_due(&job.id, 1_700_000_010, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.attempt_count, 1);
+        (store, thread, turn, running, observer, path)
+    }
+
+    #[tokio::test]
+    async fn episodic_requeue_and_canonical_snapshot_commits_are_serialized_in_both_orders() {
+        use pioneer_sqlite::{SqliteWriteClass, SqliteWriteEvent};
+        for snapshot_first in [true, false] {
+            let (store, thread, turn, running, observer, _path) =
+                episodic_requeue_source_fixture().await;
+            // Both contenders inherit Maintenance, so their explicit queue
+            // barriers establish FIFO order without timing or priority changes.
+            let maintenance = store.with_maintenance_access();
+            let blocker = store
+                .connection
+                .with_critical_writes()
+                .begin()
+                .await
+                .unwrap();
+            observer.events.lock().unwrap().clear();
+            observer.reads.lock().unwrap().clear();
+            let snapshot = async {
+                maintenance
+                    .materialize_item_snapshot_updated(
+                        ItemUpdatedNotification {
+                            workspace_id: thread.workspace_id.clone(),
+                            thread_id: thread.id.clone(),
+                            turn_id: turn.id.clone(),
+                            item: TurnItem::UserMessage {
+                                id: "requeue_source".to_owned(),
+                                text: "B".to_owned(),
+                                attachments: vec![],
+                            },
+                        },
+                        1_700_000_011,
+                    )
+                    .await
+            };
+            let requeue = async {
+                maintenance
+                    .requeue_thread_episodic_index_attempt(
+                        &running.id,
+                        running.attempt_count,
+                        1_700_000_012,
+                        Some(THREAD_EPISODIC_PROJECTION_CHANGED_ERROR),
+                    )
+                    .await
+            };
+            tokio::pin!(snapshot, requeue);
+            // Poll the first contender until its writer reservation is known.
+            // Pending readers/CPU preparation complete outside that reservation.
+            if snapshot_first {
+                tokio::select! { biased;
+                    result = snapshot.as_mut() => panic!("snapshot bypassed occupied writer: {result:?}"),
+                    _ = observer.wait_for_enqueued(1) => {},
+                }
+                observer.reads.lock().unwrap().clear();
+                tokio::select! { biased;
+                    result = requeue.as_mut() => panic!("requeue bypassed occupied writer: {result:?}"),
+                    _ = observer.wait_for_enqueued(2) => {},
+                }
+            } else {
+                tokio::select! { biased;
+                    result = requeue.as_mut() => panic!("requeue bypassed occupied writer: {result:?}"),
+                    _ = observer.wait_for_enqueued(1) => {},
+                }
+                assert!(
+                    observer.reads.lock().unwrap().is_empty(),
+                    "the attempt guard must read under writer ownership, never the reader pool"
+                );
+                tokio::select! { biased;
+                    result = snapshot.as_mut() => panic!("snapshot bypassed occupied writer: {result:?}"),
+                    _ = observer.wait_for_enqueued(2) => {},
+                }
+            }
+            if snapshot_first {
+                assert!(
+                    observer.reads.lock().unwrap().is_empty(),
+                    "queued requeue must not read Running before the preceding source commit"
+                );
+            }
+            blocker.rollback().await.unwrap();
+            let (saved, requeued) = tokio::join!(snapshot, requeue);
+            saved.unwrap();
+            assert_eq!(
+                requeued.unwrap(),
+                if snapshot_first {
+                    ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+                } else {
+                    ThreadEpisodicIndexAttemptOutcome::Applied
+                }
+            );
+            let acquired = observer
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|event| {
+                    if let SqliteWriteEvent::Acquired { class, .. } = event {
+                        Some(*class)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                acquired,
+                vec![SqliteWriteClass::Maintenance; 2],
+                "each contender must keep a single writer reservation through its commit"
+            );
+            let current = store
+                .find_thread_episodic_index_job(&running.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut expected = running.clone();
+            if !snapshot_first {
+                expected.next_run_at = unix_to_datetime(1_700_000_012);
+            }
+            expected.status = ThreadEpisodicIndexJobStatus::Canceled;
+            expected.last_error = Some(THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR.to_owned());
+            expected.updated_at = unix_to_datetime(1_700_000_011);
+            expected.completed_at = Some(expected.updated_at);
+            assert_eq!(
+                current, expected,
+                "late requeue must preserve the entire canceled record"
+            );
+            let sources = store
+                .list_thread_episodic_items_for_thread(&thread.workspace_id, &thread.id, 10)
+                .await
+                .unwrap();
+            assert_eq!(sources.len(), 2);
+            assert_eq!(
+                sources
+                    .iter()
+                    .find(|source| source.id == running.index_item_id)
+                    .unwrap()
+                    .status,
+                ThreadEpisodicItemStatus::Superseded
+            );
+            let replacement = sources
+                .iter()
+                .find(|source| source.status == ThreadEpisodicItemStatus::PendingIndex)
+                .unwrap();
+            let job = store
+                .find_thread_episodic_index_job_by_item(&replacement.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(job.id, running.id);
+            assert_eq!(job.status, ThreadEpisodicIndexJobStatus::Queued);
+            assert_eq!(job.attempt_count, 0);
+            assert_eq!(
+                store
+                    .get_turn_item(&turn.id, "requeue_source")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                TurnItem::UserMessage {
+                    id: "requeue_source".to_owned(),
+                    text: "B".to_owned(),
+                    attachments: vec![]
+                }
+            );
+            assert_eq!(
+                maintenance
+                    .requeue_thread_episodic_index_attempt(
+                        &running.id,
+                        running.attempt_count,
+                        1_700_000_013,
+                        Some(THREAD_EPISODIC_PROJECTION_CHANGED_ERROR),
+                    )
+                    .await
+                    .unwrap(),
+                ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+            );
+            assert_eq!(
+                store
+                    .find_thread_episodic_index_job(&running.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                current
+            );
+            store.database_connection().close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn episodic_late_requeue_cannot_revive_user_exclusion_or_deletion() {
+        for deletion in [false, true] {
+            let (store, thread, turn, running, observer, _path) =
+                episodic_requeue_source_fixture().await;
+            let maintenance = store.with_maintenance_access();
+            let blocker = store
+                .connection
+                .with_critical_writes()
+                .begin()
+                .await
+                .unwrap();
+            observer.events.lock().unwrap().clear();
+            let suppress = async {
+                if deletion {
+                    maintenance
+                        .tombstone_thread_episodic_items_for_item(
+                            &thread.workspace_id,
+                            &thread.id,
+                            &turn.id,
+                            "requeue_source",
+                            1_700_000_011,
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    maintenance
+                        .exclude_thread_episodic_item(
+                            NewThreadEpisodicExclusionRecord {
+                                id: None,
+                                workspace_id: thread.workspace_id.clone(),
+                                thread_id: thread.id.clone(),
+                                index_item_id: running.index_item_id.clone(),
+                                reason: ThreadEpisodicExclusionReason::UserRequested,
+                                created_by: "test-user".to_owned(),
+                            },
+                            1_700_000_011,
+                        )
+                        .await
+                        .unwrap();
+                }
+            };
+            let requeue = maintenance.requeue_thread_episodic_index_attempt(
+                &running.id,
+                running.attempt_count,
+                1_700_000_012,
+                Some(THREAD_EPISODIC_PROJECTION_CHANGED_ERROR),
+            );
+            tokio::pin!(suppress, requeue);
+            tokio::select! { biased;
+                _ = suppress.as_mut() => panic!("suppression bypassed occupied writer"),
+                _ = observer.wait_for_enqueued(1) => {},
+            }
+            observer.reads.lock().unwrap().clear();
+            tokio::select! { biased;
+                result = requeue.as_mut() => panic!("requeue bypassed occupied writer: {result:?}"),
+                _ = observer.wait_for_enqueued(2) => {},
+            }
+            assert!(observer.reads.lock().unwrap().is_empty());
+            blocker.rollback().await.unwrap();
+            let (_, outcome) = tokio::join!(suppress, requeue);
+            assert_eq!(
+                outcome.unwrap(),
+                ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+            );
+            let mut expected = running.clone();
+            expected.status = ThreadEpisodicIndexJobStatus::Canceled;
+            expected.last_error = Some(
+                if deletion {
+                    THREAD_EPISODIC_USER_DELETED_ERROR
+                } else {
+                    THREAD_EPISODIC_USER_EXCLUDED_ERROR
+                }
+                .to_owned(),
+            );
+            expected.updated_at = unix_to_datetime(1_700_000_011);
+            expected.completed_at = Some(expected.updated_at);
+            assert_eq!(
+                store
+                    .find_thread_episodic_index_job(&running.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                expected
+            );
+            let source = store
+                .find_thread_episodic_item(&running.index_item_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                source.status,
+                if deletion {
+                    ThreadEpisodicItemStatus::Deleted
+                } else {
+                    ThreadEpisodicItemStatus::Excluded
+                }
+            );
+            assert!(
+                maintenance
+                    .list_due_thread_episodic_index_jobs_after(1_700_000_013, None, None, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            store.database_connection().close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn episodic_requeue_reason_is_atomic_and_cancellation_and_rollback_preserve_running() {
+        use pioneer_sqlite::{SqliteWriteClass, SqliteWriteEvent};
+        let (store, _thread, _turn, running, observer, _path) =
+            episodic_requeue_source_fixture().await;
+        let maintenance = store.with_maintenance_access();
+        let blocker = store
+            .connection
+            .with_critical_writes()
+            .begin()
+            .await
+            .unwrap();
+        observer.events.lock().unwrap().clear();
+        let work = tokio::spawn({
+            let store = maintenance.clone();
+            let running = running.clone();
+            async move {
+                store
+                    .requeue_thread_episodic_index_attempt(
+                        &running.id,
+                        running.attempt_count,
+                        1_700_000_012,
+                        Some(THREAD_EPISODIC_PROJECTION_CHANGED_ERROR),
+                    )
+                    .await
+            }
+        });
+        observer.wait_for_enqueued(1).await;
+        work.abort();
+        assert!(work.await.unwrap_err().is_cancelled());
+        assert!(
+            observer
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event,
+            SqliteWriteEvent::Cancelled { class: SqliteWriteClass::Maintenance, queue, .. }
+                if queue.maintenance == 0))
+        );
+        blocker.rollback().await.unwrap();
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&running.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            running
+        );
+        assert_eq!(
+            maintenance
+                .requeue_thread_episodic_index_attempt(
+                    &running.id,
+                    running.attempt_count + 1,
+                    1_700_000_012,
+                    Some(THREAD_EPISODIC_PROJECTION_CHANGED_ERROR),
+                )
+                .await
+                .unwrap(),
+            ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&running.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            running
+        );
+        // AFTER UPDATE makes the status/reason mutation occur before the forced
+        // rollback. No test-only pause or non-DB await is added inside the writer.
+        store.connection.execute_unprepared(
+            "CREATE TRIGGER reject_requeue_after_update AFTER UPDATE ON thread_episodic_index_jobs WHEN NEW.status = 'queued' BEGIN SELECT RAISE(ROLLBACK, 'controlled requeue rollback'); END"
+        ).await.unwrap();
+        assert!(
+            maintenance
+                .requeue_thread_episodic_index_attempt(
+                    &running.id,
+                    running.attempt_count,
+                    1_700_000_012,
+                    Some(THREAD_EPISODIC_PROJECTION_CHANGED_ERROR),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&running.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            running
+        );
+        store
+            .connection
+            .execute_unprepared("DROP TRIGGER reject_requeue_after_update")
+            .await
+            .unwrap();
+        observer.events.lock().unwrap().clear();
+        observer.reads.lock().unwrap().clear();
+        assert_eq!(
+            maintenance
+                .requeue_thread_episodic_index_attempt(
+                    &running.id,
+                    running.attempt_count,
+                    1_700_000_012,
+                    Some(THREAD_EPISODIC_PROJECTION_CHANGED_ERROR),
+                )
+                .await
+                .unwrap(),
+            ThreadEpisodicIndexAttemptOutcome::Applied
+        );
+        assert!(
+            observer.reads.lock().unwrap().is_empty(),
+            "guarded reads use the transaction's writer"
+        );
+        let acquired = observer
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| {
+                if let SqliteWriteEvent::Acquired { class, .. } = event {
+                    Some(*class)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(acquired, vec![SqliteWriteClass::Maintenance]);
+        let mut expected = running.clone();
+        expected.status = ThreadEpisodicIndexJobStatus::Queued;
+        expected.next_run_at = unix_to_datetime(1_700_000_012);
+        expected.updated_at = expected.next_run_at;
+        expected.last_error = Some(THREAD_EPISODIC_PROJECTION_CHANGED_ERROR.to_owned());
+        expected.last_attempt_latency_ms = None;
+        expected.completed_at = None;
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&running.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+        // A stale repeated callback cannot reset delay, count or transition reason.
+        assert_eq!(
+            maintenance
+                .requeue_thread_episodic_index_attempt(
+                    &running.id,
+                    running.attempt_count,
+                    1_700_000_013,
+                    None,
+                )
+                .await
+                .unwrap(),
+            ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&running.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+        store
+            .connection
+            .begin()
+            .await
+            .unwrap()
+            .rollback()
+            .await
+            .unwrap();
+        store.database_connection().close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn episodic_direct_snapshot_is_atomic_and_idempotent_without_callback() {
+        let (store, thread, turn) =
+            test_store_with_started_turn("ws_source_save", "thr_source_save", "turn_source_save")
+                .await;
+        let make_item = |text: &str| TurnItem::UserMessage {
+            id: "source_save_item".to_owned(),
+            text: text.to_owned(),
+            attachments: vec![],
+        };
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: make_item("A"),
+                },
+                1_700_000_010,
+            )
+            .await
+            .unwrap();
+        // No ingestor/callback is run. Snapshot save itself leaves durable work.
+        let update = |text: &str| ItemUpdatedNotification {
+            workspace_id: thread.workspace_id.clone(),
+            thread_id: thread.id.clone(),
+            turn_id: turn.id.clone(),
+            item: make_item(text),
+        };
+        store
+            .materialize_item_snapshot_updated(update("B"), 1_700_000_011)
+            .await
+            .unwrap();
+        let rows = store
+            .list_thread_episodic_items_for_thread(&thread.workspace_id, &thread.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let job = store
+            .find_thread_episodic_index_job_by_item(&rows[0].id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, ThreadEpisodicIndexJobStatus::Queued);
+        store
+            .materialize_item_snapshot_updated(update("B"), 1_700_000_099)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job_by_item(&rows[0].id)
+                .await
+                .unwrap()
+                .unwrap(),
+            job
+        );
+        store
+            .materialize_item_snapshot_updated(update("C"), 1_700_000_100)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .find_thread_episodic_item(&rows[0].id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ThreadEpisodicItemStatus::Superseded
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ThreadEpisodicIndexJobStatus::Canceled
+        );
+        let current = store
+            .list_thread_episodic_items_for_thread(&thread.workspace_id, &thread.id, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.status == ThreadEpisodicItemStatus::PendingIndex)
+            .unwrap();
+        assert_eq!(
+            current.text_hash,
+            crate::thread_episodic_source::item_text_hash(
+                &crate::thread_episodic_source::committed_item_ingestion_input_from_parts(
+                    &thread.workspace_id,
+                    &thread.id,
+                    &turn.id,
+                    make_item("C")
+                )
+                .unwrap(),
+                "C"
+            )
+        );
+        assert!(
+            store
+                .find_thread_episodic_index_job_by_item(&current.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn episodic_direct_save_bookkeeping_failure_rolls_back_source_and_projection() {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_source_rollback",
+            "thr_source_rollback",
+            "turn_source_rollback",
+        )
+        .await;
+        let item = |text: &str| TurnItem::UserMessage {
+            id: "rollback_source".to_owned(),
+            text: text.to_owned(),
+            attachments: vec![],
+        };
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: item("before"),
+                },
+                1_700_000_010,
+            )
+            .await
+            .unwrap();
+        let before = store
+            .get_turn_item(&turn.id, "rollback_source")
+            .await
+            .unwrap()
+            .unwrap();
+        // Fault injection belongs only to this fixture; production guards remain intact.
+        store.connection.execute_unprepared("CREATE TRIGGER fail_episodic_job BEFORE INSERT ON thread_episodic_index_jobs BEGIN SELECT RAISE(ABORT, 'bookkeeping failure'); END").await.unwrap();
+        store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: item("after"),
+                },
+                1_700_000_011,
+            )
+            .await
+            .expect_err("source and job must be one atomic write set");
+        assert_eq!(
+            store
+                .get_turn_item(&turn.id, "rollback_source")
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert!(
+            store
+                .list_thread_episodic_items_for_thread(&thread.workspace_id, &thread.id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_thread_episodic_index_jobs_for_thread(&thread.workspace_id, &thread.id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn episodic_direct_save_revalidates_group_context_and_rolls_back() {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_context_guard",
+            "thr_context_guard",
+            "turn_context_guard",
+        )
+        .await;
+        let item = |text: &str| TurnItem::AgentMessage {
+            id: "context_source".to_owned(),
+            text: text.to_owned(),
+            phase: AgentMessagePhase::FinalAnswer,
+            markdown: None,
+            markdown_version: None,
+        };
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: item("before"),
+                },
+                1_700_000_010,
+            )
+            .await
+            .unwrap();
+        let after = item("after");
+        let prepared = store
+            .prepare_episodic_source_save(&thread.workspace_id, &thread.id, &turn.id, &after)
+            .await
+            .unwrap();
+        let now = unix_to_datetime(1_700_000_011);
+        let projected = crate::repositories::turn::prepare_turn_item_projection(
+            &turn.id,
+            &after,
+            Some("completed"),
+            now,
+            now,
+        )
+        .unwrap();
+        let transaction = store.connection.begin().await.unwrap();
+        // A preceding write in the same transaction changes the causal group.
+        pioneer_entity::task_run_turn::Entity::insert(pioneer_entity::task_run_turn::ActiveModel {
+            id: Set("new_context_link".to_owned()),
+            task_id: Set("context_task".to_owned()),
+            run_id: Set("context_run".to_owned()),
+            execution_id: Set(None),
+            thread_id: Set(thread.id.clone()),
+            turn_id: Set(turn.id.clone()),
+            kind: Set("initial".to_owned()),
+            round: Set(0),
+            sequence: Set(0),
+            status: Set("candidate_created".to_owned()),
+            reviews_candidate_id: Set(None),
+            requested_by_candidate_id: Set(None),
+            requested_by_review_event_id: Set(None),
+            created_at: Set(now),
+            started_at: Set(None),
+            completed_at: Set(None),
+        })
+        .exec(&transaction)
+        .await
+        .unwrap();
+        crate::repositories::turn::upsert_prepared_turn_item(&transaction, projected)
+            .await
+            .unwrap();
+        let error = store
+            .commit_episodic_source_save(&transaction, &prepared, now)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("context changed before commit"));
+        transaction.rollback().await.unwrap();
+        assert_eq!(
+            store
+                .get_turn_item(&turn.id, "context_source")
+                .await
+                .unwrap()
+                .unwrap(),
+            item("before")
+        );
+        assert!(
+            store
+                .get_task_run_turn_by_turn(&thread.id, &turn.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .list_thread_episodic_index_jobs_for_thread(&thread.workspace_id, &thread.id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn episodic_updated_delivery_and_task_projection_survive_missing_callback() {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_source_delivery",
+            "thr_source_delivery",
+            "turn_source_delivery",
+        )
+        .await;
+        let item = |text: &str| TurnItem::AgentMessage {
+            id: "durable_source".to_owned(),
+            text: text.to_owned(),
+            phase: AgentMessagePhase::FinalAnswer,
+            markdown: None,
+            markdown_version: None,
+        };
+        let completed = ItemCompletedNotification {
+            workspace_id: thread.workspace_id.clone(),
+            thread_id: thread.id.clone(),
+            turn_id: turn.id.clone(),
+            item: item("first"),
+        };
+        store
+            .materialize_task_delivery_item(
+                ItemStartedNotification {
+                    workspace_id: completed.workspace_id.clone(),
+                    thread_id: completed.thread_id.clone(),
+                    turn_id: completed.turn_id.clone(),
+                    item: completed.item.clone(),
+                },
+                completed,
+                1_700_000_010,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .materialize_item_updated(
+                ItemUpdatedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: item("changed"),
+                },
+                1_700_000_011,
+            )
+            .await
+            .unwrap();
+        let maintenance = store.with_maintenance_access();
+        let first = maintenance
+            .claim_due_turn_event_deliveries("thread_episodic", 1_700_000_100, 10)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1); // Causal predecessor blocks the update delivery.
+        assert!(matches!(
+            first[0].event.payload,
+            CanonicalTurnEventPayload::ItemCompleted(_)
+        ));
+        let repeat = maintenance
+            .claim_due_turn_event_deliveries("thread_episodic", 1_700_001_100, 10)
+            .await
+            .unwrap();
+        assert_eq!(repeat.len(), 1);
+        assert_eq!(repeat[0].id, first[0].id);
+        assert_ne!(repeat[0].claim_token, first[0].claim_token);
+        assert!(
+            !maintenance
+                .complete_turn_event_delivery(&first[0].id, &first[0].claim_token, 1_700_001_100)
+                .await
+                .unwrap()
+        );
+        assert!(
+            maintenance
+                .complete_turn_event_delivery(&repeat[0].id, &repeat[0].claim_token, 1_700_001_100)
+                .await
+                .unwrap()
+        );
+        let next = maintenance
+            .claim_due_turn_event_deliveries("thread_episodic", 1_700_001_101, 10)
+            .await
+            .unwrap();
+        assert_eq!(next.len(), 1);
+        assert!(matches!(
+            next[0].event.payload,
+            CanonicalTurnEventPayload::ItemUpdated(_)
+        ));
+        assert_eq!(
+            store
+                .get_turn_item(&turn.id, "durable_source")
+                .await
+                .unwrap()
+                .unwrap(),
+            item("changed")
+        );
+    }
+
+    #[tokio::test]
+    async fn episodic_delivery_waits_for_projection_replay() {
+        use pioneer_entity::{
+            turn_event_projection_state as receipt, turn_event_projection_stream_state as stream,
+        };
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_delivery_replay",
+            "thr_delivery_replay",
+            "turn_delivery_replay",
+        )
+        .await;
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: TurnItem::UserMessage {
+                        id: "replay_source".to_owned(),
+                        text: "durable source".to_owned(),
+                        attachments: vec![],
+                    },
+                },
+                1_700_000_010,
+            )
+            .await
+            .unwrap();
+        let event =
+            crate::repositories::turn_event::latest_event_for_turn(&store.connection, &turn.id)
+                .await
+                .unwrap()
+                .unwrap();
+        receipt::Entity::update_many()
+            .filter(receipt::Column::EventId.eq(event.id.clone()))
+            .col_expr(receipt::Column::Status, Expr::value("pending"))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        stream::Entity::update_many()
+            .filter(stream::Column::TurnId.eq(turn.id.clone()))
+            .col_expr(
+                stream::Column::ProjectedThroughSequence,
+                Expr::value(event.sequence - 1),
+            )
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .claim_due_turn_event_deliveries("thread_episodic", 1_700_000_100, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .replay_due_turn_event_projections(1_700_000_100, 10)
+                .await
+                .unwrap()
+                .projected,
+            1
+        );
+        let delivered = store
+            .claim_due_turn_event_deliveries("thread_episodic", 1_700_000_101, 10)
+            .await
+            .unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].event.id, event.id);
+    }
+
+    #[tokio::test]
+    async fn episodic_canonical_payload_repair_commits_job_and_fences_stale_payload() {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_source_repair",
+            "thr_source_repair",
+            "turn_source_repair",
+        )
+        .await;
+        let item = |text: &str| TurnItem::UserMessage {
+            id: "repair_source".to_owned(),
+            text: text.to_owned(),
+            attachments: vec![],
+        };
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: item("before"),
+                },
+                1_700_000_010,
+            )
+            .await
+            .unwrap();
+        let row =
+            crate::repositories::turn::find_turn_item(&store.connection, &turn.id, "repair_source")
+                .await
+                .unwrap()
+                .unwrap();
+        let payload = serde_json::to_string(&item("repaired")).unwrap();
+        let episodic = store
+            .prepare_terminal_payload_episodic_save(&row, &payload)
+            .await
+            .unwrap()
+            .unwrap();
+        let transaction = store.connection.begin().await.unwrap();
+        assert!(
+            store
+                .apply_one_terminal_turn_item_payload_repair(
+                    &transaction,
+                    &row,
+                    &payload,
+                    Some(&episodic)
+                )
+                .await
+                .unwrap()
+        );
+        transaction.commit().await.unwrap();
+        let jobs = store
+            .list_thread_episodic_index_jobs_for_thread(&thread.workspace_id, &thread.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, ThreadEpisodicIndexJobStatus::Queued);
+        let stale_payload = serde_json::to_string(&item("stale repair")).unwrap();
+        let stale = store
+            .prepare_terminal_payload_episodic_save(&row, &stale_payload)
+            .await
+            .unwrap()
+            .unwrap();
+        let transaction = store.connection.begin().await.unwrap();
+        assert!(
+            !store
+                .apply_one_terminal_turn_item_payload_repair(
+                    &transaction,
+                    &row,
+                    &stale_payload,
+                    Some(&stale)
+                )
+                .await
+                .unwrap()
+        );
+        transaction.commit().await.unwrap();
+        assert_eq!(
+            store
+                .get_turn_item(&turn.id, "repair_source")
+                .await
+                .unwrap()
+                .unwrap(),
+            item("repaired")
+        );
+        assert_eq!(
+            store
+                .list_thread_episodic_index_jobs_for_thread(&thread.workspace_id, &thread.id, 10)
+                .await
+                .unwrap(),
+            jobs
+        );
+    }
+
+    #[tokio::test]
+    async fn episodic_model_reset_commits_cursor_with_replacement_and_preserves_budget_on_restart()
+    {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_reset_cursor",
+            "thr_reset_cursor",
+            "turn_reset_cursor",
+        )
+        .await;
+        let mut originals = Vec::new();
+        for index in 0..34 {
+            let item = TurnItem::UserMessage {
+                id: format!("reset_{index:02}"),
+                text: format!("reset source {index}"),
+                attachments: vec![],
+            };
+            store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: thread.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn_id: turn.id.clone(),
+                        item: item.clone(),
+                    },
+                    1_700_010_000,
+                )
+                .await
+                .unwrap();
+            store
+                .materialize_item_snapshot_updated(
+                    ItemUpdatedNotification {
+                        workspace_id: thread.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn_id: turn.id.clone(),
+                        item,
+                    },
+                    1_700_010_001,
+                )
+                .await
+                .unwrap();
+        }
+        let sources = store
+            .list_thread_episodic_items_for_thread(&thread.workspace_id, &thread.id, 100)
+            .await
+            .unwrap();
+        for source in &sources {
+            originals.push(
+                store
+                    .find_thread_episodic_index_job_by_item(&source.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let key = thread_episodic_projection_reset_key(&thread.workspace_id).unwrap();
+        let now = unix_to_datetime(1_700_010_002);
+        upsert_projection_meta_with_config(
+            &store.database_connection(),
+            ProjectionMetaRecord {
+                projection_key: key.clone(),
+                projection_version: 1,
+                status: PROJECTION_META_STATUS_PENDING.to_owned(),
+                source_thread_count: 0,
+                source_turn_count: 0,
+                source_turn_item_count: 0,
+                source_turn_event_count: 0,
+                last_error: None,
+                backfill_started_at: Some(now),
+                backfilled_at: None,
+                created_at: now,
+                updated_at: now,
+            },
+            ProjectionMetaConfigRecord {
+                projection_config_hash: Some("model-b-reset".to_owned()),
+                projection_config_json: Some(
+                    serde_json::to_string(&ThreadEpisodicProjectionResetProgress::default())
+                        .unwrap(),
+                ),
+            },
+        )
+        .await
+        .unwrap();
+        // The first quantum commits. The next source forces rollback of its
+        // replacement and cursor together, simulating interruption mid-reset.
+        store.database_connection().execute_unprepared("CREATE TRIGGER reject_second_reset_batch BEFORE UPDATE ON thread_episodic_items WHEN OLD.item_id = 'reset_32' BEGIN SELECT RAISE(ABORT, 'controlled reset bookkeeping failure'); END").await.unwrap();
+        assert!(
+            store
+                .with_maintenance_access()
+                .reset_thread_episodic_projection(&thread.workspace_id, 1_700_010_002)
+                .await
+                .is_err()
+        );
+        let progress: ThreadEpisodicProjectionResetProgress = serde_json::from_str(
+            find_projection_meta(&store.database_connection(), &key)
+                .await
+                .unwrap()
+                .unwrap()
+                .projection_config_json
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(progress.files_cleaned);
+        assert_eq!(progress.after_source.as_ref().unwrap()[2], "reset_31");
+        let mut prefix = Vec::new();
+        for source in &sources {
+            let job = store
+                .find_thread_episodic_index_job_by_item(&source.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let original = originals
+                .iter()
+                .find(|old| old.index_item_id == source.id)
+                .unwrap();
+            if source.item_id.as_str() < "reset_32" {
+                assert_ne!(job.id, original.id);
+                assert_eq!(job.attempt_count, 0);
+                prefix.push(job);
+            } else {
+                assert_eq!(&job, original);
+            }
+        }
+        assert_eq!(prefix.len(), 32);
+        store
+            .database_connection()
+            .execute_unprepared("DROP TRIGGER reject_second_reset_batch")
+            .await
+            .unwrap();
+        store
+            .with_maintenance_access()
+            .reset_thread_episodic_projection(&thread.workspace_id, 1_700_010_003)
+            .await
+            .unwrap();
+        for job in &prefix {
+            assert_eq!(
+                store
+                    .find_thread_episodic_index_job(&job.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                *job
+            );
+        }
+        let replacement = store
+            .find_thread_episodic_index_job_by_item(&originals[0].index_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(replacement.id, originals[0].id);
+        let claim = store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                &thread.workspace_id,
+                1_700_010_004,
+                1,
+                5,
+            )
+            .await
+            .unwrap()
+            .assert_no_failures_for_test()
+            .pop()
+            .unwrap();
+        store
+            .fail_thread_episodic_index_attempt_without_source_validation(
+                &claim.id,
+                claim.attempt_count,
+                ThreadEpisodicIndexJobFailureUpdate {
+                    retryable: false,
+                    next_run_at_unix: None,
+                    last_error: Some("new model exhausted".to_owned()),
+                    capacity_error: false,
+                    last_attempt_latency_ms: None,
+                },
+                1_700_010_004,
+            )
+            .await
+            .unwrap();
+        let exhausted = store
+            .find_thread_episodic_index_job(&claim.id)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .with_maintenance_access()
+            .reset_thread_episodic_projection(&thread.workspace_id, 1_700_010_005)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&claim.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            exhausted
+        );
+        assert_eq!(exhausted.status, ThreadEpisodicIndexJobStatus::Canceled);
+        assert_eq!(exhausted.attempt_count, 1);
+        assert_eq!(
+            store
+                .fail_thread_episodic_index_attempt_without_source_validation(
+                    &originals[0].id,
+                    1,
+                    ThreadEpisodicIndexJobFailureUpdate {
+                        retryable: true,
+                        next_run_at_unix: Some(1_700_010_100),
+                        last_error: Some("old callback".to_owned()),
+                        capacity_error: false,
+                        last_attempt_latency_ms: None
+                    },
+                    1_700_010_005
+                )
+                .await
+                .unwrap(),
+            ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+        );
+    }
+
+    #[tokio::test]
+    async fn episodic_started_update_does_not_complete_or_index_draft() {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_source_draft",
+            "thr_source_draft",
+            "turn_source_draft",
+        )
+        .await;
+        let item = TurnItem::AgentMessage {
+            id: "draft_source".to_owned(),
+            text: "unfinished final answer".to_owned(),
+            phase: AgentMessagePhase::FinalAnswer,
+            markdown: None,
+            markdown_version: None,
+        };
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: item.clone(),
+                },
+                1_700_000_010,
+            )
+            .await
+            .unwrap();
+        let update = ItemUpdatedNotification {
+            workspace_id: thread.workspace_id.clone(),
+            thread_id: thread.id.clone(),
+            turn_id: turn.id.clone(),
+            item: item.clone(),
+        };
+        store
+            .materialize_item_updated(update.clone(), 1_700_000_011)
+            .await
+            .unwrap();
+        store
+            .materialize_item_snapshot_updated(update, 1_700_000_012)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .get_thread_episodic_canonical_item(
+                    &thread.workspace_id,
+                    &thread.id,
+                    &turn.id,
+                    "draft_source"
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .committed
+        );
+        assert!(
+            store
+                .list_thread_episodic_items_for_thread(&thread.workspace_id, &thread.id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item,
+                },
+                1_700_000_013,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_thread_episodic_canonical_item(
+                    &thread.workspace_id,
+                    &thread.id,
+                    &turn.id,
+                    "draft_source"
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .committed
+        );
+    }
+
     #[tokio::test]
     async fn item_snapshot_update_does_not_append_turn_event_but_surfaces_in_turn_items() {
         let workspace_id = "ws_diff_snapshot";
@@ -46449,6 +48459,7 @@ mod tests {
                 &transaction,
                 &stale_row,
                 stale_repair.as_str(),
+                None,
             )
             .await
             .expect("stale conditional repair should execute safely");

@@ -1298,6 +1298,26 @@ pub(crate) struct PreparedTurnItemProjection {
 }
 
 impl PreparedTurnItemProjection {
+    /// An update carries content, not a completion transition. Check the
+    /// transaction's current item so event B observes event A in atomic batches.
+    pub(crate) async fn preserve_uncommitted_source_status<C: ConnectionTrait>(
+        &mut self,
+        db: &C,
+    ) -> Result<()> {
+        if matches!(
+            self.item_type.as_str(),
+            "user_message" | "agent_message" | "task"
+        ) {
+            let current = find_turn_item(db, &self.turn_id, &self.item_id).await?;
+            if current.as_ref().is_none_or(|row| {
+                !crate::thread_episodic_source::source_status_is_committed(row.status.as_deref())
+            }) {
+                self.status = Some(crate::convention::TURN_ITEM_STATUS_IN_PROGRESS.to_owned());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn payload_json(&self) -> &str {
         self.payload_json.as_str()
     }

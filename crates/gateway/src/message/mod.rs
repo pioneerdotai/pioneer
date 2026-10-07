@@ -1102,19 +1102,34 @@ impl MessageProcessor {
                 thread_episodic_runtime_config.vector_search.clone(),
             ),
         );
-        let thread_episodic_index_executor = Arc::new(ThreadEpisodicIndexExecutor::new(
-            maintenance_crud_store.clone(),
-            thread_episodic_backend.clone(),
-            Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                    maintenance_crud_store.clone(),
-                    thread_episodic_storage_uri_from_path(thread_episodic_storage_root.as_path()),
+        let thread_episodic_workspace_refill_supervisor =
+            Arc::new(crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor::default());
+        let thread_episodic_index_executor = Arc::new(
+            ThreadEpisodicIndexExecutor::new(
+                maintenance_crud_store.clone(),
+                thread_episodic_backend.clone(),
+                Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                    Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                        maintenance_crud_store.clone(),
+                        thread_episodic_storage_uri_from_path(
+                            thread_episodic_storage_root.as_path(),
+                        ),
+                    )),
+                    thread_episodic_embedding_provider_resolver.clone(),
+                    maintenance_crud_store,
                 )),
+            )
+            .with_projection_runtime(
+                thread_episodic_storage_root.clone(),
                 thread_episodic_embedding_provider_resolver.clone(),
-                maintenance_crud_store,
-            )),
-        ));
+                thread_episodic_workspace_refill_supervisor.clone(),
+            ),
+        );
         thread_episodic_index_executor.apply_config(thread_episodic_runtime_config.index_executor);
+        thread_episodic_index_executor.set_indexing_enabled(
+            thread_episodic_runtime_config.enabled
+                && thread_episodic_runtime_config.indexing_enabled,
+        );
         let thread_episodic_recall_embedding_provider_resolver: Arc<
             dyn ThreadEpisodicIndexEmbeddingProviderResolver,
         > = thread_episodic_embedding_provider_resolver.clone();
@@ -1130,8 +1145,6 @@ impl MessageProcessor {
         let thread_episodic_ingestion_enabled = thread_episodic_runtime_config.enabled
             && thread_episodic_runtime_config.indexing_enabled;
         let (thread_episodic_vector_refill_status_tx, _) = broadcast::channel(64);
-        let thread_episodic_workspace_refill_supervisor =
-            Arc::new(crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor::default());
 
         Self {
             thread_manager,
@@ -1467,6 +1480,10 @@ impl MessageProcessor {
             None,
         )
         .await
+    }
+
+    pub(crate) async fn shutdown_thread_episodic_index_runner(&self) {
+        self.thread_episodic_index_executor.shutdown().await;
     }
 
     pub(crate) fn thread_episodic_workspace_refill_supervisor(
@@ -2109,6 +2126,8 @@ impl MessageProcessor {
             *current = config.clone();
         }
         self.thread_episodic_index_executor
+            .set_indexing_enabled(thread_episodic_ingestion_enabled);
+        self.thread_episodic_index_executor
             .apply_config(config.index_executor);
         self.thread_episodic_recall_service
             .apply_config(config.recall_service);
@@ -2133,6 +2152,7 @@ impl MessageProcessor {
             .apply_workspace_configs(configs.clone());
         self.thread_episodic_recall_service
             .apply_workspace_vector_search_configs(configs);
+        self.thread_episodic_index_executor.wake();
     }
 
     pub(crate) fn compaction_settings(
@@ -2399,6 +2419,7 @@ impl MessageProcessor {
     }
 
     async fn initialize_resilience_workers(self: &Arc<Self>) -> anyhow::Result<()> {
+        self.thread_episodic_index_executor.wake();
         let background = self.for_background_reconciliation();
         let trace = pioneer_observability::GatewayOperationTrace::start(
             pioneer_observability::GatewayOperation::ResilienceInitialize,
@@ -4553,18 +4574,29 @@ impl MessageProcessor {
                 ThreadEpisodicRuntimeConfig::default().vector_search,
             ),
         );
-        let thread_episodic_index_executor = Arc::new(ThreadEpisodicIndexExecutor::new(
-            maintenance_crud_store.clone(),
-            thread_episodic_backend.clone(),
-            Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                    maintenance_crud_store.clone(),
-                    thread_episodic_storage_uri_from_path(thread_episodic_storage_root.as_path()),
+        let thread_episodic_workspace_refill_supervisor =
+            Arc::new(crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor::default());
+        let thread_episodic_index_executor = Arc::new(
+            ThreadEpisodicIndexExecutor::new(
+                maintenance_crud_store.clone(),
+                thread_episodic_backend.clone(),
+                Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                    Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                        maintenance_crud_store.clone(),
+                        thread_episodic_storage_uri_from_path(
+                            thread_episodic_storage_root.as_path(),
+                        ),
+                    )),
+                    thread_episodic_embedding_provider_resolver.clone(),
+                    maintenance_crud_store,
                 )),
+            )
+            .with_projection_runtime(
+                thread_episodic_storage_root.clone(),
                 thread_episodic_embedding_provider_resolver.clone(),
-                maintenance_crud_store,
-            )),
-        ));
+                thread_episodic_workspace_refill_supervisor.clone(),
+            ),
+        );
         let thread_episodic_recall_embedding_provider_resolver: Arc<
             dyn ThreadEpisodicIndexEmbeddingProviderResolver,
         > = thread_episodic_embedding_provider_resolver.clone();
@@ -4576,8 +4608,6 @@ impl MessageProcessor {
             ),
         );
         let (thread_episodic_vector_refill_status_tx, _) = broadcast::channel(64);
-        let thread_episodic_workspace_refill_supervisor =
-            Arc::new(crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor::default());
         Self {
             thread_manager,
             agent_manager,
