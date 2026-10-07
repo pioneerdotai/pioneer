@@ -626,7 +626,7 @@ pub struct MessageProcessor {
         Mutex<
             HashMap<
                 crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
-                Arc<tokio::sync::Mutex<()>>,
+                turn_handlers::CliRuntimeSessionTurnLocks,
             >,
         >,
     >,
@@ -2677,6 +2677,7 @@ impl MessageProcessor {
                     processor.clone(),
                 )),
             ]);
+            let mut cli_runtime_stale_turn_scan = cli_runtime::CliRuntimeStaleTurnScan::default();
             let mut next_skill_upload_cleanup = 0;
             let mut next_agent_action_ledger_compaction = 0;
             let mut next_native_terminal_effect_purge = 0;
@@ -3066,7 +3067,10 @@ impl MessageProcessor {
 
                 crate::database::attribution::scope_database_workload(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    this.fail_stale_cli_runtime_turns(now_timestamp_millis()),
+                    this.fail_stale_cli_runtime_turns(
+                        now_timestamp_millis(),
+                        &mut cli_runtime_stale_turn_scan,
+                    ),
                 )
                 .await;
 
@@ -3387,6 +3391,10 @@ impl MessageProcessor {
                     self.cli_runtime_command_heartbeats.remove_key(&key).await;
                     continue;
                 }
+                Ok(
+                    cli_runtime::CLIRuntimeAuthoritativeTurnState::Deferred
+                    | cli_runtime::CLIRuntimeAuthoritativeTurnState::Superseded,
+                ) => continue,
                 Ok(cli_runtime::CLIRuntimeAuthoritativeTurnState::Unavailable) => {
                     self.cli_runtime_command_heartbeats
                         .mark_attempt_failed(&key, now_unix)

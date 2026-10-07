@@ -71,17 +71,31 @@ mod tests {
     use crate::Migrator;
     use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 
+    // Keep rollback scoped to this release, excluding later irreversible migrations.
+    struct GateFixtureMigrator;
+    impl MigratorTrait for GateFixtureMigrator {
+        fn migrations() -> Vec<Box<dyn MigrationTrait>> {
+            let mut migrations = Migrator::migrations();
+            let position = migrations
+                .iter()
+                .position(|migration| migration.name() == Migration.name())
+                .expect("terminal-effect gate migration must remain registered");
+            migrations.truncate(position + 1);
+            migrations
+        }
+    }
+
     #[tokio::test]
     async fn schema_and_marker_rollback_on_index_failure_then_retry_and_down() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let name = Migration.name();
-        let migrations = Migrator::migrations();
+        let migrations = GateFixtureMigrator::migrations();
         let position = migrations
             .iter()
             .position(|migration| migration.name() == name)
             .expect("terminal-effect gate migration must remain registered");
         let before = <u32 as TryFrom<usize>>::try_from(position).unwrap();
-        Migrator::up(&db, Some(before)).await.unwrap();
+        GateFixtureMigrator::up(&db, Some(before)).await.unwrap();
         db.execute_unprepared(
             "CREATE INDEX idx_task_result_candidate_gate ON task_result_candidate(id)",
         )
@@ -89,7 +103,7 @@ mod tests {
         .unwrap();
         // Exercise only this migration's transaction and rollback. Later migrations
         // may intentionally be irreversible and must not participate in this roundtrip.
-        assert!(Migrator::up(&db, Some(1)).await.is_err());
+        assert!(GateFixtureMigrator::up(&db, Some(1)).await.is_err());
         let columns = db
             .query_all_raw(Statement::from_string(
                 DbBackend::Sqlite,
@@ -116,13 +130,15 @@ mod tests {
                     .unwrap()
             );
         }
-        let applied = Migrator::get_applied_migrations(&db).await.unwrap();
+        let applied = GateFixtureMigrator::get_applied_migrations(&db)
+            .await
+            .unwrap();
         assert_eq!(applied.len(), before as usize);
         assert!(!applied.iter().any(|migration| migration.name() == name));
         db.execute_unprepared("DROP INDEX idx_task_result_candidate_gate")
             .await
             .unwrap();
-        Migrator::up(&db, Some(1)).await.unwrap();
+        GateFixtureMigrator::up(&db, Some(1)).await.unwrap();
         let columns = db
             .query_all_raw(Statement::from_string(
                 DbBackend::Sqlite,
@@ -138,7 +154,9 @@ mod tests {
             assert_eq!(row.try_get::<i64>("", "notnull").unwrap(), 1);
             assert_eq!(row.try_get::<String>("", "dflt_value").unwrap(), "0");
         }
-        let applied = Migrator::get_applied_migrations(&db).await.unwrap();
+        let applied = GateFixtureMigrator::get_applied_migrations(&db)
+            .await
+            .unwrap();
         assert_eq!(applied.len(), position + 1);
         assert!(applied.iter().any(|migration| migration.name() == name));
         let added_indexes = [
@@ -164,8 +182,10 @@ mod tests {
                     .unwrap()
             );
         }
-        Migrator::down(&db, Some(1)).await.unwrap();
-        let applied = Migrator::get_applied_migrations(&db).await.unwrap();
+        GateFixtureMigrator::down(&db, Some(1)).await.unwrap();
+        let applied = GateFixtureMigrator::get_applied_migrations(&db)
+            .await
+            .unwrap();
         assert_eq!(applied.len(), position);
         assert!(!applied.iter().any(|migration| migration.name() == name));
         for (table, index) in added_indexes {
@@ -204,15 +224,17 @@ mod tests {
                     .any(|row| row.try_get::<String>("", "name").unwrap() == name)
             );
         }
-        Migrator::up(&db, Some(1)).await.unwrap();
-        let applied = Migrator::get_applied_migrations(&db).await.unwrap();
+        GateFixtureMigrator::up(&db, Some(1)).await.unwrap();
+        let applied = GateFixtureMigrator::get_applied_migrations(&db)
+            .await
+            .unwrap();
         assert_eq!(applied.len(), position + 1);
         assert!(applied.iter().any(|migration| migration.name() == name));
 
         // Keep the forward compatibility check for the complete registered chain.
         Migrator::up(&db, None).await.unwrap();
         let applied = Migrator::get_applied_migrations(&db).await.unwrap();
-        assert_eq!(applied.len(), migrations.len());
+        assert_eq!(applied.len(), Migrator::migrations().len());
         assert!(applied.iter().any(|migration| migration.name() == name));
     }
 }
