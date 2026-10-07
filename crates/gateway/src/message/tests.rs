@@ -38451,7 +38451,7 @@ async fn production_settings_recovery_transitions_projection_before_new_source_c
         .unwrap();
         assert_eq!(
             capsule.effective_vec_index_dimension().unwrap(),
-            Some(dimension)
+            Some(u32::try_from(dimension).unwrap())
         );
         for source in current_items {
             let frame = capsule

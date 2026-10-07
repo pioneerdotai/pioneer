@@ -5537,7 +5537,7 @@ mod tests {
     use pioneer_entity::turn;
     use pioneer_memory::{
         InMemoryMemoryBackend, MemoryOperationContext, MemoryService, MemoryServiceConfig,
-        PioneerAdaptiveCutoffDiagnostics, PioneerAdaptiveCutoffReason,
+        MemvidThreadEpisodicBackend, PioneerAdaptiveCutoffDiagnostics, PioneerAdaptiveCutoffReason,
         ThreadEpisodicAdaptiveRetrievalImplementation, ThreadEpisodicEmbeddingErrorKind,
         ThreadEpisodicMemvidBackendCapabilities, ThreadEpisodicMemvidCapabilityState,
         ThreadEpisodicMemvidSearchHit, ThreadEpisodicMemvidSearchOutput,
@@ -11299,7 +11299,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 capsule.effective_vec_index_dimension().unwrap(),
-                Some(dimension_b)
+                Some(u32::try_from(dimension_b).unwrap())
             );
             for id in [&ready.id, &extra.id] {
                 let source = store.find_thread_episodic_item(id).await.unwrap().unwrap();

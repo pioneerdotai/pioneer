@@ -2495,7 +2495,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn ingest_committed_thread_item_with_result(
+    pub(super) async fn ingest_committed_thread_item_with_result(
         &self,
         notification: &pioneer_protocol::ItemCompletedNotification,
     ) -> Result<()> {
