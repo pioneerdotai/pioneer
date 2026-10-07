@@ -618,6 +618,15 @@ impl McpService {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn hold_test_turn_mcp_invocation(
+        &self,
+        turn_id: &str,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> impl Drop {
+        self.register_active_mcp_invocation(turn_id, "test-server", "test-call", cancellation)
+    }
+
     pub(crate) fn cancel_turn_mcp_invocations(&self, turn_id: &str) -> usize {
         self.cancel_active_mcp_invocations(|invocation| invocation.turn_id == turn_id)
     }

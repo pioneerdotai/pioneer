@@ -831,16 +831,16 @@ async fn oauth_queue_cancellation_impl(
         )
         .await
         .unwrap();
-        assert!(
+        let staged = serde_json::to_value(
             secrets
                 .mcp_oauth_persistence()
                 .read(&server_id)
                 .await
                 .unwrap()
-                .unwrap()
-                .pending_consent
-                .is_some()
-        );
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(staged["pending_consent"]["candidate"].is_object());
         if decision == OAuthState::Cancelled {
             socket
                 .send(ClientMessage::Text(

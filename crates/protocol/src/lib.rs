@@ -173,10 +173,11 @@ pub use cli_runtime::{
     CLIRuntimeThreadBindingManagement, CLIRuntimeThreadCompactParams,
     CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams, CLIRuntimeThreadForkResponse,
     CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse, CliMcpAdapterReadiness,
-    CliMcpInjectionKind, CliMcpProjectionUpdateKind, RUNTIME_DIAGNOSTIC_LINE_MAX_CHARS,
-    RUNTIME_DIAGNOSTIC_MAX_LINES, RuntimeAccountSnapshot, RuntimeAppInfo, RuntimeCapabilities,
-    RuntimeDiagnostic, RuntimeDiagnosticLevel, RuntimeModelInfo, RuntimeStatus, RuntimeSummary,
-    sanitize_runtime_diagnostic_line, sanitize_runtime_diagnostic_lines,
+    CliMcpInjectionKind, CliMcpProjectionUpdateKind, CliRuntimeBlockedTurnGuard,
+    RUNTIME_DIAGNOSTIC_LINE_MAX_CHARS, RUNTIME_DIAGNOSTIC_MAX_LINES, RuntimeAccountSnapshot,
+    RuntimeAppInfo, RuntimeCapabilities, RuntimeDiagnostic, RuntimeDiagnosticLevel,
+    RuntimeModelInfo, RuntimeStatus, RuntimeSummary, sanitize_runtime_diagnostic_line,
+    sanitize_runtime_diagnostic_lines,
 };
 pub use client_projection::{
     AgentWorkGraphProjection, AgentWorkNodeProjection, AgentWorkNodeState,

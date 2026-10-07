@@ -168,6 +168,24 @@ pub struct NewCliRuntimeThreadBinding {
     pub updated_at: DateTimeWithTimeZone,
 }
 
+/// Only the persistent active set participates in global background discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliRuntimeActiveTurnBindingStatus {
+    Starting,
+    Running,
+}
+
+impl CliRuntimeActiveTurnBindingStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+        }
+    }
+}
+
+pub const CLI_RUNTIME_ACTIVE_TURN_BINDING_PAGE_MAX: u64 = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliRuntimeTurnBindingRecord {
     pub turn_id: String,
@@ -1236,6 +1254,42 @@ pub async fn list_turn_bindings_for_thread<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to list CLI runtime turn bindings")?
+        .into_iter()
+        .map(turn_binding_record_from_model)
+        .collect()
+}
+
+// One equality range per status; the row-value seek matches the global
+// (status, created_at, turn_id) index, including timestamp ties.
+pub(crate) fn active_turn_binding_page_query(
+    status: CliRuntimeActiveTurnBindingStatus,
+    after: Option<&(DateTimeWithTimeZone, String)>,
+) -> sea_orm::Select<turn_cli_runtime_binding::Entity> {
+    use turn_cli_runtime_binding::Column;
+    let mut query =
+        turn_cli_runtime_binding::Entity::find().filter(Column::Status.eq(status.as_str()));
+    if let Some((created_at, turn_id)) = after {
+        query = query.filter(
+            Expr::tuple([Expr::col(Column::CreatedAt), Expr::col(Column::TurnId)]).gt(Expr::tuple(
+                [Expr::value(*created_at), Expr::value(turn_id.clone())],
+            )),
+        );
+    }
+    query
+        .order_by_asc(Column::CreatedAt)
+        .order_by_asc(Column::TurnId)
+        .limit(CLI_RUNTIME_ACTIVE_TURN_BINDING_PAGE_MAX)
+}
+
+pub async fn list_active_turn_binding_page<C: ConnectionTrait>(
+    db: &C,
+    status: CliRuntimeActiveTurnBindingStatus,
+    after: Option<&(DateTimeWithTimeZone, String)>,
+) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
+    active_turn_binding_page_query(status, after)
+        .all(db)
+        .await
+        .context("failed to list active CLI runtime turn binding page")?
         .into_iter()
         .map(turn_binding_record_from_model)
         .collect()

@@ -1637,6 +1637,16 @@ async fn migration_installation_and_completion_marker_rollback_together() {
     let tx = store.connection.begin().await.unwrap();
     TrackerFixtureMigrator::up(&*tx, None).await.unwrap();
     tx.commit().await.unwrap();
+    assert_eq!(
+        store
+            .connection
+            .query_all_raw(DatabaseBackend::Sqlite.build(&marker))
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "parent tracker completion marker must be installed"
+    );
     assert_eq!(generation(&store).await, 0);
 }
 

@@ -38,6 +38,8 @@ pub enum RuntimeTimeoutObservation {
     Active,
     Terminal,
     Unavailable,
+    /// Another owner is transitioning this session; no timeout evidence.
+    Deferred,
 }
 
 pub const fn hard_deadline_mode(
