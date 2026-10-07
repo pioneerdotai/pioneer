@@ -2532,7 +2532,7 @@ async fn large_input_noop_and_unknown_recovery_use_the_same_bounded_verification
     let total = large_metadata_inputs(&source);
     let fence = fence(&root);
     let attempts: Attempts = Arc::default();
-    let baseline = Arc::default();
+    let baseline: Arc<StdMutex<Baseline>> = Arc::default();
     let conf = config(&harness, &root);
     assert_eq!(
         consume(job(&harness, &root, baseline.clone(), fence.clone()))
@@ -2797,7 +2797,7 @@ async fn final_noop_metadata_read_and_recovery_markers_are_separate_outer_root_q
         "x".repeat(254 * 1024)
     );
     fs::write(source.join("SKILL.md"), &skill).unwrap();
-    let baseline = Arc::default();
+    let baseline: Arc<StdMutex<Baseline>> = Arc::default();
     let guard = fence(&root);
     assert_eq!(
         consume(job(&harness, &root, baseline.clone(), guard.clone())).await,
