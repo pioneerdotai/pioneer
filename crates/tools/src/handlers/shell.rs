@@ -19,8 +19,8 @@ use std::future::pending;
 use std::io;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
@@ -67,13 +67,47 @@ impl Default for OneShotOutputLimits {
 }
 
 pub struct UnifiedExecHandler {
-    sessions: Arc<Mutex<HashMap<u64, Arc<Mutex<ExecSession>>>>>,
+    sessions: Arc<StdMutex<HashMap<u64, Arc<Mutex<ExecSession>>>>>,
+    one_shots: StdMutex<HashMap<u64, Arc<Mutex<RetainedOneShot>>>>,
     next_session_id: AtomicU64,
     one_shot_limits: OneShotOutputLimits,
+    cleanup_error: StdMutex<Option<String>>,
+}
+
+struct RetainedOneShot {
+    child: Child,
+    readers: Vec<tokio::task::JoinHandle<()>>,
+    reader_error: Option<String>,
+    process_id: Option<u32>,
+    _runtime_temp_dir: Option<Arc<crate::process_policy::ProcessRuntimeTempDir>>,
+}
+
+async fn drain_shell_readers(
+    readers: &mut Vec<tokio::task::JoinHandle<()>>,
+    reader_error: &mut Option<String>,
+) -> Result<(), ToolError> {
+    while let Some(reader) = readers.last_mut() {
+        reader.abort();
+        let result = (&mut *reader).await;
+        readers.pop();
+        if let Err(error) = result {
+            if !error.is_cancelled() {
+                let message = format!("shell reader join failed: {error}");
+                *reader_error = Some(message.clone());
+            }
+        }
+    }
+    match reader_error {
+        Some(error) => Err(ToolError::internal(error.clone())),
+        None => Ok(()),
+    }
 }
 
 struct ExecSession {
     child: Child,
+    readers: Vec<tokio::task::JoinHandle<()>>,
+    reader_error: Option<String>,
+    process_id: Option<u32>,
     stdin: Option<ChildStdin>,
     stdout: Arc<Mutex<SessionBuffer>>,
     stderr: Arc<Mutex<SessionBuffer>>,
@@ -88,15 +122,24 @@ struct ExecSession {
 impl Default for UnifiedExecHandler {
     fn default() -> Self {
         Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(StdMutex::new(HashMap::new())),
+            one_shots: StdMutex::new(HashMap::new()),
             next_session_id: AtomicU64::new(0),
             one_shot_limits: OneShotOutputLimits::default(),
+            cleanup_error: StdMutex::new(None),
         }
     }
 }
 
 impl Drop for UnifiedExecHandler {
     fn drop(&mut self) {
+        if let Ok(children) = self.one_shots.try_lock() {
+            for child in children.values() {
+                if let Ok(mut child) = child.try_lock() {
+                    terminate_child_process_now(&mut child.child);
+                }
+            }
+        }
         if let Ok(sessions) = self.sessions.try_lock() {
             for session in sessions.values() {
                 if let Ok(mut guard) = session.try_lock() {
@@ -199,6 +242,124 @@ impl ToolHandler for UnifiedExecHandler {
 }
 
 impl UnifiedExecHandler {
+    /// Called after native dispatch tasks have ended. No registry lock spans a
+    /// process wait. A cancelled waiter leaves each Child and JoinHandle here.
+    pub async fn stop_and_wait(&self) -> Result<(), ToolError> {
+        let children = self
+            .one_shots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(id, child)| (*id, child.clone()))
+            .collect::<Vec<_>>();
+        for (id, child) in children {
+            let mut retained = child.lock().await;
+            let process_result = terminate_child_process(&mut retained.child).await;
+            if let Err(error) = &process_result {
+                self.remember_cleanup_error(error);
+            }
+            if process_result.is_ok() {
+                kill_process_tree(retained.process_id.take(), true);
+            }
+            let RetainedOneShot {
+                readers,
+                reader_error,
+                ..
+            } = &mut *retained;
+            if let Err(error) = drain_shell_readers(readers, reader_error).await {
+                self.remember_cleanup_error(&error);
+            }
+            if process_result.is_ok() {
+                self.one_shots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id);
+            }
+        }
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for id in sessions {
+            if let Err(error) = self.close_session(id).await {
+                self.remember_cleanup_error(&error);
+            }
+        }
+        match self
+            .cleanup_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            Some(error) => Err(ToolError::internal(error)),
+            None => Ok(()),
+        }
+    }
+
+    fn remember_cleanup_error(&self, error: &ToolError) {
+        let mut failure = self
+            .cleanup_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if failure.is_none() {
+            *failure = Some(error.to_string());
+        }
+    }
+
+    /// Used only after native dispatch tasks joined, so no new child can appear.
+    /// An error outcome and ownership of an unconfirmed process are distinct.
+    pub fn cleanup_is_quiescent(&self) -> bool {
+        self.one_shots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+            && self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+    }
+
+    async fn close_session(&self, id: u64) -> Result<(), ToolError> {
+        let session = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)
+            .cloned();
+        if let Some(session) = session {
+            let mut session = session.lock().await;
+            let process_result = terminate_child_process(&mut session.child).await;
+            if let Err(error) = &process_result {
+                self.remember_cleanup_error(error);
+            }
+            if process_result.is_ok() {
+                kill_process_tree(session.process_id.take(), true);
+            }
+            let ExecSession {
+                readers,
+                reader_error,
+                ..
+            } = &mut *session;
+            let result = drain_shell_readers(readers, reader_error).await;
+            if let Err(error) = &result {
+                self.remember_cleanup_error(error);
+            }
+            // Release only after child wait and all reader joins, even on reader panic.
+            if process_result.is_ok() {
+                self.sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id);
+            }
+            return process_result.and(result);
+        }
+        Ok(())
+    }
+
     async fn handle_exec_command(
         &self,
         args: ExecCommandArgs,
@@ -217,12 +378,19 @@ impl UnifiedExecHandler {
                 &trace,
                 cancellation,
                 self.one_shot_limits,
+                self,
             )
             .await?;
             return Ok(Box::new(result.into_tool_output()));
         }
 
-        if self.sessions.lock().await.len() >= MAX_ACTIVE_SESSIONS {
+        if self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+            >= MAX_ACTIVE_SESSIONS
+        {
             return Err(ToolError::execution_failed(format!(
                 "too many active exec sessions (limit={MAX_ACTIVE_SESSIONS}); close existing sessions or wait for cleanup"
             )));
@@ -261,15 +429,19 @@ impl UnifiedExecHandler {
             .saturating_add(1);
         let stdout_buffer = Arc::new(Mutex::new(SessionBuffer::default()));
         let stderr_buffer = Arc::new(Mutex::new(SessionBuffer::default()));
+        let mut readers = Vec::new();
         if let Some(stdout) = stdout {
-            spawn_reader(stdout, stdout_buffer.clone());
+            readers.push(spawn_reader(stdout, stdout_buffer.clone()));
         }
         if let Some(stderr) = stderr {
-            spawn_reader(stderr, stderr_buffer.clone());
+            readers.push(spawn_reader(stderr, stderr_buffer.clone()));
         }
 
         let session = Arc::new(Mutex::new(ExecSession {
+            process_id: child.id(),
             child,
+            readers,
+            reader_error: None,
             stdin,
             stdout: stdout_buffer,
             stderr: stderr_buffer,
@@ -283,7 +455,7 @@ impl UnifiedExecHandler {
 
         self.sessions
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(session_id, session.clone());
 
         let session_cancelled = tokio::select! {
@@ -302,7 +474,7 @@ impl UnifiedExecHandler {
                     );
                 }
             }
-            self.sessions.lock().await.remove(&session_id);
+            self.close_session(session_id).await?;
             return Err(ToolError::cancelled("command cancelled"));
         }
 
@@ -322,7 +494,7 @@ impl UnifiedExecHandler {
             let mut guard = session.lock().await;
             let _ = terminate_child_process(&mut guard.child).await;
             drop(guard);
-            self.sessions.lock().await.remove(&session_id);
+            self.close_session(session_id).await?;
             return Err(error);
         }
         let state = {
@@ -334,7 +506,7 @@ impl UnifiedExecHandler {
         };
 
         if state.finished {
-            self.sessions.lock().await.remove(&session_id);
+            self.close_session(session_id).await?;
         }
 
         let payload = build_exec_model_payload(ExecPayloadInput {
@@ -367,7 +539,7 @@ impl UnifiedExecHandler {
         let session = self
             .sessions
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&args.session_id)
             .cloned()
             .ok_or_else(|| {
@@ -417,7 +589,7 @@ impl UnifiedExecHandler {
             let mut guard = session.lock().await;
             let _ = terminate_child_process(&mut guard.child).await;
             drop(guard);
-            self.sessions.lock().await.remove(&args.session_id);
+            self.close_session(args.session_id).await?;
             return Err(error);
         }
 
@@ -435,7 +607,7 @@ impl UnifiedExecHandler {
         };
 
         if state.finished {
-            self.sessions.lock().await.remove(&args.session_id);
+            self.close_session(args.session_id).await?;
         }
 
         let payload = build_exec_model_payload(ExecPayloadInput {
@@ -459,8 +631,41 @@ impl UnifiedExecHandler {
     }
 
     async fn cleanup_stale_sessions(&self) {
+        let children = self
+            .one_shots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(id, child)| (*id, child.clone()))
+            .collect::<Vec<_>>();
+        for (id, child) in children {
+            if let Ok(mut retained) = child.try_lock() {
+                if retained.child.try_wait().ok().flatten().is_some()
+                    && terminate_child_process(&mut retained.child).await.is_ok()
+                {
+                    kill_process_tree(retained.process_id.take(), true);
+                    let RetainedOneShot {
+                        readers,
+                        reader_error,
+                        ..
+                    } = &mut *retained;
+                    if let Err(error) = drain_shell_readers(readers, reader_error).await {
+                        self.remember_cleanup_error(&error);
+                    }
+                    if readers.is_empty() {
+                        self.one_shots
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&id);
+                    }
+                }
+            }
+        }
         let snapshot = {
-            let sessions = self.sessions.lock().await;
+            let sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             sessions
                 .iter()
                 .map(|(id, session)| (*id, session.clone()))
@@ -483,12 +688,18 @@ impl UnifiedExecHandler {
                         );
                     }
                 }
-                to_remove.push(session_id);
+                drop(guard);
+                if self.close_session(session_id).await.is_ok() {
+                    to_remove.push(session_id);
+                }
             }
         }
 
         if !to_remove.is_empty() {
-            let mut sessions = self.sessions.lock().await;
+            let mut sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for session_id in to_remove {
                 sessions.remove(&session_id);
             }
@@ -591,6 +802,7 @@ async fn run_one_shot(
     trace: &crate::events::ToolEventTrace,
     cancellation: tokio_util::sync::CancellationToken,
     configured_limits: OneShotOutputLimits,
+    owner: &UnifiedExecHandler,
 ) -> Result<OneShotCommandResult, ToolError> {
     let started_at = Instant::now();
     let process_plan = build_process_spawn_plan(
@@ -607,10 +819,30 @@ async fn run_one_shot(
     let timeout_ms = process_plan.timeout_ms;
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| {
+    let child = command.spawn().map_err(|error| {
         ToolError::execution_failed(format!("failed to spawn command: {error}"))
     })?;
     let process_id = child.id();
+    let child_id = owner.next_session_id.fetch_add(1, Ordering::Relaxed);
+    let retained = Arc::new(Mutex::new(RetainedOneShot {
+        child,
+        readers: Vec::new(),
+        reader_error: None,
+        process_id,
+        _runtime_temp_dir: process_plan.runtime_temp_dir.clone(),
+    }));
+    owner
+        .one_shots
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(child_id, retained.clone());
+    let mut retained = retained.lock().await;
+    let RetainedOneShot {
+        child,
+        readers,
+        reader_error,
+        ..
+    } = &mut *retained;
 
     let stdout_reader = child.stdout.take().ok_or_else(|| {
         ToolError::internal("stdout pipe was unexpectedly unavailable".to_owned())
@@ -625,20 +857,40 @@ async fn run_one_shot(
     let reader_shutdown = tokio_util::sync::CancellationToken::new();
     let (chunk_tx, mut chunk_rx) =
         mpsc::channel::<ShellChunkEvent>(ONE_SHOT_CHUNK_CHANNEL_CAPACITY);
-    let stdout_task = tokio::spawn(read_stream_with_chunks(
-        stdout_reader,
-        "stdout",
-        chunk_tx.clone(),
-        output_budget.clone(),
-        reader_shutdown.child_token(),
-    ));
-    let stderr_task = tokio::spawn(read_stream_with_chunks(
-        stderr_reader,
-        "stderr",
-        chunk_tx,
-        output_budget,
-        reader_shutdown.child_token(),
-    ));
+    let stdout_shutdown = reader_shutdown.child_token();
+    let stderr_shutdown = reader_shutdown.child_token();
+    let stdout_budget = output_budget.clone();
+    let stdout_chunk_tx = chunk_tx.clone();
+    let (stdout_tx, stdout_result) = tokio::sync::oneshot::channel();
+    let stdout_task = tokio::spawn(async move {
+        let result = read_stream_with_chunks(
+            stdout_reader,
+            "stdout",
+            stdout_chunk_tx,
+            stdout_budget,
+            stdout_shutdown,
+        )
+        .await;
+        let _ = stdout_tx.send(result);
+    });
+    let (stderr_tx, stderr_result) = tokio::sync::oneshot::channel();
+    let stderr_task = tokio::spawn(async move {
+        let result = read_stream_with_chunks(
+            stderr_reader,
+            "stderr",
+            chunk_tx,
+            output_budget,
+            stderr_shutdown,
+        )
+        .await;
+        let _ = stderr_tx.send(result);
+    });
+    let stdout_abort = stdout_task.abort_handle();
+    let stderr_abort = stderr_task.abort_handle();
+    readers.push(stdout_task);
+    readers.push(stderr_task);
+    let stdout_task = stdout_abort;
+    let stderr_task = stderr_abort;
 
     let mut stdout_buf = String::new();
     let mut stderr_buf = String::new();
@@ -669,7 +921,7 @@ async fn run_one_shot(
             _ = cancellation.cancelled() => {
                 cancelled = true;
                 if status_opt.is_none() {
-                    status_opt = Some(terminate_child_process(&mut child).await?);
+                    status_opt = Some(terminate_child_process(child).await?);
                 } else {
                     kill_process_tree(process_id, true);
                 }
@@ -680,7 +932,7 @@ async fn run_one_shot(
             }
             _ = &mut wait_deadline, if status_opt.is_none() => {
                 timed_out = true;
-                status_opt = Some(terminate_child_process(&mut child).await?);
+                status_opt = Some(terminate_child_process(child).await?);
                 pipe_drain_deadline.get_or_insert_with(|| {
                     TokioInstant::now() + Duration::from_millis(ONE_SHOT_PIPE_DRAIN_GRACE_MS)
                 });
@@ -732,7 +984,7 @@ async fn run_one_shot(
                         }
                         if status_opt.is_none() && !limit_termination_started {
                             limit_termination_started = true;
-                            status_opt = Some(terminate_child_process(&mut child).await?);
+                            status_opt = Some(terminate_child_process(child).await?);
                             pipe_drain_deadline.get_or_insert_with(|| {
                                 TokioInstant::now()
                                     + Duration::from_millis(ONE_SHOT_PIPE_DRAIN_GRACE_MS)
@@ -777,11 +1029,11 @@ async fn run_one_shot(
         return Err(ToolError::cancelled("command cancelled"));
     }
 
-    let stdout_summary = stdout_task
+    let stdout_summary = stdout_result
         .await
         .map_err(|error| ToolError::internal(format!("stdout task failed: {error}")))?
         .map_err(|error| ToolError::execution_failed(format!("failed to read stdout: {error}")))?;
-    let stderr_summary = stderr_task
+    let stderr_summary = stderr_result
         .await
         .map_err(|error| ToolError::internal(format!("stderr task failed: {error}")))?
         .map_err(|error| ToolError::execution_failed(format!("failed to read stderr: {error}")))?;
@@ -791,6 +1043,13 @@ async fn run_one_shot(
     let status = status_opt.ok_or_else(|| {
         ToolError::execution_failed("command finished without exit status".to_owned())
     })?;
+
+    drain_shell_readers(readers, reader_error).await?;
+    owner
+        .one_shots
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&child_id);
 
     let output_stats = ExecOutputStats {
         stdout: ExecStreamOutputStats {
@@ -1242,7 +1501,7 @@ fn decode_shell_bytes(pending: &mut Vec<u8>, bytes: &[u8], eof: bool) -> String 
     text
 }
 
-fn spawn_reader<R>(mut reader: R, target: Arc<Mutex<SessionBuffer>>)
+fn spawn_reader<R>(mut reader: R, target: Arc<Mutex<SessionBuffer>>) -> tokio::task::JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -1264,7 +1523,7 @@ where
             }
             target.lock().await.append(&chunk[..read]);
         }
-    });
+    })
 }
 
 async fn emit_shell_chunk_delta(
@@ -1349,6 +1608,224 @@ mod tests {
         SandboxBackendKind, TurnExecutionSecuritySnapshot, TurnPermissionMode,
         TurnPermissionProfileSnapshot, TurnPermissionProfileSource,
     };
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_one_shot_dispatch_retains_child_and_async_cleanup_reaps_it() {
+        let handler = Arc::new(UnifiedExecHandler::default());
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let bus = ToolEventBus::new(8);
+        let mut durable = bus.take_durable_receiver().unwrap();
+        let trace = bus.start_trace("turn", "call", "exec_command");
+        let native = handler.clone();
+        let task = tokio::spawn(async move {
+            started.send(()).unwrap();
+            native
+                .handle(
+                    invocation(
+                        "exec_command",
+                        ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                            command: Some(vec![
+                                "sh".into(),
+                                "-c".into(),
+                                "printf ready; sleep 60".into(),
+                            ]),
+                            workdir: None,
+                            timeout_ms: Some(60_000),
+                            max_output_tokens: None,
+                            yield_time_ms: None,
+                            tty: Some(false),
+                        })),
+                    ),
+                    trace,
+                )
+                .await
+        });
+        started_rx.await.unwrap();
+        let _unacknowledged_output = tokio::time::timeout(Duration::from_secs(5), durable.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let child = handler
+            .one_shots
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        task.abort();
+        let cancellation = match task.await {
+            Err(error) => error,
+            Ok(_) => panic!("tool dispatch should be aborted"),
+        };
+        assert!(cancellation.is_cancelled());
+        assert_eq!(handler.one_shots.lock().unwrap().len(), 1);
+        handler.stop_and_wait().await.unwrap();
+        assert!(child.lock().await.child.try_wait().unwrap().is_some());
+        assert!(handler.one_shots.lock().unwrap().is_empty());
+        handler.stop_and_wait().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_completion_reaps_yielded_persistent_sessions() {
+        let handler = UnifiedExecHandler::default();
+        handler
+            .handle(
+                invocation(
+                    "exec_command",
+                    ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                        command: Some(vec!["sh".into(), "-c".into(), "sleep 60".into()]),
+                        workdir: None,
+                        timeout_ms: None,
+                        max_output_tokens: None,
+                        yield_time_ms: Some(1),
+                        tty: Some(true),
+                    })),
+                ),
+                trace("exec_command"),
+            )
+            .await
+            .unwrap();
+        let session = handler
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        assert!(session.lock().await.child.try_wait().unwrap().is_none());
+        handler.stop_and_wait().await.unwrap();
+        assert!(session.lock().await.child.try_wait().unwrap().is_some());
+        assert!(handler.sessions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_shell_reader_wait_preserves_handle_and_cached_panic_is_sticky() {
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        // Cleanup aborts reader tasks; even a task not yet polled remains owned.
+        let mut readers = vec![tokio::spawn(async move {
+            let _ = released.await;
+        })];
+        let mut failure = None;
+        drain_shell_readers(&mut readers, &mut failure)
+            .await
+            .unwrap();
+        assert!(readers.is_empty());
+        let _ = release.send(());
+        let reader = tokio::spawn(async {
+            panic!("reader failure");
+        });
+        while !reader.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let other = tokio::spawn(std::future::pending::<()>());
+        let other_handle = other.abort_handle();
+        readers.push(other);
+        readers.push(reader);
+        assert!(
+            drain_shell_readers(&mut readers, &mut failure)
+                .await
+                .is_err()
+        );
+        assert!(readers.is_empty());
+        assert!(other_handle.is_finished());
+        // Even a previously cached error must not abandon newly retained readers.
+        let another = tokio::spawn(std::future::pending::<()>());
+        let another_handle = another.abort_handle();
+        readers.push(another);
+        assert!(
+            drain_shell_readers(&mut readers, &mut failure)
+                .await
+                .is_err()
+        );
+        assert!(readers.is_empty());
+        assert!(another_handle.is_finished());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_reader_drain_keeps_unconfirmed_join_for_retry() {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (started, start) = tokio::sync::oneshot::channel();
+        // Abort cannot stop a running blocking reader; only its real join can
+        // acknowledge the ownership. No process is needed for this regression.
+        let reader = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _ = released.recv();
+        });
+        start.await.unwrap();
+        let mut readers = vec![reader];
+        let mut failure = None;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                drain_shell_readers(&mut readers, &mut failure)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(readers.len(), 1);
+        release.send(()).unwrap();
+        drain_shell_readers(&mut readers, &mut failure)
+            .await
+            .unwrap();
+        assert!(readers.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reader_panic_does_not_abandon_other_readers_or_other_owned_processes() {
+        let handler = UnifiedExecHandler::default();
+        let mut children = Vec::new();
+        let mut reader_controls = Vec::new();
+        for id in 0..2 {
+            let mut command = tokio::process::Command::new("sh");
+            command
+                .args(["-c", "sleep 60"])
+                .process_group(0)
+                .kill_on_drop(true);
+            let child = command.spawn().unwrap();
+            let process_id = child.id();
+            let pending = tokio::spawn(std::future::pending::<()>());
+            reader_controls.push(pending.abort_handle());
+            let panicked = tokio::spawn(async {
+                panic!("retained reader failure");
+            });
+            while !panicked.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let retained = Arc::new(Mutex::new(RetainedOneShot {
+                child,
+                readers: vec![pending, panicked],
+                reader_error: None,
+                process_id,
+                _runtime_temp_dir: None,
+            }));
+            handler
+                .one_shots
+                .lock()
+                .unwrap()
+                .insert(id, retained.clone());
+            children.push(retained);
+        }
+        assert!(handler.stop_and_wait().await.is_err());
+        assert!(handler.cleanup_is_quiescent());
+        for child in children {
+            let mut child = child.lock().await;
+            assert!(child.child.try_wait().unwrap().is_some());
+            assert!(child.readers.is_empty());
+        }
+        assert!(
+            reader_controls
+                .iter()
+                .all(tokio::task::AbortHandle::is_finished)
+        );
+        // Resolved ownership is released; the handler's failure outcome remains sticky.
+        assert!(handler.stop_and_wait().await.is_err());
+        assert!(handler.cleanup_is_quiescent());
+    }
 
     fn invocation(tool_name: &str, payload: ToolPayload) -> ToolInvocation {
         let workdir = std::env::current_dir().expect("cwd must be available");
@@ -2212,7 +2689,7 @@ mod tests {
             Err(error) => assert!(matches!(error, ToolError::Cancelled(_))),
         }
         assert!(
-            handler.sessions.lock().await.is_empty(),
+            handler.sessions.lock().unwrap().is_empty(),
             "cancelled tty command should not leave a live session"
         );
     }

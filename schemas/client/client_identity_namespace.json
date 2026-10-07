@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientIdentityNamespace",
+  "type": "object",
+  "properties": {
+    "feature": {
+      "$ref": "#/$defs/ClientFeature"
+    },
+    "list": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "feature"
+  ],
+  "$defs": {
+    "ClientFeature": {
+      "type": "string",
+      "enum": [
+        "session",
+        "navigation",
+        "workspace_tree",
+        "task",
+        "thread",
+        "timeline",
+        "composer",
+        "pending_request",
+        "artifact",
+        "avatar",
+        "provider",
+        "administration",
+        "mcp",
+        "skills",
+        "settings",
+        "onboarding_invitation",
+        "agents_document",
+        "desktop_update"
+      ]
+    }
+  }
+}

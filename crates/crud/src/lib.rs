@@ -1,3 +1,5 @@
+mod plugins;
+pub use plugins::{PluginNativeWrite, PluginOwnershipWrite, validate_standalone_mcp_name};
 mod tool_output;
 pub use repositories::compaction;
 mod compaction_store;
@@ -2715,6 +2717,7 @@ fn skill_dependency_snapshot_record_from_model(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillUploadSessionRecord {
+    pub purpose: String,
     pub upload_id: String,
     pub workspace_id: String,
     pub connection_id: u64,
@@ -3447,6 +3450,7 @@ fn skill_upload_session_record_from_model(
     model: pioneer_entity::skill_upload_session::Model,
 ) -> SkillUploadSessionRecord {
     SkillUploadSessionRecord {
+        purpose: model.purpose,
         upload_id: model.upload_id,
         workspace_id: model.workspace_id,
         connection_id: u64::try_from(model.connection_id).unwrap_or_default(),
@@ -15601,6 +15605,44 @@ impl CrudStore {
         .await
     }
 
+    pub async fn cancel_agent_work_graph_and_collect_owners(
+        &self,
+        root_execution_id: &str,
+        terminal_reason: &str,
+        finished_at: sea_orm::prelude::DateTimeWithTimeZone,
+    ) -> Result<Vec<AgentWorkGraphCancellationTarget>> {
+        self.run_serialized_write(|| {
+            let finished_at = finished_at.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin Agent work-graph cancellation transaction")?;
+                match crate::repositories::agent_domain::cancel_agent_work_graph_and_collect_owners(
+                    &transaction,
+                    root_execution_id,
+                    terminal_reason,
+                    finished_at,
+                )
+                .await
+                {
+                    Ok(targets) => {
+                        transaction.commit().await.context(
+                            "failed to commit Agent work-graph cancellation transaction",
+                        )?;
+                        Ok(targets)
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
+            }
+        })
+        .await
+    }
+
     pub async fn load_execution_for_run(&self, run_id: &str) -> Result<Option<TaskRunExecution>> {
         task_run_execution::find_execution_by_run(&self.connection, run_id)
             .await?
@@ -19007,31 +19049,69 @@ impl CrudStore {
         record: &WorkspaceSkillPolicyRecord,
         event_timestamp_secs: i64,
     ) -> Result<()> {
-        self.run_serialized_write(|| async {
-            let now = unix_to_datetime(event_timestamp_secs);
-            skill_workspace_policy::upsert_workspace_skill_policy(
-                &self.connection,
-                record,
-                now,
-                now,
-            )
+        self.upsert_workspace_skill_policy_with_plugin_change(record, None, event_timestamp_secs)
             .await
+    }
+    pub async fn upsert_workspace_skill_policy_with_plugin_change(
+        &self,
+        record: &WorkspaceSkillPolicyRecord,
+        native: Option<&PluginNativeWrite>,
+        event_timestamp_secs: i64,
+    ) -> Result<()> {
+        plugins::validate_native_write_input(native)?;
+        self.run_serialized_write(|| async {
+            let db = self.connection.begin().await?;
+            repositories::plugins::validate_native_write(
+                &db,
+                native,
+                &record.workspace_id,
+                "skill",
+                record.skill_id.as_str(),
+            )
+            .await?;
+            let now = unix_to_datetime(event_timestamp_secs);
+            skill_workspace_policy::upsert_workspace_skill_policy(&db, record, now, now).await?;
+            if let Some(native) = native {
+                repositories::plugins::publish_native_write(&db, native, "skill", false).await?;
+            }
+            db.commit().await?;
+            Ok(())
         })
         .await
     }
-
     pub async fn delete_workspace_skill_policy(
         &self,
         workspace_id: &str,
         skill_id: &SkillId,
     ) -> Result<bool> {
-        self.run_serialized_write(|| async {
-            skill_workspace_policy::delete_workspace_skill_policy(
-                &self.connection,
-                workspace_id,
-                skill_id,
-            )
+        self.delete_workspace_skill_policy_with_plugin_change(workspace_id, skill_id, None)
             .await
+    }
+    pub async fn delete_workspace_skill_policy_with_plugin_change(
+        &self,
+        workspace_id: &str,
+        skill_id: &SkillId,
+        native: Option<&PluginNativeWrite>,
+    ) -> Result<bool> {
+        plugins::validate_native_write_input(native)?;
+        self.run_serialized_write(|| async {
+            let db = self.connection.begin().await?;
+            repositories::plugins::validate_native_write(
+                &db,
+                native,
+                workspace_id,
+                "skill",
+                skill_id.as_str(),
+            )
+            .await?;
+            let removed =
+                skill_workspace_policy::delete_workspace_skill_policy(&db, workspace_id, skill_id)
+                    .await?;
+            if let Some(native) = native {
+                repositories::plugins::publish_native_write(&db, native, "skill", false).await?;
+            }
+            db.commit().await?;
+            Ok(removed)
         })
         .await
     }
@@ -19110,6 +19190,26 @@ impl CrudStore {
         upload_id: &str,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
+        self.install_skill_lifecycle_with_ownership(
+            installation,
+            policy,
+            audit_records,
+            Some(upload_id),
+            None,
+            event_timestamp_secs,
+        )
+        .await
+    }
+
+    pub async fn install_skill_lifecycle_with_ownership(
+        &self,
+        installation: &SkillInstallationRecord,
+        policy: &WorkspaceSkillPolicyRecord,
+        audit_records: &[SkillAuditEventRecord],
+        upload_id: Option<&str>,
+        ownership: Option<&PluginOwnershipWrite>,
+        event_timestamp_secs: i64,
+    ) -> Result<bool> {
         if installation.pack_id.is_some() || installation.pack_member_key.is_some() {
             bail!("pack members must be inserted through a pack transaction");
         }
@@ -19126,6 +19226,11 @@ impl CrudStore {
         }
         validate_atomic_skill_audit_bound(audit_records)?;
 
+        if upload_id.is_some() == ownership.is_some() {
+            bail!("skill publication requires either finalized upload or package ownership");
+        }
+        let prepared_link =
+            ownership.map(|write| repositories::plugins::prepare_link(write, "skill"));
         let now = unix_to_datetime(event_timestamp_secs);
         let prepared_installation =
             skill_installation::prepare_skill_installation(installation, now, now);
@@ -19133,12 +19238,13 @@ impl CrudStore {
             skill_workspace_policy::prepare_workspace_skill_policy(policy, now, now);
         let prepared_audit_records =
             skill_audit_event::prepare_skill_audit_events(None, audit_records);
-        let upload_id = upload_id.to_owned();
+        let upload_id = upload_id.map(str::to_owned);
         self.run_serialized_write(|| {
             let prepared_installation = prepared_installation.clone();
             let prepared_policy = prepared_policy.clone();
             let prepared_audit_records = prepared_audit_records.clone();
             let upload_id = upload_id.clone();
+            let prepared_link = prepared_link.clone();
             async move {
                 let transaction = self
                     .connection
@@ -19146,6 +19252,15 @@ impl CrudStore {
                     .await
                     .context("failed to begin skill lifecycle install transaction")?;
                 let result: Result<bool> = async {
+                    repositories::plugins::validate_publication(
+                        &transaction,
+                        ownership,
+                        &installation.scope_key,
+                        "skill",
+                        installation.skill_id.as_str(),
+                        None,
+                    )
+                    .await?;
                     skill_installation::insert_prepared_skill_installations(
                         &transaction,
                         std::slice::from_ref(&prepared_installation),
@@ -19161,19 +19276,24 @@ impl CrudStore {
                         prepared_audit_records,
                     )
                     .await?;
-                    if !skill_upload_session::transition_skill_upload_status(
-                        &transaction,
-                        upload_id.as_str(),
-                        &["finalized"],
-                        "consumed",
-                        None,
-                        Some(event_timestamp_secs),
-                        None,
-                        now,
-                    )
-                    .await?
-                    {
-                        return Ok(false);
+                    if let Some(link) = prepared_link {
+                        repositories::plugins::publish(&transaction, link).await?;
+                    }
+                    if let Some(upload_id) = upload_id {
+                        if !skill_upload_session::transition_skill_upload_status(
+                            &transaction,
+                            upload_id.as_str(),
+                            &["finalized"],
+                            "consumed",
+                            None,
+                            Some(event_timestamp_secs),
+                            None,
+                            now,
+                        )
+                        .await?
+                        {
+                            return Ok(false);
+                        }
                     }
                     Ok(true)
                 }
@@ -19260,6 +19380,48 @@ impl CrudStore {
         upload_id: &str,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
+        self.update_skill_lifecycle_with_ownership(
+            skill_id,
+            patch,
+            audit_records,
+            Some(upload_id),
+            None,
+            event_timestamp_secs,
+        )
+        .await
+    }
+
+    pub async fn update_skill_lifecycle_with_ownership(
+        &self,
+        skill_id: &SkillId,
+        patch: &SkillInstallationPatch,
+        audit_records: &[SkillAuditEventRecord],
+        upload_id: Option<&str>,
+        ownership: Option<&PluginOwnershipWrite>,
+        event_timestamp_secs: i64,
+    ) -> Result<bool> {
+        self.update_skill_lifecycle_with_plugin_change(
+            skill_id,
+            patch,
+            audit_records,
+            upload_id,
+            ownership,
+            None,
+            event_timestamp_secs,
+        )
+        .await
+    }
+
+    pub async fn update_skill_lifecycle_with_plugin_change(
+        &self,
+        skill_id: &SkillId,
+        patch: &SkillInstallationPatch,
+        audit_records: &[SkillAuditEventRecord],
+        upload_id: Option<&str>,
+        ownership: Option<&PluginOwnershipWrite>,
+        native: Option<&PluginNativeWrite>,
+        event_timestamp_secs: i64,
+    ) -> Result<bool> {
         if audit_records.is_empty()
             || audit_records
                 .iter()
@@ -19268,19 +19430,29 @@ impl CrudStore {
             bail!("skill update lifecycle requires audit events for the updated SkillId");
         }
         validate_atomic_skill_audit_bound(audit_records)?;
+        if native.is_some() && (ownership.is_some() || upload_id.is_none()) {
+            bail!("native skill edit requires its finalized upload");
+        }
+        plugins::validate_native_write_input(native)?;
 
+        if upload_id.is_some() == ownership.is_some() {
+            bail!("skill update requires either finalized upload or package ownership");
+        }
+        let prepared_link =
+            ownership.map(|write| repositories::plugins::prepare_link(write, "skill"));
         let fence = prepare_generic_skill_update_fence(&self.connection, skill_id, patch).await?;
         let now = unix_to_datetime(event_timestamp_secs);
         let skill_id = skill_id.clone();
         let patch = patch.clone();
         let prepared_audit_records =
             skill_audit_event::prepare_skill_audit_events(None, audit_records);
-        let upload_id = upload_id.to_owned();
+        let upload_id = upload_id.map(str::to_owned);
         self.run_serialized_write(|| {
             let skill_id = skill_id.clone();
             let patch = patch.clone();
             let prepared_audit_records = prepared_audit_records.clone();
             let upload_id = upload_id.clone();
+            let prepared_link = prepared_link.clone();
             let fence = fence.clone();
             async move {
                 let transaction = self
@@ -19294,6 +19466,39 @@ impl CrudStore {
                     {
                         return Ok(false);
                     }
+                    let Some(existing) = fence.existing.as_ref() else {
+                        return Ok(false);
+                    };
+                    if ownership.is_some()
+                        && (patch
+                            .scope_key
+                            .as_ref()
+                            .is_some_and(|scope| scope != &existing.scope_key)
+                            || existing.pack_id.is_some())
+                    {
+                        bail!("plugin child cannot move scope or belong to a pack");
+                    }
+                    if native.is_some() {
+                        repositories::plugins::validate_native_write(
+                            &transaction,
+                            native,
+                            &existing.scope_key,
+                            "skill",
+                            skill_id.as_str(),
+                        )
+                        .await?;
+                    } else {
+                        repositories::plugins::validate_publication(
+                            &transaction,
+                            ownership,
+                            &existing.scope_key,
+                            "skill",
+                            skill_id.as_str(),
+                            Some(skill_id.as_str()),
+                        )
+                        .await?;
+                    }
+
                     if !skill_installation::update_skill_installation(
                         &transaction,
                         &skill_id,
@@ -19309,19 +19514,33 @@ impl CrudStore {
                         prepared_audit_records,
                     )
                     .await?;
-                    if !skill_upload_session::transition_skill_upload_status(
-                        &transaction,
-                        upload_id.as_str(),
-                        &["finalized"],
-                        "consumed",
-                        None,
-                        Some(event_timestamp_secs),
-                        None,
-                        now,
-                    )
-                    .await?
-                    {
-                        return Ok(false);
+                    if let Some(link) = prepared_link {
+                        repositories::plugins::publish(&transaction, link).await?;
+                    }
+                    if let Some(write) = native {
+                        repositories::plugins::publish_native_write(
+                            &transaction,
+                            write,
+                            "skill",
+                            false,
+                        )
+                        .await?;
+                    }
+                    if let Some(upload_id) = upload_id {
+                        if !skill_upload_session::transition_skill_upload_status(
+                            &transaction,
+                            upload_id.as_str(),
+                            &["finalized"],
+                            "consumed",
+                            None,
+                            Some(event_timestamp_secs),
+                            None,
+                            now,
+                        )
+                        .await?
+                        {
+                            return Ok(false);
+                        }
                     }
                     Ok(true)
                 }
@@ -20328,6 +20547,23 @@ impl CrudStore {
         audit_records: &[SkillAuditEventRecord],
         event_timestamp_secs: i64,
     ) -> Result<bool> {
+        self.uninstall_skill_installation_lifecycle_with_plugin_change(
+            expected,
+            audit_records,
+            None,
+            event_timestamp_secs,
+        )
+        .await
+    }
+    pub async fn uninstall_skill_installation_lifecycle_with_plugin_change(
+        &self,
+        expected: &SkillInstallationRecord,
+        audit_records: &[SkillAuditEventRecord],
+        native: Option<&PluginNativeWrite>,
+        event_timestamp_secs: i64,
+    ) -> Result<bool> {
+        plugins::validate_native_write_input(native)?;
+        let package_removal = plugins::native_package_removal(native)?;
         if audit_records.is_empty()
             || audit_records
                 .iter()
@@ -20407,6 +20643,15 @@ impl CrudStore {
                         }
                     }
 
+                    repositories::plugins::validate_native_write(
+                        &transaction,
+                        native,
+                        &expected.scope_key,
+                        "skill",
+                        expected.skill_id.as_str(),
+                    )
+                    .await?;
+
                     skill_workspace_policy::delete_workspace_skill_policy(
                         &transaction,
                         expected.scope_key.as_str(),
@@ -20441,6 +20686,23 @@ impl CrudStore {
                         prepared_audit_records,
                     )
                     .await?;
+                    if let Some(native) = native {
+                        repositories::plugins::publish_native_write(
+                            &transaction,
+                            native,
+                            "skill",
+                            true,
+                        )
+                        .await?;
+                        if package_removal {
+                            repositories::plugins::mark_package_removed(
+                                &transaction,
+                                native,
+                                "skill",
+                            )
+                            .await?;
+                        }
+                    }
                     Ok(true)
                 }
                 .await;
@@ -20703,6 +20965,46 @@ impl CrudStore {
         audit: &McpAuditEventRecord,
         event_timestamp_secs: i64,
     ) -> Result<String> {
+        self.upsert_mcp_server_installation_with_audit_and_ownership(
+            record,
+            audit,
+            None,
+            event_timestamp_secs,
+        )
+        .await
+    }
+
+    pub async fn upsert_mcp_server_installation_with_audit_and_ownership(
+        &self,
+        record: &McpServerInstallationRecord,
+        audit: &McpAuditEventRecord,
+        ownership: Option<&PluginOwnershipWrite>,
+        event_timestamp_secs: i64,
+    ) -> Result<String> {
+        self.upsert_mcp_server_installation_with_plugin_native_change(
+            record,
+            audit,
+            ownership,
+            None,
+            event_timestamp_secs,
+        )
+        .await
+    }
+
+    pub async fn upsert_mcp_server_installation_with_plugin_native_change(
+        &self,
+        record: &McpServerInstallationRecord,
+        audit: &McpAuditEventRecord,
+        ownership: Option<&PluginOwnershipWrite>,
+        native: Option<&PluginNativeWrite>,
+        event_timestamp_secs: i64,
+    ) -> Result<String> {
+        plugins::validate_native_write_input(native)?;
+        if native.is_some() && ownership.is_some() {
+            bail!("ambiguous plugin write");
+        }
+        let prepared_link =
+            ownership.map(|write| repositories::plugins::prepare_link(write, "mcp"));
         self.run_serialized_write(|| async {
             let transaction = self
                 .connection
@@ -20711,6 +21013,51 @@ impl CrudStore {
                 .context("failed to begin MCP installation transaction")?;
             let now = unix_to_datetime(event_timestamp_secs);
 
+            let existing = mcp_server_installation::find_mcp_server_installation(
+                &transaction,
+                &record.scope_kind,
+                &record.scope_key,
+                &record.name,
+            )
+            .await?;
+            if ownership.is_none() && native.is_none() {
+                validate_standalone_mcp_name(&record.name, existing.is_some())?;
+            }
+            let child_id = ownership
+                .map(|write| write.child_id.as_str())
+                .or_else(|| existing.as_ref().map(|row| row.id.as_str()))
+                .or(record.id.as_deref())
+                .unwrap_or("");
+            if ownership.is_some()
+                && (record.scope_kind != "workspace" || record.id.as_deref() != Some(child_id))
+            {
+                bail!("owned MCP publication requires reserved ID and workspace scope");
+            }
+            if native.is_some() {
+                if record.scope_kind != "workspace"
+                    || existing.as_ref().map(|row| row.id.as_str()) != Some(child_id)
+                {
+                    bail!("owned native settings cannot adopt an installation");
+                }
+                repositories::plugins::validate_native_write(
+                    &transaction,
+                    native,
+                    &record.scope_key,
+                    "mcp",
+                    child_id,
+                )
+                .await?;
+            } else {
+                repositories::plugins::validate_publication(
+                    &transaction,
+                    ownership,
+                    &record.scope_key,
+                    "mcp",
+                    child_id,
+                    existing.as_ref().map(|row| row.id.as_str()),
+                )
+                .await?;
+            }
             let installation_id = match mcp_server_installation::upsert_mcp_server_installation(
                 &transaction,
                 record,
@@ -20734,6 +21081,16 @@ impl CrudStore {
                 return Err(error);
             }
 
+            if let Some(link) = prepared_link.clone() {
+                if installation_id != ownership.expect("prepared ownership").child_id {
+                    bail!("MCP publication identity changed");
+                }
+                repositories::plugins::publish(&transaction, link).await?;
+            }
+            if let Some(native) = native {
+                repositories::plugins::publish_native_write(&transaction, native, "mcp", false)
+                    .await?;
+            }
             transaction
                 .commit()
                 .await
@@ -20811,6 +21168,17 @@ impl CrudStore {
         record: &McpServerInstallationRecord,
         audit: &McpAuditEventRecord,
     ) -> Result<()> {
+        self.delete_mcp_server_installation_with_plugin_change(record, audit, None)
+            .await
+    }
+    pub async fn delete_mcp_server_installation_with_plugin_change(
+        &self,
+        record: &McpServerInstallationRecord,
+        audit: &McpAuditEventRecord,
+        native: Option<&PluginNativeWrite>,
+    ) -> Result<()> {
+        plugins::validate_native_write_input(native)?;
+        let package_removal = plugins::native_package_removal(native)?;
         let scope_kind = record.scope_kind.clone();
         let scope_key = record.scope_key.clone();
         let name = record.name.clone();
@@ -20831,6 +21199,36 @@ impl CrudStore {
                     .await
                     .context("failed to begin MCP uninstall transaction")?;
 
+                let current = mcp_server_installation::find_mcp_server_installation(
+                    &transaction,
+                    &scope_kind,
+                    &scope_key,
+                    &name,
+                )
+                .await?;
+                if let Some(native) = native {
+                    let current = current.as_ref().context("MCP installation missing")?;
+                    if Some(current.id.as_str()) != server_installation_id.as_deref() {
+                        bail!("MCP uninstall installation identity changed");
+                    }
+                    repositories::plugins::validate_native_write(
+                        &transaction,
+                        Some(native),
+                        &scope_key,
+                        "mcp",
+                        &current.id,
+                    )
+                    .await?;
+                } else if let Some(current) = current {
+                    repositories::plugins::validate_native_write(
+                        &transaction,
+                        None,
+                        &scope_key,
+                        "mcp",
+                        &current.id,
+                    )
+                    .await?;
+                }
                 if let Some(server_installation_id) = server_installation_id.as_deref() {
                     if let Err(error) =
                         mcp_server_catalog_snapshot::delete_mcp_server_catalog_snapshot(
@@ -20863,6 +21261,14 @@ impl CrudStore {
                     return Err(error);
                 }
 
+                if let Some(native) = native {
+                    repositories::plugins::publish_native_write(&transaction, native, "mcp", true)
+                        .await?;
+                    if package_removal {
+                        repositories::plugins::mark_package_removed(&transaction, native, "mcp")
+                            .await?;
+                    }
+                }
                 transaction
                     .commit()
                     .await
@@ -32601,6 +33007,9 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 }
 
 #[cfg(test)]
+mod plugin_ownership_tests;
+
+#[cfg(test)]
 mod tests {
     #[path = "cli_runtime_active_bindings.rs"]
     mod cli_runtime_active_bindings;
@@ -32820,7 +33229,7 @@ mod tests {
         }
     }
 
-    async fn test_store_with_workspace(workspace_id: &str) -> CrudStore {
+    pub(super) async fn test_store_with_workspace(workspace_id: &str) -> CrudStore {
         test_store_with_workspace_migrator::<Migrator>(workspace_id).await
     }
 
@@ -39310,6 +39719,7 @@ mod tests {
         pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
             id: Set(turn_id.to_owned()),
             thread_id: Set(thread_id.to_owned()),
+            plugin_selection_json: Set(None),
             status: Set("completed".to_owned()),
             error: Set(None),
             prompt_manifest_json: Set("{}".to_owned()),
@@ -49638,7 +50048,11 @@ mod tests {
         );
     }
 
-    fn skill_pack_record(id: char, name: &str, scope_key: &str) -> SkillPackInstallationRecord {
+    pub(super) fn skill_pack_record(
+        id: char,
+        name: &str,
+        scope_key: &str,
+    ) -> SkillPackInstallationRecord {
         SkillPackInstallationRecord {
             pack_id: SkillPackId::new(id.to_string().repeat(21)).expect("valid pack id"),
             name: name.to_owned(),
@@ -49649,7 +50063,7 @@ mod tests {
         }
     }
 
-    fn pack_skill_record(
+    pub(super) fn pack_skill_record(
         id: char,
         parent: &SkillPackInstallationRecord,
         member_key: &str,
@@ -50021,6 +50435,7 @@ mod tests {
     async fn skill_upload_terminal_transitions_cannot_overwrite_consumed_or_aborted_state() {
         let store = test_store_with_workspace("workspace-one").await;
         let finalized = |upload_id: &str| crate::SkillUploadSessionRecord {
+            purpose: "skill".to_owned(),
             upload_id: upload_id.to_owned(),
             workspace_id: "workspace-one".to_owned(),
             connection_id: 7,
@@ -50147,6 +50562,7 @@ mod tests {
     async fn ordinary_skill_lifecycle_transactions_include_upload_consumption() {
         let store = test_store_with_workspace("workspace-one").await;
         let upload = |upload_id: &str| crate::SkillUploadSessionRecord {
+            purpose: "skill".to_owned(),
             upload_id: upload_id.to_owned(),
             workspace_id: "workspace-one".to_owned(),
             connection_id: 7,

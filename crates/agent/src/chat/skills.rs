@@ -530,6 +530,159 @@ SELECTED SKILL BODY SHOULD ONLY BE AVAILABLE THROUGH read_skill.
         let _ = fs::remove_dir_all(root);
     }
 
+    // Plugin leaves use this same native resolution/runtime-plan path.
+    // NOT_RUN / NOT_COMPILED: no provider, process or fixture is started.
+    #[test]
+    fn disabled_bundled_skill_is_absent_from_prompt_tools_and_read_index() {
+        let root = temp_case("plugin-disabled-sibling");
+        for slug in ["allowed", "disabled"] {
+            let dir = root.join("tests").join(slug);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("SKILL.md"),
+                format!(
+                    "---\nname: {slug}\ndescription: {slug} bundled skill\n---\nBody for {slug}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let mut catalog = test_catalog(&root, "allowed");
+        catalog
+            .skills
+            .extend(test_catalog(&root, "disabled").skills);
+        for skill in &mut catalog.skills {
+            skill.host_explicit_only = true;
+            skill
+                .runtime
+                .runtime_tools
+                .push(pioneer_skills::SkillRuntimeToolDefinition {
+                    tool_slug: "lookup".into(),
+                    description: "lookup".into(),
+                    kind: pioneer_skills::SkillRuntimeToolKind::FunctionProxy,
+                    parameters: serde_json::json!({"type":"object"}),
+                    execution_class: Default::default(),
+                    config: serde_json::json!({"function":"lookup"}),
+                    output_policy: None,
+                });
+        }
+        let refs = [
+            explicit_skill_ref("allowed"),
+            explicit_skill_ref("disabled"),
+        ];
+        let mut policies = HashMap::from([(
+            SkillPolicyKey::new(test_skill_id("disabled")),
+            crate::WorkspaceSkillPolicy {
+                enabled: Some(false),
+                allow_implicit_invocation: Some(true),
+            },
+        )]);
+        let resolve = |policies: &HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>| {
+            resolve_turn_skills_with_explicit_refs(
+                &[],
+                &refs,
+                &catalog,
+                &[],
+                &test_skills_config(&root),
+                policies,
+                &crate::AgentMcpAvailability::default(),
+            )
+            .unwrap()
+        };
+        let result = resolve(&policies);
+        assert_eq!(result.result.active.len(), 1);
+        assert_eq!(result.result.active[0].skill_id, test_skill_id("allowed"));
+        assert!(
+            result
+                .prompt
+                .contains(&format!("skill:{}", test_skill_id("allowed")))
+        );
+        assert!(
+            !result
+                .prompt
+                .contains(&format!("skill:{}", test_skill_id("disabled")))
+        );
+        assert!(
+            result
+                .runtime_plan
+                .read_skill_index
+                .contains_key(&format!("skill:{}", test_skill_id("allowed")))
+        );
+        assert!(
+            !result
+                .runtime_plan
+                .read_skill_index
+                .contains_key(&format!("skill:{}", test_skill_id("disabled")))
+        );
+        assert!(
+            result
+                .runtime_plan
+                .tools
+                .iter()
+                .any(|t| t.skill_id == test_skill_id("allowed"))
+        );
+        assert!(
+            result
+                .runtime_plan
+                .tools
+                .iter()
+                .all(|t| t.skill_id != test_skill_id("disabled"))
+        );
+        assert_eq!(to_turn_skill_bindings(&result.result.active, &[]).len(), 1);
+        // Trust exclusions also come from the actual native resolver, even
+        // when an installed candidate is policy-enabled at Gateway expansion.
+        let mut untrusted_catalog = catalog.clone();
+        untrusted_catalog
+            .skills
+            .iter_mut()
+            .find(|s| s.identity.skill_id == test_skill_id("disabled"))
+            .unwrap()
+            .runtime
+            .trust_level = SkillTrustLevel::Untrusted;
+        let untrusted = resolve_turn_skills_with_explicit_refs(
+            &[],
+            &refs,
+            &untrusted_catalog,
+            &[],
+            &test_skills_config(&root),
+            &HashMap::new(),
+            &crate::AgentMcpAvailability::default(),
+        )
+        .unwrap();
+        assert_eq!(untrusted.result.active.len(), 1);
+        assert_eq!(
+            untrusted.result.active[0].skill_id,
+            test_skill_id("allowed")
+        );
+        assert!(
+            !untrusted
+                .runtime_plan
+                .read_skill_index
+                .contains_key(&format!("skill:{}", test_skill_id("disabled")))
+        );
+        assert!(
+            !untrusted
+                .prompt
+                .contains(&format!("skill:{}", test_skill_id("disabled")))
+        );
+        policies.insert(
+            SkillPolicyKey::new(test_skill_id("allowed")),
+            crate::WorkspaceSkillPolicy {
+                enabled: Some(false),
+                allow_implicit_invocation: Some(true),
+            },
+        );
+        let excluded = resolve(&policies);
+        assert!(excluded.result.active.is_empty());
+        assert!(excluded.runtime_plan.read_skill_index.is_empty());
+        assert!(excluded.runtime_plan.tools.is_empty());
+        assert!(
+            !excluded
+                .prompt
+                .contains(&format!("skill:{}", test_skill_id("allowed")))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn catalog_hidden_skill_stays_active_with_only_an_internal_exact_reference() {
         let root = temp_case("catalog-hidden-prompt");

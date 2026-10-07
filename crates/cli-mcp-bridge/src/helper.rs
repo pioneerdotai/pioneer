@@ -214,7 +214,13 @@ where
                 let read = read?;
                 if read == 0 {
                     let shutdown = BridgeFrame::new(BridgeFrameType::Shutdown, Vec::new())?;
-                    connection.send_frame(&shutdown).await?;
+                    if let Err(error) = connection.send_frame(&shutdown).await {
+                        // Provider EOF can race Gateway teardown. Only a closed
+                        // peer makes the final control frame unnecessary.
+                        if !matches!(&error, PrivateIpcError::Io(error) if crate::platform::peer_closed(error)) {
+                            return Err(error.into());
+                        }
+                    }
                     connection.shutdown().await?;
                     stdin_buffer.zeroize();
                     return Ok(());
@@ -320,6 +326,7 @@ mod tests {
         inbound: VecDeque<Result<Option<BridgeFrame>, PrivateIpcError>>,
         sent: Vec<BridgeFrame>,
         shutdown: bool,
+        send_error: Option<std::io::ErrorKind>,
     }
 
     impl MockTransport {
@@ -339,6 +346,7 @@ mod tests {
                 inbound: frames.into_iter().map(|frame| Ok(Some(frame))).collect(),
                 sent: Vec::new(),
                 shutdown: false,
+                send_error: None,
             }
         }
     }
@@ -364,6 +372,9 @@ mod tests {
         }
 
         async fn send_frame(&mut self, frame: &BridgeFrame) -> Result<(), PrivateIpcError> {
+            if let Some(kind) = self.send_error {
+                return Err(std::io::Error::from(kind).into());
+            }
             self.sent.push(frame.clone());
             Ok(())
         }
@@ -470,6 +481,41 @@ mod tests {
         assert!(transport.shutdown);
         assert_eq!(transport.sent.len(), 1);
         assert_eq!(transport.sent[0].frame_type(), BridgeFrameType::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn helper_eof_accepts_closed_peer_but_preserves_other_send_errors() {
+        use std::io::ErrorKind;
+        for kind in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::NotConnected,
+        ] {
+            let mut transport = MockTransport::with_frames([]);
+            transport.send_error = Some(kind);
+            relay(tokio::io::empty(), tokio::io::sink(), &mut transport)
+                .await
+                .expect("peer already closed during provider EOF");
+            assert!(transport.shutdown);
+        }
+        let mut transport = MockTransport::with_frames([]);
+        transport.send_error = Some(ErrorKind::PermissionDenied);
+        assert!(matches!(
+            relay(tokio::io::empty(), tokio::io::sink(), &mut transport).await,
+            Err(HelperError::Ipc(PrivateIpcError::Io(error))) if error.kind() == ErrorKind::PermissionDenied
+        ));
+        assert!(!transport.shutdown);
+    }
+
+    #[tokio::test]
+    async fn helper_payload_keeps_closed_peer_send_errors_fatal() {
+        let mut transport = MockTransport::with_frames([]);
+        transport.send_error = Some(std::io::ErrorKind::BrokenPipe);
+        assert!(matches!(
+            relay(&b"payload"[..], tokio::io::sink(), &mut transport).await,
+            Err(HelperError::Ipc(PrivateIpcError::Io(error))) if error.kind() == std::io::ErrorKind::BrokenPipe
+        ));
+        assert!(!transport.shutdown);
     }
 
     #[tokio::test]

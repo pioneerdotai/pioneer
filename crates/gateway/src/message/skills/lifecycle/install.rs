@@ -61,119 +61,158 @@ impl MessageProcessor {
         params: SkillsInstallParams,
     ) {
         let connection_id = request_context.connection_id();
+        let result = self
+            .install_skill_source_deferred(
+                request_context,
+                request_id.clone(),
+                params.workspace_id,
+                params.target_source_kind,
+                SkillInstallSource::UploadedSkill(params.source),
+            )
+            .await;
+        match result {
+            Ok((payload, publication)) => {
+                match JsonRpcResponse::from_result(request_id, &payload) {
+                    Ok(response) => {
+                        if let Err(error) = self.send_json(connection_id, &response).await {
+                            warn!(connection_id, error = %error, "failed to send skills/install response");
+                        }
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            skills_error(
+                                None,
+                                INVALID_REQUEST_CODE,
+                                SKILLS_ERROR_INTERNAL,
+                                "failed to encode skills/install response",
+                                json!({"error": format!("{error:#}")}),
+                            ),
+                        )
+                        .await
+                    }
+                }
+                self.publish_skill_change(publication).await;
+            }
+            Err(error) => self.send_error(connection_id, error).await,
+        }
+    }
+
+    pub(crate) async fn install_skill_source(
+        &self,
+        request_context: &RequestContext,
+        request_id: RequestId,
+        workspace: String,
+        target_kind: String,
+        source: SkillInstallSource,
+    ) -> std::result::Result<SkillsInstallResponse, JsonRpcErrorResponse> {
+        let (response, publication) = self
+            .install_skill_source_deferred(
+                request_context,
+                request_id,
+                workspace,
+                target_kind,
+                source,
+            )
+            .await?;
+        self.publish_skill_change(publication).await;
+        Ok(response)
+    }
+
+    async fn install_skill_source_deferred(
+        &self,
+        request_context: &RequestContext,
+        request_id: RequestId,
+        workspace: String,
+        target_kind: String,
+        source: SkillInstallSource,
+    ) -> std::result::Result<(SkillsInstallResponse, SkillChangePublication), JsonRpcErrorResponse>
+    {
+        let connection_id = request_context.connection_id();
         let authenticated_owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let workspace_id = match self
             .validate_skills_workspace(
                 connection_id,
                 request_id.clone(),
-                params.workspace_id,
+                workspace,
                 methods::SKILLS_INSTALL,
             )
             .await
         {
             Ok(workspace_id) => workspace_id,
             Err(error) => {
-                self.send_error(connection_id, error).await;
-                return;
+                return Err(error);
             }
         };
-        let target_source_kind =
-            match parse_installable_source_kind(params.target_source_kind.as_str()) {
-                Some(kind) => kind,
-                None => {
-                    self.send_error(
-                        connection_id,
-                        skills_error(
-                            Some(request_id),
-                            INVALID_PARAMS_CODE,
-                            SKILLS_ERROR_SOURCE_NOT_SUPPORTED,
-                            "install target_source_kind must be `user` or `registry`",
-                            json!({"target_source_kind": params.target_source_kind}),
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            };
+        let target_source_kind = match parse_installable_source_kind(target_kind.as_str()) {
+            Some(kind) => kind,
+            None => {
+                return Err(skills_error(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    SKILLS_ERROR_SOURCE_NOT_SUPPORTED,
+                    "install target_source_kind must be `user` or `registry`",
+                    json!({"target_source_kind": target_kind}),
+                ));
+            }
+        };
         let context = match self.skills_runtime_context(workspace_id.as_str()) {
             Ok(context) => context,
             Err(error) => {
-                self.send_error(
-                    connection_id,
-                    skills_error(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        SKILLS_ERROR_INTERNAL,
-                        "failed to resolve skills runtime context",
-                        json!({"error": format!("{error:#}")}),
-                    ),
-                )
-                .await;
-                return;
+                return Err(skills_error(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    SKILLS_ERROR_INTERNAL,
+                    "failed to resolve skills runtime context",
+                    json!({"error": format!("{error:#}")}),
+                ));
             }
         };
-        let upload_id = match parse_lifecycle_upload_id(params.source) {
-            Ok(upload_id) => upload_id,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    skills_error(
-                        Some(request_id),
-                        INVALID_PARAMS_CODE,
-                        SKILLS_ERROR_INVALID_REQUEST,
-                        "invalid lifecycle source",
-                        json!({"error": error}),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        let materialized = match self
-            .materialize_uploaded_skill_source(
-                connection_id,
-                workspace_id.as_str(),
-                upload_id.as_str(),
+        let materialized = self
+            .materialize_install_source(
+                request_context,
+                &workspace_id,
+                source,
                 &context,
+                target_source_kind,
                 &request_id,
             )
-            .await
-        {
-            Ok(materialized) => materialized,
-            Err(error) => {
-                self.send_error(connection_id, error).await;
-                return;
-            }
-        };
+            .await?;
 
-        let skill_id = match self
-            .allocate_install_skill_id(materialized.upload.upload_id.as_str(), &context)
-            .await
-        {
-            Ok(skill_id) => skill_id,
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
-                self.send_error(
-                    connection_id,
+        let skill_id = match materialized.ownership() {
+            Some(owner) => SkillId::new(owner.child_id.clone()).map_err(|_| {
+                skills_error(
+                    Some(request_id.clone()),
+                    INVALID_PARAMS_CODE,
+                    SKILLS_ERROR_INVALID_REQUEST,
+                    "invalid reserved skill identity",
+                    json!({}),
+                )
+            })?,
+            None => self
+                .allocate_install_skill_id(
+                    materialized.upload_id().expect("uploaded source"),
+                    &context,
+                )
+                .await
+                .map_err(|error| {
+                    materialized.cleanup_failure();
                     skills_error(
-                        Some(request_id),
+                        Some(request_id.clone()),
                         INVALID_REQUEST_CODE,
                         SKILLS_ERROR_INTERNAL,
                         "failed to allocate skill identity",
                         json!({"error": format!("{error:#}")}),
-                    ),
-                )
-                .await;
-                return;
-            }
+                    )
+                })?,
         };
-        let source_ref = format!("upload:{}", materialized.upload.upload_id);
+        let source_ref = materialized.source_ref();
         let prepared = match pioneer_skills::prepare_materialized_skill(
             pioneer_skills::PrepareMaterializedSkillRequest {
                 skill_id: skill_id.clone(),
                 source_kind: target_source_kind,
                 source_ref: source_ref.clone(),
-                materialized_source_path: materialized.source_dir.clone(),
+                materialized_source_path: materialized.source_dir().to_path_buf(),
                 policy: installer_policy(&context),
             },
         ) {
@@ -182,55 +221,58 @@ impl MessageProcessor {
                 let mapped = map_lifecycle_error(&error, methods::SKILLS_INSTALL);
                 let (message, details) =
                     lifecycle_error_payload(&error, &mapped, None, &context.validation_policy);
-                let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
-                self.send_error(
-                    connection_id,
-                    skills_error(
-                        Some(request_id),
-                        mapped.jsonrpc_code,
-                        mapped.code,
-                        message,
-                        details,
-                    ),
-                )
-                .await;
-                return;
+                materialized.cleanup_failure();
+                return Err(skills_error(
+                    Some(request_id),
+                    mapped.jsonrpc_code,
+                    mapped.code,
+                    message,
+                    details,
+                ));
             }
         };
         let Some(location) = install_location_for_source_kind(&context, &target_source_kind) else {
-            let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
-            self.send_error(
-                connection_id,
-                skills_error(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    SKILLS_ERROR_INTERNAL,
-                    "validated install source has no managed location",
-                    json!({"target_source_kind": target_source_kind.as_db_value()}),
-                ),
-            )
-            .await;
-            return;
+            materialized.cleanup_failure();
+            return Err(skills_error(
+                Some(request_id),
+                INVALID_REQUEST_CODE,
+                SKILLS_ERROR_INTERNAL,
+                "validated install source has no managed location",
+                json!({"target_source_kind": target_source_kind.as_db_value()}),
+            ));
         };
         let now = now_timestamp_secs();
-        let upload_guard = self
-            .acquire_skill_upload_lock(materialized.upload.upload_id.as_str())
-            .await;
-        let write_guard = self.acquire_skills_write_lock().await;
-        if let Err(error) = self
-            .revalidate_finalized_upload_locked(
-                &authenticated_owner,
-                workspace_id.as_str(),
-                materialized.upload.upload_id.as_str(),
-                &request_id,
-            )
-            .await
+        if materialized.ownership().is_some()
+            && !prepared.definition.conformance.agentskills_strict.compliant
         {
-            let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
-            drop(write_guard);
-            drop(upload_guard);
-            self.send_error(connection_id, error).await;
-            return;
+            return Err(skills_error(
+                Some(request_id),
+                INVALID_PARAMS_CODE,
+                SKILLS_ERROR_INVALID_REQUEST,
+                "package skill does not conform to Agent Skills",
+                json!({}),
+            ));
+        }
+        let upload_guard = match materialized.upload_id() {
+            Some(id) => Some(self.acquire_skill_upload_lock(id).await),
+            None => None,
+        };
+        let write_guard = self.acquire_skills_write_lock().await;
+        if let Some(id) = materialized.upload_id() {
+            if let Err(error) = self
+                .revalidate_finalized_upload_locked(
+                    &authenticated_owner,
+                    &workspace_id,
+                    id,
+                    &request_id,
+                )
+                .await
+            {
+                materialized.cleanup_failure();
+                drop(write_guard);
+                drop(upload_guard);
+                return Err(error);
+            }
         }
         if let Err(error) = self
             .ensure_skills_lock_v2_locked(
@@ -240,19 +282,14 @@ impl MessageProcessor {
             )
             .await
         {
-            let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
-            self.send_error(
-                connection_id,
-                skills_error(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    SKILLS_ERROR_INTERNAL,
-                    "failed to convert skills lock",
-                    json!({"error": format!("{error:#}")}),
-                ),
-            )
-            .await;
-            return;
+            materialized.cleanup_failure();
+            return Err(skills_error(
+                Some(request_id),
+                INVALID_REQUEST_CODE,
+                SKILLS_ERROR_INTERNAL,
+                "failed to convert skills lock",
+                json!({"error": format!("{error:#}")}),
+            ));
         }
         let identity_collision = context
             .catalog_params
@@ -262,35 +299,25 @@ impl MessageProcessor {
             || match self.crud_store.find_skill_installation(&skill_id).await {
                 Ok(existing) => existing.is_some(),
                 Err(error) => {
-                    let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
-                    self.send_error(
-                        connection_id,
-                        skills_error(
-                            Some(request_id),
-                            INVALID_REQUEST_CODE,
-                            SKILLS_ERROR_INTERNAL,
-                            "failed to verify allocated skill identity",
-                            json!({"error": format!("{error:#}")}),
-                        ),
-                    )
-                    .await;
-                    return;
+                    materialized.cleanup_failure();
+                    return Err(skills_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_INTERNAL,
+                        "failed to verify allocated skill identity",
+                        json!({"error": format!("{error:#}")}),
+                    ));
                 }
             };
         if identity_collision {
-            let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
-            self.send_error(
-                connection_id,
-                skills_error(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    SKILLS_ERROR_INTERNAL,
-                    "allocated skill identity became unavailable; retry installation",
-                    json!({"skill_id": skill_id}),
-                ),
-            )
-            .await;
-            return;
+            materialized.cleanup_failure();
+            return Err(skills_error(
+                Some(request_id),
+                INVALID_REQUEST_CODE,
+                SKILLS_ERROR_INTERNAL,
+                "allocated skill identity became unavailable; retry installation",
+                json!({"skill_id": skill_id}),
+            ));
         }
         let install_result = match pioneer_skills::commit_prepared_skill(
             pioneer_skills::CommitPreparedSkillRequest {
@@ -309,19 +336,14 @@ impl MessageProcessor {
                 let mapped = map_lifecycle_error(&error, methods::SKILLS_INSTALL);
                 let (message, details) =
                     lifecycle_error_payload(&error, &mapped, None, &context.validation_policy);
-                let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
-                self.send_error(
-                    connection_id,
-                    skills_error(
-                        Some(request_id),
-                        mapped.jsonrpc_code,
-                        mapped.code,
-                        message,
-                        details,
-                    ),
-                )
-                .await;
-                return;
+                materialized.cleanup_failure();
+                return Err(skills_error(
+                    Some(request_id),
+                    mapped.jsonrpc_code,
+                    mapped.code,
+                    message,
+                    details,
+                ));
             }
         };
         let install_path = install_result.install_path.display().to_string();
@@ -351,41 +373,41 @@ impl MessageProcessor {
         let audit_records = skill_audit_records(install_result.audit_events.as_slice());
         let persisted = self
             .crud_store
-            .install_skill_lifecycle(
+            .install_skill_lifecycle_with_ownership(
                 &installation_record,
                 &policy_record,
                 audit_records.as_slice(),
-                materialized.upload.upload_id.as_str(),
+                materialized.upload_id(),
+                materialized.ownership(),
                 now,
             )
             .await;
         if !matches!(persisted, Ok(true)) {
             rollback_committed_install(&install_result, &location);
-            let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
+            materialized.cleanup_failure();
             let error = match persisted {
                 Ok(false) => anyhow::anyhow!(
                     "upload `{}` changed state before skill publication",
-                    materialized.upload.upload_id
+                    materialized.source_ref()
                 ),
                 Err(error) => error,
                 Ok(true) => unreachable!(),
             };
-            self.send_error(
-                connection_id,
-                skills_error(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    SKILLS_ERROR_INTERNAL,
-                    "failed to persist skill installation and consume upload",
-                    json!({"error": format!("{error:#}")}),
-                ),
-            )
-            .await;
-            return;
+            return Err(skills_error(
+                Some(request_id),
+                INVALID_REQUEST_CODE,
+                SKILLS_ERROR_INTERNAL,
+                "failed to persist skill installation and consume upload",
+                json!({"error": format!("{error:#}")}),
+            ));
         }
 
         pioneer_skills::finalize_prepared_skill_commit(&install_result);
-        self.cleanup_upload_artifacts(&materialized.upload, materialized.cleanup_root.as_path());
+        if let Some(upload) = materialized.uploaded() {
+            self.cleanup_upload_artifacts(&upload.upload, upload.cleanup_root.as_path());
+        }
+        drop(write_guard);
+        drop(upload_guard);
 
         let payload = SkillsInstallResponse {
             status: "installed".to_owned(),
@@ -403,42 +425,24 @@ impl MessageProcessor {
                 events_written: audit_records.len(),
             },
         };
-        let response = match JsonRpcResponse::from_result(request_id, &payload) {
-            Ok(response) => response,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    skills_error(
-                        None,
-                        INVALID_REQUEST_CODE,
-                        SKILLS_ERROR_INTERNAL,
-                        "failed to encode skills/install response",
-                        json!({"error": format!("{error:#}")}),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        if let Err(error) = self.send_json(connection_id, &response).await {
-            warn!(connection_id, error = %format!("{error:#}"), "failed to send skills/install response");
-            return;
-        }
-        self.notify_skills_changed(
-            workspace_id.as_str(),
-            "installed",
-            vec![SkillChangedItem {
-                skill_id,
-                owner: installation_record.owner,
-                slug: installation_record.slug,
-                source_kind: installation_record.source_kind,
-                change_type: "install".to_owned(),
-                fingerprint_before: None,
-                fingerprint_after: Some(installation_record.fingerprint),
-            }],
-            now,
-        )
-        .await;
+        Ok((
+            payload,
+            SkillChangePublication {
+                workspace_id,
+                reason: "installed",
+                changes: vec![SkillChangedItem {
+                    skill_id,
+                    owner: installation_record.owner,
+                    slug: installation_record.slug,
+                    source_kind: installation_record.source_kind,
+                    change_type: "install".to_owned(),
+                    fingerprint_before: None,
+                    fingerprint_after: Some(installation_record.fingerprint),
+                }],
+                pack_changes: Vec::new(),
+                created_at: now,
+            },
+        ))
     }
 }
 

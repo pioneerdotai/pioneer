@@ -504,6 +504,7 @@ pub struct RecoveryCoordinator {
     execution_leases: Arc<crate::authorization::ExecutionLeaseRegistry>,
     turn_execution_owner_id: Arc<str>,
     listener_starter: Arc<RwLock<Option<RecoveryListenerStarter>>>,
+    plugin_launch_locks: Option<crate::message::plugins::PluginMutationLocks>,
 }
 
 #[derive(Debug, Clone)]
@@ -747,7 +748,36 @@ impl RecoveryCoordinator {
             )
             .into(),
             listener_starter: Arc::new(RwLock::new(None)),
+            plugin_launch_locks: None,
         }
+    }
+
+    pub(crate) fn with_plugin_launch_locks(
+        mut self,
+        locks: crate::message::plugins::PluginMutationLocks,
+    ) -> Self {
+        self.plugin_launch_locks = Some(locks);
+        self
+    }
+    pub(crate) async fn acquire_plugin_recovery_admission(
+        &self,
+        workspace: &str,
+        turn: &str,
+    ) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>> {
+        let Some(locks) = &self.plugin_launch_locks else {
+            anyhow::ensure!(
+                self.crud_store.get_plugin_selection(turn).await?.is_none(),
+                "plugin recovery admission is unavailable"
+            );
+            return Ok(Vec::new());
+        };
+        crate::message::plugins::acquire_plugin_launch_admission(
+            &self.crud_store,
+            locks,
+            workspace,
+            turn,
+        )
+        .await
     }
 
     pub(crate) fn with_crud_store(&self, crud_store: Arc<CrudStore>) -> Self {
@@ -2568,6 +2598,23 @@ impl RecoveryCoordinator {
                 .await;
         }
 
+        let plugin_launch = match self
+            .acquire_plugin_recovery_admission(&workspace_id, &job.turn_id)
+            .await
+        {
+            Ok(guards) => guards,
+            Err(_) => {
+                return self
+                    .block_active_recovery(
+                        job,
+                        active_attempt_id,
+                        "Plugin selection changed or is unavailable; refresh the selection".into(),
+                        None,
+                        now_unix,
+                    )
+                    .await;
+            }
+        };
         match self
             .agent_manager
             .start_recovery_attempt(thread_id.as_str(), request.clone())
@@ -2605,6 +2652,7 @@ impl RecoveryCoordinator {
                 });
             }
             Err(error) => {
+                drop(plugin_launch);
                 if matches!(
                     &error,
                     AgentControlError::ThreadNotFound | AgentControlError::NoActiveTurn
@@ -2656,6 +2704,12 @@ impl RecoveryCoordinator {
                                     )
                                     .await;
                             }
+                            let _restored_plugin_launch = match self.acquire_plugin_recovery_admission(
+                                &workspace_id, &job.turn_id).await {
+                                Ok(guards) => guards,
+                                Err(_) => return self.block_active_recovery(job, active_attempt_id,
+                                    "Plugin selection changed or is unavailable; refresh the selection".into(), None, now_unix).await,
+                            };
                             match self
                                 .agent_manager
                                 .start_restored_recovery_turn(

@@ -13,6 +13,8 @@ fn independent_direct_and_ffi_profile_replay_preserves_owner_and_page_isolation(
         let direct = pioneer_client::catalog_test_support::settings_model_picker_client();
         let wire = pioneer_client::catalog_test_support::settings_model_picker_client();
         let runtime = ClientFfiRuntime {
+            native_oauth: Arc::new(plugin_shell::NativeOAuthShell::new(&wire)),
+            plugin_uploads: Default::default(),
             core: wire.clone(),
             config: Default::default(),
             client_subscriptions: Default::default(),

@@ -334,7 +334,8 @@ fn validate_execution_capabilities(capabilities: &[TurnCapability]) -> Result<()
             pioneer_protocol::TurnCapabilityKind::Skill {
                 pack_id: Some(_), ..
             }
-            | pioneer_protocol::TurnCapabilityKind::SkillPack { .. } => {
+            | pioneer_protocol::TurnCapabilityKind::SkillPack { .. }
+            | pioneer_protocol::TurnCapabilityKind::Plugin { .. } => {
                 bail!("skill pack metadata cannot enter the runtime snapshot");
             }
             pioneer_protocol::TurnCapabilityKind::McpServer { .. }

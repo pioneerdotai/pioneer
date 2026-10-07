@@ -370,9 +370,11 @@ async fn authorized_path_and_url_pins_survive_budget_renderer_and_replay_without
         config.security.enforce_path_allowlist = true;
         config.security.allowed_path_roots = vec![file.path().parent().unwrap().into()];
         config.security.allow_url_sources = true;
-        config.security.url_allowed_domains = vec!["example.com".into()];
+        // Use a numeric documentation address: the fixture supplies HTTP bytes
+        // after real URL guards, and this test must not need external DNS.
+        config.security.url_allowed_domains = vec!["192.0.2.1".into()];
         state.pipeline_config = Some(config);
-        let url = "https://example.com/evidence.png";
+        let url = "https://192.0.2.1/evidence.png";
         state
             .url_fixtures
             .write()

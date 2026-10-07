@@ -193,6 +193,7 @@ fn restart_relevant_options_changed(
     new: &CLIAgentRuntimeSessionStartOptions,
 ) -> bool {
     old.cwd != new.cwd
+        || old.plugin_selection != new.plugin_selection
         || old.approval_policy != new.approval_policy
         || old.authorization_scope_fingerprint != new.authorization_scope_fingerprint
         || old.app_server_args != new.app_server_args

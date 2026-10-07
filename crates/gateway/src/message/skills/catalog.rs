@@ -65,7 +65,7 @@ fn projected_skill_policy_state(
     }
 }
 
-fn member_skill_is_operationally_visible(
+pub(in crate::message) fn member_skill_is_operationally_visible(
     skill: &pioneer_skills::SkillDefinition,
     effective_policy: &pioneer_skills::EffectiveSkillPolicy,
     installed_in_workspace: bool,
@@ -73,6 +73,22 @@ fn member_skill_is_operationally_visible(
     skill.is_available()
         && effective_policy.enabled
         && (matches!(skill.identity.source_kind, SkillSourceKind::System) || installed_in_workspace)
+}
+
+pub(in crate::message) fn skill_is_disclosed(
+    principal: &crate::auth::AuthenticatedSessionPrincipal,
+    skill: &pioneer_skills::SkillDefinition,
+    effective_policy: &pioneer_skills::EffectiveSkillPolicy,
+    installed_in_workspace: bool,
+) -> bool {
+    let authorization = crate::authorization::AuthorizationService::new();
+    authorization.skill_allowed(
+        principal.kind,
+        principal.role_key.as_ref(),
+        skill.identity.skill_id.as_str(),
+    ) && (authorization.role_disclosure_policy(principal.kind, principal.role_key.as_ref())
+        != Some(crate::authorization::RoleDisclosurePolicy::Collaborator)
+        || member_skill_is_operationally_visible(skill, effective_policy, installed_in_workspace))
 }
 
 #[cfg(test)]
@@ -132,6 +148,29 @@ mod cli_runtime_resolver_tests {
         })
     }
 
+    #[test]
+    fn plugin_host_constraint_prevents_implicit_flags_without_relaxing_enabled_policy() {
+        use pioneer_skills::policy::{
+            SkillPolicy, SkillPolicyKey, SkillPolicySet, effective_policy_for_skill,
+        };
+        let mut skill = definition("bundled", SkillSourceKind::User);
+        let key = SkillPolicyKey::new(skill.identity.skill_id.clone());
+        let mut policies = SkillPolicySet::default();
+        policies.workspace_by_key.insert(
+            key,
+            SkillPolicy {
+                enabled: Some(false),
+                allow_implicit_invocation: Some(true),
+            },
+        );
+        let standalone = effective_policy_for_skill(&skill, &policies);
+        assert!(standalone.allow_implicit_invocation);
+        skill.host_explicit_only = true;
+        let owned = effective_policy_for_skill(&skill, &policies);
+        assert!(!owned.allow_implicit_invocation);
+        assert!(!owned.enabled);
+    }
+
     fn attachment(
         slug: &str,
         source_kind: SkillSourceKind,
@@ -158,6 +197,7 @@ mod cli_runtime_resolver_tests {
         assert!(projected.allow_implicit_invocation_editable);
         assert!(pioneer_client::skills::catalog::skill_is_user_selectable(
             &SkillListItem {
+                plugin_owner: None,
                 skill_id: skill.identity.skill_id.clone(),
                 pack: None,
                 owner: skill.identity.owner.clone(),
@@ -694,16 +734,12 @@ impl MessageProcessor {
             .skills
             .iter()
             .filter(|skill| {
-                crate::authorization::AuthorizationService::new().skill_allowed(
-                    request_context.principal().kind,
-                    request_context.principal().role_key.as_ref(),
-                    skill.identity.skill_id.as_str(),
-                ) && (!member
-                    || member_skill_is_operationally_visible(
-                        skill,
-                        &effective_policy_for_skill(skill, &policy_set),
-                        installation_by_id.contains_key(&skill.identity.skill_id),
-                    ))
+                skill_is_disclosed(
+                    request_context.principal(),
+                    skill,
+                    &effective_policy_for_skill(skill, &policy_set),
+                    installation_by_id.contains_key(&skill.identity.skill_id),
+                )
             })
             .map(|skill| {
                 let installation = installation_by_id.get(&skill.identity.skill_id);
@@ -734,6 +770,7 @@ impl MessageProcessor {
                     .map(|excluded| excluded.reason.as_db_value().to_owned());
 
                 SkillListItem {
+                    plugin_owner: None,
                     skill_id: skill.identity.skill_id.clone(),
                     pack: installation.and_then(|item| {
                         item.pack_id.clone().zip(item.pack_member_key.clone()).map(
@@ -796,6 +833,32 @@ impl MessageProcessor {
             }
         }
 
+        for item in &mut response_items {
+            match self
+                .crud_store
+                .find_skill_plugin_owner(&item.skill_id)
+                .await
+            {
+                Ok(owner) => {
+                    item.plugin_owner = owner.map(|o| pioneer_protocol::PluginOwner {
+                        plugin_id: o.plugin_id,
+                        member_key: o.member_key,
+                    })
+                }
+                Err(_) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id.clone()),
+                            INVALID_REQUEST_CODE,
+                            "skill ownership unavailable",
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
         let response_payload = SkillListResponse {
             snapshot_version: self.current_skills_snapshot_version(),
             generated_at: now_timestamp_secs(),

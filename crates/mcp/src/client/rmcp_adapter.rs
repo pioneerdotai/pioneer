@@ -49,7 +49,7 @@ impl McpRuntimeConnector for RmcpRuntimeConnector {
                 let secrets = transport.secrets.clone();
                 let startup_timeout = Duration::from_millis(transport.startup_timeout_ms.max(1));
                 let tool_timeout = Duration::from_millis(transport.tool_timeout_ms.max(1));
-                let (transport, stderr_tail) =
+                let (transport, stderr_tail, child) =
                     build_stdio_transport(&transport).map_err(|error| {
                         McpRuntimeError::failed(redact_text(
                             format!("failed to spawn stdio MCP server: {error:#}").as_str(),
@@ -58,21 +58,35 @@ impl McpRuntimeConnector for RmcpRuntimeConnector {
                     })?;
                 let (event_tx, event_rx) = mpsc::unbounded_channel();
                 let handler = RuntimeClientHandler { event_tx };
-                let mut client = tokio::time::timeout(startup_timeout, handler.serve(transport))
-                    .await
-                    .map_err(|_| {
-                        McpRuntimeError::failed("stdio MCP initialize timed out".to_owned())
-                    })?
-                    .map_err(|error| {
-                        McpRuntimeError::failed(redact_text(
-                            format!("stdio MCP initialize failed: {error:#}").as_str(),
-                            secrets.as_slice(),
-                        ))
-                    })?;
-
+                let mut client =
+                    match tokio::time::timeout(startup_timeout, handler.serve(transport)).await {
+                        Ok(Ok(client)) => client,
+                        result => {
+                            let error = match result {
+                                Err(_) => McpRuntimeError::failed("stdio MCP initialize timed out"),
+                                Ok(Err(error)) => McpRuntimeError::failed(redact_text(
+                                    format!("stdio MCP initialize failed: {error:#}").as_str(),
+                                    secrets.as_slice(),
+                                )),
+                                Ok(Ok(_)) => unreachable!(),
+                            };
+                            if child.stop_and_wait().await.is_err() {
+                                return Ok(Box::new(RmcpRuntimeSession::failed_startup(
+                                    child,
+                                    None,
+                                    event_rx,
+                                    installation_id,
+                                    secrets,
+                                    tool_timeout,
+                                    error,
+                                )));
+                            }
+                            return Err(error);
+                        }
+                    };
                 let collected = match collect_catalog(
                     &client,
-                    installation_id,
+                    installation_id.clone(),
                     now_unix,
                     tool_timeout,
                     secrets.as_slice(),
@@ -87,13 +101,26 @@ impl McpRuntimeConnector for RmcpRuntimeConnector {
                         } else {
                             format!("{}; stderr: {}", error.message, stderr)
                         };
-                        let _ = client.close_with_timeout(Duration::from_secs(3)).await;
-                        return Err(McpRuntimeError {
+                        let close_failed = client.close().await.is_err();
+                        let child_failed = child.stop_and_wait().await.is_err();
+                        let error = McpRuntimeError {
                             kind: error.kind,
                             state: error.state,
                             oauth_failure: error.oauth_failure,
                             message,
-                        });
+                        };
+                        if close_failed || child_failed {
+                            return Ok(Box::new(RmcpRuntimeSession::failed_startup(
+                                child,
+                                Some(client),
+                                event_rx,
+                                installation_id,
+                                secrets,
+                                tool_timeout,
+                                error,
+                            )));
+                        }
+                        return Err(error);
                     }
                 };
                 let CollectedCatalog {
@@ -102,6 +129,9 @@ impl McpRuntimeConnector for RmcpRuntimeConnector {
                 } = collected;
 
                 Ok(Box::new(RmcpRuntimeSession {
+                    startup_failure: None,
+                    shutdown_outcome: None,
+                    child: Some(child),
                     client: Some(client),
                     event_rx,
                     catalog,
@@ -120,11 +150,20 @@ impl McpRuntimeConnector for RmcpRuntimeConnector {
                 };
                 let had_authorization = authorized.is_some();
                 let http = crate::oauth::ManagedHttpClient {
-                    plain: reqwest_0_13::Client::builder().build().map_err(|_| {
-                        McpRuntimeError::failed("HTTP client initialization failed")
-                    })?,
+                    // Portable configured headers cannot follow a redirect to
+                    // another origin. The OAuth client already disables redirects.
+                    plain: {
+                        let builder = reqwest_0_13::Client::builder();
+                        let builder = if installation.is_portable_plugin() {
+                            builder.redirect(reqwest_0_13::redirect::Policy::none())
+                        } else {
+                            builder
+                        };
+                        builder.build()
+                    }
+                    .map_err(|_| McpRuntimeError::failed("HTTP client initialization failed"))?,
                     authorized,
-                    owner: if installation.transport.has_authorization_header() {
+                    owner: if installation.explicit_authorization_overrides_oauth() {
                         None
                     } else {
                         self.oauth.clone()
@@ -174,6 +213,9 @@ impl McpRuntimeConnector for RmcpRuntimeConnector {
                         .await;
                 }
                 Ok(Box::new(RmcpRuntimeSession {
+                    startup_failure: None,
+                    shutdown_outcome: None,
+                    child: None,
                     client: Some(client),
                     event_rx,
                     catalog,
@@ -224,6 +266,9 @@ impl ClientHandler for RuntimeClientHandler {
 }
 
 struct RmcpRuntimeSession {
+    child: Option<Arc<crate::client::stdio::StdioChildOwner>>,
+    shutdown_outcome: Option<Result<(), McpRuntimeError>>,
+    startup_failure: Option<McpRuntimeError>,
     client: Option<RunningService<RoleClient, RuntimeClientHandler>>,
     event_rx: mpsc::UnboundedReceiver<McpSessionEvent>,
     catalog: McpCatalogSnapshot,
@@ -232,8 +277,45 @@ struct RmcpRuntimeSession {
     tool_timeout: Duration,
 }
 
+impl RmcpRuntimeSession {
+    fn failed_startup(
+        child: Arc<crate::client::stdio::StdioChildOwner>,
+        client: Option<RunningService<RoleClient, RuntimeClientHandler>>,
+        event_rx: mpsc::UnboundedReceiver<McpSessionEvent>,
+        id: String,
+        secrets: Vec<String>,
+        tool_timeout: Duration,
+        error: McpRuntimeError,
+    ) -> Self {
+        Self {
+            child: Some(child),
+            client,
+            event_rx,
+            secrets,
+            tool_timeout,
+            shutdown_outcome: None,
+            startup_failure: Some(error),
+            degraded_reason: None,
+            catalog: McpCatalogSnapshot {
+                server_installation_id: id,
+                catalog_version: String::new(),
+                server_info_json: "{}".into(),
+                server_instructions_hash: None,
+                tools_json: "[]".into(),
+                resources_json: "[]".into(),
+                resource_templates_json: "[]".into(),
+                prompts_json: "[]".into(),
+                generated_at_unix: 0,
+            },
+        }
+    }
+}
+
 #[async_trait]
 impl McpRuntimeSession for RmcpRuntimeSession {
+    fn startup_failure(&self) -> Option<&McpRuntimeError> {
+        self.startup_failure.as_ref()
+    }
     fn initial_catalog(&self) -> &McpCatalogSnapshot {
         &self.catalog
     }
@@ -396,9 +478,32 @@ impl McpRuntimeSession for RmcpRuntimeSession {
     }
 
     async fn shutdown(&mut self) {
-        if let Some(mut client) = self.client.take() {
-            let _ = client.close_with_timeout(Duration::from_secs(3)).await;
+        let _ = self.shutdown_result().await;
+    }
+    async fn shutdown_result(&mut self) -> Result<(), McpRuntimeError> {
+        if let Some(result) = &self.shutdown_outcome {
+            if result.is_err()
+                && let Some(child) = &self.child
+            {
+                let _ = child.stop_and_wait().await;
+            }
+            return result.clone();
         }
+        let mut outcome = Ok(());
+        if let Some(client) = self.client.as_mut() {
+            // Owned by the Gateway actor, which is not aborted by a stop waiter.
+            // No nested timeout that discards rmcp's cleanup JoinHandle.
+            if client.close().await.is_err() {
+                outcome = Err(McpRuntimeError::failed("MCP service cleanup join failed"));
+            }
+        }
+        if let Some(child) = &self.child {
+            if child.stop_and_wait().await.is_err() {
+                outcome = Err(McpRuntimeError::failed("MCP stdio process cleanup failed"));
+            }
+        }
+        self.shutdown_outcome = Some(outcome.clone());
+        outcome
     }
 }
 

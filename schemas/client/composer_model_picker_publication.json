@@ -1,0 +1,1131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ComposerModelPickerPublication",
+  "type": "object",
+  "properties": {
+    "closed": {
+      "type": "boolean"
+    },
+    "deferred": {
+      "type": "boolean"
+    },
+    "identity": {
+      "$ref": "#/$defs/ComposerOperationIdentity"
+    },
+    "models_request": {
+      "$ref": "#/$defs/ComposerCatalogRequest"
+    },
+    "provider_rows": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ComposerModelPickerProvider"
+      }
+    },
+    "providers_request": {
+      "$ref": "#/$defs/ComposerCatalogRequest"
+    },
+    "reasoning_rows": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ReasoningEffortRow"
+      }
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "selected_provider_ready": {
+      "type": "boolean"
+    },
+    "selected_reasoning_effort": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "selector": {
+      "$ref": "#/$defs/ProviderModelSelectorState"
+    }
+  },
+  "required": [
+    "provider_rows",
+    "reasoning_rows",
+    "selected_provider_ready",
+    "identity",
+    "revision",
+    "selector",
+    "deferred",
+    "closed",
+    "providers_request",
+    "models_request"
+  ],
+  "$defs": {
+    "CLIAgentRuntimeKind": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude"
+      ]
+    },
+    "CliRuntimeMcpReadinessReason": {
+      "type": "string",
+      "enum": [
+        "runtimeNotReady",
+        "unsupportedContract",
+        "strictIsolationFailed",
+        "helperSelfProbeFailed",
+        "platformIpcUnavailable",
+        "continuityUnavailable",
+        "readinessUnavailable"
+      ]
+    },
+    "ComposerCapabilityTarget": {
+      "description": "Capability eligibility context.\n\nThe target kind exists only because native skills retain their current\nsource policy while CLI skills must be exportable. Capability support is\nrepresented exclusively by [`ComposerCapabilityPolicy`].",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/ComposerCapabilityTargetKind"
+        },
+        "supports_mcp_tools": {
+          "type": "boolean"
+        },
+        "supports_skills": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "supports_skills",
+        "supports_mcp_tools"
+      ]
+    },
+    "ComposerCapabilityTargetKind": {
+      "type": "string",
+      "enum": [
+        "native",
+        "cli"
+      ]
+    },
+    "ComposerCatalogRequest": {
+      "type": "object",
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "state": {
+          "$ref": "#/$defs/ComposerCatalogRequestState"
+        }
+      },
+      "required": [
+        "generation",
+        "state"
+      ]
+    },
+    "ComposerCatalogRequestState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "idle"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "loading"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "ready"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "failed"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "cancelled"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "ComposerModelPickerProvider": {
+      "type": "object",
+      "properties": {
+        "capability_target": {
+          "$ref": "#/$defs/ComposerCapabilityTarget"
+        },
+        "cli_runtime": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "mcp_readiness_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CliRuntimeMcpReadinessReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "cli_runtime",
+        "capability_target"
+      ]
+    },
+    "ComposerOperationIdentity": {
+      "type": "object",
+      "properties": {
+        "draft_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "draft_id",
+        "generation"
+      ]
+    },
+    "ProviderModelCapabilities": {
+      "type": "object",
+      "properties": {
+        "embeddings": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "fine_tuning": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "input_modalities": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "json_output": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "output_modalities": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "reasoning": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderModelReasoningCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "streaming": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "thinking": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "tool_calling": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "transcription": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "vision": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "ProviderModelInfo": {
+      "type": "object",
+      "properties": {
+        "active": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "capabilities": {
+          "$ref": "#/$defs/ProviderModelCapabilities"
+        },
+        "created": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "family": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "lifecycle_status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limits": {
+          "$ref": "#/$defs/ProviderModelLimits"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "owned_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pricing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderModelPricing"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider": {
+          "type": "string"
+        },
+        "transcription": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderTranscriptionModelMetadata"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "provider",
+        "limits",
+        "capabilities"
+      ]
+    },
+    "ProviderModelLimits": {
+      "type": "object",
+      "properties": {
+        "context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      }
+    },
+    "ProviderModelPricing": {
+      "type": "object",
+      "properties": {
+        "image": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "input_token": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "output_token": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "request": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      }
+    },
+    "ProviderModelReasoningCapabilities": {
+      "type": "object",
+      "properties": {
+        "default_effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effort_options": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mandatory": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReasoningCapabilitySource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "supported": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "supports_token_budget": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "ProviderModelSelectorMode": {
+      "type": "string",
+      "enum": [
+        "Chat",
+        "SelfImprovement",
+        "Embeddings",
+        "Transcription"
+      ]
+    },
+    "ProviderModelSelectorState": {
+      "type": "object",
+      "properties": {
+        "cli_runtimes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RuntimeSummary"
+          }
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "loading_cli_runtimes": {
+          "type": "boolean"
+        },
+        "loading_models": {
+          "type": "boolean"
+        },
+        "loading_providers": {
+          "type": "boolean"
+        },
+        "mode": {
+          "$ref": "#/$defs/ProviderModelSelectorMode"
+        },
+        "models": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProviderModelInfo"
+          }
+        },
+        "providers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProviderSummary"
+          }
+        },
+        "selected_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selected_provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "providers",
+        "cli_runtimes",
+        "models",
+        "mode",
+        "loading_providers",
+        "loading_cli_runtimes",
+        "loading_models"
+      ]
+    },
+    "ProviderSummary": {
+      "type": "object",
+      "properties": {
+        "api_key_configured": {
+          "type": "boolean"
+        },
+        "available": {
+          "description": "The gateway can construct this provider in the selected workspace.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "base_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "capabilities": {
+          "$ref": "#/$defs/ProviderSummaryCapabilities",
+          "default": {
+            "embeddings": false,
+            "self_improvement": false,
+            "transcription": false
+          }
+        },
+        "name": {
+          "type": "string"
+        },
+        "proxy_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "ProviderSummaryCapabilities": {
+      "type": "object",
+      "properties": {
+        "embeddings": {
+          "type": "boolean",
+          "default": false
+        },
+        "self_improvement": {
+          "description": "Gateway-authoritative eligibility for the API-only self-improvement\nmodel selectors.",
+          "type": "boolean",
+          "default": false
+        },
+        "transcription": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "ProviderTranscriptionModelMetadata": {
+      "type": "object",
+      "properties": {
+        "accuracy_score": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "download_size_mb": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "engine": {
+          "type": "string"
+        },
+        "recommended": {
+          "type": "boolean"
+        },
+        "speed_score": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "supported_languages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "supports_language_selection": {
+          "type": "boolean"
+        },
+        "supports_translation": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "engine",
+        "download_size_mb",
+        "accuracy_score",
+        "speed_score",
+        "supports_translation",
+        "supported_languages",
+        "supports_language_selection",
+        "recommended"
+      ]
+    },
+    "ReasoningCapabilitySource": {
+      "type": "string",
+      "enum": [
+        "provider_metadata",
+        "cli_metadata",
+        "static_registry",
+        "config_override",
+        "unknown"
+      ]
+    },
+    "ReasoningEffortRow": {
+      "type": "object",
+      "properties": {
+        "effort": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "selected": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "effort",
+        "label",
+        "selected"
+      ]
+    },
+    "RuntimeAccountSnapshot": {
+      "type": "object",
+      "properties": {
+        "account_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "auth_method": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "authenticated": {
+          "type": "boolean"
+        },
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "authenticated"
+      ]
+    },
+    "RuntimeCapabilities": {
+      "type": "object",
+      "properties": {
+        "supports_approvals": {
+          "type": "boolean"
+        },
+        "supports_apps": {
+          "type": "boolean"
+        },
+        "supports_auth_management": {
+          "type": "boolean"
+        },
+        "supports_command_approvals": {
+          "type": "boolean"
+        },
+        "supports_compaction": {
+          "type": "boolean"
+        },
+        "supports_diff_updates": {
+          "type": "boolean"
+        },
+        "supports_file_change_approvals": {
+          "type": "boolean"
+        },
+        "supports_fork": {
+          "type": "boolean"
+        },
+        "supports_generated_schema_probe": {
+          "type": "boolean"
+        },
+        "supports_goal": {
+          "type": "boolean"
+        },
+        "supports_history_read": {
+          "type": "boolean"
+        },
+        "supports_interrupt": {
+          "type": "boolean"
+        },
+        "supports_mcp_tools": {
+          "type": "boolean",
+          "default": false
+        },
+        "supports_model_list": {
+          "type": "boolean"
+        },
+        "supports_resume": {
+          "type": "boolean"
+        },
+        "supports_review": {
+          "type": "boolean"
+        },
+        "supports_skills": {
+          "type": "boolean",
+          "default": false
+        },
+        "supports_steer": {
+          "type": "boolean"
+        },
+        "supports_thread_archive": {
+          "type": "boolean"
+        },
+        "supports_threads": {
+          "type": "boolean"
+        },
+        "supports_user_input_requests": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "supports_threads",
+        "supports_resume",
+        "supports_fork",
+        "supports_steer",
+        "supports_interrupt",
+        "supports_approvals",
+        "supports_file_change_approvals",
+        "supports_command_approvals",
+        "supports_user_input_requests",
+        "supports_model_list",
+        "supports_apps",
+        "supports_review",
+        "supports_compaction",
+        "supports_goal",
+        "supports_diff_updates",
+        "supports_history_read",
+        "supports_thread_archive",
+        "supports_auth_management",
+        "supports_generated_schema_probe"
+      ]
+    },
+    "RuntimeDiagnostic": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "level": {
+          "$ref": "#/$defs/RuntimeDiagnosticLevel"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "level",
+        "code",
+        "message"
+      ]
+    },
+    "RuntimeDiagnosticLevel": {
+      "type": "string",
+      "enum": [
+        "info",
+        "warning",
+        "error"
+      ]
+    },
+    "RuntimeStatus": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "disabled"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "binary_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "type": "string",
+              "const": "missing_binary"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string",
+              "const": "spawn_failed"
+            }
+          },
+          "required": [
+            "state",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "initializing"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "needs_auth"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "ready"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string",
+              "const": "degraded"
+            }
+          },
+          "required": [
+            "state",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "minimum_version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "type": "string",
+              "const": "unsupported_version"
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string",
+              "const": "error"
+            }
+          },
+          "required": [
+            "state",
+            "message"
+          ]
+        }
+      ]
+    },
+    "RuntimeSummary": {
+      "type": "object",
+      "properties": {
+        "account": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RuntimeAccountSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "binary_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "capabilities": {
+          "$ref": "#/$defs/RuntimeCapabilities"
+        },
+        "debug_native_events_enabled": {
+          "type": "boolean"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RuntimeDiagnostic"
+          }
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "home_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/CLIAgentRuntimeKind"
+        },
+        "models_refreshed_at_unix_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "proxy_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recent_stderr": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "runtime_id": {
+          "type": "string"
+        },
+        "shadow_home_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/RuntimeStatus"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "runtime_id",
+        "kind",
+        "display_name",
+        "enabled",
+        "status",
+        "capabilities"
+      ]
+    }
+  }
+}

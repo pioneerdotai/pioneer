@@ -1,0 +1,503 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NavigationIntent",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "open_agents_document"
+        },
+        "scope": {
+          "$ref": "#/$defs/AgentsDocEditorScope"
+        }
+      },
+      "required": [
+        "kind",
+        "scope"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "set_administration_route"
+        },
+        "route": {
+          "$ref": "#/$defs/AdministrationRoute"
+        }
+      },
+      "required": [
+        "kind",
+        "route"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "set_settings_route"
+        },
+        "route": {
+          "$ref": "#/$defs/SettingsRoute"
+        }
+      },
+      "required": [
+        "kind",
+        "route"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "filter": {
+          "$ref": "#/$defs/ProviderFilter"
+        },
+        "kind": {
+          "type": "string",
+          "const": "set_providers_route"
+        }
+      },
+      "required": [
+        "kind",
+        "filter"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "set_mcp_route"
+        },
+        "server_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "set_skills_route"
+        },
+        "skill_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "select_workspace"
+        },
+        "workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "select_thread"
+        },
+        "thread_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "destination": {
+          "$ref": "#/$defs/SemanticDestination"
+        },
+        "kind": {
+          "type": "string",
+          "const": "navigate"
+        }
+      },
+      "required": [
+        "kind",
+        "destination"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "remember_draft"
+        },
+        "thread_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "workspace_id"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "remember_last"
+        },
+        "thread_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "workspace_id"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "promote_thread"
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "thread_id"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "entry": {
+          "$ref": "#/$defs/TaskThreadLineage"
+        },
+        "kind": {
+          "type": "string",
+          "const": "push_task_thread"
+        }
+      },
+      "required": [
+        "kind",
+        "entry"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "pop_task_thread"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "clear_lineage"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "reset"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    }
+  ],
+  "$defs": {
+    "AdministrationRoute": {
+      "type": "string",
+      "enum": [
+        "Members",
+        "Invitations"
+      ]
+    },
+    "AgentsDocEditorScope": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "root"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "workspace_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "folder_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "folder"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "workspace_id",
+            "folder_id"
+          ]
+        }
+      ]
+    },
+    "ProviderFilter": {
+      "type": "string",
+      "enum": [
+        "Api",
+        "Connected",
+        "Cli"
+      ]
+    },
+    "SemanticDestination": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "plugins"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "threads"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "agents_document"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "filter": {
+              "$ref": "#/$defs/ProviderFilter"
+            },
+            "kind": {
+              "type": "string",
+              "const": "providers"
+            }
+          },
+          "required": [
+            "kind",
+            "filter"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "administration"
+            },
+            "route": {
+              "$ref": "#/$defs/AdministrationRoute"
+            }
+          },
+          "required": [
+            "kind",
+            "route"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "mcp"
+            },
+            "server_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "skills"
+            },
+            "skill_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SkillId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "settings"
+            },
+            "route": {
+              "$ref": "#/$defs/SettingsRoute"
+            }
+          },
+          "required": [
+            "kind",
+            "route"
+          ]
+        }
+      ]
+    },
+    "SettingsRoute": {
+      "type": "string",
+      "enum": [
+        "General",
+        "Account",
+        "Memory",
+        "SelfImprovement"
+      ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "TaskThreadLineage": {
+      "type": "object",
+      "properties": {
+        "child_thread_id": {
+          "type": "string"
+        },
+        "parent_thread_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "parent_thread_id",
+        "child_thread_id",
+        "workspace_id",
+        "title"
+      ]
+    }
+  }
+}

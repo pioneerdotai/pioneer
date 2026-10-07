@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProviderOperationPublication",
+  "type": "object",
+  "properties": {
+    "action": {
+      "$ref": "#/$defs/ProviderActionKind"
+    },
+    "generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "request": {
+      "$ref": "#/$defs/ProviderLoadState"
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "target": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "revision",
+    "generation",
+    "workspace_id",
+    "target",
+    "action",
+    "request"
+  ],
+  "$defs": {
+    "ProviderActionKind": {
+      "type": "string",
+      "enum": [
+        "configure",
+        "disconnect",
+        "connect",
+        "set_runtime_proxy",
+        "remove_runtime_proxy",
+        "save_runtime",
+        "set_runtime_enabled"
+      ]
+    },
+    "ProviderLoadState": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "loading",
+        "ready",
+        "failed",
+        "forbidden",
+        "cancelled"
+      ]
+    }
+  }
+}

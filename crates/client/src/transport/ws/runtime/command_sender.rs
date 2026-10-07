@@ -794,6 +794,30 @@ impl GatewayWsCommandSender {
         client_ws_commands::task_cancel(self, params)
     }
 
+    pub fn plugins_list(
+        &self,
+        params: pioneer_protocol::PluginsListParams,
+    ) -> Result<pioneer_protocol::PluginsListResponse> {
+        client_ws_commands::plugins_list(self, params)
+    }
+    pub fn plugins_details(
+        &self,
+        params: pioneer_protocol::PluginsDetailsParams,
+    ) -> Result<pioneer_protocol::PluginItem> {
+        client_ws_commands::plugins_details(self, params)
+    }
+    pub fn plugins_preview(
+        &self,
+        params: pioneer_protocol::PluginsSourceParams,
+    ) -> Result<pioneer_protocol::PluginsPreviewResponse> {
+        client_ws_commands::plugins_preview(self, params)
+    }
+    pub fn plugins_install(
+        &self,
+        params: pioneer_protocol::PluginsInstallParams,
+    ) -> Result<pioneer_protocol::PluginItem> {
+        client_ws_commands::plugins_install(self, params)
+    }
     pub fn skills_list(&self, params: SkillListParams) -> Result<SkillListResponse> {
         client_ws_commands::skills_list(self, params)
     }
@@ -1054,6 +1078,17 @@ impl GatewayWsCommandSender {
         offset: u64,
         chunk: Vec<u8>,
     ) -> Result<SkillsUploadChunkAckNotification> {
+        self.send_skill_upload_chunk_bound(None, workspace_id, upload_id, offset, chunk)
+    }
+    /// Fence binary delivery just like RPC delivery; None preserves legacy callers.
+    pub fn send_skill_upload_chunk_bound(
+        &self,
+        expected_connection: Option<u64>,
+        workspace_id: String,
+        upload_id: String,
+        offset: u64,
+        chunk: Vec<u8>,
+    ) -> Result<SkillsUploadChunkAckNotification> {
         let payload = crate::transport::ws::frames::encode_skill_upload_chunk_frame(
             workspace_id,
             upload_id.clone(),
@@ -1064,6 +1099,7 @@ impl GatewayWsCommandSender {
         let (response_tx, response_rx) = mpsc::channel();
         self.command_tx
             .send(GatewayWsCommand::BinaryUploadChunk {
+                expected_connection,
                 upload_id,
                 offset,
                 payload,
@@ -1206,6 +1242,48 @@ mod connection_generation_tests {
         ));
         core.shutdown();
         assert_eq!(core.route_gateway_event(&settings), None);
+    }
+
+    // NOT_RUN / NOT_COMPILED. Raw queue only; no transport worker/network.
+    #[test]
+    fn bound_native_request_does_not_recapture_route_changed_before_send() {
+        use crate::rpc::JsonRpcRequestTransport;
+        let (command_tx, mut queue) = unbounded_channel();
+        let sender = GatewayWsCommandSender {
+            command_tx,
+            next_connection_id: Arc::new(AtomicU64::new(8)),
+            session_access: Arc::new(Mutex::new(None)),
+            connection_generations: Arc::default(),
+            test_requests: Arc::default(),
+        };
+        sender.connection_generations.lock().unwrap().active = Some(7);
+        let bound = sender.requests_for_connection(7);
+        // Models replacement after native work's last current check. Every
+        // mutation and OAuth callback uses this same bound Request transport.
+        sender.connection_generations.lock().unwrap().active = Some(8);
+        for method in [
+            "mcp/install",
+            "mcp/policy/set",
+            "skills/policy/set",
+            "mcp/oauth",
+        ] {
+            let (response_tx, _) = mpsc::channel();
+            bound
+                .send_json_rpc_request("request".into(), method.into(), response_tx)
+                .unwrap();
+            let GatewayWsCommand::Request {
+                expected_connection,
+                ..
+            } = queue.try_recv().unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(expected_connection, Some(7));
+            assert_ne!(
+                expected_connection,
+                sender.connection_generations.lock().unwrap().active
+            );
+        }
     }
 
     #[test]

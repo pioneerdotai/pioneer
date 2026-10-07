@@ -2681,6 +2681,26 @@
         "scopeKind"
       ]
     },
+    "TurnPluginCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "expectedRevision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "label": {
+          "type": "string"
+        },
+        "pluginId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pluginId",
+        "expectedRevision",
+        "label"
+      ]
+    },
     "TurnSkillCapabilitySummary": {
       "type": "object",
       "properties": {
@@ -2975,6 +2995,22 @@
             "type": {
               "type": "string",
               "const": "skill"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnPluginCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "plugin"
             }
           },
           "required": [

@@ -51,6 +51,10 @@ impl<'de> serde::Deserialize<'de> for ComposerCapability {
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum ComposerCapabilityKind {
+    Plugin {
+        plugin_id: String,
+        expected_revision: i64,
+    },
     Skill {
         skill_id: SkillId,
         owner: Option<String>,
@@ -401,6 +405,9 @@ pub fn composer_capability_removal_reason(
 ) -> Option<ComposerCapabilityRemovalReason> {
     let policy = target.policy();
     match &capability.kind {
+        // Preserve the parent across provider changes. Unsupported runtimes
+        // reject it explicitly at Gateway admission instead of losing the chip.
+        ComposerCapabilityKind::Plugin { .. } => None,
         ComposerCapabilityKind::Skill { source_kind, .. } => {
             if !policy.supports_skills {
                 Some(ComposerCapabilityRemovalReason::SkillsUnsupported)
@@ -589,6 +596,13 @@ impl ComposerCapability {
         TurnCapability {
             id: self.key(),
             kind: match &self.kind {
+                ComposerCapabilityKind::Plugin {
+                    plugin_id,
+                    expected_revision,
+                } => TurnCapabilityKind::Plugin {
+                    plugin_id: plugin_id.clone(),
+                    expected_revision: *expected_revision,
+                },
                 ComposerCapabilityKind::Skill { skill_id, .. } => TurnCapabilityKind::Skill {
                     skill_id: skill_id.clone(),
                     pack_id: None,
@@ -615,6 +629,16 @@ impl ComposerCapability {
 
     pub fn to_user_message_attachment(&self) -> UserMessageAttachment {
         match &self.kind {
+            ComposerCapabilityKind::Plugin {
+                plugin_id,
+                expected_revision,
+            } => UserMessageAttachment::Plugin {
+                capability: pioneer_protocol::TurnPluginCapabilitySummary {
+                    plugin_id: plugin_id.clone(),
+                    expected_revision: *expected_revision,
+                    label: self.label.clone(),
+                },
+            },
             ComposerCapabilityKind::Skill {
                 skill_id,
                 owner,
@@ -660,6 +684,7 @@ impl ComposerCapability {
 impl ComposerCapabilityKind {
     pub fn key(&self) -> String {
         match self {
+            Self::Plugin { plugin_id, .. } => pioneer_protocol::plugin_capability_key(plugin_id),
             Self::Skill { skill_id, .. } => pioneer_protocol::skill_capability_key(skill_id),
             Self::McpServer { name, scope_kind } => {
                 pioneer_protocol::mcp_server_capability_key(*scope_kind, name)
@@ -1197,6 +1222,7 @@ pub fn filter_mcp_server_capability_rows(
 ) -> Vec<SelectableMcpCapability> {
     let mut rows = servers
         .iter()
+        .filter(|server| crate::mcp::list::mcp_is_standalone(server))
         .map(selectable_mcp_server_from_item)
         .collect::<Vec<_>>();
     rows = filter_selectable_mcp_capability_rows(rows.as_slice(), query);
@@ -1450,6 +1476,7 @@ mod tests {
 
     fn skill_item(slug: &str) -> SkillListItem {
         SkillListItem {
+            plugin_owner: None,
             skill_id: skill_id(slug),
             pack: None,
             owner: None,
@@ -1485,6 +1512,7 @@ mod tests {
 
     fn mcp_server(name: &str) -> McpListItem {
         McpListItem {
+            plugin_owner: None,
             id: format!("mcp:{name}"),
             name: name.to_owned(),
             display_name: None,

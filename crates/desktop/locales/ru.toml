@@ -1753,3 +1753,6 @@ reason_unknown = "Операция не завершилась ожидаемы�
 [mcp.oauth]
 callback_received = "Ответ принят. Вернитесь в Pioneer, чтобы узнать результат входа."
 callback_rejected = "Запрос входа отклонён. Вернитесь в Pioneer для повторного входа."
+
+[plugins]
+title = "Плагины"

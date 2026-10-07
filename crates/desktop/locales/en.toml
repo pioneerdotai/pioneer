@@ -1753,3 +1753,6 @@ reason_unknown = "The operation did not complete as expected. Check the gateway 
 [mcp.oauth]
 callback_received = "Callback accepted. Return to Pioneer to check the sign-in result."
 callback_rejected = "Callback rejected. Return to Pioneer to retry sign-in."
+
+[plugins]
+title = "Plugins"

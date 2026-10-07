@@ -15,6 +15,7 @@ mod diagnostics;
 mod gateway;
 mod invitation;
 mod pending_requests;
+mod plugin_shell;
 mod presentation;
 #[cfg(feature = "schema")]
 pub mod schema;
@@ -110,6 +111,13 @@ pub struct PioneerClientFfi {
 struct ClientFfiRuntime {
     config: Mutex<Option<ClientFfiConfig>>,
     core: Arc<ClientCore>,
+    native_oauth: Arc<plugin_shell::NativeOAuthShell>,
+    plugin_uploads: Mutex<
+        std::collections::BTreeMap<
+            (String, u64),
+            pioneer_client::skills::operations::SkillUploadOperation,
+        >,
+    >,
     client_subscriptions: Mutex<HashMap<ClientScope, ClientSubscription>>,
     observed_scopes: Mutex<std::collections::HashSet<ClientScope>>,
 
@@ -131,6 +139,8 @@ impl Default for ClientFfiRuntime {
     fn default() -> Self {
         let core = mobile_process_core();
         Self {
+            native_oauth: Arc::new(plugin_shell::NativeOAuthShell::new(&core)),
+            plugin_uploads: Mutex::default(),
             core,
             config: Default::default(),
             client_subscriptions: Default::default(),
@@ -994,6 +1004,11 @@ impl ClientFfiRuntime {
         composer_attachment_from_path_request(request).map_err(|error| format!("{error:#}"))
     }
 
+    fn plugin_shell(&self, input_json: &str) -> Result<plugin_shell::PluginShellResponse, String> {
+        let request = serde_json::from_str(input_json)
+            .map_err(|_| "invalid_plugin_shell_request".to_owned())?;
+        plugin_shell::execute(self, request)
+    }
     fn composer_skill_pack_picker(
         &self,
         input_json: &str,
@@ -2527,3 +2542,5 @@ mod onboarding_binding_tests;
 
 #[cfg(test)]
 mod settings_binding_tests;
+
+ffi_client_json_method!(pioneer_client_ffi_plugin_shell, plugin_shell);

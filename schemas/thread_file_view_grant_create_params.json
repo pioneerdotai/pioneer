@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadFileViewGrantCreateParams",
+  "type": "object",
+  "properties": {
+    "href": {
+      "type": "string",
+      "maxLength": 4096,
+      "minLength": 1
+    },
+    "item_id": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1
+    },
+    "thread_id": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1
+    },
+    "turn_id": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1
+    }
+  },
+  "required": [
+    "thread_id",
+    "turn_id",
+    "item_id",
+    "href"
+  ]
+}

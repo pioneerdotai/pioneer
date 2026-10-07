@@ -49,6 +49,16 @@
           "maximum": 65535,
           "minimum": 0
         },
+        "destinationLocation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PatchHistoryPathView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "destinationPath": {
           "type": [
             "string",
@@ -81,6 +91,9 @@
         "sideEffects": {
           "$ref": "#/$defs/PatchHistorySideEffects"
         },
+        "sourceLocation": {
+          "$ref": "#/$defs/PatchHistoryPathView"
+        },
         "sourcePath": {
           "type": "string"
         }
@@ -91,6 +104,7 @@
         "sequence",
         "kind",
         "sourcePath",
+        "sourceLocation",
         "sideEffects"
       ]
     },
@@ -172,6 +186,25 @@
         "dominant",
         "mixed",
         "finalNewline"
+      ]
+    },
+    "PatchHistoryPathView": {
+      "type": "object",
+      "properties": {
+        "absolutePath": {
+          "type": "string"
+        },
+        "relativePath": {
+          "type": "string"
+        },
+        "workspaceRoot": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "relativePath",
+        "workspaceRoot",
+        "absolutePath"
       ]
     },
     "PatchHistoryProvenanceView": {

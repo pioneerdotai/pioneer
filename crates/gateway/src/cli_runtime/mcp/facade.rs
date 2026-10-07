@@ -629,16 +629,21 @@ impl CliMcpToolFacade {
             .and_then(encode_response)
     }
 
-    pub(crate) async fn shutdown(&self) -> CliMcpFacadeShutdownOutcome {
+    pub(crate) fn request_shutdown(&self) {
         if !self.shutting_down.swap(true, Ordering::AcqRel) {
             self.admission.close();
             self.ledger.cancel_all();
         }
+    }
+    pub(crate) async fn shutdown(&self) -> CliMcpFacadeShutdownOutcome {
+        self.request_shutdown();
         let drained = self
             .ledger
             .wait_drained(self.limits.shutdown_drain_duration)
             .await;
-        self.ledger.clear();
+        if drained {
+            self.ledger.clear();
+        }
         CliMcpFacadeShutdownOutcome { drained }
     }
 
@@ -975,12 +980,15 @@ impl CliMcpToolFacade {
             arguments,
             origin: TurnMcpInvocationOrigin::CliFacade,
         };
-        let invocation = self.invoker.invoke(invocation, cancellation.clone());
-        let result = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return Err(cancelled_error()),
-            outcome = invocation => outcome.map_err(invocation_error)?,
-        };
+        // Cancellation is a signal to the existing Gateway invoker. Dropping
+        // its future here can leave native I/O, approval or blocking file work
+        // running after the facade ledger appears drained. Await its genuine
+        // completion; the native server owner retains this call while waiting.
+        let result = self
+            .invoker
+            .invoke(invocation, cancellation.clone())
+            .await
+            .map_err(invocation_error)?;
         if cancellation.is_cancelled() {
             return Err(cancelled_error());
         }

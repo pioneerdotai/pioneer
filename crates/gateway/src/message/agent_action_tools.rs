@@ -890,7 +890,7 @@ pub(crate) fn pin_launch_selection_capabilities(
                 }
                 skill_ids.push(skill_id.clone());
             }
-            TurnCapabilityKind::SkillPack { .. } => {
+            TurnCapabilityKind::SkillPack { .. } | TurnCapabilityKind::Plugin { .. } => {
                 anyhow::bail!("normalized Task launch contains an unexpanded Skill pack");
             }
             TurnCapabilityKind::McpServer { name, scope_kind } => {
@@ -990,6 +990,7 @@ pub(crate) fn task_launch_selection_capabilities(
     use pioneer_protocol::TurnCapabilityKind;
 
     if !selection.selected_capabilities.is_empty() {
+        let mut has_plugins = false;
         let mut skill_ids = Vec::new();
         let mut mcp_server_ids = Vec::new();
         let mut capability_ids = Vec::new();
@@ -999,6 +1000,14 @@ pub(crate) fn task_launch_selection_capabilities(
             }
             capability_ids.push(capability.id.clone());
             match &capability.kind {
+                TurnCapabilityKind::Plugin {
+                    plugin_id,
+                    expected_revision,
+                } if *expected_revision > 0
+                    && capability.id == pioneer_protocol::plugin_capability_key(plugin_id) =>
+                {
+                    has_plugins = true;
+                }
                 TurnCapabilityKind::Skill {
                     skill_id,
                     pack_id: None,
@@ -1033,7 +1042,11 @@ pub(crate) fn task_launch_selection_capabilities(
                 _ => anyhow::bail!("persisted Task launch capability is not normalized"),
             }
         }
-        if skill_ids != selection.skill_ids || mcp_server_ids != selection.mcp_server_ids {
+        // Parent expansion is checked by the Gateway normalizer against the
+        // persisted native grant ceiling at admission, never by this parser.
+        if !has_plugins
+            && (skill_ids != selection.skill_ids || mcp_server_ids != selection.mcp_server_ids)
+        {
             anyhow::bail!("persisted Task launch capabilities differ from its grant selection");
         }
         return Ok(selection.selected_capabilities.clone());
@@ -2014,6 +2027,8 @@ struct AgentActionToolHandler {
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct DurableAgentStartDispatch {
+    #[serde(default)]
+    plugin_selection: Option<pioneer_protocol::PluginSelectionSnapshot>,
     thread_id: String,
     turn_id: String,
     params: TurnStartParams,
@@ -2301,6 +2316,26 @@ async fn dispatch_agent_action_outbox_row(
     }
     if resource.status != "running" || resource.permit_id.is_none() {
         anyhow::bail!("StartAgent execution has an inconsistent durable permit state");
+    }
+    if let Some(snapshot) = &dispatch.plugin_selection {
+        let _admission = super::plugins::acquire_plugin_selection_admission(
+            processor.crud_store.as_ref(),
+            &processor.plugin_mutation_locks,
+            &execution.workspace_id,
+            snapshot,
+        )
+        .await?;
+        if processor
+            .crud_store
+            .get_plugin_selection(&dispatch.turn_id)
+            .await?
+            .is_none()
+        {
+            processor
+                .crud_store
+                .prepare_plugin_selection(&dispatch.turn_id, snapshot)
+                .await?;
+        }
     }
     let input = processor
         .crud_store
@@ -2774,10 +2809,22 @@ impl AgentActionToolHandler {
                     "invalid child Agent launch capabilities: {error:#}"
                 ))
             })?;
-        let normalized_capabilities = processor
+        let presentation = processor
+            .inherited_plugin_presentation(
+                self.context.workspace_id.as_str(),
+                self.context.turn_id.as_str(),
+                &requested_capabilities,
+            )
+            .await
+            .map_err(|error| {
+                ToolError::execution_failed(format!(
+                    "parent plugin authority unavailable: {error:#}"
+                ))
+            })?;
+        let mut normalized_capabilities = processor
             .normalize_turn_skill_capabilities(
                 self.context.workspace_id.as_str(),
-                requested_capabilities.as_slice(),
+                presentation.as_slice(),
             )
             .await
             .map_err(|error| {
@@ -2785,6 +2832,13 @@ impl AgentActionToolHandler {
                     "child Agent launch capabilities are unavailable: {error}"
                 ))
             })?;
+        let ceiling = requested_capabilities
+            .iter()
+            .map(|cap| cap.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        normalized_capabilities
+            .execution
+            .retain(|cap| ceiling.contains(cap.id.as_str()));
         let turn_id = pioneer_crud::canonical_agent_id(
             'T',
             &format!("agent-start-turn\0{}", plan.projection.action_id),
@@ -2899,7 +2953,7 @@ impl AgentActionToolHandler {
             thread_id: thread_id.clone(),
             turn_id: turn_id.clone(),
             input: child.authored_turn.input.0.clone(),
-            capabilities: normalized_capabilities.execution,
+            capabilities: normalized_capabilities.execution.clone(),
             model: Some(child.grant.profile.model_id.clone()),
             model_provider: Some(child.grant.profile.provider_id.clone()),
             sandbox_policy: None,
@@ -3203,6 +3257,7 @@ impl AgentActionToolHandler {
                 "thread_id": thread_id.clone(),
                 "turn_id": turn_id.clone(),
                 "params": params.clone(),
+                "plugin_selection": normalized_capabilities.plugin_selection.clone(),
                 "identity": child.grant.identity.clone(),
                 "profile": child.grant.profile.clone(),
                 "identity_source_revision": child.grant.identity.source_revision,
@@ -3227,12 +3282,31 @@ impl AgentActionToolHandler {
         // durable commit. Every fallible identity, authority, presentation,
         // graph and outbox preparation step above therefore leaves no phantom
         // child Turn behind when it fails.
+        let plugin_guards = if let Some(snapshot) = &normalized_capabilities.plugin_selection {
+            let guards = super::plugins::acquire_plugin_selection_admission(
+                processor.crud_store.as_ref(),
+                &processor.plugin_mutation_locks,
+                &self.context.workspace_id,
+                snapshot,
+            )
+            .await
+            .map_err(|error| {
+                ToolError::execution_failed(format!("child plugin admission failed: {error:#}"))
+            })?;
+            guards
+        } else {
+            Vec::new()
+        };
+        let mut parent_envelope = params.clone();
+        parent_envelope.capabilities = normalized_capabilities.presentation;
         let outcome = processor
             .thread_manager
-            .concurrent_agent_turn_start_with_permission_profile(
-                params.clone(),
+            .agent_turn_start_with_plugin_capabilities(
+                parent_envelope,
+                params.capabilities.clone(),
                 permission_profile,
                 child.authored_turn.author.clone(),
+                true,
             )
             .await
             .map_err(|error| {
@@ -3283,6 +3357,16 @@ impl AgentActionToolHandler {
                 )));
             }
         };
+        if let Some(snapshot) = &normalized_capabilities.plugin_selection {
+            processor
+                .crud_store
+                .prepare_plugin_selection(&turn_id, snapshot)
+                .await
+                .map_err(|error| {
+                    ToolError::execution_failed(format!("child plugin snapshot failed: {error:#}"))
+                })?;
+        }
+        drop(plugin_guards);
         plan.projection.queued = graph_result.queued;
         processor
             .register_execution_lease(turn_id.as_str())

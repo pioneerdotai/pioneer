@@ -544,6 +544,16 @@
         "class": {
           "$ref": "#/$defs/ProviderFailureClass"
         },
+        "errorReason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderErrorReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "httpStatus": {
           "type": [
             "integer",
@@ -552,6 +562,16 @@
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0
+        },
+        "requestId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderRequestId"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "retryAfterMs": {
           "type": [
@@ -566,26 +586,6 @@
         },
         "transport": {
           "$ref": "#/$defs/ProviderTransportKind"
-        },
-        "errorReason": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ProviderErrorReason"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "requestId": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ProviderRequestId"
-            },
-            {
-              "type": "null"
-            }
-          ]
         }
       },
       "additionalProperties": false,
@@ -1748,6 +1748,27 @@
     },
     "TurnCapabilityKind": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "expectedRevision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "pluginId": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "plugin"
+            }
+          },
+          "required": [
+            "type",
+            "pluginId",
+            "expectedRevision"
+          ]
+        },
         {
           "type": "object",
           "properties": {

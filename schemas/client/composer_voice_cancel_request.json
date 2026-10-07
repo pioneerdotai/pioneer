@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ComposerVoiceCancelRequest",
+  "type": "object",
+  "properties": {
+    "operation": {
+      "$ref": "#/$defs/ComposerOperationIdentity"
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "session_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "operation",
+    "session_id"
+  ],
+  "$defs": {
+    "ComposerOperationIdentity": {
+      "type": "object",
+      "properties": {
+        "draft_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "draft_id",
+        "generation"
+      ]
+    }
+  }
+}

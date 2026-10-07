@@ -124,8 +124,61 @@ struct McpServerTaskHandle {
     call_tx: mpsc::Sender<McpServerCommand>,
     oauth_failure_revision: Arc<std::sync::atomic::AtomicU64>,
     recovery: Arc<OAuthRecoveryMailbox>,
-    shutdown_tx: oneshot::Sender<McpShutdownRequest>,
-    join: JoinHandle<()>,
+    shutdown_tx: Option<oneshot::Sender<McpShutdownRequest>>,
+    completed: Arc<tokio_util::sync::CancellationToken>,
+    join: Arc<McpTaskJoin>,
+    session: Arc<Mutex<Option<Box<dyn pioneer_mcp::McpRuntimeSession>>>>,
+}
+
+// Completion is distinct from the shutdown request. It remains in the native
+// task map until observed, even when the stop caller is cancelled.
+struct McpTaskCompletion(Arc<tokio_util::sync::CancellationToken>);
+impl Drop for McpTaskCompletion {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+struct McpTaskJoin {
+    state: Mutex<McpTaskJoinState>,
+    finished: tokio::task::AbortHandle,
+}
+struct McpTaskJoinState {
+    handle: Option<JoinHandle<Result<()>>>,
+    outcome: Option<Result<(), String>>,
+}
+impl McpTaskJoin {
+    fn new(handle: JoinHandle<Result<()>>) -> Arc<Self> {
+        Arc::new(Self {
+            finished: handle.abort_handle(),
+            state: Mutex::new(McpTaskJoinState {
+                handle: Some(handle),
+                outcome: None,
+            }),
+        })
+    }
+    fn is_finished(&self) -> bool {
+        self.finished.is_finished()
+    }
+    async fn wait(&self) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if let Some(outcome) = &state.outcome {
+            return outcome.clone().map_err(anyhow::Error::msg);
+        }
+        let outcome = match state
+            .handle
+            .as_mut()
+            .context("MCP task join owner is unknown")?
+            .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err("MCP runtime cleanup failed".to_owned()),
+            Err(_) => Err("MCP runtime task join failed; cleanup unknown".to_owned()),
+        };
+        state.outcome = Some(outcome.clone());
+        state.handle = None;
+        outcome.map_err(anyhow::Error::msg)
+    }
 }
 
 struct McpShutdownRequest {
@@ -294,6 +347,7 @@ impl McpService {
             .lock()
             .await
             .get(installation_id)
+            .filter(|task| task.shutdown_tx.is_some())
             .map(|task| {
                 (
                     task.call_tx.clone(),
@@ -453,6 +507,16 @@ impl McpService {
             .connector
             .write()
             .expect("MCP connector lock poisoned") = connector;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn task_stop_requested_for_tests(&self, id: &str) -> bool {
+        self.inner
+            .tasks
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|task| task.shutdown_tx.is_none())
     }
 
     #[cfg(test)]
@@ -674,19 +738,68 @@ impl McpService {
     }
 
     pub(crate) async fn reload_workspace(&self, workspace_id: &str) -> Result<()> {
-        self.reload_workspace_with_store(self.inner.crud_store.as_ref(), workspace_id)
+        self.reload_workspace_with_store(self.inner.crud_store.as_ref(), workspace_id, None)
             .await
     }
 
     pub(crate) async fn reload_workspace_for_maintenance(&self, workspace_id: &str) -> Result<()> {
         let store = self.inner.crud_store.with_maintenance_access();
-        self.reload_workspace_with_store(&store, workspace_id).await
+        self.reload_workspace_with_store(&store, workspace_id, None)
+            .await
     }
 
+    /// Only the foreground owner can reload its own prepared parent while the
+    /// pending plan still fences execution. Startup and OAuth launch cannot.
+    pub(crate) async fn reload_after_plugin_change(
+        &self,
+        guard: &crate::message::plugins::PluginMutationGuard,
+    ) -> Result<()> {
+        self.reload_workspace_with_store(
+            self.runtime_store(),
+            &guard.parent().workspace_id,
+            Some(guard),
+        )
+        .await
+    }
+    async fn plugin_start_available(
+        &self,
+        store: &CrudStore,
+        row: &McpServerInstallationRecord,
+        admitted: Option<&crate::message::plugins::PluginMutationGuard>,
+    ) -> Result<bool> {
+        if row.scope_kind != "workspace" {
+            return Ok(true);
+        }
+        let id = row.id.as_deref().context("MCP installation ID missing")?;
+        if let Some(guard) = admitted {
+            if store
+                .find_mcp_plugin_owner(id)
+                .await?
+                .is_some_and(|owner| owner.plugin_id == guard.parent().id)
+            {
+                let current = store
+                    .find_plugin_installation(&guard.parent().id)
+                    .await?
+                    .context("plugin owner missing")?;
+                anyhow::ensure!(
+                    current.workspace_id == row.scope_key
+                        && current.revision == guard.parent().revision,
+                    "plugin reload admission changed"
+                );
+                return store
+                    .plugin_child_runtime_available(id, &row.scope_key)
+                    .await;
+            }
+        }
+        store
+            .plugin_child_available("mcp", id, &row.scope_key)
+            .await
+    }
     async fn reload_workspace_with_store(
         &self,
         store: &CrudStore,
         workspace_id: &str,
+        admitted: Option<&crate::message::plugins::PluginMutationGuard>,
     ) -> Result<()> {
         let rows = store
             .list_mcp_server_installations("workspace", workspace_id)
@@ -722,7 +835,8 @@ impl McpService {
                 .oauth
                 .synchronize(&installation_id, &installation)
                 .await?;
-            if !row.enabled {
+            let parent_available = self.plugin_start_available(store, &row, admitted).await?;
+            if !row.enabled || !parent_available {
                 self.inner.oauth.suspend(&installation_id).await?;
                 self.stop_task(&installation_id, DomainRuntimeState::Disabled)
                     .await;
@@ -775,16 +889,12 @@ impl McpService {
                 }
             };
             let (should_start, secret_material_changed) = {
-                let mut tasks = self.inner.tasks.lock().await;
-                if tasks
-                    .get(&installation_id)
-                    .is_some_and(|handle| handle.join.is_finished())
-                {
-                    tasks.remove(&installation_id);
-                }
+                let tasks = self.inner.tasks.lock().await;
                 match tasks.get(&installation_id) {
                     Some(handle)
-                        if handle.fingerprint == row.fingerprint
+                        if handle.shutdown_tx.is_some()
+                            && !handle.join.is_finished()
+                            && handle.fingerprint == row.fingerprint
                             && handle.effective_secret_fingerprint
                                 == effective_secret_fingerprint =>
                     {
@@ -815,10 +925,11 @@ impl McpService {
                         None,
                     )
                     .await;
-                    self.stop_task(&installation_id, DomainRuntimeState::Stopped)
-                        .await;
+                    self.stop_task_result(&installation_id, DomainRuntimeState::Stopped)
+                        .await?;
                 }
-                self.start_task(row, effective_secret_fingerprint).await?;
+                self.start_task(row, effective_secret_fingerprint, store, admitted)
+                    .await?;
             }
         }
 
@@ -846,10 +957,50 @@ impl McpService {
             {
                 continue;
             }
-            self.stop_task(&installation_id, DomainRuntimeState::Stopped)
-                .await;
+            if self
+                .stop_task_result(&installation_id, DomainRuntimeState::Stopped)
+                .await
+                .is_ok()
+            {
+                self.inner.tasks.lock().await.remove(&installation_id);
+                // Release admission only after observing the actual successful
+                // join. Absence then means no retained runtime was left behind.
+                self.inner
+                    .runtime_generations
+                    .lock()
+                    .await
+                    .remove(&installation_id);
+            }
         }
 
+        Ok(())
+    }
+
+    /// Caller owns the installation lifecycle guard and a revalidated native
+    /// row. A missing task is proof only when this lifecycle has never started
+    /// it (or released it after a confirmed join), not merely an empty task map.
+    pub(crate) async fn stop_admitted_installation(
+        &self,
+        row: &McpServerInstallationRecord,
+    ) -> Result<()> {
+        let id = row
+            .id
+            .as_deref()
+            .context("MCP installation identity missing")?;
+        if self.task_exists(id).await {
+            return self.stop_task_result(id, DomainRuntimeState::Stopped).await;
+        }
+        if self.inner.runtime_generations.lock().await.contains_key(id) {
+            anyhow::bail!("MCP runtime stop owner is unknown");
+        }
+        let current = self
+            .runtime_store()
+            .find_mcp_server_installation(&row.scope_kind, &row.scope_key, &row.name)
+            .await?
+            .context("MCP installation missing during stop")?;
+        if current.id != row.id {
+            anyhow::bail!("MCP installation changed during stop");
+        }
         Ok(())
     }
 
@@ -910,7 +1061,8 @@ impl McpService {
                 // The admission guard excludes durable resource/UUID replacement.
                 if row.enabled && self.oauth().event_is_current(event, &installation).await {
                     let fingerprint = self.effective_secret_fingerprint_for_row(&row)?;
-                    self.start_task(row, fingerprint).await?;
+                    self.start_task(row, fingerprint, self.runtime_store(), None)
+                        .await?;
                 }
             }
             pioneer_mcp_oauth::OAuthState::Recovered => {
@@ -984,14 +1136,42 @@ impl McpService {
                 None,
             )
             .await;
-            self.stop_task(installation_id, DomainRuntimeState::Stopped)
-                .await;
+            if self
+                .runtime_store()
+                .find_mcp_plugin_owner(installation_id)
+                .await?
+                .is_some()
+            {
+                // Owned restart cannot reinterpret an absent retained owner as
+                // confirmation. Standalone keeps its prior native branch.
+                self.stop_admitted_installation(row).await?;
+            } else if self.task_exists(installation_id).await {
+                self.stop_task_result(installation_id, DomainRuntimeState::Stopped)
+                    .await?;
+            }
         }
-        if row.enabled {
+        let parent_available = if row.scope_kind == "workspace" {
+            match row.id.as_deref() {
+                Some(id) => {
+                    self.runtime_store()
+                        .plugin_child_available("mcp", id, &row.scope_key)
+                        .await?
+                }
+                None => false,
+            }
+        } else {
+            true
+        };
+        if row.enabled && parent_available {
             match self.effective_secret_fingerprint_for_row(&row) {
                 Ok(effective_secret_fingerprint) => {
-                    self.start_task(row.clone(), effective_secret_fingerprint)
-                        .await?;
+                    self.start_task(
+                        row.clone(),
+                        effective_secret_fingerprint,
+                        self.runtime_store(),
+                        None,
+                    )
+                    .await?;
                 }
                 Err(error) => {
                     self.publish_status(
@@ -1046,12 +1226,30 @@ impl McpService {
         explicit_tools: &[AgentMcpToolRef],
     ) -> Result<WorkspaceMcpToolState> {
         self.reload_workspace(workspace_id).await?;
-        let rows = self
+        let mut rows = self
             .inner
             .crud_store
             .list_mcp_server_installations("workspace", workspace_id)
             .await
             .context("failed to load MCP workspace installations for tool materialization")?;
+        for row in &mut rows {
+            if let Some(id) = &row.id {
+                if self
+                    .inner
+                    .crud_store
+                    .find_mcp_plugin_owner(id)
+                    .await?
+                    .is_some()
+                {
+                    row.allow_implicit_invocation = false;
+                    row.enabled &= self
+                        .inner
+                        .crud_store
+                        .plugin_child_available("mcp", id, workspace_id)
+                        .await?;
+                }
+            }
+        }
         let runtime = self.runtime_snapshot("workspace", workspace_id).await;
         let mut state = WorkspaceMcpToolState::default();
         let mut explicit_servers_by_name = HashMap::<String, Vec<&AgentMcpServerRef>>::new();
@@ -1573,6 +1771,24 @@ impl McpService {
                 ))
             })?;
 
+        if !self
+            .inner
+            .crud_store
+            .plugin_turn_child_available(
+                &request.turn_id,
+                "mcp",
+                &request.server_id,
+                &request.workspace_id,
+            )
+            .await
+            .map_err(|_| {
+                pioneer_tools::ToolError::Rejected("plugin ownership unavailable".into())
+            })?
+        {
+            return Err(pioneer_tools::ToolError::Rejected(
+                "plugin selection is unavailable for this turn".into(),
+            ));
+        }
         if !row.enabled {
             self.audit_tool_call(
                 &row,
@@ -1666,6 +1882,7 @@ impl McpService {
             .lock()
             .await
             .get(request.server_id.as_str())
+            .filter(|handle| handle.shutdown_tx.is_some())
             .map(|handle| handle.call_tx.clone())
             .ok_or_else(|| {
                 pioneer_tools::ToolError::NotFound(format!(
@@ -1851,12 +2068,30 @@ impl McpService {
         &self,
         row: McpServerInstallationRecord,
         effective_secret_fingerprint: String,
+        store: &CrudStore,
+        admitted: Option<&crate::message::plugins::PluginMutationGuard>,
     ) -> Result<()> {
         let installation = installation_from_record(&row)?;
         let installation_id = row
             .id
             .clone()
             .context("MCP installation row is missing id")?;
+        // All callers retain the existing installation lifecycle admission.
+        // Include OAuth Authorized, which starts directly without reload. A
+        // closed parent cannot recreate a process after lifecycle stop ACK.
+        if !self.plugin_start_available(store, &row, admitted).await? {
+            self.publish_status(
+                &row,
+                DomainRuntimeState::Disabled,
+                Some("Plugin operation is unfinished or disabled".into()),
+                None,
+                0,
+                None,
+                None,
+            )
+            .await;
+            return Ok(());
+        }
         let connector = self
             .inner
             .connector
@@ -1872,6 +2107,9 @@ impl McpService {
         let scope_key = row.scope_key.clone();
         let task_installation_id = installation_id.clone();
         let runtime_generation = self.next_runtime_generation();
+        // Publish the actor and its admission together, so a completed legacy
+        // stop cannot remove a replacement actor's runtime generation.
+        let mut tasks = self.inner.tasks.lock().await;
         self.inner
             .runtime_generations
             .lock()
@@ -1881,7 +2119,12 @@ impl McpService {
         let actor_failure_revision = oauth_failure_revision.clone();
         let recovery = Arc::new(OAuthRecoveryMailbox::default());
         let actor_recovery = recovery.clone();
+        let session = Arc::new(Mutex::new(None));
+        let actor_session = session.clone();
+        let completed = Arc::new(tokio_util::sync::CancellationToken::new());
+        let completion = McpTaskCompletion(completed.clone());
         let join = tokio::spawn(async move {
+            let _completion = completion;
             service
                 .run_server_task(
                     row,
@@ -1892,11 +2135,13 @@ impl McpService {
                     call_rx,
                     actor_failure_revision,
                     actor_recovery,
+                    actor_session,
                 )
-                .await;
+                .await
         });
+        let join = McpTaskJoin::new(join);
 
-        self.inner.tasks.lock().await.insert(
+        tasks.insert(
             installation_id,
             McpServerTaskHandle {
                 name,
@@ -1907,8 +2152,10 @@ impl McpService {
                 call_tx,
                 oauth_failure_revision,
                 recovery,
-                shutdown_tx,
+                shutdown_tx: Some(shutdown_tx),
+                completed,
                 join,
+                session,
             },
         );
 
@@ -1933,30 +2180,96 @@ impl McpService {
     }
 
     async fn stop_task(&self, installation_id: &str, final_state: DomainRuntimeState) {
-        self.cancel_installation_mcp_invocations(installation_id);
-        let handle = self.inner.tasks.lock().await.remove(installation_id);
-        if let Some(handle) = handle {
+        // Preserve the legacy best-effort wrapper. An absent task is never an
+        // acknowledgement through the Result-returning business entrypoint.
+        if !self.task_exists(installation_id).await {
+            return;
+        }
+        match self.stop_task_owner(installation_id, final_state).await {
+            Ok(completion) => {
+                // Legacy stop releases a successfully joined actor. Lifecycle
+                // stop_task_result retains the outcome for repair/idempotence.
+                // Match the exact owner under the same lock as start publication.
+                let mut tasks = self.inner.tasks.lock().await;
+                if tasks
+                    .get(installation_id)
+                    .is_some_and(|task| Arc::ptr_eq(&task.completed, &completion))
+                {
+                    tasks.remove(installation_id);
+                    self.inner
+                        .runtime_generations
+                        .lock()
+                        .await
+                        .remove(installation_id);
+                }
+            }
+            Err(error) => warn!(error = %error, "MCP server task join failed"),
+        }
+    }
+
+    // Caller owns the existing installation lifecycle guard. The actor owns
+    // cleanup independently of this waiter and the task map keeps its outcome.
+    pub(crate) async fn stop_task_result(
+        &self,
+        installation_id: &str,
+        final_state: DomainRuntimeState,
+    ) -> Result<()> {
+        self.stop_task_owner(installation_id, final_state)
+            .await
+            .map(|_| ())
+    }
+
+    async fn stop_task_owner(
+        &self,
+        installation_id: &str,
+        final_state: DomainRuntimeState,
+    ) -> Result<Arc<tokio_util::sync::CancellationToken>> {
+        let (completion, join, session) = {
+            let mut tasks = self.inner.tasks.lock().await;
+            let handle = tasks
+                .get_mut(installation_id)
+                .context("MCP runtime stop owner is unknown")?;
             handle
                 .recovery
                 .pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
-            let _ = handle.shutdown_tx.send(McpShutdownRequest {
-                final_state,
-                crud_store: self
-                    .runtime_store
-                    .clone()
-                    .unwrap_or_else(|| self.inner.crud_store.clone()),
-            });
-            if let Err(error) = handle.join.await {
-                warn!(
-                    installation_id,
-                    error = %format!("{error:#}"),
-                    "MCP server task join failed"
-                );
+            if let Some(shutdown) = handle.shutdown_tx.take() {
+                let _ = shutdown.send(McpShutdownRequest {
+                    final_state,
+                    crud_store: self
+                        .runtime_store
+                        .clone()
+                        .unwrap_or_else(|| self.inner.crud_store.clone()),
+                });
+            }
+            (
+                handle.completed.clone(),
+                handle.join.clone(),
+                handle.session.clone(),
+            )
+        };
+        self.cancel_installation_mcp_invocations(installation_id);
+        // Token means future ended, not success: always inspect retained join.
+        completion.cancelled().await;
+        let outcome = join.wait().await;
+        if outcome.is_err() {
+            // A panicked/failed actor does not discard its native session.
+            // Retry actual cleanup, while preserving the failed join outcome.
+            if let Some(session) = session.lock().await.as_mut() {
+                let _ = session.shutdown_result().await;
             }
         }
+        outcome?;
+        let tasks = self.inner.tasks.lock().await;
+        if tasks
+            .get(installation_id)
+            .is_some_and(|handle| !Arc::ptr_eq(&handle.completed, &completion))
+        {
+            anyhow::bail!("MCP runtime changed during shutdown");
+        }
+        Ok(completion)
     }
 
     async fn run_server_task(
@@ -1969,7 +2282,8 @@ impl McpService {
         mut call_rx: mpsc::Receiver<McpServerCommand>,
         oauth_failure_revision: Arc<std::sync::atomic::AtomicU64>,
         recovery: Arc<OAuthRecoveryMailbox>,
-    ) {
+        retained_session: Arc<Mutex<Option<Box<dyn pioneer_mcp::McpRuntimeSession>>>>,
+    ) -> Result<()> {
         let resolver = Arc::new(GatewayMcpSecretResolver {
             gateway_secrets: self.inner.gateway_secrets.clone(),
         });
@@ -1990,15 +2304,46 @@ impl McpService {
             )
             .await;
 
-            let connect = tokio::select! {
-                final_state=&mut shutdown_rx => {
-                    if let Ok(final_state)=final_state{self.publish_scoped_shutdown(&row, final_state).await;}
-                    return;
-                }
-                result=connector.connect(installation.clone(),installation_id.clone(),resolver.clone(),now)=>result,
-            };
+            // Do not drop a connector which already owns a spawned child.
+            // The existing connector startup budget applies; a stop observer's
+            // deadline can expire without disposing this actual owner.
+            if let Ok(final_state) = shutdown_rx.try_recv() {
+                self.publish_scoped_shutdown(&row, final_state).await;
+                return Ok(());
+            }
+            let connect = connector
+                .connect(
+                    installation.clone(),
+                    installation_id.clone(),
+                    resolver.clone(),
+                    now,
+                )
+                .await;
 
-            let mut session = match connect {
+            // Startup retains the connector until its real owner completes.
+            // If stop arrived meanwhile, clean that owner and use the stop
+            // caller's scoped store before publishing any startup outcome.
+            if let Ok(request) = shutdown_rx.try_recv() {
+                if let Ok(session) = connect {
+                    let mut owner = retained_session.lock().await;
+                    *owner = Some(session);
+                    let session = owner.as_mut().expect("native startup cleanup owner");
+                    let startup_cleanup_failed = session.startup_failure().is_some();
+                    session
+                        .shutdown_result()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("MCP startup cleanup unconfirmed"))?;
+                    if startup_cleanup_failed {
+                        anyhow::bail!(
+                            "MCP startup cleanup previously failed; native stop outcome unknown"
+                        );
+                    }
+                }
+                self.publish_scoped_shutdown(&row, request).await;
+                return Ok(());
+            }
+
+            let session = match connect {
                 Ok(session) => session,
                 Err(error) => {
                     let next_retry_at = if error.state == DomainRuntimeState::Failed {
@@ -2032,7 +2377,7 @@ impl McpService {
                         if let Ok(final_state) = shutdown_rx.await {
                             self.publish_scoped_shutdown(&row, final_state).await;
                         }
-                        return;
+                        return Ok(());
                     }
 
                     let delay = self.inner.retry_policy.delay_secs(retry_attempt);
@@ -2042,7 +2387,7 @@ impl McpService {
                             if let Ok(final_state) = final_state {
                                 self.publish_scoped_shutdown(&row, final_state).await;
                             }
-                            return;
+                            return Ok(());
                         }
                         _ = sleep(Duration::from_secs(delay)) => {}
                     }
@@ -2050,6 +2395,29 @@ impl McpService {
                 }
             };
 
+            let mut session_owner = retained_session.lock().await;
+            *session_owner = Some(session);
+            let session = session_owner.as_mut().expect("native MCP session owner");
+            if let Some(error) = session.startup_failure().cloned() {
+                self.publish_status(
+                    &row,
+                    DomainRuntimeState::Failed,
+                    Some(error.message.clone()),
+                    Some(error.message),
+                    0,
+                    None,
+                    None,
+                )
+                .await;
+                if let Ok(state) = shutdown_rx.await {
+                    self.publish_scoped_shutdown(&row, state).await;
+                }
+                session
+                    .shutdown_result()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("MCP startup cleanup unconfirmed"))?;
+                anyhow::bail!("MCP startup cleanup previously failed; native stop outcome unknown");
+            }
             let catalog = session.initial_catalog().clone();
             self.persist_catalog_and_notify(&row, &catalog).await;
             let ready_state = if session.degraded_reason().is_some() {
@@ -2098,12 +2466,12 @@ impl McpService {
                         )
                         .await;
                         shutdown_service.audit(&row, "stop", Some(catalog.catalog_version.as_str()), json!({})).await;
-                        session.shutdown().await;
+                        session.shutdown_result().await.map_err(|_| anyhow::anyhow!("MCP session cleanup failed"))?;
                         if let Ok(final_state) = final_state {
                             self.publish_scoped_shutdown(&row, final_state).await;
                         }
                         shutdown_service.audit(&row, "stopped", Some(catalog.catalog_version.as_str()), json!({})).await;
-                        return;
+                        return Ok(());
                     }
                     event = session.wait_for_event() => {
                         match event {
@@ -2168,10 +2536,10 @@ impl McpService {
                                     None,
                                 )
                                 .await;
-                                session.shutdown().await;
+                                session.shutdown_result().await.map_err(|_| anyhow::anyhow!("MCP session cleanup failed"))?;
                                 let delay=self.inner.retry_policy.delay_secs(retry_attempt);
                                 retry_attempt=retry_attempt.saturating_add(1);
-                                tokio::select!{final_state=&mut shutdown_rx=>{if let Ok(state)=final_state{self.publish_scoped_shutdown(&row, state).await;}return;},_=sleep(Duration::from_secs(delay))=>{}}
+                                tokio::select!{final_state=&mut shutdown_rx=>{if let Ok(state)=final_state{self.publish_scoped_shutdown(&row, state).await;}return Ok(());},_=sleep(Duration::from_secs(delay))=>{}}
                                 continue 'connection;
                             }
                         }
@@ -2197,7 +2565,7 @@ impl McpService {
                                 // shutdown can interrupt acquisition (no stop/join deadlock).
                                 let _retry_admission = if _admission.is_none() {
                                     tokio::select! {
-                                        state=&mut shutdown_rx=>{ if let Ok(state)=state { self.publish_scoped_shutdown(&row,state).await; } session.shutdown().await; return; },
+                                        state=&mut shutdown_rx=>{ if let Ok(state)=state { self.publish_scoped_shutdown(&row,state).await; } session.shutdown_result().await.map_err(|_| anyhow::anyhow!("MCP session cleanup failed"))?; return Ok(()); },
                                         guard=self.installation_lifecycle_guard(&row.scope_kind,&row.scope_key,&row.name)=>Some(guard),
                                     }
                                 } else { None };
@@ -4188,6 +4556,10 @@ mod tests {
         }
 
         async fn shutdown(&mut self) {}
+        async fn shutdown_result(&mut self) -> Result<(), pioneer_mcp::McpRuntimeError> {
+            self.shutdown().await;
+            Ok(())
+        }
     }
 
     #[async_trait::async_trait]
@@ -4241,6 +4613,219 @@ mod tests {
         }
 
         async fn shutdown(&mut self) {}
+        async fn shutdown_result(&mut self) -> Result<(), pioneer_mcp::McpRuntimeError> {
+            self.shutdown().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_stop_retains_native_handle_until_a_retry_observes_completion() {
+        let (service, _, workspace) = test_mcp_service().await;
+        let id = "stopping-native-installation";
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (call_tx, _call_rx) = mpsc::channel(1);
+        let completed = Arc::new(CancellationToken::new());
+        let completion = McpTaskCompletion(completed.clone());
+        let (entered, stopping) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let join = tokio::spawn(async move {
+            let _completion = completion;
+            shutdown_rx.await.expect("native shutdown request");
+            entered.send(()).expect("shutdown observer");
+            released.await.expect("shutdown completion release");
+            Ok(())
+        });
+        let join = McpTaskJoin::new(join);
+        service.inner.tasks.lock().await.insert(
+            id.into(),
+            McpServerTaskHandle {
+                name: "stopping-native".into(),
+                scope_kind: "workspace".into(),
+                scope_key: workspace,
+                fingerprint: "configuration".into(),
+                effective_secret_fingerprint: "material".into(),
+                call_tx,
+                oauth_failure_revision: Arc::new(AtomicU64::new(0)),
+                recovery: Arc::new(OAuthRecoveryMailbox::default()),
+                shutdown_tx: Some(shutdown_tx),
+                completed,
+                join,
+                session: Arc::new(Mutex::new(None)),
+            },
+        );
+        let native = service.clone();
+        let first = tokio::spawn(async move {
+            native
+                .stop_task_result(id, DomainRuntimeState::Stopped)
+                .await
+        });
+        stopping.await.expect("native stop was requested");
+        first.abort();
+        assert!(
+            first
+                .await
+                .expect_err("caller was cancelled")
+                .is_cancelled()
+        );
+        assert!(
+            service.task_exists(id).await,
+            "unacknowledged native owner remains reachable"
+        );
+        tokio::time::timeout(Duration::from_secs(1), service.oauth_recovered(id))
+            .await
+            .expect("stopping actors must not receive OAuth recovery commands");
+        assert!(
+            service.inner.tasks.lock().await[id]
+                .recovery
+                .pending
+                .lock()
+                .unwrap()
+                .is_none()
+        );
+        let native = service.clone();
+        let retry = tokio::spawn(async move {
+            native
+                .stop_task_result(id, DomainRuntimeState::Stopped)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !retry.is_finished(),
+            "a cancellation signal is not a shutdown acknowledgement"
+        );
+        release.send(()).expect("allow native completion");
+        retry
+            .await
+            .expect("retry join")
+            .expect("native shutdown acknowledged");
+        assert!(service.inner.tasks.lock().await[id].shutdown_tx.is_none());
+        service
+            .stop_task_result(id, DomainRuntimeState::Stopped)
+            .await
+            .expect("same retained result on repeat");
+        service.stop_task(id, DomainRuntimeState::Stopped).await;
+        assert!(
+            !service.task_exists(id).await,
+            "legacy stop releases only the confirmed actor"
+        );
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delayed_stop_does_not_remove_a_replacement_runtime_with_the_same_installation_id() {
+        let (service, _, workspace) = test_mcp_service().await;
+        let id = "replacement-native-installation";
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (call_tx, _call_rx) = mpsc::channel(1);
+        let completed = Arc::new(CancellationToken::new());
+        let completion = McpTaskCompletion(completed.clone());
+        let (entered, stopping) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let join = tokio::spawn(async move {
+            let _completion = completion;
+            shutdown_rx.await.expect("original shutdown");
+            entered.send(()).expect("original stop observer");
+            released.await.expect("original completion release");
+            Ok(())
+        });
+        let join = McpTaskJoin::new(join);
+        service.inner.tasks.lock().await.insert(
+            id.into(),
+            McpServerTaskHandle {
+                name: "replacement-native".into(),
+                scope_kind: "workspace".into(),
+                scope_key: workspace.clone(),
+                fingerprint: "original".into(),
+                effective_secret_fingerprint: "material".into(),
+                call_tx,
+                oauth_failure_revision: Arc::new(AtomicU64::new(0)),
+                recovery: Arc::new(OAuthRecoveryMailbox::default()),
+                shutdown_tx: Some(shutdown_tx),
+                completed,
+                join,
+                session: Arc::new(Mutex::new(None)),
+            },
+        );
+        let native = service.clone();
+        let old_stop = tokio::spawn(async move {
+            native
+                .stop_task_result(id, DomainRuntimeState::Stopped)
+                .await
+        });
+        stopping.await.expect("original stop admitted");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (call_tx, _call_rx) = mpsc::channel(1);
+        let completed = Arc::new(CancellationToken::new());
+        let completion = McpTaskCompletion(completed.clone());
+        let join = tokio::spawn(async move {
+            let _completion = completion;
+            shutdown_rx
+                .await
+                .expect("replacement retains its own shutdown sender");
+            Ok(())
+        });
+        let join = McpTaskJoin::new(join);
+        service.inner.tasks.lock().await.insert(
+            id.into(),
+            McpServerTaskHandle {
+                name: "replacement-native".into(),
+                scope_kind: "workspace".into(),
+                scope_key: workspace,
+                fingerprint: "replacement".into(),
+                effective_secret_fingerprint: "material".into(),
+                call_tx,
+                oauth_failure_revision: Arc::new(AtomicU64::new(0)),
+                recovery: Arc::new(OAuthRecoveryMailbox::default()),
+                shutdown_tx: Some(shutdown_tx),
+                completed,
+                join,
+                session: Arc::new(Mutex::new(None)),
+            },
+        );
+        release.send(()).expect("finish original runtime");
+        old_stop
+            .await
+            .expect("original stop caller")
+            .expect_err("replacement is not the original owner");
+        assert_eq!(
+            service.inner.tasks.lock().await[id].fingerprint,
+            "replacement"
+        );
+        service
+            .stop_task_result(id, DomainRuntimeState::Stopped)
+            .await
+            .expect("stop exact replacement");
+        assert!(service.inner.tasks.lock().await[id].shutdown_tx.is_none());
+        service
+            .stop_task_result(id, DomainRuntimeState::Stopped)
+            .await
+            .expect("same retained result on repeat");
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn native_mcp_join_error_survives_cancelled_and_concurrent_observers() {
+        let (release, released) = oneshot::channel::<()>();
+        let owner = McpTaskJoin::new(tokio::spawn(async move {
+            let _ = released.await;
+            anyhow::bail!("native cleanup failed")
+        }));
+        let observer = owner.clone();
+        let waiter = tokio::spawn(async move { observer.wait().await });
+        tokio::task::yield_now().await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        let (first, second) = tokio::join!(owner.wait(), owner.wait());
+        assert!(first.is_err());
+        assert!(second.is_err());
+        assert!(owner.wait().await.is_err());
+        let panic = McpTaskJoin::new(tokio::spawn(async {
+            panic!("native actor panic");
+        }));
+        assert!(panic.wait().await.is_err());
+        assert!(panic.wait().await.is_err());
     }
 
     async fn test_mcp_service() -> (McpService, Arc<CrudStore>, String) {
@@ -4764,6 +5349,35 @@ mod tests {
             .expect("test MCP installation lookup should succeed")
             .and_then(|row| row.id)
             .expect("test MCP installation should have id")
+    }
+
+    // Regression source only: NOT_RUN / NOT_COMPILED.
+    #[tokio::test]
+    async fn admitted_stop_distinguishes_never_started_from_lost_native_owner() {
+        let (service, store, workspace) = test_mcp_service().await;
+        let id = seed_mcp_installation(&store, &workspace, "never-started", false, false).await;
+        let row = store
+            .find_mcp_server_installation("workspace", &workspace, "never-started")
+            .await
+            .unwrap()
+            .unwrap();
+        let _guard = service
+            .installation_lifecycle_guard("workspace", &workspace, "never-started")
+            .await;
+        service.stop_admitted_installation(&row).await.unwrap();
+        // A runtime admission with a lost task is not the same proof as an
+        // installation that was never started by this lifecycle.
+        service
+            .inner
+            .runtime_generations
+            .lock()
+            .await
+            .insert(id.clone(), 1);
+        assert!(service.stop_admitted_installation(&row).await.is_err());
+        service.inner.runtime_generations.lock().await.remove(&id);
+        let mut foreign = row.clone();
+        foreign.id = Some("foreign-native-id".into());
+        assert!(service.stop_admitted_installation(&foreign).await.is_err());
     }
 
     async fn configure_mcp_installation_secret(
@@ -6583,6 +7197,11 @@ mod tests {
                 .call_tool(name, args, budget, timeout, cancellation)
                 .await
         }
+        async fn shutdown_result(&mut self) -> Result<(), pioneer_mcp::McpRuntimeError> {
+            self.shutdown().await;
+            Ok(())
+        }
+
         async fn shutdown(&mut self) {
             self.inner.shutdown().await;
         }
@@ -8113,6 +8732,114 @@ mod tests {
         assert_eq!(
             materialization.diagnostics[0].code,
             "mcp.resolution.installation_unavailable"
+        );
+    }
+    // C1 regression source only: NOT_RUN / NOT_COMPILED.
+    #[tokio::test]
+    async fn direct_native_start_cannot_bypass_the_closed_parent_during_oauth_recovery() {
+        let (service, store, workspace) = test_mcp_service().await;
+        seed_mcp_installation(&store, &workspace, "template", false, false).await;
+        let mut row = store
+            .find_mcp_server_installation("workspace", &workspace, "template")
+            .await
+            .unwrap()
+            .unwrap();
+        let parent_id = "P".repeat(21);
+        let child_id = "S".repeat(21);
+        let now = chrono::Utc::now().fixed_offset();
+        store
+            .insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+                id: parent_id.clone(),
+                workspace_id: workspace.clone(),
+                name: "mixed".into(),
+                version: None,
+                source_upload_id: "source".into(),
+                package_path: "/unused/package".into(),
+                data_path: "/unused/data".into(),
+                package_fingerprint: "tree".into(),
+                enabled: true,
+                state: "installing".into(),
+                revision: 1,
+                pending_json: Some("{}".into()),
+                last_error: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        row.id = Some(child_id.clone());
+        row.name = "pplugin_closed_parent_fixture".into();
+        row.enabled = true;
+        let write = pioneer_crud::PluginOwnershipWrite {
+            plugin_id: parent_id.clone(),
+            expected_revision: 1,
+            member_key: "one".into(),
+            member_path: None,
+            package_fingerprint: "tree".into(),
+            child_id: child_id.clone(),
+        };
+        let audit = pioneer_crud::McpAuditEventRecord {
+            turn_id: None,
+            server_installation_id: Some(child_id.clone()),
+            server_name: row.name.clone(),
+            raw_tool_name: None,
+            callable_name: None,
+            catalog_version: None,
+            action: "install".into(),
+            decision: "allowed".into(),
+            reason_code: None,
+            details_json: "{}".into(),
+            created_at_unix: 1,
+        };
+        store
+            .upsert_mcp_server_installation_with_audit_and_ownership(&row, &audit, Some(&write), 1)
+            .await
+            .unwrap();
+        store
+            .settle_plugin_installation(&parent_id, 1, "installed", None)
+            .await
+            .unwrap();
+        store
+            .begin_plugin_mutation(
+                &workspace,
+                &parent_id,
+                1,
+                "updating",
+                true,
+                "{\"kind\":\"set_enabled\",\"enabled\":true}",
+            )
+            .await
+            .unwrap();
+        let _native = service
+            .installation_lifecycle_guard("workspace", &workspace, &row.name)
+            .await;
+        // OAuth Authorized and restart converge on this real native start seam.
+        // The connector must never be reached while the parent gate is closed.
+        service
+            .start_task(
+                row.clone(),
+                "fixture-fingerprint".into(),
+                service.runtime_store(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!service.inner.tasks.lock().await.contains_key(&child_id));
+        assert!(
+            !service
+                .inner
+                .runtime_generations
+                .lock()
+                .await
+                .contains_key(&child_id)
+        );
+        assert!(
+            store
+                .find_mcp_server_installation("workspace", &workspace, &row.name)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
         );
     }
 }

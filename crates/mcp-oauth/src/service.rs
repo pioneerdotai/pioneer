@@ -259,7 +259,7 @@ fn identity(installation: &McpServerInstallation, client_secret: Option<&str>) -
         resource,
         &installation.auth,
         client_secret,
-        installation.transport.has_authorization_header(),
+        installation.explicit_authorization_overrides_oauth(),
     ))
     .expect("serializable OAuth identity");
     hex::encode(Sha256::digest(bytes))
@@ -272,9 +272,10 @@ fn resource(installation: &McpServerInstallation) -> Result<&str, AuthError> {
 }
 fn valid_redirect(value: &str) -> bool {
     Url::parse(value).is_ok_and(|u| {
-        u.scheme() == "http"
-            && u.host_str() == Some("127.0.0.1")
-            && u.port().is_some()
+        ((u.scheme() == "http" && u.host_str() == Some("127.0.0.1") && u.port().is_some())
+            // The native app owns these fixed callback schemes/routes. Remote
+            // HTTP and arbitrary custom redirects remain rejected.
+            || (matches!(u.scheme(), "pioneer" | "pioneer-dev") && u.host_str().is_none() && u.port().is_none()))
             && u.path() == "/oauth/mcp/callback"
             && u.query().is_none()
             && u.fragment().is_none()
@@ -601,12 +602,12 @@ impl McpOAuthService {
         explicit_sign_in: bool,
         preparation_failed: bool,
     ) -> Result<(), McpRuntimeError> {
-        if installation.transport.has_authorization_header() {
+        if installation.explicit_authorization_overrides_oauth() {
             return Ok(());
         }
         if !preparation_failed && !valid_redirect(redirect) {
             return Err(McpRuntimeError::failed(
-                "Invalid OAuth loopback redirect URI",
+                "Invalid OAuth callback redirect URI",
             ));
         }
         let entry = self
@@ -720,7 +721,7 @@ impl McpOAuthService {
         redirect: &str,
         workspace: &str,
     ) -> Result<(), McpRuntimeError> {
-        if installation.transport.has_authorization_header() {
+        if installation.explicit_authorization_overrides_oauth() {
             return Err(McpRuntimeError::failed(
                 "Remove the explicit Authorization header before using OAuth",
             ));
@@ -1962,7 +1963,7 @@ impl McpOAuthService {
             .load(std::sync::atomic::Ordering::Acquire)
             || status == OAuthState::CleanupRequired;
         let state = if status == OAuthState::Idle
-            || (entry.installation.transport.has_authorization_header()
+            || (entry.installation.explicit_authorization_overrides_oauth()
                 && status != OAuthState::CleanupRequired)
         {
             None
@@ -1978,7 +1979,7 @@ impl McpOAuthService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .state;
-        if entry.installation.transport.has_authorization_header()
+        if entry.installation.explicit_authorization_overrides_oauth()
             && status != OAuthState::CleanupRequired
         {
             return None;
@@ -2507,8 +2508,8 @@ impl McpOAuthService {
             if let Some((installation, client)) = session {
                 if resource(&entry.installation).ok() != resource(installation).ok()
                     || entry.installation.auth != installation.auth
-                    || entry.installation.transport.has_authorization_header()
-                        != installation.transport.has_authorization_header()
+                    || entry.installation.explicit_authorization_overrides_oauth()
+                        != installation.explicit_authorization_overrides_oauth()
                 {
                     return;
                 }
@@ -2652,14 +2653,11 @@ impl McpOAuthProvider for McpOAuthService {
             .callers
             .enter()
             .map_err(|e| oauth_runtime_error(&e))?;
-        if let McpTransportConfig::StreamableHttp { headers, .. } = &installation.transport {
-            if headers
-                .keys()
-                .any(|k| k.eq_ignore_ascii_case("authorization"))
-            {
-                return Ok(None);
-            }
-        } else {
+        if !matches!(
+            installation.transport,
+            McpTransportConfig::StreamableHttp { .. }
+        ) || installation.explicit_authorization_overrides_oauth()
+        {
             return Ok(None);
         }
         let entry = self
@@ -2750,5 +2748,31 @@ impl McpOAuthProvider for McpOAuthService {
             insufficient_scope,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod native_redirect_regressions {
+    // NOT_RUN / NOT_COMPILED. Preserve desktop loopback and constrain phone URI.
+    #[test]
+    fn only_known_native_routes_or_existing_loopback_are_admitted() {
+        for uri in [
+            "http://127.0.0.1:23456/oauth/mcp/callback",
+            "pioneer:///oauth/mcp/callback",
+            "pioneer-dev:///oauth/mcp/callback",
+        ] {
+            assert!(super::valid_redirect(uri), "{uri}");
+        }
+        for uri in [
+            "https://example.com/oauth/mcp/callback",
+            "pioneer://foreign/oauth/mcp/callback",
+            "other:///oauth/mcp/callback",
+            "pioneer:///other",
+            "pioneer:///oauth/mcp/callback?state=x",
+            "pioneer:///oauth/mcp/callback#x",
+            "http://localhost:123/oauth/mcp/callback",
+        ] {
+            assert!(!super::valid_redirect(uri), "{uri}");
+        }
     }
 }

@@ -1746,18 +1746,13 @@ impl TaskAgentExecutor {
             None
         };
         let normalized_selected_capabilities = if let Some(selection) = launch_selection.as_ref() {
-            let requested =
-                super::agent_action_tools::task_launch_selection_capabilities(&selection.execution)
-                    .context("persisted Task launch capabilities are invalid")?;
             Some(
                 processor
-                    .normalize_turn_skill_capabilities(
+                    .normalize_task_launch_capabilities(
                         context.workspace_id.as_str(),
-                        requested.as_slice(),
+                        &selection.execution,
                     )
-                    .await
-                    .map_err(|message| anyhow!(message))
-                    .context("persisted Task launch capabilities are unavailable")?,
+                    .await?,
             )
         } else {
             None
@@ -2052,16 +2047,19 @@ impl TaskAgentExecutor {
             let parent = &workflow_parent;
             let turn_outcome = processor
                 .thread_manager
-                .agent_turn_start_with_permission_profile(
+                .agent_turn_start_with_plugin_capabilities(
                     TurnStartParams {
                         input: child_input.clone(),
                         model: Some(effective_model.model.clone()),
                         model_provider: Some(effective_model.model_provider.clone()),
                         mode: Some(child_mode),
+                        capabilities: normalized_composer_capabilities.as_ref().or(normalized_selected_capabilities.as_ref()).filter(|n| n.plugin_selection.is_some()).map(|n| n.presentation.clone()).unwrap_or_else(|| turn_params.capabilities.clone()),
                         ..turn_params.clone()
                     },
+                    turn_params.capabilities.clone(),
                     child_permission_profile.clone(),
                     non_cli_action_author,
+                    false,
                 )
                 .await
                 .context("failed to create hidden task turn")?;
@@ -2214,7 +2212,7 @@ impl TaskAgentExecutor {
         if let Some((runtime_id, runtime_kind)) = cli_runtime_backend {
             let action_author = input_author;
             let cli_presentation_capabilities = normalized_composer_capabilities
-                .as_ref()
+                .as_ref().or(normalized_selected_capabilities.as_ref())
                 .map(|normalized| normalized.presentation.clone());
             return message_future(async move {
                 // The shared CLI preparation future is deliberately large. Run it
@@ -2222,6 +2220,8 @@ impl TaskAgentExecutor {
                 // consume the native runtime worker's stack before preparation
                 // begins.
                 let prepare_processor = processor.clone();
+                let mut turn_params = turn_params;
+                if let Some(presentation) = &cli_presentation_capabilities { turn_params.capabilities = presentation.clone(); }
                 // Only a Composer service turn answers in the invoking
                 // conversation. Delegated Tasks own their hidden conversation:
                 // they may run while the invoking CLI turn waits for them.
@@ -2553,7 +2553,7 @@ impl TaskAgentExecutor {
                 .context("failed to validate hidden task skill capabilities"),
         )
         .await?;
-        if let Some(normalized) = normalized_composer_capabilities.as_ref() {
+        if let Some(normalized) = normalized_composer_capabilities.as_ref().or_else(|| normalized_selected_capabilities.as_ref().filter(|n| n.plugin_selection.is_some())) {
             let capability_attachments = close_admitted_task_turn_on_error(
                 processor,
                 child_thread_id.as_str(),
@@ -2666,6 +2666,7 @@ impl TaskAgentExecutor {
             return Ok(TaskExecutorStartOutcome::Started);
         }
         let runtime_permission_profile = turn_permission_profile;
+        let _plugin_launch = processor.acquire_task_plugin_launch_guards(task, child_turn_id.as_str()).await?;
         if let Err(error) = processor
             .agent_manager
             .start_turn_with_hook_context_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
@@ -3090,7 +3091,7 @@ impl TaskAgentExecutor {
                         thread_id: child_thread_id.clone(),
                         turn_id: child_turn_id.clone(),
                         input,
-                        capabilities: turn_settings.capabilities.clone(),
+                        capabilities: turn_settings.presentation.clone(),
                         model: Some(effective_model.model.clone()),
                         model_provider: Some(effective_model.model_provider.clone()),
                         sandbox_policy: None,
@@ -3164,13 +3165,13 @@ impl TaskAgentExecutor {
         }
         let turn_outcome = match processor
             .thread_manager
-            .agent_turn_start_with_permission_profile(
+            .agent_turn_start_with_plugin_capabilities(
                 TurnStartParams {
                     agent_delegation_routes: Vec::new(),
                     thread_id: child_runtime.task_run_turn.thread_id.clone(),
                     turn_id: child_runtime.task_run_turn.turn_id.clone(),
                     input,
-                    capabilities: turn_settings.capabilities.clone(),
+                    capabilities: turn_settings.presentation.clone(),
                     model: Some(effective_model.model),
                     model_provider: Some(effective_model.model_provider),
                     sandbox_policy: None,
@@ -3183,8 +3184,10 @@ impl TaskAgentExecutor {
                     permission_profile: turn_settings.permission_selection.clone(),
                     cli_runtime_options: None,
                 },
+                turn_settings.capabilities.clone(),
                 child_permission_profile,
                 action_author,
+                false,
             )
             .await
         {
@@ -3693,6 +3696,9 @@ impl TaskAgentExecutor {
             return Ok(());
         }
         let runtime_permission_profile = turn_permission_profile;
+        let _plugin_launch = processor
+            .acquire_task_plugin_launch_guards(task, child_turn_id.as_str())
+            .await?;
         if let Err(error) = processor
             .agent_manager
             .start_turn_with_hook_context_and_execution_checkpoint_permission_profile_security_snapshot_and_agent_skill_overlay(
@@ -4299,6 +4305,9 @@ impl TaskAgentExecutor {
             .context("failed to resolve restored task permission profile")?;
         let runtime_security_snapshot =
             load_required_task_child_execution_security_snapshot(processor, child_turn_id).await?;
+        let _plugin_launch = processor
+            .acquire_task_plugin_launch_guards(task, child_turn_id)
+            .await?;
         processor
             .agent_manager
             .start_turn_with_hook_context_and_execution_checkpoint_permission_profile_security_snapshot_and_agent_skill_overlay(
@@ -5521,7 +5530,7 @@ impl TaskAgentExecutor {
                         thread_id: task_run_turn.thread_id.clone(),
                         turn_id: task_run_turn.turn_id.clone(),
                         input,
-                        capabilities: turn_settings.capabilities.clone(),
+                        capabilities: turn_settings.presentation.clone(),
                         model: Some(effective_model.model.clone()),
                         model_provider: Some(effective_model.model_provider.clone()),
                         sandbox_policy: None,
@@ -5587,13 +5596,13 @@ impl TaskAgentExecutor {
         }
         let turn_outcome = processor
             .thread_manager
-            .agent_turn_start_with_permission_profile(
+            .agent_turn_start_with_plugin_capabilities(
                 TurnStartParams {
                     agent_delegation_routes: Vec::new(),
                     thread_id: task_run_turn.thread_id.clone(),
                     turn_id: task_run_turn.turn_id.clone(),
                     input,
-                    capabilities: turn_settings.capabilities.clone(),
+                    capabilities: turn_settings.presentation.clone(),
                     model: Some(effective_model.model),
                     model_provider: Some(effective_model.model_provider),
                     sandbox_policy: None,
@@ -5606,8 +5615,10 @@ impl TaskAgentExecutor {
                     permission_profile: turn_settings.permission_selection.clone(),
                     cli_runtime_options: None,
                 },
+                turn_settings.capabilities.clone(),
                 reviewer_permission_profile,
                 action_author,
+                false,
             )
             .await
             .context("failed to create hidden reviewer turn")?;
@@ -5876,6 +5887,9 @@ impl TaskAgentExecutor {
             return Ok(());
         }
         let runtime_permission_profile = turn_permission_profile;
+        let _plugin_launch = processor
+            .acquire_task_plugin_launch_guards(task, task_run_turn.turn_id.as_str())
+            .await?;
         if let Err(error) = processor
             .agent_manager
             .start_turn_with_hook_context_permission_profile_security_snapshot_and_agent_skill_overlay(
@@ -9105,6 +9119,7 @@ struct ResolvedTaskExecutionTurnSettings {
     execution_backend: AgentExecutionBackend,
     cli_runtime: Option<(String, CLIAgentRuntimeKind)>,
     capabilities: Vec<pioneer_protocol::TurnCapability>,
+    presentation: Vec<pioneer_protocol::TurnCapability>,
     reasoning: Option<pioneer_protocol::TurnReasoningSelection>,
     permission_selection: Option<pioneer_protocol::TurnPermissionProfileSelection>,
     permission_profile: TurnPermissionProfileSnapshot,
@@ -9155,20 +9170,22 @@ async fn resolved_task_execution_turn_settings(
             None,
         ),
     };
-    let capabilities = match launch {
-        Some(launch) => {
-            let requested =
-                super::agent_action_tools::task_launch_selection_capabilities(&launch.execution)
-                    .context("pinned Task launch capabilities are invalid")?;
+    let normalized = match launch {
+        Some(launch) => Some(
             processor
-                .normalize_turn_skill_capabilities(task.workspace_id.as_str(), requested.as_slice())
-                .await
-                .map_err(|message| anyhow!(message))
-                .context("pinned Task launch capabilities are unavailable")?
-                .execution
-        }
-        None => Vec::new(),
+                .normalize_task_launch_capabilities(task.workspace_id.as_str(), &launch.execution)
+                .await?,
+        ),
+        None => None,
     };
+    let capabilities = normalized
+        .as_ref()
+        .map(|n| n.execution.clone())
+        .unwrap_or_default();
+    let presentation = normalized
+        .as_ref()
+        .map(|n| n.presentation.clone())
+        .unwrap_or_default();
     let permission_selection =
         launch.and_then(|launch| launch.execution.permission_profile.clone());
     let launch_permission_profile = permission_selection
@@ -9184,6 +9201,7 @@ async fn resolved_task_execution_turn_settings(
         execution_backend,
         cli_runtime,
         capabilities,
+        presentation,
         reasoning: launch.and_then(|launch| launch.execution.reasoning.clone()),
         permission_selection,
         permission_profile,

@@ -204,7 +204,8 @@ pub async fn persist_cli_mcp_materialization_rejections(
                 ..
             } => (Some(server_name.as_str()), Some(raw_tool_name.as_str())),
             pioneer_protocol::TurnCapabilityKind::Skill { .. }
-            | pioneer_protocol::TurnCapabilityKind::SkillPack { .. } => (None, None),
+            | pioneer_protocol::TurnCapabilityKind::SkillPack { .. }
+            | pioneer_protocol::TurnCapabilityKind::Plugin { .. } => (None, None),
         };
         persist_cli_mcp_preflight_rejection(
             crud_store,

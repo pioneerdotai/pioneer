@@ -1,0 +1,354 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskReviewPublication",
+  "type": "object",
+  "properties": {
+    "allowed_actions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TaskReviewAction"
+      }
+    },
+    "candidate_id": {
+      "type": "string"
+    },
+    "generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "item": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskWaitReviewDisplayItem"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "request": {
+      "$ref": "#/$defs/TaskReviewRequestState"
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "visible_actions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TaskReviewAction"
+      }
+    }
+  },
+  "required": [
+    "thread_id",
+    "candidate_id",
+    "revision",
+    "generation",
+    "visible_actions",
+    "allowed_actions",
+    "request"
+  ],
+  "$defs": {
+    "TaskReviewAction": {
+      "type": "string",
+      "enum": [
+        "Accept",
+        "Revise",
+        "Cancel"
+      ]
+    },
+    "TaskReviewFailure": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "error": {
+              "$ref": "#/$defs/TaskReviewPlanError"
+            },
+            "kind": {
+              "type": "string",
+              "const": "plan"
+            }
+          },
+          "required": [
+            "kind",
+            "error"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "transport"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "unavailable"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "TaskReviewPlanError": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "UserControlsNotAllowed",
+            "MissingTaskId",
+            "MissingRunId",
+            "MissingCandidateId",
+            "BlankFeedback"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ActionNotAllowed": {
+              "type": "object",
+              "properties": {
+                "action": {
+                  "$ref": "#/$defs/TaskReviewAction"
+                }
+              },
+              "required": [
+                "action"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ActionNotAllowed"
+          ]
+        }
+      ]
+    },
+    "TaskReviewRequestState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "idle"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/TaskReviewAction"
+            },
+            "kind": {
+              "type": "string",
+              "const": "pending"
+            }
+          },
+          "required": [
+            "kind",
+            "action"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/TaskReviewAction"
+            },
+            "kind": {
+              "type": "string",
+              "const": "succeeded"
+            }
+          },
+          "required": [
+            "kind",
+            "action"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "error": {
+              "$ref": "#/$defs/TaskReviewFailure"
+            },
+            "kind": {
+              "type": "string",
+              "const": "failed"
+            }
+          },
+          "required": [
+            "kind",
+            "error"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "cancelled"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "TaskWaitReviewDisplayItem": {
+      "type": "object",
+      "properties": {
+        "allowed_actions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "candidate_id": {
+          "type": "string"
+        },
+        "candidate_status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "extraction_error_preview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_revision_rounds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "owner_principal_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permission_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permission_source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remaining_revision_rounds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "result_preview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "review_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision_blocked_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "round": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "user_approval_required": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "task_id",
+        "candidate_id",
+        "user_approval_required",
+        "diagnostics",
+        "allowed_actions"
+      ]
+    }
+  }
+}

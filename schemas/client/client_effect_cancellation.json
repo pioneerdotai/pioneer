@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientEffectCancellation",
+  "type": "object",
+  "properties": {
+    "generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "operation_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "operation_id",
+    "generation"
+  ]
+}

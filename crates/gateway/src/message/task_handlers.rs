@@ -175,17 +175,12 @@ impl MessageProcessor {
         let launch = contract
             .launch
             .ok_or_else(|| anyhow::anyhow!("Agent Task launch is unavailable"))?;
-        if !launch.execution.selected_capabilities.is_empty() {
-            request.capabilities =
-                super::agent_action_tools::task_launch_selection_capabilities(&launch.execution)?;
-        }
         request.capabilities = self
-            .normalize_turn_skill_capabilities(
+            .normalize_task_launch_capabilities(
                 response.task.workspace_id.as_str(),
-                request.capabilities.as_slice(),
+                &launch.execution,
             )
-            .await
-            .map_err(|error| anyhow::anyhow!(error))?
+            .await?
             .execution;
         if !matches!(
             request.execution_backend,
@@ -858,7 +853,7 @@ impl MessageProcessor {
                     return;
                 }
             };
-            let (canonical_launch, resolved_launch) =
+            let (mut canonical_launch, resolved_launch) =
                 match super::agent_action_tools::resolve_workspace_task_launch(
                     self,
                     params.workspace_id.as_str(),
@@ -886,6 +881,29 @@ impl MessageProcessor {
                         return;
                     }
                 };
+            let normalized_launch = match self
+                .normalize_new_task_launch_capabilities(
+                    params.workspace_id.as_str(),
+                    &mut canonical_launch,
+                )
+                .await
+            {
+                Ok(normalized) => normalized,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        crate::public_error::agent_rpc_error(
+                            Some(request_id),
+                            INVALID_PARAMS_CODE,
+                            pioneer_protocol::PublicErrorCode::InvalidInput,
+                            pioneer_protocol::PublicErrorStage::Admission,
+                            format!("invalid Task capabilities: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
             params.launch = Some(canonical_launch);
             resolved_task_launch = resolved_launch;
             let mut execution_request =
@@ -913,6 +931,7 @@ impl MessageProcessor {
                         return;
                     }
                 };
+            execution_request.capabilities = normalized_launch.execution;
             if !matches!(
                 execution_request.execution_backend,
                 Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { .. })

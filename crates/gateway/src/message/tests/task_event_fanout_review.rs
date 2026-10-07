@@ -1,4 +1,4 @@
-//! Review regressions. Compile only until orchestrator acceptance.
+//! Task event fanout scheduling and cutover regressions.
 use super::*;
 use crate::message::TaskEventFanoutSummary;
 use pioneer_crud::{TASK_EVENT_FANOUT_BYTE_BUDGET as BYTES, TaskEventFanoutOutcome};
@@ -8,18 +8,16 @@ use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
 use std::sync::atomic::{AtomicI64, AtomicUsize};
 const NOW: i64 = 4_000_000_000;
 
-// The cutover fixture needs the cancellation-era schema for Gateway setup,
-// but must not apply later irreversible migrations before its fanout rollback.
+// Gateway setup reads the current Turn, including nullable plugin selections.
+// Keep that schema prefix, excluding later irreversible migrations before rollback.
 struct FanoutCutoverFixtureMigrator;
 impl MigratorTrait for FanoutCutoverFixtureMigrator {
     fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
         let mut migrations = Migrator::migrations();
         let target = migrations
             .iter()
-            .position(|migration| {
-                migration.name() == "m20261005_000001_native_cancellation_context"
-            })
-            .expect("cancellation migration remains registered");
+            .position(|migration| migration.name() == "m20261005_000001_plugin_ownership")
+            .expect("plugin selection migration remains registered");
         migrations.truncate(target + 1);
         migrations
     }

@@ -376,6 +376,7 @@ pub struct BuiltinTools {
     pub runtime: ToolCallRuntime,
     pub visibility: ToolVisibilitySnapshot,
     pub event_bus: ToolEventBus,
+    pub shell: Arc<handlers::UnifiedExecHandler>,
 }
 
 impl BuiltinTools {
@@ -568,7 +569,7 @@ pub fn build_tools_with_environment_and_security_snapshot(
 
     let unified_exec_handler = Arc::new(UnifiedExecHandler::default());
     builder.register_handler("exec_command", unified_exec_handler.clone());
-    builder.register_handler("write_stdin", unified_exec_handler);
+    builder.register_handler("write_stdin", unified_exec_handler.clone());
     builder.register_handler("read_file", Arc::new(ReadFileHandler));
     builder.register_handler("list_dir", Arc::new(ListDirHandler));
     builder.register_handler("grep_files", Arc::new(GrepHandler));
@@ -634,6 +635,7 @@ pub fn build_tools_with_environment_and_security_snapshot(
     .with_execution_security_snapshot(execution_security_snapshot);
 
     Ok(BuiltinTools {
+        shell: unified_exec_handler,
         router,
         runtime,
         visibility,

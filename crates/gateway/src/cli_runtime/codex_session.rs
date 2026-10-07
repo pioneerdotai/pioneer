@@ -40,10 +40,10 @@ use async_trait::async_trait;
 use pioneer_cli_agent_runtime::codex::{
     CodexAppServerClient, CodexCollaborationMode, CodexConfigReadSnapshot,
     CodexGenerationOverlayDescriptor, CodexGenerationOverlayIdentity, CodexHomeOverlayPolicy,
-    CodexJsonlRpcClient, CodexJsonlRpcNotificationEvent, CodexManagedMcpConfigInput,
-    CodexManagedMcpConfigLimits, CodexManagedMcpSemanticInput, CodexManagedMcpToolIdentity,
-    CodexThreadForkParams, CodexThreadNameSetParams, CodexThreadOpenSnapshot,
-    CodexThreadStartParams, CodexTurnStartParams, CodexTurnSteerParams,
+    CodexJsonlRpcClient, CodexJsonlRpcNotificationEvent, CodexJsonlRpcOwner,
+    CodexManagedMcpConfigInput, CodexManagedMcpConfigLimits, CodexManagedMcpSemanticInput,
+    CodexManagedMcpToolIdentity, CodexThreadForkParams, CodexThreadNameSetParams,
+    CodexThreadOpenSnapshot, CodexThreadStartParams, CodexTurnStartParams, CodexTurnSteerParams,
     cleanup_codex_generation_overlay, codex_config_read_max_origins,
     codex_config_value_fingerprint, codex_generation_app_server_process_config,
     recover_codex_fork_source_rollout_path, recover_codex_stale_rollout_path,
@@ -69,6 +69,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::BufReader;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::timeout as tokio_timeout;
 use tokio_util::sync::CancellationToken;
@@ -511,6 +512,7 @@ impl CLIAgentRuntimeSessionFactory for DispatchingCLIAgentRuntimeSessionFactory 
         &self,
         process_instance: &CliSessionInstanceId,
         launch_spec: &CliSessionLaunchSpec,
+        startup: &crate::cli_runtime::manager::CLIAgentRuntimeSessionStartup,
     ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
         let key = process_instance.key();
         let instance = load_effective_cli_runtime_instances(self.runtime_home.as_path())?
@@ -525,7 +527,7 @@ impl CLIAgentRuntimeSessionFactory for DispatchingCLIAgentRuntimeSessionFactory 
                     mcp_limits: self.mcp_limits,
                     turn_mcp_invoker: self.turn_mcp_invoker.clone(),
                 }
-                .start_session_with_launch_spec(process_instance, launch_spec)
+                .start_session_with_launch_spec(process_instance, launch_spec, startup)
                 .await
             }
             GatewayCliAgentRuntimeKindConfig::Claude => {
@@ -536,7 +538,7 @@ impl CLIAgentRuntimeSessionFactory for DispatchingCLIAgentRuntimeSessionFactory 
                     self.turn_mcp_invoker.clone(),
                     self.crud_store.clone(),
                 )
-                .start_session_with_launch_spec(process_instance, launch_spec)
+                .start_session_with_launch_spec(process_instance, launch_spec, startup)
                 .await
             }
         }
@@ -791,6 +793,14 @@ enum CodexRequiredMcpBridgeState {
         server: JoinHandle<Result<(), crate::cli_runtime::mcp::server::CliMcpBridgeServerError>>,
         active_turn: Option<CodexActiveMcpTurn>,
     },
+    Stopping {
+        handle: Option<CliMcpBridgeFacadeHandle>,
+        server: Option<
+            JoinHandle<Result<(), crate::cli_runtime::mcp::server::CliMcpBridgeServerError>>,
+        >,
+        outcome: Option<Result<(), String>>,
+        cleanup_done: bool,
+    },
     Failed,
 }
 
@@ -803,7 +813,8 @@ impl CodexRequiredMcpBridge {
             let mut state = self.state.lock().await;
             match &*state {
                 CodexRequiredMcpBridgeState::Ready { .. } => return Ok(()),
-                CodexRequiredMcpBridgeState::Failed => {
+                CodexRequiredMcpBridgeState::Failed
+                | CodexRequiredMcpBridgeState::Stopping { .. } => {
                     bail!("Codex required MCP bridge generation is failed")
                 }
                 CodexRequiredMcpBridgeState::Serving { bound_grant, .. } => bound_grant.clone(),
@@ -820,7 +831,7 @@ impl CodexRequiredMcpBridge {
                         .take_transport(&self.process_instance)
                         .await
                         .map_err(|error| anyhow!("Codex required MCP transport failed: {error}"))?;
-                    let (handle, server) = CliMcpBridgeFacadeServer::build(
+                    let (handle, server) = CliMcpBridgeFacadeServer::build_owned(
                         transport,
                         self.supervisor.coordinator(),
                         Arc::new(CodexCorrelatingTurnMcpInvoker {
@@ -880,16 +891,76 @@ impl CodexRequiredMcpBridge {
         }
     }
 
-    async fn fail_closed(&self) {
+    async fn request_stop(&self) {
         let mut state = self.state.lock().await;
-        let previous = std::mem::replace(&mut *state, CodexRequiredMcpBridgeState::Failed);
-        match previous {
-            CodexRequiredMcpBridgeState::Serving { server, .. }
-            | CodexRequiredMcpBridgeState::Ready { server, .. } => server.abort(),
-            CodexRequiredMcpBridgeState::Pending | CodexRequiredMcpBridgeState::Failed => {}
+        if let CodexRequiredMcpBridgeState::Stopping { handle, .. } = &*state {
+            if let Some(handle) = handle {
+                handle.request_shutdown();
+            }
+            return;
         }
-        drop(state);
-        self.supervisor.revoke_session(&self.process_instance).await;
+        let previous = std::mem::replace(&mut *state, CodexRequiredMcpBridgeState::Failed);
+        *state = match previous {
+            CodexRequiredMcpBridgeState::Serving { handle, server, .. }
+            | CodexRequiredMcpBridgeState::Ready { handle, server, .. } => {
+                handle.request_shutdown();
+                CodexRequiredMcpBridgeState::Stopping {
+                    handle: Some(handle),
+                    server: Some(server),
+                    outcome: None,
+                    cleanup_done: false,
+                }
+            }
+            _ => CodexRequiredMcpBridgeState::Stopping {
+                handle: None,
+                server: None,
+                outcome: Some(Ok(())),
+                cleanup_done: false,
+            },
+        };
+    }
+    async fn stop_and_wait(&self) -> Result<()> {
+        self.request_stop().await;
+        let mut state = self.state.lock().await;
+        let CodexRequiredMcpBridgeState::Stopping {
+            server,
+            outcome,
+            cleanup_done,
+            ..
+        } = &mut *state
+        else {
+            bail!("Codex bridge stop ownership changed");
+        };
+        if outcome.is_none() {
+            let task = server
+                .as_mut()
+                .ok_or_else(|| anyhow!("Codex bridge completion is unknown"))?;
+            let result = match task.await {
+                Ok(result) => result.map_err(|e| e.to_string()),
+                Err(_) => Err("Codex MCP facade worker failed".to_owned()),
+            };
+            server.take();
+            *outcome = Some(result);
+        }
+        outcome.clone().unwrap().map_err(|e| anyhow!("{e}"))?;
+        if !*cleanup_done {
+            if !self.launch.cleanup_confirmed()
+                && !self
+                    .supervisor
+                    .revoke_session_result(&self.process_instance)
+                    .await?
+                && !self.launch.cleanup_confirmed()
+            {
+                bail!("CLI MCP cleanup owner is unknown");
+            }
+            *cleanup_done = true;
+        }
+        Ok(())
+    }
+    async fn fail_closed(&self) {
+        if let Err(error) = self.stop_and_wait().await {
+            tracing::warn!(error = %error, "Codex MCP bridge cleanup retained");
+        }
     }
 
     fn register_native_item(
@@ -1134,7 +1205,9 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
         &self,
         process_instance: &CliSessionInstanceId,
         launch_spec: &CliSessionLaunchSpec,
+        startup: &crate::cli_runtime::manager::CLIAgentRuntimeSessionStartup,
     ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
+        startup.check_admission()?;
         let options = &launch_spec.options;
         if options.elevated_instructions.is_some() {
             bail!(
@@ -1195,6 +1268,12 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
         )
         .map_err(|error| anyhow!("failed to prepare Codex generation overlay: {error}"))?;
         let mut overlay_guard = CodexGenerationOverlayStartupGuard::new(overlay);
+        startup.retain_preparation(
+            crate::cli_runtime::manager::CliStartupProcessCleanup::Codex(
+                overlay_guard.descriptor().clone(),
+            ),
+        );
+        overlay_guard.cleanup_on_drop = false;
         let mut prepared_mcp_bridge = None;
         let mut mcp_attestation = CodexMcpAttestationExpectation::unmanaged_empty(
             self.mcp_limits.max_codex_config_origins(),
@@ -1303,23 +1382,27 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
         process_config.args.extend(instance.app_server_args.clone());
         process_config.args.extend(options.app_server_args.clone());
         process_config = process_config.with_environment(&options.env);
-        let mut process = spawn_cli_agent_process(&process_config).with_context(|| {
+        startup.check_admission()?;
+        let process = spawn_cli_agent_process(&process_config).with_context(|| {
             format!(
                 "failed to spawn Codex app-server for CLI runtime `{}`",
                 instance.id
             )
         })?;
-        let stderr = process.stderr();
+        let generation_overlay = overlay_guard.disarm();
+        let process = Arc::new(Mutex::new(process));
+        startup.retain_process(
+            process.clone(),
+            crate::cli_runtime::manager::CliStartupProcessCleanup::Codex(
+                generation_overlay.clone(),
+            ),
+        );
+        let mut process_guard = process.lock().await;
+        let stderr = process_guard.stderr();
         let required_mcp_bridge = if let Some(prepared) = prepared_mcp_bridge {
-            let provider_process_id = match process.id() {
+            let provider_process_id = match process_guard.id() {
                 Some(process_id) if process_id != 0 => process_id,
                 _ => {
-                    cleanup_failed_codex_startup(
-                        &self.bridge_supervisor,
-                        process_instance,
-                        &mut process,
-                    )
-                    .await;
                     bail!("Codex app-server process identity is unavailable");
                 }
             };
@@ -1328,12 +1411,6 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
                 .associate_provider_process(process_instance, provider_process_id, None)
                 .await
             {
-                cleanup_failed_codex_startup(
-                    &self.bridge_supervisor,
-                    process_instance,
-                    &mut process,
-                )
-                .await;
                 bail!("failed to bind Codex MCP bridge to app-server process: {error}");
             }
             let projection_fingerprint = prepared.projection.fingerprint().clone();
@@ -1356,8 +1433,8 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
             None
         };
         let rpc_setup = (|| -> Result<_> {
-            let (stdout, stdin) = process.take_stdio()?;
-            let rpc = CodexJsonlRpcClient::new_with_channel_capacity_and_budget(
+            let (stdout, stdin) = process_guard.take_stdio()?;
+            let (rpc, owner) = CodexJsonlRpcClient::new_owned_with_channel_capacity_and_budget(
                 BufReader::new(stdout),
                 stdin,
                 instance.event_channel_capacity,
@@ -1374,40 +1451,23 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
             let diagnostics = rpc
                 .take_diagnostic_receiver()
                 .ok_or_else(|| anyhow!("Codex diagnostic receiver was already taken"))?;
-            Ok((rpc, notifications, server_requests, diagnostics))
+            Ok((rpc, owner, notifications, server_requests, diagnostics))
         })();
-        let (rpc, notifications, server_requests, diagnostics) = match rpc_setup {
+        let (rpc, rpc_owner, notifications, server_requests, diagnostics) = match rpc_setup {
             Ok(setup) => setup,
             Err(error) => {
                 if let Some(bridge) = required_mcp_bridge.as_ref() {
                     bridge.fail_closed().await;
                 }
-                cleanup_failed_codex_startup(
-                    &self.bridge_supervisor,
-                    process_instance,
-                    &mut process,
-                )
-                .await;
                 return Err(error);
             }
         };
         let client = CodexAppServerClient::new(rpc);
-        if let Err(error) = client
-            .initialize(Duration::from_millis(instance.startup_probe_timeout_ms))
-            .await
-        {
-            if let Some(bridge) = required_mcp_bridge.as_ref() {
-                bridge.fail_closed().await;
-            }
-            cleanup_failed_codex_startup(&self.bridge_supervisor, process_instance, &mut process)
-                .await;
-            return Err(anyhow!(error)).context("Codex initialize handshake failed");
-        }
-        let generation_overlay = overlay_guard.disarm();
-
-        Ok(Arc::new(CodexCLIAgentRuntimeSession {
+        drop(process_guard);
+        let session = Arc::new(CodexCLIAgentRuntimeSession {
             client,
-            process: tokio::sync::Mutex::new(process),
+            rpc_owner: tokio::sync::Mutex::new(rpc_owner),
+            process,
             request_timeout: Duration::from_millis(instance.request_timeout_ms),
             shutdown_grace: Duration::from_secs(2),
             event_receivers: StdMutex::new(Some(CLIAgentRuntimeCodexEventReceivers {
@@ -1425,17 +1485,15 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
                 expected_native_thread_id,
                 bound_native_thread_id: None,
             }),
-        }))
+        });
+        startup.retain_session(session.clone());
+        tokio::select! {
+            biased;
+            _ = startup.cancelled() => bail!("Codex initialize was stopped"),
+            result = session.client.initialize(Duration::from_millis(instance.startup_probe_timeout_ms)) => { result.context("Codex initialize handshake failed")?; }
+        }
+        Ok(session)
     }
-}
-
-async fn cleanup_failed_codex_startup(
-    supervisor: &CliMcpBridgeSupervisor,
-    process_instance: &CliSessionInstanceId,
-    process: &mut CLIAgentProcess,
-) {
-    supervisor.revoke_session(process_instance).await;
-    let _ = process.terminate_with_grace(Duration::from_secs(2)).await;
 }
 
 fn codex_mcp_bootstrap_expiry(startup_timeout_ms: u64) -> Result<u64> {
@@ -1879,7 +1937,8 @@ impl CodexCLIAgentRuntimeSessionFactory {
 
 struct CodexCLIAgentRuntimeSession {
     client: CodexAppServerClient,
-    process: tokio::sync::Mutex<CLIAgentProcess>,
+    rpc_owner: tokio::sync::Mutex<CodexJsonlRpcOwner>,
+    process: Arc<tokio::sync::Mutex<CLIAgentProcess>>,
     request_timeout: Duration,
     shutdown_grace: Duration,
     event_receivers: StdMutex<Option<CLIAgentRuntimeCodexEventReceivers>>,
@@ -2003,18 +2062,36 @@ fn codex_turn_observation_from_snapshot(
 #[async_trait]
 impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
     async fn close(&self) -> Result<()> {
+        self.stop_and_wait().await?;
+        self.cleanup_after_stop().await
+    }
+    async fn stop_and_wait(&self) -> Result<()> {
         if let Some(bridge) = self.required_mcp_bridge.as_ref() {
-            bridge.fail_closed().await;
-        }
-        if let Err(error) = self.client.rpc().shutdown().await {
-            tracing::warn!(
-                error = %format!("{error:#}"),
-                "failed to request Codex CLI runtime shutdown"
-            );
+            bridge.request_stop().await;
         }
         let mut process = self.process.lock().await;
-        let _ = process.terminate_with_grace(self.shutdown_grace).await?;
+        process.terminate_with_grace(self.shutdown_grace).await?;
         drop(process);
+        let bridge_result = if let Some(bridge) = self.required_mcp_bridge.as_ref() {
+            bridge.stop_and_wait().await
+        } else {
+            Ok(())
+        };
+        // A shutdown command is only admission. Join the exact reader,
+        // dispatcher and ordered ingress before deleting this overlay. The
+        // owner stays in the session when this wait is cancelled or fails.
+        let transport_result = self
+            .rpc_owner
+            .lock()
+            .await
+            .abort_and_join_result()
+            .await
+            .context("failed to drain Codex runtime transport");
+        bridge_result?;
+        transport_result?;
+        Ok(())
+    }
+    async fn cleanup_after_stop(&self) -> Result<()> {
         let overlay = self
             .generation_overlay
             .lock()
@@ -2500,12 +2577,14 @@ fn is_codex_native_mcp_event(event: &RuntimeEvent) -> bool {
 }
 
 struct CodexGenerationOverlayStartupGuard {
+    cleanup_on_drop: bool,
     descriptor: Option<CodexGenerationOverlayDescriptor>,
 }
 
 impl CodexGenerationOverlayStartupGuard {
     fn new(descriptor: CodexGenerationOverlayDescriptor) -> Self {
         Self {
+            cleanup_on_drop: true,
             descriptor: Some(descriptor),
         }
     }
@@ -2531,6 +2610,9 @@ impl CodexGenerationOverlayStartupGuard {
 
 impl Drop for CodexGenerationOverlayStartupGuard {
     fn drop(&mut self) {
+        if !self.cleanup_on_drop {
+            return;
+        }
         let Some(descriptor) = self.descriptor.take() else {
             return;
         };
@@ -3535,8 +3617,14 @@ mod tests {
         assert!(!supervisor.revoke_session(&process_instance).await);
         assert!(matches!(
             *bridge.state.lock().await,
-            CodexRequiredMcpBridgeState::Failed
+            CodexRequiredMcpBridgeState::Stopping {
+                server: None,
+                outcome: Some(Ok(())),
+                cleanup_done: true,
+                ..
+            }
         ));
+        bridge.stop_and_wait().await.expect("cleanup is idempotent");
     }
 
     #[tokio::test]

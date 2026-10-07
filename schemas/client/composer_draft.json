@@ -292,6 +292,31 @@
         {
           "type": "object",
           "properties": {
+            "Plugin": {
+              "type": "object",
+              "properties": {
+                "expected_revision": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "plugin_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "plugin_id",
+                "expected_revision"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Plugin"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "Skill": {
               "type": "object",
               "properties": {

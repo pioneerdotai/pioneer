@@ -726,7 +726,8 @@ fn historical_user_attachment_part(
             MessageContentPart::video(historical_path_attachment(path.as_str(), "video/*"))
         }
         Attachment::Artifact { artifact } => historical_artifact_part(artifact),
-        Attachment::Skill { .. }
+        Attachment::Plugin { .. }
+        | Attachment::Skill { .. }
         | Attachment::SkillPack { .. }
         | Attachment::McpServer { .. }
         | Attachment::McpTool { .. } => return None,

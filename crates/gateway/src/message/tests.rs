@@ -123,24 +123,25 @@ use pioneer_protocol::{
     ItemToolRetryScheduledNotification, ItemUpdatedNotification, JsonRpcErrorResponse,
     JsonRpcNotification, JsonRpcResponse, METHOD_NOT_FOUND_CODE, McpChangedAction,
     McpChangedNotification, McpInstallResponse, McpInstallResultStatus, McpInstallStatus,
-    McpListResponse, McpPolicySetResponse, McpRuntimeState, McpScopeKind, McpServerDetailsResponse,
-    McpServerStatus, McpSourceKind, McpTurnBindingSummary, McpUninstallResponse, MemoryActor,
-    MemoryActorKind, MemoryCandidateDecision, MemoryCandidateStatus, MemoryCandidatesDecideParams,
-    MemoryCandidatesDecideResponse, MemoryCandidatesListParams, MemoryCandidatesListResponse,
-    MemoryCategory, MemoryChangeKind, MemoryChangedNotification, MemoryForgetParams,
-    MemoryForgetResponse, MemoryForgetTarget, MemoryForgottenNotification, MemoryGetParams,
-    MemoryGetResponse, MemoryListParams, MemoryListResponse, MemoryRememberParams,
-    MemoryRememberResponse, MemoryScope, MemoryScopeKind, MemorySearchParams, MemorySearchResponse,
-    MemorySensitivity, PersistedActorRef, PrincipalId, PromptManifest, PromptManifestDiagnostic,
-    PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
-    PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
-    PromptManifestProfile, ProviderConfigureParams, ProviderConfigureResponse,
-    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderFailureClass,
-    ProviderFailureDetails, ProviderFailureStage, ProviderListModelsParams,
-    ProviderListModelsResponse, ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams,
-    ProviderSetApiKeyResponse, ProviderTransportKind, PublicError, PublicErrorCode,
-    PublicErrorStage, PublicTaskAgendaResponse, PublicTaskDeliveriesResponse, RecoveryAction,
-    RecoveryJobStatus, RecoveryTrigger, RoleKey, SandboxMode, SkillArchiveFormat,
+    McpListResponse, McpPolicySetParams, McpPolicySetResponse, McpRuntimeState, McpScopeKind,
+    McpServerDetailsResponse, McpServerStatus, McpSourceKind, McpTurnBindingSummary,
+    McpUninstallResponse, MemoryActor, MemoryActorKind, MemoryCandidateDecision,
+    MemoryCandidateStatus, MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse,
+    MemoryCandidatesListParams, MemoryCandidatesListResponse, MemoryCategory, MemoryChangeKind,
+    MemoryChangedNotification, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget,
+    MemoryForgottenNotification, MemoryGetParams, MemoryGetResponse, MemoryListParams,
+    MemoryListResponse, MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeKind,
+    MemorySearchParams, MemorySearchResponse, MemorySensitivity, PersistedActorRef, PrincipalId,
+    PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
+    PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookSource,
+    PromptManifestHookSourceEntry, PromptManifestHookTruncation, PromptManifestProfile,
+    ProviderConfigureParams, ProviderConfigureResponse, ProviderDeleteApiKeyParams,
+    ProviderDeleteApiKeyResponse, ProviderFailureClass, ProviderFailureDetails,
+    ProviderFailureStage, ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams,
+    ProviderListResponse, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
+    ProviderTransportKind, PublicError, PublicErrorCode, PublicErrorStage,
+    PublicTaskAgendaResponse, PublicTaskDeliveriesResponse, RecoveryAction, RecoveryJobStatus,
+    RecoveryTrigger, RequestId, RoleKey, SandboxMode, SkillArchiveFormat,
     SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse, SkillsChangedNotification,
     SkillsHealthResponse, SkillsInstallResponse, SkillsPackInstallResponse,
     SkillsPackUninstallResponse, SkillsPackUpdateResponse, SkillsPolicySetResponse,
@@ -175,7 +176,8 @@ use pioneer_protocol::{
     UserMessageAttachment, VoiceAudioFormat, VoiceErrorKind, VoiceSessionOutcome,
     VoiceSessionResultNotification, VoiceSessionStartContext, VoiceStatus, WorkspaceChangeKind,
     WorkspaceChangedNotification, WorkspaceCreateResponse, WorkspaceDefaultResponse,
-    WorkspaceListResponse, WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
+    WorkspaceListResponse, WorkspaceSelectResponse, WorkspaceUpdateResponse,
+    constants::{events, methods},
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -1164,6 +1166,7 @@ impl CLIAgentRuntimeSessionFactory for StaticCliRuntimeSessionFactory {
         &self,
         _instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
         launch_spec: &CliSessionLaunchSpec,
+        _startup: &crate::cli_runtime::manager::CLIAgentRuntimeSessionStartup,
     ) -> anyhow::Result<Arc<dyn CLIAgentRuntimeSession>> {
         if let crate::cli_runtime::continuation::CliProviderContinuation::ClaudeFork {
             source_session_id,
@@ -1369,6 +1372,380 @@ async fn setup_cli_runtime_security_harness_for_principal(
         self_improvement_supervisor,
         processor: Arc::new(processor),
     }
+}
+
+fn fixture_skill_lifecycle_audit(
+    skill_id: &pioneer_protocol::SkillId,
+    slug: &str,
+    action: &str,
+    now: i64,
+) -> pioneer_crud::SkillAuditEventRecord {
+    pioneer_crud::SkillAuditEventRecord {
+        turn_id: None,
+        skill_id: skill_id.clone(),
+        skill_owner: None,
+        skill_slug: slug.into(),
+        source_kind: "user".into(),
+        action: action.into(),
+        decision: "accepted".into(),
+        reason_code: None,
+        details_json: "{}".into(),
+        created_at_unix: now,
+    }
+}
+
+#[test]
+fn plugin_turn_normalization_keeps_parent_and_rejects_raw_owned_skill() {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let harness = setup_cli_runtime_security_harness(None).await;
+        let parent_id = "P".repeat(21);
+        let fixture = unique_temp_dir("plugin-normalization");
+        let package = fixture.join("package");
+        let member = package.join("skills/bundled");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("SKILL.md"), "---\nname: bundled\ndescription: Bundled regression skill\n---\nInstructions\n").unwrap();
+        let now = chrono::Utc::now().fixed_offset();
+        harness.crud_store.insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+            id: parent_id.clone(), workspace_id: harness.workspace_id.clone(), name: "authoritative-name".into(), version: None, source_upload_id: "upload-plugin".into(), package_path: package.to_string_lossy().into(), data_path: fixture.join("data").to_string_lossy().into(), package_fingerprint: "tree".into(), enabled: true, state: "installing".into(), revision: 1, pending_json: None, last_error: None, created_at: now, updated_at: now,
+        }).await.unwrap();
+        let selected = pioneer_protocol::TurnCapability { id: pioneer_protocol::plugin_capability_key(&parent_id), label: Some("untrusted-label".into()), kind: pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id: parent_id.clone(), expected_revision: 1 } };
+        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[selected.clone()]).await.is_err());
+        let skill_id = pioneer_protocol::SkillId::new("S".repeat(21)).unwrap();
+        let child = pioneer_crud::SkillInstallationRecord { skill_id: skill_id.clone(), owner: None, slug: "bundled".into(), version: None, source_kind: "user".into(), scope_key: harness.workspace_id.clone(), source_ref: "plugin".into(), install_path: member.to_string_lossy().into(), trust_level: "community".into(), fingerprint: "member".into(), updated_at_unix: 1, pack_id: None, pack_member_key: None };
+        let policy = pioneer_crud::WorkspaceSkillPolicyRecord { id: "policy-plugin".into(), workspace_id: harness.workspace_id.clone(), skill_id: skill_id.clone(), enabled: Some(true), allow_implicit_invocation: Some(false) };
+        harness.crud_store.install_skill_lifecycle_with_ownership(&child, &policy, &[fixture_skill_lifecycle_audit(&skill_id, "bundled", "install", 1)], None, Some(&pioneer_crud::PluginOwnershipWrite { plugin_id: parent_id.clone(), expected_revision: 1, member_key: "bundled".into(), member_path: Some("skills/bundled".into()), package_fingerprint: "member".into(), child_id: skill_id.to_string() }), 1).await.unwrap();
+        harness.crud_store.settle_plugin_installation(&parent_id, 1, "installed", None).await.unwrap();
+        let result = harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[selected.clone()]).await.unwrap();
+        assert_eq!(result.presentation.len(), 1);
+        assert_eq!(result.presentation[0].label.as_deref(), Some("authoritative-name"));
+        assert!(matches!(result.presentation[0].kind, pioneer_protocol::TurnCapabilityKind::Plugin { .. }));
+        assert_eq!(result.execution.len(), 1);
+        assert!(matches!(&result.execution[0].kind, pioneer_protocol::TurnCapabilityKind::Skill { skill_id: id, .. } if id == &skill_id));
+        assert_eq!(result.plugin_selection.unwrap().children[0].id, skill_id.to_string());
+        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &result.execution).await.is_err());
+        let mut stale = selected.clone(); stale.kind = pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id: parent_id.clone(), expected_revision: 2 };
+        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[stale]).await.is_err());
+        let mut disabled = policy.clone(); disabled.enabled = Some(false);
+        let gate=harness.crud_store.begin_plugin_mutation(&harness.workspace_id,&parent_id,1,"updating",true,"{\"kind\":\"native\",\"action\":\"policy\",\"native_committed\":false}").await.unwrap();
+        harness.crud_store.upsert_workspace_skill_policy_with_plugin_change(&disabled,Some(&pioneer_crud::PluginNativeWrite {
+            plugin_id:parent_id.clone(),expected_revision:gate.revision,member_key:"bundled".into(),child_id:skill_id.to_string(),override_fields_json:"[\"enabled\"]".into(),
+            pending_after:"{\"kind\":\"native\",\"action\":\"policy\",\"native_committed\":true}".into()
+        }),2).await.unwrap();
+        harness.crud_store.finish_plugin_mutation(&parent_id,gate.revision,"installed",None).await.unwrap();
+        let mut selected=selected; selected.kind=pioneer_protocol::TurnCapabilityKind::Plugin{plugin_id:parent_id,expected_revision:gate.revision};
+        let excluded = harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[selected.clone()]).await.unwrap();
+        assert_eq!(excluded.presentation.len(), 1);
+        assert!(excluded.execution.is_empty());
+        assert_eq!(excluded.plugin_selection.unwrap().children.len(), 1, "structural candidate identity is retained until native preparation commits");
+        assert!(harness.processor.normalize_turn_skill_capabilities("foreign", &[selected]).await.is_err());
+        std::fs::remove_dir_all(fixture).unwrap();
+    });
+}
+
+// B-03 regression source: real native list projections and both plugin RPCs.
+// Installation records are fixtures, no MCP is started.
+#[tokio::test]
+async fn plugins_list_and_details_preserve_native_member_disclosure() {
+    use sea_orm::ConnectionTrait;
+    let mut harness = setup_cli_runtime_security_harness(None).await;
+    let fixture = unique_temp_dir("plugin-disclosure");
+    let package = fixture.join("package");
+    let parent_id = "P".repeat(21);
+    let now = chrono::Utc::now().fixed_offset();
+    let parent = pioneer_entity::plugin_installation::Model {
+        id: parent_id.clone(),
+        workspace_id: harness.workspace_id.clone(),
+        name: "fixture".into(),
+        version: None,
+        source_upload_id: "disclosure-upload".into(),
+        package_path: package.to_string_lossy().into(),
+        data_path: fixture.join("data").to_string_lossy().into(),
+        package_fingerprint: "tree".into(),
+        enabled: true,
+        state: "installing".into(),
+        revision: 1,
+        pending_json: None,
+        last_error: None,
+        created_at: now,
+        updated_at: now,
+    };
+    harness
+        .crud_store
+        .insert_plugin_installation(&parent)
+        .await
+        .unwrap();
+    let allowed_skill = pioneer_protocol::SkillId::new("A".repeat(21)).unwrap();
+    let hidden_skill = pioneer_protocol::SkillId::new("D".repeat(21)).unwrap();
+    for (id, key, enabled) in [
+        (&allowed_skill, "allowed-skill", true),
+        (&hidden_skill, "secret-disabled-skill", false),
+    ] {
+        let dir = package.join("skills").join(key);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {key}\ndescription: {key} description\n---\nInstructions\n"),
+        )
+        .unwrap();
+        let row = pioneer_crud::SkillInstallationRecord {
+            skill_id: id.clone(),
+            owner: None,
+            slug: key.into(),
+            version: None,
+            source_kind: "user".into(),
+            scope_key: harness.workspace_id.clone(),
+            source_ref: "plugin".into(),
+            install_path: dir.to_string_lossy().into(),
+            trust_level: "community".into(),
+            fingerprint: "member".into(),
+            updated_at_unix: 1,
+            pack_id: None,
+            pack_member_key: None,
+        };
+        harness
+            .crud_store
+            .install_skill_lifecycle_with_ownership(
+                &row,
+                &pioneer_crud::WorkspaceSkillPolicyRecord {
+                    id: format!("policy-{id}"),
+                    workspace_id: harness.workspace_id.clone(),
+                    skill_id: id.clone(),
+                    enabled: Some(enabled),
+                    allow_implicit_invocation: Some(false),
+                },
+                &[fixture_skill_lifecycle_audit(id, key, "install", 1)],
+                None,
+                Some(&pioneer_crud::PluginOwnershipWrite {
+                    plugin_id: parent_id.clone(),
+                    expected_revision: 1,
+                    member_key: key.into(),
+                    member_path: Some(format!("skills/{key}")),
+                    package_fingerprint: "member".into(),
+                    child_id: id.to_string(),
+                }),
+                1,
+            )
+            .await
+            .unwrap();
+    }
+    let allowed_mcp = "M".repeat(21);
+    let hidden_mcp = "N".repeat(21);
+    for (id, key, enabled) in [
+        (&allowed_mcp, "allowed-mcp", true),
+        (&hidden_mcp, "secret-disabled-mcp", false),
+    ] {
+        let row = pioneer_crud::McpServerInstallationRecord {
+            id: Some(id.clone()),
+            scope_kind: "workspace".into(),
+            scope_key: harness.workspace_id.clone(),
+            name: format!(
+                "pplugin_fixture_{}",
+                if enabled { "allowed" } else { "disabled" }
+            ),
+            display_name: None,
+            source_kind: "config".into(),
+            source_ref: "{}".into(),
+            transport_kind: "stdio".into(),
+            transport_json: serde_json::to_string(&pioneer_mcp::McpTransportConfig::Stdio {
+                command: "unused-fixture-command".into(),
+                args: vec![],
+                cwd: None,
+                env: Default::default(),
+                startup_timeout_ms: 5000,
+                tool_timeout_ms: 5000,
+            })
+            .unwrap(),
+            auth_json: serde_json::to_string(&pioneer_mcp::McpAuthConfig::default()).unwrap(),
+            secret_refs_json: "[]".into(),
+            enabled,
+            allow_implicit_invocation: false,
+            required: false,
+            fingerprint: "native".into(),
+            updated_at_unix: 1,
+        };
+        harness
+            .crud_store
+            .upsert_mcp_server_installation_with_audit_and_ownership(
+                &row,
+                &pioneer_crud::McpAuditEventRecord {
+                    turn_id: None,
+                    server_installation_id: None,
+                    server_name: row.name.clone(),
+                    raw_tool_name: None,
+                    callable_name: None,
+                    catalog_version: None,
+                    action: "install".into(),
+                    decision: "allowed".into(),
+                    reason_code: None,
+                    details_json: "{}".into(),
+                    created_at_unix: 1,
+                },
+                Some(&pioneer_crud::PluginOwnershipWrite {
+                    plugin_id: parent_id.clone(),
+                    expected_revision: 1,
+                    member_key: key.into(),
+                    member_path: Some("mcp.json".into()),
+                    package_fingerprint: "member".into(),
+                    child_id: id.clone(),
+                }),
+                1,
+            )
+            .await
+            .unwrap();
+    }
+    harness
+        .crud_store
+        .record_plugin_component_failure(
+            &pioneer_crud::PluginOwnershipWrite {
+                plugin_id: parent_id.clone(),
+                expected_revision: 1,
+                member_key: "secret-failed-skill".into(),
+                member_path: Some("skills/secret-failed-skill".into()),
+                package_fingerprint: "member".into(),
+                child_id: "F".repeat(21),
+            },
+            "skill",
+            "component_install_failed",
+        )
+        .await
+        .unwrap();
+    harness.crud_store.settle_plugin_installation(&parent_id, 1, "installed", Some(json!([
+        {"code":"denied_path","path":"skills/secret-disabled-skill/assets","message":"secret-disabled-skill needs attention"},
+        {"code":"invalid_mcp","path":"mcp.json#/mcpServers/secret-disabled-mcp","message":"secret-disabled-mcp needs attention"},
+    ]).to_string())).await.unwrap();
+    harness.crud_store.database_connection().execute_unprepared(&format!(
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at) \
+         VALUES('plugin-disclosure-thread','{}','','chat','test','test','active','user','visible','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", harness.workspace_id
+    )).await.unwrap();
+    materialize_test_member_collaborator(
+        &harness.crud_store,
+        &harness.workspace_id,
+        "plugin-disclosure-thread",
+    )
+    .await;
+    let (tx, mut member_rx) = mpsc::channel(32);
+    let member_connection = harness
+        .processor
+        .session_manager
+        .register_connection(tx, authenticated_test_member_collaborator())
+        .await
+        .unwrap();
+    harness
+        .processor
+        .session_manager
+        .set_connection_workspace(member_connection, Some(harness.workspace_id.clone()))
+        .await;
+    for (connection, rx, administrator) in [
+        (harness.connection_id, &mut harness.rx, true),
+        (member_connection, &mut member_rx, false),
+    ] {
+        let skills_id = generate_test_request_id("plugdisc", "skills");
+        let context =
+            registered_request_context(&harness.processor, connection, "skills/list").await;
+        harness
+            .processor
+            .skills_list(
+                &context,
+                serde_json::from_value(json!(skills_id)).unwrap(),
+                pioneer_protocol::SkillListParams {
+                    workspace_id: harness.workspace_id.clone(),
+                    include_health: true,
+                    include_policy: true,
+                },
+            )
+            .await;
+        let skills: pioneer_protocol::SkillListResponse =
+            serde_json::from_value(recv_response_by_id(rx, &skills_id).await.result).unwrap();
+        assert!(skills.skills.iter().any(|s| s.skill_id == allowed_skill));
+        assert_eq!(
+            skills.skills.iter().any(|s| s.skill_id == hidden_skill),
+            administrator
+        );
+        let mcp_id = generate_test_request_id("plugdisc", "mcp");
+        let context = registered_request_context(&harness.processor, connection, "mcp/list").await;
+        harness
+            .processor
+            .mcp_list(
+                &context,
+                serde_json::from_value(json!(mcp_id)).unwrap(),
+                pioneer_protocol::McpListParams {
+                    workspace_id: harness.workspace_id.clone(),
+                },
+            )
+            .await;
+        let mcp: pioneer_protocol::McpListResponse =
+            serde_json::from_value(recv_response_by_id(rx, &mcp_id).await.result).unwrap();
+        assert!(mcp.servers.iter().any(|s| s.id == allowed_mcp));
+        assert_eq!(
+            mcp.servers.iter().any(|s| s.id == hidden_mcp),
+            administrator
+        );
+        for method in ["plugins/list", "plugins/details"] {
+            let id = generate_test_request_id("plugdisc", method);
+            let context = registered_request_context(&harness.processor, connection, method).await;
+            let params = if method == "plugins/details" {
+                json!({"workspace_id":harness.workspace_id,"plugin_id":parent_id})
+            } else {
+                json!({"workspace_id":harness.workspace_id})
+            };
+            harness
+                .processor
+                .plugins_request(
+                    &context,
+                    serde_json::from_value(
+                        json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+                    )
+                    .unwrap(),
+                )
+                .await;
+            let value = recv_response_by_id(rx, &id).await.result;
+            let item: pioneer_protocol::PluginItem = if method == "plugins/list" {
+                serde_json::from_value::<pioneer_protocol::PluginsListResponse>(value)
+                    .unwrap()
+                    .plugins
+                    .into_iter()
+                    .find(|p| p.id == parent_id)
+                    .unwrap()
+            } else {
+                serde_json::from_value(value).unwrap()
+            };
+            assert_eq!(item.components.len(), if administrator { 5 } else { 2 });
+            assert!(
+                item.components
+                    .iter()
+                    .any(|c| c.skill_id.as_ref() == Some(&allowed_skill))
+            );
+            assert!(
+                item.components
+                    .iter()
+                    .any(|c| c.mcp_installation_id.as_ref() == Some(&allowed_mcp))
+            );
+            let encoded = serde_json::to_string(&item).unwrap();
+            if administrator {
+                assert!(encoded.contains("secret-disabled-skill"));
+                assert!(encoded.contains("secret-failed-skill"));
+                assert!(encoded.contains("secret-disabled-mcp"));
+            } else {
+                for hidden in [
+                    hidden_skill.as_str(),
+                    hidden_mcp.as_str(),
+                    "secret-disabled-skill",
+                    "secret-disabled-mcp",
+                    "secret-failed-skill",
+                    "mcp.json",
+                    "skills/",
+                ] {
+                    assert!(
+                        !encoded.contains(hidden),
+                        "hidden child must not leak through any response field: {hidden}"
+                    );
+                }
+                assert_eq!(item.diagnostics.len(), 1);
+                assert!(item.diagnostics[0].path.is_empty());
+            }
+        }
+    }
+    std::fs::remove_dir_all(fixture).unwrap();
 }
 
 #[test]
@@ -26838,6 +27215,18 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
                 .status,
             TurnStatus::Blocked | TurnStatus::Interrupted | TurnStatus::Failed
         ));
+        let (_, local_terminal) = processor
+            .thread_manager
+            .turn_get(&thread, &turn)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                local_terminal.status,
+                TurnStatus::Blocked | TurnStatus::Interrupted | TurnStatus::Failed
+            ),
+            "{case}: rollback of a competing terminal candidate must not revive the cancelled Turn"
+        );
         summary.release_paused_call();
 
         let next_processor = if case == "shutdown" {
@@ -45668,6 +46057,7 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let cli_manager = test_cli_runtime_manager(Arc::new(RecordingCliRuntimeSession::default()));
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -45677,7 +46067,8 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
         test_gateway_secrets(),
         test_summary_config(),
         test_tool_loop_config(),
-    );
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
     let thread_id = "thread_cli_projection_backlog";
     let turn_id = "turn_cli_projection_backlog";
     let native_thread_id = "native_thread_cli_projection_backlog";
@@ -45773,9 +46164,13 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
 
     let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", thread_id)
         .expect("session key should build");
+    let handle = cli_manager
+        .get_or_start(key)
+        .await
+        .expect("recording CLI session should own its projection listener");
     processor
         .handle_cli_runtime_timeline_event(
-            &key,
+            handle.instance(),
             RuntimeEvent::ItemStarted(RuntimeItemStarted {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: native_turn_id.to_owned(),
@@ -45861,6 +46256,12 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
             .expect("replayed item lookup should succeed")
             .is_some(),
         "replay should project the deferred native event"
+    );
+    assert!(
+        cli_manager
+            .close_session_instance(handle.instance())
+            .await
+            .expect("recording session and its projection listener should stop")
     );
 }
 
@@ -46029,6 +46430,7 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let cli_manager = test_cli_runtime_manager(Arc::new(RecordingCliRuntimeSession::default()));
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -46038,7 +46440,8 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
         test_gateway_secrets(),
         test_summary_config(),
         test_tool_loop_config(),
-    );
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
     let thread_id = "thread_cli_runtime_failure_recovery";
     let turn_id = "turn_cli_runtime_failure_recovery";
     let native_thread_id = "native_thread_cli_runtime_failure_recovery";
@@ -46078,10 +46481,16 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
     .await;
     let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", thread_id)
         .expect("session key should build");
+    // Durable listeners belong to a real manager-owned session; a binding row
+    // alone must not admit unowned background work.
+    let handle = cli_manager
+        .get_or_start(key)
+        .await
+        .expect("recording CLI session should start");
 
     processor
         .handle_cli_runtime_timeline_event(
-            &key,
+            handle.instance(),
             RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: Some(native_turn_id.to_owned()),
@@ -46118,7 +46527,7 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
 
     processor
         .handle_cli_runtime_timeline_event(
-            &key,
+            handle.instance(),
             RuntimeEvent::TurnFailed(pioneer_cli_agent_runtime::event::RuntimeTurnFailed {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: Some(native_turn_id.to_owned()),
@@ -46150,6 +46559,12 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
         .expect("pending recovery jobs should load");
     assert_eq!(pending_jobs.len(), 1);
     assert_eq!(pending_jobs[0].trigger, RecoveryTrigger::RuntimeFailure);
+    assert!(
+        cli_manager
+            .close_session_instance(handle.instance())
+            .await
+            .expect("recording session and its durable listener should stop")
+    );
 }
 
 #[test]
@@ -46732,6 +47147,7 @@ async fn closed_cli_runtime_durable_hub_is_replaced() {
     register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let cli_manager = test_cli_runtime_manager(Arc::new(RecordingCliRuntimeSession::default()));
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -46741,19 +47157,20 @@ async fn closed_cli_runtime_durable_hub_is_replaced() {
         test_gateway_secrets(),
         test_summary_config(),
         test_tool_loop_config(),
-    );
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
     let key = CLIAgentRuntimeSessionKey::new(
         workspace_id,
         "codex",
         "thread_closed_cli_runtime_durable_hub",
     )
     .expect("session key should build");
-    let instance = crate::cli_runtime::session_instance::CliSessionInstanceId::unmanaged_for_test(
-        key,
-        u64::MAX,
-    )
-    .expect("test session instance should build");
-    let poisoned = Arc::new(pioneer_runtime_events::ExecutionEventHub::new());
+    let handle = cli_manager
+        .get_or_start(key)
+        .await
+        .expect("recording CLI session should own the replacement listener");
+    let instance = handle.instance().clone();
+    let poisoned = Arc::new(pioneer_runtime_events::ExecutionEventHub::new_with_owned_progress());
     let receiver = poisoned
         .take_durable_receiver()
         .await
@@ -46780,6 +47197,12 @@ async fn closed_cli_runtime_durable_hub_is_replaced() {
         .expect("replacement hub should remain cached");
     active.shutdown_progress().await;
     drop(replacement);
+    assert!(
+        cli_manager
+            .close_session_instance(&instance)
+            .await
+            .expect("replacement listener should stop with its session")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -47629,10 +48052,14 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .expect("recovery execution window should exist");
     assert_eq!(latest_window.window_index, 2);
     assert_eq!(latest_window.status, ExecutionWindowStatus::Running);
+    let recovery_handle = cli_manager
+        .existing_session(&key)
+        .await
+        .expect("recovery must retain the manager-owned process that emits progress");
 
     processor
         .handle_cli_runtime_timeline_event(
-            &key,
+            recovery_handle.instance(),
             RuntimeEvent::ItemStarted(RuntimeItemStarted {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: "native_turn_default".to_owned(),
@@ -47680,7 +48107,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
 
     processor
         .handle_cli_runtime_timeline_event(
-            &key,
+            recovery_handle.instance(),
             RuntimeEvent::ItemStarted(RuntimeItemStarted {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: "native_turn_default".to_owned(),
@@ -47732,7 +48159,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
     if fail_after_confirmation {
         processor
             .handle_cli_runtime_timeline_event(
-                &key,
+                recovery_handle.instance(),
                 RuntimeEvent::TurnFailed(RuntimeTurnFailed {
                     native_thread_id: Some(native_thread_id.to_owned()),
                     native_turn_id: Some("native_turn_default".to_owned()),
@@ -47761,12 +48188,16 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
             .expect("prior recovery job should load")
             .expect("prior recovery job should exist");
         assert_eq!(prior_job.status, RecoveryJobStatus::Succeeded);
+        cli_manager
+            .close_session_instance(recovery_handle.instance())
+            .await
+            .expect("recovery listener should stop with its exact process");
         return;
     }
 
     processor
         .handle_cli_runtime_timeline_event(
-            &key,
+            recovery_handle.instance(),
             RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: "native_turn_default".to_owned(),
@@ -47804,6 +48235,10 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .expect("completed recovery execution window should exist");
     assert_eq!(completed_window.window_index, 2);
     assert_eq!(completed_window.status, ExecutionWindowStatus::Completed);
+    cli_manager
+        .close_session_instance(recovery_handle.instance())
+        .await
+        .expect("completed recovery listener should stop with its exact process");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -62752,6 +63187,8 @@ async fn cli_runtime_terminal_event_expires_pending_requests_for_turn() {
     let native_turn_id = "codex-turn-terminal-event-expires-pending";
     let (processor, crud_store, workspace_id) =
         setup_execution_window_terminal_turn(thread_id, turn_id).await;
+    let cli_manager = test_cli_runtime_manager(Arc::new(RecordingCliRuntimeSession::default()));
+    let processor = processor.with_cli_runtime_manager_for_tests(cli_manager.clone());
 
     let now = chrono::Utc::now().fixed_offset();
     seed_running_cli_runtime_binding(
@@ -62810,9 +63247,13 @@ async fn cli_runtime_terminal_event_expires_pending_requests_for_turn() {
 
     let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
         .expect("session key should build");
+    let handle = cli_manager
+        .get_or_start(key)
+        .await
+        .expect("recording CLI session should own its terminal listener");
     processor
         .handle_cli_runtime_timeline_event(
-            &key,
+            handle.instance(),
             RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: native_turn_id.to_owned(),
@@ -62853,6 +63294,12 @@ async fn cli_runtime_terminal_event_expires_pending_requests_for_turn() {
             .await
             .expect("finalization intent lookup should succeed"),
         "a live CLI success without a final AgentMessage must use the atomic terminal-only path"
+    );
+    assert!(
+        cli_manager
+            .close_session_instance(handle.instance())
+            .await
+            .expect("terminal listener should stop with its session")
     );
 }
 
@@ -65301,6 +65748,7 @@ async fn upload_expiry_waits_for_the_shared_lifecycle_guard() {
     let upload_id = "expiryguardupload0001";
     crud_store_for_assert
         .insert_skill_upload_session(&pioneer_crud::SkillUploadSessionRecord {
+            purpose: "skill".to_owned(),
             upload_id: upload_id.to_owned(),
             workspace_id,
             connection_id,
@@ -66555,7 +67003,16 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
         .process_request_for_connection(connection_id, &install_request.to_string())
         .await;
 
-    let install_response = recv_response_by_id(&mut rx, "skillslifecycle000001").await;
+    let first_payload = recv_text_timeout(&mut rx, Duration::from_secs(2)).await;
+    let first_message: serde_json::Value =
+        serde_json::from_str(&first_payload).expect("first skill install message should decode");
+    assert_eq!(
+        first_message.get("id").and_then(serde_json::Value::as_str),
+        Some("skillslifecycle000001"),
+        "standalone skill install must respond before publishing notifications"
+    );
+    let install_response: JsonRpcResponse = serde_json::from_value(first_message)
+        .expect("standalone skill install response should decode");
     let install_payload: SkillsInstallResponse =
         serde_json::from_value(install_response.result).expect("skills/install payload decode");
     assert_eq!(install_payload.status, "installed");
@@ -67991,6 +68448,10 @@ impl pioneer_mcp::McpRuntimeSession for FakeMcpRuntimeSession {
     }
 
     async fn shutdown(&mut self) {}
+    async fn shutdown_result(&mut self) -> Result<(), pioneer_mcp::McpRuntimeError> {
+        self.shutdown().await;
+        Ok(())
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -68059,7 +68520,18 @@ async fn mcp_list_empty_then_install_stdio_persists_redacts_and_notifies() {
         .process_request_for_connection(connection_id, &install_request.to_string())
         .await;
 
-    let install_response = recv_response_by_id(&mut rx, "mcp_install_stdio0001").await;
+    // The standalone acknowledgement must precede change/status fanout. Do
+    // not use the filtering helper here: it would hide an ordering regression.
+    let first_payload = recv_text_timeout(&mut rx, Duration::from_secs(2)).await;
+    let first_message: serde_json::Value =
+        serde_json::from_str(&first_payload).expect("first install message should decode");
+    assert_eq!(
+        first_message.get("id").and_then(serde_json::Value::as_str),
+        Some("mcp_install_stdio0001"),
+        "standalone install must respond before publishing notifications"
+    );
+    let install_response: JsonRpcResponse =
+        serde_json::from_value(first_message).expect("standalone install response should decode");
     let install_response_json =
         serde_json::to_string(&install_response).expect("mcp/install response serialize");
     assert!(!install_response_json.contains(secret));
@@ -68259,6 +68731,42 @@ async fn mcp_list_empty_then_install_stdio_persists_redacts_and_notifies() {
         .expect("resend MCP installation should exist after policy");
     assert!(!row.enabled);
     assert!(!row.allow_implicit_invocation);
+
+    // The business entrypoint and RPC share the native policy write, audit,
+    // lifecycle guard and runtime publication; there is no internal RPC call.
+    let context =
+        registered_request_context(&processor, connection_id, methods::MCP_POLICY_SET).await;
+    let direct = processor
+        .set_mcp_policy(
+            &context,
+            RequestId::new(generate_test_request_id("mcp_policy", "direct")).expect("request id"),
+            McpPolicySetParams {
+                workspace_id: workspace_id.clone(),
+                name: "resend".into(),
+                scope_kind: McpScopeKind::Workspace,
+                enabled: Some(false),
+                allow_implicit_invocation: Some(false),
+            },
+        )
+        .await
+        .expect("native business operation");
+    assert_eq!(direct.policy, policy_payload.policy);
+    assert_eq!(direct.server.policy, policy_payload.server.policy);
+    let after = crud_store_for_assert
+        .find_mcp_server_installation("workspace", &workspace_id, "resend")
+        .await
+        .expect("native row")
+        .expect("same installation");
+    assert_eq!(after.id, row.id);
+    assert!(!after.enabled && !after.allow_implicit_invocation);
+    let audits = crud_store_for_assert
+        .list_recent_mcp_audit_event_records("resend", 32)
+        .await
+        .expect("native policy audits");
+    assert_eq!(
+        audits.iter().filter(|row| row.action == "policy").count(),
+        2
+    );
 
     let _ = std::fs::remove_dir_all(base_dir);
 }
@@ -79118,6 +79626,649 @@ mod task_delivery_cancellation;
 #[path = "tests/memory_post_turn_recovery.rs"]
 mod memory_post_turn_recovery;
 
+#[tokio::test]
+async fn captured_descendant_stop_deadline_is_propagated_and_same_owner_can_retry() {
+    let (tx, mut rx) = mpsc::channel(64);
+    let sessions = Arc::new(SessionManager::new());
+    let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
+    let (workspaces, store, workspace) = setup_workspace_manager().await;
+    let provider = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "delayed",
+        Arc::new(DelayedProvider {
+            delay: Duration::from_secs(60),
+            text: "done".into(),
+        }),
+    ));
+    let processor = Arc::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("test-model", "delayed")),
+        provider,
+        sessions,
+        workspaces,
+        store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    start_thread_and_turn(
+        &processor,
+        connection,
+        &mut rx,
+        &workspace,
+        "thread_stop_descendant",
+        "turn_stop_descendant",
+        "Chat",
+        "delayed",
+    )
+    .await;
+    let owner = processor
+        .agent_manager
+        .capture_turn_stop_owner("thread_stop_descendant", "turn_stop_descendant")
+        .await
+        .unwrap();
+    let error = processor
+        .await_native_graph_owner(
+            &owner,
+            "graph cancellation",
+            tokio::time::Instant::now() - Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("descendant native cleanup failed")
+    );
+    processor
+        .await_native_graph_owner(
+            &owner,
+            "graph retry",
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    processor
+        .agent_manager
+        .remove_thread("thread_stop_descendant")
+        .await;
+}
+
+#[tokio::test]
+async fn graph_snapshot_matches_revision_runs_and_rejects_foreign_or_unknown() {
+    let (tx, mut rx) = mpsc::channel(64);
+    let sessions = Arc::new(SessionManager::new());
+    let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
+    let (workspaces, store, workspace) = setup_workspace_manager().await;
+    let provider = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "delayed",
+        Arc::new(DelayedProvider {
+            delay: Duration::from_secs(60),
+            text: "done".into(),
+        }),
+    ));
+    let processor = Arc::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("test-model", "delayed")),
+        provider,
+        sessions,
+        workspaces,
+        store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    for (thread, turn) in [("graph-initial", "initial"), ("graph-revision", "revision")] {
+        start_thread_and_turn(
+            &processor, connection, &mut rx, &workspace, thread, turn, "Chat", "delayed",
+        )
+        .await;
+    }
+    let owners = native_snapshot_after_publication(
+        &processor.agent_manager,
+        &["graph-initial".into(), "graph-revision".into()],
+    )
+    .await;
+    assert_eq!(owners.len(), 2);
+    let binding =
+        |thread: &str, turn: &str, pending| pioneer_crud::AgentWorkGraphCancellationTarget {
+            execution_id: "one-task-execution".into(),
+            thread_id: Some(thread.into()),
+            turn_id: Some(turn.into()),
+            parent_task_id: Some("task".into()),
+            turn_pending: pending,
+            has_cli_binding: false,
+        };
+    let targets = vec![
+        binding("graph-initial", "initial", true),
+        binding("graph-revision", "revision", true),
+        binding("historical-sibling", "completed-revision", false),
+        pioneer_crud::AgentWorkGraphCancellationTarget {
+            execution_id: "queued".into(),
+            thread_id: None,
+            turn_id: None,
+            parent_task_id: Some("task".into()),
+            turn_pending: false,
+            has_cli_binding: false,
+        },
+    ];
+    let selected = super::agent_runtime::select_native_graph_owners(
+        &targets,
+        owners.clone(),
+        "root",
+        "root-turn",
+        false,
+    )
+    .unwrap();
+    assert_eq!(selected.len(), 2);
+    let mut foreign = targets.clone();
+    foreign[0].thread_id = Some("foreign-thread".into());
+    assert!(
+        super::agent_runtime::select_native_graph_owners(
+            &foreign,
+            owners.clone(),
+            "root",
+            "root-turn",
+            false
+        )
+        .is_err()
+    );
+    let mut unknown = targets.clone();
+    unknown.push(binding("unknown", "pending-revision", true));
+    assert!(
+        super::agent_runtime::select_native_graph_owners(
+            &unknown,
+            owners.clone(),
+            "root",
+            "root-turn",
+            false
+        )
+        .is_err()
+    );
+    assert!(
+        super::agent_runtime::select_native_graph_owners(
+            &targets,
+            owners.clone(),
+            "root",
+            "unknown-root",
+            true
+        )
+        .is_err()
+    );
+    let first = selected
+        .iter()
+        .find(|owner| owner.turn_id() == "initial")
+        .unwrap();
+    processor
+        .await_native_graph_owner(
+            first,
+            "stop initial",
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    let mut partial_targets = targets.clone();
+    partial_targets[0].turn_pending = false;
+    let partial_snapshot = native_snapshot_after_publication(
+        &processor.agent_manager,
+        &["graph-initial".into(), "graph-revision".into()],
+    )
+    .await;
+    let captured_runs = partial_snapshot
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        super::agent_runtime::validate_native_graph_stop_snapshot(
+            &captured_runs,
+            &partial_snapshot
+        )
+        .is_err()
+    );
+    let active_sibling = super::agent_runtime::select_native_graph_owners(
+        &partial_targets,
+        partial_snapshot,
+        "root",
+        "root-turn",
+        false,
+    )
+    .unwrap();
+    assert_eq!(active_sibling.len(), 1);
+    assert_eq!(active_sibling[0].turn_id(), "revision");
+    // A still-pending DB row can reuse the latest actual joined outcome on retry,
+    // while completed initial/revision history needs no retained old owner.
+    let joined_snapshot = native_snapshot_after_publication(
+        &processor.agent_manager,
+        &["graph-initial".into(), "graph-revision".into()],
+    )
+    .await;
+    assert_eq!(
+        super::agent_runtime::select_native_graph_owners(
+            &targets,
+            joined_snapshot,
+            "root",
+            "root-turn",
+            false
+        )
+        .unwrap()
+        .len(),
+        2
+    );
+    processor
+        .await_native_graph_owner(
+            &active_sibling[0],
+            "stop revision",
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    let remaining = native_snapshot_after_publication(
+        &processor.agent_manager,
+        &["graph-initial".into(), "graph-revision".into()],
+    )
+    .await;
+    // The initial snapshot also contained the already drained historical sibling.
+    super::agent_runtime::validate_native_graph_stop_snapshot(&captured_runs, &remaining).unwrap();
+    let selected_only = active_sibling
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        super::agent_runtime::validate_native_graph_stop_snapshot(&selected_only, &remaining)
+            .is_err()
+    );
+    let terminal_targets = targets
+        .iter()
+        .cloned()
+        .map(|mut target| {
+            target.turn_pending = false;
+            target
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        super::agent_runtime::select_native_graph_owners(
+            &terminal_targets,
+            remaining,
+            "root",
+            "root-turn",
+            false
+        )
+        .unwrap()
+        .is_empty()
+    );
+    processor.agent_manager.remove_thread("graph-initial").await;
+    processor
+        .agent_manager
+        .remove_thread("graph-revision")
+        .await;
+}
+
+#[tokio::test]
+async fn persisted_interrupted_turn_cannot_hide_accepted_direct_checkpoint_startup() {
+    let (tx, mut rx) = mpsc::channel(64);
+    let sessions = Arc::new(SessionManager::new());
+    let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
+    let (workspaces, store, workspace) = setup_workspace_manager().await;
+    let provider = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "delayed",
+        Arc::new(DelayedProvider {
+            delay: Duration::from_secs(60),
+            text: "done".into(),
+        }),
+    ));
+    let processor = Arc::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("test-model", "delayed")),
+        provider,
+        sessions,
+        workspaces,
+        store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    let thread = "checkpoint-admission";
+    let turn = "checkpoint-turn";
+    start_thread_and_turn(
+        &processor, connection, &mut rx, &workspace, thread, turn, "Chat", "delayed",
+    )
+    .await;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if processor
+                .crud_store
+                .native_cancellation_context(turn)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initial native actor must publish cancellation context before stop");
+    // Establish interruption through the cancellation operation, which owns
+    // the durable native acknowledgement and terminal effects. The materializer
+    // alone cannot manufacture that accepted context.
+    let stop_id = generate_test_request_id("checkpoint", "stop");
+    processor
+        .process_request_for_connection(
+            connection,
+            &json!({
+                "jsonrpc": "2.0", "id": stop_id, "method": "turn/cancel",
+                "params": {"thread_id": thread, "turn_id": turn, "reason": "user stop committed"}
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut rx, &stop_id).await;
+    let cancelled: pioneer_protocol::TurnCancelResponse =
+        serde_json::from_value(response.result).expect("native cancellation must succeed");
+    assert_eq!(cancelled.turn.status, TurnStatus::Interrupted);
+    processor.agent_manager.remove_thread(thread).await;
+    processor
+        .agent_manager
+        .ensure_thread(thread, &workspace)
+        .await
+        .unwrap();
+    // Pause the actual actor before activate using its existing checkpoint
+    // durable-publication ACK, not a manually constructed completed control.
+    let mut durable = processor
+        .agent_manager
+        .take_durable_receiver(thread)
+        .await
+        .unwrap();
+    let payload = serde_json::from_value(json!({
+        "schema_version": pioneer_protocol::EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
+        "workspace_id": workspace, "thread_id": thread, "turn_id": turn,
+        "original_request": {"input_count": 1, "text_truncated": false, "attachment_count": 0},
+        "window": {"window_index": 1, "agent_round_count": 1, "tool_call_count": 0},
+        "provider_budget": {"agent_round_count": 1, "tool_call_count": 0, "provider_usage_available": false},
+        "tools": {"requested_count": 0, "executed_count": 0, "unexecuted_count": 0,
+            "total_count": 0, "succeeded_count": 0, "failed_count": 0, "in_progress_count": 0,
+            "detail_limit": 1, "details_truncated": false}
+    })).unwrap();
+    let checkpoint = pioneer_agent::ExecutionCheckpointContext {
+        window_id: format!("{turn}:window:1"),
+        window_index: 1,
+        checkpoint_id: "checkpoint".into(),
+        checkpoint_kind: "window_exhausted".into(),
+        payload,
+        usage: pioneer_agent::ExecutionWindowUsageSnapshot::default(),
+    };
+    let native = processor.agent_manager.clone();
+    let start = tokio::spawn(async move {
+        let cwd = std::env::current_dir().unwrap();
+        native.start_turn_with_hook_context_and_execution_checkpoint_permission_profile_and_security_snapshot(
+            thread, turn, ThreadMode::Chat, pioneer_agent::AgentTurnHookRuntimeContext::default(), "test-model", "delayed",
+            HashMap::new(), pioneer_skills::SkillCatalogSnapshot { version: 1, generated_at_unix: 0, skills: Vec::new() },
+            vec![UserInput::Text { text: "checkpoint startup".into(), text_elements: Vec::new() }],
+            Vec::new(), Vec::new(), HashMap::new(), Vec::new(), Some(checkpoint),
+            pioneer_protocol::default_turn_permission_profile_snapshot(),
+            pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(cwd.to_string_lossy(), 1),
+        ).await
+    });
+    let event = tokio::time::timeout(Duration::from_secs(2), durable.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        event,
+        pioneer_protocol::AgentDurableEvent::TurnExecutionWindowContinued { .. }
+    ));
+    assert!(
+        processor
+            .agent_manager
+            .active_turn_id(thread)
+            .await
+            .is_none()
+    );
+    let (_, persisted) = processor
+        .crud_store
+        .get_turn(thread, turn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.status, TurnStatus::Interrupted);
+    let target = pioneer_crud::AgentWorkGraphCancellationTarget {
+        execution_id: "checkpoint-execution".into(),
+        thread_id: Some(thread.into()),
+        turn_id: Some(turn.into()),
+        parent_task_id: None,
+        turn_pending: false,
+        has_cli_binding: false,
+    };
+    let stopped = processor
+        .agent_manager
+        .capture_native_stop_owners(&[thread.into()], 8)
+        .await
+        .map_err(anyhow::Error::new)
+        .and_then(|owners| {
+            super::agent_runtime::select_native_graph_owners(&[target], owners, thread, turn, false)
+        });
+    assert!(
+        stopped.is_err(),
+        "persisted Interrupted cannot acknowledge accepted unpublished startup"
+    );
+    assert!(matches!(
+        processor
+            .agent_manager
+            .cancel_turn_and_wait(
+                thread,
+                turn,
+                "fallback before publication",
+                tokio::time::Instant::now() + Duration::from_secs(1)
+            )
+            .await,
+        Err(pioneer_agent::StopError::UnknownOwner)
+    ));
+    durable.acknowledge_last(Ok(()));
+    start.await.unwrap().unwrap();
+    let owner = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(owners) = processor
+                .agent_manager
+                .capture_native_stop_owners(&[thread.into()], 8)
+                .await
+            {
+                if let Some(owner) = owners
+                    .into_iter()
+                    .find(|owner| owner.turn_id() == turn && !owner.is_quiescent())
+                {
+                    break owner;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    processor
+        .await_native_graph_owner(
+            &owner,
+            "retry after publication",
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert!(owner.is_quiescent());
+    drop(durable);
+    processor.agent_manager.remove_thread(thread).await;
+}
+
+async fn native_snapshot_after_publication(
+    manager: &pioneer_agent::AgentManager,
+    threads: &[String],
+) -> Vec<pioneer_agent::NativeTurnStopOwner> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match manager.capture_native_stop_owners(threads, 8).await {
+                Ok(owners) => return owners,
+                Err(pioneer_agent::StopError::UnknownOwner) => tokio::task::yield_now().await,
+                Err(error) => panic!("unexpected native snapshot error: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn plugin_mutation_and_final_native_start_share_the_parent_admission_barrier() {
+    use sea_orm::ConnectionTrait;
+    let (processor, _, _, _rx, _, workspace) = setup_workspace_message_processor().await;
+    let id = "P".repeat(21);
+    let now = chrono::Utc::now().fixed_offset();
+    let parent = pioneer_entity::plugin_installation::Model {
+        id: id.clone(),
+        workspace_id: workspace.clone(),
+        name: "empty".into(),
+        version: None,
+        source_upload_id: "admission-upload".into(),
+        package_path: "/managed/package".into(),
+        data_path: "/managed/data".into(),
+        package_fingerprint: "empty-tree".into(),
+        enabled: true,
+        state: "installing".into(),
+        revision: 1,
+        pending_json: None,
+        last_error: None,
+        created_at: now,
+        updated_at: now,
+    };
+    processor
+        .crud_store
+        .insert_plugin_installation(&parent)
+        .await
+        .unwrap();
+    processor
+        .crud_store
+        .settle_plugin_installation(&id, 1, "installed", None)
+        .await
+        .unwrap();
+    processor.crud_store.database_connection().execute_unprepared(&format!(
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at)          VALUES('plugin-admission-thread','{workspace}','','chat','test','test','active','user','visible','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);          INSERT INTO turn(id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at)          VALUES('plugin-admission-turn','plugin-admission-thread','in_progress','{{}}','user','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);"
+    )).await.unwrap();
+    processor
+        .crud_store
+        .prepare_plugin_selection(
+            "plugin-admission-turn",
+            &pioneer_protocol::PluginSelectionSnapshot {
+                parents: vec![pioneer_protocol::PluginSelectedParent {
+                    id: id.clone(),
+                    revision: 1,
+                }],
+                children: vec![],
+                phase: "prepared".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let admitted = processor
+        .acquire_plugin_launch_guards(&workspace, "plugin-admission-turn")
+        .await
+        .unwrap();
+    assert_eq!(admitted.len(), 1);
+    assert!(
+        processor
+            .recovery_coordinator
+            .acquire_plugin_recovery_admission(&workspace, "plugin-admission-turn")
+            .await
+            .is_err(),
+        "recovery must contend on the same live parent admission guard"
+    );
+    assert!(
+        processor
+            .acquire_plugin_mutation(&workspace, &id, 1)
+            .await
+            .is_err()
+    );
+    drop(admitted);
+    let recovery = processor
+        .recovery_coordinator
+        .acquire_plugin_recovery_admission(&workspace, "plugin-admission-turn")
+        .await
+        .unwrap();
+    assert_eq!(recovery.len(), 1);
+    assert!(
+        processor
+            .acquire_plugin_mutation(&workspace, &id, 1)
+            .await
+            .is_err()
+    );
+    drop(recovery);
+    let mutation = processor
+        .acquire_plugin_mutation(&workspace, &id, 1)
+        .await
+        .unwrap();
+    assert!(
+        processor
+            .acquire_plugin_launch_guards(&workspace, "plugin-admission-turn")
+            .await
+            .is_err()
+    );
+    let closed = processor
+        .crud_store
+        .begin_plugin_mutation(
+            &workspace,
+            &id,
+            1,
+            "updating",
+            false,
+            "{\"kind\":\"set_enabled\",\"children\":[]}",
+        )
+        .await
+        .unwrap();
+    drop(mutation);
+    assert_eq!(closed.revision, 2);
+    assert!(
+        processor
+            .acquire_plugin_launch_guards(&workspace, "plugin-admission-turn")
+            .await
+            .is_err()
+    );
+    assert!(
+        processor
+            .acquire_plugin_mutation(&workspace, &id, 1)
+            .await
+            .is_err()
+    );
+    assert!(
+        processor
+            .acquire_plugin_mutation("foreign", &id, 2)
+            .await
+            .is_err()
+    );
+    processor
+        .crud_store
+        .finish_plugin_mutation(&id, 2, "installed", None)
+        .await
+        .unwrap();
+    let enabled = processor
+        .crud_store
+        .begin_plugin_mutation(&workspace, &id, 2, "updating", true, "{}")
+        .await
+        .unwrap();
+    processor
+        .crud_store
+        .finish_plugin_mutation(&id, enabled.revision, "installed", None)
+        .await
+        .unwrap();
+    // Re-enabled parent still requires a fresh trusted selection revision.
+    assert!(
+        processor
+            .acquire_plugin_launch_guards(&workspace, "plugin-admission-turn")
+            .await
+            .is_err()
+    );
+}
+
+// C1-01 source regressions only: NOT_RUN / NOT_COMPILED.
+#[path = "tests_plugin_source.rs"]
+mod plugin_source_tests;
+
+// C2 sources are kept separate from the existing large harness. NOT_RUN / NOT_COMPILED.
+#[path = "plugin_c2_tests.rs"]
+mod plugin_c2_tests;
+
 async fn fanout_test_processor() -> (Arc<MessageProcessor>, String) {
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     (
@@ -79389,6 +80540,7 @@ async fn fanout_lagged_and_duplicate_wakes_do_not_create_competing_emitters() {
 
 #[path = "tests/task_event_fanout_review.rs"]
 mod fanout_review;
+
 struct CancellationEffectBarrier {
     hook_entered: Notify,
     cleanup_entered: Notify,

@@ -6745,9 +6745,9 @@ checksum = "34b357333733e8260735ba5894eb928c02ecc69c78715f01a8019e7fa7f2db4c"
 
 [[package]]
 name = "libc"
-version = "0.2.190"
+version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libfuzzer-sys"
@@ -9489,6 +9489,7 @@ dependencies = [
  "libc",
  "mime_guess",
  "pioneer-observability",
+ "pioneer-plugins",
  "pioneer-protocol",
  "pioneer-skills",
  "qrcode",
@@ -9594,6 +9595,7 @@ dependencies = [
  "pioneer-desktop-foundation",
  "pioneer-desktop-mcp",
  "pioneer-desktop-onboarding",
+ "pioneer-desktop-plugins",
  "pioneer-desktop-providers",
  "pioneer-desktop-settings",
  "pioneer-desktop-skills",
@@ -9680,6 +9682,17 @@ dependencies = [
  "rust-i18n",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "pioneer-desktop-plugins"
+version = "0.56.0"
+dependencies = [
+ "gpui-kit",
+ "pioneer-client",
+ "pioneer-desktop-foundation",
+ "rust-i18n",
  "tokio",
 ]
 
@@ -9835,6 +9848,7 @@ dependencies = [
  "pioneer-memory",
  "pioneer-migration",
  "pioneer-observability",
+ "pioneer-plugins",
  "pioneer-promt",
  "pioneer-protocol",
  "pioneer-provider",
@@ -10004,6 +10018,22 @@ dependencies = [
  "serde_json",
  "tracing",
  "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "pioneer-plugins"
+version = "0.56.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "http",
+ "pioneer-skills",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.11.0",
+ "tempfile",
  "url",
 ]
 

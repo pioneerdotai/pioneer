@@ -55,7 +55,7 @@ const SKILLS_WATCH_DEBOUNCE_MS: u64 = 1_500;
 #[derive(Clone)]
 pub(crate) struct SkillsRuntimeContext {
     catalog_params: SkillCatalogLoadParams,
-    validation_policy: SkillValidationPolicy,
+    pub(in crate::message) validation_policy: SkillValidationPolicy,
     security_policy: SkillSecurityPolicy,
     global_policy_defaults: SkillPolicy,
     user_root: PathBuf,
@@ -73,6 +73,7 @@ pub(crate) struct SkillsRuntimeContext {
 }
 
 mod catalog;
+pub(in crate::message) use catalog::{member_skill_is_operationally_visible, skill_is_disclosed};
 mod lifecycle;
 mod policy;
 mod storage_relocation;
@@ -524,5 +525,38 @@ fn hash_skill_root(root: &Path, hasher: &mut DefaultHasher) {
                 duration.subsec_nanos().hash(hasher);
             }
         }
+    }
+}
+
+pub(crate) use lifecycle::source::{SkillInstallSource, SkillUpdateInput};
+
+impl SkillsRuntimeContext {
+    pub(crate) fn plugin_root(&self) -> PathBuf {
+        self.upload_root
+            .parent()
+            .expect("skills runtime root")
+            .join("plugins")
+    }
+}
+
+impl MessageProcessor {
+    pub(crate) async fn revalidate_plugin_upload(
+        &self,
+        owner: &AuthenticatedTransferOwner,
+        workspace: &str,
+        upload: &str,
+        id: &RequestId,
+    ) -> Result<(), JsonRpcErrorResponse> {
+        let record = self
+            .revalidate_finalized_upload_locked(owner, workspace, upload, id)
+            .await?;
+        if record.purpose != "plugin" {
+            return Err(JsonRpcErrorResponse::new(
+                Some(id.clone()),
+                INVALID_PARAMS_CODE,
+                "plugins.upload_purpose_mismatch",
+            ));
+        }
+        Ok(())
     }
 }

@@ -1,7 +1,7 @@
 use crate::assets::PioneerIconName;
 use crate::desktop_navigation::MainRoute;
 use crate::desktop_navigation::{
-    OpenAdministration, OpenMcp, OpenProviders, OpenSettings, OpenSkills, OpenThreads,
+    OpenAdministration, OpenMcp, OpenPlugins, OpenProviders, OpenSettings, OpenSkills, OpenThreads,
 };
 use gpui_kit::component::{Icon, button::*, separator::Separator, theme::ActiveTheme, *};
 use gpui_kit::{prelude::*, *};
@@ -88,6 +88,21 @@ pub(crate) fn bottom_bar(
                             .on_click({
                                 let target = action_region.clone();
                                 move |_, window, cx| target.dispatch_action(&OpenMcp, window, cx)
+                            }),
+                    )
+                })
+                .when(can_manage_capabilities, |this| {
+                    this.child(
+                        Button::new("bottom-bar-open-plugins")
+                            .ghost()
+                            .small()
+                            .compact()
+                            .label(t!("plugins.title").to_string())
+                            .on_click({
+                                let target = action_region.clone();
+                                move |_, window, cx| {
+                                    target.dispatch_action(&OpenPlugins, window, cx)
+                                }
                             }),
                     )
                 })

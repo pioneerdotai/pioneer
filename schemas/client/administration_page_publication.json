@@ -1,0 +1,626 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AdministrationPagePublication",
+  "type": "object",
+  "properties": {
+    "invitations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AdministrationInvitationRow"
+      }
+    },
+    "members": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AdministrationMemberRow"
+      }
+    },
+    "next_cursor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "page": {
+      "$ref": "#/$defs/AdministrationPage"
+    },
+    "request": {
+      "$ref": "#/$defs/AdministrationLoadState"
+    },
+    "request_cursor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "page",
+    "revision",
+    "members",
+    "invitations",
+    "request"
+  ],
+  "$defs": {
+    "AdministrationInvitationRow": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/InvitationId"
+        },
+        "invitation": {
+          "$ref": "#/$defs/InvitationSummary"
+        },
+        "presentation": {
+          "$ref": "#/$defs/InvitationListRow"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "revision",
+        "invitation",
+        "presentation"
+      ]
+    },
+    "AdministrationLoadState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "idle"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "loading"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "ready"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "failed"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "forbidden"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "cancelled"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "AdministrationMemberRow": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/PrincipalId"
+        },
+        "member": {
+          "$ref": "#/$defs/MemberSummary"
+        },
+        "presentation": {
+          "$ref": "#/$defs/MemberListRow"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "revision",
+        "member",
+        "presentation"
+      ]
+    },
+    "AdministrationPage": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "members"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "member_directory"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "invitations"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "workspace_members"
+            },
+            "workspace_id": {
+              "$ref": "#/$defs/WorkspaceId"
+            }
+          },
+          "required": [
+            "kind",
+            "workspace_id"
+          ]
+        }
+      ]
+    },
+    "AuthorizationRolePresentation": {
+      "description": "Server-owned presentation metadata for the authenticated role. The key is\ndeliberately open-ended: clients display this object but never derive\nauthorization decisions from it.",
+      "type": "object",
+      "properties": {
+        "built_in": {
+          "type": "boolean"
+        },
+        "description": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "display_name",
+        "description",
+        "built_in"
+      ]
+    },
+    "InvitationId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "InvitationInviterSummary": {
+      "type": "object",
+      "properties": {
+        "display_name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/PrincipalKind"
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        }
+      },
+      "required": [
+        "principal_id",
+        "kind",
+        "display_name",
+        "nickname"
+      ]
+    },
+    "InvitationListRow": {
+      "type": "object",
+      "properties": {
+        "can_revoke": {
+          "type": "boolean"
+        },
+        "created_at_unix": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "expires_at_unix": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId"
+        },
+        "inviter_display_name": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/InvitationPresentationStatus"
+        },
+        "terminal_at_unix": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "workspace_names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "invitation_id",
+        "status",
+        "inviter_display_name",
+        "workspace_names",
+        "created_at_unix",
+        "expires_at_unix",
+        "can_revoke"
+      ]
+    },
+    "InvitationPresentationStatus": {
+      "description": "Shell-neutral invitation state. `Unknown` keeps newer server values\nfail-closed in an older presentation layer.",
+      "type": "string",
+      "enum": [
+        "pending",
+        "accepted",
+        "revoked",
+        "expired",
+        "unknown"
+      ]
+    },
+    "InvitationRevokeReason": {
+      "type": "string",
+      "enum": [
+        "inviter_revoked",
+        "inviter_unavailable",
+        "grant_authority_lost",
+        "workspace_unavailable"
+      ]
+    },
+    "InvitationStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "accepted",
+        "revoked",
+        "expired"
+      ]
+    },
+    "InvitationSummary": {
+      "type": "object",
+      "properties": {
+        "created_at_unix": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "expires_at_unix": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId"
+        },
+        "inviter": {
+          "$ref": "#/$defs/InvitationInviterSummary"
+        },
+        "revoke_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvitationRevokeReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "role_key": {
+          "$ref": "#/$defs/RoleKey"
+        },
+        "status": {
+          "$ref": "#/$defs/InvitationStatus"
+        },
+        "terminal_at_unix": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "workspaces": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/InvitationWorkspaceSummary"
+          }
+        }
+      },
+      "required": [
+        "invitation_id",
+        "role_key",
+        "status",
+        "inviter",
+        "workspaces",
+        "created_at_unix",
+        "expires_at_unix"
+      ]
+    },
+    "InvitationWorkspaceSummary": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "name"
+      ]
+    },
+    "MemberListRow": {
+      "type": "object",
+      "properties": {
+        "actions": {
+          "$ref": "#/$defs/MemberPresentationActions"
+        },
+        "avatar_revision": {
+          "description": "Revision-addressed key for the authenticated HTTP avatar cache.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/PrincipalKind"
+        },
+        "lifecycle_managed": {
+          "type": "boolean"
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        },
+        "role": {
+          "$ref": "#/$defs/AuthorizationRolePresentation"
+        },
+        "role_key": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoleKey"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/MemberPresentationStatus"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "principal_id",
+        "kind",
+        "display_name",
+        "nickname",
+        "role",
+        "lifecycle_managed",
+        "status",
+        "actions"
+      ]
+    },
+    "MemberPresentationActions": {
+      "type": "object",
+      "properties": {
+        "can_add_to_workspace": {
+          "type": "boolean"
+        },
+        "can_create_recovery_device": {
+          "type": "boolean"
+        },
+        "can_remove": {
+          "type": "boolean"
+        },
+        "can_remove_from_workspace": {
+          "type": "boolean"
+        },
+        "can_restore": {
+          "type": "boolean"
+        },
+        "can_suspend": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "can_suspend",
+        "can_restore",
+        "can_remove",
+        "can_create_recovery_device",
+        "can_add_to_workspace",
+        "can_remove_from_workspace"
+      ]
+    },
+    "MemberPresentationStatus": {
+      "type": "string",
+      "enum": [
+        "active",
+        "suspended",
+        "removed",
+        "unknown"
+      ]
+    },
+    "MemberSummary": {
+      "type": "object",
+      "properties": {
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/PrincipalKind"
+        },
+        "lifecycle_managed": {
+          "description": "Server-owned target trait. Clients may combine it with caller\ncapabilities for presentation, but never infer it from identity kind\nor a well-known role key.",
+          "type": "boolean"
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        },
+        "role": {
+          "description": "Server-owned role label. Clients display it verbatim and never infer\nrole semantics from `kind` or a well-known key.",
+          "$ref": "#/$defs/AuthorizationRolePresentation"
+        },
+        "role_key": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoleKey"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/PrincipalStatus"
+        }
+      },
+      "required": [
+        "principal_id",
+        "kind",
+        "display_name",
+        "nickname",
+        "role",
+        "lifecycle_managed",
+        "status"
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "PrincipalKind": {
+      "type": "string",
+      "enum": [
+        "superuser",
+        "user"
+      ]
+    },
+    "PrincipalStatus": {
+      "type": "string",
+      "enum": [
+        "active",
+        "suspended",
+        "removed"
+      ]
+    },
+    "RoleKey": {
+      "type": "string",
+      "maxLength": 32,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+    },
+    "WorkspaceId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

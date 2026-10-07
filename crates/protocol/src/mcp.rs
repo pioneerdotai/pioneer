@@ -63,6 +63,8 @@ pub struct McpInstallResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct McpListItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_owner: Option<crate::PluginOwner>,
     pub id: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -520,6 +522,7 @@ mod tests {
     #[test]
     fn operational_mcp_item_has_no_management_transport_or_diagnostics() {
         let item = McpListItem {
+            plugin_owner: None,
             id: "mcp-1".to_owned(),
             name: "search".to_owned(),
             display_name: Some("Search".to_owned()),

@@ -21,8 +21,10 @@ const MCP_ERROR_INTERNAL: &str = "mcp.internal_error";
 mod details;
 mod install;
 mod list;
+pub(in crate::message) use list::mcp_installation_is_disclosed;
 mod oauth;
 mod policy;
+pub(crate) mod portable;
 mod restart;
 mod uninstall;
 
@@ -277,6 +279,7 @@ fn list_item_from_record_with_catalog_and_runtime(
             }
         });
     Ok(McpListItem {
+        plugin_owner: None,
         id: record.id.clone().unwrap_or_default(),
         name: record.name.clone(),
         display_name: record.display_name.clone(),
@@ -375,6 +378,24 @@ impl MessageProcessor {
         };
         self.send_gateway_management_notification(events::MCP_CHANGED, &notification)
             .await;
+    }
+
+    /// Standalone RPCs acknowledge the write before notifications and runtime
+    /// reload, preserving their existing ordering without a second installer.
+    pub(super) async fn publish_mcp_changes(
+        &self,
+        workspace_id: &str,
+        changed: Vec<McpChangedItem>,
+    ) {
+        self.notify_mcp_changed(workspace_id, changed, now_timestamp_secs())
+            .await;
+        if let Err(error) = self.mcp_service.reload_workspace(workspace_id).await {
+            warn!(
+                workspace_id,
+                error = %format!("{error:#}"),
+                "failed to reload MCP runtime after configuration change"
+            );
+        }
     }
 
     async fn validate_mcp_workspace(

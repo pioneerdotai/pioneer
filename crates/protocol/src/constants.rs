@@ -95,6 +95,16 @@ pub mod methods {
     pub const CLI_RUNTIME_REQUEST_RESPOND: &str = "cli_runtime/request/respond";
     pub const SETTINGS_GET: &str = "settings/get";
     pub const SETTINGS_UPDATE: &str = "settings/update";
+    pub const PLUGINS_PREVIEW: &str = "plugins/preview";
+    pub const PLUGINS_INSTALL: &str = "plugins/install";
+    pub const PLUGINS_UPDATE: &str = "plugins/update";
+    pub const PLUGINS_REMOVE: &str = "plugins/remove";
+    pub const PLUGINS_RETRY: &str = "plugins/retry";
+    pub const PLUGINS_CONTINUE: &str = "plugins/continue";
+    pub const PLUGINS_SET_ENABLED: &str = "plugins/set_enabled";
+    pub const PLUGINS_LIST: &str = "plugins/list";
+    pub const PLUGINS_DETAILS: &str = "plugins/details";
+    pub const PLUGINS_CHANGED: &str = "plugins/changed";
     pub const SKILLS_LIST: &str = "skills/list";
     pub const SKILLS_INSTALL: &str = "skills/install";
     pub const SKILLS_UPDATE: &str = "skills/update";
@@ -254,6 +264,15 @@ pub mod methods {
         CLI_RUNTIME_REQUEST_RESPOND,
         SETTINGS_GET,
         SETTINGS_UPDATE,
+        PLUGINS_PREVIEW,
+        PLUGINS_INSTALL,
+        PLUGINS_UPDATE,
+        PLUGINS_REMOVE,
+        PLUGINS_RETRY,
+        PLUGINS_CONTINUE,
+        PLUGINS_SET_ENABLED,
+        PLUGINS_LIST,
+        PLUGINS_DETAILS,
         SKILLS_LIST,
         SKILLS_INSTALL,
         SKILLS_UPDATE,

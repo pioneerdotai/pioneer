@@ -1267,6 +1267,7 @@ mod tests {
         turn::Entity::insert(turn::ActiveModel {
             id: Set(turn_id.to_owned()),
             thread_id: Set(thread_id.to_owned()),
+            plugin_selection_json: Set(None),
             initiated_by_actor_id: Set(None),
             initiated_by_actor_kind: Set(None),
             status: Set("completed".to_owned()),
@@ -1434,6 +1435,7 @@ mod tests {
         turn::Entity::insert(turn::ActiveModel {
             id: Set(synthetic_turn_id.to_owned()),
             thread_id: Set(thread_id.to_owned()),
+            plugin_selection_json: Set(None),
             initiated_by_actor_id: Set(None),
             initiated_by_actor_kind: Set(None),
             status: Set("completed".to_owned()),

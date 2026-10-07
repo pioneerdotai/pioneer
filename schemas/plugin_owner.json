@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PluginOwner",
+  "type": "object",
+  "properties": {
+    "member_key": {
+      "type": "string"
+    },
+    "plugin_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "plugin_id",
+    "member_key"
+  ]
+}

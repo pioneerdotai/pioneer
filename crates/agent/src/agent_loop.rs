@@ -26,7 +26,6 @@ use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
@@ -316,6 +315,9 @@ pub(super) async fn run_agent_loop(
 
     macro_rules! clear_active_turn_control {
         () => {{
+            if let Some(control) = active_turn_control.as_ref() {
+                let _ = control.completion.finish(false).await;
+            }
             if let (Some(turn_id), Some(run_id)) = (active_turn_id.as_deref(), active_turn_run_id) {
                 control_plane.clear(turn_id, run_id);
             }
@@ -337,6 +339,17 @@ pub(super) async fn run_agent_loop(
     }
 
     while let Some(command) = command_rx.recv().await {
+        // Start/recovery may ACK before replacement publication, and finish
+        // may continue a drained root into a new execution window. Keep this
+        // actor seam visible to stop snapshots through all intervening awaits.
+        let _publication = matches!(
+            &command,
+            AgentCommand::StartTurn { .. }
+                | AgentCommand::StartRecoveryAttempt { .. }
+                | AgentCommand::StartRestoredRecoveryTurn { .. }
+                | AgentCommand::TurnTaskFinished { .. }
+        )
+        .then(|| control_plane.publication_transition());
         // Retain the completed turn's Stop fence without owning background
         // preparation. Durable registration already happened before provider
         // execution and the Gateway worker owns all later work.
@@ -346,10 +359,10 @@ pub(super) async fn run_agent_loop(
                 | AgentCommand::StartRecoveryAttempt { .. }
                 | AgentCommand::StartRestoredRecoveryTurn { .. }
                 | AgentCommand::Shutdown
-        ) || matches!(&command, AgentCommand::CancelTurn { turn_id, .. }
-                if context_fence.as_ref().is_some_and(|check| check.session.context.turn_id == *turn_id));
-        let cancelled_context_check = matches!(&command, AgentCommand::CancelTurn { turn_id, .. }
-            if context_fence.as_ref().is_some_and(|check| check.session.context.turn_id == *turn_id));
+        ) || matches!(&command, AgentCommand::CancelTurn { turn_id, captured_run, .. }
+                if (captured_run.is_none() || *captured_run == active_turn_run_id) && context_fence.as_ref().is_some_and(|check| check.session.context.turn_id == *turn_id));
+        let cancelled_context_check = matches!(&command, AgentCommand::CancelTurn { turn_id, captured_run, .. }
+            if (captured_run.is_none() || *captured_run == active_turn_run_id) && context_fence.as_ref().is_some_and(|check| check.session.context.turn_id == *turn_id));
         let context_stop_error = if stop_check && let Some(check) = context_fence.take() {
             check
                 .stop(!matches!(&command, AgentCommand::Shutdown))
@@ -511,7 +524,12 @@ pub(super) async fn run_agent_loop(
                 let turn_request_snapshot = active_turn_request.clone();
                 let runtime_snapshot = active_runtime_snapshot.clone();
                 let recovery = active_recovery.clone();
-                active_turn_task = None;
+                if let Some(task) = active_turn_task.take() {
+                    let _ = task.into_join_handle().join().await;
+                }
+                if let Some(control) = active_turn_control.as_ref() {
+                    let _ = control.completion.finish(false).await;
+                }
 
                 let TurnTaskCompletion {
                     result,
@@ -1002,12 +1020,19 @@ pub(super) async fn run_agent_loop(
                 }
             }
             AgentCommand::CancelTurn {
+                captured_run,
                 turn_id,
                 reason,
                 ack,
             } => {
-                if let Some(outcome) = ack.completed() {
+                if captured_run.is_none()
+                    && let Some(outcome) = ack.completed()
+                {
                     let _ = ack.send(outcome);
+                    continue;
+                }
+                if captured_run.is_some() && captured_run != active_turn_run_id {
+                    let _ = ack.send(Err(super::AgentControlError::TurnMismatch));
                     continue;
                 }
                 if cancelled_context_check {
@@ -1039,6 +1064,9 @@ pub(super) async fn run_agent_loop(
 
                 if let Some(task) = active_turn_task.take() {
                     wait_for_turn_task_shutdown(task.into_join_handle()).await;
+                }
+                if let Some(control) = active_turn_control.as_ref() {
+                    let _ = control.completion.finish(false).await;
                 }
                 let turn_request_snapshot = active_turn_request.clone();
                 let runtime_snapshot = active_runtime_snapshot.clone();
@@ -1299,6 +1327,9 @@ pub(super) async fn run_agent_loop(
                 if let Some(task) = active_turn_task.take() {
                     wait_for_turn_task_shutdown(task.into_join_handle()).await;
                 }
+                if let Some(control) = active_turn_control.as_ref() {
+                    let _ = control.completion.finish(false).await;
+                }
 
                 if let Err(error) = publish_recovery_execution_window_continued(
                     event_hub.as_ref(),
@@ -1508,6 +1539,9 @@ pub(super) async fn run_agent_loop(
                 if let Some(task) = active_turn_task.take() {
                     wait_for_turn_task_shutdown(task.into_join_handle()).await;
                 }
+                if let Some(control) = active_turn_control.as_ref() {
+                    let _ = control.completion.finish(false).await;
+                }
                 break;
             }
         }
@@ -1526,8 +1560,10 @@ fn spawn_turn_task(
     turn_control: TurnExecutionControl,
     recovery: Option<RecoveryAttemptContext>,
     run_id: u64,
-) -> JoinHandle<()> {
-    tokio::spawn(turn_flow_future(async move {
+) -> Arc<super::NativeTask> {
+    let owner = turn_control.completion.clone();
+    let panic_owner = owner.clone();
+    let handle = tokio::spawn(turn_flow_future(async move {
         // Admission ACK remains process control; provider/tool work cannot begin
         // until its immutable cancellation description has a durable ACK.
         let initial_turn = recovery.is_none() && turn_request.execution_window_index == 1;
@@ -1661,6 +1697,7 @@ fn spawn_turn_task(
         .catch_unwind()
         .await
         .unwrap_or_else(|panic| {
+            panic_owner.mark_panic();
             let message = panic_payload_message(panic.as_ref());
             error!(
                 thread_id = %thread_id,
@@ -1684,7 +1721,10 @@ fn spawn_turn_task(
                 context_session,
             })
             .await;
-    }))
+    }));
+    let root = super::NativeTask::new(handle);
+    owner.set_root(root.clone());
+    root
 }
 
 struct OwnedContextFence {
@@ -1709,7 +1749,7 @@ impl Drop for OwnedContextFence {
 }
 
 struct ActiveTurnTask {
-    handle: Option<JoinHandle<()>>,
+    handle: Option<Arc<super::NativeTask>>,
 }
 
 struct AgentLoopControlPlaneGuard(AgentThreadControlPlane);
@@ -1721,13 +1761,13 @@ impl Drop for AgentLoopControlPlaneGuard {
 }
 
 impl ActiveTurnTask {
-    fn new(handle: JoinHandle<()>) -> Self {
+    fn new(handle: Arc<super::NativeTask>) -> Self {
         Self {
             handle: Some(handle),
         }
     }
 
-    fn into_join_handle(mut self) -> JoinHandle<()> {
+    fn into_join_handle(mut self) -> Arc<super::NativeTask> {
         self.handle
             .take()
             .expect("active turn task handle should be present")
@@ -1745,22 +1785,13 @@ impl Drop for ActiveTurnTask {
     }
 }
 
-async fn wait_for_turn_task_shutdown(mut task: JoinHandle<()>) {
-    if task.is_finished() {
-        let _ = task.await;
-        return;
-    }
-
-    if timeout(Duration::from_millis(TURN_CANCEL_GRACE_MS), &mut task)
+async fn wait_for_turn_task_shutdown(task: Arc<super::NativeTask>) {
+    if timeout(Duration::from_millis(TURN_CANCEL_GRACE_MS), task.join())
         .await
         .is_err()
     {
-        // Cooperative cancellation had its full grace period.  A task that
-        // still does not quiesce is fenced as a last resort; the shell child
-        // itself is protected by kill_on_drop and the handler process-group
-        // cleanup.
         task.abort();
-        let _ = task.await;
+        let _ = task.join().await;
     }
 }
 

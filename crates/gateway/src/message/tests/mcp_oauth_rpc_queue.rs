@@ -1307,6 +1307,7 @@ async fn oauth_scope_phase(phase: &'static str) {
         .await
         .unwrap();
     }
+    let startup_release = Arc::new(tokio::sync::Notify::new());
     if phase != "live" && phase != "recovery" {
         let entered = Arc::new(tokio::sync::Notify::new());
         processor
@@ -1314,6 +1315,7 @@ async fn oauth_scope_phase(phase: &'static str) {
             .set_connector_for_tests(Arc::new(ScopePhaseConnector {
                 phase,
                 entered: entered.clone(),
+                release: startup_release.clone(),
             }));
         processor
             .mcp_service
@@ -1387,9 +1389,33 @@ async fn oauth_scope_phase(phase: &'static str) {
             .mcp_service
             .set_connector_for_tests(Arc::new(FakeMcpRuntimeConnector));
     }
-    service
-        .restart_server("workspace", &workspace_id, "resend")
+    let restart = {
+        let service = service.clone();
+        let workspace_id = workspace_id.clone();
+        tokio::spawn(async move {
+            service
+                .restart_server("workspace", &workspace_id, "resend")
+                .await
+        })
+    };
+    if phase == "startup" {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !service.task_stop_requested_for_tests(id).await {
+                tokio::task::yield_now().await;
+            }
+        })
         .await
+        .expect("restart must request stop from the retained startup owner");
+        assert!(
+            !restart.is_finished(),
+            "startup cannot acknowledge stop before completion"
+        );
+        startup_release.notify_one();
+    }
+    tokio::time::timeout(Duration::from_secs(3), restart)
+        .await
+        .expect("restart should finish after real connector completion")
+        .unwrap()
         .unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -1488,19 +1514,28 @@ async fn await_oauth_wire_response(
 struct ScopePhaseConnector {
     phase: &'static str,
     entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
 }
 #[async_trait::async_trait]
 impl pioneer_mcp::McpRuntimeConnector for ScopePhaseConnector {
     async fn connect(
         &self,
-        _: pioneer_mcp::McpServerInstallation,
-        _: String,
-        _: Arc<dyn pioneer_mcp::McpSecretResolver>,
-        _: i64,
+        installation: pioneer_mcp::McpServerInstallation,
+        id: String,
+        resolver: Arc<dyn pioneer_mcp::McpSecretResolver>,
+        now: i64,
     ) -> Result<Box<dyn pioneer_mcp::McpRuntimeSession>, pioneer_mcp::McpRuntimeError> {
         self.entered.notify_one();
         if self.phase == "startup" {
-            std::future::pending().await
+            self.release.notified().await;
+            pioneer_mcp::McpRuntimeConnector::connect(
+                &FakeMcpRuntimeConnector,
+                installation,
+                id,
+                resolver,
+                now,
+            )
+            .await
         } else if self.phase == "backoff" {
             Err(pioneer_mcp::McpRuntimeError::failed(
                 "controlled retry backoff",
@@ -1596,6 +1631,9 @@ impl pioneer_mcp::McpRuntimeSession for ScopeRefreshSession {
     }
     async fn shutdown(&mut self) {
         self.inner.shutdown().await;
+    }
+    async fn shutdown_result(&mut self) -> Result<(), pioneer_mcp::McpRuntimeError> {
+        self.inner.shutdown_result().await
     }
 }
 

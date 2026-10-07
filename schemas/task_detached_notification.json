@@ -1478,6 +1478,27 @@
         {
           "type": "object",
           "properties": {
+            "expectedRevision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "pluginId": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "plugin"
+            }
+          },
+          "required": [
+            "type",
+            "pluginId",
+            "expectedRevision"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "packId": {
               "anyOf": [
                 {

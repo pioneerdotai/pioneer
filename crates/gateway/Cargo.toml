@@ -37,6 +37,7 @@ pioneer-promt.workspace = true
 pioneer-runtime-events.workspace = true
 pioneer-tunnel.workspace = true
 pioneer-skills.workspace = true
+pioneer-plugins.workspace = true
 pioneer-sqlite.workspace = true
 pioneer-tasks.workspace = true
 pioneer-tools.workspace = true

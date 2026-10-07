@@ -2069,6 +2069,89 @@ where
     )
 }
 
+pub fn plugins_list<T: JsonRpcRequestTransport>(
+    transport: &T,
+    params: pioneer_protocol::PluginsListParams,
+) -> Result<pioneer_protocol::PluginsListResponse> {
+    require_non_empty_field(&params.workspace_id, "workspace_id", methods::PLUGINS_LIST)?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::PLUGINS_LIST,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+pub fn plugins_details<T: JsonRpcRequestTransport>(
+    transport: &T,
+    params: pioneer_protocol::PluginsDetailsParams,
+) -> Result<pioneer_protocol::PluginItem> {
+    require_non_empty_field(
+        &params.workspace_id,
+        "workspace_id",
+        methods::PLUGINS_DETAILS,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::PLUGINS_DETAILS,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+pub fn plugins_preview<T: JsonRpcRequestTransport>(
+    transport: &T,
+    params: pioneer_protocol::PluginsSourceParams,
+) -> Result<pioneer_protocol::PluginsPreviewResponse> {
+    require_non_empty_field(
+        &params.workspace_id,
+        "workspace_id",
+        methods::PLUGINS_PREVIEW,
+    )?;
+    anyhow::ensure!(
+        params.target.is_none(),
+        "use typed plugins_update_preview for an existing plugin"
+    );
+    send_json_rpc_request_typed(
+        transport,
+        methods::PLUGINS_PREVIEW,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+pub fn plugins_install<T: JsonRpcRequestTransport>(
+    transport: &T,
+    params: pioneer_protocol::PluginsInstallParams,
+) -> Result<pioneer_protocol::PluginItem> {
+    require_non_empty_field(
+        &params.workspace_id,
+        "workspace_id",
+        methods::PLUGINS_INSTALL,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::PLUGINS_INSTALL,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn plugins_set_enabled<T: JsonRpcRequestTransport>(
+    transport: &T,
+    params: pioneer_protocol::PluginsSetEnabledParams,
+) -> Result<pioneer_protocol::PluginItem> {
+    require_non_empty_field(
+        &params.workspace_id,
+        "workspace_id",
+        methods::PLUGINS_SET_ENABLED,
+    )?;
+    require_non_empty_field(&params.plugin_id, "plugin_id", methods::PLUGINS_SET_ENABLED)?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::PLUGINS_SET_ENABLED,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
 pub fn skills_list<TTransport>(
     transport: &TTransport,
     params: SkillListParams,
@@ -4009,6 +4092,7 @@ mod tests {
                 skills_upload_start(
                     &PanicTransport,
                     SkillsUploadStartParams {
+                        purpose: Default::default(),
                         workspace_id: "ws_1".to_owned(),
                         file_name: "skill.tar.gz".to_owned(),
                         archive_format: SkillArchiveFormat::TarGz,
@@ -4230,5 +4314,104 @@ mod tests {
             ),
             "client_attachment_id is required for artifact/upload/start"
         );
+    }
+}
+
+pub fn plugins_update_preview<T: JsonRpcRequestTransport>(
+    transport: &T,
+    params: pioneer_protocol::PluginsUpdatePreviewParams,
+) -> Result<pioneer_protocol::PluginsUpdatePreviewResponse> {
+    require_non_empty_field(
+        &params.workspace_id,
+        "workspace_id",
+        methods::PLUGINS_PREVIEW,
+    )?;
+    require_non_empty_field(&params.plugin_id, "plugin_id", methods::PLUGINS_PREVIEW)?;
+    require_non_empty_field(&params.upload_id, "upload_id", methods::PLUGINS_PREVIEW)?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::PLUGINS_PREVIEW,
+        &pioneer_protocol::PluginsSourceParams {
+            workspace_id: params.workspace_id,
+            upload_id: params.upload_id,
+            target: Some(pioneer_protocol::PluginPreviewTarget {
+                plugin_id: params.plugin_id,
+                expected_revision: params.expected_revision,
+            }),
+        },
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+pub fn plugins_mutate<T: JsonRpcRequestTransport>(
+    transport: &T,
+    params: pioneer_protocol::PluginsMutateParams,
+) -> Result<pioneer_protocol::PluginsMutationResponse> {
+    use pioneer_protocol::*;
+    let PluginsMutateParams {
+        workspace_id,
+        plugin_id,
+        expected_revision,
+        intent,
+    } = params;
+    require_non_empty_field(&workspace_id, "workspace_id", "plugins")?;
+    require_non_empty_field(&plugin_id, "plugin_id", "plugins")?;
+    match intent {
+        PluginManagementIntent::Update {
+            upload_id,
+            expected_fingerprint,
+            confirm_changes,
+        } => send_json_rpc_request_typed(
+            transport,
+            methods::PLUGINS_UPDATE,
+            &PluginsUpdateParams {
+                workspace_id,
+                plugin_id,
+                expected_revision,
+                upload_id,
+                expected_fingerprint,
+                confirm_changes,
+            },
+            RPC_REQUEST_TIMEOUT,
+        ),
+        PluginManagementIntent::Remove { purge_data } => send_json_rpc_request_typed(
+            transport,
+            methods::PLUGINS_REMOVE,
+            &PluginsRemoveParams {
+                workspace_id,
+                plugin_id,
+                expected_revision,
+                purge_data,
+            },
+            RPC_REQUEST_TIMEOUT,
+        ),
+        PluginManagementIntent::Retry {
+            components,
+            restore_removed,
+        } => send_json_rpc_request_typed(
+            transport,
+            methods::PLUGINS_RETRY,
+            &PluginsRetryParams {
+                workspace_id,
+                plugin_id,
+                expected_revision,
+                components: if components.is_empty() {
+                    None
+                } else {
+                    Some(components)
+                },
+                restore_removed,
+            },
+            RPC_REQUEST_TIMEOUT,
+        ),
+        PluginManagementIntent::Continue => send_json_rpc_request_typed(
+            transport,
+            methods::PLUGINS_CONTINUE,
+            &PluginsContinueParams {
+                workspace_id,
+                plugin_id,
+                expected_revision,
+            },
+            RPC_REQUEST_TIMEOUT,
+        ),
     }
 }

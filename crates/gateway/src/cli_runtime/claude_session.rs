@@ -334,6 +334,14 @@ enum ClaudeRequiredMcpBridgeState {
         server: JoinHandle<Result<(), crate::cli_runtime::mcp::server::CliMcpBridgeServerError>>,
         active_turn: Option<ClaudeActiveMcpTurn>,
     },
+    Stopping {
+        handle: Option<CliMcpBridgeFacadeHandle>,
+        server: Option<
+            JoinHandle<Result<(), crate::cli_runtime::mcp::server::CliMcpBridgeServerError>>,
+        >,
+        outcome: Option<Result<(), String>>,
+        cleanup_done: bool,
+    },
     Failed,
 }
 
@@ -346,7 +354,8 @@ impl ClaudeRequiredMcpBridge {
             let mut state = self.state.lock().await;
             match &*state {
                 ClaudeRequiredMcpBridgeState::Ready { .. } => return Ok(()),
-                ClaudeRequiredMcpBridgeState::Failed => {
+                ClaudeRequiredMcpBridgeState::Failed
+                | ClaudeRequiredMcpBridgeState::Stopping { .. } => {
                     bail!("Claude required MCP bridge generation is failed")
                 }
                 ClaudeRequiredMcpBridgeState::Serving { bound_grant, .. } => bound_grant.clone(),
@@ -365,7 +374,7 @@ impl ClaudeRequiredMcpBridge {
                         .map_err(|error| {
                             anyhow!("Claude required MCP transport failed: {error}")
                         })?;
-                    let (handle, server) = CliMcpBridgeFacadeServer::build(
+                    let (handle, server) = CliMcpBridgeFacadeServer::build_owned(
                         transport,
                         self.supervisor.coordinator(),
                         Arc::new(ClaudeCorrelatingTurnMcpInvoker {
@@ -425,16 +434,76 @@ impl ClaudeRequiredMcpBridge {
         }
     }
 
-    async fn fail_closed(&self) {
+    async fn request_stop(&self) {
         let mut state = self.state.lock().await;
-        let previous = std::mem::replace(&mut *state, ClaudeRequiredMcpBridgeState::Failed);
-        match previous {
-            ClaudeRequiredMcpBridgeState::Serving { server, .. }
-            | ClaudeRequiredMcpBridgeState::Ready { server, .. } => server.abort(),
-            ClaudeRequiredMcpBridgeState::Pending | ClaudeRequiredMcpBridgeState::Failed => {}
+        if let ClaudeRequiredMcpBridgeState::Stopping { handle, .. } = &*state {
+            if let Some(handle) = handle {
+                handle.request_shutdown();
+            }
+            return;
         }
-        drop(state);
-        self.supervisor.revoke_session(&self.process_instance).await;
+        let previous = std::mem::replace(&mut *state, ClaudeRequiredMcpBridgeState::Failed);
+        *state = match previous {
+            ClaudeRequiredMcpBridgeState::Serving { handle, server, .. }
+            | ClaudeRequiredMcpBridgeState::Ready { handle, server, .. } => {
+                handle.request_shutdown();
+                ClaudeRequiredMcpBridgeState::Stopping {
+                    handle: Some(handle),
+                    server: Some(server),
+                    outcome: None,
+                    cleanup_done: false,
+                }
+            }
+            _ => ClaudeRequiredMcpBridgeState::Stopping {
+                handle: None,
+                server: None,
+                outcome: Some(Ok(())),
+                cleanup_done: false,
+            },
+        };
+    }
+    async fn stop_and_wait(&self) -> Result<()> {
+        self.request_stop().await;
+        let mut state = self.state.lock().await;
+        let ClaudeRequiredMcpBridgeState::Stopping {
+            server,
+            outcome,
+            cleanup_done,
+            ..
+        } = &mut *state
+        else {
+            bail!("Claude bridge stop ownership changed");
+        };
+        if outcome.is_none() {
+            let task = server
+                .as_mut()
+                .ok_or_else(|| anyhow!("Claude bridge completion is unknown"))?;
+            let result = match task.await {
+                Ok(result) => result.map_err(|e| e.to_string()),
+                Err(_) => Err("Claude MCP facade worker failed".to_owned()),
+            };
+            server.take();
+            *outcome = Some(result);
+        }
+        outcome.clone().unwrap().map_err(|e| anyhow!("{e}"))?;
+        if !*cleanup_done {
+            if !self.launch.cleanup_confirmed()
+                && !self
+                    .supervisor
+                    .revoke_session_result(&self.process_instance)
+                    .await?
+                && !self.launch.cleanup_confirmed()
+            {
+                bail!("CLI MCP cleanup owner is unknown");
+            }
+            *cleanup_done = true;
+        }
+        Ok(())
+    }
+    async fn fail_closed(&self) {
+        if let Err(error) = self.stop_and_wait().await {
+            tracing::warn!(error = %error, "Claude MCP bridge cleanup retained");
+        }
     }
 
     async fn prepare_turn(
@@ -656,7 +725,9 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
         &self,
         process_instance: &CliSessionInstanceId,
         launch_spec: &CliSessionLaunchSpec,
+        startup: &crate::cli_runtime::manager::CLIAgentRuntimeSessionStartup,
     ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
+        startup.check_admission()?;
         let options = &launch_spec.options;
         let launch_projection = match &launch_spec.mcp {
             CliMcpSessionLaunch::Disabled | CliMcpSessionLaunch::ManagementOnly => None,
@@ -773,6 +844,12 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
             }
         };
         let mut managed_mcp_guard = ClaudeManagedMcpConfigStartupGuard::new(managed_mcp_config);
+        startup.retain_preparation(
+            crate::cli_runtime::manager::CliStartupProcessCleanup::Claude(
+                managed_mcp_guard.descriptor().clone(),
+            ),
+        );
+        managed_mcp_guard.cleanup_on_drop = false;
         let allowed_tool_names = launch_projection
             .map(|projection| projection.preflight.allowed_tool_names.as_slice())
             .unwrap_or_default();
@@ -785,9 +862,19 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
         )?
         .with_process_generation(process_instance.generation())
         .context("failed to bind Claude process generation")?;
-        let mut process = spawn_cli_agent_process(&process_config)
+        startup.check_admission()?;
+        let process = spawn_cli_agent_process(&process_config)
             .with_context(|| format!("failed to spawn Claude CLI for runtime `{}`", instance.id))?;
-        let stderr = process.stderr();
+        let managed_mcp_config = managed_mcp_guard.disarm();
+        let process = Arc::new(Mutex::new(process));
+        startup.retain_process(
+            process.clone(),
+            crate::cli_runtime::manager::CliStartupProcessCleanup::Claude(
+                managed_mcp_config.clone(),
+            ),
+        );
+        let mut process_guard = process.lock().await;
+        let stderr = process_guard.stderr();
         let mcp_native_items = prepared_mcp_bridge
             .as_ref()
             .map(|_| Arc::new(ClaudeNativeMcpCorrelationLedger::default()));
@@ -796,11 +883,9 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
                 .bridge_supervisor
                 .as_ref()
                 .expect("prepared Claude bridge requires supervisor");
-            let provider_process_id = match process.id() {
+            let provider_process_id = match process_guard.id() {
                 Some(process_id) if process_id != 0 => process_id,
                 _ => {
-                    supervisor.revoke_session(process_instance).await;
-                    let _ = process.terminate_with_grace(Duration::from_secs(2)).await;
                     bail!("Claude provider process identity is unavailable");
                 }
             };
@@ -808,8 +893,6 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
                 .associate_provider_process(process_instance, provider_process_id, None)
                 .await
             {
-                supervisor.revoke_session(process_instance).await;
-                let _ = process.terminate_with_grace(Duration::from_secs(2)).await;
                 bail!("failed to bind Claude MCP bridge to provider process: {error}");
             }
             let invoker = self
@@ -839,7 +922,7 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
         } else {
             None
         };
-        let (stdout, stdin) = process.take_stdio()?;
+        let (stdout, stdin) = process_guard.take_stdio()?;
         let (event_tx, event_rx) = mpsc::channel(instance.event_channel_capacity.max(1));
         let client = Arc::new(ClaudeStreamClient::new(
             stdin,
@@ -870,31 +953,10 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
             launch_spec.native_event_budget,
         ));
         client.spawn_reader(stdout);
-        if let Err(error) = client
-            .initialize(Duration::from_millis(instance.startup_probe_timeout_ms))
-            .await
-        {
-            let provider_session_id = provider_session_id.to_string();
-            let _ = self
-                .crud_store
-                .verify_claude_provider_session_binding(
-                    key.thread_id.as_str(),
-                    provider_session_id.as_str(),
-                    None,
-                    i64::try_from(process_instance.generation()).unwrap_or(i64::MAX),
-                )
-                .await;
-            let _ = process.terminate_with_grace(Duration::from_secs(2)).await;
-            if let Some(bridge) = required_mcp_bridge.as_ref() {
-                bridge.fail_closed().await;
-            }
-            return Err(error).context("Claude initialize handshake failed");
-        }
-        let managed_mcp_config = managed_mcp_guard.disarm();
-
-        Ok(Arc::new(ClaudeCLIAgentRuntimeSession {
+        drop(process_guard);
+        let session = Arc::new(ClaudeCLIAgentRuntimeSession {
             client,
-            process: Mutex::new(process),
+            process,
             request_timeout: Duration::from_millis(instance.request_timeout_ms),
             shutdown_grace: Duration::from_secs(5),
             native_thread_id: Mutex::new(None),
@@ -911,17 +973,38 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
             })),
             _stderr: stderr,
             managed_mcp_config: std::sync::Mutex::new(Some(managed_mcp_config)),
-        }))
+        });
+        startup.retain_session(session.clone());
+        let initialize = tokio::select! {
+            biased;
+            _ = startup.cancelled() => Err(anyhow!("Claude initialize was stopped")),
+            result = session.client.initialize(Duration::from_millis(instance.startup_probe_timeout_ms)) => result,
+        };
+        if let Err(error) = initialize {
+            let _ = self
+                .crud_store
+                .verify_claude_provider_session_binding(
+                    key.thread_id.as_str(),
+                    provider_session_id.to_string().as_str(),
+                    None,
+                    i64::try_from(process_instance.generation()).unwrap_or(i64::MAX),
+                )
+                .await;
+            return Err(error).context("Claude initialize handshake failed");
+        }
+        Ok(session)
     }
 }
 
 struct ClaudeManagedMcpConfigStartupGuard {
+    cleanup_on_drop: bool,
     descriptor: Option<ClaudeManagedMcpConfigDescriptor>,
 }
 
 impl ClaudeManagedMcpConfigStartupGuard {
     fn new(descriptor: ClaudeManagedMcpConfigDescriptor) -> Self {
         Self {
+            cleanup_on_drop: true,
             descriptor: Some(descriptor),
         }
     }
@@ -941,6 +1024,9 @@ impl ClaudeManagedMcpConfigStartupGuard {
 
 impl Drop for ClaudeManagedMcpConfigStartupGuard {
     fn drop(&mut self) {
+        if !self.cleanup_on_drop {
+            return;
+        }
         let Some(descriptor) = self.descriptor.take() else {
             return;
         };
@@ -1016,12 +1102,31 @@ fn materialize_claude_selected_skill_plugins(
         // contain characters that are not accepted by Claude's plugin-name
         // grammar. The manifest still points to the exact canonical skill
         // directory below this generation-scoped plugin root.
-        let plugin_name = format!("pioneer-selected-skill-{index}");
+        let plugin_name = if selected.plugin_id.is_some() {
+            install_name.clone()
+        } else {
+            format!("pioneer-selected-skill-{index}")
+        };
         let plugin_root = plugins_root.join(plugin_name.as_str());
-        let skill_destination = plugin_root.join("skills").join(install_name.as_str());
+        let context_destination = if selected.plugin_id.is_some() {
+            plugin_root.join("context")
+        } else {
+            plugin_root.join("skills").join(install_name.as_str())
+        };
+        let skill_destination =
+            context_destination.join(selected.skill_relative_path.as_deref().unwrap_or(""));
+        if let Some(relative) = &selected.skill_relative_path {
+            anyhow::ensure!(
+                !relative.is_empty()
+                    && Path::new(relative)
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_))),
+                "selected skill context escapes projection"
+            );
+        }
         replace_external_runtime_skill(
             selected.installed_path.as_path(),
-            skill_destination.as_path(),
+            context_destination.as_path(),
         )
         .with_context(|| {
             format!(
@@ -1030,7 +1135,7 @@ fn materialize_claude_selected_skill_plugins(
             )
         })?;
         let copied_hash =
-            compute_skill_folder_hash(skill_destination.as_path()).with_context(|| {
+            compute_skill_folder_hash(context_destination.as_path()).with_context(|| {
                 format!(
                     "failed to fingerprint managed Claude skill snapshot `{}`",
                     selected.install_name
@@ -1067,7 +1172,7 @@ fn materialize_claude_selected_skill_plugins(
             "name": plugin_name,
             "version": "1.0.0",
             "description": format!("Pioneer-selected skill {}", selected.install_name),
-            "skills": [format!("./skills/{install_name}")]
+            "skills": [format!("./{}", skill_destination.strip_prefix(&plugin_root)?.to_string_lossy())]
         }))
         .context("failed to serialize managed Claude skill plugin manifest")?;
         let mut manifest_file = std::fs::OpenOptions::new()
@@ -1665,7 +1770,7 @@ fn claude_process_config_from_instance(
 
 struct ClaudeCLIAgentRuntimeSession {
     client: Arc<ClaudeStreamClient>,
-    process: Mutex<CLIAgentProcess>,
+    process: Arc<Mutex<CLIAgentProcess>>,
     request_timeout: Duration,
     shutdown_grace: Duration,
     native_thread_id: Mutex<Option<String>>,
@@ -1690,10 +1795,32 @@ enum ClaudeReplacementCheckpoint {
 #[async_trait]
 impl CLIAgentRuntimeSession for ClaudeCLIAgentRuntimeSession {
     async fn close(&self) -> Result<()> {
+        self.stop_and_wait().await?;
+        self.cleanup_after_stop().await
+    }
+    async fn stop_and_wait(&self) -> Result<()> {
+        self.client.stopping.store(true, Ordering::Release);
+        self.client
+            .fail_pending_requests("Claude session stopped".to_owned())
+            .await;
+        if let Some(bridge) = self.required_mcp_bridge.as_ref() {
+            bridge.request_stop().await;
+        }
         let mut process = self.process.lock().await;
         let _ = process.terminate_with_grace(self.shutdown_grace).await?;
         self.process_closed.store(true, Ordering::Release);
         drop(process);
+        let bridge_result = if let Some(bridge) = self.required_mcp_bridge.as_ref() {
+            bridge.stop_and_wait().await
+        } else {
+            Ok(())
+        };
+        let workers_result = self.client.stop_workers().await;
+        bridge_result?;
+        workers_result?;
+        Ok(())
+    }
+    async fn cleanup_after_stop(&self) -> Result<()> {
         let managed_mcp_config = self
             .managed_mcp_config
             .lock()
@@ -1761,6 +1888,9 @@ impl CLIAgentRuntimeSession for ClaudeCLIAgentRuntimeSession {
             bail!("Claude provider process did not complete its graceful close barrier");
         }
         let mut checkpoint = self.replacement_checkpoint.lock().await;
+        if *checkpoint == ClaudeReplacementCheckpoint::Confirmed {
+            return Ok(());
+        }
         if *checkpoint != ClaudeReplacementCheckpoint::Armed {
             bail!("Claude replacement checkpoint was not armed before process close");
         }
@@ -1985,6 +2115,8 @@ struct ClaudeStreamClient {
     stdin: Mutex<ChildStdin>,
     pending: Mutex<HashMap<String, oneshot::Sender<Result<JsonValue, String>>>>,
     event_ingress: OrderedEventIngress<RuntimeEvent>,
+    workers: Mutex<ClaudeStreamWorkers>,
+    stopping: std::sync::atomic::AtomicBool,
     state: Mutex<ClaudeStreamState>,
     state_changed: tokio::sync::Notify,
     request_counter: AtomicU64,
@@ -2057,6 +2189,33 @@ enum ClaudeMcpToolLifecycle {
     Cancelled,
 }
 
+#[derive(Default)]
+struct ClaudeStreamWorkers {
+    tasks: Vec<JoinHandle<()>>,
+    failure: Option<String>,
+}
+impl ClaudeStreamWorkers {
+    async fn stop_and_join(&mut self) -> Result<()> {
+        for task in &self.tasks {
+            task.abort();
+        }
+        while let Some(task) = self.tasks.last_mut() {
+            let result = task.await;
+            self.tasks.pop();
+            if let Err(error) = result {
+                if !error.is_cancelled() {
+                    self.failure
+                        .get_or_insert("Claude stream worker failed".into());
+                }
+            }
+        }
+        if let Some(error) = &self.failure {
+            bail!("{error}");
+        }
+        Ok(())
+    }
+}
+
 impl ClaudeStreamClient {
     fn new(
         stdin: ChildStdin,
@@ -2066,10 +2225,17 @@ impl ClaudeStreamClient {
         native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget,
     ) -> Self {
         let expected_provider_session_id = provider_session_verifier.expected_provider_session_id;
+        let (event_ingress, ingress_worker) =
+            OrderedEventIngress::spawn_owned(event_tx, OrderedIngressConfig::default());
         Self {
+            workers: Mutex::new(ClaudeStreamWorkers {
+                tasks: vec![ingress_worker],
+                failure: None,
+            }),
+            stopping: std::sync::atomic::AtomicBool::new(false),
             stdin: Mutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
-            event_ingress: OrderedEventIngress::spawn(event_tx, OrderedIngressConfig::default()),
+            event_ingress,
             state: Mutex::new(ClaudeStreamState::default()),
             state_changed: tokio::sync::Notify::new(),
             request_counter: AtomicU64::new(0),
@@ -2085,10 +2251,17 @@ impl ClaudeStreamClient {
         event_tx: mpsc::Sender<RuntimeEvent>,
         expected_provider_session_id: uuid::Uuid,
     ) -> Self {
+        let (event_ingress, ingress_worker) =
+            OrderedEventIngress::spawn_owned(event_tx, OrderedIngressConfig::default());
         Self {
+            workers: Mutex::new(ClaudeStreamWorkers {
+                tasks: vec![ingress_worker],
+                failure: None,
+            }),
+            stopping: std::sync::atomic::AtomicBool::new(false),
             stdin: Mutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
-            event_ingress: OrderedEventIngress::spawn(event_tx, OrderedIngressConfig::default()),
+            event_ingress,
             state: Mutex::new(ClaudeStreamState::default()),
             state_changed: tokio::sync::Notify::new(),
             request_counter: AtomicU64::new(0),
@@ -2106,10 +2279,17 @@ impl ClaudeStreamClient {
         expected_provider_session_id: uuid::Uuid,
         mcp: Option<ClaudeMcpEventContext>,
     ) -> Self {
+        let (event_ingress, ingress_worker) =
+            OrderedEventIngress::spawn_owned(event_tx, OrderedIngressConfig::default());
         Self {
+            workers: Mutex::new(ClaudeStreamWorkers {
+                tasks: vec![ingress_worker],
+                failure: None,
+            }),
+            stopping: std::sync::atomic::AtomicBool::new(false),
             stdin: Mutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
-            event_ingress: OrderedEventIngress::spawn(event_tx, OrderedIngressConfig::default()),
+            event_ingress,
             state: Mutex::new(ClaudeStreamState::default()),
             state_changed: tokio::sync::Notify::new(),
             request_counter: AtomicU64::new(0),
@@ -2122,11 +2302,23 @@ impl ClaudeStreamClient {
 
     fn spawn_reader(self: &Arc<Self>, stdout: ChildStdout) {
         let client = self.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             client.read_loop(stdout).await;
         });
+        self.workers
+            .try_lock()
+            .expect("Claude reader registration is synchronous")
+            .tasks
+            .push(task);
     }
 
+    async fn stop_workers(&self) -> Result<()> {
+        self.stopping.store(true, Ordering::Release);
+        self.fail_pending_requests("Claude session stopped".to_owned())
+            .await;
+        self.event_ingress.close();
+        self.workers.lock().await.stop_and_join().await
+    }
     async fn initialize(&self, timeout: Duration) -> Result<()> {
         let _startup_stage = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::CliHandshake,
@@ -2267,7 +2459,13 @@ impl ClaudeStreamClient {
             new_runtime_id()
         );
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(request_id.clone(), tx);
+        {
+            let mut pending = self.pending.lock().await;
+            if self.stopping.load(Ordering::Acquire) {
+                bail!("Claude session stopped");
+            }
+            pending.insert(request_id.clone(), tx);
+        }
         if let Err(error) = self
             .write_json_line(json!({
                 "type": "control_request",
@@ -2310,6 +2508,9 @@ impl ClaudeStreamClient {
 
     async fn write_json_line(&self, value: JsonValue) -> Result<()> {
         let mut stdin = self.stdin.lock().await;
+        if self.stopping.load(Ordering::Acquire) {
+            bail!("Claude session stopped");
+        }
         let line = serde_json::to_string(&value).context("failed to encode Claude JSON line")?;
         stdin
             .write_all(line.as_bytes())
@@ -3511,6 +3712,9 @@ impl ClaudeStreamClient {
     }
 
     async fn emit(&self, event: RuntimeEvent) {
+        if self.stopping.load(Ordering::Acquire) {
+            return;
+        }
         self.record_turn_observation(&event).await;
         match self.event_ingress.offer(event).await {
             OrderedIngressOffer::Accepted => {}
@@ -4024,6 +4228,41 @@ pub(crate) mod tests {
     use std::process::Stdio;
     use tokio::io::duplex;
     use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn claude_actual_worker_join_retains_cancelled_wait_and_sticky_panic() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let started = entered.clone();
+        let finish = release.clone();
+        let blocking = tokio::task::spawn_blocking(move || {
+            started.notify_one();
+            tokio::runtime::Handle::current().block_on(finish.notified());
+        });
+        let failed = tokio::spawn(async {
+            panic!("Claude owned worker injected panic");
+        });
+        while !failed.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let workers = Arc::new(Mutex::new(ClaudeStreamWorkers {
+            tasks: vec![failed, blocking],
+            failure: None,
+        }));
+        entered.notified().await;
+        let waiter = {
+            let workers = workers.clone();
+            tokio::spawn(async move { workers.lock().await.stop_and_join().await })
+        };
+        tokio::task::yield_now().await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(workers.lock().await.tasks.len(), 2);
+        release.notify_one();
+        assert!(workers.lock().await.stop_and_join().await.is_err());
+        assert!(workers.lock().await.stop_and_join().await.is_err());
+        assert!(workers.lock().await.tasks.is_empty());
+    }
 
     #[tokio::test]
     async fn claude_bash_wire_results_and_parent_progress_are_retained() {
@@ -5207,6 +5446,8 @@ done
 
     fn selected_skill_fixture(path: &Path, install_name: &str) -> CliRuntimeSelectedSkill {
         CliRuntimeSelectedSkill {
+            plugin_id: None,
+            skill_relative_path: None,
             install_name: install_name.to_owned(),
             installed_path: path.to_path_buf(),
             source_folder_hash: compute_skill_folder_hash(path).expect("skill fixture hash"),
@@ -5484,6 +5725,7 @@ done
         let config = claude_process_config_from_instance(
             &instance,
             &CLIAgentRuntimeSessionStartOptions {
+                plugin_selection: None,
                 cwd: None,
                 approval_policy: Some("acceptEdits".to_owned()),
                 authorization_scope_fingerprint: None,
@@ -5509,6 +5751,7 @@ done
         let config = claude_process_config_from_instance(
             &instance,
             &CLIAgentRuntimeSessionStartOptions {
+                plugin_selection: None,
                 cwd: None,
                 approval_policy: Some("bypassPermissions".to_owned()),
                 authorization_scope_fingerprint: None,
@@ -5543,6 +5786,7 @@ done
             let config = claude_process_config_from_instance(
                 &instance,
                 &CLIAgentRuntimeSessionStartOptions {
+                    plugin_selection: None,
                     cwd: None,
                     approval_policy: Some(permission_mode.to_owned()),
                     authorization_scope_fingerprint: None,
@@ -5993,5 +6237,91 @@ done
         drop(state);
 
         let _ = child.kill().await;
+    }
+
+    // C2 source regression: NOT_RUN / NOT_COMPILED. Materializes argv/files only.
+    #[test]
+    fn owned_claude_manifests_select_exact_member_with_full_context_and_no_native_autoload() {
+        for native_override in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("context-source");
+            let relative = if native_override { "" } else { "skills/member" };
+            for (path, bytes) in [
+                (
+                    format!("{relative}/SKILL.md")
+                        .trim_start_matches('/')
+                        .to_owned(),
+                    "---\nname: same-name\ndescription: member\n---\nBody unchanged\n",
+                ),
+                ("skills/unselected/SKILL.md".into(), "Unselected definition"),
+                ("scripts/run.sh".into(), "package sibling"),
+                ("references/root.txt".into(), "full native context"),
+                ("hooks/hooks.json".into(), "{}"),
+                ("commands/unselected.md".into(), "unmanaged command"),
+            ] {
+                let path = source.join(path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, bytes).unwrap();
+            }
+            let id = pioneer_protocol::SkillId::new("S".repeat(21)).unwrap();
+            let alias = crate::cli_runtime::skills::plugin_skill_alias("parent", &id);
+            let mut selected = selected_skill_fixture(&source, &alias);
+            selected.plugin_id = Some("parent".into());
+            selected.skill_relative_path = (!native_override).then(|| relative.into());
+            let instance = claude_instance(temp.path().join("home").to_string_lossy().into_owned());
+            let config = claude_process_config_from_instance(
+                &instance,
+                &CLIAgentRuntimeSessionStartOptions {
+                    selected_skills: vec![selected],
+                    approval_policy: Some("default".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let roots = config
+                .args
+                .windows(2)
+                .filter(|pair| pair[0] == "--plugin-dir")
+                .map(|pair| PathBuf::from(&pair[1]))
+                .collect::<Vec<_>>();
+            assert_eq!(roots.len(), 1);
+            let root = &roots[0];
+            assert_eq!(root.file_name().unwrap().to_string_lossy(), alias);
+            let manifest: JsonValue = serde_json::from_slice(
+                &std::fs::read(root.join(".claude-plugin/plugin.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(manifest["name"], alias);
+            assert_eq!(
+                manifest["skills"],
+                json!([if native_override {
+                    "./context".to_owned()
+                } else {
+                    "./context/skills/member".to_owned()
+                }])
+            );
+            assert_eq!(
+                std::fs::read(root.join("context/scripts/run.sh")).unwrap(),
+                b"package sibling"
+            );
+            assert_eq!(
+                std::fs::read(root.join("context/references/root.txt")).unwrap(),
+                b"full native context"
+            );
+            assert_eq!(
+                std::fs::read(root.join("context").join(relative).join("SKILL.md")).unwrap(),
+                std::fs::read(source.join(relative).join("SKILL.md")).unwrap()
+            );
+            assert!(!root.join("hooks").exists());
+            assert!(!root.join("commands").exists());
+            assert!(manifest.get("hooks").is_none());
+            assert!(manifest.get("commands").is_none());
+            assert!(has_arg(&config.args, "--setting-sources="));
+            assert!(!has_arg(&config.args, "--setting-sources=user"));
+            assert_eq!(
+                arg_value_after(&config.args, "--permission-mode").as_deref(),
+                Some("default")
+            );
+        }
     }
 }

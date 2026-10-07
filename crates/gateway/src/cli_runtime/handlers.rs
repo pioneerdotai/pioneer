@@ -1261,6 +1261,24 @@ impl MessageProcessor {
                     return;
                 }
             };
+            let _plugin_launch = match self
+                .acquire_cli_instance_plugin_guards(handle.instance())
+                .await
+            {
+                Ok(guards) => guards,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        cli_runtime_public_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("CLI plugin continuation admission failed: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
             let fork = match handle
                 .session()
                 .fork_thread(CLIAgentRuntimeThreadForkRequest {
@@ -1734,6 +1752,24 @@ impl MessageProcessor {
                 .await;
                 return;
             };
+            let _plugin_launch = match self
+                .acquire_cli_instance_plugin_guards(handle.instance())
+                .await
+            {
+                Ok(guards) => guards,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        cli_runtime_public_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("CLI plugin continuation admission failed: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
             let steer = match handle
                 .session()
                 .steer_turn(CLIAgentRuntimeTurnSteerRequest {
@@ -1759,6 +1795,7 @@ impl MessageProcessor {
             };
 
             self.emit_cli_runtime_steer_accepted_timeline_event_fresh_task(
+                handle.instance().clone(),
                 workspace_id.clone(),
                 params.thread_id.clone(),
                 params.turn_id.clone(),
@@ -2593,6 +2630,39 @@ impl MessageProcessor {
             }
         };
 
+        let _plugin_launch = if let Some(turn) = pending.turn_id.as_deref() {
+            match async {
+                let guards = self
+                    .acquire_plugin_launch_guards(&pending.workspace_id, turn)
+                    .await?;
+                super::super::message::plugins::validate_cli_plugin_selection(
+                    self.crud_store.as_ref(),
+                    &pending.workspace_id,
+                    turn,
+                )
+                .await?;
+                anyhow::Ok(guards)
+            }
+            .await
+            {
+                Ok(guards) => guards,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        cli_runtime_public_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("CLI plugin interaction authority changed: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    interaction_service.zeroize_resolution(&mut resolution);
+                    return;
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let contains_secret = validated_interaction.contains_secret_answer(&resolution);
         let durable_resolution =
             interaction_service.durable_resolution(&resolution, contains_secret);
@@ -3374,7 +3444,7 @@ impl MessageProcessor {
         }
         let poisoned_hub = hubs.remove(instance);
 
-        let hub = Arc::new(ExecutionEventHub::new());
+        let hub = Arc::new(ExecutionEventHub::new_with_owned_progress());
         let durable_receiver = hub
             .take_durable_receiver()
             .await
@@ -3388,29 +3458,62 @@ impl MessageProcessor {
         drop(hubs);
 
         if let Some(poisoned_hub) = poisoned_hub {
-            poisoned_hub.shutdown_progress().await;
+            self.drain_cli_hub(instance, &poisoned_hub).await;
         }
 
-        self.spawn_cli_runtime_execution_event_listener(
+        let admitted = self.spawn_cli_runtime_execution_event_listener(
             instance.clone(),
-            Arc::downgrade(&hub),
+            hub.clone(),
             durable_receiver,
             snapshot_receiver,
             live_receiver,
         );
+        if !admitted {
+            self.drain_cli_hub(instance, &hub).await;
+        }
         hub
+    }
+
+    fn spawn_owned_cli_work<F>(&self, instance: &CliSessionInstanceId, future: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.cli_runtime_manager
+            .as_ref()
+            .is_some_and(|manager| manager.spawn_instance_work(instance, future))
+    }
+    async fn drain_cli_hub(&self, instance: &CliSessionInstanceId, hub: &ExecutionEventHub) {
+        if let Err(error) = hub.shutdown_and_wait().await {
+            if let Some(manager) = self.cli_runtime_manager.as_ref() {
+                manager.record_instance_failure(instance, error);
+            }
+        }
+    }
+    fn cli_work_cancellation(
+        &self,
+        instance: &CliSessionInstanceId,
+    ) -> tokio_util::sync::CancellationToken {
+        self.cli_runtime_manager
+            .as_ref()
+            .and_then(|manager| manager.instance_cancellation(instance).ok())
+            .unwrap_or_else(|| {
+                let token = tokio_util::sync::CancellationToken::new();
+                token.cancel();
+                token
+            })
     }
 
     fn spawn_cli_runtime_execution_event_listener(
         &self,
         instance: CliSessionInstanceId,
-        hub: std::sync::Weak<ExecutionEventHub>,
+        hub: Arc<ExecutionEventHub>,
         mut durable_receiver: pioneer_runtime_events::DurableEventReceiver,
         mut snapshot_receiver: pioneer_runtime_events::SnapshotEventReceiver,
         mut live_receiver: tokio::sync::broadcast::Receiver<AgentProgressEvent>,
-    ) {
+    ) -> bool {
         let processor = self.clone();
-        tokio::spawn(async move {
+        let cancellation = self.cli_work_cancellation(&instance);
+        self.spawn_owned_cli_work(&instance.clone(), async move {
             let key = instance.key();
             let listener_processor = processor.clone();
             let listener_instance = instance.clone();
@@ -3421,6 +3524,7 @@ impl MessageProcessor {
                 while durable_open || snapshot_open || live_open {
                     tokio::select! {
                         biased;
+                        _ = cancellation.cancelled() => break,
                         snapshot = snapshot_receiver.recv(), if snapshot_open => {
                             match snapshot {
                                 Some(event) => {
@@ -3546,6 +3650,7 @@ impl MessageProcessor {
             let listener_panicked = AssertUnwindSafe(listener).catch_unwind().await.is_err();
             let key = instance.key();
             if listener_panicked {
+                if let Some(manager) = processor.cli_runtime_manager.as_ref() { manager.record_instance_failure(&instance, "CLI execution listener panicked".to_owned()); }
                 warn!(
                     workspace_id = key.workspace_id.as_str(),
                     runtime_id = key.runtime_id.as_str(),
@@ -3553,18 +3658,15 @@ impl MessageProcessor {
                     "CLI runtime execution event listener panicked; evicting poisoned hub"
                 );
             }
-            if let Some(hub) = hub.upgrade() {
-                processor
-                    .invalidate_cli_runtime_execution_event_hub_if_same(&instance, &hub)
-                    .await;
-            }
+            processor.invalidate_cli_runtime_execution_event_hub_if_same(&instance, &hub).await;
+            processor.drain_cli_hub(&instance, &hub).await;
             debug!(
                 workspace_id = key.workspace_id.as_str(),
                 runtime_id = key.runtime_id.as_str(),
                 thread_id = key.thread_id.as_str(),
                 "CLI runtime execution event listener closed"
             );
-        });
+        })
     }
 
     async fn invalidate_cli_runtime_execution_event_hub_if_same(
@@ -3580,7 +3682,7 @@ impl MessageProcessor {
             }
         };
         if let Some(hub) = removed {
-            hub.shutdown_progress().await;
+            self.drain_cli_hub(instance, &hub).await;
         }
     }
 
@@ -3611,6 +3713,9 @@ impl MessageProcessor {
         cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<(), pioneer_runtime_events::ExecutionEventHubError> {
         for attempt in 0..2 {
+            if !self.cli_runtime_instance_is_current(instance).await {
+                return Err(pioneer_runtime_events::ExecutionEventHubError::DurableLaneClosed);
+            }
             let hub = self.ensure_cli_runtime_execution_event_hub(instance).await;
             match hub.publish_cli_runtime_blocked_and_wait(event.clone(), turn_transition.cloned(), cli_blocked_guard.clone()).await {
                 Ok(()) => return Ok(()),
@@ -3638,7 +3743,7 @@ impl MessageProcessor {
     async fn close_cli_runtime_execution_event_hub(&self, instance: &CliSessionInstanceId) {
         let hub = self.cli_runtime_event_hubs.lock().await.remove(instance);
         if let Some(hub) = hub {
-            hub.shutdown_progress().await;
+            self.drain_cli_hub(instance, &hub).await;
         }
         self.cli_runtime_turn_binding_cache
             .lock()
@@ -3684,11 +3789,14 @@ impl MessageProcessor {
         debug_native_events: bool,
     ) {
         let processor = self.clone();
-        tokio::spawn(async move {
+        let cancellation = self.cli_work_cancellation(&instance);
+        self.spawn_owned_cli_work(&instance.clone(), async move {
             let key = instance.key();
             let mut events = receivers.events;
             let runtime_kind = receivers.runtime_kind;
-            while let Some(event) = events.recv().await {
+            loop {
+                let event = tokio::select! { biased; _ = cancellation.cancelled() => break, item = events.recv() => item };
+                let Some(event) = event else { break; };
                 if !processor.cli_runtime_instance_is_current(&instance).await {
                     processor.audit_stale_cli_runtime_process_activity(&instance, "event");
                     continue;
@@ -3737,10 +3845,13 @@ impl MessageProcessor {
         let notification_processor = self.clone();
         let notification_instance = instance.clone();
         let notification_session = session.clone();
-        tokio::spawn(async move {
+        let cancellation = self.cli_work_cancellation(&notification_instance);
+        self.spawn_owned_cli_work(&notification_instance.clone(), async move {
             let notification_key = notification_instance.key();
             let mut notifications = receivers.notifications;
-            while let Some(notification) = notifications.recv().await {
+            loop {
+                let notification = tokio::select! { biased; _ = cancellation.cancelled() => break, item = notifications.recv() => item };
+                let Some(notification) = notification else { break; };
                 if !notification_processor
                     .cli_runtime_instance_is_current(&notification_instance)
                     .await
@@ -3797,10 +3908,13 @@ impl MessageProcessor {
 
         let request_processor = self.clone();
         let request_instance = instance.clone();
-        tokio::spawn(async move {
+        let cancellation = self.cli_work_cancellation(&request_instance);
+        self.spawn_owned_cli_work(&request_instance.clone(), async move {
             let request_key = request_instance.key();
             let mut server_requests = receivers.server_requests;
-            while let Some(request) = server_requests.recv().await {
+            loop {
+                let request = tokio::select! { biased; _ = cancellation.cancelled() => break, item = server_requests.recv() => item };
+                let Some(request) = request else { break; };
                 let native_request_id = serde_json::to_value(&request.id)
                     .unwrap_or_else(|_| JsonValue::String(request.id.to_string()));
                 let responder = CLIAgentRuntimeMachineRequestResponder::new(
@@ -3862,10 +3976,13 @@ impl MessageProcessor {
 
         let diagnostic_processor = self.clone();
         let diagnostic_instance = instance;
-        tokio::spawn(async move {
+        let cancellation = self.cli_work_cancellation(&diagnostic_instance);
+        self.spawn_owned_cli_work(&diagnostic_instance.clone(), async move {
             let diagnostic_key = diagnostic_instance.key();
             let mut diagnostics = receivers.diagnostics;
-            while let Some(diagnostic) = diagnostics.recv().await {
+            loop {
+                let diagnostic = tokio::select! { biased; _ = cancellation.cancelled() => break, item = diagnostics.recv() => item };
+                let Some(diagnostic) = diagnostic else { break; };
                 if diagnostic.kind
                     == pioneer_cli_agent_runtime::codex::CodexJsonlRpcClientDiagnosticKind::SessionRecoveryRequired
                 {
@@ -6457,6 +6574,17 @@ impl MessageProcessor {
         recovery: pioneer_protocol::RecoveryAttemptContext,
         transition: &Arc<tokio::sync::OwnedMutexGuard<()>>,
     ) -> CLIRuntimeObservationGapReconciliation {
+        let _plugin_launch = match self
+            .acquire_plugin_launch_guards(binding.workspace_id.as_str(), binding.turn_id.as_str())
+            .await
+        {
+            Ok(guards) => guards,
+            Err(error) => {
+                return CLIRuntimeObservationGapReconciliation::InvalidBinding {
+                    diagnostic: format!("CLI reconciliation plugin admission failed: {error:#}"),
+                };
+            }
+        };
         let native_turn_id = match binding.native_turn_id.as_deref() {
             Some(native_turn_id) if !native_turn_id.trim().is_empty() => native_turn_id,
             _ => {
@@ -6503,6 +6631,11 @@ impl MessageProcessor {
                 };
             }
         };
+        if let Err(error) = manager.admit_turn_owner(handle.instance(), &binding.turn_id) {
+            return CLIRuntimeObservationGapReconciliation::InvalidBinding {
+                diagnostic: format!("CLI reconciliation owner unavailable: {error:#}"),
+            };
+        }
         self.ensure_cli_runtime_session_event_pumps(
             handle.instance(),
             handle.session(),
@@ -9269,33 +9402,28 @@ impl MessageProcessor {
 
     async fn emit_cli_runtime_steer_accepted_timeline_event_fresh_task(
         &self,
+        instance: CliSessionInstanceId,
         workspace_id: String,
         thread_id: String,
         turn_id: String,
         native_turn_id: String,
     ) {
         let processor = self.clone();
-        let log_thread_id = thread_id.clone();
-        let log_turn_id = turn_id.clone();
-        let join = tokio::spawn(async move {
-            processor
-                .emit_cli_runtime_steer_accepted_timeline_event(
-                    workspace_id.as_str(),
-                    thread_id.as_str(),
-                    turn_id.as_str(),
-                    native_turn_id.as_str(),
-                )
-                .await;
+        let (completed, wait) = tokio::sync::oneshot::channel();
+        self.spawn_owned_cli_work(&instance.clone(), async move {
+            if processor.cli_runtime_instance_is_current(&instance).await {
+                processor
+                    .emit_cli_runtime_steer_accepted_timeline_event(
+                        workspace_id.as_str(),
+                        thread_id.as_str(),
+                        turn_id.as_str(),
+                        native_turn_id.as_str(),
+                    )
+                    .await;
+            }
+            let _ = completed.send(());
         });
-
-        if let Err(error) = join.await {
-            warn!(
-                thread_id = log_thread_id.as_str(),
-                turn_id = log_turn_id.as_str(),
-                error = %format!("{error:#}"),
-                "CLI runtime steer accepted timeline event task failed"
-            );
-        }
+        let _ = wait.await;
     }
 
     pub(super) async fn best_effort_sync_cli_runtime_thread_name(

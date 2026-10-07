@@ -294,6 +294,22 @@
         "route_to_domain_state"
       ]
     },
+    "MemoryRecallEligibility": {
+      "type": "object",
+      "properties": {
+        "eligible": {
+          "type": "boolean"
+        },
+        "reason": {
+          "description": "Low-cardinality policy reason, never a payload or identifier.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "eligible",
+        "reason"
+      ]
+    },
     "MemoryRecord": {
       "type": "object",
       "properties": {
@@ -369,6 +385,17 @@
         },
         "provenance": {
           "$ref": "#/$defs/MemoryProvenance"
+        },
+        "recall_eligibility": {
+          "description": "Response-only assessment for this read; absence means not assessed.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryRecallEligibility"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "scope": {
           "$ref": "#/$defs/MemoryScope"

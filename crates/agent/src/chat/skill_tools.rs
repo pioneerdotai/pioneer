@@ -202,3 +202,181 @@ mod tests {
         );
     }
 }
+
+/// Wrap only the existing skill handlers; installation/runtime tool creation
+/// remain unchanged. The same TurnToolProvider used for native admission owns
+/// the late check, with no second permission or plugin runtime engine.
+pub(super) fn guard_skill_tooling(
+    materialized: &mut SkillToolMaterialization,
+    plan: &SkillRuntimePlan,
+    provider: std::sync::Arc<dyn crate::TurnToolProvider>,
+    context: crate::TurnToolContext,
+) {
+    for bundle in &mut materialized.bundles {
+        for (name, handler) in &mut bundle.handlers {
+            let skill_id = plan
+                .tools
+                .iter()
+                .find(|t| &t.canonical_tool_name == name)
+                .map(|t| t.skill_id.clone());
+            *handler = std::sync::Arc::new(GatedSkillHandler {
+                inner: handler.clone(),
+                provider: provider.clone(),
+                context: context.clone(),
+                skill_id,
+                read_index: plan
+                    .read_skill_index
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.skill_id.clone()))
+                    .collect(),
+            });
+        }
+    }
+}
+struct GatedSkillHandler {
+    inner: std::sync::Arc<dyn pioneer_tools::ToolHandler>,
+    provider: std::sync::Arc<dyn crate::TurnToolProvider>,
+    context: crate::TurnToolContext,
+    skill_id: Option<pioneer_protocol::SkillId>,
+    read_index: HashMap<String, pioneer_protocol::SkillId>,
+}
+#[async_trait::async_trait]
+impl pioneer_tools::ToolHandler for GatedSkillHandler {
+    async fn handle(
+        &self,
+        invocation: pioneer_tools::ToolInvocation,
+        trace: pioneer_tools::ToolEventTrace,
+    ) -> Result<Box<dyn pioneer_tools::ToolOutput>, pioneer_tools::ToolError> {
+        let id = if let Some(id) = &self.skill_id {
+            Some(id.clone())
+        } else {
+            match &invocation.payload {
+                pioneer_tools::ToolPayload::Function { arguments } => {
+                    let arguments = arguments;
+                    arguments
+                        .get("skill_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .map(|v| v.strip_prefix('$').unwrap_or(v))
+                        .and_then(|key| {
+                            self.read_index
+                                .get(key)
+                                .or_else(|| self.read_index.get(&format!("skill:{key}")))
+                        })
+                        .cloned()
+                }
+                _ => None,
+            }
+        };
+        if let Some(id) = id {
+            self.provider
+                .authorize_skill_invocation(self.context.clone(), id)
+                .await
+                .map_err(pioneer_tools::ToolError::Rejected)?;
+        }
+        self.inner.handle(invocation, trace).await
+    }
+}
+
+#[cfg(test)]
+mod late_gate_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    struct Provider(Arc<AtomicBool>);
+    #[async_trait::async_trait]
+    impl crate::TurnToolProvider for Provider {
+        async fn materialize_turn_tools(
+            &self,
+            _: crate::TurnToolContext,
+        ) -> Result<crate::TurnToolMaterialization, String> {
+            Ok(Default::default())
+        }
+        async fn authorize_skill_invocation(
+            &self,
+            _: crate::TurnToolContext,
+            _: pioneer_protocol::SkillId,
+        ) -> Result<(), String> {
+            if self.0.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err("plugin_closed".into())
+            }
+        }
+    }
+    struct Inner(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl pioneer_tools::ToolHandler for Inner {
+        async fn handle(
+            &self,
+            _: pioneer_tools::ToolInvocation,
+            _: pioneer_tools::ToolEventTrace,
+        ) -> Result<Box<dyn pioneer_tools::ToolOutput>, pioneer_tools::ToolError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(pioneer_tools::ToolError::Rejected("inner_called".into()))
+        }
+    }
+    // Source regression only; no fixture/process execution. NOT_RUN / NOT_COMPILED.
+    #[tokio::test]
+    async fn read_and_dynamic_handlers_recheck_parent_after_materialization() {
+        let id = pioneer_protocol::SkillId::new("S".repeat(21)).unwrap();
+        let enabled = Arc::new(AtomicBool::new(true));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn crate::TurnToolProvider> = Arc::new(Provider(enabled.clone()));
+        let inner: Arc<dyn pioneer_tools::ToolHandler> = Arc::new(Inner(calls.clone()));
+        let context = crate::TurnToolContext {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+        };
+        for skill_id in [None, Some(id.clone())] {
+            let handler = GatedSkillHandler {
+                inner: inner.clone(),
+                provider: provider.clone(),
+                context: context.clone(),
+                skill_id,
+                read_index: HashMap::from([(format!("skill:{id}"), id.clone())]),
+            };
+            let invocation = || pioneer_tools::ToolInvocation {
+                call_id: "call".into(),
+                tool_name: "read_skill".into(),
+                source: pioneer_tools::ToolCallSource::Model,
+                payload: pioneer_tools::ToolPayload::Function {
+                    arguments: serde_json::json!({"skill_id": format!("$skill:{id}")}),
+                },
+                workdir: ".".into(),
+                environment: Default::default(),
+                attempt_id: 1,
+                idempotency_key: None,
+                recovery: Default::default(),
+                permission_metadata: Default::default(),
+                execution_security_snapshot: None,
+                apply_patch_preflight: None,
+                cancellation: tokio_util::sync::CancellationToken::new(),
+            };
+            let bus = pioneer_tools::ToolEventBus::new(4);
+            enabled.store(true, Ordering::SeqCst);
+            let before = calls.load(Ordering::SeqCst);
+            let _ = pioneer_tools::ToolHandler::handle(
+                &handler,
+                invocation(),
+                bus.start_trace("turn", "call", "read_skill"),
+            )
+            .await;
+            assert_eq!(calls.load(Ordering::SeqCst), before + 1);
+            enabled.store(false, Ordering::SeqCst);
+            let result = pioneer_tools::ToolHandler::handle(
+                &handler,
+                invocation(),
+                bus.start_trace("turn", "call2", "read_skill"),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(pioneer_tools::ToolError::Rejected(reason)) if reason == "plugin_closed")
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), before + 1);
+        }
+    }
+}

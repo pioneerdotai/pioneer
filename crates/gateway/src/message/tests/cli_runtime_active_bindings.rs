@@ -2640,13 +2640,16 @@ async fn cli_native_terminal_consumer_acks_delivery_and_retains_ownership_after_
         gate.try_lock().is_err(),
         "consumer retains ownership independently of its publisher"
     );
-    let mut admission = Box::pin(processor.cli_runtime_turn_resume_transition(BLOCKED_TURN));
-    assert!(futures_util::poll!(&mut admission).is_pending());
+    // Count before polling admission: its binding lookup can retain the
+    // fixture's only connection until the future is polled again. Another DB
+    // query while admission is suspended would deadlock the fixture itself.
     let before = pioneer_entity::turn_event::Entity::find()
         .filter(pioneer_entity::turn_event::Column::TurnId.eq(BLOCKED_TURN))
         .count(&store.database_connection())
         .await
         .unwrap();
+    let mut admission = Box::pin(processor.cli_runtime_turn_resume_transition(BLOCKED_TURN));
+    assert!(futures_util::poll!(&mut admission).is_pending());
     processor.release_completed_history_preparation_barrier();
     let admission = admission.await.unwrap().unwrap();
     drop(admission);

@@ -15,7 +15,8 @@ use pioneer_entity::{
     agent_identity, agent_presentation_snapshot, agent_running_permit,
     agent_turn_response_execution, agent_work_branch_schedule, agent_work_queue,
     agent_work_resource_scope, agent_work_scheduler_state, native_agent_config, task_delivery,
-    task_occurrence_contract, task_run_execution, thread, thread_lineage, turn, turn_item,
+    task_occurrence_contract, task_run_execution, thread, thread_lineage, turn,
+    turn_cli_runtime_binding, turn_item,
 };
 use pioneer_protocol::{
     AgentDelegationRouteId, AgentDelegationRouteProjection, AgentExecutionId,
@@ -61,6 +62,9 @@ pub const AGENT_ROUTE_GRAPH_MAX_EDGES: usize = 2_048;
 pub const ACTIVE_AGENT_IDENTITY_CATALOG_LIMIT: u64 =
     pioneer_protocol::ChildAgentLaunchGrantSet::MAX_IDENTITIES as u64;
 const AGENT_PROJECTION_BATCH_LIMIT: usize = 200;
+// Independent of graph nodes: one Task occurrence may have many revision Turns.
+const AGENT_GRAPH_RESPONSE_BINDING_LIMIT: usize = 65_536;
+const AGENT_GRAPH_RESPONSE_QUERY_BATCH: usize = 128;
 const AGENT_BACKGROUND_BATCH_LIMIT: u64 = 512;
 pub(super) const AGENT_WORK_GRAPH_MAX_CONCURRENCY: i64 = 4_096;
 pub(super) const AGENT_WORK_GRAPH_MAX_QUEUE_DEPTH: i64 = 2_048;
@@ -443,6 +447,18 @@ pub struct AgentWorkGraphCancellationTarget {
     pub turn_id: Option<String>,
     pub thread_id: Option<String>,
     pub parent_task_id: Option<String>,
+    /// Admission uncertainty, never a process completion acknowledgement.
+    pub turn_pending: bool,
+    pub has_cli_binding: bool,
+}
+
+#[derive(sea_orm::FromQueryResult)]
+struct AgentGraphResponseBinding {
+    execution_id: String,
+    turn_id: String,
+    bound_thread_id: Option<String>,
+    bound_status: Option<String>,
+    has_cli_binding: bool,
 }
 
 pub async fn load_native_agent_config<C: ConnectionTrait>(
@@ -6481,6 +6497,28 @@ pub async fn cancel_agent_work_graph(
     terminal_reason: &str,
     finished_at: DateTimeWithTimeZone,
 ) -> Result<Vec<AgentWorkGraphCancellationTarget>> {
+    cancel_agent_work_graph_targets(db, root_execution_id, terminal_reason, finished_at, false)
+        .await
+}
+
+/// The await caller must also see already-fenced bindings on retry. This is
+/// collected inside the same bounded native graph write, before its fence.
+pub async fn cancel_agent_work_graph_and_collect_owners(
+    db: &DatabaseTransaction,
+    root_execution_id: &str,
+    terminal_reason: &str,
+    finished_at: DateTimeWithTimeZone,
+) -> Result<Vec<AgentWorkGraphCancellationTarget>> {
+    cancel_agent_work_graph_targets(db, root_execution_id, terminal_reason, finished_at, true).await
+}
+
+async fn cancel_agent_work_graph_targets(
+    db: &DatabaseTransaction,
+    root_execution_id: &str,
+    terminal_reason: &str,
+    finished_at: DateTimeWithTimeZone,
+    collect_owners: bool,
+) -> Result<Vec<AgentWorkGraphCancellationTarget>> {
     let root = agent_execution::Entity::find_by_id(root_execution_id.to_owned())
         .one(db)
         .await
@@ -6534,45 +6572,129 @@ pub async fn cancel_agent_work_graph(
         .iter()
         .map(|execution| execution.id.clone())
         .collect::<Vec<_>>();
-    let response_turns = if active_ids.is_empty() {
-        Vec::new()
+    let target_executions = if collect_owners {
+        executions.iter().collect::<Vec<_>>()
     } else {
-        let active_turn_ids = Query::select()
-            .column(turn::Column::Id)
-            .from(turn::Entity)
-            .and_where(turn::Column::Status.eq("in_progress"))
-            .to_owned();
-        agent_turn_response_execution::Entity::find()
-            .filter(agent_turn_response_execution::Column::ExecutionId.is_in(active_ids.clone()))
-            .filter(agent_turn_response_execution::Column::TurnId.in_subquery(active_turn_ids))
-            .limit(graph_row_limit)
-            .all(db)
-            .await
-            .context("failed to load active Agent work-graph Turn bindings")?
+        active.clone()
     };
-    if response_turns.len() > active_ids.len() {
-        bail!("Agent work graph has too many active Turn bindings");
-    }
-    let mut response_turns_by_execution = BTreeMap::new();
-    for response in response_turns {
-        if response_turns_by_execution
-            .insert(response.execution_id, response.turn_id)
-            .is_some()
-        {
-            bail!("Agent execution has multiple active response Turns");
-        }
-    }
-    let targets = active
+    let target_ids = target_executions
         .iter()
-        .map(|execution| AgentWorkGraphCancellationTarget {
-            execution_id: execution.id.clone(),
-            turn_id: response_turns_by_execution
-                .get(execution.id.as_str())
-                .cloned(),
-            thread_id: execution.parent_thread_id.clone(),
-            parent_task_id: execution.parent_task_id.clone(),
-        })
+        .map(|execution| execution.id.clone())
         .collect::<Vec<_>>();
+    let targets = if collect_owners {
+        let mut bindings = BTreeMap::<String, Vec<(String, String, bool, bool)>>::new();
+        let mut binding_count = 0;
+        for batch in target_ids.chunks(AGENT_GRAPH_RESPONSE_QUERY_BATCH) {
+            let responses = agent_turn_response_execution::Entity::find()
+                .filter(agent_turn_response_execution::Column::ExecutionId.is_in(batch.to_vec()))
+                .select_only()
+                .column(agent_turn_response_execution::Column::ExecutionId)
+                .column(agent_turn_response_execution::Column::TurnId)
+                .column_as(turn::Column::ThreadId, "bound_thread_id")
+                .column_as(turn::Column::Status, "bound_status")
+                .expr_as(
+                    sea_orm::sea_query::Expr::col((turn::Entity, turn::Column::Id)).in_subquery(
+                        Query::select()
+                            .column(turn_cli_runtime_binding::Column::TurnId)
+                            .from(turn_cli_runtime_binding::Entity)
+                            .to_owned(),
+                    ),
+                    "has_cli_binding",
+                )
+                .left_join(turn::Entity)
+                .limit((AGENT_GRAPH_RESPONSE_BINDING_LIMIT - binding_count + 1) as u64)
+                .into_model::<AgentGraphResponseBinding>()
+                .all(db)
+                .await
+                .context("failed to load bounded Agent graph response bindings")?;
+            binding_count += responses.len();
+            if binding_count > AGENT_GRAPH_RESPONSE_BINDING_LIMIT {
+                bail!("Agent graph response bindings exceed independent completion limit");
+            }
+            for response in responses {
+                let thread = response
+                    .bound_thread_id
+                    .context("Agent graph response Turn is missing")?;
+                let status = response
+                    .bound_status
+                    .context("Agent graph response Turn status is missing")?;
+                bindings.entry(response.execution_id).or_default().push((
+                    response.turn_id,
+                    thread,
+                    status == "in_progress",
+                    response.has_cli_binding,
+                ));
+            }
+        }
+        // One-to-many bindings, with an explicit unbound node for queued work.
+        // Thread identity comes from the response Turn, not its execution's parent.
+        let mut targets = Vec::new();
+        for execution in &target_executions {
+            if let Some(responses) = bindings.remove(&execution.id) {
+                for (turn_id, thread_id, turn_pending, has_cli_binding) in responses {
+                    targets.push(AgentWorkGraphCancellationTarget {
+                        execution_id: execution.id.clone(),
+                        turn_id: Some(turn_id),
+                        thread_id: Some(thread_id),
+                        parent_task_id: execution.parent_task_id.clone(),
+                        turn_pending,
+                        has_cli_binding,
+                    });
+                }
+            } else {
+                targets.push(AgentWorkGraphCancellationTarget {
+                    execution_id: execution.id.clone(),
+                    turn_id: None,
+                    thread_id: execution.parent_thread_id.clone(),
+                    parent_task_id: execution.parent_task_id.clone(),
+                    turn_pending: false,
+                    has_cli_binding: false,
+                });
+            }
+        }
+        targets
+    } else {
+        // Preserve the standalone active-only contract, including its validation.
+        let response_turns = if target_ids.is_empty() {
+            Vec::new()
+        } else {
+            let active_turn_ids = Query::select()
+                .column(turn::Column::Id)
+                .from(turn::Entity)
+                .and_where(turn::Column::Status.eq("in_progress"))
+                .to_owned();
+            agent_turn_response_execution::Entity::find()
+                .filter(agent_turn_response_execution::Column::ExecutionId.is_in(target_ids))
+                .filter(agent_turn_response_execution::Column::TurnId.in_subquery(active_turn_ids))
+                .limit(graph_row_limit)
+                .all(db)
+                .await
+                .context("failed to load Agent work-graph Turn bindings")?
+        };
+        if response_turns.len() > target_executions.len() {
+            bail!("Agent work graph has too many active Turn bindings");
+        }
+        let mut responses = BTreeMap::new();
+        for response in response_turns {
+            if responses
+                .insert(response.execution_id, response.turn_id)
+                .is_some()
+            {
+                bail!("Agent execution has multiple active response Turns");
+            }
+        }
+        target_executions
+            .iter()
+            .map(|execution| AgentWorkGraphCancellationTarget {
+                execution_id: execution.id.clone(),
+                turn_id: responses.get(&execution.id).cloned(),
+                thread_id: execution.parent_thread_id.clone(),
+                parent_task_id: execution.parent_task_id.clone(),
+                turn_pending: true,
+                has_cli_binding: false,
+            })
+            .collect()
+    };
 
     if !active_ids.is_empty() {
         agent_execution::Entity::update_many()
@@ -7660,12 +7782,100 @@ mod tests {
         .await
         .unwrap();
 
+        // A Task occurrence may retain several completed revisions plus a
+        // currently admitted revision: response cardinality exceeds node count.
+        for (id, status) in [
+            ("initial", "completed"),
+            ("revision-1", "completed"),
+            ("revision-2", "completed"),
+            ("revision-active", "in_progress"),
+        ] {
+            turn::ActiveModel {
+                id: Set(id.to_owned()),
+                thread_id: Set("thread-revisions".to_owned()),
+                status: Set(status.to_owned()),
+                prompt_manifest_json: Set("{}".to_owned()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                turn_kind: Set("agent".to_owned()),
+                origin: Set("task".to_owned()),
+                mentions_json: Set("[]".to_owned()),
+                message_revision: Set(1),
+                work_owner: Set("turn".to_owned()),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            agent_turn_response_execution::ActiveModel {
+                turn_id: Set(id.to_owned()),
+                execution_id: Set(child_id.to_owned()),
+                presentation_snapshot_id: Set("snapshot-revisions".to_owned()),
+                created_at: Set(now),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
         let transaction = db.begin().await.unwrap();
         let targets = cancel_agent_work_graph(&transaction, root_id, "root cancelled", now)
             .await
             .unwrap();
         transaction.commit().await.unwrap();
         assert_eq!(targets.len(), 3);
+        let active_child = targets
+            .iter()
+            .find(|target| target.execution_id == child_id)
+            .unwrap();
+        assert_eq!(active_child.turn_id.as_deref(), Some("revision-active"));
+        // Standalone still uses its original parent-thread targeting semantics.
+        assert_eq!(active_child.thread_id.as_deref(), Some("thread-cancel"));
+        // Existing admission cancellation ignores terminal rows on retry.
+        let transaction = db.begin().await.unwrap();
+        assert!(
+            cancel_agent_work_graph(&transaction, root_id, "repeat", now)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        transaction.rollback().await.unwrap();
+        // Completion must retain the exact graph after that same durable fence.
+        let transaction = db.begin().await.unwrap();
+        let owners = cancel_agent_work_graph_and_collect_owners(&transaction, root_id, "wait", now)
+            .await
+            .unwrap();
+        assert_eq!(owners.len(), 6);
+        let revisions = owners
+            .iter()
+            .filter(|target| target.execution_id == child_id)
+            .collect::<Vec<_>>();
+        assert_eq!(revisions.len(), 4);
+        assert!(
+            revisions
+                .iter()
+                .all(|target| target.thread_id.as_deref() == Some("thread-revisions"))
+        );
+        assert_eq!(
+            revisions
+                .iter()
+                .filter(|target| target.turn_pending)
+                .count(),
+            1
+        );
+        assert!(
+            owners
+                .iter()
+                .all(|target| target.execution_id != unrelated_id)
+        );
+        assert!(
+            owners
+                .iter()
+                .find(|target| target.execution_id == queued_id)
+                .unwrap()
+                .turn_id
+                .is_none()
+        );
+        transaction.rollback().await.unwrap();
         for id in [root_id, child_id, queued_id] {
             assert_eq!(
                 agent_execution::Entity::find_by_id(id)

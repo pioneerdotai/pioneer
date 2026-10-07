@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PluginsSourceParams",
+  "type": "object",
+  "properties": {
+    "target": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PluginPreviewTarget"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "upload_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "workspace_id",
+    "upload_id"
+  ],
+  "$defs": {
+    "PluginPreviewTarget": {
+      "type": "object",
+      "properties": {
+        "expected_revision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "plugin_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "plugin_id",
+        "expected_revision"
+      ]
+    }
+  }
+}

@@ -119,6 +119,7 @@ pub struct McpCatalogView {
     pub(crate) input: Arc<CatalogInput>,
     binding: Arc<CatalogBinding>,
     sidebar: Entity<CatalogSidebar>,
+    pub(crate) plugin_component: Option<(String, String, String)>,
     demand: Option<McpDemand>,
     demand_key: Option<(String, Option<String>)>,
     pub(crate) sidebar_width: Pixels,
@@ -145,6 +146,23 @@ impl McpCatalogView {
         self.input.is_mcp_pending(name)
     }
 
+    /// Embed the genuine native details/controller under one plugin parent.
+    /// The native catalog's authoritative owner is rechecked on every publication.
+    pub fn new_plugin_details(
+        config: McpCatalogConfig,
+        workspace: String,
+        parent: String,
+        child: String,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let view = Self::new(config, window, cx);
+        view.update(cx, |view, cx| {
+            view.plugin_component = Some((workspace, parent, child));
+            view.sync_publications(window, cx);
+        });
+        view
+    }
     pub fn new(config: McpCatalogConfig, window: &mut Window, cx: &mut App) -> Entity<Self> {
         let mount = NEXT_MOUNT.fetch_add(1, Ordering::Relaxed);
         cx.new(|cx| {
@@ -205,6 +223,7 @@ impl McpCatalogView {
                 binding,
                 sidebar,
                 demand: None,
+                plugin_component: None,
                 demand_key: None,
                 sidebar_width: px(320.),
                 mount,
@@ -280,6 +299,15 @@ impl McpCatalogView {
     }
     fn sync_publications(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut next = CatalogInput::empty(&self.client);
+        if let Some((workspace, _, child)) = &self.plugin_component {
+            if next.navigation_input.workspace_id() == Some(workspace.as_str()) {
+                next.navigation_input = Arc::new(next.navigation_input.with_details_destination(
+                    SemanticDestination::Mcp {
+                        server_id: Some(child.clone()),
+                    },
+                ));
+            }
+        }
         let session = self.client.gateway_session();
         next.gateway.connection_state = session
             .status
@@ -308,7 +336,22 @@ impl McpCatalogView {
             });
             let catalog = self.client.mcp_catalog_snapshot(&workspace);
             if let Some(catalog) = catalog {
-                next.mcp_servers = catalog.servers().iter().map(|s| (**s).clone()).collect();
+                next.mcp_servers = catalog
+                    .servers()
+                    .iter()
+                    .filter(|server| match &self.plugin_component {
+                        Some((expected_workspace, parent, child)) => {
+                            expected_workspace == &workspace
+                                && &server.id == child
+                                && server
+                                    .plugin_owner
+                                    .as_ref()
+                                    .is_some_and(|owner| &owner.plugin_id == parent)
+                        }
+                        None => pioneer_client::mcp::list::mcp_is_standalone(server),
+                    })
+                    .map(|s| (**s).clone())
+                    .collect();
                 next.mcp_loading = catalog.request() == McpLoadState::Loading;
                 next.mcp_error = (catalog.request() == McpLoadState::Failed)
                     .then(|| t!("mcp.error.load_servers_failed", error = "").to_string());

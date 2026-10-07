@@ -13,13 +13,14 @@ use sea_orm::sea_query::{ExprTrait, Query};
 const NOW: i64 = 4_000_000_000;
 const MIGRATION: &str = "m20261002_000001_task_run_occurrence_reconcile";
 
-// Event-driven fixture creation needs the cancellation marker columns. Use
-// that production schema prefix, without later irreversible migrations.
+// Event-driven fixture creation needs cancellation markers and the current
+// Turn's nullable plugin selection column. Use that production schema prefix,
+// without later irreversible migrations.
 struct TrackerFixtureMigrator;
 
 impl MigratorTrait for TrackerFixtureMigrator {
     fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
-        migrations_through("m20261005_000001_native_cancellation_context")
+        migrations_through("m20261005_000001_plugin_ownership")
     }
 }
 

@@ -122,6 +122,7 @@ pub struct CodexJsonlRpcClient {
 /// Dropping the owner aborts every task even when client clones remain alive.
 pub struct CodexJsonlRpcOwner {
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    join_failure: Option<String>,
 }
 impl CodexJsonlRpcOwner {
     pub async fn shutdown(mut self) {
@@ -129,13 +130,31 @@ impl CodexJsonlRpcOwner {
     }
 
     pub async fn abort_and_join(&mut self) {
+        // Preserve the service/probe API's best-effort contract. Runtime stop
+        // callers use the result-returning operation below.
+        let _ = self.abort_and_join_result().await;
+    }
+
+    /// Stop and join this exact transport, including ordered event ingress.
+    /// Keep handles across cancellation and a consumed panic across retries;
+    /// neither an abort request nor an empty task vector is successful proof.
+    pub async fn abort_and_join_result(&mut self) -> anyhow::Result<()> {
         for task in &self.tasks {
             task.abort();
         }
         while let Some(task) = self.tasks.last_mut() {
-            let _ = task.await;
+            if let Err(error) = task.await
+                && !error.is_cancelled()
+                && self.join_failure.is_none()
+            {
+                self.join_failure = Some("Codex transport task failed while stopping".to_owned());
+            }
             self.tasks.pop();
         }
+        if let Some(failure) = &self.join_failure {
+            return Err(anyhow::anyhow!("{failure}"));
+        }
+        Ok(())
     }
 
     fn detach(mut self) {
@@ -223,6 +242,32 @@ impl CodexJsonlRpcClient {
         W: AsyncWrite + Send + Unpin + 'static,
     {
         Self::new_with_server_request_policy(
+            reader,
+            writer,
+            notification_capacity,
+            server_request_capacity,
+            diagnostic_capacity,
+            DEFAULT_SERVER_REQUEST_TIMEOUT,
+            native_event_budget,
+        )
+    }
+
+    /// The persistent Gateway session owns the same workers as a service
+    /// attempt while retaining its configured channel capacities/event budget.
+    /// The legacy constructor above intentionally remains detached.
+    pub fn new_owned_with_channel_capacity_and_budget<R, W>(
+        reader: R,
+        writer: W,
+        notification_capacity: usize,
+        server_request_capacity: usize,
+        diagnostic_capacity: usize,
+        native_event_budget: crate::NativeEventBudget,
+    ) -> (Self, CodexJsonlRpcOwner)
+    where
+        R: AsyncBufRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        Self::new_owned_with_server_request_policy(
             reader,
             writer,
             notification_capacity,
@@ -321,6 +366,7 @@ impl CodexJsonlRpcClient {
             client,
             CodexJsonlRpcOwner {
                 tasks: vec![reader_worker, rpc_worker, ingress_worker],
+                join_failure: None,
             },
         )
     }
@@ -8337,6 +8383,125 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, split};
+
+    #[tokio::test]
+    async fn persistent_owned_transport_retains_capacities_and_closes_pending_rpc() {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let (reader, writer) = split(client_io);
+        let (client, mut owner) = CodexJsonlRpcClient::new_owned_with_channel_capacity_and_budget(
+            BufReader::new(reader),
+            writer,
+            7,
+            11,
+            13,
+            codex_native_event_budget(),
+        );
+        let mut notifications = client.take_notification_receiver().unwrap();
+        let mut requests = client.take_server_request_receiver().unwrap();
+        let mut diagnostics = client.take_diagnostic_receiver().unwrap();
+        assert_eq!(notifications.max_capacity(), 7);
+        assert_eq!(requests.max_capacity(), 11);
+        assert_eq!(diagnostics.max_capacity(), 13);
+        let pending = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .request_value("pending", None, Duration::from_secs(60))
+                    .await
+            }
+        });
+        let mut server = BufReader::new(server_io);
+        server.read_line(&mut String::new()).await.unwrap();
+        owner.abort_and_join_result().await.unwrap();
+        assert!(pending.await.unwrap().is_err());
+        assert!(notifications.recv().await.is_none());
+        assert!(requests.recv().await.is_none());
+        assert!(diagnostics.recv().await.is_none());
+        assert!(owner.tasks.is_empty());
+        owner.abort_and_join_result().await.unwrap();
+        assert_eq!(server.read_line(&mut String::new()).await.unwrap(), 0);
+        assert!(
+            client
+                .request_value("late", None, Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transport_join_cancellation_retains_pending_handle_and_consumed_panic() {
+        // A running blocking worker cannot be aborted: it represents delayed
+        // native cleanup, without starting a provider/process/fixture.
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let delayed = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            wait.recv().unwrap();
+        });
+        ready.await.unwrap();
+        let panicked = tokio::spawn(async {
+            panic!("transport worker panic");
+        });
+        while !panicked.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut owner = CodexJsonlRpcOwner {
+            tasks: vec![delayed, panicked],
+            join_failure: None,
+        };
+        {
+            let mut stop = Box::pin(owner.abort_and_join_result());
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(stop.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            // Cancelling this waiter must not detach delayed native cleanup.
+        }
+        assert_eq!(owner.tasks.len(), 1);
+        assert!(owner.join_failure.is_some());
+        release.send(()).unwrap();
+        assert!(owner.abort_and_join_result().await.is_err());
+        assert!(
+            owner.tasks.is_empty(),
+            "all other workers still drain after a panic"
+        );
+        assert!(
+            owner.abort_and_join_result().await.is_err(),
+            "consumed panic stays failed"
+        );
+        owner.abort_and_join().await; // legacy best effort does not erase it
+        assert!(owner.abort_and_join_result().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn old_transport_close_does_not_stop_replacement_transport() {
+        let (old_io, _old_server) = tokio::io::duplex(1024);
+        let (reader, writer) = split(old_io);
+        let (_old, mut old_owner) = CodexJsonlRpcClient::new_owned(BufReader::new(reader), writer);
+        let (new_io, new_server) = tokio::io::duplex(1024);
+        let (reader, writer) = split(new_io);
+        let (replacement, mut replacement_owner) =
+            CodexJsonlRpcClient::new_owned(BufReader::new(reader), writer);
+        old_owner.abort_and_join_result().await.unwrap();
+        let pending = tokio::spawn(async move {
+            replacement
+                .request_value("replacement", None, Duration::from_secs(1))
+                .await
+        });
+        let mut server = BufReader::new(new_server);
+        let mut line = String::new();
+        server.read_line(&mut line).await.unwrap();
+        let request: JsonValue = serde_json::from_str(&line).unwrap();
+        let response = json!({"id": request["id"], "result": {"alive": true}});
+        server
+            .get_mut()
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(pending.await.unwrap().unwrap(), json!({"alive": true}));
+        replacement_owner.abort_and_join_result().await.unwrap();
+    }
 
     #[tokio::test]
     async fn owned_codex_transport_joins_all_tasks_between_attempts() {

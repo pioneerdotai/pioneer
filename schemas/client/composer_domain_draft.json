@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ComposerDomainDraft",
-  "description": "Complete, shell-neutral draft payload used by desktop and mobile.\n\nHot editor state (cursor, IME composition, focus, keyboard, sheets) is not\npart of this value. A shell snapshots its text only at lifecycle boundaries\nsuch as switching threads.",
+  "description": "Complete, shell-neutral draft payload used by desktop and mobile.\n\nHot editor state (cursor, IME composition, focus, keyboard, sheets) is not\npart of this value. Client owns the text; shells publish user edits and\napply controlled publications without moving cursor or IME state into Client.",
   "type": "object",
   "properties": {
     "domain": {
@@ -277,6 +277,31 @@
     },
     "ComposerCapabilityKind": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "Plugin": {
+              "type": "object",
+              "properties": {
+                "expected_revision": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "plugin_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "plugin_id",
+                "expected_revision"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Plugin"
+          ]
+        },
         {
           "type": "object",
           "properties": {
