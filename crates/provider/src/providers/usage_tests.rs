@@ -302,7 +302,7 @@ async fn compatible_stream_usage_opt_in_is_profile_specific_and_terminal_is_cumu
             OpenAiCompatibleProvider::new(profile, url, "fixture-key", AuthStyle::Bearer);
         let mut stream = crate::attachments::runtime::with_async_authority_scope(
             "usage-fixture-authority".into(),
-            provider.stream_chat(request()),
+            provider.stream_chat(request("fixture")),
         )
         .await
         .unwrap();
@@ -334,7 +334,7 @@ async fn groq_request_id_is_distinct_and_profile_specific() {
         let provider = OpenAiCompatibleProvider::new(profile, url, "fixture", AuthStyle::Bearer);
         let response = crate::attachments::runtime::with_async_authority_scope(
             "usage-fixture-authority".into(),
-            provider.chat(request()),
+            provider.chat(request("fixture")),
         )
         .await
         .unwrap();
@@ -372,7 +372,7 @@ async fn openrouter_header_is_preserved_on_chat_rejection_and_stream_before_body
         let provider = OpenRouterProvider::with_base_url("fixture", url);
         let result = crate::attachments::runtime::with_async_authority_scope(
             "usage-fixture-authority".into(),
-            provider.stream_chat(request()),
+            provider.stream_chat(request("openai/gpt-4o")),
         )
         .await;
         let mut usage = TokenUsage::default();
@@ -400,7 +400,7 @@ async fn openrouter_header_is_preserved_on_chat_rejection_and_stream_before_body
     let provider = OpenRouterProvider::with_base_url("fixture", url);
     let error = crate::attachments::runtime::with_async_authority_scope(
         "usage-fixture-authority".into(),
-        provider.chat(request()),
+        provider.chat(request("openai/gpt-4o")),
     )
     .await
     .err()
@@ -423,7 +423,7 @@ async fn openrouter_header_is_preserved_on_chat_rejection_and_stream_before_body
     let provider = OpenRouterProvider::with_base_url("fixture", url);
     let response = crate::attachments::runtime::with_async_authority_scope(
         "usage-fixture-authority".into(),
-        provider.chat(request()),
+        provider.chat(request("openai/gpt-4o")),
     )
     .await
     .unwrap();
@@ -444,7 +444,7 @@ async fn openrouter_matching_and_conflicting_body_use_header_policy_without_doub
         let provider = OpenRouterProvider::with_base_url("fixture", url);
         let mut stream = crate::attachments::runtime::with_async_authority_scope(
             "usage-fixture-authority".into(),
-            provider.stream_chat(request()),
+            provider.stream_chat(request("openai/gpt-4o")),
         )
         .await
         .unwrap();
@@ -475,7 +475,7 @@ async fn anthropic_returned_model_survives_nonstream_and_message_start_without_u
         if streaming {
             let mut stream = crate::attachments::runtime::with_async_authority_scope(
                 "usage-fixture-authority".into(),
-                provider.stream_chat(request()),
+                provider.stream_chat(request("claude-sonnet-4-5")),
             )
             .await
             .unwrap();
@@ -487,7 +487,7 @@ async fn anthropic_returned_model_survives_nonstream_and_message_start_without_u
         } else {
             let response = crate::attachments::runtime::with_async_authority_scope(
                 "usage-fixture-authority".into(),
-                provider.chat(request()),
+                provider.chat(request("claude-sonnet-4-5")),
             )
             .await
             .unwrap();
