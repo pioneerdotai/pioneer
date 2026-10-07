@@ -312,16 +312,18 @@ pub(crate) fn publish_watched_candidate<'a>(
         }
         let started = std::sync::atomic::AtomicBool::new(false);
         let patch = candidate_database_patch(&publication.candidate);
-        let database_work = async {
-            if publication.confirm_only {
-                crud_store.confirm_skill_reconciliation(&snapshot, workspace.as_ref(), &still_current, &started).await
-            } else {
-                crud_store.reconcile_skill_installation_with_progress(&snapshot, &patch, publication.now, workspace.as_ref(), &still_current, &started).await
-            }
-        };
         let mut switched = if let Err(error) = validation {
             Err(pioneer_crud::SkillReconciliationError { outcome: pioneer_crud::SkillReconciliationFailure::NotCommitted, error }.into())
         } else {
+            // End the DB future's borrow before moving publication into finish,
+            // including when cancellation wins before the future is polled.
+            let database_work = async {
+                if publication.confirm_only {
+                    crud_store.confirm_skill_reconciliation(&snapshot, workspace.as_ref(), &still_current, &started).await
+                } else {
+                    crud_store.reconcile_skill_installation_with_progress(&snapshot, &patch, publication.now, workspace.as_ref(), &still_current, &started).await
+                }
+            };
             tokio::select! { biased;
                 _ = stop.cancelled() => Err(pioneer_crud::SkillReconciliationError {
                     outcome: if started.load(std::sync::atomic::Ordering::Acquire) { pioneer_crud::SkillReconciliationFailure::Unknown } else { pioneer_crud::SkillReconciliationFailure::NotCommitted },
