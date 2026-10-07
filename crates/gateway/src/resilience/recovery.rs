@@ -967,6 +967,7 @@ impl RecoveryCoordinator {
         recovery_attempt_id: &str,
         failure: ProviderFailureDetails,
         now_unix: i64,
+        accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
         let Some(job) = self.crud_store.get_recovery_job(recovery_job_id).await? else {
             return Ok(Vec::new());
@@ -985,6 +986,7 @@ impl RecoveryCoordinator {
                     recovery_attempt_id,
                     failure,
                     now_unix,
+                    accepted_cli_outcome,
                 )
                 .await;
         }
@@ -997,6 +999,7 @@ impl RecoveryCoordinator {
             failure.retry_after_ms,
             Some(diagnostic),
             now_unix,
+            accepted_cli_outcome,
         )
         .await
     }
@@ -1007,6 +1010,7 @@ impl RecoveryCoordinator {
         recovery_attempt_id: &str,
         failure: ProviderFailureDetails,
         now_unix: i64,
+        accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
         let mut diagnostic = pioneer_protocol::RecoveryDiagnostic::provider(&failure);
         diagnostic.stop_reason = Some(pioneer_protocol::RecoveryStopReason::PolicyRejected);
@@ -1021,6 +1025,7 @@ impl RecoveryCoordinator {
                 Some(message.clone()),
                 Some(diagnostic),
                 now_unix,
+                accepted_cli_outcome,
             )
             .await?
         {
@@ -1053,6 +1058,7 @@ impl RecoveryCoordinator {
         recovery_attempt_id: &str,
         failure_message: String,
         now_unix: i64,
+        accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
         let Some(job) = self.crud_store.get_recovery_job(recovery_job_id).await? else {
             return Ok(Vec::new());
@@ -1070,6 +1076,7 @@ impl RecoveryCoordinator {
             None,
             None,
             now_unix,
+            accepted_cli_outcome,
         )
         .await
     }
@@ -1159,6 +1166,7 @@ impl RecoveryCoordinator {
                     None,
                     None,
                     now_unix,
+                    None,
                 )
                 .await?,
             );
@@ -1175,6 +1183,7 @@ impl RecoveryCoordinator {
         retry_after_ms: Option<u64>,
         diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
         now_unix: i64,
+        accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
         let policy = self.policy_for_recovery_job(&job).await?;
         let attempt_number = attempt_number_for_job(&job);
@@ -1209,6 +1218,7 @@ impl RecoveryCoordinator {
                     Some(last_error),
                     Some(diagnostic),
                     now_unix,
+                    accepted_cli_outcome,
                 )
                 .await?
             {
@@ -1256,6 +1266,7 @@ impl RecoveryCoordinator {
                 reason.clone(),
                 diagnostic,
                 now_unix,
+                accepted_cli_outcome,
             )
             .await?
         {
@@ -1394,6 +1405,18 @@ impl RecoveryCoordinator {
         error_message: &str,
         now_unix: i64,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        self.block_active_recoveries_for_turn_if_owned(turn_id, recovery, error_message, now_unix)
+            .await?;
+        Ok(Vec::new())
+    }
+
+    pub async fn block_active_recoveries_for_turn_if_owned(
+        &self,
+        turn_id: &str,
+        recovery: Option<&RecoveryAttemptContext>,
+        error_message: &str,
+        now_unix: i64,
+    ) -> Result<bool> {
         let jobs = if let Some(recovery) = recovery {
             self.crud_store
                 .get_recovery_job(recovery.job_id.as_str())
@@ -1449,7 +1472,7 @@ impl RecoveryCoordinator {
                 .await?;
         }
 
-        Ok(Vec::new())
+        Ok(blocked_any)
     }
 
     async fn fail_active_recoveries_for_turn_with_cancel_reason(
@@ -1494,6 +1517,7 @@ impl RecoveryCoordinator {
                     Some(error_message.to_owned()),
                     Some(diagnostic),
                     now_unix,
+                    None,
                 )
                 .await?
             {
@@ -1686,6 +1710,16 @@ impl RecoveryCoordinator {
         execution: &TurnExecutionRecord,
         now_unix: i64,
     ) -> Result<()> {
+        if execution.executor_kind == TurnExecutorKind::CliRuntime
+            && self
+                .crud_store
+                .has_pending_cli_runtime_terminal_event(&execution.turn_id)
+                .await?
+        {
+            // Ownership takeover precedes the active scan. Preserve the exact
+            // accepted outcome for that scan instead of synthesizing a restart.
+            return Ok(());
+        }
         if self
             .open_recovery_for_turn(execution.turn_id.as_str())
             .await?
@@ -1931,6 +1965,7 @@ impl RecoveryCoordinator {
                         None,
                         None,
                         now_unix,
+                        None,
                     )
                     .await?,
                 );
@@ -1991,6 +2026,46 @@ impl RecoveryCoordinator {
         let Some(claim_token) = job.claim_token.clone() else {
             bail!("claimed recovery job `{}` has no claim token", job.id);
         };
+
+        if self
+            .crud_store
+            .get_turn_execution(&job.turn_id)
+            .await?
+            .is_some_and(|execution| {
+                execution.executor_kind == TurnExecutorKind::CliRuntime
+                    && execution.status.is_active()
+                    && (execution.owner_id != self.turn_execution_owner_id.as_ref()
+                        || execution.lease_until.timestamp() <= now_unix)
+            })
+        {
+            self.crud_store
+                .release_claimed_recovery_job(
+                    &job.id,
+                    &claim_token,
+                    now_unix.saturating_add(5),
+                    Some("Turn execution authority awaits ownership takeover".into()),
+                    now_unix,
+                )
+                .await?;
+            return Ok(events);
+        }
+
+        if self
+            .crud_store
+            .has_pending_cli_runtime_terminal_event(&job.turn_id)
+            .await?
+        {
+            self.crud_store
+                .release_claimed_recovery_job(
+                    &job.id,
+                    &claim_token,
+                    now_unix.saturating_add(5),
+                    Some("accepted CLI terminal outcome awaits delivery".into()),
+                    now_unix,
+                )
+                .await?;
+            return Ok(events);
+        }
 
         let run_index = job.run_count.saturating_add(1);
 
@@ -2385,6 +2460,7 @@ impl RecoveryCoordinator {
                             None,
                             None,
                             now_unix,
+                            None,
                         )
                         .await;
                 }
@@ -2516,6 +2592,7 @@ impl RecoveryCoordinator {
                             None,
                             None,
                             now_unix,
+                            None,
                         )
                         .await;
                 }
@@ -2616,6 +2693,7 @@ impl RecoveryCoordinator {
                                                 None,
                                                 None,
                                                 now_unix,
+                                                None,
                                             )
                                             .await;
                                     }
@@ -2722,6 +2800,7 @@ impl RecoveryCoordinator {
                 last_error,
                 diagnostic,
                 now_unix,
+                None,
             )
             .await?
         {
@@ -2807,6 +2886,7 @@ impl RecoveryCoordinator {
                     Some(error.to_string()),
                     Some(diagnostic),
                     now_unix,
+                    None,
                 )
                 .await?
             {
@@ -7190,6 +7270,7 @@ mod tests {
                 request.recovery_attempt_id.as_str(),
                 "replacement native turn disconnected".to_owned(),
                 1_700_000_012,
+                None,
             )
             .await
             .expect("native CLI recovery failure should return to coordinator policy");
@@ -8911,7 +8992,13 @@ mod tests {
                 provider_failure(ProviderFailureClass::AuthOrPermission, "raw last failure");
             failure.http_status = Some(403);
             let events = coordinator
-                .record_recovery_provider_failure(&job.id, &attempt, failure.clone(), 1_700_000_003)
+                .record_recovery_provider_failure(
+                    &job.id,
+                    &attempt,
+                    failure.clone(),
+                    1_700_000_003,
+                    None,
+                )
                 .await
                 .unwrap();
             let [RecoveryCoordinatorEvent::RecoveryExhausted(outcome)] = events.as_slice() else {
@@ -8962,7 +9049,7 @@ mod tests {
         last.stage = ProviderFailureStage::Connect;
         last.provider_code = Some("credential=secret".to_owned());
         let events = coordinator
-            .record_recovery_provider_failure(&job.id, &attempt, last.clone(), 1_700_000_002)
+            .record_recovery_provider_failure(&job.id, &attempt, last.clone(), 1_700_000_002, None)
             .await
             .unwrap();
         assert!(matches!(
@@ -9005,7 +9092,8 @@ mod tests {
                     &job.id,
                     &attempt,
                     provider_failure(ProviderFailureClass::Unknown, "stale"),
-                    pending.next_run_at_unix
+                    pending.next_run_at_unix,
+                    None,
                 )
                 .await
                 .unwrap()
@@ -9017,6 +9105,7 @@ mod tests {
                 attempt2,
                 last.clone(),
                 pending.next_run_at_unix + 1,
+                None,
             )
             .await
             .unwrap();
@@ -9045,7 +9134,8 @@ mod tests {
                     &job.id,
                     attempt2,
                     last,
-                    pending.next_run_at_unix + 2
+                    pending.next_run_at_unix + 2,
+                    None,
                 )
                 .await
                 .unwrap()
@@ -9089,6 +9179,7 @@ mod tests {
                     "failed inside recovery",
                 ),
                 1_700_000_002,
+                None,
             )
             .await
             .expect("active recovery failure should be recorded");
@@ -9185,6 +9276,7 @@ mod tests {
                 active_attempt_id.as_str(),
                 renewed,
                 failure_at_unix,
+                None,
             )
             .await
             .expect("renewed provider cooldown should requeue");
@@ -9950,6 +10042,7 @@ mod tests {
                     "late provider failure after timeout",
                 ),
                 1_700_000_003,
+                None,
             )
             .await
             .expect("late stale provider failure should not error");
@@ -10320,6 +10413,7 @@ mod tests {
                 active_attempt_id.as_str(),
                 provider_failure(ProviderFailureClass::ModelNotFound, "still missing"),
                 1_700_000_002,
+                None,
             )
             .await
             .expect("active recovery failure should be recorded");
@@ -10633,6 +10727,7 @@ mod tests {
                 active_attempt_id.as_str(),
                 provider_failure(ProviderFailureClass::NetworkTransient, "connection reset"),
                 1_700_000_002,
+                None,
             )
             .await
             .expect("active recovery failure should use persisted policy");
@@ -10680,6 +10775,7 @@ mod tests {
                     "HTTP 400 unchanged request",
                 ),
                 1_700_000_002,
+                None,
             )
             .await
             .expect("request rejection should terminalize active recovery");

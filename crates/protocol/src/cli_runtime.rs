@@ -1206,3 +1206,87 @@ mod tests {
         assert_eq!(decoded, response);
     }
 }
+
+/// Internal source identity for the durable lane and saved native outcomes.
+/// This does not change client or canonical domain event payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliRuntimeBlockedTurnGuard {
+    /// Existing native-journal outcome being delivered; None is a guarded
+    /// Blocked observation with the atomic attempt/canonical transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_delivery_id: Option<String>,
+    pub turn_id: String,
+    pub thread_id: String,
+    pub workspace_id: String,
+    pub continuation_thread_id: String,
+    pub runtime_id: String,
+    pub runtime_kind: String,
+    pub native_thread_id: String,
+    pub binding_native_turn_id: Option<String>,
+    pub binding_status: String,
+    pub native_goal_status: Option<String>,
+    pub native_goal_turn_id: Option<String>,
+    pub attempt_id: String,
+    pub attempt_status: String,
+    pub attempt_native_turn_id: Option<String>,
+    pub recovery_job_id: Option<String>,
+    pub recovery_attempt_id: Option<String>,
+    pub recovery_confirmed: bool,
+    // (segment id, native turn id, status); latest segment must still be this one.
+    pub segment: Option<(String, String, String)>,
+    pub execution_owner: Option<(String, u64)>,
+}
+
+impl CliRuntimeBlockedTurnGuard {
+    pub fn goal_keeps_turn_open(observed: bool, status: Option<&str>) -> bool {
+        observed && status.is_some_and(|status| status != "complete")
+    }
+
+    pub fn segment_ack_needs_goal_completion(&self, observed: bool, status: Option<&str>) -> bool {
+        self.native_goal_status
+            .as_deref()
+            .is_some_and(|status| status != "complete")
+            && observed
+            && !Self::goal_keeps_turn_open(observed, status)
+    }
+    /// Accepted outcome identity belongs to the physical provider execution,
+    /// not the Gateway lease holder. Compute outside database capacity.
+    pub fn terminal_delivery_id(&self) -> String {
+        use sha2::Digest;
+        let identity = serde_json::to_vec(&(
+            &self.turn_id,
+            &self.attempt_id,
+            self.segment.as_ref().map(|(id, _, _)| id),
+        ))
+        .expect("native source identity serializes");
+        format!(
+            "cli-terminal:{}",
+            hex::encode(sha2::Sha256::digest(identity))
+        )
+    }
+
+    /// Native event provenance survives legitimate activity/status/Goal changes
+    /// of this execution, but never a different attempt, segment or owner epoch.
+    pub fn same_execution(&self, other: &Self) -> bool {
+        self.same_native_execution(other) && self.execution_owner == other.execution_owner
+    }
+
+    /// Only an already accepted journal outcome may cross a process takeover.
+    /// Its replay still needs current owner/generation authorization in writer.
+    pub fn same_native_execution(&self, other: &Self) -> bool {
+        self.turn_id == other.turn_id
+            && self.thread_id == other.thread_id
+            && self.workspace_id == other.workspace_id
+            && self.continuation_thread_id == other.continuation_thread_id
+            && self.runtime_id == other.runtime_id
+            && self.runtime_kind == other.runtime_kind
+            && self.native_thread_id == other.native_thread_id
+            && self.binding_native_turn_id == other.binding_native_turn_id
+            && self.attempt_id == other.attempt_id
+            && self.attempt_native_turn_id == other.attempt_native_turn_id
+            && self.recovery_job_id == other.recovery_job_id
+            && self.recovery_attempt_id == other.recovery_attempt_id
+            && self.segment.as_ref().map(|(id, native, _)| (id, native))
+                == other.segment.as_ref().map(|(id, native, _)| (id, native))
+    }
+}
