@@ -526,20 +526,41 @@ async fn partial_snapshot_startup_backoff_and_late_event_recovery() {
 #[tokio::test]
 async fn failed_snapshot_update_keeps_live_roots_and_root_failure_is_isolated() {
     let harness = harness_with_bad_root(true).await;
+    let source = harness.directory.path().join("source/pkg");
+    std::fs::create_dir_all(&source).unwrap();
+    for kind in ["user", "registry"] {
+        std::fs::create_dir_all(harness.directory.path().join("managed/ws").join(kind)).unwrap();
+    }
+    let healthy_root = fs_canonical(source.parent().unwrap());
     let signals = Arc::new(Signals::default());
+    // Inject the edit explicitly. Native folder-creation callbacks can cancel
+    // an initial scan and schedule an unrelated five-second root backoff.
+    signals
+        .native_events_disabled
+        .store(true, Ordering::Release);
     let stop = CancellationToken::new();
     let worker = tokio::spawn(run_with_signals(
         harness.processor.clone(),
         stop.clone(),
         signals.clone(),
     ));
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while signals.snapshots.load(Ordering::Relaxed) == 0 {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let settled = signals
+                .roots
+                .lock()
+                .unwrap()
+                .get(&healthy_root)
+                .is_some_and(|dirty| dirty.generation == dirty.acknowledged);
+            if settled {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap();
+    .expect("healthy initial scan must finish before snapshot failure injection");
+    let snapshots = signals.snapshots.load(Ordering::Relaxed);
     let roots = signals.roots.lock().unwrap().len();
     *signals.snapshot_failure_page.lock().unwrap() = Some(1);
     harness
@@ -548,23 +569,26 @@ async fn failed_snapshot_update_keeps_live_roots_and_root_failure_is_isolated() 
         .create_workspace("other", Some("Changed"))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(Duration::from_secs(5), signals.snapshot_failed.notified())
+        .await
+        .expect("changed workspace snapshot must reach its injected failure");
     let before = signals.loop_iterations.load(Ordering::Relaxed);
-    let source = harness.directory.path().join("source/pkg");
-    std::fs::create_dir_all(&source).unwrap();
     std::fs::write(
         source.join("SKILL.md"),
         "---\nname: Healthy\n---\nLate healthy root",
     )
     .unwrap();
-    signals.event(Ok(Event::new(EventKind::Any).add_path(source)));
+    signals.event(Ok(Event::new(EventKind::Modify(
+        notify::event::ModifyKind::Any,
+    ))
+    .add_path(source.join("SKILL.md"))));
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(signals.roots.lock().unwrap().len(), roots);
     assert!(
         signals.loop_iterations.load(Ordering::Relaxed) - before < 200,
         "no expired provisional deadline spin"
     );
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let rows = harness
                 .processor
@@ -580,8 +604,15 @@ async fn failed_snapshot_update_keeps_live_roots_and_root_failure_is_isolated() 
     })
     .await
     .expect("healthy previous mapping continues during snapshot backoff");
+    assert_eq!(
+        signals.snapshots.load(Ordering::Relaxed),
+        snapshots,
+        "healthy import must finish using the previous mapping while snapshots fail"
+    );
     *signals.snapshot_failure_page.lock().unwrap() = None;
-    tokio::time::timeout(Duration::from_secs(12), async {
+    // A slow import may span more than one failed snapshot retry. Preserve
+    // that scheduled backoff while waiting for the replacement mappings.
+    tokio::time::timeout(Duration::from_secs(35), async {
         loop {
             let rows = harness
                 .processor

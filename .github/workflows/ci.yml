@@ -88,11 +88,13 @@ jobs:
           set -euo pipefail
           cargo check --locked --workspace
 
-      - name: cargo-test-episodic-regressions
+      - name: cargo-test-pr-regressions
         if: matrix.run_tests == 'true'
         shell: bash
         run: |
           set -euo pipefail
+          cargo test --locked -p pioneer-gateway --lib failed_snapshot_update_keeps_live_roots_and_root_failure_is_isolated -- --nocapture
+          cargo test --locked -p pioneer-gateway --lib cli_native_terminal_consumer_acks_delivery_and_retains_ownership_after_publisher_cancel -- --nocapture
           cargo test --locked -p pioneer-gateway --lib refill_confirmed_prefix_survives_poison_and_unknown_commit_without_replay -- --nocapture
           cargo test --locked -p pioneer-gateway --lib thread_episodic -- --nocapture
 
