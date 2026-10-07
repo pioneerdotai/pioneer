@@ -138,6 +138,23 @@ pub async fn list_workspace_memberships_for_workspace<C: ConnectionTrait>(
         })
 }
 
+/// Internal maintenance snapshot, bounded by the active/id keyset index.
+pub async fn list_active_workspace_page<C: ConnectionTrait>(
+    db: &C,
+    after: Option<&str>,
+) -> Result<Vec<workspace::Model>> {
+    let mut query = workspace::Entity::find().filter(workspace::Column::IsActive.eq(true));
+    if let Some(after) = after {
+        query = query.filter(workspace::Column::Id.gt(after.to_owned()));
+    }
+    query
+        .order_by_asc(workspace::Column::Id)
+        .limit(64)
+        .all(db)
+        .await
+        .context("failed to page active workspaces")
+}
+
 /// Returns only active workspaces granted to the exact ordinary principal.
 ///
 /// The membership predicate is part of the SQL query so callers never load an
