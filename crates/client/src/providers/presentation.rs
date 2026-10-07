@@ -436,6 +436,7 @@ mod tests {
     fn reasoning_model(options: Vec<&str>, supported: Option<bool>) -> ProviderModelInfo {
         let mut model = model("gpt-5", Some("GPT 5"));
         model.capabilities.reasoning = Some(ProviderModelReasoningCapabilities {
+            native: Default::default(),
             supported,
             effort_options: options.into_iter().map(str::to_owned).collect(),
             default_effort: None,

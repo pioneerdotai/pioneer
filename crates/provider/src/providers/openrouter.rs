@@ -13,8 +13,8 @@ use crate::{
     types::{
         ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, InputContentType,
         InputTypeSupport, ProviderCapabilities, ProviderInputCapabilities, ProviderReplayState,
-        ProviderTermination, ProviderTimeoutPolicy, ReasoningConfig, ReasoningEffort, Role,
-        StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+        ProviderTermination, ProviderTimeoutPolicy, ReasoningEffort, Role, StreamChunk, TokenUsage,
+        ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -63,6 +63,8 @@ struct ApiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ApiReasoningOptions>,
     stream: bool,
+    #[serde(flatten)]
+    generation: crate::generation::Fields,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -622,19 +624,10 @@ impl OpenRouterArchitecture {
     }
 }
 
+// Keep field presence/null separately from booleans and per-model enums.
 #[derive(Debug, Deserialize)]
-struct OpenRouterReasoningMetadata {
-    #[serde(default)]
-    supported_efforts: Option<Vec<String>>,
-    #[serde(default)]
-    default_effort: Option<String>,
-    #[serde(default)]
-    default_enabled: Option<bool>,
-    #[serde(default)]
-    mandatory: Option<bool>,
-    #[serde(default)]
-    supports_max_tokens: Option<bool>,
-}
+#[serde(transparent)]
+struct OpenRouterReasoningMetadata(serde_json::Map<String, serde_json::Value>);
 
 #[derive(Debug, Deserialize)]
 struct OpenRouterPricing {
@@ -651,6 +644,40 @@ struct OpenRouterPricing {
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl OpenRouterProvider {
+    fn build_chat_request(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        let catalog = crate::catalog::model_catalog().ok();
+        Self::build_chat_request_with_catalog(request, messages, stream, catalog.as_deref())
+    }
+
+    fn build_chat_request_with_catalog(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> Result<ApiChatRequest> {
+        let generation =
+            crate::generation::chat_fields_from_catalog(catalog, "openrouter", request)?;
+        Ok(ApiChatRequest {
+            generation,
+            model: request.model.clone(),
+            messages,
+            temperature: None,
+            max_tokens: None,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: request.tool_choice.clone().map(Self::convert_tool_choice),
+            parallel_tool_calls: request.parallel_tool_calls,
+            reasoning: None,
+            stream,
+        })
+    }
+
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_timeout_policy(api_key, ProviderTimeoutPolicy::default())
     }
@@ -685,21 +712,7 @@ impl OpenRouterProvider {
         stream: bool,
     ) -> Result<ApiChatRequest> {
         let rendered_messages = Self::convert_messages(prepared)?;
-        let reasoning = Self::reasoning_options(request.reasoning);
-        Ok(ApiChatRequest {
-            model: request.model.clone(),
-            messages: rendered_messages,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.clone().map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            reasoning,
-            stream,
-        })
+        Self::build_chat_request(request, rendered_messages, stream)
     }
 
     fn audio_format_from_mime(mime: &str) -> Result<&'static str> {
@@ -720,19 +733,6 @@ impl OpenRouterProvider {
     fn looks_like_url(value: &str) -> bool {
         let value = value.trim().to_ascii_lowercase();
         value.starts_with("http://") || value.starts_with("https://") || value.starts_with("data:")
-    }
-
-    fn reasoning_options(
-        request_reasoning: Option<ReasoningConfig>,
-    ) -> Option<ApiReasoningOptions> {
-        let effort = match request_reasoning {
-            Some(ReasoningConfig::Effort(effort)) => effort,
-            Some(ReasoningConfig::Disabled) | None => return None,
-        };
-
-        Some(ApiReasoningOptions {
-            effort: effort.as_str().to_owned(),
-        })
     }
 
     fn media_url_or_data_url(
@@ -1686,7 +1686,7 @@ fn provider_model_from_openrouter_model_entry(m: OpenRouterModelEntry) -> Provid
             .map(|v| v.iter().any(|m| m.eq_ignore_ascii_case("image")));
     }
     if let Some(reasoning) = reasoning {
-        capabilities.thinking = reasoning.supported;
+        // Effort/default/mandatory/budget facts are not a native thinking bool.
         capabilities.reasoning = Some(reasoning);
     }
 
@@ -1735,48 +1735,226 @@ fn openrouter_embedding_model_from_openrouter_model_entry(
 fn openrouter_reasoning_capabilities(
     metadata: OpenRouterReasoningMetadata,
 ) -> Option<ProviderModelReasoningCapabilities> {
-    let effort_options = metadata
-        .supported_efforts
-        .map(|efforts| {
-            efforts
-                .into_iter()
-                .filter_map(|effort| {
-                    ReasoningEffort::canonical_value(effort.as_str()).map(str::to_owned)
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| {
-            OPENROUTER_GATEWAY_REASONING_EFFORTS
-                .iter()
-                .map(|effort| (*effort).to_owned())
-                .collect()
-        });
-    let default_effort = metadata
-        .default_effort
-        .as_deref()
+    let fields = metadata.0;
+    let mut native = std::collections::BTreeMap::new();
+    let efforts = fields.get("supported_efforts");
+    let values = efforts.and_then(serde_json::Value::as_array);
+    let complete = values.is_some_and(|v| v.iter().all(serde_json::Value::is_string));
+    // Documented null = generic gateway vocabulary; omitted within a reasoning
+    // object = no effort selection. Neither is a confirmed per-model enum.
+    // https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
+    native.insert(
+        "effort.enum".into(),
+        if efforts.is_none() {
+            Some(false)
+        } else if complete {
+            Some(true)
+        } else {
+            None
+        },
+    );
+    if efforts.is_some_and(serde_json::Value::is_null) {
+        native.insert("effort.gateway".into(), Some(true));
+    }
+    let mut options = Vec::new();
+    if complete {
+        for value in values.unwrap() {
+            let raw = value.as_str().unwrap();
+            let value = ReasoningEffort::canonical_value(raw).unwrap_or(raw);
+            native.insert(format!("effort.{value}"), Some(true));
+            if ReasoningEffort::from_str(value).is_some() {
+                options.push(value.to_owned());
+            }
+        }
+    } else if native.get("effort.gateway") == Some(&Some(true)) {
+        options = OPENROUTER_GATEWAY_REASONING_EFFORTS
+            .iter()
+            .map(|v| (*v).into())
+            .collect();
+    }
+    if complete || native.get("effort.gateway") == Some(&Some(true)) {
+        for value in OPENROUTER_GATEWAY_REASONING_EFFORTS {
+            native
+                .entry(format!("effort.{value}"))
+                .or_insert(Some(options.iter().any(|v| v == value)));
+        }
+    }
+    for (source, target) in [
+        ("supported", "reasoning.supported"),
+        ("mandatory", "mandatory"),
+        ("default_enabled", "default_enabled"),
+        ("supports_max_tokens", "supports_token_budget"),
+    ] {
+        if let Some(value) = fields.get(source) {
+            native.insert(target.into(), value.as_bool());
+        }
+    }
+    let default_effort = fields
+        .get("default_effort")
+        .and_then(serde_json::Value::as_str)
         .and_then(ReasoningEffort::canonical_value)
         .map(str::to_owned);
-    if effort_options.is_empty()
-        && default_effort.is_none()
-        && metadata.default_enabled != Some(true)
-        && metadata.mandatory != Some(true)
-        && metadata.supports_max_tokens != Some(true)
-    {
-        return None;
+    if let Some(value) = fields.get("default_effort") {
+        native.insert("default_effort".into(), None);
+        if let Some(raw) = value.as_str() {
+            native.insert(
+                format!(
+                    "default_effort.{}",
+                    ReasoningEffort::canonical_value(raw).unwrap_or(raw)
+                ),
+                Some(true),
+            );
+        }
     }
-
-    Some(ProviderModelReasoningCapabilities {
-        supported: Some(true),
-        effort_options,
+    let mut reasoning = ProviderModelReasoningCapabilities {
+        native,
+        effort_options: options,
         default_effort,
-        mandatory: metadata.mandatory,
-        supports_token_budget: metadata.supports_max_tokens,
-        source: Some(ReasoningCapabilitySource::ProviderMetadata),
-    })
+        source: Some(if complete {
+            ReasoningCapabilitySource::ProviderMetadata
+        } else {
+            ReasoningCapabilitySource::Unknown
+        }),
+        ..Default::default()
+    };
+    preserve_native_reasoning(&mut reasoning);
+    Some(reasoning)
+}
+
+/// Restore separately published fields after catalog enrichment. This uses the
+/// same compact internal facts carried by the authority-bound request scope;
+/// no public schema or second model catalog is introduced.
+pub(crate) fn preserve_native_reasoning(reasoning: &mut ProviderModelReasoningCapabilities) {
+    let native = &reasoning.native;
+    let complete = native.get("effort.enum") == Some(&Some(true));
+    let gateway = native.get("effort.gateway") == Some(&Some(true));
+    if complete || gateway {
+        reasoning.effort_options = OPENROUTER_GATEWAY_REASONING_EFFORTS
+            .iter()
+            .filter(|e| native.get(&format!("effort.{e}")) == Some(&Some(true)))
+            .map(|e| (*e).to_owned())
+            .collect();
+    } else if native.get("effort.enum") == Some(&Some(false)) {
+        reasoning.effort_options.clear();
+    }
+    // A missing/empty effort selector is not an aggregate reasoning denial.
+    // Positive effort or budget support can confirm reasoning; unknown fields
+    // retain the matching catalog fallback (or unknown in the raw parser).
+    // default_enabled/mandatory alone do not establish either capability.
+    if native.get("supports_token_budget") == Some(&Some(true))
+        || native.iter().any(|(k, v)| {
+            k.starts_with("effort.")
+                && !matches!(k.as_str(), "effort.enum" | "effort.gateway")
+                && *v == Some(true)
+        })
+    {
+        reasoning.supported = Some(true);
+    }
+    if let Some(supported) = native.get("reasoning.supported").copied().flatten() {
+        reasoning.supported = Some(supported);
+    }
+    if let Some(mandatory) = native.get("mandatory").copied().flatten() {
+        reasoning.mandatory = Some(mandatory);
+    }
+    if let Some(budget) = native.get("supports_token_budget").copied().flatten() {
+        reasoning.supports_token_budget = Some(budget);
+    }
+    if let Some(default) = native.iter().find_map(|(k, v)| {
+        k.strip_prefix("default_effort.")
+            .filter(|e| *v == Some(true) && ReasoningEffort::from_str(e).is_some())
+    }) {
+        reasoning.default_effort = Some(default.into());
+    }
+    if reasoning.mandatory == Some(true) || reasoning.supported == Some(false) {
+        reasoning
+            .effort_options
+            .retain(|e| reasoning.supported != Some(false) && e != "none");
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn render_chat_request_mode_for_test(
+    catalog: &crate::catalog::ModelCatalog,
+    request: &ChatRequest,
+    stream: bool,
+) -> Result<serde_json::Value> {
+    use crate::Provider;
+    let provider = OpenRouterProvider::new("fixture");
+    let request = crate::tools::policy::prepare_request("openrouter", request.clone())?;
+    let mut prepared = prepare_messages_for_provider_async(
+        "openrouter",
+        &request.model,
+        &provider.capabilities(),
+        &request.rendered_messages_with_compiled_prompt(),
+    )
+    .await?;
+    crate::tools::policy::prepare_history("openrouter", &mut prepared.messages)?;
+    ensure_no_unrendered_attachments("openrouter", &prepared)?;
+    serde_json::to_value(OpenRouterProvider::build_chat_request_with_catalog(
+        &request,
+        OpenRouterProvider::convert_messages(&prepared)?,
+        stream,
+        Some(catalog),
+    )?)
+    .map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn router_default_off_effort_and_mandatory_models_reach_both_bodies() {
+        let catalog = crate::catalog::ModelCatalog::parse(
+            include_str!("../../tests/fixtures/catalog/models.json"),
+            include_str!("../../tests/fixtures/catalog/provenance.json"),
+        )
+        .unwrap();
+        let mut request = crate::generation::test_request("openai/gpt-5.4");
+        for stream in [false, true] {
+            for reasoning in [
+                None,
+                Some(ReasoningConfig::Disabled),
+                Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+            ] {
+                request.reasoning = reasoning;
+                let body = serde_json::to_value(
+                    OpenRouterProvider::build_chat_request_with_catalog(
+                        &request,
+                        vec![],
+                        stream,
+                        Some(&catalog),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(body["max_tokens"], 1024);
+                if reasoning.is_none() {
+                    assert!(body.get("reasoning").is_none());
+                } else {
+                    assert_eq!(
+                        body["reasoning"]["effort"],
+                        if crate::generation::selected_off(reasoning) {
+                            "none"
+                        } else {
+                            "high"
+                        }
+                    );
+                }
+                assert!(body.get("reasoning_effort").is_none());
+            }
+        }
+        request.model = "openai/gpt-oss-120b".into();
+        request.reasoning = Some(ReasoningConfig::Disabled);
+        assert!(
+            OpenRouterProvider::build_chat_request_with_catalog(
+                &request,
+                vec![],
+                false,
+                Some(&catalog)
+            )
+            .is_err()
+        );
+    }
     use super::*;
 
     #[tokio::test]
@@ -2432,6 +2610,7 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "anthropic/claude-sonnet-4".into(),
             messages: vec![
                 ApiMessage {
@@ -2475,6 +2654,7 @@ mod tests {
     #[test]
     fn api_request_serializes_reasoning_options() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "openai/gpt-5".into(),
             messages: vec![ApiMessage {
                 role: "user".into(),
@@ -2501,21 +2681,9 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_options_omit_absent_or_disabled_effort_and_serialize_explicit_none() {
-        assert!(OpenRouterProvider::reasoning_options(None).is_none());
-        assert!(OpenRouterProvider::reasoning_options(Some(ReasoningConfig::disabled())).is_none());
-
-        let reasoning = OpenRouterProvider::reasoning_options(Some(ReasoningConfig::effort(
-            ReasoningEffort::None,
-        )))
-        .expect("explicit none reasoning effort should serialize");
-
-        assert_eq!(reasoning.effort, "none");
-    }
-
-    #[test]
     fn api_request_serializes_reasoning_options_for_any_model() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "anthropic/claude-sonnet-4".into(),
             messages: vec![ApiMessage {
                 role: "user".into(),

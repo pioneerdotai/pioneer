@@ -48,9 +48,9 @@ async fn fixture(body: String) -> (String, tokio::task::JoinHandle<serde_json::V
     });
     (format!("http://{address}"), server)
 }
-fn request() -> ChatRequest {
+fn request(model: &str) -> ChatRequest {
     ChatRequest {
-        model: "fixture".into(),
+        model: model.into(),
         messages: vec![ChatMessage::user("test")],
         temperature: None,
         max_tokens: Some(100),
@@ -74,7 +74,7 @@ async fn openai_usage_after_finish_is_read_before_terminal_without_cache_double_
     let provider = OpenAiProvider::with_base_url("fixture-key", url);
     let mut stream = crate::attachments::runtime::with_async_authority_scope(
         "usage-fixture-authority".into(),
-        provider.stream_chat(request()),
+        provider.stream_chat(request("gpt-4o")),
     )
     .await
     .unwrap();
@@ -115,7 +115,7 @@ async fn openrouter_ignores_repeated_empty_terminal_choice_and_preserves_usage()
     let provider = OpenRouterProvider::with_base_url("fixture-key", url);
     let chunks: Vec<_> = crate::attachments::runtime::with_async_authority_scope(
         "usage-fixture-authority".into(),
-        provider.stream_chat(request()),
+        provider.stream_chat(request("openai/gpt-4o")),
     )
     .await
     .unwrap()
@@ -153,7 +153,7 @@ async fn openai_rejects_real_payload_after_finish_reason() {
     let provider = OpenAiProvider::with_base_url("fixture-key", url);
     let chunks: Vec<_> = crate::attachments::runtime::with_async_authority_scope(
         "usage-fixture-authority".into(),
-        provider.stream_chat(request()),
+        provider.stream_chat(request("gpt-4o")),
     )
     .await
     .unwrap()
@@ -181,7 +181,7 @@ async fn anthropic_stream_merges_start_cache_input_and_cumulative_output() {
     let provider = AnthropicProvider::with_base_url("fixture-key", url);
     let mut stream = crate::attachments::runtime::with_async_authority_scope(
         "usage-fixture-authority".into(),
-        provider.stream_chat(request()),
+        provider.stream_chat(request("claude-sonnet-4-5")),
     )
     .await
     .unwrap();
@@ -213,7 +213,7 @@ async fn missing_usage_stays_unknown_and_missing_finish_is_error() {
         let provider = OpenAiProvider::with_base_url("fixture-key", url);
         let chunks: Vec<_> = crate::attachments::runtime::with_async_authority_scope(
             "usage-fixture-authority".into(),
-            provider.stream_chat(request()),
+            provider.stream_chat(request("gpt-4o")),
         )
         .await
         .unwrap()
@@ -265,7 +265,7 @@ async fn dropping_stream_closes_pending_http_transport() {
     let provider = OpenAiProvider::with_base_url("fixture-key", format!("http://{address}"));
     let mut stream = crate::attachments::runtime::with_async_authority_scope(
         "usage-fixture-authority".into(),
-        provider.stream_chat(request()),
+        provider.stream_chat(request("gpt-4o")),
     )
     .await
     .unwrap();

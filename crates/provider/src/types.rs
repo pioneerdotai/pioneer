@@ -849,6 +849,10 @@ pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub temperature: Option<f32>,
+    /// Prepared generation reserve. Adapters must preserve this bound in their
+    /// native field. For inclusive APIs it covers thinking + visible output;
+    /// visible-only APIs need a separate prepared thinking reserve or an
+    /// explicit restriction. Qualitative effort never invents token budgets.
     pub max_tokens: Option<u32>,
     pub tools: Option<Vec<ToolDefinition>>,
     pub tool_choice: Option<ToolChoice>,
@@ -882,7 +886,9 @@ pub struct EmbeddingResponse {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningConfig {
+    /// Explicit off; differs from an omitted setting (server default).
     Disabled,
+    /// Includes explicit `None`, serialized as the protocol's off control.
     Effort(ReasoningEffort),
 }
 

@@ -4179,6 +4179,7 @@ impl Provider for PromptParityCaptureProvider {
                 tool_calling: Some(true),
                 thinking: Some(true),
                 reasoning: Some(pioneer_protocol::ProviderModelReasoningCapabilities {
+                    native: Default::default(),
                     supported: Some(true),
                     effort_options: vec![
                         "minimal".to_owned(),
@@ -77930,7 +77931,9 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
     let mut enabled_budget = None;
     let mut enabled_reserve = None;
     for (effort, reasoning, thinking) in [
-        (None, None, false),
+        // V4's server default enables thinking; only explicit off keeps this
+        // completed non-thinking tool round native instead of portable.
+        (None, None, true),
         (Some("none"), Some(ReasoningConfig::Disabled), false),
         (
             Some("high"),

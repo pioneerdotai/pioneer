@@ -34,10 +34,10 @@ pub(crate) async fn prepare(
             media: vec![],
         });
     }
-    let prepared = super::prepare_messages_for_provider_async(
+    let prepared = super::prepare_messages_for_request_async(
         provider,
-        request.model.as_str(),
         capabilities,
+        &request,
         &request.messages,
     )
     .await?;

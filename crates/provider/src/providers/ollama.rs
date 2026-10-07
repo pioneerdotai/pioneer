@@ -38,6 +38,8 @@ struct OllamaChatRequest {
     tools: Option<Vec<OllamaToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<OllamaOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    think: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -89,6 +91,23 @@ struct OllamaToolFunctionCall {
 struct OllamaOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_predict: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaShowResponse {
+    // Modern servers expose supported controls. Older versions omit this;
+    // omission must never be interpreted as support for false or an effort.
+    thinking: Option<OllamaThinking>,
+    // /api/show also supplies the instance's explicit input capabilities.
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaThinking {
+    values: Vec<serde_json::Value>,
 }
 
 // ── Ollama API response types ──────────────────────────────────────────────
@@ -145,13 +164,6 @@ struct OllamaModelDetails {
     quantization_level: Option<String>,
 }
 
-// Metadata only: /api/show capabilities are the instance's explicit model
-// contract (https://github.com/ollama/ollama/blob/main/docs/api.md).
-#[derive(Debug, Deserialize)]
-struct OllamaShowResponse {
-    #[serde(default)]
-    capabilities: Option<Vec<String>>,
-}
 fn apply_show_input(model: &mut ProviderModelInfo, response: OllamaShowResponse) {
     if let Some(capabilities) = response.capabilities {
         let vision = capabilities.iter().any(|v| v == "vision");
@@ -323,12 +335,89 @@ impl OllamaProvider {
     fn build_options(request: &ChatRequest) -> Option<OllamaOptions> {
         let options = OllamaOptions {
             temperature: request.temperature,
+            num_predict: request.max_tokens,
         };
-        if options.temperature.is_some() {
+        if options.temperature.is_some() || options.num_predict.is_some() {
             Some(options)
         } else {
             None
         }
+    }
+
+    fn resolve_think(
+        request: &ChatRequest,
+        metadata: Option<&OllamaThinking>,
+    ) -> Result<Option<serde_json::Value>> {
+        let Some(reasoning) = request.reasoning else {
+            return Ok(None);
+        };
+        let value = if matches!(
+            reasoning,
+            crate::types::ReasoningConfig::Effort(crate::types::ReasoningEffort::None)
+        ) && metadata.is_some_and(|m| m.values.contains(&serde_json::json!("none")))
+        {
+            serde_json::json!("none")
+        } else if crate::generation::selected_off(Some(reasoning)) {
+            serde_json::json!(false)
+        } else {
+            let crate::types::ReasoningConfig::Effort(effort) = reasoning else {
+                unreachable!()
+            };
+            serde_json::json!(effort.as_str())
+        };
+        anyhow::ensure!(
+            metadata.is_some_and(|m| m.values.contains(&value)),
+            "Ollama server/model does not advertise selected think control {value} in /api/show; upgrade the server or select a supported setting"
+        );
+        Ok(Some(value))
+    }
+
+    async fn thinking_for_request(
+        &self,
+        request: &ChatRequest,
+    ) -> Result<Option<serde_json::Value>> {
+        crate::generation::validate_cap("ollama", request)?;
+        if request.reasoning.is_none() {
+            return Ok(None);
+        }
+        let response = crate::http::non_stream_request(
+            self.client
+                .post(format!("{}/api/show", self.base_url))
+                .json(&serde_json::json!({"model":request.model})),
+            self.timeout_policy,
+        )
+        .send()
+        .await?;
+        if !response.status().is_success() {
+            return Err(Self::api_error(response).await);
+        }
+        let metadata: OllamaShowResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_model_metadata",
+        )
+        .await?;
+        Self::resolve_think(request, metadata.thinking.as_ref())
+    }
+
+    fn build_chat_request(
+        request: &ChatRequest,
+        prepared: &PreparedProviderMessages,
+        stream: bool,
+        think: Option<serde_json::Value>,
+    ) -> Result<OllamaChatRequest> {
+        crate::generation::validate_cap("ollama", request)?;
+        Ok(OllamaChatRequest {
+            model: request.model.clone(),
+            messages: Self::convert_messages(prepared)?,
+            stream,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            options: Self::build_options(request),
+            think,
+        })
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
@@ -641,17 +730,8 @@ impl crate::traits::Provider for OllamaProvider {
         .await?;
         crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let options = Self::build_options(&request);
-        let api_request = OllamaChatRequest {
-            model: request.model,
-            messages: Self::convert_messages(&prepared)?,
-            stream: false,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            options,
-        };
+        let think = self.thinking_for_request(&request).await?;
+        let api_request = Self::build_chat_request(&request, &prepared, false, think)?;
 
         let request_builder = self.client.post(self.chat_url()).json(&api_request);
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
@@ -685,17 +765,8 @@ impl crate::traits::Provider for OllamaProvider {
         .await?;
         crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let options = Self::build_options(&request);
-        let api_request = OllamaChatRequest {
-            model: request.model,
-            messages: Self::convert_messages(&prepared)?,
-            stream: true,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            options,
-        };
+        let think = self.thinking_for_request(&request).await?;
+        let api_request = Self::build_chat_request(&request, &prepared, true, think)?;
 
         let request_builder = self.client.post(self.chat_url()).json(&api_request);
         let response =
@@ -811,6 +882,87 @@ impl crate::traits::Provider for OllamaProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_bodies_preserve_prepared_cap_independent_of_temperature() {
+        let provider = OllamaProvider::new();
+        let mut request = crate::generation::test_request("qwen3:fixture");
+        let prepared = crate::attachments::prepare_messages_for_provider(
+            "ollama",
+            &provider.capabilities(),
+            &request.messages,
+        )
+        .unwrap();
+        for stream in [false, true] {
+            let body = serde_json::to_value(
+                OllamaProvider::build_chat_request(&request, &prepared, stream, None).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["options"]["num_predict"], 1024);
+            assert!(body["options"].get("temperature").is_none());
+            assert!(body.get("think").is_none());
+            assert_eq!(body["stream"], stream);
+        }
+        request.temperature = Some(0.7);
+        let body = serde_json::to_value(
+            OllamaProvider::build_chat_request(
+                &request,
+                &prepared,
+                true,
+                Some(serde_json::json!(false)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["options"]["num_predict"], 1024);
+        assert_eq!(body["think"], false);
+    }
+
+    #[test]
+    fn server_metadata_controls_default_off_and_supported_efforts() {
+        let mut request = crate::generation::test_request("an-installed-model-alias");
+        assert_eq!(OllamaProvider::resolve_think(&request, None).unwrap(), None);
+        let booleans: OllamaShowResponse =
+            serde_json::from_str(r#"{"thinking":{"values":[true,false],"default":true}}"#).unwrap();
+        let levels: OllamaShowResponse = serde_json::from_str(
+            r#"{"thinking":{"values":["low","medium","high"],"default":"medium"}}"#,
+        )
+        .unwrap();
+        for off in [
+            crate::types::ReasoningConfig::Disabled,
+            crate::types::ReasoningConfig::Effort(crate::types::ReasoningEffort::None),
+        ] {
+            request.reasoning = Some(off);
+            assert_eq!(
+                OllamaProvider::resolve_think(&request, booleans.thinking.as_ref()).unwrap(),
+                Some(serde_json::json!(false))
+            );
+            assert!(OllamaProvider::resolve_think(&request, levels.thinking.as_ref()).is_err());
+            assert!(OllamaProvider::resolve_think(&request, None).is_err());
+        }
+        request.reasoning = Some(crate::types::ReasoningConfig::Effort(
+            crate::types::ReasoningEffort::High,
+        ));
+        assert_eq!(
+            OllamaProvider::resolve_think(&request, levels.thinking.as_ref()).unwrap(),
+            Some(serde_json::json!("high"))
+        );
+        assert!(OllamaProvider::resolve_think(&request, booleans.thinking.as_ref()).is_err());
+        request.reasoning = Some(crate::types::ReasoningConfig::Effort(
+            crate::types::ReasoningEffort::Max,
+        ));
+        assert!(OllamaProvider::resolve_think(&request, levels.thinking.as_ref()).is_err());
+        let explicit_none: OllamaShowResponse =
+            serde_json::from_str(r#"{"thinking":{"values":["none","high"]}}"#).unwrap();
+        request.reasoning = Some(crate::types::ReasoningConfig::Effort(
+            crate::types::ReasoningEffort::None,
+        ));
+        assert_eq!(
+            OllamaProvider::resolve_think(&request, explicit_none.thinking.as_ref()).unwrap(),
+            Some(serde_json::json!("none"))
+        );
+        request.reasoning = Some(crate::types::ReasoningConfig::Disabled);
+        assert!(OllamaProvider::resolve_think(&request, explicit_none.thinking.as_ref()).is_err());
+    }
     use super::*;
     use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
     use crate::traits::Provider;
@@ -958,6 +1110,7 @@ mod tests {
     #[test]
     fn request_serializes_without_options() {
         let request = OllamaChatRequest {
+            think: None,
             model: "llama3".into(),
             messages: vec![OllamaMessage {
                 role: "user".into(),
@@ -982,6 +1135,7 @@ mod tests {
     #[test]
     fn request_serializes_with_temperature() {
         let request = OllamaChatRequest {
+            think: None,
             model: "llama3".into(),
             messages: vec![OllamaMessage {
                 role: "user".into(),
@@ -995,6 +1149,7 @@ mod tests {
             stream: false,
             tools: None,
             options: Some(OllamaOptions {
+                num_predict: None,
                 temperature: Some(0.7),
             }),
         };
@@ -1096,6 +1251,54 @@ mod tests {
 #[cfg(test)]
 mod discovery_input_tests {
     use super::*;
+
+    #[test]
+    fn show_metadata_preserves_thinking_and_input_capabilities_together() {
+        let mut request = crate::generation::test_request("instance-model");
+        request.reasoning = Some(crate::types::ReasoningConfig::Disabled);
+        for capabilities in [
+            None,
+            Some(vec!["completion"]),
+            Some(vec!["completion", "vision"]),
+        ] {
+            for thinking in [None, Some(serde_json::json!({"values": [true, false]}))] {
+                let mut body = serde_json::json!({});
+                if let Some(capabilities) = &capabilities {
+                    body["capabilities"] = serde_json::json!(capabilities);
+                }
+                if let Some(thinking) = &thinking {
+                    body["thinking"] = thinking.clone();
+                }
+                let show: OllamaShowResponse = serde_json::from_value(body).unwrap();
+                let selected = OllamaProvider::resolve_think(&request, show.thinking.as_ref());
+                if thinking.is_some() {
+                    assert_eq!(selected.unwrap(), Some(serde_json::json!(false)));
+                } else {
+                    assert!(selected.is_err());
+                }
+                let mut model: ProviderModelInfo = serde_json::from_value(serde_json::json!({
+                    "id": "instance-model", "provider": "ollama", "limits": {}, "capabilities": {}
+                }))
+                .unwrap();
+                apply_show_input(&mut model, show);
+                let vision = capabilities
+                    .as_ref()
+                    .map(|values| values.contains(&"vision"));
+                assert_eq!(model.capabilities.vision, vision);
+                assert_eq!(
+                    model.capabilities.input_modalities,
+                    vision.map(|vision| {
+                        if vision {
+                            vec!["text".into(), "image".into()]
+                        } else {
+                            vec!["text".into()]
+                        }
+                    })
+                );
+            }
+        }
+    }
+
     #[test]
     fn show_missing_is_unknown_and_explicit_capabilities_are_instance_input_evidence() {
         let mut model:ProviderModelInfo=serde_json::from_value(serde_json::json!({"id":"instance-model","provider":"ollama","limits":{},"capabilities":{}})).unwrap();

@@ -56,6 +56,12 @@ pub(super) fn models_dev(
             "https://api.openai.com/v1",
         ),
         (
+            "deepseek",
+            "deepseek",
+            "openai-completions",
+            "https://api.deepseek.com",
+        ),
+        (
             "groq",
             "groq",
             "openai-completions",
@@ -176,8 +182,29 @@ pub(super) fn models_dev(
                 m
             };
             let mut candidate = base(provider, id, api, url, effective, (4096, 4096));
+            if matches!(provider, "google" | "google-vertex")
+                && let Some(resolved) = alias.filter(|a| data[source]["models"].get(*a).is_some())
+            {
+                // Retain the identity of the existing source alias resolution;
+                // effort names alone do not identify a budget/level protocol.
+                candidate.model["sourceGeneration"]["resolvedModelId"] = json!(resolved);
+            }
             candidate.model["name"] =
                 json!(m["name"].as_str().filter(|s| !s.is_empty()).unwrap_or(id));
+            if matches!(provider, "glm" | "zai-standard") {
+                // These are native CN/global GLM endpoints, not hosted relays.
+                // Use the same documented controls as the coding profiles,
+                // with each profile's own updateable source options and limits.
+                // https://docs.z.ai/guides/llm/glm-5.3
+                candidate.compat(json!({"supportsDeveloperRole":false,"thinkingFormat":"zai"}));
+                if let Some(mut map) = effort_map(&m["reasoning_options"]) {
+                    if matches!(id.as_str(), "glm-5.2" | "glm-5.2-highspeed") {
+                        map["off"] = json!("none");
+                    }
+                    candidate.thinking(map);
+                    candidate.compat(json!({"supportsReasoningEffort":true}));
+                }
+            }
             match provider {
                 "amazon-bedrock"=>{if id.starts_with("eu."){candidate.model["baseUrl"]=json!("https://bedrock-runtime.eu-central-1.amazonaws.com");}
 if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":true}));}},
@@ -712,9 +739,9 @@ pub(super) fn registered_supplements(
             };
             *source
         };
-        for (id, m) in entries(data, source) {
-            if m["tool_call"] != true
-                || m["status"] == "deprecated"
+        for (id, model) in entries(data, source) {
+            if model["tool_call"] != true
+                || model["status"] == "deprecated"
                 || result
                     .iter()
                     .chain(existing.iter())
@@ -722,14 +749,46 @@ pub(super) fn registered_supplements(
             {
                 continue;
             }
-            result.push(base(
+            let mut candidate = base(provider, id, "openai-completions", url, model, (4096, 4096));
+            // A list of effort names alone does not establish a wire format.
+            // These profiles document the standard Chat effort field.
+            // Sources: each vendor's Chat schema, recorded in G04 coverage.
+            if !matches!(
                 provider,
-                id,
-                "openai-completions",
-                url,
-                m,
-                (4096, 4096),
-            ));
+                "deepinfra" | "friendli" | "venice" | "synthetic" | "nebius" | "cohere"
+            ) {
+                candidate.compat(json!({"supportsReasoningEffort":false}));
+            }
+            candidate.compat(json!({"maxTokensField":"max_tokens"}));
+            if provider == "cohere" && model["reasoning"] == true {
+                // Compatibility API documents only none/high, corresponding
+                // to off/on, including toggle-only source entries.
+                candidate.thinking(json!({"off":"none","minimal":null,"low":null,
+                    "medium":null,"high":"high","xhigh":null,"max":null}));
+                candidate.compat(
+                    json!({"generationSource":"https://docs.cohere.com/docs/compatibility-api"}),
+                );
+            }
+            if provider == "novita" {
+                // Official Chat schema documents the switch for these families;
+                // a generic toggle in source metadata does not prove this field.
+                let supports_off = matches!(
+                    id.as_str(),
+                    "zai-org/glm-4.5"
+                        | "deepseek/deepseek-v3.1"
+                        | "deepseek/deepseek-v3.1-terminus"
+                        | "deepseek/deepseek-v3.2-exp"
+                );
+                candidate.compat(json!({"thinkingFormat":"novita","supportsThinkingToggle":supports_off,
+                    "generationSource":"https://docs.novita.ai/api-reference/model-apis-llm-create-chat-completion"}));
+            }
+            if provider == "siliconflow" {
+                candidate.compat(json!({"thinkingFormat":"siliconflow",
+                    "supportsThinkingToggle":model["reasoning_options"].as_array().is_some_and(|o| o.iter().any(|o| o["type"] == "toggle")),
+                    "generationCapIncludesThinking":false,
+                    "generationSource":"https://docs.siliconflow.cn/docs/api/chat-completions-post"}));
+            }
+            result.push(candidate);
         }
     }
     result
