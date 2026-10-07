@@ -93,6 +93,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cargo test --locked -p pioneer-gateway --lib refill_confirmed_prefix_survives_poison_and_unknown_commit_without_replay -- --nocapture
           cargo test --locked -p pioneer-gateway --lib thread_episodic -- --nocapture
 
       - name: cargo-test-workspace

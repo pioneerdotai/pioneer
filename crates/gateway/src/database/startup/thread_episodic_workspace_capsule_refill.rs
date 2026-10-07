@@ -8495,7 +8495,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refill_claim_partial_success_survives_poison_and_unknown_commit_without_replay() {
+    async fn refill_confirmed_prefix_survives_poison_and_unknown_commit_without_replay() {
         use pioneer_crud::{ThreadEpisodicIndexJobStatus, ThreadEpisodicItemStatus};
         use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
         for fault in [
@@ -8531,6 +8531,10 @@ mod tests {
                 );
             }
             let now = chrono::Utc::now().timestamp();
+            // Refill claims one job per portion. Commit both healthy portions
+            // before the poison portion, then verify that failure preserves
+            // their exact attempts and never replays any selected portion.
+            let due_offsets = [-3, -1, -2];
             for (index, job) in jobs.iter_mut().enumerate() {
                 let mut row =
                     pioneer_entity::thread_episodic_index_jobs::Entity::find_by_id(&job.id)
@@ -8539,7 +8543,7 @@ mod tests {
                         .unwrap()
                         .unwrap()
                         .into_active_model();
-                row.next_run_at = Set(fixed_datetime_from_unix(now - 3 + index as i64));
+                row.next_run_at = Set(fixed_datetime_from_unix(now + due_offsets[index]));
                 row.update(&store.database_connection()).await.unwrap();
                 *job = store
                     .find_thread_episodic_index_job(&job.id)
@@ -8555,7 +8559,7 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 store
-                    .requeue_thread_episodic_index_attempt(&claim.id, 1, now - 2, None)
+                    .requeue_thread_episodic_index_attempt(&claim.id, 1, now - 1, None)
                     .await
                     .unwrap();
                 store.database_connection().execute_unprepared(&format!(
@@ -8611,11 +8615,14 @@ mod tests {
                 None,
             )
             .await;
-            assert!(result.is_err(), "poison claim must remain visible");
+            assert!(
+                result.is_err(),
+                "{fault}: poison claim must remain visible: {result:?}"
+            );
             assert_eq!(
                 store.episodic_claim_discoveries_for_test() - discoveries,
-                1,
-                "the selected portion must never replay, including a lock error"
+                jobs.len() as u64,
+                "{fault}: the selected portion must never replay, including a lock error"
             );
             for job in [&jobs[0], &jobs[2]] {
                 let current = store
@@ -8624,7 +8631,12 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 assert_eq!(current.id, job.id);
-                assert_eq!(current.status, ThreadEpisodicIndexJobStatus::Completed);
+                assert_eq!(
+                    current.status,
+                    ThreadEpisodicIndexJobStatus::Completed,
+                    "{fault}: healthy claim {} must complete",
+                    job.id
+                );
                 assert_eq!(current.attempt_count, 1);
                 assert_eq!(
                     store

@@ -3170,7 +3170,7 @@ pub(crate) struct ThreadEpisodicIndexExecutor {
     #[cfg(test)]
     readiness_read_failure: std::sync::atomic::AtomicBool,
     #[cfg(test)]
-    clock_origin: StdMutex<Option<(i64, tokio::time::Instant)>>,
+    clock_origin: StdMutex<Option<i64>>,
     #[cfg(test)]
     projection_claim_pause: AsyncMutex<Option<tokio::sync::oneshot::Sender<()>>>,
     #[cfg(test)]
@@ -3298,16 +3298,31 @@ impl ThreadEpisodicIndexExecutor {
 
     fn now_unix(&self) -> i64 {
         #[cfg(test)]
-        if let Some((unix, instant)) = *self.clock_origin.lock().unwrap() {
-            return unix.saturating_add(instant.elapsed().as_secs() as i64);
+        if let Some(unix) = *self.clock_origin.lock().unwrap() {
+            return unix;
         }
         chrono::Utc::now().timestamp()
     }
 
     #[cfg(test)]
     fn use_managed_time_for_test(&self) {
-        *self.clock_origin.lock().unwrap() =
-            Some((chrono::Utc::now().timestamp(), tokio::time::Instant::now()));
+        *self.clock_origin.lock().unwrap() = Some(chrono::Utc::now().timestamp());
+    }
+
+    #[cfg(test)]
+    async fn advance_managed_time_for_test(&self, seconds: i64) {
+        // Keep the durable scheduling clock deterministic while SQLite and
+        // Memvid use native threads. Pause Tokio only to release the runner's
+        // timer, then resume before awaiting DB/FS work; idle auto-advance must
+        // not expire pool or provider timeouts during those operations.
+        {
+            let mut clock = self.clock_origin.lock().unwrap();
+            let now = clock.as_mut().expect("managed clock must be initialized");
+            *now = now.saturating_add(seconds);
+        }
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(seconds as u64)).await;
+        tokio::time::resume();
     }
 
     // One owned runner; the permit survives the empty-read -> idle boundary.
@@ -3590,6 +3605,24 @@ impl ThreadEpisodicIndexExecutor {
                 .unwrap();
             if job.status == ThreadEpisodicIndexJobStatus::Completed {
                 return job;
+            }
+            assert_ne!(
+                job.status,
+                ThreadEpisodicIndexJobStatus::Canceled,
+                "job {id} became terminal while waiting for completion: {job:?}"
+            );
+            let managed_clock = self.clock_origin.lock().unwrap().is_some();
+            let now = self.now_unix();
+            if job.status == ThreadEpisodicIndexJobStatus::Failed
+                && managed_clock
+                && job.next_run_at.timestamp() > now
+            {
+                // Recovery first settles Running to a durable retry. Advance
+                // to that saved deadline instead of letting a paused runtime
+                // auto-advance unrelated SQLite/FS operation timeouts.
+                self.advance_managed_time_for_test(job.next_run_at.timestamp() - now)
+                    .await;
+                continue;
             }
             changed.await;
         }
@@ -7376,6 +7409,14 @@ mod tests {
                     .reset_thread_episodic_projection(&workspace_id, claim_now + 2)
                     .await
                     .unwrap();
+                crate::database::startup::thread_episodic_workspace_capsule_refill::mark_projection_reset(
+                    &crud_store.database_connection(),
+                    &workspace_id,
+                    pioneer_crud::PROJECTION_META_STATUS_COMPLETE,
+                    &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only(),
+                )
+                .await
+                .unwrap();
                 assert!(
                     crud_store
                         .find_thread_episodic_index_job(&version_a_job.id)
@@ -12140,8 +12181,7 @@ mod tests {
         // no notification at its deadline. The same runner must use its timer.
         executor.wake();
         executor.wait_for_busy_workspace_for_test().await;
-        tokio::time::pause();
-        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        executor.advance_managed_time_for_test(61).await;
         assert_eq!(
             executor
                 .wait_for_completed_job_for_test(&later.id)
@@ -12278,7 +12318,6 @@ mod tests {
         executor.use_managed_time_for_test();
         let (quanta_tx, mut quanta_rx) = tokio::sync::mpsc::channel(16);
         *executor.quantum_observer.lock().unwrap() = Some(quanta_tx);
-        tokio::time::pause();
         let now = executor.now_unix();
         let mut owners = Vec::new();
         let mut old_jobs = Vec::new();
@@ -12463,8 +12502,7 @@ mod tests {
         executor.wake();
         fixed_rx.await.unwrap();
         // The real round has frozen T0 and its end at A; B is outside it.
-        tokio::time::pause();
-        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        executor.advance_managed_time_for_test(61).await;
         release_tx.send(()).unwrap();
         assert_eq!(
             executor
@@ -12595,10 +12633,9 @@ mod tests {
                 .as_ref()
                 .is_none_or(|attempt| attempt.job.id == c_job.id)
         );
-        // Freeze the clock after A/B/C have finished their real execution. If
+        // The managed clock remains fixed after A/B/C's real execution. If
         // the first recovery deadline elapsed during FS work, this bounded probe
         // either observes its backoff or records the still-rejected writer once.
-        tokio::time::pause();
         let probe = executor.run_once(executor.now_unix()).await.unwrap();
         assert!(probe.storage_error);
         assert_eq!(probe.discovered + probe.settlements, 1);
@@ -12611,7 +12648,7 @@ mod tests {
         assert_eq!(early.storage_errors, vec!["running_recovery_backoff"]);
         assert_eq!(*executor.recovery_retry_at.lock().unwrap(), deadline);
         // Keep the rejection in place through multiple real recovery quanta.
-        tokio::time::advance(std::time::Duration::from_secs(90)).await;
+        executor.advance_managed_time_for_test(90).await;
         let quantum = executor.run_once(executor.now_unix()).await.unwrap();
         assert!(quantum.discovered + quantum.settlements <= 1);
         assert_eq!(quantum.claimed, 0);
@@ -12785,8 +12822,7 @@ mod tests {
             assert_eq!(running.attempt_count, 1);
             // Readiness failed before FS, or claim commit was not acknowledged.
             assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
-            tokio::time::pause();
-            tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            executor.advance_managed_time_for_test(2).await;
             assert_eq!(
                 executor
                     .wait_for_completed_job_for_test(&healthy.id)
@@ -12794,12 +12830,11 @@ mod tests {
                     .attempt_count,
                 1
             );
-            tokio::time::advance(std::time::Duration::from_secs(180)).await;
+            executor.advance_managed_time_for_test(180).await;
             let completed = executor.wait_for_completed_job_for_test(&job.id).await;
             assert_eq!(completed.attempt_count, 2);
             assert!(executor.in_flight.lock().unwrap().is_none());
             executor.shutdown().await;
-            tokio::time::resume();
         }
     }
 
@@ -12867,8 +12902,7 @@ mod tests {
             .requeue_thread_episodic_index_attempt(&job.id, 2, executor.now_unix(), None)
             .await
             .unwrap();
-        tokio::time::pause();
-        tokio::time::advance(std::time::Duration::from_secs(180)).await;
+        executor.advance_managed_time_for_test(180).await;
         assert_eq!(
             executor
                 .wait_for_completed_job_for_test(&job.id)
@@ -13035,8 +13069,7 @@ mod tests {
             // No manual wake or run_once: the surviving runner observes durable
             // Running on its next bounded round and respects existing retry policy.
             if stage != "result" {
-                tokio::time::pause();
-                tokio::time::advance(std::time::Duration::from_secs(180)).await;
+                executor.advance_managed_time_for_test(180).await;
                 assert_eq!(
                     executor
                         .wait_for_completed_job_for_test(&b_job.id)
@@ -13044,7 +13077,6 @@ mod tests {
                         .attempt_count,
                     2
                 );
-                tokio::time::resume();
             }
             executor.shutdown().await;
         }
