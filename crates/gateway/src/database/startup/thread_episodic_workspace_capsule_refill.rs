@@ -38,6 +38,8 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+#[cfg(test)]
+pub(crate) use tests::make_refill_history_unavailable;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -805,6 +807,14 @@ pub(crate) async fn refill_once_with_projection_resolver_and_config(
     };
     // Wait outside DB capacity for ordinary claims/capsule writes to finish.
     // Refusing a live writer must not silently abandon a requested replacement.
+    #[cfg(test)]
+    if let Some(notice) = REFILL_OWNERSHIP_TEST_NOTICE
+        .lock()
+        .unwrap()
+        .remove(&(thread_episodic_storage_root.to_owned(), false))
+    {
+        let _ = notice.send(());
+    }
     let ownership = lock_thread_episodic_workspace(workspace_id).await;
     if let Some(acquired) = ownership_acquired {
         acquired.store(true, std::sync::atomic::Ordering::Release);
@@ -813,7 +823,7 @@ pub(crate) async fn refill_once_with_projection_resolver_and_config(
     if let Some(notice) = REFILL_OWNERSHIP_TEST_NOTICE
         .lock()
         .unwrap()
-        .remove(thread_episodic_storage_root)
+        .remove(&(thread_episodic_storage_root.to_owned(), true))
     {
         let _ = notice.send(());
     }
@@ -1767,8 +1777,19 @@ pub(crate) fn notify_next_retry_wait_for_test(
 
 #[cfg(test)]
 static REFILL_OWNERSHIP_TEST_NOTICE: std::sync::Mutex<
-    BTreeMap<PathBuf, tokio::sync::oneshot::Sender<()>>,
+    BTreeMap<(PathBuf, bool), tokio::sync::oneshot::Sender<()>>,
 > = std::sync::Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+pub(crate) fn notify_ownership_wait_for_test(
+    root: &Path,
+    notice: tokio::sync::oneshot::Sender<()>,
+) {
+    REFILL_OWNERSHIP_TEST_NOTICE
+        .lock()
+        .unwrap()
+        .insert((root.to_owned(), false), notice);
+}
 
 #[cfg(test)]
 type RefillBlockingTestGate = (
@@ -3137,7 +3158,8 @@ mod tests {
     };
     use pioneer_sqlite::SqliteDatabase;
     use sea_orm::{
-        ConnectOptions, ConnectionTrait, Database, DatabaseBackend, Statement, TransactionTrait,
+        ConnectOptions, ConnectionTrait, Database, DatabaseBackend, EntityTrait, Statement,
+        TransactionTrait,
     };
     use sha2::{Digest, Sha256};
     use std::collections::VecDeque;
@@ -5310,11 +5332,10 @@ mod tests {
         let config = vector_search_config(
             GatewayThreadEpisodicVectorProviderConfig::OpenAi,
             "text-embedding-3-small",
-            3,
+            1536,
         );
-        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
-            0.1, 0.2, 0.3,
-        ]));
+        let embedding_provider =
+            Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![0.1; 1536]));
         let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
             embedding_provider.as_ref(),
         )
@@ -6272,7 +6293,7 @@ mod tests {
         .unwrap();
         // Any history DTO load/reindex now fails. Canonical reads for the one
         // current job remain available, as required by source freshness guards.
-        db.execute_unprepared("DROP VIEW turn_event").await.unwrap();
+        make_refill_history_unavailable(&crud_store).await;
         let resumed_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
             0.1, 0.2, 0.3,
         ]));
@@ -6342,11 +6363,7 @@ mod tests {
                 .unwrap(),
             1
         );
-        crud_store
-            .database_connection()
-            .execute_unprepared("DROP VIEW turn_event")
-            .await
-            .unwrap();
+        make_refill_history_unavailable(&crud_store).await;
         // Existing lexical work needs no provider and must not rediscover history.
         let summary = refill_once_with_projection_resolver(
             crud_store.clone(),
@@ -6762,13 +6779,17 @@ mod tests {
             .execute_unprepared("PRAGMA journal_mode=WAL")
             .await
             .expect("test database should enable WAL");
-        let workspace_id = WorkspaceManager::new(writer.clone())
-            .list_workspaces()
+        pioneer_entity::workspace::Entity::delete_many()
+            .exec(&writer)
             .await
-            .expect("workspace list should succeed")
-            .into_iter()
-            .find(|workspace| workspace.is_active && workspace.is_current)
-            .expect("current workspace should exist")
+            .unwrap();
+        let workspace_id = WorkspaceManager::new(writer.clone())
+            .create_workspace(
+                &pioneer_protocol::generate_id(),
+                Some("Concurrent refill test"),
+            )
+            .await
+            .expect("isolated workspace should exist")
             .id;
         let mut reader_options =
             ConnectOptions::new(format!("sqlite://{}?mode=ro", database_path.display()));
@@ -6881,11 +6902,7 @@ mod tests {
                 dimension != 3 || version != THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION;
             if !replacement {
                 // Any history read is an error; both sources already have jobs.
-                store
-                    .database_connection()
-                    .execute_unprepared("DROP VIEW turn_event")
-                    .await
-                    .unwrap();
+                make_refill_history_unavailable(&store).await;
             }
             let provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
                 "openrouter",
@@ -7627,11 +7644,7 @@ mod tests {
         );
         // The actual history view is unavailable; idle A must not resolve a
         // provider, prepare history, rewrite sources/jobs or touch the capsule.
-        store
-            .database_connection()
-            .execute_unprepared("DROP VIEW turn_event")
-            .await
-            .unwrap();
+        make_refill_history_unavailable(&store).await;
         let returned = refill_once_with_workspace_projection(
             store.clone(),
             root.path(),
@@ -7960,7 +7973,7 @@ mod tests {
         REFILL_OWNERSHIP_TEST_NOTICE
             .lock()
             .unwrap()
-            .insert(root.path().to_owned(), owned_tx);
+            .insert((root.path().to_owned(), true), owned_tx);
         let cancellation = CancellationToken::new();
         let mut config = GatewayThreadEpisodicVectorSearchConfig::default();
         config.enabled = false;
@@ -8581,11 +8594,7 @@ mod tests {
             .await;
             // Prepared resume must not turn a local claim error into discovery
             // of history or recreate the already confirmed A attempt.
-            store
-                .database_connection()
-                .execute_unprepared("DROP VIEW turn_event")
-                .await
-                .unwrap();
+            make_refill_history_unavailable(&store).await;
             let discoveries = store.episodic_claim_discoveries_for_test();
             let result = refill_once_with_projection_resolver_and_config(
                 store.clone(),
@@ -8812,20 +8821,46 @@ mod tests {
         bootstrap(&connection)
             .await
             .expect("gateway bootstrap should create default workspace");
+        // Ownership is process-wide, so independent databases need independent
+        // workspace identities too. No source rows exist at this point.
+        pioneer_entity::workspace::Entity::delete_many()
+            .exec(&connection)
+            .await
+            .unwrap();
         let workspace_manager = WorkspaceManager::new(connection.clone());
         let workspace_id = workspace_manager
-            .list_workspaces()
+            .create_workspace(&pioneer_protocol::generate_id(), Some("Refill test"))
             .await
-            .expect("workspace list should succeed")
-            .into_iter()
-            .find(|workspace| workspace.is_active && workspace.is_current)
-            .expect("current workspace should exist")
+            .expect("isolated workspace should exist")
             .id;
         (
             Arc::new(CrudStore::new(connection)),
             TempDir::new().expect("temp dir"),
             workspace_id,
         )
+    }
+
+    pub(crate) async fn make_refill_history_unavailable(store: &CrudStore) {
+        let db = store.database_connection();
+        let object = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "SELECT type FROM sqlite_schema WHERE name = ?",
+                ["turn_event".into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<String>("", "type")
+            .unwrap();
+        // Compression exposes a view; an ordinary in-memory schema has a
+        // table. Keep its rows and FK targets while denying history queries.
+        let statement = match object.as_str() {
+            "table" => "ALTER TABLE turn_event RENAME TO forbidden_refill_history",
+            "view" => "DROP VIEW turn_event",
+            other => panic!("unexpected history object: {other}"),
+        };
+        db.execute_unprepared(statement).await.unwrap();
     }
 
     async fn mark_refill_marker(crud_store: &CrudStore, status: &str, version: i64) {

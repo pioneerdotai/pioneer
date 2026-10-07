@@ -1119,7 +1119,7 @@ impl MessageProcessor {
                     Some("in_progress"),
                 )
                 .await;
-                self.ingest_committed_thread_item(&item_completed).await;
+                self.kick_native_turn_event_deliveries();
                 self.send_notification_to_thread_subscribers(
                     thread_id,
                     events::ITEM_COMPLETED,
@@ -1269,9 +1269,9 @@ impl MessageProcessor {
         )
         .await;
 
-        // Delivery projects an already-produced result into the target conversation. Index the
-        // committed projection directly; do not run another turn or post-turn memory extractor.
-        self.ingest_committed_thread_item(&completed).await;
+        // The canonical transaction already saved an episodic delivery. Wake
+        // that consumer once; a direct ingest here would duplicate delivery.
+        self.kick_native_turn_event_deliveries();
         self.send_notification_to_thread_subscribers(thread_id, events::ITEM_COMPLETED, &completed)
             .await;
         self.notify_semantic_timeline_item_changed(

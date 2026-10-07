@@ -653,6 +653,26 @@ async fn wait_for_episodic_ingestor_calls(
     .expect("optional episodic outbox delivery should complete");
 }
 
+async fn wait_for_episodic_ingestor_item(
+    ingestor: &RecordingThreadEpisodicIngestor,
+    thread_id: &str,
+    turn_id: &str,
+    item_id: &str,
+) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if ingestor.calls.lock().await.iter().any(|call| {
+                call.thread_id == thread_id && call.turn_id == turn_id && call.item_id == item_id
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("committed item should reach the durable episodic consumer");
+}
+
 #[derive(Default)]
 struct RecordingCliRuntimeSession {
     thread_starts: TokioMutex<Vec<CLIAgentRuntimeThreadOpenParams>>,
@@ -23995,6 +24015,13 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         delivered_message_index < completed_card_index,
         "the complete AgentMessage must be committed before the parent Task card becomes completed"
     );
+    wait_for_episodic_ingestor_item(
+        &delivery_ingestor,
+        parent_thread_id,
+        &run.id,
+        delivered_message_id,
+    )
+    .await;
     let ingestion_calls = delivery_ingestor.calls.lock().await;
     // Child events may still be indexed after the recorder is installed.
     // Only calls for the committed parent message belong to this assertion.
@@ -34956,9 +34983,35 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread_impl() 
             } if text == "delivered scheduled result"
         )
     }));
+    let delivered_item_id = items
+        .events
+        .iter()
+        .find_map(|event| match &event.payload {
+            TurnItemEventPayload::ItemCompleted {
+                item: TurnItem::AgentMessage { id, text, .. },
+                ..
+            } if text == "delivered scheduled result" => Some(id.as_str()),
+            _ => None,
+        })
+        .unwrap();
+    wait_for_episodic_ingestor_item(
+        &delivery_ingestor,
+        origin_thread_id,
+        &run.id,
+        delivered_item_id,
+    )
+    .await;
     let ingestion_calls = delivery_ingestor.calls.lock().await;
-    assert_eq!(ingestion_calls.len(), 1);
-    let delivered_call = &ingestion_calls[0];
+    let delivered_calls: Vec<_> = ingestion_calls
+        .iter()
+        .filter(|call| {
+            call.thread_id == origin_thread_id
+                && call.turn_id == run.id
+                && call.item_id == delivered_item_id
+        })
+        .collect();
+    assert_eq!(delivered_calls.len(), 1);
+    let delivered_call = delivered_calls[0];
     assert_eq!(delivered_call.workspace_id, workspace_id);
     assert_eq!(delivered_call.thread_id, origin_thread_id);
     assert_eq!(delivered_call.turn_id, run.id);

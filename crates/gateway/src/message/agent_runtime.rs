@@ -2480,21 +2480,6 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn ingest_committed_thread_item(
-        &self,
-        notification: &pioneer_protocol::ItemCompletedNotification,
-    ) {
-        if let Err(error) = self
-            .ingest_committed_thread_item_with_result(notification)
-            .await
-        {
-            warn!(
-                error = %format!("{error:#}"),
-                "thread episodic ingestion failed after committed item persistence"
-            );
-        }
-    }
-
     pub(super) async fn ingest_committed_thread_item_with_result(
         &self,
         notification: &pioneer_protocol::ItemCompletedNotification,

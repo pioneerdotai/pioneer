@@ -11642,11 +11642,7 @@ mod tests {
         }
         // Prepared same-B replacement resumes jobs only, after cancellation
         // released the exact abandoned claims under exclusive workspace ownership.
-        store
-            .database_connection()
-            .execute_unprepared("DROP VIEW turn_event")
-            .await
-            .unwrap();
+        refill::make_refill_history_unavailable(&store).await;
         let resumed = refill::refill_once_with_workspace_projection(
             store.clone(),
             root.path(),
@@ -13241,12 +13237,16 @@ mod tests {
             .execute_unprepared("PRAGMA journal_mode=WAL")
             .await
             .unwrap();
-        let workspace = WorkspaceManager::new(writer.clone())
-            .list_workspaces()
+        pioneer_entity::workspace::Entity::delete_many()
+            .exec(&writer)
             .await
-            .unwrap()
-            .into_iter()
-            .find(|workspace| workspace.is_active && workspace.is_current)
+            .unwrap();
+        let workspace = WorkspaceManager::new(writer.clone())
+            .create_workspace(
+                &pioneer_protocol::generate_id(),
+                Some("Physical episodic test"),
+            )
+            .await
             .unwrap()
             .id;
         let mut options =
@@ -13616,12 +13616,16 @@ mod tests {
             .execute_unprepared("PRAGMA journal_mode=WAL")
             .await
             .unwrap();
-        let workspace = WorkspaceManager::new(writer.clone())
-            .list_workspaces()
+        pioneer_entity::workspace::Entity::delete_many()
+            .exec(&writer)
             .await
-            .unwrap()
-            .into_iter()
-            .find(|workspace| workspace.is_active && workspace.is_current)
+            .unwrap();
+        let workspace = WorkspaceManager::new(writer.clone())
+            .create_workspace(
+                &pioneer_protocol::generate_id(),
+                Some("Physical episodic test"),
+            )
+            .await
             .unwrap()
             .id;
         let mut reader_options = ConnectOptions::new(sqlite_read_only_connection_url(&db_path));
@@ -14070,17 +14074,27 @@ mod tests {
         // Late maintenance runs while real index execution is blocked. There is
         // no +1-second ownership trick: its admission cannot recover any claim.
         let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only();
-        let summary = refill::refill_once_with_projection_resolver(
-            store.clone(),
-            root.path(),
-            &workspace,
-            target.clone(),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(summary.skipped);
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        refill::notify_ownership_wait_for_test(root.path(), waiting_tx);
+        let maintenance = tokio::spawn({
+            let store = store.clone();
+            let root = root.path().to_owned();
+            let workspace = workspace.clone();
+            let target = target.clone();
+            async move {
+                refill::refill_once_with_projection_resolver(
+                    store, &root, &workspace, target, None, None,
+                )
+                .await
+            }
+        });
+        // Late maintenance must wait for the live owner, rather than recover
+        // its Running claim. The barrier confirms it has reached admission.
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!maintenance.is_finished());
         assert_eq!(
             store
                 .find_thread_episodic_index_job(&job.id)
@@ -14130,8 +14144,11 @@ mod tests {
             .await;
         assert_eq!(output.hits.len(), 1);
         assert_eq!(output.hits[0].provenance.index_item_id.0, ready.id);
+        maintenance.abort();
+        assert!(maintenance.await.unwrap_err().is_cancelled());
         running.abort();
         assert!(running.await.unwrap_err().is_cancelled());
+        executor.shutdown().await;
         assert!(
             refill::refill_is_current_for_workspace_target(&store, &workspace, &target)
                 .await
@@ -14717,14 +14734,17 @@ mod tests {
         bootstrap(&connection)
             .await
             .expect("gateway bootstrap should create default workspace");
+        // Workspace ownership is shared by the whole process, including tests
+        // with separate databases. Give each fixture its own lock identity.
+        pioneer_entity::workspace::Entity::delete_many()
+            .exec(&connection)
+            .await
+            .unwrap();
         let workspace_manager = WorkspaceManager::new(connection.clone());
         let workspace_id = workspace_manager
-            .list_workspaces()
+            .create_workspace(&pioneer_protocol::generate_id(), Some("Episodic test"))
             .await
-            .expect("workspace list should succeed")
-            .into_iter()
-            .find(|workspace| workspace.is_active && workspace.is_current)
-            .expect("current workspace should exist")
+            .expect("isolated workspace should exist")
             .id;
         let crud_store = Arc::new(CrudStore::new(connection));
         mark_thread_episodic_workspace_refill_complete_for_test(crud_store.as_ref(), &workspace_id)
