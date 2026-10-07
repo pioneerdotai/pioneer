@@ -486,6 +486,7 @@ mod tests {
                 2,
                 "native turn interrupted".to_owned(),
                 timestamp(1_700_020_020),
+                None,
             )
             .await
             .expect("recovery attempt should prepare");
@@ -534,6 +535,7 @@ mod tests {
                 2,
                 "native turn interrupted".to_owned(),
                 timestamp(1_700_020_021),
+                None,
             )
             .await
             .expect("repeated recovery preparation should be idempotent");

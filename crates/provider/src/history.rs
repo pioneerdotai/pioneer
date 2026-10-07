@@ -2,10 +2,7 @@
 //! owner may put it back on the wire.  This module derives an outbound view of
 //! completed history without changing the stored messages.
 
-use crate::{
-    CanonicalProviderRoundEnvelope, ChatMessage, ChatRequest, ProviderReplayState, ReasoningConfig,
-    Role,
-};
+use crate::{CanonicalProviderRoundEnvelope, ChatMessage, ChatRequest, ProviderReplayState, Role};
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -46,7 +43,10 @@ fn completed_message_indexes(messages: &[ChatMessage]) -> BTreeSet<usize> {
             complete: true,
             ..Default::default()
         });
+        // Protection applies to the whole unit, even when every call has a
+        // result. Such continuation inputs cannot be rewritten portably.
         unit.complete &= origin.complete
+            && !origin.protected_input
             && !origin.unit_id.is_empty()
             && !origin.sources.is_empty()
             && origin.sources.iter().all(|source| {
@@ -129,6 +129,15 @@ fn portable_reasoning(state: &ProviderReplayState) -> Option<String> {
                 string_at(block, &["thinking"]).or_else(|| string_at(block, &["text"]))
             })
             .collect::<Vec<_>>(),
+        "gemini" => state
+            .payload
+            .get("parts")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|part| part.get("thought").and_then(serde_json::Value::as_bool) == Some(true))
+            .filter_map(|part| string_at(part, &["text"]))
+            .collect::<Vec<_>>(),
         "bedrock" => state
             .payload
             .get("blocks")
@@ -160,7 +169,7 @@ fn portable_reasoning(state: &ProviderReplayState) -> Option<String> {
     // without a separator when populating common reasoning_content.
     (!parts.is_empty()).then(|| {
         parts.join(
-            if matches!(state.provider.as_str(), "anthropic" | "bedrock") {
+            if matches!(state.provider.as_str(), "anthropic" | "bedrock" | "gemini") {
                 ""
             } else {
                 "\n"
@@ -330,13 +339,13 @@ pub fn project_messages_for_provider(
     model: &str,
     messages: &[ChatMessage],
 ) -> Result<Vec<ChatMessage>> {
-    project_messages(provider, model, false, messages)
+    project_messages(provider, model, None, messages)
 }
 
-fn project_messages(
+pub(crate) fn project_messages(
     provider: &str,
     model: &str,
-    reasoning_enabled: bool,
+    thinking_override: Option<bool>,
     messages: &[ChatMessage],
 ) -> Result<Vec<ChatMessage>> {
     let completed = completed_message_indexes(messages);
@@ -378,8 +387,9 @@ fn project_messages(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let deepseek_thinking =
-        provider == "deepseek" && deepseek_thinking_required(model, reasoning_enabled, &projected);
+    let deepseek_thinking = provider == "deepseek"
+        && thinking_override
+            .unwrap_or_else(|| deepseek_thinking_required(model, false, &projected));
     if !deepseek_thinking {
         return Ok(projected);
     }
@@ -475,15 +485,21 @@ fn project_messages(
         .collect()
 }
 
+/// Keep the current request's mode authoritative through budget and attachment
+/// materialization. Historical reasoning must never override explicit off.
+pub(crate) fn request_thinking_override(provider: &str, request: &ChatRequest) -> Option<bool> {
+    (provider == "deepseek").then(|| crate::generation::deepseek_effective_thinking(request))
+}
+
 pub fn project_request_for_provider(
     provider: &str,
     mut request: ChatRequest,
 ) -> Result<ChatRequest> {
-    let reasoning_enabled = matches!(request.reasoning, Some(ReasoningConfig::Effort(_)));
+    let thinking = request_thinking_override(provider, &request);
     request.messages = project_messages(
         provider,
         request.model.as_str(),
-        reasoning_enabled,
+        thinking,
         &request.messages,
     )?;
     Ok(request)
@@ -514,6 +530,115 @@ mod tests {
         });
     }
 
+    #[test]
+    fn a_protected_member_keeps_the_whole_foreign_round_incompatible() {
+        let mut assistant = ChatMessage::assistant_tool_calls_with_provider_state(
+            None::<String>,
+            None::<String>,
+            vec![ProviderToolCall {
+                id: "call".into(),
+                name: "inspect".into(),
+                arguments: "{}".into(),
+            }],
+            Some(ProviderReplayState::for_model(
+                "openrouter",
+                "source-model",
+                serde_json::json!({"opaque":"retained"}),
+            )),
+        );
+        let mut result = ChatMessage::tool_result("call", "inspect", "observed");
+        complete(&mut assistant, "round");
+        complete(&mut result, "round");
+        for protected_index in 0..2 {
+            let mut canonical = vec![assistant.clone(), result.clone()];
+            canonical[protected_index]
+                .provenance
+                .as_mut()
+                .unwrap()
+                .protected_input = true;
+            let bytes = serde_json::to_vec(&canonical).unwrap();
+            for reasoning in [
+                None,
+                Some(crate::ReasoningConfig::Disabled),
+                Some(crate::ReasoningConfig::Effort(crate::ReasoningEffort::None)),
+                Some(crate::ReasoningConfig::Effort(crate::ReasoningEffort::High)),
+            ] {
+                let mut request = crate::generation::test_request("deepseek-v4-flash");
+                request.messages = canonical.clone();
+                request.reasoning = reasoning;
+                let error = project_request_for_provider("deepseek", request).unwrap_err();
+                assert!(
+                    error
+                        .downcast_ref::<IncompatibleProviderReplayContinuation>()
+                        .is_some()
+                );
+                assert_eq!(serde_json::to_vec(&canonical).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn v2_native_history_switches_models_and_all_registered_profiles_without_leaking_signatures() {
+        for owner in ["anthropic", "gemini"] {
+            let payload = if owner == "anthropic" {
+                serde_json::json!({"schema_version":2,"blocks":[{"type":"thinking","thinking":"rationale","signature":"secret-signature"},{"type":"redacted_thinking","data":"secret-redacted"},{"type":"text","text":"answer"}]})
+            } else {
+                serde_json::json!({"schema_version":2,"parts":[{"text":"rationale","thought":true,"thoughtSignature":"secret-signature"},{"text":"answer","thoughtSignature":"secret-redacted"}]})
+            };
+            let mut message = ChatMessage::assistant("answer");
+            message.provider_replay_state =
+                Some(ProviderReplayState::for_model(owner, "source", payload));
+            let active = message.clone();
+            let mut stored: ChatMessage =
+                serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+            assert!(
+                stored.provenance.is_none(),
+                "stored JSON cannot grant completion authority"
+            );
+            let unattributed = stored.clone();
+            // The trusted cold loader reconstructs provenance from exact durable
+            // source revisions; ChatMessage serialization intentionally omits it.
+            complete(&mut stored, "final");
+            let same = project_messages_for_provider(owner, "source", &[stored.clone()]).unwrap();
+            assert_eq!(same[0], stored);
+            for profile in crate::definition::provider_definitions() {
+                let switched =
+                    project_messages_for_provider(profile.name, "target", &[stored.clone()])
+                        .unwrap();
+                let wire = serde_json::to_string(&switched).unwrap();
+                assert!(!wire.contains("secret-signature") && !wire.contains("secret-redacted"));
+                assert!(wire.contains("rationale"));
+                assert!(
+                    project_messages_for_provider(profile.name, "target", &[active.clone()])
+                        .is_err()
+                );
+                assert!(
+                    project_messages_for_provider(profile.name, "target", &[unattributed.clone()])
+                        .is_err(),
+                    "a JSON roundtrip cannot authorize a foreign provider/model projection"
+                );
+            }
+            // A fork keeps native source ownership; it does not mint signatures.
+            let mut inherited = stored.clone();
+            inherited.provenance.as_mut().unwrap().inherited = true;
+            inherited.provenance.as_mut().unwrap().context_thread = Some("fork-thread".into());
+            assert!(
+                project_messages_for_provider(owner, "source", &[inherited.clone()]).unwrap()[0]
+                    .provider_replay_state
+                    .is_some()
+            );
+            assert!(
+                project_messages_for_provider(owner, "target", &[inherited]).unwrap()[0]
+                    .provider_replay_state
+                    .is_none()
+            );
+            let mut legacy = stored.clone();
+            legacy.provider_replay_state.as_mut().unwrap().model = None;
+            let projected = project_messages_for_provider(owner, "source", &[legacy]).unwrap();
+            assert!(projected[0].provider_replay_state.is_none());
+            assert!(stored.provider_replay_state.is_some());
+        }
+    }
     #[test]
     fn foreign_completed_replay_becomes_portable_without_mutating_canonical_message() {
         let replay = ProviderReplayState::new(

@@ -9,7 +9,7 @@ use pioneer_sqlite::{
     SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass, SqliteWriteEvent,
     SqliteWriteExecutor, SqliteWriteObserver, sqlite_read_only_connection_url,
 };
-use sea_orm::sea_query::SqliteQueryBuilder;
+use sea_orm::sea_query::{Query, SqliteQueryBuilder};
 use sea_orm::{ConnectOptions, Database, DatabaseBackend, Statement};
 use std::{
     path::PathBuf,
@@ -86,13 +86,23 @@ impl Fixture {
         options.max_connections(1);
         options.map_sqlx_sqlite_opts(|o| o.pragma("foreign_keys", "ON"));
         let writer = Database::connect(options).await?;
-        let boundary = Migrator::migrations()
-            .iter()
-            .position(|migration| migration.name() == "m20260919_000001_native_event_cleanup_queue")
-            .expect("native cleanup migration registered") as u32;
-        // This fixture's latest means its own release boundary, not whichever
-        // unrelated migration was appended most recently.
-        Migrator::up(&writer, Some(boundary + u32::from(latest))).await?;
+        Migrator::up(
+            &writer,
+            if latest {
+                None
+            } else {
+                Some(
+                    Migrator::migrations()
+                        .iter()
+                        .position(|migration| {
+                            migration.name() == "m20260919_000001_native_event_cleanup_queue"
+                        })
+                        .expect("native cleanup migration is registered")
+                        as u32,
+                )
+            },
+        )
+        .await?;
         writer.execute_unprepared("PRAGMA journal_mode=WAL").await?;
         let fixture = Self::connect(path, writer).await?;
         fixture.sql("INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws-cleanup','Cleanup',1,1)").await?;
@@ -138,12 +148,14 @@ impl Fixture {
         let writer = Database::connect(options).await?;
         match migration {
             Some(true) => {
-                let applied = Migrator::get_applied_migrations(&writer).await?;
-                let boundary = applied
+                // This fixture can stop at the cleanup release boundary, so
+                // only applied migrations belong to the rollback suffix.
+                let migrations = Migrator::get_applied_migrations(&writer).await?;
+                let target = migrations
                     .iter()
                     .position(|m| m.name() == "m20260919_000001_native_event_cleanup_queue")
-                    .expect("native cleanup migration applied");
-                Migrator::down(&writer, Some((applied.len() - boundary) as u32)).await?;
+                    .expect("cleanup queue is applied");
+                Migrator::down(&writer, Some((migrations.len() - target) as u32)).await?;
             }
             Some(false) => {
                 let applied: i64 = writer
@@ -183,6 +195,12 @@ impl Fixture {
             .try_get_by_index(0)?)
     }
     async fn turn(&self, id: &str, completed: bool) -> Result<()> {
+        self.turn_in_schema(id, completed, false).await
+    }
+    async fn historical_completed_turn(&self, id: &str) -> Result<()> {
+        self.turn_in_schema(id, true, true).await
+    }
+    async fn turn_in_schema(&self, id: &str, completed: bool, historical: bool) -> Result<()> {
         let thread = Thread {
             workspace_id: "ws-cleanup".into(),
             id: "thread-cleanup".into(),
@@ -218,6 +236,112 @@ impl Fixture {
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
+        if historical {
+            // Seed the already-projected release-era result using only columns
+            // installed at the cleanup migration boundary. Today's materializer
+            // requires later terminal-marker columns and cannot run on this schema.
+            turn.status = TurnStatus::Completed;
+            let notification = TurnCompletedNotification {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn,
+            };
+            let payload = serde_json::to_string(&crate::CanonicalTurnEventPayload::TurnCompleted(
+                notification,
+            ))?;
+            let event_id = format!("historical-{id}");
+            let at = chrono::DateTime::from_timestamp(NOW, 0)
+                .unwrap()
+                .fixed_offset();
+            let statements = [
+                Query::insert()
+                    .into_table("thread")
+                    .columns([
+                        "id",
+                        "workspace_id",
+                        "preview",
+                        "mode",
+                        "model",
+                        "model_provider",
+                        "status",
+                    ])
+                    .values_panic([
+                        thread.id.clone().into(),
+                        thread.workspace_id.into(),
+                        "".into(),
+                        "agent".into(),
+                        thread.model.into(),
+                        thread.model_provider.into(),
+                        "active".into(),
+                    ])
+                    .on_conflict(OnConflict::column("id").do_nothing().to_owned())
+                    .to_owned(),
+                Query::insert()
+                    .into_table("turn")
+                    .columns(["id", "thread_id", "status"])
+                    .values_panic([id.into(), thread.id.clone().into(), "completed".into()])
+                    .to_owned(),
+                Query::insert()
+                    .into_table("turn_event")
+                    .columns([
+                        "id",
+                        "thread_id",
+                        "turn_id",
+                        "sequence",
+                        "event_type",
+                        "payload",
+                        "created_at",
+                    ])
+                    .values_panic([
+                        event_id.clone().into(),
+                        thread.id.clone().into(),
+                        id.into(),
+                        1_i64.into(),
+                        "turn/completed".into(),
+                        payload.into(),
+                        at.into(),
+                    ])
+                    .to_owned(),
+                Query::insert()
+                    .into_table("turn_event_projection_state")
+                    .columns([
+                        "event_id",
+                        "thread_id",
+                        "turn_id",
+                        "sequence",
+                        "status",
+                        "next_run_at",
+                        "projected_at",
+                    ])
+                    .values_panic([
+                        event_id.into(),
+                        thread.id.clone().into(),
+                        id.into(),
+                        1_i64.into(),
+                        "projected".into(),
+                        at.into(),
+                        at.into(),
+                    ])
+                    .to_owned(),
+                Query::insert()
+                    .into_table("turn_event_projection_stream_state")
+                    .columns([
+                        "turn_id",
+                        "thread_id",
+                        "status",
+                        "projected_through_sequence",
+                    ])
+                    .values_panic([id.into(), thread.id.into(), "healthy".into(), 1_i64.into()])
+                    .to_owned(),
+            ];
+            let statements = statements.map(|statement| DatabaseBackend::Sqlite.build(&statement));
+            let transaction = self.db.begin().await?;
+            for statement in statements {
+                transaction.execute_raw(statement).await?;
+            }
+            transaction.commit().await?;
+            return self.bind(id, "codex", "completed").await;
+        }
         self.store
             .materialize_turn_start(
                 &thread,
@@ -477,7 +601,9 @@ async fn byte_budget_runtime_ownership_and_empty_preparation_races() -> Result<(
 #[tokio::test]
 async fn migration_bootstrap_restart_vacuum_and_live_events_before_cursor() -> Result<()> {
     let f = Fixture::open_version(false).await?;
-    f.turn("legacy", true).await?;
+    let prior_migrations = f.scalar("SELECT COUNT(*) FROM seaql_migrations").await?;
+    assert!(prior_migrations + 1 < Migrator::migrations().len() as i64);
+    f.historical_completed_turn("legacy").await?;
     for i in 0..130 {
         f.event(
             &format!("m-{i:03}"),
@@ -488,6 +614,7 @@ async fn migration_bootstrap_restart_vacuum_and_live_events_before_cursor() -> R
         )
         .await?;
     }
+    assert_eq!(f.prepared("legacy").await?.ids.len(), 128);
     let f = f.migrate(false).await?;
     assert_eq!(
         f.scalar("SELECT COUNT(*) FROM native_event_cleanup_job")
@@ -503,7 +630,7 @@ async fn migration_bootstrap_restart_vacuum_and_live_events_before_cursor() -> R
     assert!(!first.complete);
     let f = f.restart().await?;
     f.sql("VACUUM").await?;
-    f.turn("live", true).await?;
+    f.historical_completed_turn("live").await?;
     f.event("a-live", Some("live"), "codex", "item/completed", 1)
         .await?;
     assert_eq!(
@@ -523,7 +650,30 @@ async fn migration_bootstrap_restart_vacuum_and_live_events_before_cursor() -> R
     assert!(bootstrap(&f.db).await?.complete);
     // Down removes only queue schema; upgrading again re-enables bootstrap.
     let f = f.migrate(true).await?;
+    assert_eq!(
+        f.scalar("SELECT COUNT(*) FROM seaql_migrations").await?,
+        prior_migrations,
+        "rollback must preserve migrations preceding cleanup"
+    );
+    assert_eq!(
+        f.scalar("SELECT COUNT(*) FROM seaql_migrations WHERE version='m20260919_000001_native_event_cleanup_queue'").await?,
+        0,
+        "rollback must remove the cleanup completion marker"
+    );
+    assert_eq!(
+        f.scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='history_check_due'"
+        )
+        .await?,
+        1,
+        "rollback must preserve the earlier history-check schema"
+    );
     let f = f.migrate(false).await?;
+    assert_eq!(
+        f.scalar("SELECT COUNT(*) FROM seaql_migrations").await?,
+        prior_migrations + 1,
+        "upgrade must reinstall cleanup without advancing later migrations"
+    );
     assert_eq!(
         f.scalar("SELECT complete FROM native_event_cleanup_bootstrap")
             .await?,
@@ -944,9 +1094,10 @@ async fn moved_event_wakes_destination_and_queued_deletes_do_not_update_job() ->
 #[tokio::test]
 async fn bootstrap_cursor_rolls_back_with_job_registration_failure() -> Result<()> {
     let f = Fixture::open_version(false).await?;
-    f.turn("legacy", true).await?;
+    f.historical_completed_turn("legacy").await?;
     f.event("legacy", Some("legacy"), "codex", "item/completed", 8)
         .await?;
+    assert_eq!(f.prepared("legacy").await?.ids.len(), 1);
     let f = f.migrate(false).await?;
     f.sql("CREATE TRIGGER fail_bootstrap BEFORE INSERT ON native_event_cleanup_job BEGIN SELECT RAISE(ABORT,'injected bootstrap failure'); END").await?;
     assert!(bootstrap(&f.db).await.is_err());

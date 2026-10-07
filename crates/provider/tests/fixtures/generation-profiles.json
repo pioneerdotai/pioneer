@@ -1,0 +1,289 @@
+[
+  {
+    "provider": "groq",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "mistral",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "xai",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "together",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "fireworks",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "novita",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "perplexity",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "cohere",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "venice",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "cerebras",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "sambanova",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "hyperbolic",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "deepinfra",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "huggingface",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "ai21",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "reka",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "baseten",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "nscale",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "anyscale",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "nebius",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "friendli",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "lepton",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "siliconflow",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": false
+  },
+  {
+    "provider": "aihubmix",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "astrai",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "stepfun",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "baichuan",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "yi",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "hunyuan",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "ovhcloud",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "nvidia",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "synthetic",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "doubao",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "qianfan",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "lmstudio",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "llamacpp",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "sglang",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "vllm",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "osaurus",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "litellm",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  },
+  {
+    "provider": "custom",
+    "model": "unknown-contract-fixture",
+    "cap_field": "max_tokens",
+    "cap": 1024,
+    "default_supported": true
+  }
+]

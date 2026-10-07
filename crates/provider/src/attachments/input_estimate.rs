@@ -10,6 +10,7 @@ use std::{collections::BTreeMap, io::Cursor};
 pub struct MediaInputEstimate {
     pub message: usize,
     pub part: usize,
+    /// Local heuristic for context admission; never measured media billing.
     pub input_tokens: u64,
 }
 
@@ -33,14 +34,15 @@ pub(crate) async fn prepare(
             media: vec![],
         });
     }
-    let prepared = super::prepare_messages_for_provider_async(
+    let prepared = super::prepare_messages_for_request_async(
         provider,
-        request.model.as_str(),
         capabilities,
+        &request,
         &request.messages,
     )
     .await?;
     super::ensure_no_unrendered_attachments(provider, &prepared)?;
+    let admission = super::admission::current();
     let provider = provider.to_owned();
     // Header/document parsing and base64 encoding remain outside async workers
     // and outside every DB scope. The pipeline bounds both count and bytes.
@@ -66,6 +68,9 @@ pub(crate) async fn prepare(
             // Pin the bytes that were actually estimated. A later provider pass
             // can neither re-fetch an edited URL nor reopen a changed file.
             // Exact artifact identity is preserved for the existing upload cache.
+            if let Some(state) = &admission {
+                state.pin(&attachment)?;
+            }
             target.source = AttachmentDataSource::Bytes {
                 base64_data: STANDARD.encode(bytes),
             };
@@ -236,15 +241,141 @@ pub fn image_tokens(provider: &str, model: &str, width: u32, height: u32) -> Res
         .div_ceil(100))
 }
 
-fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
+/// Exact rational seconds for native limits; rounding is only for estimates.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct NativeDuration {
+    numer: u128,
+    denom: u128,
+}
+impl NativeDuration {
+    pub(super) const ZERO: Self = Self { numer: 0, denom: 1 };
+    fn new(numer: u128, denom: u128) -> Self {
+        let g = gcd(numer, denom);
+        Self {
+            numer: numer / g,
+            denom: denom / g,
+        }
+    }
+    pub(super) fn add(self, other: Self) -> Result<Self> {
+        let g = gcd(self.denom, other.denom);
+        let a = other.denom / g;
+        let b = self.denom / g;
+        let numer = self
+            .numer
+            .checked_mul(a)
+            .and_then(|n| other.numer.checked_mul(b).and_then(|m| n.checked_add(m)))
+            .context("native duration rational overflow")?;
+        let denom = self
+            .denom
+            .checked_mul(a)
+            .context("native duration denominator overflow")?;
+        Ok(Self::new(numer, denom))
+    }
+    fn max(self, other: Self) -> Result<Self> {
+        let a = self
+            .numer
+            .checked_mul(other.denom)
+            .context("native duration comparison overflow")?;
+        let b = other
+            .numer
+            .checked_mul(self.denom)
+            .context("native duration comparison overflow")?;
+        Ok(if a >= b { self } else { other })
+    }
+    pub(super) fn within_millis(self, limit: u64) -> Result<bool> {
+        let left = self
+            .numer
+            .checked_mul(1000)
+            .context("native duration limit overflow")?;
+        let right = u128::from(limit)
+            .checked_mul(self.denom)
+            .context("native duration limit overflow")?;
+        Ok(left <= right)
+    }
+    fn ceil(self, units: u128) -> Result<u64> {
+        u64::try_from(
+            self.numer
+                .checked_mul(units)
+                .context("duration resolution overflow")?
+                .div_ceil(self.denom),
+        )
+        .context("duration resolution exceeds bounded representation")
+    }
+}
+/// Signed timestamp in exact seconds. Only subtraction against one proven
+/// container origin yields a duration; raw ticks from different bases never mix.
+#[derive(Clone, Copy)]
+struct TimelineTime {
+    numer: i128,
+    denom: u128,
+}
+impl TimelineTime {
+    fn from_ticks(ticks: i64, base: symphonia::core::units::TimeBase) -> Self {
+        // i64 × u32 fits i128 exactly; no sign/width loss here.
+        Self {
+            numer: i128::from(ticks) * i128::from(base.numer.get()),
+            denom: u128::from(base.denom.get()),
+        }
+    }
+    fn since(self, origin: Self) -> Result<NativeDuration> {
+        let g = gcd(self.denom, origin.denom);
+        let a = i128::try_from(origin.denom / g)?;
+        let b = i128::try_from(self.denom / g)?;
+        let n = self
+            .numer
+            .checked_mul(a)
+            .and_then(|n| origin.numer.checked_mul(b).and_then(|o| n.checked_sub(o)))
+            .context("native timeline subtraction overflow")?;
+        let n = u128::try_from(n).context("media timestamp precedes proven container origin")?;
+        Ok(NativeDuration::new(
+            n,
+            self.denom
+                .checked_mul(origin.denom / g)
+                .context("native timeline denominator overflow")?,
+        ))
+    }
+}
+fn checked_packet_end(
+    pts: symphonia::core::units::Timestamp,
+    dur: symphonia::core::units::Duration,
+) -> Result<i64> {
+    pts.checked_add(dur)
+        .map(|end| end.get())
+        .context("native packet end timestamp overflow")
+}
+
+fn gcd(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+pub(super) fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
+    native_duration(bytes, mime)?.ceil(1000)
+}
+#[cfg(test)]
+pub(super) fn duration_nanos(bytes: &[u8], mime: &str) -> Result<u64> {
+    native_duration(bytes, mime)?.ceil(1_000_000_000)
+}
+pub(super) fn native_duration(bytes: &[u8], mime: &str) -> Result<NativeDuration> {
     if matches!(
         mime,
         "video/mp4" | "audio/mp4" | "video/quicktime" | "audio/x-m4a"
     ) {
+        let edits = super::mp4_timing::identity_edits(bytes)?;
         let context =
             mp4parse::read_mp4(&mut Cursor::new(bytes)).context("MP4 timing is unavailable")?;
-        let mut duration = 0;
+        super::mp4_timing::validate_edits(&edits, &context)?;
+        let mut duration = NativeDuration::ZERO;
         for track in &context.tracks {
+            // Existing MP4 track spans are zero-origin bounds. An explicit
+            // leading edit/loop breaks that proof; refuse instead of dropping it.
+            ensure!(
+                !track.looped.unwrap_or(false) && track.empty_duration.is_none_or(|v| v.0 == 0),
+                "MP4 offset/loop timeline is not proven by native track spans"
+            );
             let ticks = track
                 .duration
                 .context("MP4 track duration is unavailable")?;
@@ -252,13 +383,23 @@ fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
                 .timescale
                 .context("MP4 track time base is unavailable")?;
             ensure!(scale.0 > 0, "MP4 track time base is zero");
-            duration = duration.max(
-                ((u128::from(ticks.0) * 1000).div_ceil(u128::from(scale.0)))
-                    .min(u128::from(u64::MAX)) as u64,
-            );
+            duration = duration.max(NativeDuration::new(
+                u128::from(ticks.0),
+                u128::from(scale.0),
+            ))?;
         }
-        ensure!(duration > 0, "MP4 duration is unavailable");
+        ensure!(duration.numer > 0, "MP4 duration is unavailable");
         return Ok(duration);
+    }
+    // These demuxers may populate Some(duration) from sampled byte lengths.
+    // A raw complete frame scan establishes counts without estimated end trims.
+    if matches!(mime, "audio/mpeg" | "audio/mp3") {
+        let (samples, rate) = super::audio_timing::mp3_samples(bytes)?;
+        return Ok(NativeDuration::new(u128::from(samples), u128::from(rate)));
+    }
+    if mime == "audio/aac" {
+        let (samples, rate) = super::audio_timing::adts_samples(bytes)?;
+        return Ok(NativeDuration::new(u128::from(samples), u128::from(rate)));
     }
     use symphonia::core::{
         formats::{FormatOptions, probe::Hint},
@@ -277,8 +418,36 @@ fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
         FormatOptions::default(),
         MetadataOptions::default(),
     )?;
+    let webm = matches!(mime, "audio/webm" | "video/webm")
+        .then(|| super::webm::timing(bytes))
+        .transpose()?;
+    let media = format.media_info().clone();
+    let media_base = media
+        .time_base
+        .context("native container time base is unavailable")?;
+    // MKV uses Segment-relative timestamps. Its rounded float duration is only
+    // accepted after exact raw metadata proof and packet-end verification.
+    if let Some(timing) = &webm {
+        ensure!(
+            media.start_ts.get() == 0
+                && u64::from(media_base.numer.get()) * 1_000_000_000
+                    == u64::from(media_base.denom.get()) * u64::from(timing.scale_nanos),
+            "WebM segment origin/time base is not proven"
+        );
+        ensure!(
+            media.duration.map(|d| d.get()) == timing.duration_ticks,
+            "WebM library/raw segment duration mismatch"
+        );
+    } else {
+        ensure!(
+            format.tracks().len() == 1 || media.start_ts.get() == 0,
+            "nonzero multi-track container origin is not proven"
+        );
+    }
+    let origin = TimelineTime::from_ticks(media.start_ts.get(), media_base);
     let mut bases = BTreeMap::new();
-    let mut duration = 0_u64;
+    let mut duration = NativeDuration::ZERO;
+    let mut unknown = std::collections::BTreeSet::new();
     let mut all_known = !format.tracks().is_empty();
     for track in format.tracks() {
         let base = track.time_base.or_else(|| {
@@ -294,11 +463,24 @@ fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
             if let Some(ticks) = track
                 .duration
                 .map(symphonia::core::units::Duration::get)
-                .or(track.num_frames)
+                .or_else(|| {
+                    // num_frames is a count; it is ticks only at reciprocal
+                    // audio sample rate, never arbitrary video timebase.
+                    let rate = track.codec_params.as_ref()?.audio()?.sample_rate?;
+                    (u64::from(base.numer.get()) * u64::from(rate) == u64::from(base.denom.get()))
+                        .then_some(track.num_frames)
+                        .flatten()
+                })
             {
-                duration = duration.max(ticks_millis(ticks.saturating_add(1), base));
+                let end = checked_packet_end(
+                    track.start_ts,
+                    symphonia::core::units::Duration::new(ticks),
+                )?;
+                TimelineTime::from_ticks(track.start_ts.get(), base).since(origin)?;
+                duration = duration.max(TimelineTime::from_ticks(end, base).since(origin)?)?;
             } else {
                 all_known = false;
+                unknown.insert(track.id);
             }
         } else {
             anyhow::bail!("media track time base is unavailable");
@@ -307,13 +489,29 @@ fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
     if !all_known {
         // Demux packet timestamps without decoding or transcribing audio/video.
         let mut complete = false;
+        let mut spans = BTreeMap::<u32, (i64, i64)>::new();
         for _ in 0..1_000_000 {
             match format.next_packet() {
                 Ok(Some(packet)) => {
-                    if let Some(base) = bases.get(&packet.track_id) {
-                        let end = packet.pts.saturating_add(packet.dur).get().max(0) as u64;
-                        duration = duration.max(ticks_millis(end.saturating_add(1), *base));
-                    }
+                    ensure!(
+                        bases.contains_key(&packet.track_id),
+                        "packet references unknown timed track"
+                    );
+                    ensure!(
+                        !unknown.contains(&packet.track_id) || packet.dur.get() > 0,
+                        "unknown packet end duration; native span is not established"
+                    );
+                    let start = packet.pts.get();
+                    let end = checked_packet_end(packet.pts, packet.dur)?;
+                    TimelineTime::from_ticks(start, bases[&packet.track_id]).since(origin)?;
+                    ensure!(end >= start, "invalid packet time span");
+                    spans
+                        .entry(packet.track_id)
+                        .and_modify(|span| {
+                            span.0 = span.0.min(start);
+                            span.1 = span.1.max(end);
+                        })
+                        .or_insert((start, end));
                 }
                 Ok(None) => {
                     complete = true;
@@ -332,16 +530,37 @@ fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
             complete,
             "media timing scan exceeded its bounded packet quantum"
         );
+        for id in &unknown {
+            let (start, end) = spans.get(id).context("media track timing is unavailable")?;
+            ensure!(end > start, "media track duration is unavailable");
+        }
+        for (id, (_, end)) in spans {
+            duration = duration.max(TimelineTime::from_ticks(end, bases[&id]).since(origin)?)?;
+        }
     }
-    ensure!(duration > 0, "media duration is unavailable");
+    if let Some(timing) = webm {
+        if let Some(ticks) = timing.duration_ticks {
+            let declared = ticks_span(ticks, media_base);
+            let bound = declared.max(duration)?;
+            ensure!(
+                bound.numer == declared.numer && bound.denom == declared.denom,
+                "WebM declared segment duration precedes measured packet end"
+            );
+            duration = declared;
+        }
+    }
+    ensure!(duration.numer > 0, "media duration is unavailable");
     Ok(duration)
 }
-fn ticks_millis(ticks: u64, base: symphonia::core::units::TimeBase) -> u64 {
-    (u128::from(ticks)
-        .saturating_mul(u128::from(base.numer.get()))
-        .saturating_mul(1000)
-        .div_ceil(u128::from(base.denom.get())))
-    .min(u128::from(u64::MAX)) as u64
+fn ticks_span(ticks: u64, base: symphonia::core::units::TimeBase) -> NativeDuration {
+    NativeDuration::new(
+        u128::from(ticks) * u128::from(base.numer.get()),
+        u128::from(base.denom.get()),
+    )
+}
+#[cfg(test)]
+fn ticks_nanos(ticks: u64, base: symphonia::core::units::TimeBase) -> u64 {
+    ticks_span(ticks, base).ceil(1_000_000_000).unwrap()
 }
 
 #[cfg(test)]
@@ -394,7 +613,7 @@ mod tests {
         out.resize(44 + length as usize, 0);
         out
     }
-    fn mp4(duration: u32) -> Vec<u8> {
+    pub(super) fn mp4(duration: u32) -> Vec<u8> {
         fn atom(name: &[u8; 4], bytes: &[u8]) -> Vec<u8> {
             let mut out = ((bytes.len() + 8) as u32).to_be_bytes().to_vec();
             out.extend(name);
@@ -417,9 +636,10 @@ mod tests {
         let audio = attachment(InputContentType::Audio, "audio/wav", wav());
         assert_eq!(
             duration_millis(audio.bytes.as_ref().unwrap(), "audio/wav").unwrap(),
-            1001
+            1000
         );
-        assert_eq!(estimate("gemini", "gemini-fixture", &audio).unwrap(), 51);
+        // Context estimate remains a rounded duration heuristic, not billing.
+        assert_eq!(estimate("gemini", "gemini-fixture", &audio).unwrap(), 50);
         let video = attachment(InputContentType::Video, "video/mp4", mp4(2500));
         assert_eq!(estimate("gemini", "gemini-fixture", &video).unwrap(), 875);
         assert!(duration_millis(&mp4(u32::MAX), "video/mp4").is_err());
@@ -518,6 +738,7 @@ mod tests {
             ChatMessage, InputTypeSupport, MessageAttachment, ProviderCapabilities,
             ProviderInputCapabilities,
         };
+        use std::sync::Arc;
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("image.png");
         let bytes = png(512, 512);
@@ -554,9 +775,20 @@ mod tests {
             reasoning: None,
             compiled_prompt: None,
         };
-        let prepared = super::super::runtime::with_async_authority_scope(
-            "fixture-media-authority".into(),
-            prepare("openai", &caps, request),
+        let catalog = Arc::new(
+            crate::catalog::ModelCatalog::parse(
+                include_str!("../../tests/fixtures/catalog/models.json"),
+                include_str!("../../tests/fixtures/catalog/provenance.json"),
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(super::super::admission::AdmissionState::for_test(catalog));
+        let prepared = super::super::admission::scope(
+            state.clone(),
+            super::super::runtime::with_async_authority_scope(
+                "fixture-media-authority".into(),
+                prepare("openai", &caps, request),
+            ),
         )
         .await
         .unwrap();
@@ -570,13 +802,16 @@ mod tests {
             panic!("unpinned image")
         };
         assert_eq!(STANDARD.decode(base64_data).unwrap(), bytes);
-        let next = super::super::runtime::with_async_authority_scope(
-            "fixture-media-authority".into(),
-            super::super::prepare_messages_for_provider_async(
-                "openai",
-                prepared.request.model.as_str(),
-                &caps,
-                &prepared.request.messages,
+        let next = super::super::admission::scope(
+            state,
+            super::super::runtime::with_async_authority_scope(
+                "fixture-media-authority".into(),
+                super::super::prepare_messages_for_provider_async(
+                    "openai",
+                    prepared.request.model.as_str(),
+                    &caps,
+                    &prepared.request.messages,
+                ),
             ),
         )
         .await
@@ -585,6 +820,356 @@ mod tests {
         assert_eq!(
             next.attachments[0].sha256,
             image.sha256.as_ref().unwrap().as_str()
+        );
+    }
+}
+
+#[cfg(test)]
+mod native_span_rounding_tests {
+    use super::*;
+    #[test]
+    fn native_timebase_rounding_has_no_inclusive_timestamp_tick() {
+        use std::num::NonZeroU32;
+        let base = symphonia::core::units::TimeBase::new(
+            NonZeroU32::new(1).unwrap(),
+            NonZeroU32::new(8000).unwrap(),
+        );
+        assert_eq!(ticks_nanos(8000, base), 1_000_000_000);
+        assert_eq!(ticks_nanos(8001, base), 1_000_125_000);
+        let thirds = symphonia::core::units::TimeBase::new(
+            NonZeroU32::new(1).unwrap(),
+            NonZeroU32::new(3).unwrap(),
+        );
+        assert_eq!(ticks_nanos(1, thirds), 333_333_334);
+        assert_eq!(ticks_nanos(3, thirds), 1_000_000_000);
+        let exact = ticks_span(1, thirds)
+            .add(ticks_span(1, thirds))
+            .unwrap()
+            .add(ticks_span(1, thirds))
+            .unwrap();
+        assert!(exact.within_millis(1000).unwrap());
+        assert!(!exact.within_millis(999).unwrap());
+        assert_eq!(exact.ceil(1000).unwrap(), 1000);
+    }
+}
+
+#[cfg(test)]
+mod container_timeline_regressions {
+    use super::*;
+    use crate::attachments::media_fixtures::{TimingFixture, webm_timeline};
+    #[test]
+    fn mixed_shift_overlap_metadata_and_packet_scan_use_segment_timeline() {
+        for declared_duration in [None, Some(11000.0)] {
+            let bytes = webm_timeline(
+                true,
+                true,
+                "webm",
+                TimingFixture {
+                    video_start: 10000,
+                    declared_duration,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(duration_millis(&bytes, "video/webm").unwrap(), 11000);
+        }
+        let half_ms = webm_timeline(
+            false,
+            true,
+            "webm",
+            TimingFixture {
+                video_start: 20000,
+                video_duration: 2000,
+                timestamp_scale: 500_000,
+                declared_duration: Some(22000.0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(duration_millis(&half_ms, "video/webm").unwrap(), 11000);
+        let trailing = webm_timeline(
+            true,
+            true,
+            "webm",
+            TimingFixture {
+                video_start: 10000,
+                declared_duration: Some(12000.0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(duration_millis(&trailing, "video/webm").unwrap(), 12000);
+        for (audio_start, video_start, expected) in [(0, 0, 1000), (0, 500, 1500), (500, 0, 1500)] {
+            let bytes = webm_timeline(
+                true,
+                true,
+                "webm",
+                TimingFixture {
+                    audio_start,
+                    video_start,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(duration_millis(&bytes, "video/webm").unwrap(), expected);
+        }
+        let leading = webm_timeline(
+            false,
+            true,
+            "webm",
+            TimingFixture {
+                cluster_timestamp: 5000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(duration_millis(&leading, "video/webm").unwrap(), 6000); // Segment zero, not per-track reset
+        for timing in [
+            TimingFixture {
+                video_start: -1,
+                ..Default::default()
+            },
+            TimingFixture {
+                codec_delay: 1,
+                ..Default::default()
+            },
+            TimingFixture {
+                track_scale: 2.0,
+                ..Default::default()
+            },
+            TimingFixture {
+                declared_duration: Some(999.5),
+                ..Default::default()
+            },
+            TimingFixture {
+                declared_duration: Some(999.0),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                native_duration(&webm_timeline(true, true, "webm", timing), "video/webm").is_err()
+            );
+        }
+    }
+    #[test]
+    fn container_packet_end_near_i64_boundary_is_checked_not_clamped() {
+        let overflow = webm_timeline(
+            false,
+            true,
+            "webm",
+            TimingFixture {
+                cluster_timestamp: (i64::MAX - 1000) as u64,
+                video_duration: 2000,
+                ..Default::default()
+            },
+        );
+        let error = native_duration(&overflow, "video/webm").unwrap_err();
+        assert!(error.to_string().contains("packet end timestamp overflow"));
+        let valid = webm_timeline(
+            false,
+            true,
+            "webm",
+            TimingFixture {
+                cluster_timestamp: (i64::MAX - 2000) as u64,
+                video_duration: 2000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            duration_millis(&valid, "video/webm").unwrap(),
+            i64::MAX as u64
+        );
+    }
+    #[test]
+    fn rational_origin_and_different_timebases_do_not_add_raw_ticks() {
+        use std::num::NonZeroU32;
+        let ms = symphonia::core::units::TimeBase::new(
+            NonZeroU32::new(1).unwrap(),
+            NonZeroU32::new(1000).unwrap(),
+        );
+        let sec = symphonia::core::units::TimeBase::new(
+            NonZeroU32::new(1).unwrap(),
+            NonZeroU32::new(1).unwrap(),
+        );
+        let origin = TimelineTime::from_ticks(5000, ms);
+        assert_eq!(
+            TimelineTime::from_ticks(11, sec)
+                .since(origin)
+                .unwrap()
+                .ceil(1000)
+                .unwrap(),
+            6000
+        );
+        assert_eq!(
+            TimelineTime::from_ticks(1000, ms)
+                .since(TimelineTime::from_ticks(-1, sec))
+                .unwrap()
+                .ceil(1000)
+                .unwrap(),
+            2000
+        );
+        assert!(TimelineTime::from_ticks(-1, sec).since(origin).is_err());
+    }
+}
+
+#[cfg(test)]
+mod mp4_timeline_boundary_regressions {
+    use super::*;
+    #[test]
+    fn leading_movie_edit_is_not_silently_erased_from_track_duration() {
+        fn atom(id: &[u8; 4], bytes: &[u8]) -> Vec<u8> {
+            [(bytes.len() as u32 + 8).to_be_bytes().as_slice(), id, bytes].concat()
+        }
+        // Valid metadata edit list: a 10s empty segment, then 1s media.
+        // The existing narrow metadata timing fixture supplies the media track;
+        // this negative test claims no complete encoded/endpoint acceptance.
+        let raw = super::tests::mp4(1000);
+        let mut edits = vec![0; 4];
+        edits.extend(2u32.to_be_bytes());
+        for (duration, start) in [(10000u32, -1i32), (1000, 0)] {
+            edits.extend(duration.to_be_bytes());
+            edits.extend(start.to_be_bytes());
+            edits.extend(1i16.to_be_bytes());
+            edits.extend(0i16.to_be_bytes());
+        }
+        let mut track = atom(b"edts", &atom(b"elst", &edits));
+        track.extend(&raw[16..]);
+        let bytes = atom(b"moov", &atom(b"trak", &track));
+        assert!(
+            native_duration(&bytes, "video/mp4")
+                .unwrap_err()
+                .to_string()
+                .contains("MP4 nonidentity edit timeline")
+        );
+    }
+}
+
+#[cfg(test)]
+mod confirmed_duration_regressions {
+    use super::*;
+    use crate::attachments::media_fixtures::{Mp4Edit, encoded_audio_mp4, vbr_adts, vbr_mp3};
+    #[test]
+    fn elementary_vbr_counts_are_independent_of_initial_bitrate_estimate() {
+        // 100 MPEG1 frames *1152 samples /48000Hz =2400ms.
+        let mp3 = native_duration(&vbr_mp3(100), "audio/mpeg").unwrap();
+        assert_eq!(mp3.ceil(1000).unwrap(), 2400);
+        assert!(mp3.within_millis(2400).unwrap());
+        assert!(!mp3.within_millis(2399).unwrap());
+        assert!(
+            !native_duration(&vbr_mp3(101), "audio/mpeg")
+                .unwrap()
+                .within_millis(2400)
+                .unwrap()
+        );
+        // 441 ADTS single raw blocks *1024 /44100Hz =10240ms.
+        let aac = native_duration(&vbr_adts(441), "audio/aac").unwrap();
+        assert_eq!(aac.ceil(1000).unwrap(), 10240);
+        assert!(aac.within_millis(10240).unwrap());
+        assert!(!aac.within_millis(10239).unwrap());
+        assert!(
+            !native_duration(&vbr_adts(442), "audio/aac")
+                .unwrap()
+                .within_millis(10240)
+                .unwrap()
+        );
+        for (mime, mut bytes) in [("audio/mpeg", vbr_mp3(100)), ("audio/aac", vbr_adts(441))] {
+            bytes.pop();
+            assert!(native_duration(&bytes, mime).is_err());
+        }
+        let mut changed = vbr_mp3(100);
+        changed[960 * 20 + 2] = 0x10; // 44.1kHz instead of48kHz
+        assert!(native_duration(&changed, "audio/mpeg").is_err());
+        let mut multiple = vbr_adts(441);
+        multiple[6] |= 1;
+        assert!(native_duration(&multiple, "audio/aac").is_err());
+        assert!(native_duration(b"\xff\xf1", "audio/aac").is_err());
+        assert!(native_duration(b"ID3", "audio/mpeg").is_err());
+        let xing = crate::attachments::media_fixtures::xing_mp3(100, 100);
+        assert_eq!(duration_millis(&xing, "audio/mpeg").unwrap(), 2400);
+        assert!(
+            native_duration(
+                &crate::attachments::media_fixtures::xing_mp3(100, 99),
+                "audio/mpeg"
+            )
+            .is_err()
+        );
+        let mut bad_trim = crate::attachments::regression::mp3().to_vec();
+        // Pinned Lavc encoder string starts at0xb9. Mutating it invalidates tag
+        // CRC while retaining media/frame layout; no bytes are decoded here.
+        bad_trim[0xb9 + 5] ^= 1;
+        assert!(native_duration(&bad_trim, "audio/mpeg").is_err());
+        // The pinned codec asset has an unproven tag CRC; hard timing must
+        // reject it. Supported CRC/count/trim domains have independent fixtures.
+        let unproven =
+            native_duration(crate::attachments::regression::mp3(), "audio/mpeg").unwrap_err();
+        assert!(unproven.to_string().contains("CRC"));
+    }
+    #[test]
+    fn full_mp4_edit_table_requires_exact_single_identity_in_both_scales() {
+        // Valid encoded AAC container; movie scale1000 and media scale44100.
+        let no_edit = encoded_audio_mp4(None);
+        assert_eq!(duration_millis(&no_edit, "audio/mp4").unwrap(), 10240);
+        let identity = encoded_audio_mp4(Some(&[Mp4Edit {
+            duration: 10240,
+            start: 0,
+            rate: 0x10000,
+        }]));
+        assert_eq!(duration_millis(&identity, "audio/mp4").unwrap(), 10240);
+        for edits in [
+            vec![
+                Mp4Edit {
+                    duration: 1000,
+                    start: 0,
+                    rate: 0x10000
+                };
+                2
+            ],
+            vec![Mp4Edit {
+                duration: 1000,
+                start: 44100,
+                rate: 0x10000,
+            }],
+            vec![Mp4Edit {
+                duration: 10240,
+                start: 0,
+                rate: 0x20000,
+            }],
+            vec![Mp4Edit {
+                duration: 451584,
+                start: 0,
+                rate: 0x10000,
+            }], // raw ticks are not movie ticks
+        ] {
+            assert!(native_duration(&encoded_audio_mp4(Some(&edits)), "audio/mp4").is_err());
+        }
+        // Exact reviewer metadata-only counterexample, distinct from encoded
+        // admission fixtures: MDHD1s, movie1000Hz, two 1s positive edits, flags0.
+        fn atom(id: &[u8], data: &[u8]) -> Vec<u8> {
+            [((data.len() + 8) as u32).to_be_bytes().as_slice(), id, data].concat()
+        }
+        let mdia = super::tests::mp4(1000)[16..].to_vec();
+        let mut elst = vec![0; 4];
+        elst.extend(2u32.to_be_bytes());
+        for _ in 0..2 {
+            elst.extend(1000u32.to_be_bytes());
+            elst.extend(0i32.to_be_bytes());
+            elst.extend(0x10000i32.to_be_bytes());
+        }
+        let mut mvhd = vec![0; 12];
+        mvhd.extend(1000u32.to_be_bytes());
+        mvhd.extend(2000u32.to_be_bytes());
+        mvhd.resize(100, 0);
+        let bytes = atom(
+            b"moov",
+            &[
+                atom(b"mvhd", &mvhd),
+                atom(
+                    b"trak",
+                    &[mdia, atom(b"edts", &atom(b"elst", &elst))].concat(),
+                ),
+            ]
+            .concat(),
+        );
+        assert!(
+            native_duration(&bytes, "video/mp4")
+                .unwrap_err()
+                .to_string()
+                .contains("nonidentity edit timeline")
         );
     }
 }

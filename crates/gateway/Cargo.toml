@@ -65,9 +65,11 @@ mime_guess.workspace = true
 url.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
 tiktoken-rs.workspace = true
+tokenizers.workspace = true
 flate2.workspace = true
 tar.workspace = true
 sha2.workspace = true
+zstd.workspace = true
 subtle.workspace = true
 hex.workspace = true
 hmac.workspace = true
@@ -90,5 +92,6 @@ pioneer-sqlite = { workspace = true, features = ["test-support"] }
 pioneer-client.workspace = true
 pioneer-client-ffi.workspace = true
 pioneer-crud = { workspace = true, features = ["test-support"] }
+pioneer-mcp-oauth = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }

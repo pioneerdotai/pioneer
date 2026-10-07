@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
@@ -149,11 +149,35 @@ impl ProviderCacheKey {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ProviderOrigin {
+    Factory,
+    Injected,
+}
+
+impl ProviderOrigin {
+    fn use_public_catalog(self, provider: &str, base_url: Option<&str>) -> bool {
+        // Resolver URLs do not attest the endpoint of an injected inner.
+        matches!(self, Self::Factory)
+            && base_url.is_none_or(|endpoint| {
+                crate::provider_definition(provider)
+                    .and_then(|definition| definition.default_base_url)
+                    .is_some_and(|stock| {
+                        stock.trim_end_matches('/') == endpoint.trim_end_matches('/')
+                    })
+            })
+    }
+}
+
 struct AuthorityBoundProvider {
     inner: Arc<dyn Provider>,
     authority_fingerprint: ProviderAuthorityFingerprint,
     revoked: Arc<AtomicBool>,
     redact_endpoint_errors: bool,
+    input_admission: Arc<crate::attachments::admission::AdmissionState>,
+    discovery_tools: RwLock<BTreeMap<String, bool>>,
+    discovery_reasoning: RwLock<BTreeMap<String, crate::generation::NativeReasoning>>,
+    use_public_catalog: bool,
 }
 
 /// The request's endpoint can contain a secret path. Never retain a raw
@@ -163,6 +187,7 @@ struct RedactedEndpointError {
     message: &'static str,
     classification: ProviderFailureClassification,
     incomplete: Option<crate::failure::ProviderStreamIncomplete>,
+    native: Option<crate::failure::AnthropicStreamError>,
 }
 
 impl Display for RedactedEndpointError {
@@ -176,9 +201,14 @@ impl Display for RedactedEndpointError {
 
 impl Error for RedactedEndpointError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.incomplete
+        self.native
             .as_ref()
             .map(|cause| cause as &(dyn Error + 'static))
+            .or_else(|| {
+                self.incomplete
+                    .as_ref()
+                    .map(|cause| cause as &(dyn Error + 'static))
+            })
     }
 }
 
@@ -209,6 +239,10 @@ fn redacted_endpoint_error(
 ) -> anyhow::Error {
     if error.is::<RedactedEndpointError>() {
         return error;
+    }
+    if let Some(rejection) = error.downcast_ref::<crate::attachments::MediaInputRejection>() {
+        // Keep only the controlled diagnostic, dropping any raw context chain.
+        return rejection.clone().into();
     }
     // Adapters can supply structured status even when their error does not
     // contain a reqwest source or the usual `API error (...)` prefix.
@@ -246,7 +280,11 @@ fn redacted_endpoint_error(
         .retry_after_ms
         .or_else(|| extract_retry_after_ms(&lower));
     // Provider-supplied codes may themselves contain the endpoint path.
-    classification.provider_code = None;
+    classification.provider_code =
+        crate::failure::anthropic_stream_error(&error).and_then(|native| {
+            (native != crate::failure::AnthropicStreamError::Unknown)
+                .then(|| native.code().to_owned())
+        });
     let message = if is_network {
         "provider network request failed"
     } else if status.is_some() {
@@ -258,14 +296,85 @@ fn redacted_endpoint_error(
         message,
         classification,
         incomplete: crate::failure::provider_stream_incomplete(&error),
+        native: crate::failure::anthropic_stream_error(&error),
     }
     .into()
 }
 
 impl AuthorityBoundProvider {
+    fn model_tool_calling_with_catalog(
+        &self,
+        model: &str,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> bool {
+        let discovery = self
+            .discovery_tools
+            .read()
+            .expect("discovery tools lock")
+            .get(model)
+            .copied();
+        let source = self
+            .use_public_catalog
+            .then(|| catalog.and_then(|c| c.tool_support(self.name(), model)))
+            .flatten();
+        self.capabilities().tool_calling
+            && crate::catalog::merge_tool_support(discovery, source) != Some(false)
+    }
+
+    fn enrich_discovery(
+        &self,
+        catalog: &crate::catalog::ModelCatalog,
+        models: &mut [ProviderModelInfo],
+    ) {
+        // Keep raw media evidence before any catalog enrichment, in this same
+        // authority instance. A refresh replaces both capability snapshots.
+        self.input_admission.replace_discovery(models.to_vec());
+        // Keep raw discovery capability in this authority's existing instance;
+        // enrichment must never export it to another credential/endpoint scope.
+        *self.discovery_tools.write().expect("discovery tools lock") = models
+            .iter()
+            .filter_map(|m| m.capabilities.tool_calling.map(|v| (m.id.clone(), v)))
+            .collect();
+        *self
+            .discovery_reasoning
+            .write()
+            .expect("discovery reasoning lock") = models
+            .iter()
+            .filter_map(|m| {
+                m.capabilities
+                    .reasoning
+                    .as_ref()
+                    .filter(|r| !r.native.is_empty())
+                    .map(|r| (m.id.clone(), r.native.clone()))
+            })
+            .collect();
+        catalog.enrich_for_tool_scope(self.inner.name(), models, self.use_public_catalog);
+    }
+
+    fn discovery_reasoning_snapshot(&self) -> BTreeMap<String, crate::generation::NativeReasoning> {
+        self.discovery_reasoning
+            .read()
+            .expect("discovery reasoning lock")
+            .clone()
+    }
+
+    fn discovery_tool_snapshot(&self) -> BTreeMap<String, bool> {
+        self.discovery_tools
+            .read()
+            .expect("discovery tools lock")
+            .clone()
+    }
+
     fn ensure_not_revoked(&self) -> Result<()> {
         if self.revoked.load(Ordering::Acquire) {
             return Err(ProviderAuthorityRevoked.into());
+        }
+        // Check before catalog loading, budgeting and endpoint redaction so
+        // retirement remains a local, non-secret diagnostic in every operation.
+        if let Some(reason) = crate::definition::provider_definition(self.inner.name())
+            .and_then(|definition| definition.retirement_reason())
+        {
+            anyhow::bail!(reason);
         }
         Ok(())
     }
@@ -295,6 +404,11 @@ impl Provider for AuthorityBoundProvider {
         self.inner.capabilities()
     }
 
+    fn model_tool_calling(&self, model: &str) -> bool {
+        let catalog = crate::catalog::model_catalog().ok();
+        self.model_tool_calling_with_catalog(model, catalog.as_deref())
+    }
+
     fn native_file_tool_capability(
         &self,
         model: &str,
@@ -315,9 +429,17 @@ impl Provider for AuthorityBoundProvider {
     ) -> Result<crate::attachments::PreparedInputBudget> {
         self.ensure_not_revoked()?;
         self.public_result(
-            crate::attachments::runtime::with_async_authority_scope(
-                self.authority_fingerprint.as_str().to_owned(),
-                self.inner.prepare_input_budget(request),
+            crate::attachments::admission::scope(
+                self.input_admission.clone(),
+                crate::attachments::runtime::with_async_authority_scope(
+                    self.authority_fingerprint.as_str().to_owned(),
+                    crate::generation::with_native_reasoning(
+                        self.name(),
+                        self.use_public_catalog,
+                        self.discovery_reasoning_snapshot(),
+                        self.inner.prepare_input_budget(request),
+                    ),
+                ),
             )
             .await,
         )
@@ -326,9 +448,22 @@ impl Provider for AuthorityBoundProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         self.ensure_not_revoked()?;
         self.public_result(
-            crate::attachments::runtime::with_async_authority_scope(
-                self.authority_fingerprint.as_str().to_owned(),
-                self.inner.chat(request),
+            crate::attachments::admission::scope(
+                self.input_admission.clone(),
+                crate::attachments::runtime::with_async_authority_scope(
+                    self.authority_fingerprint.as_str().to_owned(),
+                    crate::tools::policy::with_discovery_tools(
+                        self.name(),
+                        self.use_public_catalog,
+                        self.discovery_tool_snapshot(),
+                        crate::generation::with_native_reasoning(
+                            self.name(),
+                            self.use_public_catalog,
+                            self.discovery_reasoning_snapshot(),
+                            self.inner.chat(request),
+                        ),
+                    ),
+                ),
             )
             .await,
         )
@@ -347,9 +482,22 @@ impl Provider for AuthorityBoundProvider {
     ) -> Result<crate::ProviderStream> {
         self.ensure_not_revoked()?;
         let mut response = self.public_result(
-            crate::attachments::runtime::with_async_authority_scope(
-                self.authority_fingerprint.as_str().to_owned(),
-                self.inner.stream_chat_with_diagnostics(request),
+            crate::attachments::admission::scope(
+                self.input_admission.clone(),
+                crate::attachments::runtime::with_async_authority_scope(
+                    self.authority_fingerprint.as_str().to_owned(),
+                    crate::tools::policy::with_discovery_tools(
+                        self.name(),
+                        self.use_public_catalog,
+                        self.discovery_tool_snapshot(),
+                        crate::generation::with_native_reasoning(
+                            self.name(),
+                            self.use_public_catalog,
+                            self.discovery_reasoning_snapshot(),
+                            self.inner.stream_chat_with_diagnostics(request),
+                        ),
+                    ),
+                ),
             )
             .await,
         )?;
@@ -368,7 +516,7 @@ impl Provider for AuthorityBoundProvider {
         self.ensure_not_revoked()?;
         let catalog = crate::catalog::model_catalog()?;
         let mut models = self.public_result(self.inner.list_models().await)?;
-        catalog.enrich(self.inner.name(), &mut models);
+        self.enrich_discovery(&catalog, &mut models);
         Ok(models)
     }
 
@@ -394,7 +542,9 @@ impl Provider for AuthorityBoundProvider {
 }
 
 struct ProviderCacheEntry {
-    provider: Arc<dyn Provider>,
+    // Keep the authority wrapper type; coercion at the public API boundary
+    // preserves the same Arc lease/revocation semantics.
+    provider: Arc<AuthorityBoundProvider>,
     revoked: Arc<AtomicBool>,
     last_access: Instant,
     access_sequence: u64,
@@ -740,17 +890,20 @@ impl ProviderRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(provider_name.as_str())
             .cloned();
-        let provider: Arc<dyn Provider> = match injected {
-            Some(provider) => provider,
-            None => Arc::from(
-                create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
-                    provider_name.as_str(),
-                    &api_key,
-                    self.timeout_policy,
-                    proxy_url.as_deref(),
-                    base_url.as_deref(),
-                    authority_fingerprint.as_str(),
-                )?,
+        let (provider, origin): (Arc<dyn Provider>, _) = match injected {
+            Some(provider) => (provider, ProviderOrigin::Injected),
+            None => (
+                Arc::from(
+                    create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
+                        provider_name.as_str(),
+                        &api_key,
+                        self.timeout_policy,
+                        proxy_url.as_deref(),
+                        base_url.as_deref(),
+                        authority_fingerprint.as_str(),
+                    )?,
+                ),
+                ProviderOrigin::Factory,
             ),
         };
 
@@ -762,11 +915,16 @@ impl ProviderRegistry {
         cache.prune_expired(now, self.limits.idle_ttl);
         let access_sequence = cache.next_sequence();
         let revoked = Arc::new(AtomicBool::new(false));
-        let provider: Arc<dyn Provider> = Arc::new(AuthorityBoundProvider {
+        let use_public_catalog = origin.use_public_catalog(provider.name(), base_url.as_deref());
+        let provider = Arc::new(AuthorityBoundProvider {
             inner: provider,
             authority_fingerprint,
             revoked: revoked.clone(),
             redact_endpoint_errors: base_url.is_some(),
+            input_admission: Arc::new(Default::default()),
+            use_public_catalog,
+            discovery_tools: RwLock::new(BTreeMap::new()),
+            discovery_reasoning: RwLock::new(BTreeMap::new()),
         });
         if !cache.make_room_for_insert(self.limits.max_cached_instances) {
             return Err(ProviderRegistryCapacityExceeded {
@@ -856,6 +1014,7 @@ impl ProviderRegistry {
         digest.update(proxy_url.unwrap_or("<direct>").as_bytes());
         digest.update([0]);
         digest.update(base_url.unwrap_or("<default>").as_bytes());
+        crate::factory::hash_connection_environment(&mut digest, provider_name);
         ProviderAuthorityFingerprint(hex::encode(digest.finalize()))
     }
 
@@ -884,11 +1043,16 @@ impl ProviderRegistry {
         let now = Instant::now();
         let access_sequence = cache.next_sequence();
         let revoked = Arc::new(AtomicBool::new(false));
-        let provider: Arc<dyn Provider> = Arc::new(AuthorityBoundProvider {
+        let use_public_catalog = ProviderOrigin::Injected.use_public_catalog(provider.name(), None);
+        let provider = Arc::new(AuthorityBoundProvider {
             inner: provider,
             authority_fingerprint: authority_fingerprint.clone(),
             revoked: revoked.clone(),
             redact_endpoint_errors: false,
+            input_admission: Arc::new(Default::default()),
+            use_public_catalog,
+            discovery_tools: RwLock::new(BTreeMap::new()),
+            discovery_reasoning: RwLock::new(BTreeMap::new()),
         });
         cache.prune_expired(now, self.limits.idle_ttl);
         if cache.make_room_for_insert(self.limits.max_cached_instances) {
@@ -1086,6 +1250,860 @@ mod tests {
         assert!(provider.chat(chat_request()).await.is_ok());
     }
 
+    struct RouterReasoningFixture {
+        discovery: String,
+        catalog: Arc<crate::catalog::ModelCatalog>,
+        bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+    #[async_trait]
+    impl Provider for RouterReasoningFixture {
+        fn name(&self) -> &str {
+            "openrouter"
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+        async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+            Ok(crate::providers::openrouter::models_from_native_discovery_fixture(&self.discovery))
+        }
+        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+            let body = crate::providers::openrouter::render_chat_request_mode_for_test(
+                &self.catalog,
+                &request,
+                false,
+            )
+            .await?;
+            self.bodies.lock().unwrap().push(body);
+            Ok(ChatResponse {
+                text: String::new(),
+                usage: None,
+                termination: ProviderTermination::Complete,
+                reasoning_content: None,
+                tool_calls: vec![],
+                provider_replay_state: None,
+            })
+        }
+        async fn stream_chat(
+            &self,
+            request: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+            let body = crate::providers::openrouter::render_chat_request_mode_for_test(
+                &self.catalog,
+                &request,
+                true,
+            )
+            .await?;
+            self.bodies.lock().unwrap().push(body);
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn router_native_fields_survive_catalog_conflicts_and_actual_authority_requests() {
+        use crate::{ReasoningConfig, ReasoningEffort};
+        let id = "openai/gpt-5.4";
+        // Each case has a distinct real authority instance/cache. These facts
+        // enter through the production parser, never with_native_reasoning.
+        for (metadata, expected, supported, mandatory, default, budget) in [
+            (
+                serde_json::json!({"supported_efforts":["low","high"], "default_effort":"high", "default_enabled":true,"mandatory":true,"supports_max_tokens":false}),
+                vec!["low", "high"],
+                Some(true),
+                Some(true),
+                Some("high"),
+                Some(false),
+            ),
+            (
+                serde_json::json!({"supported_efforts":["none","low","high"], "mandatory":false}),
+                vec!["none", "low", "high"],
+                Some(true),
+                Some(false),
+                None,
+                None,
+            ),
+            (
+                serde_json::json!({"supported_efforts":[], "default_enabled":false}),
+                vec![],
+                Some(true),
+                Some(false),
+                None,
+                None,
+            ),
+            // An explicit aggregate negative remains independent of a positive enum.
+            (
+                serde_json::json!({"supported":false,"supported_efforts":["low","high"],"mandatory":true}),
+                vec![],
+                Some(false),
+                Some(true),
+                None,
+                None,
+            ),
+            // Documented omission within the object denies effort selection,
+            // but does not turn budget support or a default into effort support.
+            (
+                serde_json::json!({"default_effort":"high","supports_max_tokens":true}),
+                vec![],
+                Some(true),
+                Some(false),
+                Some("high"),
+                Some(true),
+            ),
+            (
+                serde_json::json!({"supported_efforts":null,"default_effort":"none","default_enabled":false,"mandatory":false}),
+                vec!["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                Some(true),
+                Some(false),
+                Some("none"),
+                None,
+            ),
+            // Absent or malformed enum carries no confirmed per-model enum;
+            // matching catalog fallback remains visible as mixed/unknown source.
+            (
+                serde_json::Value::Null,
+                vec!["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                Some(true),
+                Some(false),
+                None,
+                None,
+            ),
+            (
+                serde_json::json!({"supported_efforts":[null],"mandatory":null,"supports_max_tokens":null}),
+                vec!["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                Some(true),
+                Some(false),
+                None,
+                None,
+            ),
+        ] {
+            let mut catalog_metadata = serde_json::json!({"thinkingLevelMap":{"off":"none","medium":"high","xhigh":"xhigh","max":"max","minimal":"minimal","low":"low","high":"high"}});
+            if metadata["mandatory"] == true && metadata.get("supported").is_none() {
+                catalog_metadata["reasoning"] = serde_json::json!(false);
+                catalog_metadata["compat"] = serde_json::json!({"supportsReasoningEffort":false});
+            }
+            let catalog = Arc::new(crate::generation::test_catalog_model(
+                "openrouter",
+                id,
+                id,
+                catalog_metadata,
+            ));
+            let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let wrapper = AuthorityBoundProvider {
+                inner: Arc::new(RouterReasoningFixture {
+                    discovery: serde_json::json!({"data":[{"id":id,"reasoning":metadata}]})
+                        .to_string(),
+                    catalog: catalog.clone(),
+                    bodies: bodies.clone(),
+                }),
+                authority_fingerprint: ProviderAuthorityFingerprint(
+                    "router-reasoning-fixture".into(),
+                ),
+                revoked: Arc::new(AtomicBool::new(false)),
+                redact_endpoint_errors: false,
+                input_admission: Arc::new(Default::default()),
+                use_public_catalog: true,
+                discovery_tools: RwLock::new(BTreeMap::new()),
+                discovery_reasoning: RwLock::new(BTreeMap::new()),
+            };
+            let mut models = wrapper.inner.list_models().await.unwrap();
+            let raw_native = models[0]
+                .capabilities
+                .reasoning
+                .as_ref()
+                .map(|r| r.native.clone())
+                .unwrap_or_default();
+            wrapper.enrich_discovery(&catalog, &mut models);
+            let r = models[0].capabilities.reasoning.as_ref().unwrap();
+            assert_eq!(r.native, raw_native);
+            for (field, fact) in [
+                ("mandatory", "mandatory"),
+                ("default_enabled", "default_enabled"),
+                ("supports_max_tokens", "supports_token_budget"),
+                ("supported", "reasoning.supported"),
+            ] {
+                assert_eq!(
+                    raw_native.get(fact).copied(),
+                    metadata.get(field).map(serde_json::Value::as_bool)
+                );
+            }
+
+            assert_eq!(
+                models[0].capabilities.thinking,
+                Some(!(metadata["mandatory"] == true && metadata.get("supported").is_none()))
+            );
+            assert_eq!(r.effort_options, expected);
+            assert_eq!(r.supported, supported);
+            assert_eq!(r.mandatory, mandatory);
+            assert_eq!(r.default_effort.as_deref(), default);
+            assert_eq!(r.supports_token_budget, budget);
+            let mut request = crate::generation::test_request(id);
+            for setting in [
+                None,
+                Some(ReasoningConfig::Disabled),
+                Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::Minimal)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::Low)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::Medium)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::XHigh)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::Max)),
+            ] {
+                request.reasoning = setting;
+                let effort = setting.map(|s| match s {
+                    ReasoningConfig::Disabled => "none",
+                    ReasoningConfig::Effort(e) => e.as_str(),
+                });
+                let allowed = effort.is_none_or(|e| expected.contains(&e));
+                for stream in [false, true] {
+                    let result = if stream {
+                        wrapper.stream_chat(request.clone()).await.map(|_| ())
+                    } else {
+                        wrapper.chat(request.clone()).await.map(|_| ())
+                    };
+                    if allowed {
+                        result.unwrap();
+                        let body = bodies.lock().unwrap().last().unwrap().clone();
+                        assert_eq!(body["stream"], stream);
+                        assert_eq!(body["max_tokens"], 1024);
+                        if let Some(effort) = effort {
+                            let expected_wire = if effort == "medium"
+                                && raw_native.get("effort.medium") != Some(&Some(true))
+                            {
+                                "high"
+                            } else {
+                                effort
+                            };
+                            assert_eq!(body["reasoning"]["effort"], expected_wire);
+                        } else {
+                            assert!(body.get("reasoning").is_none());
+                        }
+                    } else {
+                        let error = result.unwrap_err().to_string();
+                        assert!(error.contains("native OpenRouter"), "{error}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn router_budget_support_is_independent_of_effort_selection_and_catalog() {
+        use crate::{ReasoningConfig, ReasoningEffort};
+        let id = "openai/gpt-5.4";
+        for (enum_case, enum_value) in [
+            ("empty", serde_json::json!([])),
+            ("omitted", serde_json::Value::Null),
+            ("gateway", serde_json::Value::Null),
+            ("malformed", serde_json::json!([null])),
+        ] {
+            for budget in [
+                None,
+                Some(serde_json::Value::Null),
+                Some(serde_json::json!(false)),
+                Some(serde_json::json!(true)),
+            ] {
+                for catalog_support in [false, true] {
+                    for aggregate_negative in [false, true] {
+                        let mut metadata = serde_json::json!({"default_enabled":true,"default_effort":"high","mandatory":true});
+                        if enum_case != "omitted" {
+                            metadata["supported_efforts"] = enum_value.clone();
+                        }
+                        if let Some(budget) = &budget {
+                            metadata["supports_max_tokens"] = budget.clone();
+                        }
+                        if aggregate_negative {
+                            metadata["supported"] = serde_json::json!(false);
+                        }
+                        let catalog = Arc::new(crate::generation::test_catalog_model(
+                            "openrouter",
+                            id,
+                            id,
+                            serde_json::json!({"reasoning":catalog_support,"thinkingLevelMap":{"off":"none","low":"low","high":"high"}}),
+                        ));
+                        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+                        let authority = AuthorityBoundProvider {
+                            inner: Arc::new(RouterReasoningFixture {
+                                discovery:
+                                    serde_json::json!({"data":[{"id":id,"reasoning":metadata}]})
+                                        .to_string(),
+                                catalog: catalog.clone(),
+                                bodies: bodies.clone(),
+                            }),
+                            authority_fingerprint: ProviderAuthorityFingerprint(
+                                "router-budget-fixture".into(),
+                            ),
+                            revoked: Arc::new(AtomicBool::new(false)),
+                            redact_endpoint_errors: false,
+                            input_admission: Arc::new(Default::default()),
+                            use_public_catalog: true,
+                            discovery_tools: RwLock::new(BTreeMap::new()),
+                            discovery_reasoning: RwLock::new(BTreeMap::new()),
+                        };
+                        let mut models = authority.inner.list_models().await.unwrap();
+                        let raw = models[0].capabilities.reasoning.as_ref().unwrap();
+                        let positive_budget =
+                            budget.as_ref().and_then(serde_json::Value::as_bool) == Some(true);
+                        let native_support = if aggregate_negative {
+                            Some(false)
+                        } else if positive_budget || enum_case == "gateway" {
+                            Some(true)
+                        } else {
+                            None
+                        };
+                        // Empty/omitted enums and default-on/mandatory by themselves
+                        // are not an aggregate negative (or an invented positive).
+                        assert_eq!(raw.supported, native_support);
+                        assert_eq!(
+                            raw.supports_token_budget,
+                            budget.as_ref().and_then(serde_json::Value::as_bool)
+                        );
+                        let native = raw.native.clone();
+                        authority.enrich_discovery(&catalog, &mut models);
+                        let effective = models[0].capabilities.reasoning.as_ref().unwrap();
+                        assert_eq!(effective.native, native);
+                        assert_eq!(
+                            effective.supported,
+                            native_support.or(Some(catalog_support))
+                        );
+                        assert_eq!(models[0].capabilities.thinking, Some(catalog_support));
+                        assert_eq!(
+                            effective.supports_token_budget,
+                            budget.as_ref().and_then(serde_json::Value::as_bool)
+                        );
+                        assert_eq!(effective.mandatory, Some(true));
+                        assert_eq!(effective.default_effort.as_deref(), Some("high"));
+                        assert_eq!(native.get("default_enabled"), Some(&Some(true)));
+                        assert_eq!(
+                            native.get("supports_token_budget").copied(),
+                            budget.as_ref().map(serde_json::Value::as_bool)
+                        );
+                        let effort_allowed = !aggregate_negative
+                            && (enum_case == "gateway"
+                                || enum_case == "malformed" && catalog_support);
+                        assert_eq!(
+                            effective.effort_options.iter().any(|e| e == "high"),
+                            effort_allowed
+                        );
+                        if matches!(enum_case, "empty" | "omitted") || aggregate_negative {
+                            assert!(effective.effort_options.is_empty());
+                        }
+                        for setting in [
+                            None,
+                            Some(ReasoningConfig::Disabled),
+                            Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                            Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+                        ] {
+                            let mut request = crate::generation::test_request(id);
+                            request.reasoning = setting;
+                            for stream in [false, true] {
+                                let result = if stream {
+                                    authority.stream_chat(request.clone()).await.map(|_| ())
+                                } else {
+                                    authority.chat(request.clone()).await.map(|_| ())
+                                };
+                                if setting.is_none()
+                                    || setting
+                                        == Some(ReasoningConfig::Effort(ReasoningEffort::High))
+                                        && effort_allowed
+                                {
+                                    result.unwrap();
+                                    let body = bodies.lock().unwrap().last().unwrap().clone();
+                                    assert_eq!(body["stream"], stream);
+                                    assert_eq!(body["max_tokens"], 1024);
+                                    if setting.is_none() {
+                                        assert!(body.get("reasoning").is_none());
+                                    } else {
+                                        assert_eq!(body["reasoning"]["effort"], "high");
+                                    }
+                                } else {
+                                    let error = result.unwrap_err().to_string();
+                                    assert!(
+                                        error.contains("native OpenRouter")
+                                            || error.contains(
+                                                "selected catalog model does not support reasoning"
+                                            ),
+                                        "{error}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    struct ToolDiscoveryProvider;
+    #[async_trait]
+    impl Provider for ToolDiscoveryProvider {
+        fn name(&self) -> &str {
+            "openai"
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                tool_calling: true,
+                ..Default::default()
+            }
+        }
+        async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+            Ok(vec![crate::catalog::tool_tests::discovered(
+                "g03-positive",
+                Some(false),
+            )])
+        }
+        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+            crate::tools::policy::prepare_request(self.name(), request)?;
+            anyhow::bail!("fixture reached model boundary")
+        }
+        async fn stream_chat(
+            &self,
+            request: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+            crate::tools::policy::prepare_request(self.name(), request)?;
+            anyhow::bail!("fixture reached model boundary")
+        }
+    }
+
+    #[tokio::test]
+    async fn discovered_false_reaches_agent_consumer_and_both_authority_request_paths() {
+        let catalog = crate::catalog::tool_tests::generated_catalog();
+        let wrapper = |authority: &str| AuthorityBoundProvider {
+            inner: Arc::new(ToolDiscoveryProvider),
+            authority_fingerprint: ProviderAuthorityFingerprint(authority.into()),
+            revoked: Arc::new(AtomicBool::new(false)),
+            redact_endpoint_errors: false,
+            input_admission: Arc::new(Default::default()),
+            use_public_catalog: false,
+            discovery_tools: RwLock::new(BTreeMap::new()),
+            discovery_reasoning: RwLock::new(BTreeMap::new()),
+        };
+        let mut public = wrapper("public-authority");
+        public.use_public_catalog = true;
+        // Same method as the actual agent's Provider::model_tool_calling,
+        // with an isolated source-generated snapshot rather than global state.
+        assert!(!public.model_tool_calling_with_catalog("g03-negative", Some(&catalog)));
+        assert!(public.model_tool_calling_with_catalog("g03-positive", Some(&catalog)));
+        assert!(public.model_tool_calling_with_catalog("unknown", Some(&catalog)));
+        let a = wrapper("authority-a");
+        let b = wrapper("authority-b");
+        let mut models = a.inner.list_models().await.unwrap();
+        a.enrich_discovery(&catalog, &mut models);
+        assert_eq!(models[0].capabilities.tool_calling, Some(false));
+        assert!(!a.model_tool_calling("g03-positive"));
+        assert!(b.model_tool_calling("g03-positive"));
+        let mut request = crate::tools::policy::test_request();
+        request.model = "g03-positive".into();
+        assert!(
+            a.chat(request.clone())
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("does not support tool definitions")
+        );
+        assert!(
+            a.stream_chat(request.clone())
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("does not support tool definitions")
+        );
+        assert!(
+            b.chat(request.clone())
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("fixture reached model boundary")
+        );
+        request.tool_choice = Some(crate::ToolChoice::None);
+        assert!(
+            a.chat(request)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("does not support tool definitions")
+        );
+        // A fresh discovery listing atomically replaces previous known values.
+        a.enrich_discovery(
+            &catalog,
+            &mut [crate::catalog::tool_tests::discovered(
+                "g03-positive",
+                Some(true),
+            )],
+        );
+        assert!(a.model_tool_calling("g03-positive"));
+    }
+
+    // Native response data, not hand-built ProviderModelInfo capability bools.
+    const NATIVE_TOOL_MODELS: &str = r#"{"data":[
+        {"id":"g03-positive","supported_parameters":[]},
+        {"id":"negative-no-source","supported_parameters":["temperature"]},
+        {"id":"native-positive","supported_parameters":["tools"]},
+        {"id":"g03-negative","supported_parameters":["tools"]},
+        {"id":"missing"}, {"id":"null","supported_parameters":null},
+        {"id":"malformed","supported_parameters":["tools",42]}
+    ]}"#;
+
+    struct NativeModelsProvider {
+        name: &'static str,
+        catalog: Arc<crate::catalog::ModelCatalog>,
+    }
+    #[async_trait]
+    impl Provider for NativeModelsProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                tool_calling: true,
+                ..Default::default()
+            }
+        }
+        async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+            Ok(
+                crate::providers::openrouter::models_from_native_discovery_fixture(
+                    NATIVE_TOOL_MODELS,
+                ),
+            )
+        }
+        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+            crate::tools::policy::prepare_request_with_catalog(
+                self.name(),
+                request,
+                Some(&self.catalog),
+            )?;
+            Ok(ChatResponse {
+                text: "local boundary".into(),
+                usage: None,
+                reasoning_content: None,
+                tool_calls: vec![],
+                provider_replay_state: None,
+                termination: ProviderTermination::Complete,
+            })
+        }
+        async fn stream_chat(
+            &self,
+            request: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+            self.chat(request).await?;
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    fn scoped_registry(endpoint: Option<&str>) -> ProviderRegistry {
+        let endpoint = endpoint.map(str::to_owned);
+        ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+            |_, _| Ok(String::new()),
+            |_, _| Ok(None),
+            move |_, _| Ok(endpoint.clone()),
+            ProviderTimeoutPolicy::default(),
+        )
+    }
+
+    // Inspect the actual cached wrapper, without extra production metadata or
+    // changing its flag. Cache stores the same single Arc used by public leases.
+    fn cached_wrapper(
+        registry: &ProviderRegistry,
+        workspace: Option<&str>,
+        name: &str,
+    ) -> Arc<AuthorityBoundProvider> {
+        let name = normalize_provider_name(name);
+        registry
+            .cache
+            .read()
+            .unwrap()
+            .entries
+            .iter()
+            .find(|(key, _)| key.workspace_id.as_deref() == workspace && key.provider_name == name)
+            .unwrap()
+            .1
+            .provider
+            .clone()
+    }
+
+    async fn wrapper_support(
+        wrapper: &AuthorityBoundProvider,
+        model: &str,
+        catalog: &crate::catalog::ModelCatalog,
+    ) -> Option<bool> {
+        crate::tools::policy::with_discovery_tools(
+            wrapper.name(),
+            wrapper.use_public_catalog,
+            wrapper.discovery_tool_snapshot(),
+            async {
+                crate::tools::policy::tool_support_with_catalog(
+                    wrapper.name(),
+                    model,
+                    Some(catalog),
+                )
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn native_openrouter_discovery_reaches_scoped_consumers_and_both_preflights() {
+        let catalog = Arc::new(crate::catalog::tool_tests::generated_catalog());
+        for endpoint in [
+            None,
+            Some("https://openrouter.ai/api/v1"),
+            Some("https://private.invalid/api/v1"),
+        ] {
+            let registry = scoped_registry(endpoint);
+            // Factory path determines real stock/override scope; no HTTP.
+            let actual = registry.get_or_create("openrouter").unwrap();
+            let wrapper = cached_wrapper(&registry, None, "openrouter");
+            assert_eq!(
+                wrapper.use_public_catalog,
+                endpoint != Some("https://private.invalid/api/v1")
+            );
+            let mut models = crate::providers::openrouter::models_from_native_discovery_fixture(
+                NATIVE_TOOL_MODELS,
+            );
+            wrapper.enrich_discovery(&catalog, &mut models);
+            for id in ["g03-positive", "negative-no-source"] {
+                assert_eq!(wrapper_support(&wrapper, id, &catalog).await, Some(false));
+                assert!(!actual.model_tool_calling(id));
+                assert!(!wrapper.model_tool_calling_with_catalog(id, Some(&catalog)));
+                for choice in [None, Some(crate::ToolChoice::None)] {
+                    let mut request = crate::tools::policy::test_request();
+                    request.model = id.into();
+                    request.tool_choice = choice;
+                    // Actual OpenRouter adapter entrypoints reject before HTTP,
+                    // including disabled new calls with definitions supplied.
+                    assert!(actual.chat(request.clone()).await.is_err());
+                    assert!(actual.stream_chat(request.clone()).await.is_err());
+                    assert!(actual.stream_chat_with_diagnostics(request).await.is_err());
+                }
+            }
+            for id in [
+                "native-positive",
+                "missing",
+                "null",
+                "malformed",
+                "custom-unknown",
+            ] {
+                assert!(wrapper.model_tool_calling_with_catalog(id, Some(&catalog)));
+            }
+            // A public source negative is still a veto against discovery true;
+            // a foreign endpoint never inherits that same source restriction.
+            assert_eq!(
+                wrapper_support(&wrapper, "g03-negative", &catalog).await,
+                Some(!wrapper.use_public_catalog)
+            );
+            let other = registry
+                .get_or_create_for_workspace("other", "openrouter")
+                .unwrap();
+            assert!(other.model_tool_calling("negative-no-source"));
+
+            // Native-normalized fixture adapter permits the allowed-path cases
+            // without HTTP/preparation/runtime; registry constructors stay real.
+            let isolated = scoped_registry(endpoint);
+            isolated
+                .insert(
+                    "openrouter",
+                    Arc::new(NativeModelsProvider {
+                        name: "openrouter",
+                        catalog: catalog.clone(),
+                    }),
+                )
+                .unwrap();
+            let provider = isolated
+                .get_or_create_for_workspace("a", "openrouter")
+                .unwrap();
+            let fixture = cached_wrapper(&isolated, Some("a"), "openrouter");
+            let mut models = fixture.inner.list_models().await.unwrap();
+            fixture.enrich_discovery(&catalog, &mut models);
+            for id in [
+                "g03-positive",
+                "negative-no-source",
+                "native-positive",
+                "missing",
+                "null",
+                "malformed",
+                "custom-unknown",
+            ] {
+                for disabled in [false, true] {
+                    let mut request = crate::tools::policy::test_request();
+                    request.model = id.into();
+                    if disabled {
+                        request.tool_choice = Some(crate::ToolChoice::None);
+                    }
+                    let allowed = !matches!(id, "g03-positive" | "negative-no-source");
+                    assert_eq!(provider.chat(request.clone()).await.is_ok(), allowed);
+                    assert_eq!(provider.stream_chat(request.clone()).await.is_ok(), allowed);
+                    request.tools = None;
+                    request.tool_choice = Some(crate::ToolChoice::None);
+                    assert!(provider.chat(request.clone()).await.is_ok());
+                    assert!(provider.stream_chat(request).await.is_ok());
+                }
+            }
+        }
+    }
+
+    fn catalog_with_restricted_parallel() -> Arc<crate::catalog::ModelCatalog> {
+        let mut generated = crate::catalog::generator::generate(
+            &crate::catalog::tool_tests::source_snapshot(),
+            false,
+        )
+        .unwrap();
+        // Isolated protocol metadata, not a global catalog publication. Source
+        // bools still come from generation of the real source fixtures.
+        generated
+            .models
+            .get_mut("openai")
+            .unwrap()
+            .get_mut("g03-positive")
+            .unwrap()["compat"]["supportsParallelToolCalls"] = serde_json::json!(false);
+        Arc::new(
+            crate::catalog::ModelCatalog::parse_with_capabilities(
+                &serde_json::to_string(&generated.models).unwrap(),
+                &serde_json::to_string(&generated.provenance).unwrap(),
+                generated.tool_capabilities,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn injected_origin_stays_isolated_on_insert_workspace_and_global_reconstruction() {
+        let catalog = catalog_with_restricted_parallel();
+        for endpoint in [
+            None,
+            Some("https://api.openai.com/v1"),
+            Some("https://private.invalid/v1"),
+        ] {
+            let registry = scoped_registry(endpoint);
+            registry
+                .insert(
+                    " OPENAI ",
+                    Arc::new(NativeModelsProvider {
+                        name: "openai",
+                        catalog: catalog.clone(),
+                    }),
+                )
+                .unwrap();
+            for path in 0..3 {
+                let (workspace, provider) = match path {
+                    0 => (None, registry.get_or_create("openai").unwrap()),
+                    1 => (
+                        Some("workspace-a"),
+                        registry
+                            .get_or_create_for_workspace("workspace-a", "openai")
+                            .unwrap(),
+                    ),
+                    _ => {
+                        registry.invalidate_global_provider("openai");
+                        (None, registry.get_or_create("openai").unwrap())
+                    }
+                };
+                let wrapper = cached_wrapper(&registry, workspace, "openai");
+                assert!(
+                    !wrapper.use_public_catalog,
+                    "path {path}, endpoint {endpoint:?}"
+                );
+                // Public negative, positive and compat controls all stay out.
+                for id in ["g03-positive", "g03-negative"] {
+                    assert_eq!(wrapper_support(&wrapper, id, &catalog).await, None);
+                    assert!(wrapper.model_tool_calling_with_catalog(id, Some(&catalog)));
+                    let mut request = crate::tools::policy::test_request();
+                    request.model = id.into();
+                    request.parallel_tool_calls = Some(false);
+                    assert!(provider.chat(request.clone()).await.is_ok());
+                    assert!(provider.stream_chat(request).await.is_ok());
+                }
+                let mut models = wrapper.inner.list_models().await.unwrap();
+                wrapper.enrich_discovery(&catalog, &mut models);
+                assert_eq!(
+                    wrapper_support(&wrapper, "g03-positive", &catalog).await,
+                    Some(false)
+                );
+                assert!(!provider.model_tool_calling("g03-positive"));
+                let mut request = crate::tools::policy::test_request();
+                request.model = "g03-positive".into();
+                assert!(provider.chat(request.clone()).await.is_err());
+                assert!(provider.stream_chat(request).await.is_err());
+                // Native positive does not inherit public negative.
+                assert_eq!(
+                    wrapper_support(&wrapper, "g03-negative", &catalog).await,
+                    Some(true)
+                );
+                assert!(provider.model_tool_calling("g03-negative"));
+                let mut positive = crate::tools::policy::test_request();
+                positive.model = "g03-negative".into();
+                positive.parallel_tool_calls = Some(false);
+                assert!(provider.chat(positive.clone()).await.is_ok());
+                assert!(provider.stream_chat(positive).await.is_ok());
+                let other = registry
+                    .get_or_create_for_workspace(&format!("other-{path}"), "openai")
+                    .unwrap();
+                let other_wrapper =
+                    cached_wrapper(&registry, Some(&format!("other-{path}")), "openai");
+                assert_eq!(
+                    wrapper_support(&other_wrapper, "g03-positive", &catalog).await,
+                    None
+                );
+                assert!(other.model_tool_calling("g03-positive"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn factory_origin_retains_only_stock_source_and_control_scope_after_reconstruction() {
+        let catalog = catalog_with_restricted_parallel();
+        for endpoint in [
+            None,
+            Some("https://api.openai.com/v1/"),
+            Some("https://private.invalid/v1"),
+        ] {
+            let registry = scoped_registry(endpoint);
+            let public = endpoint != Some("https://private.invalid/v1");
+            for path in 0..3 {
+                let workspace = (path == 1).then_some("workspace-a");
+                if path == 2 {
+                    registry.invalidate_global_provider("openai");
+                }
+                let _lease = match workspace {
+                    Some(ws) => registry.get_or_create_for_workspace(ws, "openai").unwrap(),
+                    None => registry.get_or_create("openai").unwrap(),
+                };
+                let wrapper = cached_wrapper(&registry, workspace, "openai");
+                assert_eq!(wrapper.use_public_catalog, public);
+                assert_eq!(
+                    wrapper_support(&wrapper, "g03-negative", &catalog).await,
+                    public.then_some(false)
+                );
+                assert_eq!(
+                    wrapper_support(&wrapper, "g03-positive", &catalog).await,
+                    public.then_some(true)
+                );
+                assert_eq!(
+                    wrapper.model_tool_calling_with_catalog("g03-negative", Some(&catalog)),
+                    !public
+                );
+                let mut request = crate::tools::policy::test_request();
+                request.model = "g03-positive".into();
+                request.parallel_tool_calls = Some(false);
+                let result = crate::tools::policy::with_discovery_tools(
+                    wrapper.name(),
+                    wrapper.use_public_catalog,
+                    wrapper.discovery_tool_snapshot(),
+                    async {
+                        crate::tools::policy::prepare_request_with_catalog(
+                            wrapper.name(),
+                            request,
+                            Some(&catalog),
+                        )
+                    },
+                )
+                .await;
+                assert_eq!(result.is_err(), public); // explicit public compat restriction
+            }
+        }
+    }
+
     #[test]
     fn registry_configuration_is_hard_bounded() {
         let limits = ProviderRegistryLimits {
@@ -1148,10 +2166,135 @@ mod tests {
     }
 
     #[test]
+    fn glm_profiles_and_aliases_keep_native_file_tools_after_factory_and_registry() {
+        let registry = ProviderRegistry::new(|_| "dummy-key".to_owned());
+        for alias in [
+            "glm",
+            "zhipu",
+            "bigmodel",
+            "glm-cn",
+            "zhipu-cn",
+            "zai",
+            "glm-global",
+            "zhipu-global",
+            "z.ai",
+            "z-ai",
+            "glm-coding",
+            "glm-coding-cn",
+            "zhipu-coding",
+            "zai-coding-cn",
+            "zai-coding",
+            "glm-coding-global",
+            "zai-coding-plan",
+        ] {
+            let canonical = crate::definition::provider_definition(alias).unwrap().name;
+            let direct = crate::factory::create_provider(alias, "dummy-key").unwrap();
+            let scoped = registry
+                .get_or_create_for_workspace("fixture", alias)
+                .unwrap();
+            for provider in [direct.as_ref(), scoped.as_ref()] {
+                assert_eq!(provider.name(), canonical, "{alias}");
+                assert!(provider.capabilities().tool_calling, "{alias}");
+                let capability = provider.native_file_tool_capability("glm-5.2");
+                assert_eq!(capability.provider, canonical, "{alias}");
+                assert_eq!(capability.model, "glm-5.2");
+                assert_eq!(
+                    capability.patch_shape,
+                    crate::NativePatchWireShape::JsonFunction
+                );
+                assert!(capability.read_file && capability.apply_patch, "{alias}");
+                assert!(capability.is_supported());
+                let schema = crate::apply_patch_tool_schema(capability.patch_shape);
+                assert_eq!(schema["type"], "object");
+                assert_eq!(schema["required"], serde_json::json!(["patch"]));
+                assert_eq!(schema["properties"]["patch"]["type"], "string");
+                assert_eq!(schema["additionalProperties"], false);
+                for missing in ["", " ", "unknown", "unsupported"] {
+                    let unavailable = provider.native_file_tool_capability(missing);
+                    assert_eq!(unavailable.provider, canonical);
+                    assert_eq!(
+                        unavailable.patch_shape,
+                        crate::NativePatchWireShape::Unavailable
+                    );
+                    assert!(!unavailable.read_file && !unavailable.apply_patch);
+                }
+            }
+            assert!(scoped.authority_fingerprint().is_some());
+        }
+        assert!(crate::factory::create_provider("unknown-glm-profile", "dummy-key").is_err());
+        let unknown = crate::select_native_file_tool_capability("unknown-glm-profile", "glm-5.2");
+        assert!(!unknown.read_file && !unknown.apply_patch);
+    }
+
+    #[test]
+    fn glm_global_and_coding_profiles_resolve_separate_credential_authorities() {
+        let names = Arc::new(Mutex::new(Vec::new()));
+        let captured = names.clone();
+        let registry = ProviderRegistry::new_scoped(move |_, provider| {
+            captured.lock().unwrap().push(provider.to_owned());
+            format!("dummy-{provider}-key")
+        });
+        let cn = registry
+            .get_or_create_for_workspace("fixture", "bigmodel")
+            .unwrap();
+        let global = registry
+            .get_or_create_for_workspace("fixture", "glm-global")
+            .unwrap();
+        let cn_coding = registry
+            .get_or_create_for_workspace("fixture", "zai-coding-cn")
+            .unwrap();
+        let global_coding = registry
+            .get_or_create_for_workspace("fixture", "zai-coding-plan")
+            .unwrap();
+        assert_eq!(
+            *names.lock().unwrap(),
+            ["glm", "zai", "glm-coding", "zai-coding"]
+        );
+        for (provider, name) in [
+            (cn, "glm"),
+            (global, "zai"),
+            (cn_coding, "glm-coding"),
+            (global_coding, "zai-coding"),
+        ] {
+            assert_eq!(provider.name(), name);
+        }
+    }
+
+    #[test]
     fn get_or_create_unknown_provider_errors() {
         let registry = ProviderRegistry::new(|_| String::new());
         let result = registry.get_or_create("nonexistent_provider_xyz");
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn retired_profiles_never_discover_warmup_or_chat_even_with_override() {
+        let registry = ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+            |_, _| Ok("dummy-key".to_owned()),
+            |_, _| Ok(None),
+            |_, _| Ok(Some("https://example.test/retired/v1".to_owned())),
+            ProviderTimeoutPolicy::default(),
+        );
+        for alias in ["yi", "01ai", "lingyiwanwu", "hyperbolic"] {
+            let provider = registry
+                .get_or_create_for_workspace("fixture-workspace", alias)
+                .unwrap();
+            assert!(!provider.capabilities().streaming);
+            for error in [
+                provider.list_models().await.unwrap_err(),
+                provider.warmup().await.unwrap_err(),
+                provider.chat(chat_request()).await.unwrap_err(),
+            ] {
+                assert!(error.to_string().contains("retired"));
+                assert!(!error.to_string().contains("example.test"));
+                assert!(!error.to_string().contains("dummy-key"));
+            }
+            let error = match provider.stream_chat(chat_request()).await {
+                Err(error) => error,
+                Ok(_) => panic!("retired stream must fail"),
+            };
+            assert!(error.to_string().contains("retired"));
+        }
     }
 
     #[test]
@@ -2322,13 +3465,40 @@ mod tests {
             let provider = registry
                 .get_or_create_for_workspace("upload-workspace", "openai")
                 .unwrap();
+            // Keep the actual registry-created adapter, endpoint authority and
+            // redaction wrapper. Give only this test authority a known PDF
+            // model so upload errors are reached after real PDF admission.
+            drop(provider);
+            let provider = {
+                let mut cache = registry.cache.write().unwrap();
+                let entry = cache
+                    .entries
+                    .values_mut()
+                    .find(|entry| entry.provider.name() == "openai")
+                    .unwrap();
+                let wrapper = Arc::get_mut(&mut entry.provider).unwrap();
+                wrapper.input_admission = Arc::new(crate::attachments::regression::state(
+                    "openai",
+                    "media",
+                    serde_json::json!({}),
+                ));
+                entry.provider.clone()
+            };
             let mut request = chat_request();
+            request.model = "media".into();
             // The normal planner uploads files at or above its default threshold.
-            let bytes = vec![b'x'; 512 * 1024];
+            let mut pdf =
+                lopdf::Document::load_mem(&crate::attachments::regression::pdf(1)).unwrap();
+            pdf.add_object(lopdf::Stream::new(
+                lopdf::dictionary! {},
+                vec![b'x'; 512 * 1024],
+            ));
+            let mut bytes = Vec::new();
+            pdf.save_to(&mut bytes).unwrap();
             request.messages = vec![crate::ChatMessage::user_parts(vec![
                 crate::MessageContentPart::file(crate::MessageAttachment {
-                    mime_type: "application/octet-stream".into(),
-                    name: Some("payload.bin".into()),
+                    mime_type: "application/pdf".into(),
+                    name: Some("payload.pdf".into()),
                     size_bytes: Some(bytes.len() as u64),
                     sha256: None,
                     source: crate::AttachmentDataSource::Bytes {
@@ -2394,5 +3564,54 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod media_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn media_rejection_crosses_private_endpoint_redaction_without_raw_context() {
+        let provider = crate::providers::EchoProvider;
+        let error = anyhow::anyhow!("https://private.test/credential/path").context(
+            crate::attachments::MediaInputRejection(
+                "unknown input capabilities; refresh the catalog",
+            ),
+        );
+        let safe = redacted_endpoint_error(&provider, error, ProviderFailureStage::Connect);
+        assert_eq!(
+            safe.to_string(),
+            "unknown input capabilities; refresh the catalog"
+        );
+        assert!(!format!("{safe:#}").contains("private.test"));
+    }
+}
+
+#[cfg(test)]
+mod stream_error_redaction_tests {
+    use super::*;
+    #[test]
+    fn native_cause_survives_endpoint_redaction_without_untrusted_text() {
+        let error = anyhow::Error::from(crate::failure::AnthropicStreamError::Overloaded)
+            .context("credential=secret payload");
+        let redacted = redacted_endpoint_error(
+            &crate::providers::EchoProvider::new(),
+            error,
+            ProviderFailureStage::MidStream,
+        );
+        assert_eq!(
+            crate::failure::anthropic_stream_error(&redacted),
+            Some(crate::failure::AnthropicStreamError::Overloaded)
+        );
+        let classification = &redacted
+            .downcast_ref::<RedactedEndpointError>()
+            .unwrap()
+            .classification;
+        assert_eq!(classification.class, ProviderFailureClass::Provider5xx);
+        assert_eq!(
+            classification.provider_code.as_deref(),
+            Some("overloaded_error")
+        );
+        assert!(!format!("{redacted:#?} {redacted:#}").contains("secret"));
     }
 }

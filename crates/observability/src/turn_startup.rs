@@ -1849,6 +1849,53 @@ mod regression_tests {
         assert!(current_key().is_none());
     }
     #[test]
+    fn sync_worker_scope_restores_key_and_parent_on_return_error_and_unwind() {
+        // No tracer/exporter/observation setup: typed Context values demonstrate
+        // parent attachment and restoration independently of span recording.
+        #[derive(Clone, Debug, PartialEq)]
+        struct Parent(&'static str);
+        let initial_key = current_key();
+        let base = Context::new().with_value(Parent("base"));
+        let _base = base.attach();
+        scope_sync(Some("outer-worker".to_owned()), || {
+            let parent = Context::new().with_value(Parent("outer"));
+            let _parent = parent.attach();
+            let assert_outer = || {
+                assert_eq!(current_key().as_deref(), Some("outer-worker"));
+                assert_eq!(Context::current().get::<Parent>(), Some(&Parent("outer")));
+            };
+            scope_sync(Some("outer-worker".to_owned()), || {
+                assert_outer(); // Same key preserves the current parent.
+            });
+            for key in [Some("other-worker".to_owned()), None] {
+                scope_sync(key.clone(), || {
+                    assert_eq!(current_key(), key);
+                    assert!(Context::current().get::<Parent>().is_none());
+                });
+                assert_outer();
+                let result: Result<(), ()> = scope_sync(key.clone(), || {
+                    assert_eq!(current_key(), key);
+                    assert!(Context::current().get::<Parent>().is_none());
+                    Err(())
+                });
+                assert_eq!(result, Err(()));
+                assert_outer();
+                let panic = std::panic::catch_unwind(|| {
+                    scope_sync(key.clone(), || {
+                        assert_eq!(current_key(), key);
+                        assert!(Context::current().get::<Parent>().is_none());
+                        panic!("controlled synchronous worker unwind");
+                    })
+                });
+                assert!(panic.is_err());
+                assert_outer();
+            }
+        });
+        assert_eq!(current_key(), initial_key);
+        assert_eq!(Context::current().get::<Parent>(), Some(&Parent("base")));
+    }
+
+    #[test]
     fn exported_dimensions_never_include_local_identifiers() {
         let mut o = observation();
         o.turn_key = Some("private-turn".into());

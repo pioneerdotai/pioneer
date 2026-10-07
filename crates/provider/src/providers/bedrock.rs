@@ -6,7 +6,7 @@ use crate::reasoning_registry;
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
     ProviderInputCapabilities, ProviderReplayState, ProviderTermination, ProviderTimeoutPolicy,
-    ProviderToolCall, ReasoningConfig, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+    ProviderToolCall, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -47,6 +47,7 @@ struct BedrockMessage {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct BedrockContentBlock {
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
@@ -177,9 +178,9 @@ struct BedrockResponseContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BedrockReasoningContent {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     reasoning_text: Option<BedrockReasoningText>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     redacted_content: Option<String>,
 }
 
@@ -274,6 +275,7 @@ struct BedrockModelLifecycle {
 // ── Provider struct ────────────────────────────────────────────────────────
 
 pub struct BedrockProvider {
+    replay_authority: String,
     access_key_id: String,
     secret_access_key: String,
     session_token: Option<String>,
@@ -304,23 +306,25 @@ fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8>
     hmac_sha256(&k_service, b"aws4_request")
 }
 
-/// Build an AWS SigV4 `Authorization` header value.
-///
-/// Returns `(authorization_header_value, amz_date)`.
-fn sign_request(
+/// The exact request used by the signer, separately inspectable from the
+/// transmitted URL. Keep this single construction path for all operations.
+fn canonical_request(
     method: &str,
     url: &Url,
     body: &[u8],
-    access_key_id: &str,
-    secret_access_key: &str,
     session_token: Option<&str>,
-    region: &str,
-    service: &str,
-    datetime: &str, // e.g. "20260319T120000Z"
-) -> String {
-    let date = &datetime[..8]; // "20260319"
+    datetime: &str,
+) -> (String, String) {
     let host = url.host_str().unwrap_or_default();
-    let path = url.path();
+    // AWS's non-S3 default signs a second URI encoding of the escaped path.
+    // Preserve separators while encoding the percent bytes in model IDs/ARNs.
+    // https://docs.rs/aws-sigv4/latest/aws_sigv4/http_request/enum.PercentEncodingMode.html
+    let path = url
+        .path()
+        .split('/')
+        .map(crate::definition::encode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/");
 
     // Canonical query string (empty for POST)
     let canonical_query = url.query().unwrap_or("");
@@ -350,7 +354,24 @@ fn sign_request(
     let canonical_request = format!(
         "{method}\n{path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
     );
+    (canonical_request, signed_headers)
+}
 
+/// Build an AWS SigV4 `Authorization` header value.
+fn sign_request(
+    method: &str,
+    url: &Url,
+    body: &[u8],
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: Option<&str>,
+    region: &str,
+    service: &str,
+    datetime: &str, // e.g. "20260319T120000Z"
+) -> String {
+    let date = &datetime[..8];
+    let (canonical_request, signed_headers) =
+        canonical_request(method, url, body, session_token, datetime);
     let scope = format!("{date}/{region}/{service}/aws4_request");
     let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
 
@@ -367,6 +388,74 @@ fn sign_request(
 // ── Implementation ─────────────────────────────────────────────────────────
 
 impl BedrockProvider {
+    pub(crate) fn environment_is_configured() -> bool {
+        let access = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default();
+        let secret = std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default();
+        let session = std::env::var("AWS_SESSION_TOKEN").ok();
+        Self::validate_connection_values(
+            &access,
+            &secret,
+            session.as_deref(),
+            &Self::environment_region(),
+        )
+        .is_ok()
+    }
+
+    fn validate_connection(&self) -> Result<()> {
+        Self::validate_connection_values(
+            &self.access_key_id,
+            &self.secret_access_key,
+            self.session_token.as_deref(),
+            &self.region,
+        )
+    }
+
+    fn validate_connection_values(
+        access: &str,
+        secret: &str,
+        session: Option<&str>,
+        region: &str,
+    ) -> Result<()> {
+        if access.trim().is_empty() || secret.trim().is_empty() {
+            anyhow::bail!(
+                "Bedrock SigV4 requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY; a single provider API key is insufficient"
+            );
+        }
+        if session.is_some_and(|token| token.trim().is_empty()) {
+            anyhow::bail!("AWS_SESSION_TOKEN must be nonempty when supplied");
+        }
+        // AWS Bedrock bindRegion uses Smithy's host-label validation. Retain
+        // this adapter's lowercase region contract; require one DNS label,
+        // 1..=63 ASCII bytes, with alphanumeric boundaries, not a region list.
+        // https://github.com/aws/smithy-go/blob/9b28af0b8afffb9debb149a07df6fc40edc6e529/endpoints/private/rulesfn/uri.go
+        // https://github.com/aws/smithy-go/blob/9b28af0b8afffb9debb149a07df6fc40edc6e529/transport/http/host.go
+        if !(1..=63).contains(&region.len())
+            || region.starts_with('-')
+            || region.ends_with('-')
+            || !region
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        {
+            anyhow::bail!(
+                "Bedrock requires an AWS region that is a lowercase DNS label (1-63 bytes, alphanumeric start/end)"
+            );
+        }
+        Ok(())
+    }
+
+    fn environment_region() -> String {
+        std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|_| "us-east-1".to_string())
+    }
+
+    fn dns_suffix(&self) -> &'static str {
+        if self.region.starts_with("cn-") {
+            "amazonaws.com.cn"
+        } else {
+            "amazonaws.com"
+        }
+    }
     pub fn new(
         access_key_id: impl Into<String>,
         secret_access_key: impl Into<String>,
@@ -387,6 +476,7 @@ impl BedrockProvider {
         timeout_policy: ProviderTimeoutPolicy,
     ) -> Self {
         Self {
+            replay_authority: pioneer_protocol::generate_id(32),
             access_key_id: access_key_id.into(),
             secret_access_key: secret_access_key.into(),
             session_token: None,
@@ -419,6 +509,7 @@ impl BedrockProvider {
         timeout_policy: ProviderTimeoutPolicy,
     ) -> Self {
         Self {
+            replay_authority: pioneer_protocol::generate_id(32),
             access_key_id: access_key_id.into(),
             secret_access_key: secret_access_key.into(),
             session_token: Some(session_token.into()),
@@ -442,31 +533,37 @@ impl BedrockProvider {
         let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
             .map_err(|_| anyhow!("AWS_SECRET_ACCESS_KEY environment variable not set"))?;
         let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
-        let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        let region = Self::environment_region();
 
-        Ok(Self {
+        let provider = Self {
+            replay_authority: pioneer_protocol::generate_id(32),
             access_key_id,
             secret_access_key,
             session_token,
             region,
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
-        })
+        };
+        provider.validate_connection()?;
+        Ok(provider)
     }
 
     fn list_foundation_models_url(&self) -> String {
         format!(
-            "https://bedrock.{}.amazonaws.com/foundation-models",
-            self.region
+            "https://bedrock.{}.{}/foundation-models",
+            self.region,
+            self.dns_suffix()
         )
     }
 
     /// Build the Converse API endpoint URL for the given model ID.
     fn converse_url(&self, model_id: &str) -> String {
-        let encoded_model = model_id.replace('/', "%2F");
+        let encoded_model = crate::definition::encode_path_segment(model_id);
         format!(
-            "https://bedrock-runtime.{}.amazonaws.com/model/{}/converse",
-            self.region, encoded_model
+            "https://bedrock-runtime.{}.{}/model/{}/converse",
+            self.region,
+            self.dns_suffix(),
+            encoded_model
         )
     }
 
@@ -521,8 +618,21 @@ impl BedrockProvider {
                 text: None,
                 image: None,
                 document: Some(BedrockDocumentBlock {
-                    format: normalize_format(subtype),
-                    name: attachment.name.clone(),
+                    format: match attachment.mime_type.as_str() {
+                        "text/plain" => "txt".to_owned(),
+                        "text/html" => "html".to_owned(),
+                        "text/csv" => "csv".to_owned(),
+                        "application/pdf" => "pdf".to_owned(),
+                        _ => normalize_format(subtype),
+                    },
+                    // Artifact filename remains in PreparedAttachment metadata. The
+                    // API display name is neutral and satisfies 1..200/charset.
+                    // https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_DocumentBlock.html
+                    name: format!(
+                        "Document {}-{}",
+                        attachment.message_index + 1,
+                        attachment.part_index + 1
+                    ),
                     source,
                 }),
                 audio: None,
@@ -536,7 +646,12 @@ impl BedrockProvider {
                 image: None,
                 document: None,
                 audio: Some(BedrockAudioBlock {
-                    format: normalize_format(subtype),
+                    format: match subtype {
+                        "x-wav" => "wav",
+                        "x-m4a" => "m4a",
+                        other => other,
+                    }
+                    .to_owned(),
                     source,
                 }),
                 video: None,
@@ -677,6 +792,11 @@ impl BedrockProvider {
                     }
 
                     for attachment in prepared.attachments_for_message(message_index) {
+                        if msg.role == Role::Tool && attachment.kind == InputContentType::File {
+                            return Err(anyhow!(
+                                "Converse Tool document has no sibling text; nested tool result text is insufficient"
+                            ));
+                        }
                         content.push(Self::attachment_block(attachment)?);
                     }
 
@@ -694,7 +814,10 @@ impl BedrockProvider {
     fn convert_tool_config(
         tools: &[ToolDefinition],
         choice: Option<ToolChoice>,
-    ) -> BedrockToolConfig {
+    ) -> Result<BedrockToolConfig> {
+        if matches!(choice, Some(ToolChoice::None)) {
+            anyhow::bail!("Bedrock None must omit toolConfig; it cannot become Auto");
+        }
         let tools = tools
             .iter()
             .map(|tool| BedrockToolEntry {
@@ -710,19 +833,56 @@ impl BedrockProvider {
 
         let tool_choice = choice.map(|choice| match choice {
             ToolChoice::Auto => serde_json::json!({ "auto": {} }),
-            ToolChoice::None => serde_json::json!({ "auto": {} }),
+            ToolChoice::None => serde_json::Value::Null, // rejected above
             ToolChoice::Required => serde_json::json!({ "any": {} }),
             ToolChoice::Tool { name } => serde_json::json!({ "tool": { "name": name } }),
         });
 
-        BedrockToolConfig { tools, tool_choice }
+        Ok(BedrockToolConfig { tools, tool_choice })
+    }
+
+    fn build_native_request(
+        &self,
+        request: &ChatRequest,
+        prepared: &PreparedProviderMessages,
+    ) -> Result<BedrockRequest> {
+        let body = Self::build_request(request, prepared)?;
+        crate::continuation::validate_prefix(
+            &serde_json::to_value(&body)?,
+            prepared
+                .messages
+                .iter()
+                .filter(|m| m.role != Role::System)
+                .enumerate()
+                .filter_map(|(i, m)| m.provider_replay_state.clone().map(|s| (i, s))),
+            &request.model,
+            &self.replay_authority,
+        )?;
+        Ok(body)
     }
 
     fn build_request(
         request: &ChatRequest,
         prepared: &PreparedProviderMessages,
     ) -> Result<BedrockRequest> {
-        let (messages, system) = Self::convert_messages(prepared)?;
+        Self::build_request_with_catalog(
+            request,
+            prepared,
+            crate::catalog::model_catalog().ok().as_deref(),
+        )
+    }
+
+    fn build_request_with_catalog(
+        request: &ChatRequest,
+        prepared: &PreparedProviderMessages,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> Result<BedrockRequest> {
+        let request = crate::tools::policy::prepare_request("bedrock", request.clone())?;
+        let mut prepared = prepared.clone();
+        crate::tools::policy::prepare_history("bedrock", &mut prepared.messages)?;
+        let (messages, system) = Self::convert_messages(&prepared)?;
+        let generation =
+            crate::generation::anthropic_fields_with_catalog(catalog, "bedrock", &request)?;
 
         let inference_config = if request.temperature.is_some() || request.max_tokens.is_some() {
             Some(BedrockInferenceConfig {
@@ -740,34 +900,11 @@ impl BedrockProvider {
             tool_config: request
                 .tools
                 .as_ref()
-                .map(|tools| Self::convert_tool_config(tools, request.tool_choice.clone())),
-            additional_model_request_fields: Self::additional_model_request_fields(
-                request.model.as_str(),
-                request.reasoning,
-            ),
+                .map(|tools| Self::convert_tool_config(tools, request.tool_choice.clone()))
+                .transpose()?,
+            additional_model_request_fields: (!generation.is_empty())
+                .then(|| serde_json::Value::Object(generation)),
         })
-    }
-
-    fn additional_model_request_fields(
-        model_id: &str,
-        reasoning: Option<ReasoningConfig>,
-    ) -> Option<serde_json::Value> {
-        if !Self::is_anthropic_claude_model(model_id) {
-            return None;
-        }
-
-        match reasoning {
-            Some(ReasoningConfig::Effort(effort)) => Some(serde_json::json!({
-                "output_config": {
-                    "effort": effort.as_str(),
-                },
-            })),
-            Some(ReasoningConfig::Disabled) | None => None,
-        }
-    }
-
-    fn is_anthropic_claude_model(model_id: &str) -> bool {
-        model_id.contains("anthropic.claude")
     }
 
     /// Get the current UTC datetime in the format required by SigV4.
@@ -785,6 +922,74 @@ impl BedrockProvider {
         let (year, month, day, hour, minute, second) = unix_to_datetime(secs);
 
         format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
+    }
+
+    fn parse_response(api_response: BedrockResponse) -> Result<ChatResponse> {
+        let termination = api_response
+            .stop_reason
+            .as_deref()
+            .map(ProviderTermination::from_openai_reason)
+            .unwrap_or_else(|| ProviderTermination::Unknown("missing_stop_reason".to_owned()));
+
+        let usage = api_response.usage.map(|u| u.normalized());
+
+        let mut text_parts = Vec::new();
+        let mut reasoning_parts = Vec::new();
+        let mut tool_calls = Vec::new();
+        let mut replay_blocks = Vec::new();
+
+        for block in api_response.output.message.content {
+            if let Some(t) = block.text {
+                text_parts.push(t);
+            }
+            if let Some(rc) = block.reasoning_content {
+                if let Some(rt) = rc.reasoning_text.as_ref() {
+                    if !rt.text.is_empty() {
+                        reasoning_parts.push(rt.text.clone());
+                    }
+                }
+                replay_blocks.push(rc);
+            }
+            if let Some(tool_use) = block.tool_use {
+                tool_calls.push(ProviderToolCall {
+                    id: tool_use.tool_use_id,
+                    name: tool_use.name,
+                    arguments: serde_json::to_string(&tool_use.input)
+                        .unwrap_or_else(|_| "{}".to_owned()),
+                });
+            }
+        }
+
+        let text = text_parts.join("");
+        let reasoning_content = if reasoning_parts.is_empty() {
+            None
+        } else {
+            Some(reasoning_parts.join(""))
+        };
+        let provider_replay_state = if replay_blocks.is_empty() {
+            None
+        } else {
+            Some(ProviderReplayState::new(
+                "bedrock",
+                serde_json::json!({ "blocks": replay_blocks }),
+            ))
+        };
+
+        if text.is_empty()
+            && tool_calls.is_empty()
+            && reasoning_content.as_deref().unwrap_or_default().is_empty()
+        {
+            return Err(anyhow!("no response from Bedrock"));
+        }
+
+        Ok(ChatResponse {
+            text,
+            usage,
+            termination,
+            reasoning_content,
+            tool_calls,
+            provider_replay_state,
+        })
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
@@ -877,6 +1082,8 @@ impl crate::traits::Provider for BedrockProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        self.validate_connection()?;
         let prepared = prepare_messages_for_provider_async(
             self.name(),
             request.model.as_str(),
@@ -887,7 +1094,8 @@ impl crate::traits::Provider for BedrockProvider {
         )
         .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let bedrock_request = Self::build_request(&request, &prepared)?;
+        let bedrock_request = self.build_native_request(&request, &prepared)?;
+        let prefix_body = serde_json::to_value(&bedrock_request)?;
 
         let body = serde_json::to_vec(&bedrock_request)?;
         let url_str = self.converse_url(&request.model);
@@ -931,77 +1139,23 @@ impl crate::traits::Provider for BedrockProvider {
             "provider_response",
         )
         .await?;
-        let termination = api_response
-            .stop_reason
-            .as_deref()
-            .map(ProviderTermination::from_openai_reason)
-            .unwrap_or_else(|| ProviderTermination::Unknown("missing_stop_reason".to_owned()));
-
-        let usage = api_response.usage.map(|u| u.normalized());
-
-        let mut text_parts = Vec::new();
-        let mut reasoning_parts = Vec::new();
-        let mut tool_calls = Vec::new();
-        let mut replay_blocks = Vec::new();
-
-        for block in api_response.output.message.content {
-            if let Some(t) = block.text {
-                text_parts.push(t);
-            }
-            if let Some(rc) = block.reasoning_content {
-                if let Some(rt) = rc.reasoning_text.as_ref() {
-                    if !rt.text.is_empty() {
-                        reasoning_parts.push(rt.text.clone());
-                    }
-                }
-                replay_blocks.push(rc);
-            }
-            if let Some(tool_use) = block.tool_use {
-                tool_calls.push(ProviderToolCall {
-                    id: tool_use.tool_use_id,
-                    name: tool_use.name,
-                    arguments: serde_json::to_string(&tool_use.input)
-                        .unwrap_or_else(|_| "{}".to_owned()),
-                });
-            }
+        let mut response = Self::parse_response(api_response)?;
+        if let Some(state) = response.provider_replay_state.as_mut() {
+            crate::continuation::bind_prefix(
+                state,
+                &request.model,
+                &self.replay_authority,
+                &prefix_body,
+            )?;
         }
-
-        let text = text_parts.join("");
-        let reasoning_content = if reasoning_parts.is_empty() {
-            None
-        } else {
-            Some(reasoning_parts.join(""))
-        };
-        let provider_replay_state = if replay_blocks.is_empty() {
-            None
-        } else {
-            Some(ProviderReplayState::new(
-                "bedrock",
-                serde_json::json!({ "blocks": replay_blocks }),
-            ))
-        };
-
-        if text.is_empty()
-            && tool_calls.is_empty()
-            && reasoning_content.as_deref().unwrap_or_default().is_empty()
-        {
-            return Err(anyhow!("no response from Bedrock"));
-        }
-
-        Ok(ChatResponse {
-            text,
-            usage,
-            termination,
-            reasoning_content,
-            tool_calls,
-            provider_replay_state,
-        })
+        Ok(response)
     }
 
     async fn stream_chat(
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
         // Bedrock Converse streaming uses a different binary event-stream protocol.
         // Fall back to a single non-streaming call returned as one chunk.
         let response = self.chat(request).await?;
@@ -1028,6 +1182,7 @@ impl crate::traits::Provider for BedrockProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        self.validate_connection()?;
         let url_str = self.list_foundation_models_url();
         let url: Url = url_str.parse()?;
 
@@ -1089,10 +1244,10 @@ fn provider_model_from_bedrock_model_summary(m: BedrockModelSummary) -> Provider
     let has_vision = m
         .input_modalities
         .as_ref()
-        .is_some_and(|mods| mods.iter().any(|m| m == "IMAGE"));
+        .map(|mods| mods.iter().any(|m| m.eq_ignore_ascii_case("image")));
     let model_id = m.model_id.clone().unwrap_or_default();
     let mut capabilities = ProviderModelCapabilities {
-        vision: Some(has_vision),
+        vision: has_vision,
         input_modalities: m.input_modalities,
         output_modalities: m.output_modalities,
         ..ProviderModelCapabilities::default()
@@ -1121,7 +1276,774 @@ fn provider_model_from_bedrock_model_summary(m: BedrockModelSummary) -> Provider
 }
 
 #[cfg(test)]
+#[path = "bedrock_signing_tests.rs"]
+mod signing_tests;
+
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn dated_and_regional_discovery_controls_match_actual_converse_platform_subset() {
+        for (id, expected) in [
+            (
+                "anthropic.claude-opus-4-5-20251101-v1:0",
+                vec!["none", "low", "medium", "high"],
+            ),
+            (
+                "eu.anthropic.claude-opus-4-5-20251101-v1:0",
+                vec!["none", "low", "medium", "high"],
+            ),
+            (
+                "anthropic.claude-opus-4-6-v1",
+                vec!["none", "low", "medium", "high", "xhigh", "max"],
+            ),
+            (
+                "us.anthropic.claude-opus-4-6-v1",
+                vec!["none", "low", "medium", "high", "xhigh", "max"],
+            ),
+            (
+                "anthropic.claude-sonnet-4-6",
+                vec!["none", "low", "medium", "high", "max"],
+            ),
+            (
+                "anthropic.claude-opus-5",
+                vec!["none", "low", "medium", "high", "xhigh", "max"],
+            ),
+        ] {
+            let parsed = provider_model_from_bedrock_model_summary(
+                serde_json::from_value(serde_json::json!({"modelId":id})).unwrap(),
+            );
+            let partial = crate::generation::test_catalog_model(
+                "bedrock",
+                id,
+                "anthropic.claude-opus-4-6-v1",
+                serde_json::json!({"thinkingLevelMap":{"max":"max"}}),
+            );
+            for catalog in [
+                crate::generation::test_catalog(false),
+                crate::generation::test_catalog(true),
+                partial,
+            ] {
+                let mut models = vec![parsed.clone()];
+                catalog.enrich("bedrock", &mut models);
+                assert_eq!(models[0].id, id);
+                let r = models[0].capabilities.reasoning.as_ref().unwrap();
+                assert_eq!(r.effort_options, expected);
+                let mut request = crate::generation::test_request(id);
+                let prepared = prepared_for(&request.messages);
+                for effort in &r.effort_options {
+                    request.reasoning = Some(ReasoningConfig::Effort(
+                        ReasoningEffort::from_str(effort).unwrap(),
+                    ));
+                    // Existing stream uses chat fallback and this same constructor.
+                    let body = serde_json::to_value(
+                        BedrockProvider::build_request_with_catalog(
+                            &request,
+                            &prepared,
+                            Some(&catalog),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    if effort == "none" {
+                        assert_eq!(
+                            body["additionalModelRequestFields"]["thinking"]["type"],
+                            "disabled"
+                        );
+                        assert!(
+                            body["additionalModelRequestFields"]
+                                .get("output_config")
+                                .is_none()
+                        );
+                    } else {
+                        assert_eq!(
+                            body["additionalModelRequestFields"]["output_config"]["effort"],
+                            effort.as_str()
+                        );
+                    }
+                    assert_eq!(body["inferenceConfig"]["maxTokens"], 1024);
+                    if effort == "none" {
+                        continue;
+                    }
+                    if id.contains("4-5") {
+                        assert!(
+                            body["additionalModelRequestFields"]
+                                .get("thinking")
+                                .is_none()
+                        );
+                    } else {
+                        assert_eq!(
+                            body["additionalModelRequestFields"]["thinking"]["type"],
+                            "adaptive"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aws_optional_off_and_catalog_veto_match_converse_discovery() {
+        for id in [
+            "anthropic.claude-opus-4-5-20251101-v1:0",
+            "us.anthropic.claude-opus-4-6-v1",
+            "anthropic.claude-sonnet-5",
+            "anthropic.claude-opus-5",
+            "anthropic.claude-fable-5",
+        ] {
+            for veto in [false, true] {
+                let catalog = crate::generation::test_catalog_model(
+                    "bedrock",
+                    id,
+                    "anthropic.claude-opus-4-6-v1",
+                    if veto {
+                        serde_json::json!({"thinkingLevelMap":{"off":null}})
+                    } else {
+                        serde_json::json!({"thinkingLevelMap":{"max":"max"}})
+                    },
+                );
+                let mut models = vec![provider_model_from_bedrock_model_summary(
+                    serde_json::from_value(serde_json::json!({"modelId":id})).unwrap(),
+                )];
+                catalog.enrich("bedrock", &mut models);
+                let allowed = !veto && !id.contains("fable");
+                assert_eq!(
+                    models[0]
+                        .capabilities
+                        .reasoning
+                        .as_ref()
+                        .unwrap()
+                        .effort_options
+                        .iter()
+                        .any(|e| e == "none"),
+                    allowed
+                );
+                for selected in [
+                    None,
+                    Some(ReasoningConfig::Disabled),
+                    Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                ] {
+                    let mut request = crate::generation::test_request(id);
+                    request.reasoning = selected;
+                    // Production stream remains chat fallback; both use this constructor.
+                    let result = BedrockProvider::build_request_with_catalog(
+                        &request,
+                        &prepared_for(&request.messages),
+                        Some(&catalog),
+                    );
+                    if selected.is_none() || allowed {
+                        let body = serde_json::to_value(result.unwrap()).unwrap();
+                        assert!(
+                            body["additionalModelRequestFields"]
+                                .get("output_config")
+                                .is_none()
+                        );
+                        if selected.is_none() {
+                            assert!(
+                                body["additionalModelRequestFields"]
+                                    .get("thinking")
+                                    .is_none()
+                            );
+                        } else {
+                            assert_eq!(
+                                body["additionalModelRequestFields"]["thinking"]["type"],
+                                "disabled"
+                            );
+                        }
+                        assert_eq!(body["inferenceConfig"]["maxTokens"], 1024);
+                    } else {
+                        assert!(result.is_err());
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn aws_explicit_off_cannot_be_omitted_by_negative_catalog() {
+        for id in [
+            "anthropic.claude-sonnet-5",
+            "anthropic.claude-opus-5",
+            "us.anthropic.claude-opus-4-6-v1",
+        ] {
+            for reasoning in [false, true] {
+                for off_map in [
+                    serde_json::json!({}),
+                    serde_json::json!({"off":"none"}),
+                    serde_json::json!({"off":null}),
+                ] {
+                    for native_case in ["absent", "unknown", "veto"] {
+                        let mut parsed = provider_model_from_bedrock_model_summary(
+                            serde_json::from_value(serde_json::json!({"modelId":id})).unwrap(),
+                        );
+                        // AWS summary has no disabled-mode field. These two
+                        // synthetic internal facts exercise the shared native
+                        // boundary, not a claimed AWS discovery schema.
+                        if native_case != "absent" {
+                            parsed
+                                .capabilities
+                                .reasoning
+                                .as_mut()
+                                .unwrap()
+                                .native
+                                .insert(
+                                    "thinking.types.disabled".into(),
+                                    if native_case == "veto" {
+                                        Some(false)
+                                    } else {
+                                        None
+                                    },
+                                );
+                        }
+                        let native = parsed
+                            .capabilities
+                            .reasoning
+                            .as_ref()
+                            .unwrap()
+                            .native
+                            .clone();
+                        let catalog = crate::generation::test_catalog_model(
+                            "bedrock",
+                            id,
+                            "anthropic.claude-opus-4-6-v1",
+                            serde_json::json!({"reasoning":reasoning,"thinkingLevelMap":off_map}),
+                        );
+                        let mut models = vec![parsed];
+                        catalog.enrich("bedrock", &mut models);
+                        let allowed = reasoning
+                            && off_map.get("off") != Some(&serde_json::Value::Null)
+                            && native_case != "veto";
+                        assert_eq!(
+                            models[0]
+                                .capabilities
+                                .reasoning
+                                .as_ref()
+                                .unwrap()
+                                .effort_options
+                                .iter()
+                                .any(|e| e == "none"),
+                            allowed
+                        );
+                        for setting in [
+                            None,
+                            Some(ReasoningConfig::Disabled),
+                            Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                        ] {
+                            let mut request = crate::generation::test_request(id);
+                            request.reasoning = setting;
+                            // Bedrock stream still calls chat and uses this constructor.
+                            let result = crate::generation::with_native_reasoning(
+                                "bedrock",
+                                true,
+                                [(id.into(), native.clone())].into_iter().collect(),
+                                async {
+                                    BedrockProvider::build_request_with_catalog(
+                                        &request,
+                                        &prepared_for(&request.messages),
+                                        Some(&catalog),
+                                    )
+                                },
+                            )
+                            .await;
+                            if setting.is_none() || allowed {
+                                let body = serde_json::to_value(result.unwrap()).unwrap();
+                                assert!(
+                                    body["additionalModelRequestFields"]
+                                        .get("output_config")
+                                        .is_none()
+                                );
+                                if setting.is_none() {
+                                    assert!(
+                                        body["additionalModelRequestFields"]
+                                            .get("thinking")
+                                            .is_none()
+                                    );
+                                } else {
+                                    assert_eq!(
+                                        body["additionalModelRequestFields"]["thinking"]["type"],
+                                        "disabled"
+                                    );
+                                }
+                                assert_eq!(body["inferenceConfig"]["maxTokens"], 1024);
+                            } else {
+                                let error = result.unwrap_err().to_string();
+                                assert!(
+                                    error.contains("explicit Claude off")
+                                        || error.contains(
+                                            "unsupported by the model's catalog thinking map"
+                                        )
+                                        || error.contains("denies disabled thinking"),
+                                    "{error}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A documented AWS platform vocabulary update, represented both as a
+    /// saved catalog profile and as a fresh models.dev source update. Limits
+    /// remain those of the pinned source; no second limits catalog is created.
+    fn aws_46_catalog(fresh: bool) -> crate::catalog::ModelCatalog {
+        use crate::catalog::generator::{SOURCE_URLS, SourceSnapshot, generate};
+        let ids = [
+            "anthropic.claude-opus-4-6-v1",
+            "us.anthropic.claude-opus-4-6-v1",
+            "eu.anthropic.claude-opus-4-6-v1",
+            "au.anthropic.claude-opus-4-6-v1",
+            "global.anthropic.claude-opus-4-6-v1",
+        ];
+        if fresh {
+            let mut source: SourceSnapshot =
+                serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                    .unwrap();
+            for id in ids {
+                source.sources.get_mut(SOURCE_URLS[0]).unwrap().body["amazon-bedrock"]["models"]
+                    [id]["reasoning_options"][0]["values"] =
+                    serde_json::json!(["low", "medium", "high", "xhigh", "max"]);
+            }
+            let generated = generate(&source, true).unwrap();
+            crate::catalog::ModelCatalog::parse(
+                &serde_json::to_string(&generated.models).unwrap(),
+                &serde_json::to_string(&generated.provenance).unwrap(),
+            )
+            .unwrap()
+        } else {
+            let mut models: serde_json::Value =
+                serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json"))
+                    .unwrap();
+            for id in ids {
+                models["amazon-bedrock"][id]["thinkingLevelMap"]["xhigh"] =
+                    serde_json::json!("xhigh");
+                models["amazon-bedrock"][id]["sourceGeneration"]["reasoningOptions"] = serde_json::json!([{"type":"effort","values":["low","medium","high","xhigh","max"]}]);
+            }
+            crate::catalog::ModelCatalog::parse(
+                &models.to_string(),
+                include_str!("../../tests/fixtures/catalog/provenance.json"),
+            )
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn aws_opus_46_xhigh_survives_discovery_and_native_converse_materialization() {
+        let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
+        for fresh in [false, true] {
+            let updated = aws_46_catalog(fresh);
+            let original = crate::generation::test_catalog(fresh);
+            for id in [
+                "anthropic.claude-opus-4-6-v1",
+                "us.anthropic.claude-opus-4-6-v1",
+                "eu.anthropic.claude-opus-4-6-v1",
+                "au.anthropic.claude-opus-4-6-v1",
+                "global.anthropic.claude-opus-4-6-v1",
+            ] {
+                let discovered = crate::generation::test_discovery(&updated, "bedrock", id);
+                assert!(
+                    discovered
+                        .capabilities
+                        .reasoning
+                        .as_ref()
+                        .unwrap()
+                        .effort_options
+                        .contains(&"xhigh".into())
+                );
+                let mut request = crate::generation::test_request(id);
+                request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::XHigh));
+                let prepared = prepare_messages_for_provider_model(
+                    "bedrock",
+                    id,
+                    &provider.capabilities(),
+                    &request.messages,
+                )
+                .unwrap();
+                for catalog in [None, Some(&original), Some(&updated)] {
+                    // Existing stream_chat delegates to chat and uses this same constructor.
+                    let body = serde_json::to_value(
+                        BedrockProvider::build_request_with_catalog(&request, &prepared, catalog)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        body["additionalModelRequestFields"]["output_config"]["effort"],
+                        "xhigh"
+                    );
+                    assert_eq!(
+                        body["additionalModelRequestFields"]["thinking"]["type"],
+                        "adaptive"
+                    );
+                    assert_eq!(body["inferenceConfig"]["maxTokens"], 1024);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aws_46_platform_exception_cannot_widen_other_profiles_or_override_denials() {
+        let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
+        let id = "anthropic.claude-opus-4-6-v1";
+        for metadata in [
+            serde_json::json!({"compat":{"supportsReasoningEffort":false},"thinkingLevelMap":{"xhigh":"xhigh"}}),
+            serde_json::json!({"thinkingLevelMap":{"xhigh":"invented"}}),
+        ] {
+            let catalog = crate::generation::test_catalog_model("amazon-bedrock", id, id, metadata);
+            let mut request = crate::generation::test_request(id);
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::XHigh));
+            let prepared = prepare_messages_for_provider_model(
+                "bedrock",
+                id,
+                &provider.capabilities(),
+                &request.messages,
+            )
+            .unwrap();
+            assert!(
+                BedrockProvider::build_request_with_catalog(&request, &prepared, Some(&catalog))
+                    .is_err()
+            );
+            let discovered = crate::generation::test_discovery(&catalog, "bedrock", id);
+            assert!(
+                discovered
+                    .capabilities
+                    .reasoning
+                    .as_ref()
+                    .is_none_or(|r| !r.effort_options.contains(&"xhigh".into()))
+            );
+        }
+        for id in [
+            "anthropic.claude-opus-4-5-20251101-v1:0",
+            "anthropic.claude-sonnet-4-6",
+            "anthropic.claude-opus-4-8",
+            "anthropic.claude-opus-4-6-opaque",
+            "arn:aws:bedrock:region:account:application-inference-profile/opaque",
+        ] {
+            let mut request = crate::generation::test_request(id);
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::XHigh));
+            let prepared = prepare_messages_for_provider_model(
+                "bedrock",
+                id,
+                &provider.capabilities(),
+                &request.messages,
+            )
+            .unwrap();
+            assert!(
+                BedrockProvider::build_request_with_catalog(&request, &prepared, None).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn converse_mandatory_and_source_denials_override_stale_metadata() {
+        let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
+        let stale = crate::generation::test_catalog_model(
+            "amazon-bedrock",
+            "anthropic.claude-fable-5",
+            "anthropic.claude-opus-4-7",
+            serde_json::json!({"reasoning":false,"thinkingLevelMap":{"off":"low"}}),
+        );
+        let mut request = crate::generation::test_request("anthropic.claude-fable-5");
+        let prepared = prepare_messages_for_provider_model(
+            "bedrock",
+            &request.model,
+            &provider.capabilities(),
+            &request.messages,
+        )
+        .unwrap();
+        for off in [
+            ReasoningConfig::Disabled,
+            ReasoningConfig::Effort(ReasoningEffort::None),
+        ] {
+            request.reasoning = Some(off);
+            assert!(
+                BedrockProvider::build_request_with_catalog(&request, &prepared, Some(&stale))
+                    .is_err()
+            );
+        }
+        let fresh = crate::generation::test_source_temperature(
+            "amazon-bedrock",
+            "anthropic.claude-sonnet-5",
+        );
+        request.model = "anthropic.claude-sonnet-5".into();
+        request.temperature = Some(0.7);
+        for reasoning in [
+            None,
+            Some(ReasoningConfig::Disabled),
+            Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+        ] {
+            request.reasoning = reasoning;
+            assert!(
+                BedrockProvider::build_request_with_catalog(&request, &prepared, Some(&fresh))
+                    .is_err()
+            );
+        }
+        request.model = "anthropic.claude-opus-4-7-opaque-alias".into();
+        request.temperature = None;
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+        assert!(BedrockProvider::build_request_with_catalog(&request, &prepared, None).is_err());
+    }
+
+    #[test]
+    fn saved_fresh_and_fallback_converse_profiles_enable_adaptive_not_manual_thinking() {
+        let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
+        for fresh in [false, true] {
+            let catalog = crate::generation::test_catalog(fresh);
+            for id in [
+                "anthropic.claude-opus-4-7",
+                "us.anthropic.claude-opus-4-7",
+                "eu.anthropic.claude-opus-4-7",
+                "anthropic.claude-opus-4-6-v1",
+            ] {
+                let mut request = crate::generation::test_request(id);
+                request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+                let prepared = prepare_messages_for_provider_model(
+                    "bedrock",
+                    id,
+                    &provider.capabilities(),
+                    &request.messages,
+                )
+                .unwrap();
+                for snapshot in [None, Some(&catalog)] {
+                    // stream_chat delegates to chat; both use this Converse constructor.
+                    let body = serde_json::to_value(
+                        BedrockProvider::build_request_with_catalog(&request, &prepared, snapshot)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        body["additionalModelRequestFields"]["thinking"]["type"],
+                        "adaptive"
+                    );
+                    assert_eq!(
+                        body["additionalModelRequestFields"]["output_config"]["effort"],
+                        "high"
+                    );
+                    assert_eq!(body["inferenceConfig"]["maxTokens"], 1024);
+                    assert!(
+                        body["additionalModelRequestFields"]
+                            .get("anthropic_version")
+                            .is_none()
+                    );
+                }
+            }
+            for id in [
+                "anthropic.claude-fable-5",
+                "us.anthropic.claude-mythos-5",
+                "anthropic.claude-mythos-preview",
+            ] {
+                let mut request = crate::generation::test_request(id);
+                let prepared = prepare_messages_for_provider_model(
+                    "bedrock",
+                    id,
+                    &provider.capabilities(),
+                    &request.messages,
+                )
+                .unwrap();
+                for off in [
+                    ReasoningConfig::Disabled,
+                    ReasoningConfig::Effort(ReasoningEffort::None),
+                ] {
+                    request.reasoning = Some(off);
+                    for snapshot in [None, Some(&catalog)] {
+                        assert!(
+                            BedrockProvider::build_request_with_catalog(
+                                &request, &prepared, snapshot
+                            )
+                            .is_err()
+                        );
+                    }
+                }
+            }
+        }
+        let mut request =
+            crate::generation::test_request("anthropic.claude-opus-4-5-20251101-v1:0");
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+        let prepared = prepare_messages_for_provider_model(
+            "bedrock",
+            &request.model,
+            &provider.capabilities(),
+            &request.messages,
+        )
+        .unwrap();
+        let body = serde_json::to_value(
+            BedrockProvider::build_request_with_catalog(&request, &prepared, None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["additionalModelRequestFields"]["output_config"]["effort"],
+            "high"
+        );
+        assert_eq!(
+            body["additionalModelRequestFields"]["anthropic_beta"][0],
+            "effort-2025-11-24"
+        );
+        assert!(
+            body["additionalModelRequestFields"]
+                .get("thinking")
+                .is_none()
+        );
+        request.model =
+            "arn:aws:bedrock:region:account:application-inference-profile/opaque".into();
+        assert!(BedrockProvider::build_request_with_catalog(&request, &prepared, None).is_err());
+    }
+
+    #[test]
+    fn converse_honors_source_temperature_denial_without_applying_claude_policy_to_nova() {
+        let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
+        let id = "amazon.nova-pro-v1:0";
+        let negative = crate::generation::test_source_temperature("amazon-bedrock", id);
+        let mut request = crate::generation::test_request(id);
+        request.temperature = Some(0.7);
+        let prepared = prepare_messages_for_provider_model(
+            "bedrock",
+            id,
+            &provider.capabilities(),
+            &request.messages,
+        )
+        .unwrap();
+        assert!(
+            BedrockProvider::build_request_with_catalog(&request, &prepared, Some(&negative))
+                .is_err()
+        );
+        let body = serde_json::to_value(
+            BedrockProvider::build_request_with_catalog(&request, &prepared, None).unwrap(),
+        )
+        .unwrap();
+        assert!(body["inferenceConfig"].get("temperature").is_some());
+        request.model = "anthropic.claude-opus-4-8".into();
+        for reasoning in [
+            None,
+            Some(ReasoningConfig::Disabled),
+            Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+        ] {
+            request.reasoning = reasoning;
+            assert!(
+                BedrockProvider::build_request_with_catalog(&request, &prepared, None).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn production_converse_body_requires_previous_messages_and_durable_authority() {
+        use super::super::history_test_support::request;
+        let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
+        let mut req = request(vec![
+            ChatMessage::system("rules"),
+            ChatMessage::user("first"),
+        ]);
+        req.model = "anthropic.claude-sonnet-4-6".into();
+        req.tools = Some(vec![crate::ToolDefinition {
+            name: "read".into(),
+            description: "read".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }]);
+        let build = |p: &BedrockProvider, r: &ChatRequest| {
+            let prepared = prepare_messages_for_provider_model(
+                p.name(),
+                &r.model,
+                &p.capabilities(),
+                &r.rendered_messages_with_compiled_prompt(),
+            )?;
+            p.build_native_request(r, &prepared)
+                .map(|body| serde_json::to_value(body).unwrap())
+        };
+        let sent = build(&provider, &req).unwrap();
+        for blocks in [
+            serde_json::json!([{"reasoningText":{"text":"reason","signature":"synthetic"}}]),
+            serde_json::json!([{"redactedContent":"opaque"}]),
+        ] {
+            let mut state = ProviderReplayState::for_model(
+                "bedrock",
+                &req.model,
+                serde_json::json!({"blocks":blocks}),
+            );
+            crate::continuation::bind_prefix(
+                &mut state,
+                &req.model,
+                &provider.replay_authority,
+                &sent,
+            )
+            .unwrap();
+            let mut answer = ChatMessage::assistant("answer");
+            answer.provider_replay_state = Some(state);
+            let answer: ChatMessage =
+                serde_json::from_value(serde_json::to_value(answer).unwrap()).unwrap();
+            let mut next = req.clone();
+            next.messages.extend([answer, ChatMessage::user("next")]);
+            assert!(build(&provider, &next).is_ok());
+            for change in 0..4 {
+                let mut changed = next.clone();
+                match change {
+                    0 => changed.messages[1].content = "summary replaces previous message".into(),
+                    1 => changed.messages[0].content = "retry system refresh".into(),
+                    2 => {
+                        changed.tools.as_mut().unwrap()[0].parameters =
+                            serde_json::json!({"type":"string"})
+                    }
+                    _ => {
+                        changed.messages[2]
+                            .provider_replay_state
+                            .as_mut()
+                            .unwrap()
+                            .payload
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("prefix_proof");
+                    }
+                }
+                assert!(build(&provider, &changed).is_err());
+            }
+            assert!(build(&BedrockProvider::new("AKID", "SECRET", "us-east-1"), &next).is_err());
+        }
+    }
+
+    #[test]
+    fn tool_modes_none_and_unsupported_limit_are_validated_before_converse() {
+        let provider = BedrockProvider::new("unused", "unused", "us-east-1");
+        for (choice, expected) in [
+            (ToolChoice::Auto, "auto"),
+            (ToolChoice::Required, "any"),
+            (
+                ToolChoice::Tool {
+                    name: "lookup".into(),
+                },
+                "tool",
+            ),
+        ] {
+            let mut request = crate::tools::policy::test_request();
+            request.model = "anthropic.claude-3-5-sonnet-20240620-v1:0".into();
+            request.tool_choice = Some(choice);
+            let prepared = prepare_messages_for_provider(
+                "bedrock",
+                &provider.capabilities(),
+                &request.messages,
+            )
+            .unwrap();
+            let wire = BedrockProvider::build_request(&request, &prepared).unwrap();
+            assert!(
+                wire.tool_config
+                    .unwrap()
+                    .tool_choice
+                    .unwrap()
+                    .get(expected)
+                    .is_some()
+            );
+        }
+        let mut request = crate::tools::policy::test_request();
+        request.tool_choice = Some(ToolChoice::None);
+        let prepared =
+            prepare_messages_for_provider("bedrock", &provider.capabilities(), &request.messages)
+                .unwrap();
+        assert!(
+            BedrockProvider::build_request(&request, &prepared)
+                .unwrap()
+                .tool_config
+                .is_none()
+        );
+        request.tool_choice = Some(ToolChoice::Auto);
+        request.parallel_tool_calls = Some(false);
+        assert!(BedrockProvider::build_request(&request, &prepared).is_err());
+    }
+
     #[test]
     fn usage_normalization_requires_complete_separate_cache_counters() {
         let complete: super::BedrockUsage = serde_json::from_value(serde_json::json!({
@@ -1150,6 +2072,198 @@ mod tests {
     fn bedrock_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    // Restore every AWS connection input even when an assertion panics, while
+    // holding the same lock as the pre-existing environment tests.
+    struct BedrockTestEnvironment {
+        saved: [(&'static str, Option<std::ffi::OsString>); 5],
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl BedrockTestEnvironment {
+        fn new() -> Self {
+            let lock = bedrock_env_lock()
+                .lock()
+                .expect("bedrock env lock poisoned");
+            let saved = [
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "AWS_REGION",
+                "AWS_DEFAULT_REGION",
+            ]
+            .map(|name| (name, std::env::var_os(name)));
+            Self { saved, _lock: lock }
+        }
+
+        fn set(&self, name: &str, value: Option<&str>) {
+            assert!(self.saved.iter().any(|(saved, _)| *saved == name));
+            // SAFETY: test-only AWS mutations are serialized by bedrock_env_lock.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    impl Drop for BedrockTestEnvironment {
+        fn drop(&mut self) {
+            // SAFETY: the environment lock remains held until restoration ends.
+            unsafe {
+                for (name, value) in &self.saved {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bedrock_region_requires_one_bounded_dns_label() {
+        for region in [
+            "",
+            "-",
+            "-us-east-1",
+            "us-east-1-",
+            "region.invalid",
+            "us_east_1",
+            &"a".repeat(64),
+        ] {
+            let error = BedrockProvider::validate_connection_values(
+                "dummy-access",
+                "dummy-secret",
+                Some("dummy-session"),
+                region,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("DNS label"));
+            assert!(!error.to_string().contains("dummy"));
+        }
+        // A label bound, not an allowlist of regions currently offered by AWS.
+        for region in [
+            "us-east-1",
+            "us-gov-west-1",
+            "cn-north-1",
+            "a",
+            &"a".repeat(63),
+        ] {
+            assert!(
+                BedrockProvider::validate_connection_values(
+                    "dummy-access",
+                    "dummy-secret",
+                    Some("dummy-session"),
+                    region,
+                )
+                .is_ok(),
+                "{region}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_bedrock_regions_fail_lifecycle_before_network() {
+        for region in [
+            "-",
+            "-us-east-1",
+            "us-east-1-",
+            "region.invalid",
+            &"a".repeat(64),
+        ] {
+            let provider = BedrockProvider::new("dummy-access", "dummy-secret", region);
+            let request = ChatRequest {
+                model: "model:0".into(),
+                messages: vec![ChatMessage::user("dummy")],
+                temperature: None,
+                max_tokens: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                compiled_prompt: None,
+            };
+            for error in [
+                provider.list_models().await.unwrap_err(),
+                provider.warmup().await.unwrap_err(),
+                provider.chat(request.clone()).await.unwrap_err(),
+            ] {
+                assert!(error.to_string().contains("DNS label"));
+            }
+            let error = match provider.stream_chat(request).await {
+                Err(error) => error,
+                Ok(_) => panic!("invalid region must fail before stream setup"),
+            };
+            assert!(error.to_string().contains("DNS label"));
+        }
+    }
+
+    #[test]
+    fn bedrock_region_environment_availability_and_validation_agree() {
+        let env = BedrockTestEnvironment::new();
+        env.set("AWS_ACCESS_KEY_ID", Some("dummy-access"));
+        env.set("AWS_SECRET_ACCESS_KEY", Some("dummy-secret"));
+        env.set("AWS_SESSION_TOKEN", Some("dummy-session"));
+        env.set("AWS_DEFAULT_REGION", Some("cn-north-1"));
+        let definition = crate::provider_definition("bedrock").unwrap();
+        for (region, valid) in [
+            ("-", false),
+            ("-us-east-1", false),
+            ("us-east-1-", false),
+            ("region.invalid", false),
+            (&"a".repeat(64), false),
+            ("us-east-1", true),
+            ("us-gov-west-1", true),
+            ("cn-north-1", true),
+        ] {
+            env.set("AWS_REGION", Some(region));
+            assert_eq!(
+                BedrockProvider::environment_is_configured(),
+                valid,
+                "{region}"
+            );
+            assert_eq!(
+                crate::provider_is_available(true, true, true, definition),
+                valid,
+                "{region}"
+            );
+            let provider = BedrockProvider::from_env();
+            assert_eq!(provider.is_ok(), valid, "{region}");
+            assert_eq!(
+                BedrockProvider::new("dummy-access", "dummy-secret", region)
+                    .validate_connection()
+                    .is_ok(),
+                valid
+            );
+            if let Ok(provider) = provider {
+                assert_eq!(
+                    provider.region, region,
+                    "AWS_REGION must outrank the fallback"
+                );
+                assert_eq!(provider.session_token.as_deref(), Some("dummy-session"));
+            }
+        }
+        env.set("AWS_REGION", None);
+        assert_eq!(BedrockProvider::from_env().unwrap().region, "cn-north-1");
+        env.set("AWS_DEFAULT_REGION", Some("-"));
+        assert!(!BedrockProvider::environment_is_configured());
+        assert!(!crate::provider_is_available(
+            false, false, false, definition
+        ));
+        assert!(BedrockProvider::from_env().is_err());
+        env.set("AWS_DEFAULT_REGION", None);
+        assert_eq!(BedrockProvider::from_env().unwrap().region, "us-east-1");
+        assert!(BedrockProvider::environment_is_configured());
+        env.set("AWS_SESSION_TOKEN", Some(""));
+        assert!(!BedrockProvider::environment_is_configured());
+        env.set("AWS_SESSION_TOKEN", None);
+        assert!(BedrockProvider::environment_is_configured());
+        env.set("AWS_SECRET_ACCESS_KEY", None);
+        assert!(!BedrockProvider::environment_is_configured());
+        assert!(!crate::provider_is_available(true, true, true, definition));
     }
 
     fn prepared_for(messages: &[ChatMessage]) -> crate::attachments::PreparedProviderMessages {
@@ -1291,6 +2405,61 @@ mod tests {
     }
 
     #[test]
+    fn sigv4_connection_requires_pair_and_nonempty_session_token() {
+        for provider in [
+            BedrockProvider::new("dummy-access", "", "us-east-1"),
+            BedrockProvider::new("", "dummy-secret", "us-east-1"),
+            BedrockProvider::new("dummy-access", "dummy-secret", "region.invalid"),
+            BedrockProvider::with_session_token("dummy-access", "dummy-secret", "us-east-1", ""),
+        ] {
+            assert!(provider.validate_connection().is_err());
+        }
+        let provider = BedrockProvider::with_session_token(
+            "dummy-access",
+            "dummy-secret",
+            "cn-north-1",
+            "dummy-session",
+        );
+        assert!(provider.validate_connection().is_ok());
+        assert_eq!(
+            provider.converse_url("arn:aws-cn:bedrock:cn-north-1::foundation-model/example~1"),
+            "https://bedrock-runtime.cn-north-1.amazonaws.com.cn/model/arn%3Aaws-cn%3Abedrock%3Acn-north-1%3A%3Afoundation-model%2Fexample~1/converse"
+        );
+        assert_eq!(
+            provider.list_foundation_models_url(),
+            "https://bedrock.cn-north-1.amazonaws.com.cn/foundation-models"
+        );
+        let url: Url = provider.converse_url("model:0").parse().unwrap();
+        let auth = sign_request(
+            "POST",
+            &url,
+            b"{}",
+            "dummy-access",
+            "dummy-secret",
+            Some("dummy-session"),
+            "cn-north-1",
+            SERVICE,
+            "20261001T120000Z",
+        );
+        assert!(auth.contains("Credential=dummy-access/20261001/cn-north-1/bedrock/aws4_request"));
+        assert!(auth.contains("SignedHeaders=content-type;host;x-amz-date;x-amz-security-token"));
+        let without_session = sign_request(
+            "POST",
+            &url,
+            b"{}",
+            "dummy-access",
+            "dummy-secret",
+            None,
+            "cn-north-1",
+            SERVICE,
+            "20261001T120000Z",
+        );
+        assert_ne!(auth, without_session);
+        assert!(!auth.contains("dummy-secret"));
+        assert!(!auth.contains("dummy-session"));
+    }
+
+    #[test]
     fn creates_with_session_token() {
         let provider = BedrockProvider::with_session_token("AKID", "SECRET", "eu-west-1", "TOKEN");
         assert_eq!(provider.access_key_id, "AKID");
@@ -1308,7 +2477,10 @@ mod tests {
         .expect("bedrock opus 4.5 effort metadata");
 
         assert_eq!(reasoning.supported, Some(true));
-        assert_eq!(reasoning.effort_options, vec!["low", "medium", "high"]);
+        assert_eq!(
+            reasoning.effort_options,
+            vec!["none", "low", "medium", "high"]
+        );
         assert_eq!(reasoning.default_effort.as_deref(), Some("high"));
     }
 
@@ -1364,7 +2536,10 @@ mod tests {
             .reasoning
             .as_ref()
             .expect("bedrock claude reasoning model");
-        assert_eq!(reasoning.effort_options, vec!["low", "medium", "high"]);
+        assert_eq!(
+            reasoning.effort_options,
+            vec!["none", "low", "medium", "high"]
+        );
         assert_eq!(models[0].capabilities.vision, Some(true));
         assert_eq!(models[0].active, Some(true));
 
@@ -1373,54 +2548,29 @@ mod tests {
 
     #[test]
     fn from_env_reads_variables() {
-        let _env_guard = bedrock_env_lock()
-            .lock()
-            .expect("bedrock env lock poisoned");
-        // Temporarily set env vars for test.
-        // SAFETY: test-only; these env vars are not used by other threads in tests.
-        unsafe {
-            std::env::set_var("AWS_ACCESS_KEY_ID", "env-akid");
-            std::env::set_var("AWS_SECRET_ACCESS_KEY", "env-secret");
-            std::env::set_var("AWS_SESSION_TOKEN", "env-token");
-            std::env::set_var("AWS_REGION", "ap-southeast-1");
-        }
-
+        let env = BedrockTestEnvironment::new();
+        env.set("AWS_ACCESS_KEY_ID", Some("env-akid"));
+        env.set("AWS_SECRET_ACCESS_KEY", Some("env-secret"));
+        env.set("AWS_SESSION_TOKEN", Some("env-token"));
+        env.set("AWS_REGION", Some("ap-southeast-1"));
         let provider = BedrockProvider::from_env().unwrap();
         assert_eq!(provider.access_key_id, "env-akid");
         assert_eq!(provider.secret_access_key, "env-secret");
         assert_eq!(provider.session_token.as_deref(), Some("env-token"));
         assert_eq!(provider.region, "ap-southeast-1");
-
-        // Clean up
-        unsafe {
-            std::env::remove_var("AWS_ACCESS_KEY_ID");
-            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-            std::env::remove_var("AWS_SESSION_TOKEN");
-            std::env::remove_var("AWS_REGION");
-        }
     }
 
     #[test]
     fn from_env_defaults_region() {
-        let _env_guard = bedrock_env_lock()
-            .lock()
-            .expect("bedrock env lock poisoned");
-        // SAFETY: test-only; these env vars are not used by other threads in tests.
-        unsafe {
-            std::env::set_var("AWS_ACCESS_KEY_ID", "akid");
-            std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
-            std::env::remove_var("AWS_SESSION_TOKEN");
-            std::env::remove_var("AWS_REGION");
-        }
-
+        let env = BedrockTestEnvironment::new();
+        env.set("AWS_ACCESS_KEY_ID", Some("akid"));
+        env.set("AWS_SECRET_ACCESS_KEY", Some("secret"));
+        env.set("AWS_SESSION_TOKEN", None);
+        env.set("AWS_REGION", None);
+        env.set("AWS_DEFAULT_REGION", None);
         let provider = BedrockProvider::from_env().unwrap();
         assert_eq!(provider.region, "us-east-1");
         assert!(provider.session_token.is_none());
-
-        unsafe {
-            std::env::remove_var("AWS_ACCESS_KEY_ID");
-            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-        }
     }
 
     #[test]
@@ -1443,7 +2593,7 @@ mod tests {
         let url = provider.converse_url("anthropic.claude-3-sonnet-20240229-v1:0");
         assert_eq!(
             url,
-            "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-sonnet-20240229-v1:0/converse"
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-sonnet-20240229-v1%3A0/converse"
         );
     }
 
@@ -1657,7 +2807,7 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_claude_request_omits_reasoning_extension_for_disabled_reasoning() {
+    fn bedrock_claude_request_sends_explicit_disabled_thinking() {
         let request = ChatRequest {
             model: "anthropic.claude-opus-4-5".to_owned(),
             messages: vec![ChatMessage::user("Hello")],
@@ -1675,11 +2825,14 @@ mod tests {
         let bedrock_request = BedrockProvider::build_request(&request, &prepared).unwrap();
         let json = serde_json::to_value(&bedrock_request).unwrap();
 
-        assert!(json.get("additionalModelRequestFields").is_none());
+        assert_eq!(
+            json["additionalModelRequestFields"]["thinking"]["type"],
+            "disabled"
+        );
     }
 
     #[test]
-    fn bedrock_non_claude_request_omits_reasoning_extension() {
+    fn bedrock_non_claude_rejects_unimplemented_reasoning_setting() {
         let request = ChatRequest {
             model: "amazon.nova-pro-v1:0".to_owned(),
             messages: vec![ChatMessage::user("Hello")],
@@ -1694,10 +2847,7 @@ mod tests {
         let rendered = request.rendered_messages_with_compiled_sections();
         let prepared = prepared_for(rendered.as_slice());
 
-        let bedrock_request = BedrockProvider::build_request(&request, &prepared).unwrap();
-        let json = serde_json::to_value(&bedrock_request).unwrap();
-
-        assert!(json.get("additionalModelRequestFields").is_none());
+        assert!(BedrockProvider::build_request(&request, &prepared).is_err());
     }
 
     #[test]
@@ -1805,3 +2955,496 @@ mod tests {
         assert!(dt.ends_with('Z'));
     }
 }
+
+#[cfg(test)]
+mod media_contract_tests {
+    use super::*;
+    use crate::{
+        AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart, Provider,
+    };
+    #[test]
+    fn native_document_and_audio_formats_are_endpoint_enums_not_mime_subtypes() {
+        let provider = BedrockProvider::new("unused", "unused", "us-east-1");
+        for (mime, part, union, expected) in [
+            ("text/plain", 0, "document", "txt"),
+            ("audio/x-wav", 1, "audio", "wav"),
+            ("video/mp4", 2, "video", "mp4"),
+        ] {
+            let bytes = match part {
+                0 => b"document evidence".to_vec(),
+                1 => crate::attachments::regression::wav(),
+                _ => crate::attachments::regression::video().to_vec(),
+            };
+            let attachment = MessageAttachment {
+                mime_type: mime.into(),
+                name: None,
+                size_bytes: None,
+                sha256: None,
+                source: AttachmentDataSource::Bytes {
+                    base64_data: BASE64.encode(&bytes),
+                },
+                artifact: None,
+            };
+            let content = match part {
+                0 => MessageContentPart::file(attachment),
+                1 => MessageContentPart::audio(attachment),
+                _ => MessageContentPart::video(attachment),
+            };
+            let mut message = ChatMessage::user_parts(vec![content]);
+            message.content = "analyze".into();
+            let prepared = crate::attachments::prepare_messages_for_provider(
+                "bedrock",
+                &provider.capabilities(),
+                &[message],
+            )
+            .unwrap();
+            let wire = serde_json::to_value(
+                BedrockProvider::attachment_block(&prepared.attachments[0]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(wire[union]["format"], expected);
+            assert_eq!(wire[union]["source"]["bytes"], BASE64.encode(&bytes));
+        }
+    }
+    #[test]
+    fn missing_discovery_modalities_are_unknown_not_explicitly_text_only() {
+        let summary: BedrockModelSummary =
+            serde_json::from_value(serde_json::json!({"modelId":"fixture"})).unwrap();
+        assert_eq!(
+            provider_model_from_bedrock_model_summary(summary)
+                .capabilities
+                .vision,
+            None
+        );
+        let summary: BedrockModelSummary = serde_json::from_value(
+            serde_json::json!({"modelId":"fixture","inputModalities":["TEXT"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            provider_model_from_bedrock_model_summary(summary)
+                .capabilities
+                .vision,
+            Some(false)
+        );
+    }
+}
+
+#[cfg(test)]
+mod document_projection_regressions {
+    use super::*;
+    use crate::attachments::regression as fixture;
+    use crate::{MessageContentPart, Provider, ProviderToolCall};
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn neutral_display_names_and_actual_user_sibling_text_are_validated() {
+        let provider = BedrockProvider::new("unused", "unused", "us-east-1");
+        for name in [
+            None,
+            Some("file.pdf".to_owned()),
+            Some("../do_bad[things]   now.pdf".to_owned()),
+            Some(" ".repeat(300)),
+            Some("x".repeat(300)),
+        ] {
+            let state = Arc::new(fixture::state("bedrock", "media", serde_json::json!({})));
+            let mut req = fixture::request(
+                "media",
+                vec![fixture::part(
+                    InputContentType::File,
+                    "application/pdf",
+                    &fixture::pdf(1),
+                )],
+            );
+            if let MessageContentPart::File { file } = &mut req.messages[0].content_parts[0] {
+                file.name = name;
+            }
+            let budget = fixture::scoped(state.clone(), provider.prepare_input_budget(req))
+                .await
+                .unwrap();
+            let prepared = fixture::scoped(
+                state,
+                crate::attachments::prepare_messages_for_provider_async(
+                    "bedrock",
+                    "media",
+                    &provider.capabilities(),
+                    &budget.request.messages,
+                ),
+            )
+            .await
+            .unwrap();
+            let (messages, _) = BedrockProvider::convert_messages(&prepared).unwrap();
+            let wire = serde_json::to_value(messages).unwrap();
+            assert_eq!(wire[0]["content"][0]["text"], "analyze");
+            let display = wire[0]["content"][1]["document"]["name"].as_str().unwrap();
+            assert_eq!(display, "Document 1-1");
+            assert!(display.len() <= 200);
+            assert!(
+                display
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || " -()[]".contains(c))
+            );
+            assert!(prepared.attachments[0].name.ends_with(".pdf"));
+        }
+        for role in [Role::User, Role::Tool] {
+            let state = Arc::new(fixture::state("bedrock", "media", serde_json::json!({})));
+            let mut req = fixture::request(
+                "media",
+                vec![fixture::part(
+                    InputContentType::File,
+                    "application/pdf",
+                    &fixture::pdf(1),
+                )],
+            );
+            if role == Role::Tool {
+                req.messages[0].role = Role::Tool;
+                req.messages[0].tool_call_id = Some("document-call".into());
+                req.messages.insert(
+                    0,
+                    crate::ChatMessage::assistant_tool_calls(
+                        None::<String>,
+                        vec![ProviderToolCall {
+                            id: "document-call".into(),
+                            name: "read".into(),
+                            arguments: "{}".into(),
+                        }],
+                    ),
+                );
+            } else {
+                req.messages[0].content = "   ".into();
+            }
+            assert!(
+                fixture::scoped(state, provider.prepare_input_budget(req))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod summary_document_regressions {
+    use super::*;
+    use crate::{
+        Provider,
+        attachments::{admission::AdmissionState, regression as fixture},
+    };
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn native_summary_keeps_catalog_document_before_after_discovery_and_replay() {
+        let source: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/capabilities/bedrock-claude-source.json"
+        ))
+        .unwrap();
+        let id = "anthropic.claude-sonnet-4-6";
+        let row = serde_json::json!({"id":id,"name":source["name"],"provider":"amazon-bedrock","api":"bedrock-converse-stream","baseUrl":"https://bedrock-runtime.us-east-1.amazonaws.com","contextWindow":source["limit"]["context"],"maxTokens":source["limit"]["output"],"reasoning":false,"input":source["modalities"]["input"],"cost":{},"inputOrigin":{"kind":"source","expression":"pinned models.dev raw row"},"sourceMetadata":source});
+        let origins = serde_json::json!({"amazon-bedrock":{id:{
+            "contextWindow":{"kind":"source","expression":"models.dev.limit.context"},
+            "maxTokens":{"kind":"source","expression":"models.dev.limit.output"}
+        }}});
+        let catalog = Arc::new(
+            crate::catalog::ModelCatalog::parse(
+                &serde_json::json!({"amazon-bedrock":{id:row}}).to_string(),
+                &origins.to_string(),
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(AdmissionState::for_test(catalog.clone()));
+        let provider = BedrockProvider::new("unused", "unused", "us-east-1");
+        let req = fixture::request(
+            id,
+            vec![fixture::part(
+                InputContentType::File,
+                "application/pdf",
+                &fixture::pdf(1),
+            )],
+        );
+        let before = fixture::scoped(state.clone(), provider.prepare_input_budget(req.clone()))
+            .await
+            .unwrap();
+        let response: BedrockModelsResponse = serde_json::from_str(include_str!(
+            "../../tests/fixtures/capabilities/bedrock-summary.json"
+        ))
+        .unwrap();
+        let raw = response
+            .model_summaries
+            .into_iter()
+            .map(provider_model_from_bedrock_model_summary)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            raw[0].capabilities.input_modalities.as_ref().unwrap(),
+            &["TEXT", "IMAGE"]
+        );
+        state.replace_discovery(raw.clone());
+        let mut dto = raw;
+        catalog.enrich("bedrock", &mut dto);
+        assert!(
+            dto[0]
+                .capabilities
+                .input_modalities
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|v| v == "pdf")
+        );
+        for req in [req, before.request] {
+            let budget = fixture::scoped(state.clone(), provider.prepare_input_budget(req))
+                .await
+                .unwrap();
+            for _stream in [false, true] {
+                // both production routes use this same builder
+                let prepared = fixture::scoped(
+                    state.clone(),
+                    crate::attachments::prepare_messages_for_provider_async(
+                        "bedrock",
+                        id,
+                        &provider.capabilities(),
+                        &budget.request.messages,
+                    ),
+                )
+                .await
+                .unwrap();
+                let wire = serde_json::to_value(
+                    BedrockProvider::build_request(&budget.request, &prepared).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(wire["messages"][0]["content"][0]["text"], "analyze");
+                assert_eq!(
+                    wire["messages"][0]["content"][1]["document"]["source"]["bytes"],
+                    BASE64.encode(
+                        crate::attachments::attachment_bytes(&prepared.attachments[0]).unwrap()
+                    )
+                );
+            }
+        }
+        for raw_json in [
+            serde_json::json!({"modelId":"unknown","inputModalities":["TEXT","IMAGE"]}),
+            serde_json::json!({"modelId":"unknown"}),
+        ] {
+            let other = Arc::new(AdmissionState::for_test(catalog.clone()));
+            other.replace_discovery(vec![provider_model_from_bedrock_model_summary(
+                serde_json::from_value(raw_json).unwrap(),
+            )]);
+            let req = fixture::request(
+                "unknown",
+                vec![fixture::part(
+                    InputContentType::File,
+                    "application/pdf",
+                    &fixture::pdf(1),
+                )],
+            );
+            assert!(
+                fixture::scoped(other, provider.prepare_input_budget(req))
+                    .await
+                    .is_err()
+            );
+        }
+        // Types the summary does enumerate retain real negatives.
+        state.replace_discovery(vec![provider_model_from_bedrock_model_summary(
+            serde_json::from_value(serde_json::json!({"modelId":id,"inputModalities":["TEXT"]}))
+                .unwrap(),
+        )]);
+        let image = fixture::request(
+            id,
+            vec![fixture::part(
+                InputContentType::Image,
+                "image/png",
+                &fixture::image(image::ImageFormat::Png, 1, 1),
+            )],
+        );
+        assert!(
+            fixture::scoped(state.clone(), provider.prepare_input_budget(image.clone()))
+                .await
+                .is_err()
+        );
+        let isolated = Arc::new(AdmissionState::for_test(catalog));
+        assert!(
+            fixture::scoped(isolated, provider.prepare_input_budget(image))
+                .await
+                .is_ok()
+        );
+    }
+}
+
+#[cfg(test)]
+mod webm_wire_regressions {
+    use super::*;
+    use crate::{
+        Provider,
+        attachments::{media_fixtures::webm, regression as fixture},
+    };
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn identified_webm_audio_video_and_mixed_keep_native_union_and_pinned_bytes() {
+        let provider = BedrockProvider::new("unused", "unused", "us-east-1");
+        for (audio, video, kind, mime, union) in [
+            (true, false, InputContentType::Audio, "audio/webm", "audio"),
+            (false, true, InputContentType::Video, "video/webm", "video"),
+            (true, true, InputContentType::Video, "video/webm", "video"),
+        ] {
+            let bytes = webm(audio, video, "webm");
+            let state = Arc::new(fixture::state("bedrock", "media", serde_json::json!({})));
+            let budget = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(fixture::request(
+                    "media",
+                    vec![fixture::part(kind, mime, &bytes)],
+                )),
+            )
+            .await
+            .unwrap();
+            for _stream in [false, true] {
+                let prepared = fixture::scoped(
+                    state.clone(),
+                    crate::attachments::prepare_messages_for_provider_async(
+                        "bedrock",
+                        "media",
+                        &provider.capabilities(),
+                        &budget.request.messages,
+                    ),
+                )
+                .await
+                .unwrap();
+                let wire = serde_json::to_value(
+                    BedrockProvider::build_request(&budget.request, &prepared).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(wire["messages"][0]["content"][1][union]["format"], "webm");
+                assert_eq!(
+                    wire["messages"][0]["content"][1][union]["source"]["bytes"],
+                    BASE64.encode(&bytes)
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod container_timeline_wire_regressions {
+    use super::*;
+    use crate::{
+        Provider,
+        attachments::{
+            media_fixtures::{TimingFixture, webm_timeline},
+            regression as fixture,
+        },
+    };
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn eleven_second_container_budget_both_modes_and_replay_keep_native_bytes() {
+        let provider = BedrockProvider::new("unused", "unused", "us-east-1");
+        let bytes = webm_timeline(
+            true,
+            true,
+            "webm",
+            TimingFixture {
+                video_start: 10000,
+                declared_duration: Some(11000.0),
+                ..Default::default()
+            },
+        );
+        let state = Arc::new(fixture::state(
+            "bedrock",
+            "media",
+            serde_json::json!({"video":{"maxDurationMillis":11000}}),
+        ));
+        let budget = fixture::scoped(
+            state.clone(),
+            provider.prepare_input_budget(fixture::request(
+                "media",
+                vec![fixture::part(InputContentType::Video, "video/webm", &bytes)],
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(budget.media[0].input_tokens, 3850);
+        for _stream in [false, true] {
+            // both actual Converse routes share this builder
+            let replay = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(budget.request.clone()),
+            )
+            .await
+            .unwrap();
+            let prepared = fixture::scoped(
+                state.clone(),
+                crate::attachments::prepare_messages_for_provider_async(
+                    "bedrock",
+                    "media",
+                    &provider.capabilities(),
+                    &replay.request.messages,
+                ),
+            )
+            .await
+            .unwrap();
+            let wire = serde_json::to_value(
+                BedrockProvider::build_request(&replay.request, &prepared).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(wire["messages"][0]["content"][1]["video"]["format"], "webm");
+            assert_eq!(
+                wire["messages"][0]["content"][1]["video"]["source"]["bytes"],
+                BASE64.encode(&bytes)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod confirmed_duration_wire_regressions {
+    use super::*;
+    use crate::{Provider, attachments::regression as fixture};
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn confirmed_elementary_audio_and_no_edit_mp4_keep_native_bytes_in_both_modes() {
+        let provider = BedrockProvider::new("unused", "unused", "us-east-1");
+        for (kind, mime, bytes) in fixture::confirmed_wire_inputs("bedrock") {
+            let state = Arc::new(fixture::state("bedrock", "media", serde_json::json!({})));
+            let budget = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(fixture::request(
+                    "media",
+                    vec![fixture::part(kind, mime, &bytes)],
+                )),
+            )
+            .await
+            .unwrap();
+            for _stream in [false, true] {
+                let replay = fixture::scoped(
+                    state.clone(),
+                    provider.prepare_input_budget(budget.request.clone()),
+                )
+                .await
+                .unwrap();
+                let prepared = fixture::scoped(
+                    state.clone(),
+                    crate::attachments::prepare_messages_for_provider_async(
+                        "bedrock",
+                        "media",
+                        &provider.capabilities(),
+                        &replay.request.messages,
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(prepared.attachments[0].kind, kind);
+                assert_eq!(prepared.attachments[0].mime_type, mime);
+                let wire = serde_json::to_value(
+                    BedrockProvider::build_request(&replay.request, &prepared).unwrap(),
+                )
+                .unwrap();
+                let union = if kind == InputContentType::Video {
+                    "video"
+                } else {
+                    "audio"
+                };
+                assert_eq!(
+                    wire["messages"][0]["content"][1][union]["source"]["bytes"],
+                    BASE64.encode(&bytes)
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "wire_tests/bedrock.rs"]
+mod wire_contract_tests;

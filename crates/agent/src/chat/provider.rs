@@ -91,6 +91,41 @@ fn bind_replay_to_response_target(
     }
 }
 
+/// A final no-tool response can contain native state absent from UI text.
+/// Keep it in the existing acknowledged history route before finalization.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn persist_completed_response(
+    events: &AgentEventHub,
+    thread: &str,
+    turn: &str,
+    item: &str,
+    reasoning_item: &str,
+    text: &str,
+    reasoning: &str,
+    replay: Option<&pioneer_provider::ProviderReplayState>,
+) -> Result<(), ChatTurnError> {
+    if replay.is_none() && reasoning.is_empty() {
+        return Ok(());
+    }
+    let mut message = pioneer_provider::ChatMessage::assistant(text);
+    message.reasoning_content = (!reasoning.is_empty()).then(|| reasoning.to_owned());
+    message.provider_replay_state = replay.cloned();
+    super::persist_provider_history_message(
+        events,
+        thread,
+        turn,
+        reasoning_item,
+        &pioneer_provider::CanonicalProviderRoundEnvelope {
+            version: 1,
+            round_id: item.into(),
+            termination: pioneer_provider::ProviderTermination::Complete,
+            message,
+            calls: Vec::new(),
+        },
+    )
+    .await
+}
+
 /// Persist the provider accumulator, including opaque state absent from UI text.
 /// This acknowledged observation precedes failure/recovery and never becomes an
 /// executable assistant/tool round. Cancellation still drops this owned future.
@@ -215,10 +250,6 @@ pub(super) async fn request_agent_round(
                         model_name.as_str(),
                     );
                 }
-                if chunk.is_final {
-                    termination = chunk.termination;
-                    break;
-                }
 
                 validate_stream_append_limits(
                     &response_limits,
@@ -284,6 +315,10 @@ pub(super) async fn request_agent_round(
                         ProviderTransportKind::Stream,
                         error,
                     ));
+                }
+                if chunk.is_final {
+                    termination = chunk.termination;
+                    break;
                 }
             }
 
@@ -511,10 +546,6 @@ pub(super) async fn stream_provider_response(
                     model_name.as_str(),
                 );
             }
-            if is_final {
-                termination = chunk_termination;
-                break;
-            }
 
             let target = response_stream_target(message_started, thinking_item_id, message_item_id);
             validate_stream_append_limits(
@@ -644,6 +675,10 @@ pub(super) async fn stream_provider_response(
                     error,
                 ));
             }
+            if is_final {
+                termination = chunk_termination;
+                break;
+            }
         }
 
         require_round_termination(
@@ -671,6 +706,19 @@ pub(super) async fn stream_provider_response(
         )
         .await?;
         return Err(error);
+    }
+    if stream_tool_calls.is_empty() {
+        persist_completed_response(
+            event_tx,
+            thread_id,
+            turn_id,
+            message_item_id,
+            thinking_item_id,
+            &full_text,
+            &reasoning_parts,
+            provider_replay_state.as_ref(),
+        )
+        .await?;
     }
     for tool_call in stream_tool_calls {
         super::emit_durable_event(
@@ -801,7 +849,7 @@ pub(super) async fn non_stream_provider_response(
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
     let model_name = request.model.clone();
 
-    let response = provider.chat(request).await.map_err(|error| {
+    let mut response = provider.chat(request).await.map_err(|error| {
         adapter_error_for_target(
             FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
             provider.as_ref(),
@@ -813,6 +861,11 @@ pub(super) async fn non_stream_provider_response(
         )
     })?;
 
+    bind_replay_to_response_target(
+        &mut response.provider_replay_state,
+        provider.name(),
+        &model_name,
+    );
     if !response.text.is_empty() {
         pioneer_observability::turn_startup::runtime_output(
             turn_id,
@@ -847,6 +900,19 @@ pub(super) async fn non_stream_provider_response(
         model_name.as_str(),
         ProviderTransportKind::NonStream,
     )?;
+    if response.tool_calls.is_empty() {
+        persist_completed_response(
+            event_tx,
+            thread_id,
+            turn_id,
+            message_item_id,
+            thinking_item_id,
+            &response.text,
+            response.reasoning_content.as_deref().unwrap_or_default(),
+            response.provider_replay_state.as_ref(),
+        )
+        .await?;
+    }
     let reasoning_content = match &response.reasoning_content {
         Some(rc) if !rc.is_empty() => vec![rc.clone()],
         _ => Vec::new(),
@@ -1610,6 +1676,58 @@ mod tests {
         };
         assert!(!serde_json::to_string(&failure).unwrap().contains(secret));
         failure
+    }
+
+    #[tokio::test]
+    async fn ordinary_final_without_native_state_or_reasoning_does_not_expect_ui_aliases() {
+        let hub = AgentEventHub::new();
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        persist_completed_response(
+            &hub, "thread", "turn", "final", "thinking", "answer", "", None,
+        )
+        .await
+        .unwrap();
+        assert!(futures_util::FutureExt::now_or_never(receiver.recv()).is_none());
+    }
+
+    #[tokio::test]
+    async fn completed_native_response_waits_for_durable_history_acknowledgement() {
+        let hub = AgentEventHub::new();
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        let state = pioneer_provider::ProviderReplayState::for_model(
+            "gemini",
+            "fixture",
+            serde_json::json!({"schema_version":2,"parts":[{"text":"answer","thoughtSignature":"signed"}]}),
+        );
+        let publish = persist_completed_response(
+            &hub,
+            "thread",
+            "turn",
+            "final",
+            "thinking",
+            "answer",
+            "",
+            Some(&state),
+        );
+        let receive = async {
+            let AgentDurableEvent::TurnProviderHistoryAppended {
+                payload, item_id, ..
+            } = receiver.recv().await.unwrap()
+            else {
+                panic!("expected canonical history");
+            };
+            assert_eq!(item_id, "thinking");
+            let envelope: pioneer_provider::CanonicalProviderRoundEnvelope =
+                serde_json::from_value(payload).unwrap();
+            assert_eq!(
+                envelope.message.provider_replay_state.as_ref(),
+                Some(&state)
+            );
+            assert!(envelope.calls.is_empty());
+            receiver.acknowledge_last(Ok(()));
+        };
+        let (result, ()) = tokio::join!(publish, receive);
+        result.unwrap();
     }
 
     #[tokio::test]
@@ -2768,5 +2886,323 @@ fn observe_startup_chunk(turn_id: &str, chunk: &pioneer_provider::StreamChunk) {
     };
     if let Some(output) = output {
         turn_startup::runtime_output(turn_id, output);
+    }
+}
+
+#[cfg(test)]
+mod terminal_boundary_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FixtureProvider {
+        chunks: Vec<StreamChunk>,
+        fail: bool,
+        attempts: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Provider for FixtureProvider {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+        fn capabilities(&self) -> pioneer_provider::ProviderCapabilities {
+            pioneer_provider::ProviderCapabilities {
+                streaming: true,
+                ..Default::default()
+            }
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            anyhow::bail!("unexpected fallback/retry")
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            let mut chunks = self.chunks.iter().cloned().map(Ok).collect::<Vec<_>>();
+            if self.fail {
+                chunks.push(Err(
+                    pioneer_provider::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker
+                        .into(),
+                ));
+            }
+            Ok(Box::pin(futures_util::stream::iter(chunks)))
+        }
+    }
+    fn request() -> ChatRequest {
+        ChatRequest {
+            model: "fixture".into(),
+            messages: vec![pioneer_provider::ChatMessage::user("fixture")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        }
+    }
+    #[tokio::test]
+    async fn failed_partial_call_never_becomes_executable_round_or_automatic_retry() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn Provider> = Arc::new(FixtureProvider {
+            chunks: vec![StreamChunk::tool_calls(vec![ProviderToolCall {
+                id: "call".into(),
+                name: "write_file".into(),
+                arguments: "{}".into(),
+            }])],
+            fail: true,
+            attempts: attempts.clone(),
+        });
+        let hub = AgentEventHub::new();
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        let acknowledgement = tokio::spawn(async move {
+            let event = receiver.recv().await.unwrap();
+            let AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } = event else {
+                panic!("expected failed observation")
+            };
+            let envelope: pioneer_provider::CanonicalProviderRoundEnvelope =
+                serde_json::from_value(payload).unwrap();
+            assert_eq!(envelope.termination, ProviderTermination::ProviderError);
+            assert!(
+                envelope.calls.is_empty(),
+                "failed observations must not retain executable identities"
+            );
+            receiver.acknowledge_last(Ok(()));
+        });
+        let result = request_agent_round(
+            &provider,
+            request(),
+            "ws",
+            "thread",
+            "turn",
+            "item",
+            false,
+            ProviderTimeoutPolicy::default(),
+            &hub,
+        )
+        .await;
+        assert!(matches!(result, Err(ChatTurnError::ProviderFailure { .. })));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        acknowledgement.await.unwrap();
+    }
+    #[tokio::test]
+    async fn final_chunk_payload_is_accumulated_before_terminal_validation() {
+        let mut terminal = StreamChunk::final_chunk_with(ProviderTermination::Complete);
+        terminal.delta = "terminal text".into();
+        let provider: Arc<dyn Provider> = Arc::new(FixtureProvider {
+            chunks: vec![terminal],
+            fail: false,
+            attempts: Arc::new(AtomicUsize::new(0)),
+        });
+        let result = request_agent_round(
+            &provider,
+            request(),
+            "ws",
+            "thread",
+            "turn",
+            "item",
+            false,
+            ProviderTimeoutPolicy::default(),
+            &AgentEventHub::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.text, "terminal text");
+    }
+}
+
+#[cfg(test)]
+mod native_decoder_gate_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Test-only HTTP transport. No ready-made decoder errors: real adapters parse
+    // these bytes, then request_agent_round controls access to the tool dispatcher.
+    struct CountingTransport {
+        inner: Arc<dyn Provider>,
+        attempts: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Provider for CountingTransport {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        fn capabilities(&self) -> pioneer_provider::ProviderCapabilities {
+            self.inner.capabilities()
+        }
+        async fn chat(
+            &self,
+            request: ChatRequest,
+        ) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            self.inner.chat(request).await
+        }
+        async fn stream_chat(
+            &self,
+            request: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            self.inner.stream_chat(request).await
+        }
+    }
+    fn event(value: serde_json::Value) -> String {
+        format!("data: {value}\n\n")
+    }
+    fn closed_call() -> String {
+        event(serde_json::json!({"type":"message_start","message":{}}))
+            + &event(
+                serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"first","name":"write_file","input":{}}}),
+            )
+            + &event(serde_json::json!({"type":"content_block_stop","index":0}))
+    }
+
+    async fn check_gate(body: String, ollama: bool, success: bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(AtomicUsize::new(0));
+            let received_requests = requests.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                loop {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    assert!(request.len() <= 65536);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&request[..end]).unwrap();
+                        let length = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+                        }).unwrap_or(0);
+                        if request.len() >= end + 4 + length { break; }
+                    }
+                }
+                received_requests.fetch_add(1, Ordering::SeqCst);
+                let content_type = if ollama { "application/json" } else { "text/event-stream" };
+                let headers = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                // Wire fragmentation goes through reqwest and the production decoder.
+                for bytes in body.as_bytes().chunks(3) {
+                    // A malformed frame may make the client close before later frames.
+                    if socket.write_all(bytes).await.is_err() { return; }
+                }
+                let _ = socket.shutdown().await;
+            });
+            let inner: Arc<dyn Provider> = if ollama {
+                Arc::new(pioneer_provider::providers::OllamaProvider::with_base_url(base))
+            } else {
+                Arc::new(pioneer_provider::providers::AnthropicProvider::with_base_url("test-only", base))
+            };
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let name = if ollama { "ollama" } else { "anthropic" };
+            // Input preparation requires the authority scope supplied by the
+            // registry, including for text-only requests to the local transport.
+            let registry = pioneer_provider::ProviderRegistry::with_provider(
+                name,
+                Arc::new(CountingTransport { inner, attempts: attempts.clone() }),
+            );
+            let provider = registry.get_or_create_for_workspace("ws", name).unwrap();
+            assert!(provider.authority_fingerprint().is_some());
+            let hub = AgentEventHub::new();
+            let mut receiver = hub.take_durable_receiver().await.unwrap();
+            let observations = Arc::new(AtomicUsize::new(0));
+            let count = observations.clone();
+            let acknowledgements = tokio::spawn(async move {
+                while let Some(event) = receiver.recv().await {
+                    if let AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } = event {
+                        let envelope: pioneer_provider::CanonicalProviderRoundEnvelope = serde_json::from_value(payload).unwrap();
+                        assert_eq!(envelope.termination, ProviderTermination::ProviderError);
+                        assert!(envelope.calls.is_empty());
+                        assert_eq!(envelope.message.tool_calls.as_ref().unwrap().len(), 1);
+                        count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    receiver.acknowledge_last(Ok(()));
+                }
+            });
+            let request = ChatRequest {
+                model: "fixture".into(), messages: vec![pioneer_provider::ChatMessage::user("fixture")],
+                temperature: None, max_tokens: None, tools: None, tool_choice: None,
+                parallel_tool_calls: None, reasoning: None, compiled_prompt: None,
+            };
+            let result = request_agent_round(&provider, request, "ws", "thread", "turn", "item", ollama, ProviderTimeoutPolicy::default(), &hub).await;
+            let executions = AtomicUsize::new(0);
+            // Same boundary used by the runner: dispatch only a successful round.
+            if let Ok(round) = &result {
+                for _call in &round.tool_calls { executions.fetch_add(1, Ordering::SeqCst); }
+            }
+            assert_eq!(attempts.load(Ordering::SeqCst), 1, "no automatic retry/fallback");
+            assert_eq!(requests.load(Ordering::SeqCst), 1, "must reach the native decoder through HTTP");
+            if success {
+                assert!(result.is_ok());
+                assert_eq!(executions.load(Ordering::SeqCst), 1);
+            } else {
+                assert!(matches!(result, Err(ChatTurnError::ProviderFailure { .. })));
+                assert_eq!(executions.load(Ordering::SeqCst), 0);
+                if !ollama { assert_eq!(observations.load(Ordering::SeqCst), 1); }
+            }
+            server.await.unwrap();
+            acknowledgements.abort();
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn contradictory_native_finish_after_valid_call_fails_agent_gate() {
+        let body = closed_call()
+            + &event(
+                serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+            )
+            + &event(
+                serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+            )
+            + &event(serde_json::json!({"type":"message_stop"}));
+        check_gate(body, false, false).await;
+    }
+    #[tokio::test]
+    async fn malformed_native_block_after_valid_call_fails_agent_gate() {
+        for block in [
+            serde_json::json!({"type":"tool_use","id":"second","name":"write_file","input":{}}),
+            serde_json::json!({"type":"tool_use","name":"write_file","input":{}}),
+            serde_json::json!({"type":"tool_use","id":"second","input":{}}),
+        ] {
+            let index = if block.get("id").is_some() && block.get("name").is_some() {
+                0
+            } else {
+                1
+            };
+            let body = closed_call()
+                + &event(
+                    serde_json::json!({"type":"content_block_start","index":index,"content_block":block}),
+                )
+                + &event(serde_json::json!({"type":"content_block_stop","index":index}))
+                + &event(
+                    serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+                )
+                + &event(serde_json::json!({"type":"message_stop"}));
+            check_gate(body, false, false).await;
+        }
+    }
+    #[tokio::test]
+    async fn incomplete_ollama_non_stream_cannot_dispatch_tools() {
+        for done in [None, Some(false), Some(true)] {
+            let mut body = serde_json::json!({"message":{"tool_calls":[{"function":{"name":"write_file","arguments":{}}}]},"done_reason":"stop"});
+            if let Some(done) = done {
+                body["done"] = serde_json::json!(done);
+            }
+            check_gate(body.to_string(), true, done == Some(true)).await;
+        }
+        let body = closed_call()
+            + &event(
+                serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+            )
+            + &event(serde_json::json!({"type":"message_stop"}));
+        check_gate(body, false, true).await;
     }
 }

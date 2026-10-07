@@ -258,7 +258,8 @@ fn vector_provider_key_name(
 impl MessageProcessor {
     /// Process one owned RPC request from a fresh Tokio task.
     ///
-    /// Connection readers await this method, so requests remain ordered. The
+    /// Connection readers await this method, so requests remain ordered except
+    /// accepted voice finalization, which releases ingress at its ACK. The
     /// task boundary prevents a handler's generated poll stack from inheriting
     /// the WebSocket reader or another orchestration future, and aborts the
     /// handler if the awaiting connection workflow is cancelled.
@@ -267,6 +268,40 @@ impl MessageProcessor {
         connection: crate::request_context::ConnectionContext,
         payload: String,
     ) {
+        // A single, bounded exception to RPC completion ordering. Authentication,
+        // context validation and the ACK still run through the real dispatcher.
+        if let Ok(request) = serde_json::from_str::<JsonRpcRequest>(&payload)
+            && request.method == methods::VOICE_SESSION_FINALIZE
+        {
+            let Some(lease) = self.voice_finalizations.reserve(connection.connection_id()) else {
+                self.send_error(
+                    connection.connection_id(),
+                    JsonRpcErrorResponse::new(
+                        Some(request.id),
+                        INVALID_REQUEST_CODE,
+                        "voice finalization is busy or shutting down",
+                    ),
+                )
+                .await;
+                return;
+            };
+            let (accepted, ingress) = tokio::sync::oneshot::channel();
+            let tasks = self.voice_finalizations.tasks.clone();
+            tasks.spawn(pioneer_observability::turn_startup::scope(
+                pioneer_observability::turn_startup::current_key(),
+                async move {
+                    let _lease = lease;
+                    crate::voice::finalization::with_ack(accepted, async {
+                        self.process_request(&connection, &payload).await;
+                    })
+                    .await;
+                },
+            ));
+            // Invalid requests finish/drop sender without ACK; accepted requests
+            // release the reader while their tracked worker retains the slot.
+            let _ = ingress.await;
+            return;
+        }
         match message_fresh_task(async move {
             self.process_request(&connection, payload.as_str()).await;
         })
@@ -8067,11 +8102,6 @@ impl MessageProcessor {
     }
 
     pub async fn connection_closed(&self, connection_id: ConnectionId) {
-        self.artifact_uploads.abort_connection(connection_id).await;
-        self.skill_upload_owners
-            .lock()
-            .await
-            .retain(|_, owner| owner.connection_id != connection_id);
         let removed_voice_sessions = self.voice_sessions.cleanup_connection(connection_id);
         for session in &removed_voice_sessions {
             let _ = self
@@ -8088,6 +8118,12 @@ impl MessageProcessor {
                 "removed active voice sessions after connection closed"
             );
         }
+
+        self.artifact_uploads.abort_connection(connection_id).await;
+        self.skill_upload_owners
+            .lock()
+            .await
+            .retain(|_, owner| owner.connection_id != connection_id);
 
         let removed_threads = self
             .thread_manager

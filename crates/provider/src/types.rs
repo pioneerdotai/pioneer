@@ -494,6 +494,22 @@ pub struct MessageSourceAlias {
     pub thread_id: String,
     pub source: MessageSourceRef,
 }
+impl MessageSourceAlias {
+    /// Exact canonical response -> model-facing UI copy. Never a turn-wide alias.
+    pub fn is_response_copy(&self) -> bool {
+        self.thread_id == self.represented_thread_id
+            && self
+                .represented_source
+                .scope
+                .strip_prefix("context:")
+                .is_some_and(|turn| {
+                    !turn.is_empty() && self.source.scope.strip_prefix("event:") == Some(turn)
+                })
+            && !self.source.version.is_empty()
+            && !self.represented_source.version.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MessageSourceIdentity {
     pub thread_id: String,
@@ -833,9 +849,15 @@ pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub temperature: Option<f32>,
+    /// Prepared generation reserve. Adapters must preserve this bound in their
+    /// native field. For inclusive APIs it covers thinking + visible output;
+    /// visible-only APIs need a separate prepared thinking reserve or an
+    /// explicit restriction. Qualitative effort never invents token budgets.
     pub max_tokens: Option<u32>,
     pub tools: Option<Vec<ToolDefinition>>,
     pub tool_choice: Option<ToolChoice>,
+    /// true permits multiple calls (it does not require them); false requires
+    /// at most one call per response and must be enforced or rejected locally.
     pub parallel_tool_calls: Option<bool>,
     pub reasoning: Option<ReasoningConfig>,
     pub compiled_prompt: Option<CompiledPromptPayload>,
@@ -859,11 +881,14 @@ impl EmbeddingRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddingResponse {
     pub embeddings: Vec<Vec<f32>>,
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningConfig {
+    /// Explicit off; differs from an omitted setting (server default).
     Disabled,
+    /// Includes explicit `None`, serialized as the protocol's off control.
     Effort(ReasoningEffort),
 }
 
@@ -1006,7 +1031,7 @@ impl ProviderTermination {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TokenUsage {
     /// Full effective input, including cache reads/writes exactly once.
     /// None means unreported, never zero by implication.

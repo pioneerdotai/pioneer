@@ -4257,10 +4257,9 @@ async fn restore_accepted_execution_basis_prepared(
                         })?;
                     output_aliases.extend(graph.replay_aliases.iter().filter_map(
                         |(copy, represented)| {
-                            graph
-                                .input_replay_aliases
-                                .contains(copy)
-                                .then(|| (copy.clone(), represented.clone()))
+                            (graph.input_replay_aliases.contains(copy)
+                                || copy.source.scope.starts_with("event:"))
+                            .then(|| (copy.clone(), represented.clone()))
                         },
                     ));
                     output_ambiguous.extend(graph.ambiguous_input_aliases.iter().cloned());
@@ -4300,7 +4299,14 @@ async fn restore_accepted_execution_basis_prepared(
                          represented_thread: &str,
                          represented: &SourceRef|
      -> Result<()> {
-        if !copy.scope.starts_with("input:") || !represented.scope.starts_with("input:") {
+        let input_copy =
+            copy.scope.starts_with("input:") && represented.scope.starts_with("input:");
+        let response_copy = copy_thread == represented_thread
+            && represented
+                .scope
+                .strip_prefix("context:")
+                .is_some_and(|turn| copy.scope.strip_prefix("event:") == Some(turn));
+        if !input_copy && !response_copy {
             return Ok(());
         }
         let copy = pioneer_compaction::frozen::ScopedReplaySource {
@@ -4316,14 +4322,15 @@ async fn restore_accepted_execution_basis_prepared(
             source: represented.source.clone(),
         }) {
             alias_graph.insert(copy, represented, None)?;
-        } else {
+        } else if input_copy {
             alias_graph.insert(copy.clone(), copy, None)?;
         }
         Ok(())
     };
     if let Some(graph) = external_graph {
         for (copy, represented) in &graph.replay_aliases {
-            if graph.input_replay_aliases.contains(copy) {
+            if graph.input_replay_aliases.contains(copy) || copy.source.scope.starts_with("event:")
+            {
                 add_alias(
                     &copy.thread,
                     &copy.source,
@@ -4353,7 +4360,8 @@ async fn restore_accepted_execution_basis_prepared(
             .await?
             .ok_or_else(|| anyhow::anyhow!("selected checkpoint graph disappeared"))?;
         for (copy, represented) in &graph.replay_aliases {
-            if graph.input_replay_aliases.contains(copy) {
+            if graph.input_replay_aliases.contains(copy) || copy.source.scope.starts_with("event:")
+            {
                 add_alias(
                     &copy.thread,
                     &copy.source,
@@ -4379,7 +4387,9 @@ async fn restore_accepted_execution_basis_prepared(
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("checkpoint source disappeared"))?;
                 for (copy, represented) in &graph.replay_aliases {
-                    if graph.input_replay_aliases.contains(copy) {
+                    if graph.input_replay_aliases.contains(copy)
+                        || copy.source.scope.starts_with("event:")
+                    {
                         add_alias(
                             &copy.thread,
                             &copy.source,
@@ -4475,7 +4485,7 @@ async fn restore_accepted_execution_basis_prepared(
         };
         if !omitted.contains(&ordinal)
             && !accepted.contains_key(&ordinal)
-            && source.scope.starts_with("input:")
+            && (source.scope.starts_with("input:") || source.scope.starts_with("event:"))
             && reference.complete
             && !reference.protected_input
             && reference.source_aliases.is_empty()

@@ -73,12 +73,15 @@ impl SourceSnapshot {
 pub struct GeneratedCatalog {
     pub models: BTreeMap<String, BTreeMap<String, Value>>,
     pub provenance: BTreeMap<String, BTreeMap<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_capabilities: Option<super::ToolCapabilities>,
 }
 impl GeneratedCatalog {
     pub fn validate(&self) -> Result<()> {
-        ModelCatalog::parse(
+        ModelCatalog::parse_with_capabilities(
             &serde_json::to_string(&self.models)?,
             &serde_json::to_string(&self.provenance)?,
+            self.tool_capabilities.clone(),
         )?;
         for (provider, models) in &self.models {
             ensure!(
@@ -102,9 +105,9 @@ impl GeneratedCatalog {
                     "invalid reasoning metadata"
                 );
                 ensure!(
-                    model["input"].as_array().is_some_and(|a| !a.is_empty()
-                        && a.iter()
-                            .all(|v| matches!(v.as_str(), Some("text" | "image")))),
+                    model["input"].as_array().is_some_and(|a| a
+                        .iter()
+                        .all(|v| v.as_str().is_some_and(|s| !s.is_empty()))),
                     "invalid model modalities"
                 );
                 for field in ["input", "output", "cacheRead", "cacheWrite"] {
@@ -126,6 +129,7 @@ struct Candidate {
     output_origin: LimitOrigin,
     reasoning_options: Value,
     input_limit: Option<u64>,
+    tool_calling: Option<bool>,
 }
 impl Candidate {
     fn id(&self) -> &str {
@@ -237,12 +241,18 @@ fn base(
     Candidate {
         model: json!({"id":id,"name":source["name"].as_str().filter(|s|!s.is_empty()).unwrap_or(id),
         "provider":provider,"api":api,"baseUrl":url,"reasoning":source["reasoning"]==true,
-        "input":if has(&source["modalities"]["input"],"image") {vec!["text","image"]} else {vec!["text"]},
-        "cost":cost(&source["cost"]),"contextWindow":context,"maxTokens":output}),
+        "input":source["modalities"]["input"].as_array().cloned().unwrap_or_default(),
+        "inputOrigin":{"kind":if source["modalities"]["input"].is_array(){"source"}else{"fallback"},"expression":"models.dev.modalities.input"},
+        "sourceMetadata":source,
+        "inputConstraints":source["inputConstraints"],
+        "output":source["modalities"]["output"],
+        "cost":cost(&source["cost"]),"contextWindow":context,"maxTokens":output,
+        "sourceGeneration":{"temperature":source["temperature"],"reasoningOptions":source["reasoning_options"]}}),
         context_origin,
         output_origin,
         reasoning_options: source["reasoning_options"].clone(),
         input_limit: source["limit"]["input"].as_u64().filter(|limit| *limit > 0),
+        tool_calling: source["tool_call"].as_bool(),
     }
 }
 
@@ -250,7 +260,7 @@ fn base(
 /// in the saved fixture. First source wins identity collisions, as in Pi.
 pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCatalog> {
     snapshot.validate()?;
-    let mut candidates = sources::models_dev(
+    let (mut candidates, specialized) = sources::models_dev(
         &snapshot.sources[SOURCE_URLS[0]].body,
         &snapshot.sources[SOURCE_URLS[3]].body,
         strict,
@@ -263,6 +273,12 @@ pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCata
                 && m.id() == "gpt-5.3-codex-spark")
     });
     overrides::apply(&mut candidates)?;
+    let supplements = sources::registered_supplements(
+        &snapshot.sources[SOURCE_URLS[0]].body,
+        &specialized,
+        &candidates,
+    );
+    candidates.extend(supplements);
     for model in &mut candidates {
         compatibility::apply(model);
     }
@@ -270,6 +286,7 @@ pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCata
     let mut output = GeneratedCatalog {
         models: BTreeMap::new(),
         provenance: BTreeMap::new(),
+        tool_capabilities: Some(sources::tool_capabilities(snapshot)),
     };
     for candidate in candidates {
         let provider = candidate.provider().to_owned();
@@ -280,6 +297,9 @@ pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCata
         }
         let mut origins =
             json!({"contextWindow":candidate.context_origin,"maxTokens":candidate.output_origin});
+        if let Some(supported) = candidate.tool_calling {
+            origins["toolCalling"] = json!(supported);
+        }
         if let Some(value) = candidate.input_limit {
             // Keep the Pi model contract unchanged; retain this additional
             // authoritative constraint beside its source provenance.
@@ -356,15 +376,36 @@ mod tests {
     }
 
     #[test]
-    fn entire_pinned_catalog_matches_pi_reference() {
-        let generated = generate(&snapshot(), true).unwrap();
-        let reference: Value =
+    fn pinned_non_media_catalog_contract_matches_pi_reference() {
+        let mut generated = generate(&snapshot(), true).unwrap();
+        // Pioneer exposes standard CN/global profiles as well as Pi's coding
+        // plans. The supplements are verified against their own source below.
+        for supplement in ["glm", "zai-standard"] {
+            assert!(generated.models.remove(supplement).is_some());
+            assert!(generated.provenance.remove(supplement).is_some());
+        }
+        // Pi's explicit DeepSeek definitions predate the pinned source snapshot.
+        // Pioneer keeps source limits/modalities/prices authoritative. This
+        // explicit golden overlay covers the full changed provider subtree,
+        // including the source-only alias, without dropping it from comparison.
+        let deepseek: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/catalog/pioneer-deepseek.json"
+        ))
+        .unwrap();
+        let mut reference: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/provenance.json"))
                 .unwrap();
+        reference["deepseek"] = deepseek["provenance"].clone();
         let mut origins = Vec::new();
         for (p, models) in &generated.provenance {
+            if reference.get(p).is_none() {
+                continue;
+            }
             for (id, fields) in models {
                 for field in ["contextWindow", "maxTokens"] {
+                    if reference[p][id].is_null() {
+                        continue;
+                    }
                     differences(
                         &format!("{p}/{id}/{field}/kind"),
                         &fields[field]["kind"],
@@ -379,9 +420,50 @@ mod tests {
             "origin differences:\n{}",
             origins.join("\n")
         );
-        let actual = serde_json::to_value(generated.models).unwrap();
-        let expected: Value =
+        let mut actual = serde_json::to_value(generated.models).unwrap();
+        let mut expected: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json")).unwrap();
+        expected["deepseek"] = deepseek["models"].clone();
+        // Preserve the old reader fixture while the generator fixes 3.1 Pro.
+        for models in expected.as_object_mut().unwrap().values_mut() {
+            for model in models.as_object_mut().unwrap().values_mut() {
+                if model["api"] == "google-generative-ai"
+                    && model["id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("gemini-3.1-pro"))
+                {
+                    model["thinkingLevelMap"]["medium"] = json!("MEDIUM");
+                }
+            }
+        }
+        // Compare the pinned Pi surface, which deliberately had text/image
+        // only. Pioneer media supplements and new registered source routes
+        // have their own propagation fixtures below.
+        let providers = actual.as_object_mut().unwrap();
+        providers.retain(|p, _| !expected[p].is_null());
+        for (p, models) in providers {
+            models
+                .as_object_mut()
+                .unwrap()
+                .retain(|id, _| !expected[p][id].is_null());
+            for model in models.as_object_mut().unwrap().values_mut() {
+                let image = has(&model["input"], "image");
+                model["input"] = if image {
+                    json!(["text", "image"])
+                } else {
+                    json!(["text"])
+                };
+                for field in [
+                    "sourceGeneration",
+                    "inputOrigin",
+                    "sourceMetadata",
+                    "inputConstraints",
+                    "output",
+                ] {
+                    model.as_object_mut().unwrap().remove(field);
+                }
+            }
+        }
         let mut diff = Vec::new();
         differences("", &actual, &expected, &mut diff);
         assert!(
@@ -400,6 +482,55 @@ mod behavior_tests {
         serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json")).unwrap()
     }
     #[test]
+    fn glm_region_and_product_catalogs_use_their_own_sources() {
+        let mut source = snapshot();
+        let data = &mut source.sources.get_mut(SOURCE_URLS[0]).unwrap().body;
+        for (upstream, context, price) in [("zai", 61001, 1.25), ("zhipuai", 62002, 2.5)] {
+            data[upstream]["models"]["fixture-standard"] = json!({
+                "tool_call":true, "name":"Fixture standard", "limit":{"context":context,"output":1024},
+                "modalities":{"input":["text"]}, "cost":{"input":price}
+            });
+        }
+        let generated = generate(&source, true).unwrap();
+        // Runtime profile aliases must use their specialized catalog source,
+        // without a second generic row under the runtime provider name.
+        for runtime in ["zai-coding", "glm-coding"] {
+            assert!(!generated.models.contains_key(runtime));
+        }
+        let reader = ModelCatalog::parse(
+            &serde_json::to_string(&generated.models).unwrap(),
+            &serde_json::to_string(&generated.provenance).unwrap(),
+        )
+        .unwrap();
+        for (runtime, url, context, price) in [
+            ("zai", "https://api.z.ai/api/paas/v4", 61001, 1.25),
+            ("glm", "https://open.bigmodel.cn/api/paas/v4", 62002, 2.5),
+        ] {
+            let model = reader.model(runtime, "fixture-standard").unwrap();
+            assert_eq!(model.base_url, url);
+            assert_eq!(model.api, "openai-completions");
+            assert_eq!(model.cost["input"], price);
+            assert_eq!(
+                reader.limits(runtime, "fixture-standard").context_window,
+                context
+            );
+            assert_eq!(
+                reader.limits(runtime, "fixture-standard").context_origin,
+                OriginKind::Source
+            );
+        }
+        assert!(reader.model("zai-coding", "fixture-standard").is_none());
+        assert!(reader.model("glm-coding", "fixture-standard").is_none());
+        assert_eq!(
+            reader.model("zai-coding", "glm-5.2").unwrap().base_url,
+            "https://api.z.ai/api/coding/paas/v4"
+        );
+        assert_eq!(
+            reader.model("glm-coding", "glm-5.2").unwrap().base_url,
+            "https://open.bigmodel.cn/api/coding/paas/v4"
+        );
+    }
+    #[test]
     fn new_entries_are_transformed_and_unknown_limits_remain_unknown() {
         let mut source = snapshot();
         source.sources.get_mut(SOURCE_URLS[0]).unwrap().body["openai"]["models"]["fixture-new"] = json!({"name":"New source model","tool_call":true,"reasoning":true,"reasoning_options":[{"type":"effort","values":["none","high"]}],"modalities":{"input":["text","image"]},"cost":{"input":2.25}});
@@ -410,6 +541,10 @@ mod behavior_tests {
         assert_eq!(model["cost"]["input"], 2.25);
         assert_eq!(model["thinkingLevelMap"]["off"], "none");
         assert_eq!(model["thinkingLevelMap"]["high"], "high");
+        assert_eq!(
+            result.provenance["openai"]["fixture-new"]["toolCalling"],
+            true
+        );
         let reader = ModelCatalog::parse(
             &serde_json::to_string(&result.models).unwrap(),
             &serde_json::to_string(&result.provenance).unwrap(),
@@ -534,6 +669,282 @@ mod validation_tests {
             snapshot.sources.get_mut(SOURCE_URLS[0]).unwrap().body["openai"]["models"]["fixture-invalid-price"] =
                 json!({"tool_call":true,"cost":{"input":invalid}});
             assert!(generate(&snapshot, true).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod media_propagation_tests {
+    use super::*;
+    #[test]
+    fn source_modalities_and_constraints_survive_all_dynamic_transform_paths() {
+        let mut snapshot: SourceSnapshot =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                .unwrap();
+        let input = json!(["text", "image", "audio", "video", "pdf"]);
+        let source = json!({"name":"media fixture","tool_call":true,"modalities":{"input":input,"output":["text","audio"]},"inputConstraints":{"audio":{"mimeTypes":["audio/wav"],"maxBytes":4096}},"limit":{"context":64000,"output":4000}});
+        for provider in ["openai", "google", "groq", "venice"] {
+            snapshot.sources.get_mut(SOURCE_URLS[0]).unwrap().body[provider]["models"]["fixture-media"] =
+                source.clone();
+        }
+        // Source identity may use an existing alias or declare the same
+        // registered endpoint. Neither path requires a manual model registry.
+        let data = &mut snapshot.sources.get_mut(SOURCE_URLS[0]).unwrap().body;
+        data["volcengine"]["models"]["fixture-media"] = source.clone();
+        data["novita-ai"]["models"]["fixture-media"] = source.clone();
+        data["novita-ai"]["api"] = json!(
+            crate::definition::provider_definition("novita")
+                .unwrap()
+                .default_base_url
+                .unwrap()
+        );
+        snapshot.sources.get_mut(SOURCE_URLS[0]).unwrap().body["groq"]["models"]["fixture-unknown"] =
+            json!({"tool_call":true});
+        snapshot.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"].as_array_mut().unwrap().push(json!({"id":"fixture/media","name":"media fixture","supported_parameters":["tools"],"architecture":{"input_modalities":input,"output_modalities":["text","audio"]}}));
+        snapshot.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"].as_array_mut().unwrap().push(json!({"id":"fixture/media","tags":["tool-use"],"input_modalities":input,"output_modalities":["text","audio"]}));
+        let generated = generate(&snapshot, true).unwrap();
+        generated.validate().unwrap();
+        for (provider, id) in [
+            ("openai", "fixture-media"),
+            ("google", "fixture-media"),
+            ("groq", "fixture-media"),
+            ("venice", "fixture-media"),
+            ("novita", "fixture-media"),
+            ("doubao", "fixture-media"),
+            ("openrouter", "fixture/media"),
+            ("vercel-ai-gateway", "fixture/media"),
+        ] {
+            let model = &generated.models[provider][id];
+            assert_eq!(model["input"], input, "{provider}");
+            assert_eq!(model["output"], json!(["text", "audio"]), "{provider}");
+            assert_eq!(model["inputOrigin"]["kind"], "source");
+        }
+        assert_eq!(
+            generated.models["groq"]["fixture-unknown"]["input"],
+            json!([])
+        );
+        assert_eq!(
+            generated.models["groq"]["fixture-unknown"]["inputOrigin"]["kind"],
+            "fallback"
+        );
+        assert_eq!(
+            generated.models["venice"]["fixture-media"]["inputConstraints"],
+            source["inputConstraints"]
+        );
+        // Source limits retain their provenance; media support never fabricates
+        // a measured token count or a provider billing limit.
+        assert_eq!(
+            generated.provenance["venice"]["fixture-media"]["contextWindow"]["kind"],
+            "source"
+        );
+    }
+}
+
+#[cfg(test)]
+mod partial_source_tests {
+    use super::*;
+    #[test]
+    fn positive_vercel_vision_tag_is_partial_while_explicit_input_array_is_complete() {
+        let mut snapshot: SourceSnapshot =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                .unwrap();
+        snapshot.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":"fixture/vision-tag","tags":["tool-use","vision"]}));
+        snapshot.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"].as_array_mut().unwrap().push(json!({"id":"fixture/vision-array","tags":["tool-use","vision"],"input_modalities":["text","image"]}));
+        let generated = generate(&snapshot, true).unwrap();
+        let catalog = ModelCatalog::parse(
+            &serde_json::to_string(&generated.models).unwrap(),
+            &serde_json::to_string(&generated.provenance).unwrap(),
+        )
+        .unwrap();
+        use super::super::InputCapabilityState;
+        use crate::InputContentType;
+        let partial = catalog
+            .model("vercel-ai-gateway", "fixture/vision-tag")
+            .unwrap();
+        assert_eq!(
+            partial.input_capability(InputContentType::Image),
+            InputCapabilityState::Supported
+        );
+        for kind in [
+            InputContentType::Audio,
+            InputContentType::Video,
+            InputContentType::File,
+        ] {
+            assert_eq!(
+                partial.input_capability(kind),
+                InputCapabilityState::Unknown
+            );
+        }
+        assert_eq!(
+            catalog
+                .model("vercel-ai-gateway", "fixture/vision-array")
+                .unwrap()
+                .input_capability(InputContentType::Audio),
+            InputCapabilityState::Unsupported
+        );
+    }
+}
+
+#[cfg(test)]
+mod specialized_zero_regressions {
+    use super::*;
+    #[test]
+    fn native_openrouter_route_owns_filters_and_conflicting_model_metadata() {
+        for strict in [false, true] {
+            let mut s: SourceSnapshot =
+                serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                    .unwrap();
+            let conflicting = json!({"tool_call":true,"modalities":{"input":["image"]},"limit":{"context":999,"output":999}});
+            s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["openrouter"]["models"]["fixture/native-negative"] =
+                conflicting.clone();
+            s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["openrouter"]["models"]["fixture/native-positive"] =
+                conflicting;
+            s.sources.get_mut(SOURCE_URLS[1]).unwrap().body = json!({"data":[
+                {"id":"fixture/native-negative","name":"Native negative","supported_parameters":[],"architecture":{"input_modalities":["text"],"output_modalities":["text"]}},
+                {"id":"fixture/native-positive","name":"Native positive","supported_parameters":["tools"],"architecture":{"input_modalities":["text"],"output_modalities":["text"]},"context_length":64000,"top_provider":{"max_completion_tokens":4000}}
+            ]});
+            let generated = generate(&s, strict).unwrap();
+            assert!(
+                generated.models["openrouter"]
+                    .get("fixture/native-negative")
+                    .is_none()
+            );
+            let native = &generated.models["openrouter"]["fixture/native-positive"];
+            assert_eq!(native["input"], json!(["text"]));
+            assert_eq!(native["contextWindow"], 64000);
+            assert_eq!(native["maxTokens"], 4000);
+            s.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
+                .as_array_mut()
+                .unwrap()
+                .pop();
+            let zero = generate(&s, strict).unwrap();
+            assert!(zero.models.get("openrouter").is_none_or(|models| {
+                models.get("fixture/native-negative").is_none()
+                    && models.get("fixture/native-positive").is_none()
+            }));
+        }
+    }
+
+    #[test]
+    fn registered_supplements_preserve_existing_explicit_priority_and_refresh_new_ids() {
+        let mut s: SourceSnapshot =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                .unwrap();
+        let changed = json!({"tool_call":true,"name":"dynamic","modalities":{"input":["text"]},"cost":{"input":99,"output":99},"limit":{"context":64000,"output":4000}});
+        s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["deepseek"]["models"]["deepseek-v4-flash"] =
+            changed.clone();
+        s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["anthropic"]["models"]["claude-opus-4-6"] =
+            changed.clone();
+        s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["deepseek"]["models"]["fixture-dynamic"] =
+            changed;
+        let generated = generate(&s, true).unwrap();
+        let known = &generated.models["deepseek"]["deepseek-v4-flash"];
+        // DeepSeek's existing IDs, like new IDs, are source-owned. Do not
+        // reintroduce stale pinned limits/prices to exercise override priority.
+        assert_eq!(known["contextWindow"], 64000);
+        assert_eq!(known["maxTokens"], 4000);
+        assert_eq!(
+            known["cost"],
+            json!({"input":99,"output":99,"cacheRead":0,"cacheWrite":0})
+        );
+        assert_eq!(
+            generated.provenance["deepseek"]["deepseek-v4-flash"]["contextWindow"]["kind"],
+            "source"
+        );
+        // A genuine explicit context override retains priority, while the
+        // independently source-owned output limit continues to refresh.
+        assert_eq!(
+            generated.models["anthropic"]["claude-opus-4-6"]["contextWindow"],
+            1_000_000
+        );
+        assert_eq!(
+            generated.models["anthropic"]["claude-opus-4-6"]["maxTokens"],
+            4000
+        );
+        assert_eq!(
+            generated.provenance["anthropic"]["claude-opus-4-6"]["contextWindow"]["kind"],
+            "override"
+        );
+        let dynamic = &generated.models["deepseek"]["fixture-dynamic"];
+        assert_eq!(dynamic["contextWindow"], 64000);
+        assert_eq!(dynamic["maxTokens"], 4000);
+        assert_eq!(dynamic["cost"]["input"].as_f64(), Some(99.0));
+        assert_eq!(
+            generated.provenance["deepseek"]["fixture-dynamic"]["contextWindow"]["kind"],
+            "source"
+        );
+        s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["deepseek"]["models"]["fixture-dynamic"]
+            ["limit"]["context"] = json!(96000);
+        assert_eq!(
+            generate(&s, true).unwrap().models["deepseek"]["fixture-dynamic"]["contextWindow"],
+            96000
+        );
+    }
+
+    #[test]
+    fn nvidia_zero_eligible_never_refills_from_generic_source() {
+        for strict in [false, true] {
+            for (source_id, live_id, input, output, accepted) in [
+                (
+                    "stale/id",
+                    "different/live",
+                    json!(["text"]),
+                    json!(["text"]),
+                    false,
+                ),
+                (
+                    "google/gemma-2-2b-it",
+                    "google/gemma-2-2b-it",
+                    json!(["text"]),
+                    json!(["text"]),
+                    false,
+                ),
+                (
+                    "native/id",
+                    "native/id",
+                    json!(["image"]),
+                    json!(["text"]),
+                    false,
+                ),
+                (
+                    "native/id",
+                    "native/id",
+                    json!(["text"]),
+                    json!(["image"]),
+                    false,
+                ),
+                (
+                    "Native_ID",
+                    "native.id",
+                    json!(["text", "image"]),
+                    json!(["text"]),
+                    true,
+                ),
+            ] {
+                let mut s: SourceSnapshot =
+                    serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                        .unwrap();
+                s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["nvidia"]["models"] = json!({source_id:{"name":"native","tool_call":true,"modalities":{"input":input,"output":output},"limit":{"context":4096,"output":1024},"cost":{"input":0,"output":0}}});
+                s.sources.get_mut(SOURCE_URLS[3]).unwrap().body = json!({"data":[{"id":live_id}]});
+                s.validate().unwrap();
+                let generated = generate(&s, strict).unwrap();
+                let models = generated.models.get("nvidia");
+                assert_eq!(
+                    models.is_some_and(|m| !m.is_empty()),
+                    accepted,
+                    "{source_id}, {strict}"
+                );
+                if accepted {
+                    let row = &generated.models["nvidia"][live_id];
+                    assert_eq!(row["id"], live_id);
+                    assert_eq!(row["headers"]["NVCF-POLL-SECONDS"], "3600");
+                    assert_eq!(row["compat"]["supportsDeveloperRole"], false);
+                    assert_eq!(row["compat"]["supportsStore"], false);
+                }
+            }
         }
     }
 }

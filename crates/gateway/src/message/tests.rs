@@ -1,3 +1,15 @@
+#[path = "tests/cli_runtime_active_bindings.rs"]
+mod cli_runtime_active_bindings;
+
+#[path = "tests/agent_action_outbox.rs"]
+mod agent_action_outbox;
+
+#[path = "tests/history_continuation.rs"]
+mod history_continuation;
+
+#[path = "tests/compaction_lifecycle_poll.rs"]
+mod compaction_lifecycle_poll;
+
 #[path = "tests/task_run_occurrence_tracker.rs"]
 mod task_run_occurrence_tracker;
 
@@ -14,7 +26,7 @@ mod task_capsule;
 mod reconciliation_workers;
 
 use super::{
-    AuthenticatedTransferOwner, CLIRuntimeMachineRequestKey, MessageProcessor,
+    AuthenticatedTransferOwner, CLIRuntimeMachineRequestKey, MessageFuture, MessageProcessor,
     ProgressItemRegistry, ResilienceWorkerFailureImpact, message_future, now_timestamp_secs,
     record_resilience_worker_error, record_resilience_worker_poll_error,
 };
@@ -197,6 +209,30 @@ mod member_client_harness;
 
 fn default_test_permission_profile() -> pioneer_protocol::TurnPermissionProfileSnapshot {
     pioneer_protocol::default_turn_permission_profile_snapshot()
+}
+
+async fn assert_admitted_turn_owner(processor: &MessageProcessor, thread_id: &str, turn_id: &str) {
+    let receipt = processor
+        .crud_store
+        .get_turn_execution(turn_id)
+        .await
+        .expect("ownership lookup should succeed")
+        .expect("an admitted executable Turn must have an ownership receipt");
+    assert_eq!(receipt.thread_id, thread_id);
+    assert_eq!(receipt.turn_id, turn_id);
+    assert_eq!(
+        receipt.owner_id.as_str(),
+        processor.turn_execution_owner_id.as_ref()
+    );
+    assert_eq!(receipt.owner_generation, 1);
+    assert!(
+        processor
+            .crud_store
+            .get_turn_admission(turn_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 async fn registered_request_context(
@@ -645,9 +681,11 @@ struct RecordingCliRuntimeSession {
     turn_steer_result: TokioMutex<Option<CLIAgentRuntimeTurnSteerResult>>,
     turn_observation: TokioMutex<Option<CLIAgentRuntimeTurnObservation>>,
     turn_liveness_probe: TokioMutex<Option<CLIAgentRuntimeTurnLivenessProbe>>,
+    turn_liveness_probe_started: tokio::sync::Notify,
     mcp_preparations: TokioMutex<Vec<(String, String)>>,
     projected_mcp_store: TokioMutex<Option<Arc<CrudStore>>>,
     mcp_retargets: TokioMutex<Vec<(String, String, String)>>,
+    mcp_terminals: TokioMutex<Vec<String>>,
     goal_resets: TokioMutex<Vec<String>>,
     fail_next_goal_reset: TokioMutex<bool>,
     goal_clears: TokioMutex<Vec<String>>,
@@ -882,6 +920,11 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         }))
     }
 
+    async fn terminal_mcp_turn(&self, turn_id: &str) -> anyhow::Result<()> {
+        self.mcp_terminals.lock().await.push(turn_id.to_owned());
+        Ok(())
+    }
+
     async fn retarget_mcp_turn(
         &self,
         pioneer_turn_id: &str,
@@ -966,6 +1009,7 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         _native_thread_id: &str,
         _native_turn_id: &str,
     ) -> anyhow::Result<CLIAgentRuntimeTurnLivenessProbe> {
+        self.turn_liveness_probe_started.notify_one();
         Ok(self
             .turn_liveness_probe
             .lock()
@@ -3348,6 +3392,47 @@ struct DelayedProvider {
     text: String,
 }
 
+struct CancellationBarrierProvider {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl Provider for CancellationBarrierProvider {
+    fn name(&self) -> &str {
+        "delayed"
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: true,
+            embeddings: false,
+            transcription: false,
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+    async fn chat(&self, _request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(ChatResponse {
+            text: "released".to_owned(),
+            usage: None,
+            reasoning_content: None,
+            provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::Complete,
+            tool_calls: Vec::new(),
+        })
+    }
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![Ok(StreamChunk::delta(response.text))]).boxed())
+    }
+}
+
 struct RevisionProvider {
     requests: std::sync::Mutex<Vec<ChatRequest>>,
 }
@@ -3868,6 +3953,37 @@ impl Provider for CaptureSummaryProvider {
         }
     }
 
+    async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
+        if !self.native_attachments || self.name != "openai" {
+            anyhow::bail!("provider '{}' does not support listing models", self.name);
+        }
+        // Media fixtures opt into the real Chat adapter contract and discover
+        // these test models through their workspace's authority wrapper.
+        Ok(["test-model", "o4-mini"]
+            .into_iter()
+            .map(|id| pioneer_protocol::ProviderModelInfo {
+                id: id.to_owned(),
+                name: Some(format!("{id} native capture fixture")),
+                description: None,
+                created: None,
+                provider: "openai".to_owned(),
+                owned_by: None,
+                limits: Default::default(),
+                capabilities: pioneer_protocol::ProviderModelCapabilities {
+                    vision: Some(true),
+                    input_modalities: Some(vec!["text".into(), "image".into(), "pdf".into()]),
+                    output_modalities: Some(vec!["text".into()]),
+                    ..Default::default()
+                },
+                transcription: None,
+                pricing: None,
+                active: Some(true),
+                family: None,
+                lifecycle_status: None,
+            })
+            .collect())
+    }
+
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
         let is_summary_request = self.valid_summary_completion
             && request.messages.first().is_some_and(|message| {
@@ -3887,7 +4003,7 @@ impl Provider for CaptureSummaryProvider {
                         format!("{runtime} manual answer 1"),
                         format!("{runtime} manual answer 2"),
                         format!("historical-{runtime}.png"),
-                        format!("historical-{runtime}.txt"),
+                        format!("historical-{runtime}.pdf"),
                         format!("mcp-tool:workspace:history:{runtime}"),
                     ]
                 })
@@ -4063,6 +4179,7 @@ impl Provider for PromptParityCaptureProvider {
                 tool_calling: Some(true),
                 thinking: Some(true),
                 reasoning: Some(pioneer_protocol::ProviderModelReasoningCapabilities {
+                    native: Default::default(),
                     supported: Some(true),
                     effort_options: vec![
                         "minimal".to_owned(),
@@ -4526,6 +4643,7 @@ struct Phase13RecordingHookHandler {
 struct TaskPostTurnRecordingHookHandler {
     hook_id: HookId,
     calls: Arc<std::sync::Mutex<Vec<HookHandlerRequest>>>,
+    cancellation_barrier: Option<Arc<CancellationEffectBarrier>>,
 }
 
 #[async_trait::async_trait]
@@ -4556,6 +4674,10 @@ impl HookHandler for TaskPostTurnRecordingHookHandler {
             .lock()
             .expect("Task post-turn hook calls lock")
             .push(request);
+        if let Some(barrier) = &self.cancellation_barrier {
+            barrier.hook_entered.notify_one();
+            barrier.release.acquire().await.unwrap().forget();
+        }
         Ok(HookHandlerResponse::default())
     }
 }
@@ -4672,6 +4794,13 @@ fn phase_13_hook_runtime_with_fallback(
 fn task_post_turn_recording_hook_runtime(
     calls: Arc<std::sync::Mutex<Vec<HookHandlerRequest>>>,
 ) -> Arc<HookRuntime> {
+    task_post_turn_recording_hook_runtime_with_cancellation_barrier(calls, None)
+}
+
+fn task_post_turn_recording_hook_runtime_with_cancellation_barrier(
+    calls: Arc<std::sync::Mutex<Vec<HookHandlerRequest>>>,
+    cancellation_barrier: Option<Arc<CancellationEffectBarrier>>,
+) -> Arc<HookRuntime> {
     let handlers = Arc::new(HookRegistry::new());
     let subscriptions = Arc::new(HookSubscriptionRegistry::new());
     let hook_id = HookId::new("test.task_post_turn_recorder").expect("valid hook id");
@@ -4679,6 +4808,7 @@ fn task_post_turn_recording_hook_runtime(
         .register_handler(Arc::new(TaskPostTurnRecordingHookHandler {
             hook_id: hook_id.clone(),
             calls,
+            cancellation_barrier,
         }))
         .expect("Task post-turn hook registers");
     subscriptions
@@ -7934,8 +8064,16 @@ async fn complete_recorded_cli_task_turn_with_recovery(
             message: None,
             reconciliation_events: vec![observed_terminal],
         });
+        // The first lookup may race admission's final context bookkeeping.
+        // Reconciliation receives a fresh discovery snapshot after delivery.
+        let current_binding = processor
+            .crud_store
+            .get_cli_runtime_turn_binding(&pioneer_turn_id)
+            .await
+            .unwrap()
+            .unwrap();
         let recovered = processor
-            .reconcile_cli_runtime_turn_from_runtime(&continuation, workspace_id, &before)
+            .reconcile_cli_runtime_turn_from_runtime(&current_binding, workspace_id, &before)
             .await
             .unwrap();
         assert!(matches!(
@@ -12125,11 +12263,13 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "delayed"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let provider_entered = Arc::new(Notify::new());
+    let provider_release = Arc::new(Notify::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "delayed",
-        Arc::new(DelayedProvider {
-            delay: Duration::from_secs(30),
-            text: "too late".to_owned(),
+        Arc::new(CancellationBarrierProvider {
+            entered: provider_entered.clone(),
+            release: provider_release,
         }),
     ));
     let processor = Arc::new(MessageProcessor::new(
@@ -12219,6 +12359,18 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
         .expect("Composer should create one detached task");
     let run_id = wait_for_task_run_id(crud_store.clone(), task.id.as_str()).await;
     let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run_id.as_str()).await;
+    // Lineage creation precedes native actor admission. Cancel the running child
+    // only after registration of its original immutable cancellation context.
+    tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
+        .await
+        .expect("child provider should enter after context registration");
+    assert!(
+        crud_store
+            .native_cancellation_context(&lineage.child_turn_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
 
     thread_manager
         .thread_start_seeded(
@@ -12343,7 +12495,7 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
         cancelled_exchange
             .assistant_text
             .as_deref()
-            .is_none_or(|text| !text.contains("too late")),
+            .is_none_or(|text| !text.contains("too late") && !text.contains("released")),
         "partial or late provider output must not enter cancelled history"
     );
 
@@ -12384,7 +12536,7 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
     assert!(
         !cancelled_messages
             .iter()
-            .any(|m| m.content.contains("too late"))
+            .any(|m| m.content.contains("too late") || m.content.contains("released"))
     );
     assert!(cancelled_messages.iter().any(|m| {
         m.provenance
@@ -12466,15 +12618,36 @@ async fn ingest_user_test_artifact_for_thread(
     primary_thread_id: Option<&str>,
     display_name: &str,
 ) -> pioneer_protocol::ArtifactRef {
+    ingest_typed_test_artifact_for_thread(
+        processor,
+        workspace_id,
+        primary_thread_id,
+        display_name,
+        b"hello artifact".to_vec(),
+        pioneer_protocol::ArtifactKind::File,
+        "text/plain",
+    )
+    .await
+}
+
+async fn ingest_typed_test_artifact_for_thread(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    primary_thread_id: Option<&str>,
+    display_name: &str,
+    bytes: Vec<u8>,
+    kind: pioneer_protocol::ArtifactKind,
+    mime_type: &str,
+) -> pioneer_protocol::ArtifactRef {
     processor
         .artifact_service
         .ingest_bytes(pioneer_artifacts::IngestArtifactBytesRequest {
             workspace_id: workspace_id.to_owned(),
             primary_thread_id: primary_thread_id.map(str::to_owned),
-            bytes: b"hello artifact".to_vec(),
+            bytes,
             display_name: display_name.to_owned(),
-            kind: pioneer_protocol::ArtifactKind::File,
-            mime_type: Some("text/plain".to_owned()),
+            kind,
+            mime_type: Some(mime_type.to_owned()),
             created_by_kind: pioneer_protocol::ArtifactCreatedByKind::User,
             created_by_actor_id: Some("test-user".to_owned()),
             binding: None,
@@ -12483,6 +12656,29 @@ async fn ingest_user_test_artifact_for_thread(
         .await
         .expect("artifact ingest should succeed")
         .artifact
+}
+
+async fn discover_native_capture_models(
+    registry: &pioneer_provider::ProviderRegistry,
+    workspace_id: &str,
+) {
+    crate::compaction::load_test_catalog();
+    let models = registry
+        .get_or_create_for_workspace(workspace_id, "openai")
+        .unwrap()
+        .list_models()
+        .await
+        .unwrap();
+    assert_eq!(models.len(), 2);
+    assert!(models.iter().all(|model| {
+        model
+            .capabilities
+            .input_modalities
+            .as_ref()
+            .is_some_and(|input| {
+                input.iter().any(|kind| kind == "image") && input.iter().any(|kind| kind == "pdf")
+            })
+    }));
 }
 
 async fn materialize_artifact_api_thread(
@@ -12891,12 +13087,16 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let capture_provider =
-        Arc::new(CaptureSummaryProvider::new("artifact answer").with_native_attachments());
+    let capture_provider = Arc::new(
+        CaptureSummaryProvider::new("artifact answer")
+            .with_native_attachments()
+            .named("openai"),
+    );
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         capture_provider.clone(),
     ));
+    discover_native_capture_models(&provider_registry, workspace_id.as_str()).await;
     let processor = Arc::new(MessageProcessor::new(
         thread_manager,
         provider_registry,
@@ -12921,11 +13121,15 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
         "thr_artifact_followup_history",
     )
     .await;
-    let artifact = ingest_user_test_artifact_for_thread(
+    let image_bytes = crate::media_test_fixtures::image(image::ImageFormat::Jpeg);
+    let artifact = ingest_typed_test_artifact_for_thread(
         &processor,
         workspace_id.as_str(),
         Some(thread.thread.id.as_str()),
         "car.jpg",
+        image_bytes.clone(),
+        pioneer_protocol::ArtifactKind::Image,
+        "image/jpeg",
     )
     .await;
 
@@ -13007,6 +13211,8 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
         "the native artifact follow-up must complete"
     );
 
+    use base64::Engine;
+    let expected_base64 = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
     let requests = capture_provider.snapshot_requests();
     assert_eq!(requests.len(), 2);
     let second_request = &requests[1];
@@ -13033,11 +13239,12 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
     assert!(
         matches!(
             artifact_history_message.content_parts.as_slice(),
-            [pioneer_provider::MessageContentPart::File { file }]
-                if file.name.as_deref() == Some("car.jpg")
-                    && matches!(&file.source, pioneer_provider::AttachmentDataSource::Bytes { base64_data }
-                        if base64_data == "aGVsbG8gYXJ0aWZhY3Q=")
-                    && file.artifact.as_ref().is_some_and(|accepted| {
+            [pioneer_provider::MessageContentPart::Image { image }]
+                if image.name.as_deref() == Some("car.jpg")
+                    && image.mime_type == "image/jpeg"
+                    && matches!(&image.source, pioneer_provider::AttachmentDataSource::Bytes { base64_data }
+                        if base64_data == &expected_base64)
+                    && image.artifact.as_ref().is_some_and(|accepted| {
                         accepted.artifact_id == artifact.artifact_id
                             && accepted.artifact_version_id == artifact.version_id
                     })
@@ -13054,12 +13261,16 @@ async fn followup_history_rejects_unavailable_accepted_artifact_before_provider(
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let capture_provider =
-        Arc::new(CaptureSummaryProvider::new("artifact answer").with_native_attachments());
+    let capture_provider = Arc::new(
+        CaptureSummaryProvider::new("artifact answer")
+            .with_native_attachments()
+            .named("openai"),
+    );
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         capture_provider.clone(),
     ));
+    discover_native_capture_models(&provider_registry, workspace_id.as_str()).await;
     let processor = Arc::new(MessageProcessor::new(
         thread_manager,
         provider_registry,
@@ -13084,11 +13295,15 @@ async fn followup_history_rejects_unavailable_accepted_artifact_before_provider(
         "thr_unavailable_artifact_followup",
     )
     .await;
-    let artifact = ingest_user_test_artifact_for_thread(
+    let image_bytes = crate::media_test_fixtures::image(image::ImageFormat::Jpeg);
+    let artifact = ingest_typed_test_artifact_for_thread(
         &processor,
         workspace_id.as_str(),
         Some(thread.thread.id.as_str()),
         "accepted-car.jpg",
+        image_bytes.clone(),
+        pioneer_protocol::ArtifactKind::Image,
+        "image/jpeg",
     )
     .await;
 
@@ -13729,6 +13944,318 @@ impl crate::voice::supervisor::VoiceEngineLoader for TestGatewayVoiceEngineLoade
     }
 }
 
+// Regression harness uses the real owned-request dispatcher on one connection.
+// Only the speech transcriber is replaced; VAD/session/claim/admission stay real.
+struct PendingVoiceRelease(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+impl PendingVoiceRelease {
+    fn release(&self) {
+        let (released, condition) = &*self.0;
+        *released.lock().unwrap() = true;
+        condition.notify_all();
+    }
+}
+impl Drop for PendingVoiceRelease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+macro_rules! owned_voice_ingress_test {
+    ($name:ident, $terminal:literal, $action:literal) => {
+        #[test]
+        fn $name() {
+            // Use the production runtime and a separately spawned fixture task.
+            // A block_on fixture otherwise adds its large poll frame to CRUD
+            // and connection-cleanup frames on the libtest thread.
+            run_standard_stack_message_test(
+                stringify!($name),
+                owned_voice_ingress_case($terminal, $action),
+            );
+        }
+    };
+}
+
+owned_voice_ingress_test!(
+    owned_voice_ingress_transcript_cancel,
+    "transcript",
+    "cancel"
+);
+owned_voice_ingress_test!(
+    owned_voice_ingress_transcript_disconnect,
+    "transcript",
+    "disconnect"
+);
+owned_voice_ingress_test!(
+    owned_voice_ingress_transcript_winner,
+    "transcript",
+    "winner"
+);
+owned_voice_ingress_test!(owned_voice_ingress_no_speech_cancel, "no_speech", "cancel");
+owned_voice_ingress_test!(
+    owned_voice_ingress_no_speech_disconnect,
+    "no_speech",
+    "disconnect"
+);
+owned_voice_ingress_test!(owned_voice_ingress_no_speech_winner, "no_speech", "winner");
+owned_voice_ingress_test!(
+    owned_voice_ingress_runtime_error_cancel,
+    "runtime_error",
+    "cancel"
+);
+owned_voice_ingress_test!(
+    owned_voice_ingress_runtime_error_disconnect,
+    "runtime_error",
+    "disconnect"
+);
+owned_voice_ingress_test!(
+    owned_voice_ingress_runtime_error_winner,
+    "runtime_error",
+    "winner"
+);
+
+// Erase the case future before the runtime/test wrapper polls it. Keep the
+// nine combinations independent so CI identifies a failing terminal boundary.
+fn owned_voice_ingress_case(
+    terminal: &'static str,
+    action: &'static str,
+) -> MessageFuture<'static, ()> {
+    message_future(async move {
+        use crate::voice::transcription::{VoiceTranscriptionErrorKind, transcription_error};
+        let (tx, mut rx) = mpsc::channel(128);
+        let sessions = Arc::new(SessionManager::new());
+        let connection_id = register_authenticated_test_connection(&sessions, tx).await;
+        let context = sessions.connection_context(connection_id).await.unwrap();
+        let (foreign_tx, mut foreign_rx) = mpsc::channel(16);
+        let foreign_id = register_authenticated_test_connection(&sessions, foreign_tx).await;
+        let foreign_context = sessions.connection_context(foreign_id).await.unwrap();
+        let (workspace_manager, crud, workspace_id) = setup_workspace_manager().await;
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release = PendingVoiceRelease(gate.clone());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let mut processor = MessageProcessor::new(
+            Arc::new(ThreadManager::new("test-model", "openai")),
+            test_provider(),
+            sessions,
+            workspace_manager,
+            crud.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        )
+        .with_voice_input_supervisor(ready_gateway_voice_supervisor("unused native stub"));
+        processor.voice_test_transcriber = Some(Arc::new(move |_buffer| {
+            // Observe the production blocking scope before installing anything
+            // in the fake. This must come from the actual request dispatcher.
+            entered_tx
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(pioneer_observability::turn_startup::current_key())
+                .unwrap();
+            let (released, condition) = &*gate;
+            let mut flag = released.lock().unwrap();
+            while !*flag {
+                flag = condition.wait(flag).unwrap();
+            }
+            match terminal {
+                "runtime_error" => Err(transcription_error(
+                    VoiceTranscriptionErrorKind::RuntimeFailure,
+                    "controlled fake failure",
+                )),
+                "no_speech" => Ok("  ".to_owned()),
+                _ => Ok("controlled transcript".to_owned()),
+            }
+        }));
+        let processor = Arc::new(processor);
+        let thread_id = "thr_g09_owned_voice";
+        // Two distinct request contexts and a valid business ID outside the
+        // telemetry key length bound. The latter must preserve None rather
+        // than synthesizing a context from the session's turn ID.
+        let turn_id_owned = match terminal {
+            "runtime_error" => "t".repeat(513),
+            _ => format!("turn_g09_owned_voice_{terminal}_{action}"),
+        };
+        let turn_id = turn_id_owned.as_str();
+        let thread = start_thread_for_artifact_test(
+            &processor,
+            connection_id,
+            &mut rx,
+            &workspace_id,
+            thread_id,
+        )
+        .await;
+        let start_id = generate_test_request_id("voice", "start");
+        let finalize_id = generate_test_request_id("voice", "finalize");
+        let repeat_id = generate_test_request_id("voice", "repeat");
+        let foreign_request_id = generate_test_request_id("voice", "foreign");
+        let cancel_id = generate_test_request_id("voice", "cancel");
+        let late_cancel_id = generate_test_request_id("voice", "latecancel");
+        // Exercise business ingress with protocol-valid IDs; malformed IDs
+        // are rejected before the owned worker or session handler can run.
+        for id in [
+            &start_id,
+            &finalize_id,
+            &repeat_id,
+            &foreign_request_id,
+            &cancel_id,
+            &late_cancel_id,
+        ] {
+            pioneer_protocol::RequestId::new(id.as_str()).expect("valid voice RPC fixture ID");
+        }
+        let session = start_test_voice_session(
+            &processor,
+            connection_id,
+            &mut rx,
+            &workspace_id,
+            &thread.thread.id,
+            turn_id,
+            start_id.as_str(),
+        )
+        .await;
+        processor
+            .process_binary_frame_for_connection(
+                connection_id,
+                voice_test_frame(&session.session_id, 0, 960, 12000).as_slice(),
+            )
+            .await
+            .unwrap();
+        let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
+        let before = crud
+            .get_thread_history(thread_id, Some(64))
+            .await
+            .unwrap()
+            .expect("voice target history must exist");
+        let before_events = serde_json::to_value(&before.events).unwrap();
+        let finalize = json!({"jsonrpc":"2.0","id":finalize_id,"method":"voice/session/finalize","params":{
+            "session_id":session.session_id,"context":{"workspace_id":workspace_id,"thread_id":thread_id,"turn_id":turn_id}
+        }});
+        let expected_startup_key = if terminal == "runtime_error" {
+            None
+        } else {
+            Some(turn_id.to_owned())
+        };
+        let request = &finalize;
+        assert_eq!(
+            pioneer_observability::turn_startup::request_key(&request["params"]),
+            expected_startup_key
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            // An unrelated caller key must not override request-derived
+            // context or leak into the absent-context case.
+            pioneer_observability::turn_startup::scope(
+                Some("unrelated-ingress-context".to_owned()),
+                processor
+                    .clone()
+                    .process_owned_request(context.clone(), finalize.to_string()),
+            ),
+        )
+        .await
+        .expect("reader must return at ACK while transcriber remains pending");
+        let ack = recv_response_by_id(&mut rx, finalize_id.as_str()).await;
+        assert_eq!(ack.result["status"], json!("transcribing"));
+        let worker_startup_key = tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(worker_startup_key, expected_startup_key);
+        // Same owner repeated finalize is bounded/rejected; another connection
+        // cannot claim the authenticated owner's session (connection_id retained).
+        let mut repeated_finalize = finalize.clone();
+        repeated_finalize["id"] = json!(repeat_id);
+        processor
+            .clone()
+            .process_owned_request(context.clone(), repeated_finalize.to_string())
+            .await;
+        let _ = recv_error_by_id(&mut rx, repeat_id.as_str()).await;
+        let mut cancel = json!({"jsonrpc":"2.0","id":foreign_request_id,"method":"voice/session/cancel","params":{"session_id":session.session_id}});
+        processor
+            .clone()
+            .process_owned_request(foreign_context, cancel.to_string())
+            .await;
+        let _ = recv_error_by_id(&mut foreign_rx, foreign_request_id.as_str()).await;
+        assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
+        if action == "cancel" {
+            cancel["id"] = json!(cancel_id);
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                processor
+                    .clone()
+                    .process_owned_request(context.clone(), cancel.to_string()),
+            )
+            .await
+            .expect("same-connection cancel must complete BEFORE fake release");
+            let response = recv_response_by_id(&mut rx, cancel_id.as_str()).await;
+            assert_eq!(response.result["cancelled"], json!(true));
+            let event = recv_notification_by_method(&mut rx, events::VOICE_SESSION_RESULT).await;
+            let result: VoiceSessionResultNotification =
+                serde_json::from_value(event.params.unwrap()).unwrap();
+            assert_eq!(result.outcome, VoiceSessionOutcome::Cancelled);
+        } else if action == "disconnect" {
+            processor.connection_closed(connection_id).await;
+            assert!(!processor.voice_sessions.has_active_sessions().unwrap());
+            assert!(
+                processor
+                    .voice_session_buffers
+                    .take_session_audio(&session.session_id)
+                    .is_err()
+            );
+        }
+        release.release();
+        // Closing the tracker enables waiting for completion; it does
+        // not cancel the pipeline or forbid spawning by itself. Await exact worker completion, no sleeps.
+        processor.voice_finalizations.tasks.close();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            processor.voice_finalizations.tasks.wait(),
+        )
+        .await
+        .unwrap();
+        if action == "winner" {
+            let event = recv_notification_by_method(&mut rx, events::VOICE_SESSION_RESULT).await;
+            let result: VoiceSessionResultNotification =
+                serde_json::from_value(event.params.unwrap()).unwrap();
+            let expected = match terminal {
+                "transcript" => VoiceSessionOutcome::TurnStarted,
+                "no_speech" => VoiceSessionOutcome::NoSpeech,
+                _ => VoiceSessionOutcome::Failed,
+            };
+            assert_eq!(result.outcome, expected);
+            assert_eq!(
+                crud.get_turn(thread_id, turn_id).await.unwrap().is_some(),
+                terminal == "transcript"
+            );
+            cancel["id"] = json!(late_cancel_id);
+            processor
+                .clone()
+                .process_owned_request(context, cancel.to_string())
+                .await;
+            let _ = recv_error_by_id(&mut rx, late_cancel_id.as_str()).await;
+        } else {
+            assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
+            let after = crud
+                .get_thread_history(thread_id, Some(64))
+                .await
+                .unwrap()
+                .expect("cancel/disconnect must preserve voice target history");
+            assert_eq!(after.workspace_id, before.workspace_id);
+            assert_eq!(serde_json::to_value(&after.events).unwrap(), before_events);
+        }
+        while let Ok(message) = rx.try_recv() {
+            if let Message::Text(text) = message {
+                let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
+                assert_ne!(
+                    value.get("method").and_then(JsonValue::as_str),
+                    Some(events::VOICE_SESSION_RESULT),
+                    "no second/late terminal notification"
+                );
+            }
+        }
+    })
+}
+
 fn ready_gateway_voice_supervisor(
     transcript: &str,
 ) -> Arc<crate::voice::supervisor::VoiceInputSupervisor> {
@@ -14140,12 +14667,19 @@ async fn collaborative_voice_composer_admits_detached_task() {
         0,
         "collaborative voice must not dispatch an agent turn in the parent thread"
     );
-    let (_, parent_turn) = crud_store
-        .get_turn(parent_thread_id, turn_id)
-        .await
-        .expect("parent voice message turn lookup should succeed")
-        .expect("parent voice message turn should exist");
-    assert_eq!(parent_turn.status, TurnStatus::Completed);
+    // TurnStarted is published after task creation, before the owned finalize
+    // worker durably completes the parent turn. Wait for that lifecycle boundary.
+    assert_eq!(
+        wait_for_turn_status(
+            crud_store.clone(),
+            parent_thread_id,
+            turn_id,
+            TurnStatus::Completed,
+        )
+        .await,
+        TurnStatus::Completed,
+        "collaborative voice parent must complete after detached task creation"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -19053,6 +19587,7 @@ async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_
         !wait_response.completed.is_empty(),
         "child echo turn should complete the task"
     );
+    assert_admitted_turn_owner(&processor, &lineage.child_thread_id, &lineage.child_turn_id).await;
     let completed = &wait_response.completed[0];
     assert_eq!(
         completed.child_turn_id.as_deref(),
@@ -19299,11 +19834,35 @@ async fn review_enabled_child_completion_creates_pending_candidate_without_final
         include_result: true,
         format: TaskDeliveryFormat::Summary,
     });
+    let (_, reviewer_launch) = super::agent_action_tools::resolve_workspace_task_launch(
+        &processor,
+        &workspace_id,
+        "openai",
+        "test-model",
+        None,
+        None,
+        "turn_parent_review_success",
+    )
+    .await
+    .expect("reviewer must use an available exact workspace identity");
+    let reviewer_identity = reviewer_launch
+        .expect("native reviewer launch must be exact")
+        .0;
+    let mut review_policy = TaskAgentReviewPolicy::parent_agent_default(2);
+    review_policy
+        .reviewers
+        .push(pioneer_protocol::TaskResultReviewerSpec {
+            reviewer_kind: TaskResultReviewerKind::ReviewAgent,
+            agent_nickname: Some(reviewer_identity.nickname),
+            agent_role: None,
+            required: false,
+            weight: None,
+        });
     params
         .agent_spec
         .as_mut()
         .expect("agent spec should exist")
-        .review_policy = Some(TaskAgentReviewPolicy::parent_agent_default(2));
+        .review_policy = Some(review_policy);
 
     let response = create_task_for_test(&processor, params)
         .await
@@ -19319,6 +19878,28 @@ async fn review_enabled_child_completion_creates_pending_candidate_without_final
         TaskResultCandidateStatus::PendingReview,
     )
     .await;
+
+    // A reviewer context may become visible before its executable admission.
+    // Wait for that admission, then verify the same receipt as every child.
+    let mut reviewer = None;
+    for _ in 0..100 {
+        let turns = crud_store.list_task_run_turns(&run.id).await.unwrap();
+        if let Some(turn) = turns
+            .into_iter()
+            .find(|turn| turn.kind == TaskRunTurnKind::Review)
+            && crud_store
+                .get_turn_execution(&turn.turn_id)
+                .await
+                .unwrap()
+                .is_some()
+        {
+            reviewer = Some(turn);
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    let reviewer = reviewer.expect("reviewer must reach executable admission");
+    assert_admitted_turn_owner(&processor, &reviewer.thread_id, &reviewer.turn_id).await;
 
     assert_eq!(candidate.thread_id, lineage.child_thread_id);
     assert_eq!(candidate.turn_id, lineage.child_turn_id);
@@ -20252,6 +20833,7 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_i
         TaskResultCandidateStatus::PendingReview,
     )
     .await;
+    assert_admitted_turn_owner(&processor, &revised.child_thread_id, &revised.child_turn_id).await;
     assert_eq!(next_candidate.round, 1);
     assert_eq!(next_candidate.thread_id, revised.child_thread_id);
     assert_eq!(next_candidate.turn_id, revised.child_turn_id);
@@ -26117,8 +26699,9 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
             )))
             .await;
         let thread = format!("pending-heartbeat-{case}");
+        let history_created_at = super::now_timestamp_secs().saturating_sub(1);
         for index in 0..12 {
-            seed_completed_task_parent_with_inputs(
+            seed_completed_task_parent_with_inputs_at(
                 &processor,
                 &workspace,
                 &thread,
@@ -26128,6 +26711,7 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
                     text: format!("PENDING HEARTBEAT CHUNK {index:02} {}", "a ".repeat(6_500)),
                     text_elements: Vec::new(),
                 }],
+                history_created_at,
             )
             .await;
         }
@@ -26312,10 +26896,21 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
             &format!("pending-heartbeat-resume-{case}"),
         )
         .await;
+        // Verify the production order directly: created_at, durable creation
+        // sequence, legacy rowid, then ID. ID spelling alone proves no order.
         let next = format!("pending-heartbeat-next-{case}");
+        assert_eq!(
+            store
+                .latest_turn_id_by_creation_order(&thread)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(turn.as_str()),
+            "{case}: the undispatched attempt must be the persisted head before retry",
+        );
         let next_id = generate_test_request_id("pending-heartbeat-next", &next);
         let next_context = sessions.connection_context(connection).await.unwrap();
-        Arc::clone(&next_processor).process_owned_request(next_context, json!({
+        let next_payload = json!({
             "jsonrpc":"2.0", "id":next_id, "method":"turn/start",
             "params":{"thread_id":thread,"turn_id":next,
                 "input":[{"type":"text","text":"NEXT AFTER PENDING HEARTBEAT"}],
@@ -26323,12 +26918,30 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
                 "execution_backend":{"type":"cliAgentRuntime","runtime_id":"codex",
                     "runtime_kind":CLIAgentRuntimeKind::Codex},
                 "permission_profile":pioneer_protocol::TurnPermissionProfileSelection::full_access()}
-        }).to_string()).await;
+        }).to_string();
+        let (_, admission_events) = crate::public_error::test_support::capture_events_async(
+            Arc::clone(&next_processor).process_owned_request(next_context, next_payload),
+        )
+        .await;
         let payload = recv_jsonrpc_payload_by_id(&mut rx, &next_id).await;
-        let response: JsonRpcResponse = serde_json::from_str(&payload)
-            .unwrap_or_else(|error| panic!("{case}: next turn failed: {error}; {payload}"));
+        let response: JsonRpcResponse = match serde_json::from_str(&payload) {
+            Ok(response) => response,
+            Err(error) => panic!(
+                "{case}: next turn failed: {error}; {payload}; admission_reports={admission_events:#?}; durable={:?}; local={:?}",
+                store.get_turn(&thread, &next).await,
+                next_processor.thread_manager.turn_get(&thread, &next).await,
+            ),
+        };
         let accepted: TurnStartResponse = serde_json::from_value(response.result).unwrap();
         assert_eq!(accepted.turn.id, next);
+        assert_eq!(
+            store
+                .turn_before_launch_and_intervening_by_creation_order(&thread, &next, &next)
+                .await
+                .unwrap(),
+            Some((Some(turn.clone()), false)),
+            "{case}: retry must follow the terminal attempt in durable creation order",
+        );
         assert_eq!(
             wait_for_cli_runtime_turn_starts_or_turn_error(
                 &cli, 1, store.as_ref(), &thread, &next,
@@ -26421,19 +27034,51 @@ async fn cli_predispatch_read_failure_cancel_and_shutdown_release_session_lease_
         )
         .await
         .expect("dispatch should reach its final turn read");
-        if case == "cancel" {
+        let cancel = if case == "cancel" {
             let cancel_id = generate_test_request_id("predispatch", "cancel");
-            processor.process_request_for_connection(connection, &json!({
+            let cancel_processor = processor.clone();
+            let request = json!({
                 "jsonrpc":"2.0","id":cancel_id,"method":"turn/cancel",
                 "params":{"thread_id":thread,"turn_id":turn,"reason":"cancel at dispatch fence"}
-            }).to_string()).await;
+            })
+            .to_string();
+            let cancel = tokio::spawn(async move {
+                cancel_processor
+                    .process_request_for_connection(connection, &request)
+                    .await;
+            });
+            // Admission owns the transition gate at the barrier. Cancellation
+            // records its intent before waiting for that gate; let admission
+            // observe the intent and return before awaiting the cancel response.
+            timeout(Duration::from_secs(10), async {
+                while !processor
+                    .user_turn_cancel_intents
+                    .lock()
+                    .await
+                    .contains_key(&(thread.clone(), turn.clone()))
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancel must register intent before waiting for admission");
+            Some((cancel_id, cancel))
+        } else {
+            if case == "shutdown" {
+                processor.shutdown_cli_runtime_manager().await;
+            }
+            None
+        };
+        processor.release_completed_history_preparation_barrier();
+        if let Some((cancel_id, cancel)) = cancel {
+            timeout(Duration::from_secs(10), cancel)
+                .await
+                .unwrap()
+                .unwrap();
             let response = recv_response_by_id(&mut rx, &cancel_id).await;
             let cancelled: TurnCancelResponse = serde_json::from_value(response.result).unwrap();
             assert_eq!(cancelled.turn.status, TurnStatus::Interrupted);
-        } else if case == "shutdown" {
-            processor.shutdown_cli_runtime_manager().await;
         }
-        processor.release_completed_history_preparation_barrier();
         timeout(Duration::from_secs(10), start)
             .await
             .unwrap()
@@ -26994,6 +27639,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
         let summary_provider = Arc::new(
             CaptureSummaryProvider::new("released CLI summary")
                 .with_native_attachments()
+                .named("openai")
                 .with_valid_summary_completion(),
         );
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
@@ -27003,6 +27649,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
         provider_registry
             .insert("openai", summary_provider.clone())
             .expect("CLI test provider should register");
+        discover_native_capture_models(&provider_registry, workspace_id.as_str()).await;
         let mut processor = Arc::new(with_enabled_test_cli_runtime_catalog(
             MessageProcessor::new(
                 thread_manager,
@@ -27057,19 +27704,17 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             fixture_time.saturating_sub(2),
         )
         .await;
-        let historical_file = ingest_user_test_artifact_for_thread(
+        let historical_file = ingest_typed_test_artifact_for_thread(
             &processor,
             workspace_id.as_str(),
             Some(parent_thread_id.as_str()),
-            "accepted-history.txt",
+            "accepted-history.pdf",
+            crate::media_test_fixtures::pdf(),
+            pioneer_protocol::ArtifactKind::File,
+            "application/pdf",
         )
         .await;
-        let one_pixel_png = vec![
-            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
-            8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 8, 215, 99, 248, 207,
-            192, 240, 31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66,
-            96, 130,
-        ];
+        let one_pixel_png = crate::media_test_fixtures::image(image::ImageFormat::Png);
         let historical_image = processor
             .artifact_service
             .ingest_bytes(pioneer_artifacts::IngestArtifactBytesRequest {
@@ -27097,13 +27742,16 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             .into_owned();
         let historical_local_file = historical_media_dir
             .path()
-            .join(format!("historical-{runtime_id}.txt"))
+            .join(format!("historical-{runtime_id}.pdf"))
             .to_string_lossy()
             .into_owned();
         std::fs::write(historical_local_image.as_str(), one_pixel_png)
             .expect("historical local-image fixture");
-        std::fs::write(historical_local_file.as_str(), b"recorded local file")
-            .expect("historical local-file fixture");
+        std::fs::write(
+            historical_local_file.as_str(),
+            crate::media_test_fixtures::pdf(),
+        )
+        .expect("historical local-file fixture");
         let media_turn_id = format!("turn_native_parent_media_{runtime_id}");
         seed_completed_task_parent_with_inputs_at(
             &processor,
@@ -27362,7 +28010,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             "{runtime_id} must bootstrap the accepted parent history"
         );
         let initial_adapter_input = native_start.input.to_string();
-        assert!(initial_adapter_input.contains("accepted-history.txt"));
+        assert!(initial_adapter_input.contains("accepted-history.pdf"));
         assert!(initial_adapter_input.contains("accepted-history.png"));
         assert!(initial_adapter_input.contains("localImage"));
         assert_eq!(
@@ -28663,7 +29311,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                         || (native_file_parts == 0
                             && native_request_text.contains("## Goal and constraints")
                             && native_request_text
-                                .contains(format!("historical-{runtime_id}.txt").as_str())),
+                                .contains(format!("historical-{runtime_id}.pdf").as_str())),
                     "native request must deliver the file exactly once or cite it through an accepted summary, not rematerialize covered media"
                 );
                 assert_eq!(
@@ -30986,6 +31634,15 @@ async fn assert_detached_native_child_turn_cancellation() {
         .created_by_turn_id
         .as_deref()
         .expect("detached child lineage should point at its parent occurrence turn");
+    assert!(
+        crud_store
+            .get_turn_execution(parent_occurrence_turn_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "parent TaskRun occurrences are execution-free projections"
+    );
+
     let parent_anchor = wait_for_task_anchor_item_status(
         crud_store.clone(),
         parent_occurrence_turn_id,
@@ -32016,9 +32673,9 @@ async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_hi
         Some(0)
     );
 
-    let mut first_process_cursors = HashMap::new();
     processor
-        .emit_committed_task_events_after_cursor(task_id.as_str(), &mut first_process_cursors)
+        .for_background_reconciliation()
+        .task_event_fanout_quantum()
         .await
         .expect("initial fanout should succeed");
     assert_eq!(
@@ -32030,12 +32687,11 @@ async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_hi
     );
     while rx.try_recv().is_ok() {}
 
-    // An empty in-memory map models a freshly restarted Gateway process. The
-    // durable high-watermark must prevent the historical task log from being
-    // emitted again.
-    let mut restarted_process_cursors = HashMap::new();
+    // A restarted dispatcher uses only pending work; completed work has no
+    // pending row and requires no historic per-Task memory map.
     processor
-        .emit_committed_task_events_after_cursor(task_id.as_str(), &mut restarted_process_cursors)
+        .for_background_reconciliation()
+        .task_event_fanout_quantum()
         .await
         .expect("post-restart fanout scan should succeed");
     assert!(
@@ -32057,7 +32713,8 @@ async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_hi
         .await
         .expect("task update should append a new event");
     processor
-        .emit_committed_task_events_after_cursor(task_id.as_str(), &mut restarted_process_cursors)
+        .for_background_reconciliation()
+        .task_event_fanout_quantum()
         .await
         .expect("new post-restart event should fan out");
     let updated = recv_notification_by_method(&mut rx, events::TASK_UPDATED).await;
@@ -32077,21 +32734,27 @@ async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_hi
         .exec(&crud_store.database_connection())
         .await
         .expect("durable cursor fixture should delete");
-    let mut missing_cursor_process_state = HashMap::new();
-    let error = processor
-        .emit_committed_task_events_after_cursor(
-            task_id.as_str(),
-            &mut missing_cursor_process_state,
-        )
+    let summary = processor
+        .for_background_reconciliation()
+        .task_event_fanout_quantum()
         .await
-        .expect_err("a missing durable cursor must violate the listener invariant");
-    assert!(
-        format!("{error:#}").contains("missing durable task event fanout cursor"),
-        "unexpected invariant error: {error:#}"
+        .unwrap();
+    assert_eq!(
+        summary.errors, 0,
+        "cursor deletion without pending must not discover historical events"
+    );
+    assert_eq!(summary.pending, Some(false));
+    assert_eq!(
+        crud_store
+            .get_task_event_fanout_cursor(&task_id)
+            .await
+            .unwrap(),
+        None,
+        "dispatcher must not synthesize a cursor that skips the first event"
     );
     assert!(
         rx.try_recv().is_err(),
-        "an invariant failure must not replay historical task events"
+        "cursor deletion alone must not replay historical task events"
     );
 }
 
@@ -33074,11 +33737,16 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
 
     let mut child_dispatched = false;
     for _ in 0..200 {
-        if crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
-            .await
-            .expect("direct Agent outbox dispatch should succeed")
-            > 0
-        {
+        let batch =
+            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                .await
+                .expect("direct Agent outbox dispatch should succeed");
+        assert!(
+            batch.errors.is_empty(),
+            "direct Agent outbox storage should succeed: {:?}",
+            batch.errors
+        );
+        if batch.delivered > 0 {
             child_dispatched = true;
             break;
         }
@@ -33111,6 +33779,7 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         .as_str()
         .expect("direct Agent child turn id should be present")
         .to_owned();
+    assert_admitted_turn_owner(&processor, thread_id, &child_turn_id).await;
     assert_ne!(child_turn_id, root_turn_id);
     let permission_request_id = opened_request["request_id"]
         .as_str()
@@ -34772,13 +35441,18 @@ async fn failed_task_thread_delivery_is_a_sanitized_system_state_without_work_gr
         .deliveries
         .first()
         .expect("failed result should still have a delivered notification");
-    assert!(
-        delivery
-            .error_snapshot
-            .as_ref()
-            .is_some_and(|error| error.message.contains("internal path /srv/pioneer")),
-        "the durable Task diagnostic must retain the real internal cause"
+    let saved_error = delivery
+        .error_snapshot
+        .as_ref()
+        .expect("failed delivery keeps a safe descriptor");
+    assert_eq!(saved_error.code, "task_executor_start_unclassified_failed");
+    assert_eq!(
+        saved_error.class,
+        pioneer_protocol::TaskErrorClass::Internal
     );
+    assert_eq!(saved_error.message, "Task preparation or launch failed.");
+    let encoded = serde_json::to_string(saved_error).unwrap();
+    assert!(!encoded.contains("internal path /srv/pioneer"));
     let delivered_turn_id = delivery
         .delivered_turn_id
         .as_deref()
@@ -34796,7 +35470,7 @@ async fn failed_task_thread_delivery_is_a_sanitized_system_state_without_work_gr
     );
     assert_eq!(
         delivered_turn.error.as_deref(),
-        Some("Scheduled task could not start.")
+        Some("Scheduled task failed.")
     );
     assert!(
         !delivered_turn
@@ -34821,9 +35495,7 @@ async fn failed_task_thread_delivery_is_a_sanitized_system_state_without_work_gr
         .expect("delivery timeline blocks should query");
     assert!(blocks.iter().any(|block| {
         block.block_kind == pioneer_crud::BLOCK_KIND_SYSTEM
-            && block
-                .metadata_json
-                .contains("Scheduled task could not start.")
+            && block.metadata_json.contains("Scheduled task failed.")
     }));
     assert!(
         blocks
@@ -41093,6 +41765,7 @@ async fn turn_start_without_execution_backend_uses_api_provider_path() {
     )
     .await;
 
+    assert_admitted_turn_owner(&processor, "thr_turn_start_api_old", "turn_start_api_old").await;
     for _ in 0..20 {
         if capture_provider.snapshot_requests().iter().any(|request| {
             request
@@ -41189,6 +41862,7 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
         .await
         .expect("native turn/start preparation should succeed");
 
+    assert_admitted_turn_owner(&processor, "thread_security_native", "turn_security_native").await;
     let author = crud_store
         .get_turn("thread_security_native", "turn_security_native")
         .await
@@ -43831,6 +44505,101 @@ async fn member_codex_thread_fork_commits_private_creator_membership() {
     assert_eq!(readable.thread.id, FORK_THREAD_ID);
 }
 
+async fn seed_loaded_cli_runtime_turn(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) {
+    let now = chrono::Utc::now().fixed_offset();
+    materialize_cli_runtime_turn_with_execution(
+        processor.crud_store.as_ref(),
+        workspace_id,
+        thread_id,
+        turn_id,
+        "start",
+        Some(pioneer_crud::NewTurnExecution {
+            turn_id: turn_id.into(),
+            thread_id: thread_id.into(),
+            workspace_id: workspace_id.into(),
+            executor_kind: pioneer_crud::TurnExecutorKind::CliRuntime,
+            executor_key: Some("codex".into()),
+            status: pioneer_crud::TurnExecutionStatus::Starting,
+            owner_id: processor.turn_execution_owner_id.to_string(),
+            lease_until: now + chrono::Duration::seconds(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
+            created_at: now,
+        }),
+    )
+    .await;
+    let thread = processor
+        .crud_store
+        .get_thread_model(thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    processor
+        .thread_manager
+        .system_thread_restore_persisted(thread, Some(SandboxMode::FullAccess))
+        .await
+        .unwrap();
+}
+
+// A running CLI fixture needs the same durable attempt/segment as admission.
+async fn seed_running_cli_runtime_binding(
+    store: &CrudStore,
+    mut binding: NewCliRuntimeTurnBinding,
+) {
+    let native_turn_id = binding
+        .native_turn_id
+        .take()
+        .expect("running fixture native turn");
+    let native_thread_id = binding.native_thread_id.clone();
+    let turn_id = binding.turn_id.clone();
+    let codex = binding.runtime_kind == "codex";
+    let started_at = binding.updated_at;
+    binding.status = crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.into();
+    let (_, attempt) = store
+        .prepare_cli_runtime_initial_turn_attempt(binding, pioneer_protocol::generate_id(21), 1)
+        .await
+        .unwrap();
+    if let Some(execution) = store.get_turn_execution(&turn_id).await.unwrap() {
+        store
+            .activate_cli_runtime_turn_attempt_owned(
+                &turn_id,
+                &attempt.id,
+                &native_turn_id,
+                None,
+                started_at,
+                &execution.owner_id,
+                execution.lease_until,
+            )
+            .await
+            .unwrap();
+    } else {
+        store
+            .activate_cli_runtime_turn_attempt(
+                &turn_id,
+                &attempt.id,
+                &native_turn_id,
+                None,
+                started_at,
+            )
+            .await
+            .unwrap();
+    }
+    if codex {
+        store
+            .register_cli_runtime_execution_segment(
+                &turn_id,
+                &native_thread_id,
+                &native_turn_id,
+                started_at,
+            )
+            .await
+            .unwrap();
+    }
+}
+
 async fn start_loaded_thread_and_turn_for_cli_runtime_test(
     processor: &MessageProcessor,
     connection_id: ConnectionId,
@@ -43856,26 +44625,7 @@ async fn start_loaded_thread_and_turn_for_cli_runtime_test(
     let _thread_response = recv_response_by_id(rx, thread_start_id).await;
     let _thread_started = recv_notification_by_method(rx, events::THREAD_STARTED).await;
 
-    let turn_start_id = "cliruntestturn0000001";
-    let turn_start_payload = json!({
-        "jsonrpc": "2.0",
-        "id": turn_start_id,
-        "method": "turn/start",
-        "params": {
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "mode": "Agent",
-            "input": [{
-                "type": "text",
-                "text": "start"
-            }]
-        }
-    })
-    .to_string();
-    message_future(processor.process_request_for_connection(connection_id, &turn_start_payload))
-        .await;
-    let _ =
-        recv_response_and_notification_by_id_method(rx, turn_start_id, events::TURN_STARTED).await;
+    seed_loaded_cli_runtime_turn(processor, workspace_id, thread_id, turn_id).await;
 }
 
 async fn start_loaded_thread_and_turn_for_cli_runtime_test_on_fresh_tasks(
@@ -43911,34 +44661,7 @@ async fn start_loaded_thread_and_turn_for_cli_runtime_test_on_fresh_tasks(
     let _thread_response = recv_response_by_id(rx, thread_start_id).await;
     let _thread_started = recv_notification_by_method(rx, events::THREAD_STARTED).await;
 
-    let turn_start_id = "cliruntestturn0000001";
-    let turn_start_payload = json!({
-        "jsonrpc": "2.0",
-        "id": turn_start_id,
-        "method": "turn/start",
-        "params": {
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "mode": "Agent",
-            "input": [{
-                "type": "text",
-                "text": "start"
-            }]
-        }
-    })
-    .to_string();
-    Arc::clone(processor)
-        .process_owned_request(
-            processor
-                .session_manager
-                .connection_context(connection_id)
-                .await
-                .expect("test connection must be registered with a principal"),
-            turn_start_payload,
-        )
-        .await;
-    let _ =
-        recv_response_and_notification_by_id_method(rx, turn_start_id, events::TURN_STARTED).await;
+    seed_loaded_cli_runtime_turn(processor, workspace_id, thread_id, turn_id).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -44346,6 +45069,7 @@ async fn cli_runtime_stale_silent_running_binding_schedules_recovery_impl() {
                 .fixed_offset()
                 .timestamp_millis()
                 .saturating_add(20 * 60 * 1_000),
+            &mut super::cli_runtime::CliRuntimeStaleTurnScan::default(),
         )
         .await;
 
@@ -44627,8 +45351,9 @@ fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_
         .await;
 
         let old = chrono::Utc::now().fixed_offset() - chrono::Duration::hours(1);
-        crud_store
-            .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+        seed_running_cli_runtime_binding(
+            crud_store.as_ref(),
+            NewCliRuntimeTurnBinding {
                 turn_id: turn_id.to_owned(),
                 thread_id: thread_id.to_owned(),
                 continuation_thread_id: thread_id.to_owned(),
@@ -44647,9 +45372,9 @@ fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_
                 input_mapping_json: "{}".to_owned(),
                 created_at: old,
                 updated_at: old,
-            })
-            .await
-            .expect("turn binding should upsert");
+            },
+        )
+        .await;
         let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
             .expect("session key should build");
         cli_manager
@@ -44666,7 +45391,12 @@ fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_
             .fixed_offset()
             .timestamp_millis()
             .saturating_add(20 * 60 * 1_000);
-        processor.fail_stale_cli_runtime_turns(first_probe_ms).await;
+        processor
+            .fail_stale_cli_runtime_turns(
+                first_probe_ms,
+                &mut super::cli_runtime::CliRuntimeStaleTurnScan::default(),
+            )
+            .await;
         let (_workspace_id, turn) = crud_store
             .get_turn(thread_id, turn_id)
             .await
@@ -44698,7 +45428,10 @@ fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_
             })],
         });
         processor
-            .fail_stale_cli_runtime_turns(first_probe_ms.saturating_add(20 * 60 * 1_000))
+            .fail_stale_cli_runtime_turns(
+                first_probe_ms.saturating_add(20 * 60 * 1_000),
+                &mut super::cli_runtime::CliRuntimeStaleTurnScan::default(),
+            )
             .await;
 
         let (_workspace_id, turn) = crud_store
@@ -44835,8 +45568,9 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
     );
 
     let old = chrono::Utc::now().fixed_offset() - chrono::Duration::hours(1);
-    crud_store
-        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+    seed_running_cli_runtime_binding(
+        crud_store.as_ref(),
+        NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
             continuation_thread_id: thread_id.to_owned(),
@@ -44854,9 +45588,9 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
             input_mapping_json: "{}".to_owned(),
             created_at: old,
             updated_at: old,
-        })
-        .await
-        .expect("turn binding should upsert");
+        },
+    )
+    .await;
     let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
         .expect("session key should build");
     cli_manager
@@ -44887,6 +45621,7 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
                 .fixed_offset()
                 .timestamp_millis()
                 .saturating_add(20 * 60 * 1_000),
+            &mut super::cli_runtime::CliRuntimeStaleTurnScan::default(),
         )
         .await;
 
@@ -45318,8 +46053,9 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
     )
     .await;
     let now = chrono::Utc::now().fixed_offset();
-    crud_store
-        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+    seed_running_cli_runtime_binding(
+        crud_store.as_ref(),
+        NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
             continuation_thread_id: thread_id.to_owned(),
@@ -45337,9 +46073,9 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
             input_mapping_json: "{}".to_owned(),
             created_at: now,
             updated_at: now,
-        })
-        .await
-        .expect("turn binding should upsert");
+        },
+    )
+    .await;
     let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", thread_id)
         .expect("session key should build");
 
@@ -45905,6 +46641,8 @@ async fn turn_cancel_clears_codex_goal_and_interrupts_latest_execution_segment()
             Some("active".to_owned()),
             Some(second_segment_id.to_owned()),
             now,
+            None,
+            processor.turn_execution_owner_id.as_ref(),
         )
         .await
         .expect("active Codex Goal state should persist");
@@ -46601,6 +47339,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
                     .fixed_offset()
                     .timestamp_millis()
                     .saturating_add(20 * 60 * 1_000),
+                &mut super::cli_runtime::CliRuntimeStaleTurnScan::default(),
             )
             .await;
         assert!(
@@ -47139,9 +47878,38 @@ async fn cli_runtime_terminal_cleanup_keeps_session_open_for_other_active_turn()
         .await
         .expect("test CLI runtime session should start");
 
-    processor
-        .ensure_cli_runtime_turn_blocked_cleanup(thread_id, old_turn_id, Some("test block"))
-        .await;
+    materialize_cli_runtime_turn_with_text(
+        &crud_store,
+        &workspace_id,
+        thread_id,
+        old_turn_id,
+        "terminal cleanup fixture",
+    )
+    .await;
+    crud_store
+        .update_turn_status(
+            thread_id,
+            old_turn_id,
+            TurnStatus::Blocked,
+            Some("test block"),
+            now.timestamp(),
+        )
+        .await
+        .unwrap();
+    let old_binding = crud_store
+        .get_cli_runtime_turn_binding(old_turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        processor
+            .cleanup_cli_runtime_terminal_turn_status(
+                &old_binding,
+                TurnStatus::Blocked,
+                "test block",
+            )
+            .await
+    );
 
     assert_eq!(
         *cli_session.interrupts.lock().await,
@@ -47277,6 +48045,7 @@ async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
                 .fixed_offset()
                 .timestamp_millis()
                 .saturating_add(20 * 60 * 1_000),
+            &mut super::cli_runtime::CliRuntimeStaleTurnScan::default(),
         )
         .await;
 
@@ -47312,6 +48081,56 @@ async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
         .expect("pending recovery jobs should load");
     assert_eq!(pending_jobs.len(), 1);
     assert_eq!(pending_jobs[0].trigger, RecoveryTrigger::RuntimeFailure);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unbound_native_listener_owns_processor_until_abort() {
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = Box::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        Arc::new(SessionManager::new()),
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    assert!(processor.task_agent_executor.processor_weak().is_err());
+    // This fixture-only field is held exclusively by processor instances.
+    let owner_state = Arc::downgrade(&processor.native_cancellation_materialization_failure);
+    let agent_manager = processor.agent_manager.clone();
+    let thread_id = "unbound-listener-owner";
+    processor
+        .agent_manager
+        .ensure_thread(thread_id, &workspace_id)
+        .await
+        .unwrap();
+    processor
+        .ensure_agent_listener_task(thread_id)
+        .await
+        .unwrap();
+    let listener = processor
+        .agent_listener_tasks
+        .lock()
+        .await
+        .remove(thread_id)
+        .unwrap();
+    drop(processor);
+    assert!(
+        owner_state.upgrade().is_some(),
+        "the spawned listener must own its processor after the fixture is dropped"
+    );
+    listener.handle.abort();
+    let stopped = tokio::time::timeout(Duration::from_secs(2), listener.handle)
+        .await
+        .unwrap();
+    assert!(stopped.unwrap_err().is_cancelled());
+    assert!(
+        owner_state.upgrade().is_none(),
+        "joining the aborted listener must release its owned processor"
+    );
+    agent_manager.remove_thread(thread_id).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -47401,7 +48220,10 @@ async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
         .expect("turn should complete in durable store after opening the request");
 
     processor
-        .fail_stale_cli_runtime_turns(chrono::Utc::now().fixed_offset().timestamp_millis())
+        .fail_stale_cli_runtime_turns(
+            chrono::Utc::now().fixed_offset().timestamp_millis(),
+            &mut super::cli_runtime::CliRuntimeStaleTurnScan::default(),
+        )
         .await;
 
     let pending = crud_store
@@ -51608,7 +52430,12 @@ async fn cli_runtime_human_wait_defers_stale_turn_scan() {
     let scan_now = chrono::Utc::now()
         .timestamp_millis()
         .saturating_add(200_000);
-    processor.fail_stale_cli_runtime_turns(scan_now).await;
+    processor
+        .fail_stale_cli_runtime_turns(
+            scan_now,
+            &mut super::cli_runtime::CliRuntimeStaleTurnScan::default(),
+        )
+        .await;
 
     let (_workspace_id, turn) = crud_store
         .get_turn("thread_cli_command_approval", "codex-turn-command")
@@ -51642,7 +52469,12 @@ async fn cli_runtime_human_wait_expires_without_blocking_the_turn() {
     let scan_now = chrono::Utc::now()
         .timestamp_millis()
         .saturating_add(24 * 60 * 60 * 1_000 + 1);
-    processor.fail_stale_cli_runtime_turns(scan_now).await;
+    processor
+        .fail_stale_cli_runtime_turns(
+            scan_now,
+            &mut super::cli_runtime::CliRuntimeStaleTurnScan::default(),
+        )
+        .await;
 
     let pending = crud_store
         .get_cli_runtime_pending_request(opened.request_id.as_str())
@@ -51910,44 +52742,51 @@ async fn seed_cli_runtime_turn_with_text(
     )
     .await;
 
+    seed_cli_runtime_binding(
+        crud_store,
+        workspace_id,
+        runtime_id,
+        runtime_kind,
+        thread_id,
+        turn_id,
+        native_thread_id,
+    )
+    .await;
+}
+
+async fn seed_cli_runtime_binding(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    runtime_id: &str,
+    runtime_kind: &str,
+    thread_id: &str,
+    turn_id: &str,
+    native_thread_id: &str,
+) {
     let now = chrono::Utc::now().fixed_offset();
-    let (_, attempt) = crud_store
-        .prepare_cli_runtime_initial_turn_attempt(
-            NewCliRuntimeTurnBinding {
-                turn_id: turn_id.to_owned(),
-                thread_id: thread_id.to_owned(),
-                continuation_thread_id: thread_id.to_owned(),
-                workspace_id: workspace_id.to_owned(),
-                runtime_id: runtime_id.to_owned(),
-                runtime_kind: runtime_kind.to_owned(),
-                native_thread_id: native_thread_id.to_owned(),
-                native_turn_id: None,
-                request_id: None,
-                status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING
-                    .to_owned(),
-                model: Some("gpt-5".to_owned()),
-                cwd: Some("/tmp/project".to_owned()),
-                sandbox_json: None,
-                approval_policy: None,
-                input_mapping_json: "{}".to_owned(),
-                created_at: now,
-                updated_at: now,
-            },
-            pioneer_protocol::generate_id(21),
-            1,
-        )
-        .await
-        .expect("CLI approval test turn attempt should prepare");
-    crud_store
-        .activate_cli_runtime_turn_attempt(turn_id, attempt.id.as_str(), turn_id, None, now)
-        .await
-        .expect("CLI approval test turn attempt should activate");
-    if runtime_kind == "codex" {
-        crud_store
-            .register_cli_runtime_execution_segment(turn_id, native_thread_id, turn_id, now)
-            .await
-            .expect("Codex approval test execution segment should register");
-    }
+    seed_running_cli_runtime_binding(
+        crud_store,
+        NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            runtime_id: runtime_id.to_owned(),
+            runtime_kind: runtime_kind.to_owned(),
+            native_thread_id: native_thread_id.to_owned(),
+            native_turn_id: Some(turn_id.to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await;
 }
 
 async fn materialize_cli_runtime_approval_turn(
@@ -51973,6 +52812,25 @@ async fn materialize_cli_runtime_turn_with_text(
     turn_id: &str,
     user_text: &str,
 ) {
+    materialize_cli_runtime_turn_with_execution(
+        crud_store,
+        workspace_id,
+        thread_id,
+        turn_id,
+        user_text,
+        None,
+    )
+    .await;
+}
+
+async fn materialize_cli_runtime_turn_with_execution(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    user_text: &str,
+    execution: Option<pioneer_crud::NewTurnExecution>,
+) {
     ensure_test_superuser_execution_authority(crud_store).await;
     let execution_principal = authenticated_test_superuser();
     let now_secs = chrono::Utc::now().timestamp();
@@ -51996,7 +52854,7 @@ async fn materialize_cli_runtime_turn_with_text(
         visibility: None,
         turns: Vec::new(),
     };
-    let turn = Turn {
+    let mut turn = Turn {
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::default(),
@@ -52011,6 +52869,83 @@ async fn materialize_cli_runtime_turn_with_text(
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
     };
+    if let Some(execution) = execution {
+        let actor = pioneer_protocol::PersistedActorRef::Principal(
+            execution_principal.principal_id.clone(),
+        );
+        turn.author = Some(pioneer_protocol::TurnAuthorSnapshot {
+            actor: actor.clone(),
+            display_name: "Superuser".into(),
+            nickname: "superuser".into(),
+            avatar_revision: None,
+            agent: None,
+        });
+        let backend = AgentExecutionBackend::CLIAgentRuntime {
+            runtime_id: execution.executor_key.clone().unwrap(),
+            runtime_kind: if execution.executor_key.as_deref() == Some("claude") {
+                CLIAgentRuntimeKind::Claude
+            } else {
+                CLIAgentRuntimeKind::Codex
+            },
+        };
+        let authority = crate::authorization::ExecutionAuthorizationContext::for_test(
+            execution_principal.as_ref(),
+            workspace_id,
+            thread_id,
+            &turn.permission_profile,
+            Some(&backend),
+        )
+        .to_persisted_json()
+        .unwrap();
+        let audit = pioneer_protocol::TurnPermissionAuditEvent {
+            workspace_id: workspace_id.into(),
+            thread_id: thread_id.into(),
+            turn_id: turn_id.into(),
+            event_kind: pioneer_protocol::TurnPermissionAuditEventKind::ProfileSelected,
+            profile_mode: turn.permission_profile.mode,
+            profile_source: turn.permission_profile.source,
+            security_snapshot_id: None,
+            security_snapshot_version: None,
+            security_reason_code: None,
+            security_capability: None,
+            item_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            action_kind: None,
+            request_key: None,
+            decision: None,
+            reason: None,
+            cached: false,
+        };
+        crud_store
+            .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[UserInput::Text {
+                    text: user_text.into(),
+                    text_elements: Vec::new(),
+                }],
+                None,
+                pioneer_crud::TurnWorkOwner::Turn,
+                actor,
+                audit,
+                &authority,
+                None,
+                None,
+                Some(execution),
+                &pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                    "/tmp/project",
+                    chrono::Utc::now().timestamp_millis(),
+                ),
+                Vec::new(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        return;
+    }
     crud_store
         .materialize_turn_start(
             &thread,
@@ -53203,19 +54138,31 @@ async fn agent_skill_audit_event_persists_audit_rows() {
 #[test]
 fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
     run_gateway_message_test("prompt-manifest-hook-sources", || async {
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::channel(256);
         let session_manager = Arc::new(SessionManager::new());
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
         let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        let provider_entered = Arc::new(Notify::new());
+        let provider_release = Arc::new(Notify::new());
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "openai",
-            Arc::new(DelayedProvider {
-                delay: Duration::from_secs(5),
-                text: "delayed manifest response".to_owned(),
+            Arc::new(CancellationBarrierProvider {
+                entered: provider_entered.clone(),
+                release: provider_release,
             }),
         ));
+        // Preflight runs before manifest compilation and window registration.
+        // Let it finish through its own provider so the barrier gates only the
+        // main response, after the actor's durable startup events have ACKed.
+        let preflight_provider = Arc::new(PreflightCaptureProvider::new("unexpected main request"));
+        provider_registry
+            .insert("preflight-capture", preflight_provider.clone())
+            .expect("preflight provider should fit the bounded test registry");
+        let mut tool_loop_config = test_tool_loop_config();
+        tool_loop_config.preflight.provider_name = Some("preflight-capture".to_owned());
+        tool_loop_config.preflight.model = Some("test-model".to_owned());
         let processor = MessageProcessor::new(
             thread_manager.clone(),
             provider_registry,
@@ -53224,7 +54171,7 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_tool_loop_config(),
+            tool_loop_config,
         );
 
         let thread_id = "thr_000000000000000090";
@@ -53267,26 +54214,32 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
             events::TURN_STARTED,
         )
         .await;
+        // Provider entry follows the actor's real window/manifest/context ACKs.
+        // Keep it gated through the roundtrip so neither a second synthetic
+        // window nor a timer-driven completion races the manifest under test.
+        tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
+            .await
+            .expect("manifest fixture provider should enter after durable startup");
+        let preflight_requests = preflight_provider.snapshot_requests();
+        assert!(
+            !preflight_requests.is_empty(),
+            "preflight should run before main provider entry"
+        );
+        assert!(preflight_requests.iter().all(is_turn_preflight_request));
+        let window = crud_store
+            .latest_turn_execution_window(turn_id)
+            .await
+            .expect("manifest fixture execution window should load")
+            .expect("actor should persist its execution window before provider entry");
+        assert_eq!(window.workspace_id, workspace_id);
+        assert_eq!(window.thread_id, thread_id);
+        assert_eq!(window.turn_id, turn_id);
+        assert_eq!(window.window_index, 1);
+        assert_eq!(window.status, ExecutionWindowStatus::Running);
         let _execution_lease = processor
             .register_execution_lease(turn_id)
             .await
             .expect("prompt-manifest fixture execution lease should register");
-        assert!(
-            processor
-                .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowStarted {
-                    notification: pioneer_protocol::TurnExecutionWindowStartedNotification {
-                        workspace_id: workspace_id.clone(),
-                        thread_id: thread_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        window_id: "prompt_manifest_fixture_window".to_owned(),
-                        window_index: 1,
-                        status: ExecutionWindowStatus::Running,
-                        started_at_unix_ms: 1_000,
-                    },
-                })
-                .await,
-            "prompt-manifest fixture execution window should persist"
-        );
 
         let manifest = PromptManifest {
             compiler_version: "0.1.0-test".to_owned(),
@@ -53330,13 +54283,16 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
             }],
         };
 
-        processor
-            .handle_durable_agent_event(AgentDurableEvent::PromptManifestCompiled {
-                thread_id: thread_id.to_owned(),
-                turn_id: turn_id.to_owned(),
-                manifest: manifest.clone(),
-            })
-            .await;
+        assert!(
+            processor
+                .handle_durable_agent_event(AgentDurableEvent::PromptManifestCompiled {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    manifest: manifest.clone(),
+                })
+                .await,
+            "hook-source manifest event should receive its durable ACK"
+        );
 
         let (_, in_memory_turn) = thread_manager
             .turn_get(thread_id, turn_id)
@@ -53368,6 +54324,7 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
             serde_json::from_value(response.result).expect("turn/get result should decode");
 
         assert_eq!(turn_get.turn.prompt_manifest, Some(manifest));
+        processor.agent_manager.remove_thread(thread_id).await;
     });
 }
 
@@ -53659,21 +54616,62 @@ fn turn_cancel_interrupts_running_turn_and_is_idempotent() {
 }
 
 async fn assert_turn_cancel_interrupts_running_turn_and_is_idempotent() {
-    let (tx, mut rx) = mpsc::channel(16);
+    assert_turn_cancel_with_optional_busy_native_actor(false, false, false).await;
+}
+
+#[test]
+fn native_gateway_cancellation_commits_while_provider_is_blocked_and_preserves_actor() {
+    run_standard_stack_message_test(
+        "native cancellation with blocked provider",
+        assert_turn_cancel_with_optional_busy_native_actor(true, false, false),
+    );
+}
+
+async fn wait_for_cancelled_native_actor_cleanup(
+    manager: &pioneer_agent::AgentManager,
+    thread_id: &str,
+) {
+    // cancel_turn ACKs cooperative cancellation before durable terminalization.
+    // Wait for active-control cleanup before observe_turn can use its mailbox
+    // and read the actor's completed terminal observation.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while manager.active_turn_id(thread_id).await.is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled native actor should clear active control after durable ACK");
+}
+
+async fn assert_turn_cancel_with_optional_busy_native_actor(
+    busy_native: bool,
+    with_effects: bool,
+    resume_direct: bool,
+) {
+    let (tx, mut rx) = mpsc::channel(256);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "delayed"));
     let thread_manager_for_assert = thread_manager.clone();
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "delayed",
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let provider: Arc<dyn Provider> = if busy_native {
+        Arc::new(CancellationBarrierProvider {
+            entered: entered.clone(),
+            release: release.clone(),
+        })
+    } else {
         Arc::new(DelayedProvider {
             delay: Duration::from_secs(30),
             text: "too late".to_owned(),
-        }),
+        })
+    };
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "delayed", provider,
     ));
     let crud_store_for_assert = crud_store.clone();
-    let processor = MessageProcessor::new(
+    let processor = Arc::new(MessageProcessor::new(
         thread_manager,
         provider_registry,
         session_manager,
@@ -53682,7 +54680,16 @@ async fn assert_turn_cancel_interrupts_running_turn_and_is_idempotent() {
         test_gateway_secrets(),
         test_summary_config(),
         test_tool_loop_config(),
-    );
+    ));
+    let post_turn_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cleanup_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let effect_barrier = Arc::new(CancellationEffectBarrier {
+        hook_entered: Notify::new(),
+        cleanup_entered: Notify::new(),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let mut committed_events = None;
+    let mut preserved_blocked_rows = Vec::new();
 
     let thread_request_id = generate_test_request_id("turncancel", "thread");
     let thread_start_request = json!({
@@ -53753,6 +54760,302 @@ async fn assert_turn_cancel_interrupts_running_turn_and_is_idempotent() {
     )
     .await;
 
+    if with_effects {
+        install_recoverable_test_hook_runtime(
+            &processor,
+            task_post_turn_recording_hook_runtime_with_cancellation_barrier(
+                post_turn_calls.clone(),
+                Some(effect_barrier.clone()),
+            ),
+        )
+        .await;
+        processor
+            .agent_manager
+            .set_post_turn_hook_dispatch_policy(pioneer_agent::AgentPostTurnHookDispatchPolicy {
+                on_interrupted: true,
+                ..Default::default()
+            })
+            .await;
+        processor
+            .agent_manager
+            .set_task_tool_provider(Some(Arc::new(CancellationCleanupProvider {
+                calls: cleanup_calls.clone(),
+                barrier: effect_barrier.clone(),
+            })))
+            .await;
+    }
+
+    if busy_native {
+        let thread_id = "thr_000000000000000022";
+        let turn_id = "turn_000000000000000022";
+        ensure_test_superuser_execution_authority(processor.crud_store.as_ref()).await;
+        let mut authority = crate::authorization::ExecutionAuthorizationContext::for_test(
+            authenticated_test_superuser().as_ref(),
+            &workspace_id,
+            thread_id,
+            &default_test_permission_profile(),
+            None,
+        );
+        authority.bind_test_provider_authority(
+            "delayed",
+            "test-model",
+            processor
+                .provider_registry
+                .authority_fingerprint_for_workspace(&workspace_id, "delayed")
+                .unwrap()
+                .as_str(),
+        );
+        assert!(
+            processor
+                .crud_store
+                .set_turn_execution_authorization_context(
+                    turn_id,
+                    &authority.to_persisted_json().unwrap()
+                )
+                .await
+                .unwrap()
+        );
+        for cycle in 0..if resume_direct { 2 } else { 1 } {
+            processor
+                .agent_manager
+                .ensure_thread(thread_id, &workspace_id)
+                .await
+                .unwrap();
+            committed_events = processor.agent_manager.subscribe_committed(thread_id).await;
+            processor
+                .ensure_agent_listener_task(thread_id)
+                .await
+                .unwrap();
+            processor
+                .agent_manager
+                .start_turn_with_hook_context_permission_profile_and_security_snapshot(
+                    thread_id,
+                    turn_id,
+                    if with_effects {
+                        ThreadMode::Agent
+                    } else {
+                        ThreadMode::Chat
+                    },
+                    pioneer_agent::AgentTurnHookRuntimeContext::default(),
+                    "test-model",
+                    "delayed",
+                    HashMap::new(),
+                    pioneer_skills::SkillCatalogSnapshot {
+                        version: 1,
+                        generated_at_unix: 0,
+                        skills: Vec::new(),
+                    },
+                    vec![UserInput::Text {
+                        text: "hello".to_owned(),
+                        text_elements: Vec::new(),
+                    }],
+                    Vec::new(),
+                    Vec::new(),
+                    HashMap::new(),
+                    Vec::new(),
+                    default_test_permission_profile(),
+                    test_full_access_execution_security_snapshot(),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            // The provider cannot finish until release; it stays unreleased throughout cancellation.
+            assert!(
+                crud_store_for_assert
+                    .native_cancellation_context(turn_id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+
+            if resume_direct && cycle == 0 {
+                processor.agent_manager.remove_thread(thread_id).await;
+                let context = crud_store_for_assert
+                    .native_cancellation_context(turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut blocked_plan = context.preparation.clone();
+                blocked_plan.batch_id.push_str(":blocked");
+                for effect in &mut blocked_plan.effects {
+                    effect.effect_id = effect
+                        .effect_id
+                        .replace(":cancellation-effect:", ":terminal-effect:");
+                    match &mut effect.payload {
+                        pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                            request,
+                            ..
+                        } => {
+                            let mut phase: pioneer_hooks::HookPhaseRequest =
+                                serde_json::from_value(request.clone()).unwrap();
+                            let pioneer_hooks::HookInputPayload::TurnPostTurn(input) =
+                                &mut phase.input.payload
+                            else {
+                                panic!("hook input");
+                            };
+                            input.status = pioneer_hooks::TurnPostTurnStatus::Blocked;
+                            *request = serde_json::to_value(phase).unwrap();
+                        }
+                        pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
+                            reason,
+                            ..
+                        } => *reason = "parent turn blocked".into(),
+                        _ => panic!("executable original plan"),
+                    }
+                }
+                // Real ordinary preparation, canonical Blocked and activation.
+                crud_store_for_assert
+                    .prepare_native_terminal_effects(blocked_plan.clone(), now_timestamp_secs())
+                    .await
+                    .unwrap();
+                let (_, mut blocked) = crud_store_for_assert
+                    .get_turn(thread_id, turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                blocked.status = TurnStatus::Blocked;
+                processor
+                    .materialize_native_agent_turn_event(
+                        pioneer_crud::CanonicalTurnEventPayload::TurnBlocked(
+                            pioneer_protocol::TurnBlockedNotification {
+                                workspace_id: workspace_id.clone(),
+                                thread_id: thread_id.into(),
+                                turn: blocked,
+                                resume: None,
+                            },
+                        ),
+                        now_timestamp_secs(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::join!(
+                        effect_barrier.hook_entered.notified(),
+                        effect_barrier.cleanup_entered.notified()
+                    );
+                })
+                .await
+                .unwrap();
+                let db = crud_store_for_assert.database_connection();
+                let mut claimed_rows = Vec::new();
+                for effect in &blocked_plan.effects {
+                    let row = pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(
+                        effect.effect_id.clone(),
+                    )
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert!(row.terminal_committed_at.is_some());
+                    assert_eq!(row.attempt_count, 1);
+                    claimed_rows.push(row);
+                }
+                effect_barrier.release.add_permits(2);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while processor
+                        .native_terminal_effect_kick_running
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                for before in claimed_rows {
+                    let after = pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(
+                        before.effect_id.clone(),
+                    )
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(after.status, "succeeded");
+                    assert_eq!(
+                        after.payload_identity_sha256,
+                        before.payload_identity_sha256
+                    );
+                    assert_eq!(after.gate_kind, before.gate_kind);
+                    assert_eq!(after.attempt_count, before.attempt_count);
+                    assert_eq!(after.terminal_committed_at, before.terminal_committed_at);
+                    preserved_blocked_rows.push(after);
+                }
+                let now = now_timestamp_secs();
+                let job = crud_store_for_assert
+                    .enqueue_recovery_job(
+                        turn_id.into(),
+                        "reasoning_resume".into(),
+                        pioneer_protocol::TurnItemType::Reasoning,
+                        None,
+                        pioneer_protocol::RecoveryTrigger::Timeout,
+                        pioneer_protocol::RecoveryAction::BlockResumable,
+                        None,
+                        None,
+                        None,
+                        None,
+                        0,
+                        0,
+                        json!({}),
+                        json!({"base_backoff_secs":0,"max_wall_clock_secs":60}),
+                        now,
+                    )
+                    .await
+                    .unwrap();
+                crud_store_for_assert
+                    .mark_recovery_job_terminal(
+                        &job.id,
+                        pioneer_protocol::RecoveryJobStatus::Blocked,
+                        None,
+                        now,
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    crud_store_for_assert
+                        .resume_blocked_turn_recovery(
+                            thread_id,
+                            turn_id,
+                            Some(&job.id),
+                            now,
+                            processor.turn_execution_owner_id.as_ref(),
+                            now + 100
+                        )
+                        .await
+                        .unwrap(),
+                    pioneer_crud::BlockedTurnRecoveryResumeOutcome::Resumed(_)
+                ));
+                assert_eq!(
+                    crud_store_for_assert
+                        .native_cancellation_context(turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .preparation,
+                    context.preparation
+                );
+            }
+        }
+        if resume_direct {
+            processor
+                .agent_manager
+                .cancel_turn(thread_id, turn_id, "user clicked stop")
+                .await
+                .unwrap();
+            wait_for_cancelled_native_actor_cleanup(&processor.agent_manager, thread_id).await;
+            assert_eq!(
+                processor
+                    .agent_manager
+                    .observe_turn(thread_id, turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                pioneer_agent::ExecutionTurnStatus::Interrupted
+            );
+        }
+    }
     let turn_cancel_request_id = generate_test_request_id("turncancel", "stop1");
     let turn_cancel_request = json!({
         "jsonrpc": "2.0",
@@ -53823,6 +55126,162 @@ async fn assert_turn_cancel_interrupts_running_turn_and_is_idempotent() {
         .expect("interrupted turn should be persisted");
     assert_eq!(persisted_turn.status, TurnStatus::Interrupted);
     assert_eq!(persisted_turn.error.as_deref(), Some("user clicked stop"));
+    if busy_native {
+        assert!(
+            crud_store_for_assert
+                .native_cancellation_was_accepted("turn_000000000000000022")
+                .await
+                .unwrap()
+        );
+        if with_effects {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(
+                    effect_barrier.hook_entered.notified(),
+                    effect_barrier.cleanup_entered.notified()
+                );
+            })
+            .await
+            .unwrap();
+            // Existing workers have claimed both rows but barriers prevent completion.
+            // Receipt, marker and original bounded payloads must already be durable.
+            let context = crud_store_for_assert
+                .native_cancellation_context("turn_000000000000000022")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(context.preparation.effects.len(), 2);
+            let expected = pioneer_agent::post_turn::prepare_native_cancellation(
+                context.preparation.clone(),
+                "user clicked stop",
+            )
+            .unwrap();
+            let db = crud_store_for_assert.database_connection();
+            for effect in &expected.effects {
+                let row = pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(
+                    effect.effect_id.clone(),
+                )
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(row.terminal_committed_at.is_some());
+                assert_eq!(
+                    serde_json::from_str::<pioneer_protocol::NativeTerminalEffectPayload>(
+                        &row.payload_json
+                    )
+                    .unwrap(),
+                    effect.payload
+                );
+            }
+            let marker = pioneer_entity::turn_event_projection_stream_state::Entity::find_by_id(
+                "turn_000000000000000022",
+            )
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(marker.accepted_terminal_event_id, context.accepted_event_id);
+            effect_barrier.release.add_permits(2);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while processor
+                    .native_terminal_effect_kick_running
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                crud_store_for_assert
+                    .native_terminal_effect_stats()
+                    .await
+                    .unwrap()
+                    .succeeded,
+                if resume_direct { 4 } else { 2 }
+            );
+            assert_eq!(
+                post_turn_calls.lock().unwrap().len(),
+                if resume_direct { 2 } else { 1 }
+            );
+            assert_eq!(
+                cleanup_calls.lock().unwrap().len(),
+                if resume_direct { 2 } else { 1 }
+            );
+            let replay_dispatch = processor
+                .process_due_native_terminal_effects(chrono::Utc::now().timestamp(), 8)
+                .await
+                .unwrap();
+            assert!(!replay_dispatch.storage_failed);
+            assert_eq!(replay_dispatch.count, 0);
+        } else {
+            assert_eq!(
+                crud_store_for_assert
+                    .native_terminal_effect_stats()
+                    .await
+                    .unwrap()
+                    .ready,
+                0
+            );
+        }
+        wait_for_cancelled_native_actor_cleanup(&processor.agent_manager, "thr_000000000000000022")
+            .await;
+        assert_eq!(
+            processor
+                .agent_manager
+                .observe_turn("thr_000000000000000022", "turn_000000000000000022")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            pioneer_agent::ExecutionTurnStatus::Interrupted
+        );
+        assert_eq!(
+            processor.agent_manager.health_snapshot().await.dead_actors,
+            0
+        );
+        if let Some(events) = committed_events.as_mut() {
+            while let Ok(event) = events.try_recv() {
+                assert!(
+                    !matches!(event, pioneer_protocol::AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } if preparation.turn_id == "turn_000000000000000022")
+                );
+            }
+        }
+        let restarted = pioneer_crud::CrudStore::new(crud_store_for_assert.database_connection());
+        let now = now_timestamp_secs();
+        let replay_claims = restarted
+            .claim_due_native_terminal_effects_at(now, 30, 2)
+            .await
+            .unwrap();
+        assert!(!replay_claims.storage_failed);
+        assert_eq!(replay_claims.records.len(), 0);
+        for before in &preserved_blocked_rows {
+            let after = pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(
+                before.effect_id.clone(),
+            )
+            .one(&restarted.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                &after, before,
+                "cancellation/replay must preserve the entire completed Blocked row"
+            );
+        }
+        // Actor generation survives the confirmed cancellation; teardown is explicit.
+        assert!(
+            processor
+                .agent_manager
+                .thread_generation("thr_000000000000000022")
+                .await
+                .is_some()
+        );
+        processor
+            .agent_manager
+            .remove_thread("thr_000000000000000022")
+            .await;
+        release.notify_one();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -53855,46 +55314,64 @@ async fn turn_cancel_cli_runtime_without_active_session_does_not_start_runtime()
 
     let thread_id = "thr_cli_cancel_no_session";
     let turn_id = "turn_cli_cancel_no_session";
-    let thread_start_request_id = generate_test_request_id("clicancel", "thread");
-    let thread_start_request = json!({
-        "jsonrpc": "2.0",
-        "id": thread_start_request_id,
-        "method": "thread/start",
-        "params": {
-            "thread_id": thread_id,
-            "workspace_id": workspace_id,
-            "model": "test-model",
-            "model_provider": "delayed"
-        }
-    });
-    processor
-        .process_request_for_connection(connection_id, &thread_start_request.to_string())
-        .await;
-    let _ = recv_response_by_id(&mut rx, thread_start_request_id.as_str()).await;
-
-    let turn_start_request_id = generate_test_request_id("clicancel", "start");
-    let turn_start_request = json!({
-        "jsonrpc": "2.0",
-        "id": turn_start_request_id,
-        "method": "turn/start",
-        "params": {
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "mode": "Chat",
-            "model": "test-model",
-            "model_provider": "delayed",
-            "input": [{"type": "text", "text": "hello"}]
-        }
-    });
-    processor
-        .process_request_for_connection(connection_id, &turn_start_request.to_string())
-        .await;
-    let _ = recv_response_and_notification_by_id_method(
-        &mut rx,
-        turn_start_request_id.as_str(),
-        events::TURN_STARTED,
+    // Model a persisted CLI turn awaiting its first runtime session. Starting an
+    // API-provider actor and grafting a CLI binding onto it would leave the
+    // native execution/context ownership inconsistent.
+    materialize_cli_runtime_turn_with_text(
+        crud_store.as_ref(),
+        &workspace_id,
+        thread_id,
+        turn_id,
+        "hello",
     )
     .await;
+    subscribe_test_connection_to_materialized_thread(
+        &processor,
+        connection_id,
+        &workspace_id,
+        thread_id,
+    )
+    .await;
+    // Subscription seeds a new session and clears its in-memory turns. Restore
+    // the durable turn afterwards, as terminal lifecycle recovery does.
+    let persisted = crud_store
+        .get_thread_model(thread_id)
+        .await
+        .expect("persisted CLI cancellation thread should load")
+        .expect("persisted CLI cancellation thread should exist");
+    let sandbox_mode = crud_store
+        .get_thread_sandbox_mode(thread_id)
+        .await
+        .expect("persisted CLI cancellation sandbox should load");
+    processor
+        .thread_manager
+        .system_thread_restore_persisted(persisted, sandbox_mode)
+        .await
+        .expect("CLI cancellation should restore its durable turn into local state");
+    assert_eq!(
+        processor
+            .thread_manager
+            .turn_get(thread_id, turn_id)
+            .await
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+    assert!(
+        processor
+            .agent_manager
+            .turn_owner_generation(thread_id, turn_id)
+            .await
+            .is_none()
+    );
+    assert!(
+        crud_store
+            .native_cancellation_context(turn_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     let now = chrono::Utc::now().fixed_offset();
     let (_starting_binding, initial_attempt) = crud_store
@@ -59412,7 +60889,7 @@ async fn cli_runtime_request_respond_rejects_pending_for_blocked_turn_without_na
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_request_respond_for_completed_turn_expires_all_pending_requests() {
+async fn cli_runtime_completed_turn_cleanup_expires_pending_requests_before_response() {
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -59491,15 +60968,23 @@ async fn cli_runtime_request_respond_for_completed_turn_expires_all_pending_requ
             .expect("pending request should open");
     }
 
-    crate::cli_runtime::turn_binding::update_cli_runtime_turn_binding_status(
-        crud_store.as_ref(),
-        turn_id,
-        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED,
-        None,
-        chrono::Utc::now().fixed_offset(),
-    )
-    .await
-    .expect("test turn binding should complete");
+    crud_store
+        .update_turn_status(
+            thread_id,
+            turn_id,
+            TurnStatus::Completed,
+            None,
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .expect("the canonical Turn must also be completed before terminal cleanup");
+    assert_eq!(
+        processor
+            .renew_active_cli_runtime_turn_deadlines(turn_id, chrono::Utc::now().timestamp())
+            .await
+            .expect("terminal canonical Turn must repair its lagging active CLI binding"),
+        crate::resilience::RuntimeTimeoutObservation::Terminal
+    );
     let completed_binding = crud_store
         .get_cli_runtime_turn_binding(turn_id)
         .await
@@ -59536,7 +61021,7 @@ async fn cli_runtime_request_respond_for_completed_turn_expires_all_pending_requ
     assert_eq!(
         first_after_response.status,
         pioneer_crud::CliRuntimePendingRequestStatus::Expired,
-        "completed binding validation should expire the answered request before native response"
+        "terminal cleanup must expire the request before a late native response"
     );
 
     let error = recv_error_by_id(&mut rx, "cliruntime_reqdone001").await;
@@ -61269,8 +62754,9 @@ async fn cli_runtime_terminal_event_expires_pending_requests_for_turn() {
         setup_execution_window_terminal_turn(thread_id, turn_id).await;
 
     let now = chrono::Utc::now().fixed_offset();
-    crud_store
-        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+    seed_running_cli_runtime_binding(
+        crud_store.as_ref(),
+        NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
             continuation_thread_id: thread_id.to_owned(),
@@ -61288,9 +62774,9 @@ async fn cli_runtime_terminal_event_expires_pending_requests_for_turn() {
             input_mapping_json: "{}".to_owned(),
             created_at: now,
             updated_at: now,
-        })
-        .await
-        .expect("CLI runtime turn binding should upsert");
+        },
+    )
+    .await;
 
     let pending_payload = CLIRuntimePendingRequest {
         kind: CLIRuntimeRequestKind::CommandApproval,
@@ -67459,8 +68945,14 @@ async fn setup_pooled_file_workspace_manager_with_observer(
 async fn setup_workspace_manager_with_connection(
     connection: sea_orm::DatabaseConnection,
 ) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
+    setup_workspace_manager_with_connection_migrator::<Migrator>(connection).await
+}
+
+async fn setup_workspace_manager_with_connection_migrator<M: MigratorTrait>(
+    connection: sea_orm::DatabaseConnection,
+) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
     crate::compaction::load_test_catalog();
-    Migrator::up(&connection, None)
+    M::up(&connection, None)
         .await
         .expect("migrations must succeed");
     bootstrap(&connection)
@@ -68430,6 +69922,14 @@ struct MemoryAgentE2eHarness {
 }
 
 async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGatewayHarness {
+    setup_memory_gateway_harness_with_backend(case_id, enabled, None).await
+}
+
+async fn setup_memory_gateway_harness_with_backend(
+    case_id: &str,
+    enabled: bool,
+    backend: Option<Arc<dyn pioneer_memory::MemoryBackend>>,
+) -> MemoryGatewayHarness {
     let session_manager = Arc::new(SessionManager::new());
     let (tx, rx) = mpsc::channel(32);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -68440,8 +69940,13 @@ async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGat
         .await;
     let runtime_home = unique_temp_dir(&format!("memory_{case_id}"));
     std::fs::create_dir_all(runtime_home.as_path()).expect("create memory runtime home");
-    let memory_runtime = Arc::new(
-        GatewayMemoryRuntime::from_config(
+    let uses_memvid = backend.is_none();
+    let memory_runtime = Arc::new(match backend {
+        Some(backend) => {
+            assert!(enabled, "custom memory backend requires an enabled runtime");
+            GatewayMemoryRuntime::enabled_with_backend_for_test(crud_store.clone(), backend)
+        }
+        None => GatewayMemoryRuntime::from_config(
             crud_store.clone(),
             runtime_home.as_path(),
             &GatewayMemoryConfig {
@@ -68453,10 +69958,12 @@ async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGat
             },
         )
         .expect("memory runtime should initialize"),
-    );
+    });
 
     if enabled {
         assert!(memory_runtime.is_enabled());
+    }
+    if enabled && uses_memvid {
         assert!(
             memory_runtime
                 .capsules_root()
@@ -70149,7 +71656,15 @@ async fn memory_tool_remember_writes_memory_with_turn_provenance() {
 
 #[tokio::test]
 async fn supervised_memory_mutations_prompt_before_real_database_side_effects() {
-    let harness = setup_memory_gateway_harness("tool_supervised_consent", true).await;
+    // Exercise the real approval broker, tools, memory service and SQLite writes.
+    // Memvid indexing is covered separately; its Tantivy writer lifecycle must
+    // not make this permission regression depend on filesystem lock timing.
+    let harness = setup_memory_gateway_harness_with_backend(
+        "tool_supervised_consent",
+        true,
+        Some(Arc::new(pioneer_memory::InMemoryMemoryBackend::default())),
+    )
+    .await;
     let context = memory_tool_context(&harness, "tool_supervised_consent");
     let materialization = materialize_memory_tools_for_context(&harness, context.clone()).await;
     let permission_profile = pioneer_protocol::system_turn_permission_profile_snapshot(
@@ -70176,6 +71691,7 @@ async fn supervised_memory_mutations_prompt_before_real_database_side_effects() 
         crate::permissions::GatewayPermissionApprovalBroker::channel();
     let opened = Arc::new(AtomicUsize::new(0));
     let opened_for_worker = opened.clone();
+    let store_for_worker = harness.crud_store.clone();
     let approval_worker = tokio::spawn(async move {
         while let Some(event) = approval_events.recv().await {
             match event {
@@ -70189,6 +71705,15 @@ async fn supervised_memory_mutations_prompt_before_real_database_side_effects() 
                         pioneer_tools::PermissionActionKind::MemoryWrite
                     );
                     let index = opened_for_worker.fetch_add(1, Ordering::SeqCst);
+                    let rows_before_decision = store_for_worker
+                        .list_agent_memory_records(AgentMemoryListFilter::default())
+                        .await
+                        .expect("read memory before approval decision");
+                    assert_eq!(
+                        rows_before_decision.len(),
+                        index,
+                        "memory writes must wait for the approval decision"
+                    );
                     let resolution = if index == 0 {
                         pioneer_tools::PermissionApprovalResolution::AllowOnce
                     } else {
@@ -70258,6 +71783,23 @@ async fn supervised_memory_mutations_prompt_before_real_database_side_effects() 
     assert_eq!(opened.load(Ordering::SeqCst), 2);
     assert_eq!(rows.len(), 1, "denied mutation must not create a DB row");
     assert_eq!(rows[0].key.as_deref(), Some("supervised_allowed"));
+
+    let runtime = harness.processor.memory_runtime();
+    let stored = runtime
+        .service()
+        .get(
+            runtime.operation_context_for_authorized_turn(&context, None, false),
+            MemoryGetParams {
+                memory_id: rows[0].id.clone(),
+                include_deleted: false,
+            },
+        )
+        .await
+        .expect("read approved memory through the service");
+    assert_eq!(
+        stored.record.expect("approved memory should exist").content,
+        "approved supervised memory"
+    );
 
     drop(tools);
     approval_worker.abort();
@@ -75569,7 +77111,7 @@ async fn check_completed_history(
             );
             let missing = harness
                 .crud_store
-                .compaction_lifecycle_recovery((phase_13_now_secs() as u64) * 1000, "")
+                .compaction_due_lifecycle(phase_13_now_secs() * 1000)
                 .await
                 .unwrap();
             assert_eq!(
@@ -75577,7 +77119,16 @@ async fn check_completed_history(
                 1,
                 "committed checkpoint is missing terminal publication"
             );
-            assert_eq!(missing[0].status, "completed");
+            assert_eq!(
+                harness
+                    .crud_store
+                    .compaction_operation(&missing[0].operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "completed"
+            );
             assert!(provider.call_count() > 0);
             Some(provider.call_count())
         } else {
@@ -76380,7 +77931,9 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
     let mut enabled_budget = None;
     let mut enabled_reserve = None;
     for (effort, reasoning, thinking) in [
-        (None, None, false),
+        // V4's server default enables thinking; only explicit off keeps this
+        // completed non-thinking tool round native instead of portable.
+        (None, None, true),
         (Some("none"), Some(ReasoningConfig::Disabled), false),
         (
             Some("high"),
@@ -76694,7 +78247,13 @@ async fn blocked_provider_task_consumers_impl(scenario: &str, path: &str) {
         .unwrap();
     let events = processor
         .recovery_coordinator
-        .record_recovery_provider_failure(&job.id, "first_attempt", failure.clone(), first_due + 1)
+        .record_recovery_provider_failure(
+            &job.id,
+            "first_attempt",
+            failure.clone(),
+            first_due + 1,
+            None,
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -77109,7 +78668,7 @@ async fn recovery_failure_task_consumers_impl(
             } else {
                 processor
                     .recovery_coordinator
-                    .record_recovery_provider_failure(&job.id, attempt, last.clone(), due + 1)
+                    .record_recovery_provider_failure(&job.id, attempt, last.clone(), due + 1, None)
                     .await
                     .unwrap()
             };
@@ -77428,7 +78987,13 @@ fn provider_replay_is_fenced_after_retryable_recovery_start_error() {
             if attempt == "provider_attempt_A" {
                 let events = processor
                     .recovery_coordinator
-                    .record_recovery_provider_failure(&job.id, attempt, failure.clone(), due + 1)
+                    .record_recovery_provider_failure(
+                        &job.id,
+                        attempt,
+                        failure.clone(),
+                        due + 1,
+                        None,
+                    )
                     .await
                     .unwrap();
                 assert!(matches!(
@@ -77552,3 +79117,679 @@ mod task_delivery_cancellation;
 
 #[path = "tests/memory_post_turn_recovery.rs"]
 mod memory_post_turn_recovery;
+
+async fn fanout_test_processor() -> (Arc<MessageProcessor>, String) {
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    (
+        Arc::new(MessageProcessor::new(
+            Arc::new(ThreadManager::new("test-model", "openai")),
+            test_provider(),
+            Arc::new(SessionManager::new()),
+            workspace_manager,
+            crud_store,
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        )),
+        workspace_id,
+    )
+}
+fn fanout_test_task(id: &str, workspace_id: &str) -> pioneer_protocol::Task {
+    pioneer_protocol::Task {
+        id: id.into(),
+        workspace_id: workspace_id.into(),
+        owner_kind: TaskOwnerKind::Workspace,
+        owner_id: Some(workspace_id.into()),
+        created_by_thread_id: None,
+        created_by_turn_id: None,
+        root_task_id: None,
+        parent_task_id: None,
+        executor_kind: TaskExecutorKind::System,
+        status: TaskStatus::Scheduled,
+        title: "Fanout".into(),
+        goal: "Bounded delivery".into(),
+        priority: 0,
+        lifecycle_policy: None,
+        delivery_policy: None,
+        retry_policy: None,
+        timeout_policy: None,
+        concurrency_policy: None,
+        metadata: None,
+        result: None,
+        error: None,
+        revision: 0,
+        created_at: 1_700_000_000,
+        updated_at: 1_700_000_000,
+        completed_at: None,
+    }
+}
+async fn fanout_test_append(processor: &MessageProcessor, id: &str, message: &str) {
+    processor
+        .crud_store
+        .append_task_event(
+            TaskEventPayload::Progress {
+                task_id: id.into(),
+                run_id: None,
+                message: message.into(),
+                details: None,
+            },
+            1_700_000_001,
+        )
+        .await
+        .unwrap();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fanout_quantum_shares_total_event_budget_and_leaves_large_backlogs_ready() {
+    let (processor, workspace) = fanout_test_processor().await;
+    for n in 0..70 {
+        let id = format!("fanout_{n:014}");
+        let task = fanout_test_task(&id, &workspace);
+        processor
+            .crud_store
+            .append_task_event(TaskEventPayload::TaskCreated { task }, 1_700_000_000)
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            fanout_test_append(&processor, &id, "small").await;
+        }
+    }
+    // Source triggers already covered these new Tasks; exercise a full due budget.
+    let summary = processor
+        .for_background_reconciliation()
+        .task_event_fanout_quantum()
+        .await
+        .unwrap();
+    assert_eq!(summary.selected, 64);
+    assert_eq!(summary.event_inputs, 128);
+    assert_eq!(summary.emitted, 128);
+    assert_eq!(summary.errors, 0);
+    assert_eq!(summary.pending, Some(true));
+    let id = "fanout_00000000000000";
+    assert_eq!(
+        processor
+            .crud_store
+            .get_task_event_fanout_cursor(id)
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    for _ in 0..140 {
+        fanout_test_append(&processor, id, "large backlog").await;
+    }
+    for _ in 0..10 {
+        let summary = processor
+            .for_background_reconciliation()
+            .task_event_fanout_quantum()
+            .await
+            .unwrap();
+        assert!(summary.emitted <= 128);
+        assert_eq!(summary.errors, 0);
+    }
+    assert!(
+        processor
+            .crud_store
+            .get_task_event_fanout_cursor(id)
+            .await
+            .unwrap()
+            .unwrap()
+            > 128
+    );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fanout_failure_n_preserves_prefix_and_allows_another_task_to_progress() {
+    use pioneer_entity::task_event;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    let (processor, workspace) = fanout_test_processor().await;
+    for id in ["fanout_bad", "fanout_good"] {
+        processor
+            .crud_store
+            .append_task_event(
+                TaskEventPayload::TaskCreated {
+                    task: fanout_test_task(id, &workspace),
+                },
+                1_700_000_000,
+            )
+            .await
+            .unwrap();
+        fanout_test_append(&processor, id, "N").await;
+        fanout_test_append(&processor, id, "N+1").await;
+    }
+    // Malformed immutable payload models a poison stored event, not ingress.
+    task_event::Entity::update_many()
+        .col_expr(
+            task_event::Column::PayloadJson,
+            sea_orm::sea_query::Expr::val("{invalid"),
+        )
+        .filter(task_event::Column::TaskId.eq("fanout_bad"))
+        .filter(task_event::Column::Sequence.eq(2_i64))
+        .exec(&processor.crud_store.database_connection())
+        .await
+        .unwrap();
+    let summary = processor
+        .for_background_reconciliation()
+        .task_event_fanout_quantum()
+        .await
+        .unwrap();
+    assert_eq!(summary.errors, 1);
+    assert_eq!(summary.emitted, 4);
+    assert_eq!(summary.pending, Some(true));
+    assert_eq!(
+        processor
+            .crud_store
+            .get_task_event_fanout_cursor("fanout_bad")
+            .await
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        processor
+            .crud_store
+            .get_task_event_fanout_cursor("fanout_good")
+            .await
+            .unwrap(),
+        Some(3)
+    );
+    let next = processor
+        .for_background_reconciliation()
+        .task_event_fanout_quantum()
+        .await
+        .unwrap();
+    assert_eq!(next.emitted, 0);
+    assert_eq!(
+        next.pending,
+        Some(true),
+        "future poison retry is not true empty"
+    );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fanout_periodic_dispatcher_recovers_commit_without_any_bus_publication() {
+    let (processor, workspace) = fanout_test_processor().await;
+    // CrudStore append deliberately has no TaskService bus publication.
+    processor
+        .crud_store
+        .append_task_event(
+            TaskEventPayload::TaskCreated {
+                task: fanout_test_task("fanout_lost_wake", &workspace),
+            },
+            1_700_000_000,
+        )
+        .await
+        .unwrap();
+    processor.start_task_event_listener().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if processor
+                .crud_store
+                .get_task_event_fanout_cursor("fanout_lost_wake")
+                .await
+                .unwrap()
+                == Some(1)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    processor.shutdown_resilience_workers().await;
+    assert!(processor.task_event_listener_worker.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn fanout_lagged_and_duplicate_wakes_do_not_create_competing_emitters() {
+    let (processor, workspace) = fanout_test_processor().await;
+    let event = processor
+        .crud_store
+        .append_task_event(
+            TaskEventPayload::TaskCreated {
+                task: fanout_test_task("fanout_lagged_wake", &workspace),
+            },
+            1_700_000_000,
+        )
+        .await
+        .unwrap();
+    let bus = processor.task_runtime.event_bus();
+    let mut probe = bus.subscribe(pioneer_tasks::TaskEventFilter::default());
+    processor.start_task_event_listener().await;
+    // publish performs no yielding I/O: both subscriptions lag before the
+    // single-thread runtime can first poll the owned dispatcher.
+    for _ in 0..1040 {
+        bus.publish(event.clone()).await;
+    }
+    assert!(matches!(
+        probe.recv().await,
+        pioneer_tasks::TaskEventWakeDelivery::Lagged(_)
+    ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if processor
+                .crud_store
+                .get_task_event_fanout_cursor("fanout_lagged_wake")
+                .await
+                .unwrap()
+                == Some(1)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    processor.shutdown_resilience_workers().await;
+    assert!(
+        !processor
+            .crud_store
+            .has_pending_task_event_fanout()
+            .await
+            .unwrap()
+    );
+}
+
+#[path = "tests/task_event_fanout_review.rs"]
+mod fanout_review;
+struct CancellationEffectBarrier {
+    hook_entered: Notify,
+    cleanup_entered: Notify,
+    release: tokio::sync::Semaphore,
+}
+struct CancellationCleanupProvider {
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+    barrier: Arc<CancellationEffectBarrier>,
+}
+#[async_trait::async_trait]
+impl TaskToolProvider for CancellationCleanupProvider {
+    fn terminal_cleanup_runtime_contract(&self) -> &'static str {
+        "test.native-cancellation-cleanup.v1"
+    }
+    async fn materialize_task_tools(
+        &self,
+        _: TaskTurnContext,
+    ) -> Result<pioneer_agent::TaskToolMaterialization, String> {
+        Ok(pioneer_agent::TaskToolMaterialization {
+            bundles: Vec::new(),
+            diagnostics: Vec::new(),
+        })
+    }
+    async fn pending_attached_tasks(
+        &self,
+        _: TaskTurnContext,
+    ) -> Result<Vec<pioneer_agent::PendingAttachedTask>, String> {
+        Ok(Vec::new())
+    }
+    async fn review_required_attached_task_observations(
+        &self,
+        _: TaskTurnContext,
+    ) -> Result<Vec<pioneer_agent::ReviewRequiredTaskObservation>, String> {
+        Ok(Vec::new())
+    }
+    async fn terminal_attached_task_observations(
+        &self,
+        _: TaskTurnContext,
+    ) -> Result<Vec<pioneer_agent::TerminalTaskObservation>, String> {
+        Ok(Vec::new())
+    }
+    async fn cleanup_attached_tasks(&self, _: TaskTurnContext, _: String) -> Result<(), String> {
+        Err("durable cleanup must use idempotent adapter".into())
+    }
+    async fn cleanup_attached_tasks_idempotent(
+        &self,
+        effect: &str,
+        context: TaskTurnContext,
+        reason: String,
+    ) -> Result<(), String> {
+        assert_eq!(context.turn_id, "turn_000000000000000022");
+        assert!(matches!(
+            reason.as_str(),
+            "parent turn cancelled: user clicked stop" | "parent turn blocked"
+        ));
+        let new = {
+            let mut calls = self.calls.lock().unwrap();
+            if calls.iter().any(|id| id == effect) {
+                false
+            } else {
+                calls.push(effect.to_owned());
+                true
+            }
+        };
+        if new {
+            self.barrier.cleanup_entered.notify_one();
+            self.barrier.release.acquire().await.unwrap().forget();
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn native_gateway_cancellation_persists_and_processes_hook_cleanup_without_repeat_preparation_or_error()
+ {
+    // One isolated current-thread runtime keeps the scoped tracing subscriber
+    // active for actor/listener/worker tasks without installing a global subscriber.
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            use tracing_subscriber::prelude::*;
+            let events = sentry::test::with_captured_events(|| {
+                let subscriber = tracing_subscriber::registry()
+                    .with(pioneer_observability::sentry_tracing_layer());
+                tracing::subscriber::with_default(subscriber, || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    runtime.block_on(assert_turn_cancel_with_optional_busy_native_actor(
+                        true, true, false,
+                    ));
+                    runtime.shutdown_timeout(Duration::from_secs(5));
+                });
+            });
+            for event in events {
+                let json = serde_json::to_string(&event).unwrap();
+                assert!(!json.contains("durable agent-loop event was permanently rejected"));
+                assert!(!json.contains("durable event commit was exhausted"));
+                assert!(!json.contains("terminal durable event commit was exhausted"));
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn native_direct_cancellation_after_activated_blocked_resume_preserves_old_worker_rows() {
+    run_standard_stack_message_test(
+        "direct cancellation after activated Blocked resume",
+        assert_turn_cancel_with_optional_busy_native_actor(true, true, true),
+    );
+}
+
+#[test]
+fn native_cancellation_race_fallback_preserves_materialization_error_and_requires_durable_ack() {
+    run_standard_stack_message_test("native cancellation turn_finish race", async {
+        use super::agent_runtime::native_preparation_failure_tests::open_fixture_database;
+        // Capture an actual typed driver BUSY before constructing the race. No
+        // notification, provider work or barrier wait occurs under this lock.
+        let directory = tempfile::tempdir().unwrap();
+        let url = pioneer_sqlite::sqlite_connection_url(&directory.path().join("race.sqlite"));
+        let owner = open_fixture_database(&url).await;
+        let contender = open_fixture_database(&url).await;
+        owner
+            .execute_unprepared("CREATE TABLE fact(id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        let tx = owner.begin().await.unwrap();
+        tx.execute_unprepared("INSERT INTO fact VALUES(1)")
+            .await
+            .unwrap();
+        let busy = contender
+            .execute_unprepared("INSERT INTO fact VALUES(2)")
+            .await
+            .unwrap_err();
+        tx.rollback().await.unwrap();
+        owner.close().await.unwrap();
+        contender.close().await.unwrap();
+        for case in 0..3 {
+            let busy_native = false;
+            let (tx, mut rx) = mpsc::channel(256);
+            let session_manager = Arc::new(SessionManager::new());
+            let connection_id =
+                register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+            let thread_manager = Arc::new(ThreadManager::new("o4-mini", "delayed"));
+            let thread_manager_for_assert = thread_manager.clone();
+            let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let provider: Arc<dyn Provider> = if busy_native {
+                Arc::new(CancellationBarrierProvider {
+                    entered: entered.clone(),
+                    release: release.clone(),
+                })
+            } else {
+                Arc::new(DelayedProvider {
+                    delay: Duration::from_secs(30),
+                    text: "too late".to_owned(),
+                })
+            };
+            let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+                "delayed", provider,
+            ));
+            let crud_store_for_assert = crud_store.clone();
+            let processor = Arc::new(MessageProcessor::new(
+                thread_manager,
+                provider_registry,
+                session_manager,
+                workspace_manager,
+                crud_store,
+                test_gateway_secrets(),
+                test_summary_config(),
+                test_tool_loop_config(),
+            ));
+            let thread_request_id = generate_test_request_id("turncancel", "thread");
+            let thread_start_request = json!({
+                "jsonrpc": "2.0",
+                "id": thread_request_id,
+                "method": "thread/start",
+                "params": {
+                    "thread_id": "thr_000000000000000022",
+                    "workspace_id": workspace_id,
+                    "model": "test-model",
+                    "model_provider": "delayed"
+                }
+            });
+            processor
+                .process_request_for_connection(connection_id, &thread_start_request.to_string())
+                .await;
+            let _ = recv_response_by_id(&mut rx, thread_request_id.as_str()).await;
+
+            // Cancellation is the control-plane operation under test. Seed an admitted,
+            // durable in-progress Turn directly so the assertion does not depend on the
+            // separate launch-admission surface (which has its own exhaustive tests).
+            let turn_outcome = thread_manager_for_assert
+                .turn_start(
+                    connection_id,
+                    pioneer_protocol::TurnStartParams {
+                        agent_delegation_routes: Vec::new(),
+                        thread_id: "thr_000000000000000022".to_owned(),
+                        turn_id: "turn_000000000000000022".to_owned(),
+                        input: vec![UserInput::Text {
+                            text: "hello".to_owned(),
+                            text_elements: Vec::new(),
+                        }],
+                        capabilities: Vec::new(),
+                        model: Some("test-model".to_owned()),
+                        model_provider: Some("delayed".to_owned()),
+                        sandbox_policy: None,
+                        mode: Some(ThreadMode::Agent),
+                        agent_launch: None,
+                        reply_to_turn_id: None,
+                        mentioned_principal_ids: Vec::new(),
+                        execution_backend: Some(AgentExecutionBackend::ApiProvider {
+                            provider: "delayed".to_owned(),
+                        }),
+                        reasoning: None,
+                        permission_profile: None,
+                        cli_runtime_options: None,
+                    },
+                )
+                .await
+                .expect("turn cancellation fixture should seed an in-progress Turn");
+            crud_store_for_assert
+                .materialize_turn_start(
+                    &turn_outcome.materialization.thread,
+                    turn_outcome.materialization.sandbox_mode,
+                    &turn_outcome.materialization.turn,
+                    &turn_outcome.materialization.input,
+                    pioneer_protocol::PersistedActorRef::Principal(
+                        authenticated_test_superuser().principal_id.clone(),
+                    ),
+                )
+                .await
+                .expect("turn cancellation fixture should persist the in-progress Turn");
+            wait_for_thread_manager_turn_status(
+                thread_manager_for_assert.as_ref(),
+                "thr_000000000000000022",
+                "turn_000000000000000022",
+                TurnStatus::InProgress,
+            )
+            .await;
+
+            let thread_id = "thr_000000000000000022";
+            let turn_id = "turn_000000000000000022";
+            let original = pioneer_protocol::NativeTerminalEffectPreparation {
+                batch_id: format!("{turn_id}:original-cancellation"),
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.into(),
+                turn_id: turn_id.into(),
+                runtime_generation: 1,
+                effects: Vec::new(),
+            };
+            crud_store_for_assert
+                .persist_native_cancellation_context(
+                    original,
+                    processor.turn_execution_owner_id.as_ref(),
+                    now_timestamp_secs(),
+                    true,
+                )
+                .await
+                .unwrap();
+            let read_completed = Arc::new(Notify::new());
+            let continue_finish = Arc::new(Notify::new());
+            *processor.native_cancellation_finish_barrier.lock().await =
+                Some((read_completed.clone(), continue_finish.clone()));
+            let operation = processor.commit_turn_interrupted_with_recovery_disposition(
+                thread_id.into(),
+                turn_id.into(),
+                "cancel".into(),
+                None,
+                false,
+            );
+            let orchestrator = async {
+                read_completed.notified().await;
+                // The original read saw InProgress. This contender changes only
+                // local state, so the first operation's turn_finish must fail.
+                processor
+                    .thread_manager
+                    .turn_finish(
+                        thread_id,
+                        turn_id,
+                        if case == 2 {
+                            TurnStatus::Completed
+                        } else {
+                            TurnStatus::Interrupted
+                        },
+                        Some("racing finish".into()),
+                    )
+                    .await
+                    .unwrap();
+                if case == 0 {
+                    *processor
+                        .native_cancellation_materialization_failure
+                        .lock()
+                        .await = Some(busy.clone());
+                } else if case == 1 {
+                    // A real competing canonical completion makes subsequent
+                    // cancellation materialization fail its durable fence.
+                    let (_, mut completed) = crud_store_for_assert
+                        .get_turn(thread_id, turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    completed.status = TurnStatus::Completed;
+                    crud_store_for_assert
+                        .materialize_native_agent_turn_event_owned(
+                            pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(
+                                TurnCompletedNotification {
+                                    workspace_id: workspace_id.clone(),
+                                    thread_id: thread_id.into(),
+                                    turn: completed,
+                                },
+                            ),
+                            now_timestamp_secs(),
+                            None,
+                            processor.turn_execution_owner_id.as_ref(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                continue_finish.notify_one();
+            };
+            let (result, ()) = tokio::join!(operation, orchestrator);
+            let rejection = result.unwrap_err();
+            assert_eq!(rejection.is_retryable(), case == 0);
+            assert_eq!(
+                rejection.code(),
+                if case == 0 {
+                    "storage_temporarily_unavailable"
+                } else if case == 1 {
+                    "native_preparation_rejected"
+                } else {
+                    "interruption_transition_rejected"
+                }
+            );
+            assert!(
+                !crud_store_for_assert
+                    .native_cancellation_was_accepted(turn_id)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                crud_store_for_assert
+                    .get_turn(thread_id, turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .status,
+                if case == 1 {
+                    TurnStatus::Completed
+                } else {
+                    TurnStatus::InProgress
+                }
+            );
+            assert!(
+                crud_store_for_assert
+                    .native_cancellation_receipt_owned(
+                        turn_id,
+                        processor.turn_execution_owner_id.as_ref()
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            if case == 0 {
+                // Failure did not issue a durable ACK. A fresh call must really
+                // materialize the locally Interrupted result and obtain receipt.
+                processor
+                    .commit_turn_interrupted_with_recovery_disposition(
+                        thread_id.into(),
+                        turn_id.into(),
+                        "retry".into(),
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    crud_store_for_assert
+                        .native_cancellation_was_accepted(turn_id)
+                        .await
+                        .unwrap()
+                );
+                assert_eq!(
+                    crud_store_for_assert
+                        .get_turn(thread_id, turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .1
+                        .status,
+                    TurnStatus::Interrupted
+                );
+            }
+        }
+    });
+}
+
+#[path = "tests/task_start_failure.rs"]
+mod task_start_failure;

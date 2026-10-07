@@ -17,8 +17,13 @@ fn constrained_compat() -> Value {
     json!({"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false,"maxTokensField":"max_tokens","supportsStrictMode":false,"supportsLongCacheRetention":false})
 }
 
-pub(super) fn models_dev(data: &Value, nvidia: &Value, strict: bool) -> Result<Vec<Candidate>> {
+pub(super) fn models_dev(
+    data: &Value,
+    nvidia: &Value,
+    strict: bool,
+) -> Result<(Vec<Candidate>, BTreeSet<&'static str>)> {
     let mut result = Vec::new();
+    let mut specialized = BTreeSet::new();
     let specs = [
         (
             "amazon-bedrock",
@@ -51,10 +56,30 @@ pub(super) fn models_dev(data: &Value, nvidia: &Value, strict: bool) -> Result<V
             "https://api.openai.com/v1",
         ),
         (
+            "deepseek",
+            "deepseek",
+            "openai-completions",
+            "https://api.deepseek.com",
+        ),
+        (
             "groq",
             "groq",
             "openai-completions",
             "https://api.groq.com/openai/v1",
+        ),
+        // Keep standard API metadata separate from the coding subscription
+        // sources below. Source data remains the owner of limits and pricing.
+        (
+            "zai",
+            "zai-standard",
+            "openai-completions",
+            "https://api.z.ai/api/paas/v4",
+        ),
+        (
+            "zhipuai",
+            "glm",
+            "openai-completions",
+            "https://open.bigmodel.cn/api/paas/v4",
         ),
         (
             "cerebras",
@@ -119,6 +144,7 @@ pub(super) fn models_dev(data: &Value, nvidia: &Value, strict: bool) -> Result<V
         ),
     ];
     for (source, provider, api, url) in specs {
+        specialized.insert(provider);
         for (id, m) in entries(data, source) {
             if m["tool_call"] != true {
                 continue;
@@ -156,8 +182,29 @@ pub(super) fn models_dev(data: &Value, nvidia: &Value, strict: bool) -> Result<V
                 m
             };
             let mut candidate = base(provider, id, api, url, effective, (4096, 4096));
+            if matches!(provider, "google" | "google-vertex")
+                && let Some(resolved) = alias.filter(|a| data[source]["models"].get(*a).is_some())
+            {
+                // Retain the identity of the existing source alias resolution;
+                // effort names alone do not identify a budget/level protocol.
+                candidate.model["sourceGeneration"]["resolvedModelId"] = json!(resolved);
+            }
             candidate.model["name"] =
                 json!(m["name"].as_str().filter(|s| !s.is_empty()).unwrap_or(id));
+            if matches!(provider, "glm" | "zai-standard") {
+                // These are native CN/global GLM endpoints, not hosted relays.
+                // Use the same documented controls as the coding profiles,
+                // with each profile's own updateable source options and limits.
+                // https://docs.z.ai/guides/llm/glm-5.3
+                candidate.compat(json!({"supportsDeveloperRole":false,"thinkingFormat":"zai"}));
+                if let Some(mut map) = effort_map(&m["reasoning_options"]) {
+                    if matches!(id.as_str(), "glm-5.2" | "glm-5.2-highspeed") {
+                        map["off"] = json!("none");
+                    }
+                    candidate.thinking(map);
+                    candidate.compat(json!({"supportsReasoningEffort":true}));
+                }
+            }
             match provider {
                 "amazon-bedrock"=>{if id.starts_with("eu."){candidate.model["baseUrl"]=json!("https://bedrock-runtime.eu-central-1.amazonaws.com");}
 if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":true}));}},
@@ -172,6 +219,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
             result.push(candidate);
         }
     }
+    specialized.insert("cloudflare-ai-gateway");
     let mut cloudflare_ids = BTreeSet::new();
     for (prefixed, m) in entries(data, "cloudflare-ai-gateway") {
         if m["tool_call"] != true {
@@ -216,6 +264,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         c.compat(json!({"sendSessionAffinityHeaders":true}));
         result.push(c);
     }
+    specialized.insert("nvidia");
     let mut live = BTreeMap::new();
     for m in nvidia["data"].as_array().into_iter().flatten() {
         let id = text(&m["id"]);
@@ -262,6 +311,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
             "https://open.bigmodel.cn/api/coding/paas/v4",
         ),
     ] {
+        specialized.insert(provider);
         for (id, m) in entries(data, source) {
             if m["tool_call"] != true {
                 continue;
@@ -282,6 +332,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
             result.push(c);
         }
     }
+    specialized.insert("together");
     let together_source = ["together", "togetherai", "together-ai"]
         .into_iter()
         .find(|p| !data[*p].is_null())
@@ -301,6 +352,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         together(&mut c);
         result.push(c);
     }
+    specialized.insert("baseten");
     for (id, m) in entries(data, "baseten") {
         if m["status"] == "deprecated" {
             continue;
@@ -328,6 +380,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         }
         if glm {
             c.model["input"] = json!(["text"]);
+            c.model["inputOrigin"] = json!({"kind":"override","expression":"existing Pi Baseten GLM compatibility projection; raw modalities retained in sourceMetadata"});
             c.thinking(json!({"off":"none","minimal":null,"low":null,"medium":null,"high":"high","xhigh":null,"max":"max"}));
         } else if toggle {
             c.thinking(json!({"off":"off","minimal":null,"low":null,"medium":null,"high":"high","xhigh":null,"max":null}));
@@ -336,6 +389,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         }
         result.push(c);
     }
+    specialized.insert("fireworks");
     for (id, m) in entries(data, "fireworks-ai") {
         if m["tool_call"] != true {
             continue;
@@ -374,6 +428,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         } else {
             "https://opencode.ai/zen/go"
         };
+        specialized.insert(provider);
         for (id, m) in entries(data, provider) {
             if m["tool_call"] != true || m["status"] == "deprecated" {
                 continue;
@@ -431,6 +486,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
             result.push(c);
         }
     }
+    specialized.insert("github-copilot");
     for (id, m) in entries(data, "github-copilot") {
         if m["tool_call"] != true || m["status"] == "deprecated" {
             continue;
@@ -481,6 +537,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         }
         result.push(c);
     }
+    specialized.insert("kimi-coding");
     for (id, m) in entries(data, "kimi-for-coding") {
         if m["tool_call"] != true {
             continue;
@@ -533,6 +590,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         ("moonshotai", "https://api.moonshot.ai/v1"),
         ("moonshotai-cn", "https://api.moonshot.cn/v1"),
     ] {
+        specialized.insert(provider);
         for (id, m) in entries(data, provider) {
             if m["tool_call"] != true {
                 continue;
@@ -575,6 +633,7 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
         ),
     ] {
         let mut emitted = BTreeSet::new();
+        specialized.insert(provider);
         for (id, m) in entries(data, source) {
             if m["tool_call"] != true
                 || QWEN_TOKEN_PLAN_EXCLUDED_MODEL_IDS.contains(&id.as_str())
@@ -610,7 +669,129 @@ if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":tr
             );
         }
     }
-    Ok(result)
+    Ok((result, specialized))
+}
+
+/// Supplemental registered brands have lower precedence than specialized
+/// routes and existing explicit corrections, even when a route emits zero rows.
+pub(super) fn registered_supplements(
+    data: &Value,
+    specialized: &BTreeSet<&str>,
+    existing: &[Candidate],
+) -> Vec<Candidate> {
+    let mut result: Vec<Candidate> = Vec::new();
+    // Extend the existing dynamic source path to registered compatible brands.
+    // Specialized transforms above retain precedence. Missing named data does
+    // not inherit the modalities of a similarly named upstream model.
+    for definition in crate::definition::provider_definitions() {
+        let provider = definition.name;
+        if matches!(
+            provider,
+            "openai"
+                | "anthropic"
+                | "gemini"
+                | "bedrock"
+                | "copilot"
+                | "azure-openai"
+                | "ollama"
+                // The native /models route below owns this gateway's identities
+                // and filters. models.dev must not refill rejected native rows.
+                | "openrouter"
+                | "local"
+                | "telnyx"
+                | "glm"
+                | "custom"
+        ) {
+            continue;
+        }
+        // Never refill entries intentionally filtered by specialized routing
+        // (notably NVIDIA's live model list and provider-specific exclusions).
+        if specialized.contains(crate::catalog::catalog_provider(provider).as_str())
+            || specialized.iter().any(|route| {
+                crate::definition::provider_definition(route)
+                    .map_or(*route == provider, |d| d.name == provider)
+            })
+        {
+            continue;
+        }
+        let Some(url) = definition.default_base_url else {
+            continue;
+        };
+        // Reuse canonical aliases and source-declared endpoint identity rather
+        // than a second provider-name table. Ambiguous identities stay unknown.
+        let source = if data[provider]["models"].is_object() {
+            provider
+        } else {
+            let matches = data
+                .as_object()
+                .into_iter()
+                .flat_map(|providers| providers.iter())
+                .filter(|(name, value)| {
+                    value["models"].is_object()
+                        && (crate::definition::provider_definition(name)
+                            .is_some_and(|d| d.name == provider)
+                            || value["api"].as_str() == Some(url))
+                })
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>();
+            let [source] = matches.as_slice() else {
+                continue;
+            };
+            *source
+        };
+        for (id, model) in entries(data, source) {
+            if model["tool_call"] != true
+                || model["status"] == "deprecated"
+                || result
+                    .iter()
+                    .chain(existing.iter())
+                    .any(|c| c.provider() == provider && c.id() == id)
+            {
+                continue;
+            }
+            let mut candidate = base(provider, id, "openai-completions", url, model, (4096, 4096));
+            // A list of effort names alone does not establish a wire format.
+            // These profiles document the standard Chat effort field.
+            // Sources: each vendor's Chat schema, recorded in G04 coverage.
+            if !matches!(
+                provider,
+                "deepinfra" | "friendli" | "venice" | "synthetic" | "nebius" | "cohere"
+            ) {
+                candidate.compat(json!({"supportsReasoningEffort":false}));
+            }
+            candidate.compat(json!({"maxTokensField":"max_tokens"}));
+            if provider == "cohere" && model["reasoning"] == true {
+                // Compatibility API documents only none/high, corresponding
+                // to off/on, including toggle-only source entries.
+                candidate.thinking(json!({"off":"none","minimal":null,"low":null,
+                    "medium":null,"high":"high","xhigh":null,"max":null}));
+                candidate.compat(
+                    json!({"generationSource":"https://docs.cohere.com/docs/compatibility-api"}),
+                );
+            }
+            if provider == "novita" {
+                // Official Chat schema documents the switch for these families;
+                // a generic toggle in source metadata does not prove this field.
+                let supports_off = matches!(
+                    id.as_str(),
+                    "zai-org/glm-4.5"
+                        | "deepseek/deepseek-v3.1"
+                        | "deepseek/deepseek-v3.1-terminus"
+                        | "deepseek/deepseek-v3.2-exp"
+                );
+                candidate.compat(json!({"thinkingFormat":"novita","supportsThinkingToggle":supports_off,
+                    "generationSource":"https://docs.novita.ai/api-reference/model-apis-llm-create-chat-completion"}));
+            }
+            if provider == "siliconflow" {
+                candidate.compat(json!({"thinkingFormat":"siliconflow",
+                    "supportsThinkingToggle":model["reasoning_options"].as_array().is_some_and(|o| o.iter().any(|o| o["type"] == "toggle")),
+                    "generationCapIncludesThinking":false,
+                    "generationSource":"https://docs.siliconflow.cn/docs/api/chat-completions-post"}));
+            }
+            result.push(candidate);
+        }
+    }
+    result
 }
 
 pub(super) fn openrouter(data: &Value) -> Vec<Candidate> {
@@ -639,12 +820,19 @@ pub(super) fn openrouter(data: &Value) -> Vec<Candidate> {
                 (4096, 4096),
             );
             c.model["name"] = m["name"].clone();
+            // This source's candidates were filtered by supported_parameters.
+            c.tool_calling = Some(has(&m["supported_parameters"], "tools"));
             c.model["reasoning"] = json!(has(&m["supported_parameters"], "reasoning"));
-            c.model["input"] = if text(&m["architecture"]["modality"]).contains("image") {
-                json!(["text", "image"])
-            } else {
-                json!(["text"])
-            };
+            // Explicit arrays preserve audio/video/file. Legacy modality strings
+            // describe the same contract; absent metadata stays unknown.
+            let input = m["architecture"]["input_modalities"].as_array().cloned()
+                .or_else(|| m["architecture"]["modality"].as_str()
+                    .and_then(|v| v.split_once("->"))
+                    .map(|(input, _)| input.split('+').map(|v| json!(v)).collect()));
+            c.model["input"] = json!(input.clone().unwrap_or_default());
+            c.model["inputOrigin"] = json!({"kind":if input.is_some(){"source"}else{"fallback"},"expression":"openrouter.architecture.input_modalities or modality"});
+            c.model["sourceMetadata"] = json!({"architecture":m["architecture"]});
+            c.model["output"] = m["architecture"]["output_modalities"].clone();
             let context = if number(&m["top_provider"]["context_length"]) != 0. {
                 &m["top_provider"]["context_length"]
             } else {
@@ -700,11 +888,12 @@ pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
                 (4096, 4096),
             );
             c.model["reasoning"] = json!(has(&m["tags"], "reasoning"));
-            c.model["input"] = if has(&m["tags"], "vision") {
-                json!(["text", "image"])
-            } else {
-                json!(["text"])
-            };
+            c.tool_calling = Some(has(&m["tags"], "tool-use"));
+            c.model["input"] = m["input_modalities"].as_array().map(|v| json!(v))
+                .unwrap_or_else(|| if has(&m["tags"], "vision") {json!(["text", "image"])} else {json!([])});
+            c.model["inputOrigin"] = json!({"kind":if m["input_modalities"].is_array(){"source"}else if has(&m["tags"], "vision"){"partial"}else{"fallback"},"expression":"vercel.input_modalities or positive vision tag"});
+            c.model["sourceMetadata"] = json!({"tags":m["tags"],"input_modalities":m["input_modalities"]});
+            c.model["output"] = m["output_modalities"].clone();
             (c.model["contextWindow"], c.context_origin) =
                 limit(&m["context_window"], 4096, "vercel.context_window");
             (c.model["maxTokens"], c.output_origin) =
@@ -720,4 +909,58 @@ pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
             c
         })
         .collect()
+}
+
+/// Capability-only supplement collected before tool-capable list filtering.
+/// No limits/pricing/routes are generated for negative or unknown entries.
+/// Dedicated endpoint listings override models.dev only with explicit evidence.
+pub(super) fn tool_capabilities(snapshot: &SourceSnapshot) -> super::super::ToolCapabilities {
+    let mut result = super::super::ToolCapabilities::new();
+    for (provider, data) in snapshot.sources[SOURCE_URLS[0]]
+        .body
+        .as_object()
+        .into_iter()
+        .flatten()
+    {
+        let provider = super::super::catalog_provider(provider);
+        for (id, model) in data["models"].as_object().into_iter().flatten() {
+            if let Some(supported) = model["tool_call"].as_bool() {
+                result
+                    .entry(provider.clone())
+                    .or_default()
+                    .insert(id.clone(), supported);
+            }
+        }
+    }
+    for (url, provider, field, marker) in [
+        (
+            SOURCE_URLS[1],
+            "openrouter",
+            "supported_parameters",
+            "tools",
+        ),
+        (SOURCE_URLS[2], "vercel-ai-gateway", "tags", "tool-use"),
+    ] {
+        for model in snapshot.sources[url].body["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = model["id"].as_str().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            // Missing/null/malformed metadata is unknown, an explicit valid
+            // list without the capability is negative (including an empty list).
+            let Some(supported) =
+                crate::catalog::tool_support_from_marker_list(&model[field], marker)
+            else {
+                continue;
+            };
+            result
+                .entry(provider.into())
+                .or_default()
+                .insert(id.into(), supported);
+        }
+    }
+    result
 }

@@ -1,3 +1,6 @@
+#[cfg(test)]
+use super::embedding::ordered_vectors;
+use super::embedding::validate_input;
 use crate::{
     attachments::{
         AttachmentOperationError, AttachmentPipelineConfig, AttachmentTransportKind,
@@ -9,12 +12,12 @@ use crate::{
     reasoning_registry,
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
     tools::parse::parse_tool_calls,
-    tools::stream::{IncrementalLineDecoder, sse_data},
+    tools::stream::IncrementalSseDecoder,
     types::{
         ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, InputContentType,
         InputTypeSupport, ProviderCapabilities, ProviderFailureClassification,
-        ProviderInputCapabilities, ProviderTermination, ProviderTimeoutPolicy, ReasoningConfig,
-        Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+        ProviderInputCapabilities, ProviderTermination, ProviderTimeoutPolicy, Role, StreamChunk,
+        TokenUsage, ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -36,8 +39,9 @@ use pioneer_protocol::{
 pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 
 #[derive(Clone, Copy)]
-struct OpenAiEmbeddingModelDefinition {
-    id: &'static str,
+pub(super) struct OpenAiEmbeddingModelDefinition {
+    pub(super) id: &'static str,
+    pub(super) dimension: usize,
     name: &'static str,
     description: &'static str,
 }
@@ -45,20 +49,29 @@ struct OpenAiEmbeddingModelDefinition {
 const OPENAI_EMBEDDING_MODELS: &[OpenAiEmbeddingModelDefinition] = &[
     OpenAiEmbeddingModelDefinition {
         id: "text-embedding-3-small",
+        dimension: 1536,
         name: "Text Embedding 3 Small",
         description: "1536-dimensional embedding model optimized for cost and latency.",
     },
     OpenAiEmbeddingModelDefinition {
         id: "text-embedding-3-large",
+        dimension: 3072,
         name: "Text Embedding 3 Large",
         description: "3072-dimensional embedding model optimized for higher retrieval quality.",
     },
     OpenAiEmbeddingModelDefinition {
         id: "text-embedding-ada-002",
+        dimension: 1536,
         name: "Text Embedding Ada 002",
         description: "Legacy 1536-dimensional embedding model.",
     },
 ];
+
+pub(super) fn embedding_model_definition(
+    id: &str,
+) -> Option<&'static OpenAiEmbeddingModelDefinition> {
+    OPENAI_EMBEDDING_MODELS.iter().find(|model| model.id == id)
+}
 
 pub struct OpenAiProvider {
     api_key: String,
@@ -89,6 +102,8 @@ struct ApiChatRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<serde_json::Value>,
+    #[serde(flatten)]
+    generation: crate::generation::Fields,
 }
 
 #[derive(Debug, Serialize)]
@@ -240,16 +255,7 @@ struct ApiEmbeddingRequest {
     encoding_format: &'static str,
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiEmbeddingResponse {
-    data: Vec<ApiEmbeddingData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApiEmbeddingData {
-    embedding: Vec<f32>,
-    index: usize,
-}
+type ApiEmbeddingResponse = super::embedding::IndexedEmbeddingResponse;
 
 // ── SSE streaming response types ────────────────────────────────────────────
 
@@ -437,6 +443,40 @@ impl std::error::Error for OpenAiFileUploadError {}
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl OpenAiProvider {
+    fn build_chat_request(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        let catalog = crate::catalog::model_catalog().ok();
+        Self::build_chat_request_with_catalog(request, messages, stream, catalog.as_deref())
+    }
+
+    fn build_chat_request_with_catalog(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> Result<ApiChatRequest> {
+        let generation = crate::generation::chat_fields_from_catalog(catalog, "openai", request)?;
+        Ok(ApiChatRequest {
+            generation,
+            model: request.model.clone(),
+            messages,
+            temperature: None,
+            max_tokens: None,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: request.tool_choice.clone().map(Self::convert_tool_choice),
+            parallel_tool_calls: request.parallel_tool_calls,
+            reasoning_effort: None,
+            stream,
+            stream_options: stream.then(|| serde_json::json!({"include_usage": true})),
+        })
+    }
+
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_timeout_policy(api_key, ProviderTimeoutPolicy::default())
     }
@@ -936,192 +976,15 @@ impl OpenAiProvider {
     }
 }
 
-fn reasoning_effort_for_openai_request(reasoning: Option<ReasoningConfig>) -> Option<String> {
-    match reasoning {
-        Some(ReasoningConfig::Effort(effort)) => Some(effort.as_str().to_owned()),
-        Some(ReasoningConfig::Disabled) | None => None,
-    }
-}
-
-#[async_trait]
-impl crate::traits::Provider for OpenAiProvider {
-    fn name(&self) -> &str {
-        "openai"
-    }
-
-    fn authority_fingerprint(&self) -> Option<&str> {
-        Some(self.authority_fingerprint.as_str())
-    }
-
-    fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities {
-            streaming: true,
-            vision: true,
-            tool_calling: true,
-            embeddings: true,
-            transcription: false,
-            input_types: ProviderInputCapabilities {
-                text: true,
-                file: InputTypeSupport {
-                    native: true,
-                    file_upload: true,
-                    data_url_inline: false,
-                    text_fallback: false,
-                },
-                image: InputTypeSupport::data_url_inline_only(),
-                audio: InputTypeSupport::native_inline_only(),
-                video: InputTypeSupport::disabled(),
-            },
-        }
-    }
-
-    fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
-        error
-            .downcast_ref::<OpenAiFileUploadError>()
-            .map(|upload| upload.classification.clone())
-    }
-
-    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider_async(
-            self.name(),
-            request.model.as_str(),
-            &self.capabilities(),
-            request.rendered_messages_with_compiled_prompt().as_slice(),
-        )
-        .await?;
-        ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let prepared = self
-            .materialize_upload_references(request.model.as_str(), prepared)
-            .await?;
-        let rendered_messages = Self::convert_messages(&prepared)?;
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages: rendered_messages,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            reasoning_effort: reasoning_effort_for_openai_request(request.reasoning),
-            stream: false,
-            stream_options: None,
-        };
-
-        let request_builder = self
-            .client
-            .post(self.chat_completions_url())
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&api_request);
-        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
-        }
-
-        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
-            response,
-            Default::default(),
-            "provider_response",
-        )
-        .await?;
-        let usage = api_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-        });
-
-        let choice = api_response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("no response from OpenAI"))?;
-        let termination = choice
-            .finish_reason
-            .as_deref()
-            .map(ProviderTermination::from_openai_reason)
-            .unwrap_or_else(|| ProviderTermination::Unknown("missing_finish_reason".to_owned()));
-        let message = choice.message;
-
-        let text = message.effective_content();
-        let tool_calls =
-            parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())?;
-        let reasoning_content = message.reasoning_content.or(message.reasoning);
-
-        if text.is_empty()
-            && tool_calls.is_empty()
-            && reasoning_content.as_deref().unwrap_or_default().is_empty()
-        {
-            return Err(anyhow!("no response from OpenAI"));
-        }
-
-        Ok(ChatResponse {
-            text,
-            usage,
-            termination,
-            reasoning_content,
-            tool_calls,
-            provider_replay_state: None,
-        })
-    }
-
-    async fn stream_chat(
-        &self,
-        request: ChatRequest,
-    ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let prepared = prepare_messages_for_provider_async(
-            self.name(),
-            request.model.as_str(),
-            &self.capabilities(),
-            request.rendered_messages_with_compiled_prompt().as_slice(),
-        )
-        .await?;
-        ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let prepared = self
-            .materialize_upload_references(request.model.as_str(), prepared)
-            .await?;
-        let rendered_messages = Self::convert_messages(&prepared)?;
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages: rendered_messages,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            reasoning_effort: reasoning_effort_for_openai_request(request.reasoning),
-            stream: true,
-            stream_options: Some(serde_json::json!({"include_usage": true})),
-        };
-
-        let request_builder = self
-            .client
-            .post(self.chat_completions_url())
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&api_request);
-        let response =
-            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
-
-        if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
-        }
-
-        let byte_stream = crate::http::bounded_response_stream(
-            response,
-            crate::types::ProviderResponseLimits::default().max_transport_bytes,
-            "provider_stream",
-        );
-
+// The same decoder is used by HTTP transport and in-memory regression fixtures.
+impl OpenAiProvider {
+    pub(super) fn decode_stream(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
         tokio::spawn(async move {
-            let mut decoder = IncrementalLineDecoder::default();
+            let mut decoder = IncrementalSseDecoder::default();
             let mut tool_call_accumulator = StreamToolCallAccumulator::default();
             let mut terminal_reason = None;
 
@@ -1151,21 +1014,16 @@ impl crate::traits::Provider for OpenAiProvider {
                         return;
                     }
                 };
-                for line in lines {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let Some(data) = sse_data(line) else {
-                        continue;
-                    };
+                for frame in lines {
+                    let data = frame.data.as_str();
 
                     if data.trim() == "[DONE]" {
                         let terminal = terminal_reason
                             .take()
                             .map(StreamChunk::final_chunk_with)
                             .ok_or_else(|| {
-                                anyhow!("provider stream ended without a finish_reason")
+                                crate::failure::ProviderStreamIncomplete::DoneWithoutFinishReason
+                                    .into()
                             });
                         let _ = tx.send(terminal).await;
                         return;
@@ -1194,20 +1052,31 @@ impl crate::traits::Provider for OpenAiProvider {
                                 }
                             }
                             if let Some(error) = resp.error {
-                                if tx
-                                    .send(Err(anyhow!(
-                                        "OpenAI stream error: {}",
-                                        error.description()
-                                    )))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
+                                let status = error
+                                    .code
+                                    .as_ref()
+                                    .and_then(serde_json::Value::as_u64)
+                                    .and_then(|code| u16::try_from(code).ok());
+                                let outcome = crate::failure::native_chat_stream_error(
+                                    &error.description(),
+                                    status,
+                                );
+                                let _ = tx.send(Err(outcome)).await;
                                 return;
                             }
                             for choice in resp.choices {
                                 if terminal_reason.is_some() {
+                                    if choice.finish_reason.as_deref().is_some_and(|reason| {
+                                        Some(ProviderTermination::from_openai_reason(reason))
+                                            != terminal_reason
+                                    }) {
+                                        let _ = tx
+                                            .send(Err(anyhow!(
+                                                "provider changed finish_reason after completion"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
                                     if choice.delta.has_payload() {
                                         let _ = tx
                                             .send(Err(anyhow!(
@@ -1272,9 +1141,9 @@ impl crate::traits::Provider for OpenAiProvider {
                                 }
                             }
                         }
-                        Err(e) => {
+                        Err(_) => {
                             if tx
-                                .send(Err(anyhow!("malformed OpenAI SSE frame: {e}")))
+                                .send(Err(anyhow!("malformed OpenAI SSE frame")))
                                 .await
                                 .is_err()
                             {
@@ -1287,15 +1156,171 @@ impl crate::traits::Provider for OpenAiProvider {
             }
             let terminal = match decoder.finish() {
                 Err(error) => Err(error),
-                Ok(_) => terminal_reason
-                    .map(StreamChunk::final_chunk_with)
-                    .ok_or_else(|| anyhow!("provider stream ended before a terminal marker")),
+                Ok(_) => {
+                    Err(crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into())
+                }
             };
             let _ = tx.send(terminal).await;
         });
 
         let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(Box::pin(chunk_stream))
+        Box::pin(chunk_stream)
+    }
+}
+
+#[async_trait]
+impl crate::traits::Provider for OpenAiProvider {
+    fn name(&self) -> &str {
+        "openai"
+    }
+
+    fn authority_fingerprint(&self) -> Option<&str> {
+        Some(self.authority_fingerprint.as_str())
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: true,
+            vision: true,
+            tool_calling: true,
+            embeddings: true,
+            transcription: false,
+            input_types: ProviderInputCapabilities {
+                text: true,
+                file: InputTypeSupport {
+                    native: true,
+                    file_upload: true,
+                    data_url_inline: false,
+                    text_fallback: false,
+                },
+                image: InputTypeSupport::data_url_inline_only(),
+                audio: InputTypeSupport::native_inline_only(),
+                video: InputTypeSupport::disabled(),
+            },
+        }
+    }
+
+    fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
+        error
+            .downcast_ref::<OpenAiFileUploadError>()
+            .map(|upload| upload.classification.clone())
+            .or_else(|| crate::failure::classify_stream_error(error))
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
+            self.name(),
+            request.model.as_str(),
+            &self.capabilities(),
+            request.rendered_messages_with_compiled_prompt().as_slice(),
+        )
+        .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
+        ensure_no_unrendered_attachments(self.name(), &prepared)?;
+        let prepared = self
+            .materialize_upload_references(request.model.as_str(), prepared)
+            .await?;
+        let rendered_messages = Self::convert_messages(&prepared)?;
+        let api_request = Self::build_chat_request(&request, rendered_messages, false)?;
+
+        let request_builder = self
+            .client
+            .post(self.chat_completions_url())
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&api_request);
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(Self::api_error(response).await);
+        }
+
+        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
+        let usage = api_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+        });
+
+        let choice = api_response
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no response from OpenAI"))?;
+        let termination = choice
+            .finish_reason
+            .as_deref()
+            .map(ProviderTermination::from_openai_reason)
+            .unwrap_or_else(|| ProviderTermination::Unknown("missing_finish_reason".to_owned()));
+        let message = choice.message;
+
+        let text = message.effective_content();
+        let tool_calls =
+            parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())?;
+        let reasoning_content = message.reasoning_content.or(message.reasoning);
+
+        if text.is_empty()
+            && tool_calls.is_empty()
+            && reasoning_content.as_deref().unwrap_or_default().is_empty()
+        {
+            return Err(anyhow!("no response from OpenAI"));
+        }
+
+        Ok(ChatResponse {
+            text,
+            usage,
+            termination,
+            reasoning_content,
+            tool_calls,
+            provider_replay_state: None,
+        })
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
+            self.name(),
+            request.model.as_str(),
+            &self.capabilities(),
+            request.rendered_messages_with_compiled_prompt().as_slice(),
+        )
+        .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
+        ensure_no_unrendered_attachments(self.name(), &prepared)?;
+        let prepared = self
+            .materialize_upload_references(request.model.as_str(), prepared)
+            .await?;
+        let rendered_messages = Self::convert_messages(&prepared)?;
+        let api_request = Self::build_chat_request(&request, rendered_messages, true)?;
+
+        let request_builder = self
+            .client
+            .post(self.chat_completions_url())
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&api_request);
+        let response =
+            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
+
+        if !response.status().is_success() {
+            return Err(Self::api_error(response).await);
+        }
+
+        let byte_stream = crate::http::bounded_response_stream(
+            response,
+            crate::types::ProviderResponseLimits::default().max_transport_bytes,
+            "provider_stream",
+        );
+
+        Ok(Self::decode_stream(byte_stream))
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -1338,6 +1363,15 @@ impl crate::traits::Provider for OpenAiProvider {
     }
 
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+        validate_input(&request.model, &request.input)?;
+        super::embedding::EmbeddingBatchLimits::for_model(
+            "openai",
+            &request.model,
+            None,
+            None,
+            None,
+        )?
+        .validate_request(&request.input)?;
         let expected_count = request.input.len();
         let api_request = ApiEmbeddingRequest {
             model: request.model,
@@ -1358,25 +1392,13 @@ impl crate::traits::Provider for OpenAiProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let mut data = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
+        let response = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
             response,
             Default::default(),
             "provider_response",
         )
-        .await?
-        .data;
-        data.sort_by_key(|item| item.index);
-        if data.len() != expected_count {
-            return Err(anyhow!(
-                "OpenAI embedding response returned {} embeddings for {} inputs",
-                data.len(),
-                expected_count
-            ));
-        }
-
-        Ok(EmbeddingResponse {
-            embeddings: data.into_iter().map(|item| item.embedding).collect(),
-        })
+        .await?;
+        response.into_response(expected_count)
     }
 }
 
@@ -1424,7 +1446,342 @@ fn openai_embedding_model_info(model: &OpenAiEmbeddingModelDefinition) -> Provid
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn discovered_51_and_52_fallback_vocabulary_agrees_with_direct_chat_bodies() {
+        for (id, xhigh) in [("gpt-5.1", false), ("gpt-5.2", true)] {
+            let entry: ApiModelEntry =
+                serde_json::from_value(serde_json::json!({"id":id})).unwrap();
+            let discovered = provider_model_from_openai_model_entry(entry);
+            assert_eq!(
+                discovered
+                    .capabilities
+                    .reasoning
+                    .as_ref()
+                    .unwrap()
+                    .effort_options
+                    .contains(&"xhigh".into()),
+                xhigh
+            );
+            for stream in [false, true] {
+                let mut request = crate::generation::test_request(id);
+                request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::XHigh));
+                let result =
+                    OpenAiProvider::build_chat_request_with_catalog(&request, vec![], stream, None);
+                assert_eq!(result.is_ok(), xhigh);
+                if xhigh {
+                    let body = serde_json::to_value(result.unwrap()).unwrap();
+                    assert_eq!(body["reasoning_effort"], "xhigh");
+                    assert_eq!(body["max_completion_tokens"], 1024);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mapped_efforts_obey_direct_chat_model_contract_in_both_modes() {
+        use crate::generation::{test_catalog_model, test_request};
+        let partial = test_catalog_model(
+            "openai",
+            "gpt-5.1",
+            "gpt-5.4",
+            serde_json::json!({"thinkingLevelMap":{}}),
+        );
+        let stale = test_catalog_model(
+            "openai",
+            "gpt-5.1",
+            "gpt-5.4",
+            serde_json::json!({"thinkingLevelMap":{"xhigh":"xhigh","max":"surprise"}}),
+        );
+        for catalog in [None, Some(&partial), Some(&stale)] {
+            for stream in [false, true] {
+                for (effort, valid) in [
+                    (ReasoningEffort::Low, true),
+                    (ReasoningEffort::High, true),
+                    (ReasoningEffort::XHigh, false),
+                    (ReasoningEffort::Max, false),
+                ] {
+                    let mut request = test_request("gpt-5.1");
+                    request.reasoning = Some(ReasoningConfig::Effort(effort));
+                    let result = OpenAiProvider::build_chat_request_with_catalog(
+                        &request,
+                        vec![],
+                        stream,
+                        catalog,
+                    );
+                    assert_eq!(result.is_ok(), valid);
+                    if valid {
+                        let body = serde_json::to_value(result.unwrap()).unwrap();
+                        assert_eq!(body["reasoning_effort"], effort.as_str());
+                        assert_eq!(body["max_completion_tokens"], 1024);
+                    }
+                }
+            }
+        }
+        let stale = test_catalog_model(
+            "openai",
+            "gpt-6-astra",
+            "gpt-5.4",
+            serde_json::json!({"thinkingLevelMap":{"off":"low"}}),
+        );
+        for catalog in [None, Some(&stale)] {
+            for off in [
+                ReasoningConfig::Disabled,
+                ReasoningConfig::Effort(ReasoningEffort::None),
+            ] {
+                let mut request = test_request("gpt-6-astra");
+                request.reasoning = Some(off);
+                for stream in [false, true] {
+                    assert!(
+                        OpenAiProvider::build_chat_request_with_catalog(
+                            &request,
+                            vec![],
+                            stream,
+                            catalog
+                        )
+                        .is_err()
+                    );
+                }
+            }
+        }
+        let mut request = test_request("gpt-5.6");
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::Max));
+        for stream in [false, true] {
+            let body = serde_json::to_value(
+                OpenAiProvider::build_chat_request_with_catalog(&request, vec![], stream, None)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["reasoning_effort"], "max");
+        }
+    }
+
+    #[test]
+    fn native_openai_honors_negative_fresh_source_temperature() {
+        let catalog = crate::generation::test_source_temperature("openai", "gpt-4.1-nano");
+        for reasoning in [
+            None,
+            Some(ReasoningConfig::Disabled),
+            Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+        ] {
+            let mut request = crate::generation::test_request("gpt-4.1-nano");
+            request.reasoning = reasoning;
+            request.temperature = Some(0.7);
+            for stream in [false, true] {
+                assert!(
+                    OpenAiProvider::build_chat_request_with_catalog(
+                        &request,
+                        vec![],
+                        stream,
+                        Some(&catalog)
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_preferred_responses_does_not_certify_unknown_chat_family() {
+        use crate::catalog::ModelCatalog;
+        let mut models: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json")).unwrap();
+        let mut origins: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/provenance.json"))
+                .unwrap();
+        let id = "future-unverified-family";
+        let mut model = models["openai"]["gpt-5.4"].clone();
+        model["id"] = serde_json::json!(id);
+        models["openai"][id] = model;
+        origins["openai"][id] = origins["openai"]["gpt-5.4"].clone();
+        let responses = ModelCatalog::parse(&models.to_string(), &origins.to_string()).unwrap();
+        let request = crate::generation::test_request(id);
+        for stream in [false, true] {
+            assert!(
+                OpenAiProvider::build_chat_request_with_catalog(
+                    &request,
+                    vec![],
+                    stream,
+                    Some(&responses)
+                )
+                .is_err()
+            );
+        }
+        models["openai"][id]["api"] = serde_json::json!("openai-completions");
+        let chat = ModelCatalog::parse(&models.to_string(), &origins.to_string()).unwrap();
+        for stream in [false, true] {
+            let body = serde_json::to_value(
+                OpenAiProvider::build_chat_request_with_catalog(
+                    &request,
+                    vec![],
+                    stream,
+                    Some(&chat),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["max_completion_tokens"], 1024);
+            assert!(body.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn real_chat_bodies_select_family_cap_and_preserve_default_off_and_effort() {
+        for stream in [false, true] {
+            for (model, reasoning, field, expected_effort) in [
+                ("gpt-4o", None, "max_tokens", None),
+                ("o3-mini", None, "max_completion_tokens", None),
+                (
+                    "gpt-5.4",
+                    Some(ReasoningConfig::Disabled),
+                    "max_completion_tokens",
+                    Some("none"),
+                ),
+                (
+                    "gpt-5.4",
+                    Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                    "max_completion_tokens",
+                    Some("none"),
+                ),
+                (
+                    "gpt-5.4",
+                    Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+                    "max_completion_tokens",
+                    Some("high"),
+                ),
+            ] {
+                let mut request = crate::generation::test_request(model);
+                request.reasoning = reasoning;
+                let body = serde_json::to_value(
+                    OpenAiProvider::build_chat_request(&request, vec![], stream).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(body[field], 1024);
+                assert_eq!(
+                    body.get("reasoning_effort")
+                        .and_then(serde_json::Value::as_str),
+                    expected_effort
+                );
+                assert!(body.get("max_output_tokens").is_none());
+                let other = if field == "max_tokens" {
+                    "max_completion_tokens"
+                } else {
+                    "max_tokens"
+                };
+                assert!(body.get(other).is_none());
+                assert_eq!(body["stream"], stream);
+            }
+        }
+    }
+
+    #[test]
+    fn chat_rejects_temperature_and_responses_only_combinations_without_downgrading() {
+        let mut request = crate::generation::test_request("gpt-5.4");
+        request.temperature = Some(0.4);
+        for stream in [false, true] {
+            assert!(OpenAiProvider::build_chat_request(&request, vec![], stream).is_err());
+            request.reasoning = Some(ReasoningConfig::Disabled);
+            let body = serde_json::to_value(
+                OpenAiProvider::build_chat_request(&request, vec![], stream).unwrap(),
+            )
+            .unwrap();
+            assert!(body.get("temperature").is_some());
+            request.reasoning = None;
+        }
+        request.temperature = None;
+        request.tools = Some(vec![ToolDefinition {
+            name: "read".into(),
+            description: "Read".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }]);
+        for model in [
+            "gpt-5.6-sol",
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-5.4-pro",
+            "gpt-5.3-codex",
+        ] {
+            request.model = model.into();
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+            for stream in [false, true] {
+                assert!(
+                    OpenAiProvider::build_chat_request(&request, vec![], stream).is_err(),
+                    "{model}"
+                );
+            }
+        }
+        request.model = "gpt-5.6-sol".into();
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::None));
+        assert!(OpenAiProvider::build_chat_request(&request, vec![], true).is_ok());
+        request.model = "gpt-6-astra".into();
+        request.tools = None;
+        assert!(OpenAiProvider::build_chat_request(&request, vec![], true).is_err());
+        request.model = "unknown-new-family".into();
+        request.reasoning = None;
+        assert!(OpenAiProvider::build_chat_request(&request, vec![], false).is_err());
+    }
     use super::*;
+
+    #[tokio::test]
+    async fn g09_direct_embedding_adapter_rejects_invalid_batch_before_network() {
+        let provider = OpenAiProvider::new("unused-fixture-key");
+        for model in [
+            "text-embedding-3-small",
+            "text-embedding-3-large",
+            "text-embedding-ada-002",
+        ] {
+            let error = provider
+                .embed(EmbeddingRequest::new(model, vec!["short".to_owned(); 2048]))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("budget"));
+            let error = provider
+                .embed(EmbeddingRequest::new(model, vec![" a".repeat(8193)]))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("token budget"));
+        }
+    }
+
+    #[test]
+    fn embedding_wire_contract_has_actual_endpoint_model_input_encoding_and_usage() {
+        let provider = OpenAiProvider::new("fixture-key");
+        assert_eq!(
+            provider.embeddings_url(),
+            "https://api.openai.com/v1/embeddings"
+        );
+        let input = vec!["first".to_owned(), "second".to_owned()];
+        let body = ApiEmbeddingRequest {
+            model: "text-embedding-3-small".to_owned(),
+            input: input.clone(),
+            encoding_format: "float",
+        };
+        assert_eq!(
+            serde_json::to_value(body).unwrap(),
+            serde_json::json!({
+                "model": "text-embedding-3-small", "input": input, "encoding_format": "float"
+            })
+        );
+        let response: ApiEmbeddingResponse = serde_json::from_value(serde_json::json!({
+            "data": [{"index":1,"embedding":[2.0]},{"index":0,"embedding":[1.0]}],
+            "usage": {"prompt_tokens":7,"total_tokens":7}
+        }))
+        .unwrap();
+        assert_eq!(
+            ordered_vectors(response.data, 2).unwrap(),
+            vec![vec![1.0], vec![2.0]]
+        );
+        let usage: crate::types::TokenUsage = response.usage.unwrap().into();
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(0));
+        for bad in [serde_json::json!(-1), serde_json::json!(0.5)] {
+            assert!(
+                serde_json::from_value::<ApiEmbeddingResponse>(serde_json::json!({
+                    "data":[{"index":bad,"embedding":[1.0]}]
+                }))
+                .is_err()
+            );
+        }
+    }
     use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
     use crate::traits::Provider;
     use crate::types::{
@@ -1694,6 +2051,7 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "gpt-4o".into(),
             messages: vec![
                 ApiMessage {
@@ -1735,6 +2093,7 @@ mod tests {
     #[test]
     fn api_request_serializes_with_max_tokens() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "gpt-4o".into(),
             messages: vec![],
             temperature: None,
@@ -1757,6 +2116,7 @@ mod tests {
     #[test]
     fn api_request_serializes_reasoning_effort_only_when_selected() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "gpt-5.4".into(),
             messages: vec![],
             temperature: None,
@@ -1778,20 +2138,6 @@ mod tests {
         };
         let json = serde_json::to_value(&request_without_reasoning).unwrap();
         assert!(json.get("reasoning_effort").is_none());
-    }
-
-    #[test]
-    fn reasoning_effort_mapping_omits_disabled_and_serializes_explicit_none() {
-        assert_eq!(
-            reasoning_effort_for_openai_request(Some(ReasoningConfig::disabled())),
-            None
-        );
-        assert_eq!(
-            reasoning_effort_for_openai_request(Some(ReasoningConfig::effort(
-                ReasoningEffort::None
-            ))),
-            Some("none".to_owned())
-        );
     }
 
     #[test]
@@ -1869,4 +2215,133 @@ mod tests {
         assert!(caps.streaming);
         assert!(caps.vision);
     }
+}
+
+#[cfg(test)]
+mod media_contract_tests {
+    use super::*;
+    use crate::{AttachmentDataSource, MessageAttachment, MessageContentPart};
+    use crate::{ChatMessage, Provider};
+    #[test]
+    fn chat_pdf_inline_bytes_and_internal_owned_upload_use_different_fields() {
+        let provider = OpenAiProvider::new("unused");
+        let pdf_bytes = crate::attachments::regression::pdf(1);
+        let file = MessageAttachment {
+            mime_type: "application/pdf".into(),
+            name: Some("doc.pdf".into()),
+            size_bytes: None,
+            sha256: None,
+            source: AttachmentDataSource::Bytes {
+                base64_data: BASE64.encode(&pdf_bytes),
+            },
+            artifact: None,
+        };
+        let mut prepared = crate::attachments::prepare_messages_for_provider(
+            "openai",
+            &provider.capabilities(),
+            &[ChatMessage::user_parts(vec![MessageContentPart::file(
+                file,
+            )])],
+        )
+        .unwrap();
+        let inline = serde_json::to_value(
+            OpenAiProvider::build_file_part(&prepared.attachments[0]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inline["file"]["file_data"], BASE64.encode(&pdf_bytes));
+        assert_eq!(inline["file"]["filename"], "doc.pdf");
+        assert!(inline["file"].get("file_id").is_none());
+        // Simulate the existing authority-scoped upload's result AFTER bytes
+        // were checked. A caller-supplied reference is rejected before this.
+        prepared.attachments[0].source = PreparedAttachmentSource::Reference {
+            reference: "file-owned-upload".into(),
+        };
+        prepared.attachments[0].transport_plan.kind = AttachmentTransportKind::Upload;
+        prepared.attachments[0].bytes = None;
+        let uploaded = serde_json::to_value(
+            OpenAiProvider::build_file_part(&prepared.attachments[0]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(uploaded["file"]["file_id"], "file-owned-upload");
+        assert!(uploaded["file"].get("file_data").is_none());
+    }
+    #[test]
+    fn chat_audio_format_is_not_derived_from_an_arbitrary_mime_subtype() {
+        assert_eq!(
+            OpenAiProvider::audio_format_from_mime("audio/wav").unwrap(),
+            "wav"
+        );
+        assert_eq!(
+            OpenAiProvider::audio_format_from_mime("audio/mpeg").unwrap(),
+            "mp3"
+        );
+        assert!(OpenAiProvider::audio_format_from_mime("audio/flac").is_err());
+    }
+}
+
+#[cfg(test)]
+mod confirmed_duration_wire_regressions {
+    use super::*;
+    use crate::{Provider, attachments::regression as fixture};
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn confirmed_mp3_budget_native_projection_and_replay_keep_bytes() {
+        let provider = OpenAiProvider::new("unused");
+        for (kind, mime, bytes) in fixture::confirmed_wire_inputs("openai") {
+            let state = Arc::new(fixture::state(
+                "openai",
+                "media",
+                serde_json::json!({"audio":{"maxDurationMillis":2400}}),
+            ));
+            let budget = fixture::scoped(
+                state.clone(),
+                provider.prepare_input_budget(fixture::request(
+                    "media",
+                    vec![fixture::part(kind, mime, &bytes)],
+                )),
+            )
+            .await
+            .unwrap();
+            for _stream in [false, true] {
+                // Both Chat routes use this actual native message projection.
+                let replay = fixture::scoped(
+                    state.clone(),
+                    provider.prepare_input_budget(budget.request.clone()),
+                )
+                .await
+                .unwrap();
+                let prepared = fixture::scoped(
+                    state.clone(),
+                    prepare_messages_for_provider_async(
+                        "openai",
+                        "media",
+                        &provider.capabilities(),
+                        &replay.request.messages,
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(prepared.attachments[0].kind, kind);
+                assert_eq!(prepared.attachments[0].mime_type, mime);
+                let wire =
+                    serde_json::to_value(OpenAiProvider::convert_messages(&prepared).unwrap())
+                        .unwrap();
+                assert_eq!(wire[0]["content"][1]["input_audio"]["format"], "mp3");
+                assert_eq!(
+                    wire[0]["content"][1]["input_audio"]["data"],
+                    BASE64.encode(&bytes)
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod wire_contract_tests {
+    use super::*;
+    type WireProvider = OpenAiProvider;
+    fn wire_provider() -> WireProvider {
+        WireProvider::new("fixture")
+    }
+    include!("wire_tests/chat.rs");
 }

@@ -45,6 +45,7 @@ pub(crate) struct TurnStartFailure {
     public_code: pioneer_protocol::PublicErrorCode,
     diagnostic: String,
     expected_failure: Option<&'static str>,
+    task_failure: Option<pioneer_tasks::TaskStartFailure>,
 }
 
 impl TurnStartFailure {
@@ -53,12 +54,53 @@ impl TurnStartFailure {
             public_code,
             diagnostic: diagnostic.into(),
             expected_failure: None,
+            task_failure: None,
         }
     }
 
     fn expected(mut self, failure_class: &'static str) -> Self {
         self.expected_failure = Some(failure_class);
         self
+    }
+
+    fn with_task_cause(mut self, cause: pioneer_tasks::TaskStartCause) -> Self {
+        self.task_failure = Some(pioneer_tasks::TaskStartFailure::new(
+            pioneer_tasks::TaskStartStage::CliAdmission,
+            cause,
+        ));
+        self
+    }
+
+    pub(super) fn internal_typed(
+        stage: pioneer_tasks::TaskStartStage,
+        error: anyhow::Error,
+    ) -> Self {
+        let mut failure = Self::internal(format!("{error:#}"));
+        failure.task_failure = Some(pioneer_tasks::TaskStartFailure::from_error(stage, error));
+        failure
+    }
+
+    fn into_task_failure(
+        self,
+    ) -> (
+        pioneer_protocol::PublicError,
+        pioneer_tasks::TaskStartFailure,
+    ) {
+        let public_error = crate::public_error::build_public_error(
+            self.public_code,
+            pioneer_protocol::PublicErrorStage::Admission,
+        );
+        let failure = self
+            .task_failure
+            .unwrap_or_else(|| {
+                pioneer_tasks::TaskStartFailure::new(
+                    pioneer_tasks::TaskStartStage::CliAdmission,
+                    pioneer_tasks::TaskStartCause::Unclassified,
+                )
+            })
+            .with_public_error(public_error.clone())
+            .report();
+        (public_error, failure)
     }
 
     fn into_public_error(self) -> pioneer_protocol::PublicError {
@@ -81,8 +123,10 @@ impl TurnStartFailure {
         Self::new(pioneer_protocol::PublicErrorCode::InvalidInput, diagnostic)
     }
 
-    fn protocol_invalid_input(diagnostic: impl Into<String>) -> Self {
-        Self::invalid_input(diagnostic).expected("invalid_input")
+    pub(super) fn protocol_invalid_input(diagnostic: impl Into<String>) -> Self {
+        Self::invalid_input(diagnostic)
+            .expected("invalid_input")
+            .with_task_cause(pioneer_tasks::TaskStartCause::Validation)
     }
 
     fn policy_denied(diagnostic: impl Into<String>) -> Self {
@@ -96,9 +140,10 @@ impl TurnStartFailure {
     fn conflict(diagnostic: impl Into<String>) -> Self {
         Self::new(pioneer_protocol::PublicErrorCode::Conflict, diagnostic)
             .expected("admission_conflict")
+            .with_task_cause(pioneer_tasks::TaskStartCause::Refusal)
     }
 
-    fn internal(diagnostic: impl Into<String>) -> Self {
+    pub(super) fn internal(diagnostic: impl Into<String>) -> Self {
         Self::new(pioneer_protocol::PublicErrorCode::Internal, diagnostic)
     }
 
@@ -906,6 +951,15 @@ fn execution_backend_allows_agent_skill_overlay(
     )
 }
 
+// Recovery resumes the same Turn without taking its retained lease again.
+// A separate, short-lived transition mutex in the same session ownership map
+// therefore fences resume/native admission against background terminal effects.
+#[derive(Default)]
+pub(super) struct CliRuntimeSessionTurnLocks {
+    lease: Arc<tokio::sync::Mutex<()>>,
+    transition: Arc<tokio::sync::Mutex<()>>,
+}
+
 impl MessageProcessor {
     #[allow(clippy::too_many_arguments)]
     async fn admit_composite_execution_request(
@@ -926,7 +980,8 @@ impl MessageProcessor {
         {
             return Err(TurnStartFailure::policy_denied(
                 "execution target differs from the authorized thread".to_owned(),
-            ));
+            )
+            .with_task_cause(pioneer_tasks::TaskStartCause::Policy));
         }
         let provider_authority_fingerprint = match params.execution_backend.as_ref() {
             Some(AgentExecutionBackend::CLIAgentRuntime { .. })
@@ -1036,7 +1091,8 @@ impl MessageProcessor {
             if !pioneer_skills::effective_policy_for_skill(skill, &policy_set).enabled {
                 return Err(TurnStartFailure::policy_denied(format!(
                     "skill `{skill_id}` is not enabled for workspace `{workspace_id}`"
-                )));
+                ))
+                .with_task_cause(pioneer_tasks::TaskStartCause::Policy));
             }
 
             match skill.identity.source_kind {
@@ -3343,6 +3399,27 @@ impl MessageProcessor {
         })
     }
 
+    #[cfg(test)]
+    pub(super) async fn send_turn_start_failure_for_test(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        success_response: &TurnStartSuccessResponse,
+        thread_id: &str,
+        turn_id: &str,
+        failure: TurnStartFailure,
+    ) {
+        self.send_turn_start_failure(
+            connection_id,
+            request_id,
+            success_response,
+            thread_id,
+            turn_id,
+            failure,
+        )
+        .await;
+    }
+
     async fn send_turn_start_failure(
         &self,
         connection_id: ConnectionId,
@@ -3353,7 +3430,12 @@ impl MessageProcessor {
         failure: impl Into<TurnStartFailure>,
     ) {
         let failure = failure.into();
-        let public_error = failure.into_public_error();
+        let (public_error, task_failure) = if success_response.is_task() {
+            let (public_error, task_failure) = failure.into_task_failure();
+            (public_error, Some(task_failure))
+        } else {
+            (failure.into_public_error(), None)
+        };
         match success_response {
             TurnStartSuccessResponse::TurnStart => {
                 self.send_error(
@@ -3395,8 +3477,12 @@ impl MessageProcessor {
                 )
                 .await;
             }
-            TurnStartSuccessResponse::Task { .. }
-            | TurnStartSuccessResponse::DurableAgent { .. } => {
+            TurnStartSuccessResponse::Task { .. } => {
+                success_response.complete_task(Err(anyhow::Error::new(
+                    task_failure.expect("Task reporting produced a typed failure"),
+                )));
+            }
+            TurnStartSuccessResponse::DurableAgent { .. } => {
                 let encoded = serde_json::to_string(&public_error)
                     .unwrap_or_else(|_| public_error.correlation_id.clone());
                 success_response.complete_task(Err(anyhow::anyhow!(encoded)));
@@ -3421,6 +3507,9 @@ impl MessageProcessor {
         agent_turn_response: pioneer_crud::AgentTurnResponseInput,
         admitted_outcome: Option<crate::thread::TurnStartOutcome>,
     ) -> anyhow::Result<PreparedCliRuntimeNativeTurnStart> {
+        #[cfg(test)]
+        self.task_cli_preparation_attempts
+            .fetch_add(1, Ordering::SeqCst);
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let response = TurnStartSuccessResponse::Task {
             permission_profile,
@@ -3598,17 +3687,29 @@ impl MessageProcessor {
         provider_claim_matches: bool,
     ) -> MessageFuture<'a, Result<PreparedCliRuntimeCombinedPreflight, TurnStartFailure>> {
         message_future(async move {
+            #[cfg(test)]
+            if let Some(failure) = self.task_cli_admission_failure.lock().unwrap().take() {
+                return Err(failure);
+            }
             let readiness_snapshot = {
                 let _startup_part = pioneer_observability::turn_startup::stage(
                     &params.turn_id,
                     pioneer_observability::turn_startup::Stage::ReadinessWait,
                 );
-                self.cli_runtime_probe_snapshot(thread.workspace_id.as_str(), runtime_id)
-                    .await
+                let readiness = self
+                    .cli_runtime_probe_snapshot(thread.workspace_id.as_str(), runtime_id)
+                    .await;
+                #[cfg(test)]
+                let readiness = {
+                    let injected = self.task_cli_readiness_failure.lock().unwrap().take();
+                    injected.map_or(readiness, Err)
+                };
+                readiness
                     .map_err(|error| {
-                        TurnStartFailure::internal(format!(
-                            "failed to load CLI runtime readiness snapshot: {error:#}"
-                        ))
+                        TurnStartFailure::internal_typed(
+                            pioneer_tasks::TaskStartStage::CliAdmission,
+                            error.context("failed to load CLI runtime readiness snapshot"),
+                        )
                     })?
                     .ok_or_else(|| {
                         TurnStartFailure::internal(format!(
@@ -4277,6 +4378,8 @@ impl MessageProcessor {
                     }
                 }
             }
+            let transition_mutex = self.cli_runtime_session_transition_mutex(&session_key).await;
+            let _transition = transition_mutex.lock().await;
             // Session ownership serializes both provider use and continuity
             // decisions. Re-read the durable binding and persisted thread head
             // after waiting: an in-memory Thread snapshot can be empty after a
@@ -5961,11 +6064,17 @@ impl MessageProcessor {
                 }
             };
             if let Some(sent) = sent_context_basis.as_ref() {
-                match crate::cli_runtime::thread_binding::completed_context_basis_is_current(
+                let revalidation = crate::cli_runtime::thread_binding::completed_context_basis_is_current(
                     self.crud_store.as_ref(),
                     outcome.started_notification.workspace_id.as_str(),
                     &sent.completed,
-                ).await {
+                ).await;
+                #[cfg(test)]
+                let revalidation = {
+                    let injected = self.task_cli_history_revalidation_failure.lock().unwrap().take();
+                    injected.map_or(revalidation, Err)
+                };
+                match revalidation {
                     Ok(true) => {}
                     Ok(false) => {
                         self.mark_turn_blocked(
@@ -5977,12 +6086,30 @@ impl MessageProcessor {
                         return;
                     }
                     Err(error) => {
-                        self.mark_turn_blocked(
-                            outcome.started_notification.thread_id.clone(),
-                            outcome.started_notification.turn.id.clone(),
-                            format!("failed to revalidate CLI accepted history: {error:#}"),
-                        ).await;
-                        send_turn_start_failure!(format!("failed to revalidate CLI accepted history: {error:#}"));
+                        if success_response.is_task() {
+                            // Build and report once before the existing Blocked
+                            // transition. The same value then owns completion.
+                            let (_, failure) = TurnStartFailure::internal_typed(
+                                pioneer_tasks::TaskStartStage::CliPreparation,
+                                error.context("failed to revalidate CLI accepted history"),
+                            ).into_task_failure();
+                            self.mark_task_turn_blocked_on_start_failure(
+                                outcome.started_notification.thread_id.clone(),
+                                outcome.started_notification.turn.id.clone(),
+                                failure.descriptor(),
+                            ).await;
+                            success_response.complete_task(Err(anyhow::Error::new(failure)));
+                        } else {
+                            self.mark_turn_blocked(
+                                outcome.started_notification.thread_id.clone(),
+                                outcome.started_notification.turn.id.clone(),
+                                format!("failed to revalidate CLI accepted history: {error:#}"),
+                            ).await;
+                            send_turn_start_failure!(TurnStartFailure::internal_typed(
+                                pioneer_tasks::TaskStartStage::CliPreparation,
+                                error.context("failed to revalidate CLI accepted history"),
+                            ));
+                        }
                         return;
                     }
                 }
@@ -6549,6 +6676,10 @@ impl MessageProcessor {
             continuation_head,
         } = prepared;
         let pioneer_turn_id = outcome.started_notification.turn.id.clone();
+        let transition_mutex = self
+            .cli_runtime_session_transition_mutex(session_instance.key())
+            .await;
+        let transition = Arc::new(transition_mutex.lock_owned().await);
         self.interrupt_completed_history_for_new_input(
             &outcome.started_notification.workspace_id,
             &outcome.started_notification.thread_id,
@@ -6568,10 +6699,11 @@ impl MessageProcessor {
             {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    self.mark_turn_blocked(
+                    self.mark_turn_blocked_with_transition(
                         outcome.started_notification.thread_id.clone(),
                         pioneer_turn_id.clone(),
                         format!("failed to reserve CLI MCP turn lease: {error:#}"),
+                        Some(transition.clone()),
                     )
                     .await;
                     self.release_cli_runtime_session_turn_lease(pioneer_turn_id.as_str())
@@ -6587,10 +6719,11 @@ impl MessageProcessor {
                     let _ = cli_session
                         .terminal_mcp_turn(pioneer_turn_id.as_str())
                         .await;
-                    self.mark_turn_blocked(
+                    self.mark_turn_blocked_with_transition(
                         outcome.started_notification.thread_id.clone(),
                         pioneer_turn_id.clone(),
                         "CLI MCP session generation exceeds durable range".to_owned(),
+                        Some(transition.clone()),
                     )
                     .await;
                     self.release_cli_runtime_session_turn_lease(pioneer_turn_id.as_str())
@@ -6605,10 +6738,11 @@ impl MessageProcessor {
                         let _ = cli_session
                             .terminal_mcp_turn(pioneer_turn_id.as_str())
                             .await;
-                        self.mark_turn_blocked(
+                        self.mark_turn_blocked_with_transition(
                             outcome.started_notification.thread_id.clone(),
                             pioneer_turn_id.clone(),
                             "CLI MCP activation generation exceeds durable range".to_owned(),
+                            Some(transition.clone()),
                         )
                         .await;
                         self.release_cli_runtime_session_turn_lease(pioneer_turn_id.as_str())
@@ -6635,10 +6769,11 @@ impl MessageProcessor {
                 let _ = cli_session
                     .terminal_mcp_turn(pioneer_turn_id.as_str())
                     .await;
-                self.mark_turn_blocked(
+                self.mark_turn_blocked_with_transition(
                     outcome.started_notification.thread_id.clone(),
                     pioneer_turn_id.clone(),
                     format!("failed to persist CLI MCP turn lease: {error:#}"),
+                    Some(transition.clone()),
                 )
                 .await;
                 self.release_cli_runtime_session_turn_lease(pioneer_turn_id.as_str())
@@ -6717,10 +6852,11 @@ impl MessageProcessor {
                     // The failed read is not evidence that the canonical Turn
                     // is terminal. The conditional finish path rechecks its
                     // state and preserves a concurrent cancel/completion.
-                    self.mark_turn_blocked(
+                    self.mark_turn_blocked_with_transition(
                         outcome.started_notification.thread_id.clone(),
                         pioneer_turn_id.clone(),
                         reason.clone(),
+                        Some(transition.clone()),
                     )
                     .await;
                 } else {
@@ -6757,10 +6893,11 @@ impl MessageProcessor {
                     format!("failed to start native CLI runtime turn: {error:#}"),
                 )
                 .await;
-                self.mark_turn_blocked(
+                self.mark_turn_blocked_with_transition(
                     outcome.started_notification.thread_id.clone(),
                     pioneer_turn_id,
                     format!("failed to start CLI runtime turn: {error:#}"),
+                    Some(transition.clone()),
                 )
                 .await;
                 return;
@@ -6790,10 +6927,11 @@ impl MessageProcessor {
                     format!("failed to persist native CLI runtime owner: {error:#}"),
                 )
                 .await;
-                self.mark_turn_blocked(
+                self.mark_turn_blocked_with_transition(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
                     format!("failed to persist CLI runtime native turn id: {error:#}"),
+                    Some(transition.clone()),
                 )
                 .await;
                 let _ = cli_session
@@ -6829,10 +6967,11 @@ impl MessageProcessor {
                 format!("failed to confirm CLI context delivery: {error:#}"),
             )
             .await;
-            self.mark_turn_blocked(
+            self.mark_turn_blocked_with_transition(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
                 format!("failed to confirm CLI runtime context delivery: {error:#}"),
+                Some(transition.clone()),
             )
             .await;
             let _ = cli_session
@@ -6859,10 +6998,11 @@ impl MessageProcessor {
                 let _ = cli_session
                     .terminal_mcp_turn(pioneer_turn_id.as_str())
                     .await;
-                self.mark_turn_blocked(
+                self.mark_turn_blocked_with_transition(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
                     "CLI runtime native turn started without a durable attempt".to_owned(),
+                    Some(transition.clone()),
                 )
                 .await;
                 let _ = cli_session
@@ -6877,10 +7017,11 @@ impl MessageProcessor {
                 let _ = cli_session
                     .terminal_mcp_turn(pioneer_turn_id.as_str())
                     .await;
-                self.mark_turn_blocked(
+                self.mark_turn_blocked_with_transition(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
                     format!("failed to load CLI runtime attempt after native start: {error:#}"),
+                    Some(transition.clone()),
                 )
                 .await;
                 let _ = cli_session
@@ -6904,10 +7045,11 @@ impl MessageProcessor {
                 format!("failed to open CLI runtime execution window: {error:#}"),
             )
             .await;
-            self.mark_turn_blocked(
+            self.mark_turn_blocked_with_transition(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
                 format!("failed to open CLI runtime execution window: {error:#}"),
+                Some(transition.clone()),
             )
             .await;
             let _ = cli_session
@@ -6940,14 +7082,18 @@ impl MessageProcessor {
                     Some(native_turn_id.as_str()),
                 )
                 .await;
-            self.mark_turn_blocked(
+            self.mark_turn_blocked_with_transition(
                 outcome.started_notification.thread_id.clone(),
                 pioneer_turn_id,
                 format!("failed to activate CLI MCP turn lease: {error:#}"),
+                Some(transition.clone()),
             )
             .await;
             return;
         }
+        // Native admission and MCP activation are complete. Buffered events
+        // enter through the ordinary consumer, which owns its terminal transition.
+        drop(transition);
         if turn_binding.runtime_kind == "codex" {
             self.bind_buffered_codex_root_execution_segments(
                 &session_instance,
@@ -7639,6 +7785,10 @@ impl MessageProcessor {
                 return Err(CliRuntimeRecoveryStartFailure::InvalidBinding { diagnostic });
             }
         };
+        let transition_mutex = self
+            .cli_runtime_session_transition_mutex(&restored.session_key)
+            .await;
+        let _transition = transition_mutex.lock().await;
         let binding = restored.binding.clone();
         let Some((_workspace_id, turn)) = self
             .crud_store
@@ -7698,6 +7848,58 @@ impl MessageProcessor {
                 }
             }
         }
+        if self
+            .crud_store
+            .has_pending_cli_runtime_terminal_event(&binding.turn_id)
+            .await?
+        {
+            return Err(CliRuntimeRecoveryStartFailure::Unavailable {
+                diagnostic: "accepted native outcome awaits delivery".into(),
+            });
+        }
+        let terminal_source = self
+            .crud_store
+            .cli_runtime_turn_terminal_guard_by_id(&binding.turn_id)
+            .await?
+            .and_then(|snapshot| snapshot.terminal_event_source())
+            .map(|source| {
+                let id = source.terminal_delivery_id();
+                (source, id, self.turn_execution_owner_id.to_string())
+            });
+        let recovery_authority = self
+            .load_turn_execution_authorization_context(&binding.turn_id)
+            .await?;
+        let prepared_at = chrono::Utc::now().fixed_offset();
+        let (prepared_binding, attempt) = self
+            .crud_store
+            .prepare_cli_runtime_recovery_turn_attempt(
+                binding.turn_id.as_str(),
+                pioneer_protocol::generate_id(21),
+                request.job_id.clone(),
+                request.recovery_attempt_id.clone(),
+                request.execution_window_index,
+                request.previous_failure_reason.clone(),
+                prepared_at,
+                terminal_source,
+            )
+            .await?;
+        match attempt.status {
+            pioneer_crud::CliRuntimeTurnAttemptStatus::Running
+                if attempt.native_turn_id.is_some() =>
+            {
+                return Ok(false);
+            }
+            pioneer_crud::CliRuntimeTurnAttemptStatus::Starting => {}
+            status => {
+                return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                    diagnostic: format!(
+                        "CLI runtime recovery attempt `{}` is `{}` and cannot start",
+                        attempt.id,
+                        status.as_str()
+                    ),
+                });
+            }
+        }
         let manager = self
             .cli_runtime_manager
             .as_ref()
@@ -7744,39 +7946,6 @@ impl MessageProcessor {
                 .context("failed to reset Codex Goal before recovery")?;
         }
 
-        let recovery_authority = self
-            .load_turn_execution_authorization_context(&binding.turn_id)
-            .await?;
-        let prepared_at = chrono::Utc::now().fixed_offset();
-        let (prepared_binding, attempt) = self
-            .crud_store
-            .prepare_cli_runtime_recovery_turn_attempt(
-                binding.turn_id.as_str(),
-                pioneer_protocol::generate_id(21),
-                request.job_id.clone(),
-                request.recovery_attempt_id.clone(),
-                request.execution_window_index,
-                request.previous_failure_reason.clone(),
-                prepared_at,
-            )
-            .await?;
-        match attempt.status {
-            pioneer_crud::CliRuntimeTurnAttemptStatus::Running
-                if attempt.native_turn_id.is_some() =>
-            {
-                return Ok(false);
-            }
-            pioneer_crud::CliRuntimeTurnAttemptStatus::Starting => {}
-            status => {
-                return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
-                    diagnostic: format!(
-                        "CLI runtime recovery attempt `{}` is `{}` and cannot start",
-                        attempt.id,
-                        status.as_str()
-                    ),
-                });
-            }
-        }
         if let Err(error) = self
             .publish_cli_runtime_attempt_window_started(
                 session_handle.instance(),
@@ -7853,6 +8022,7 @@ impl MessageProcessor {
             .await;
             return Err(error.into());
         }
+        drop(_transition);
         if prepared_binding.runtime_kind == "codex" {
             self.bind_buffered_codex_root_execution_segments(
                 session_handle.instance(),
@@ -8065,10 +8235,41 @@ impl MessageProcessor {
         key: &crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
     ) -> Arc<tokio::sync::Mutex<()>> {
         let mut mutexes = self.cli_runtime_session_turn_mutexes.lock().await;
-        mutexes
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        mutexes.entry(key.clone()).or_default().lease.clone()
+    }
+
+    // Unlike the retained Turn lease, this gate covers one transition, including
+    // its external terminal effects. Recovery of the same Turn uses it too.
+    pub(super) async fn cli_runtime_session_transition_mutex(
+        &self,
+        key: &crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let mut mutexes = self.cli_runtime_session_turn_mutexes.lock().await;
+        mutexes.entry(key.clone()).or_default().transition.clone()
+    }
+
+    pub(super) async fn cli_runtime_turn_resume_transition(
+        &self,
+        turn_id: &str,
+    ) -> anyhow::Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
+        let Some(binding) = self
+            .crud_store
+            .get_cli_runtime_turn_binding(turn_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let key = crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
+            binding.workspace_id,
+            binding.runtime_id,
+            binding.continuation_thread_id,
+        )?;
+        Ok(Some(
+            self.cli_runtime_session_transition_mutex(&key)
+                .await
+                .lock_owned()
+                .await,
+        ))
     }
 
     async fn keep_task_cli_runtime_queue_alive(
@@ -9507,6 +9708,26 @@ impl MessageProcessor {
             return;
         }
 
+        let cli_transition = match self.cli_runtime_turn_resume_transition(&turn_id).await {
+            Ok(transition) => transition.map(Arc::new),
+            Err(error) => {
+                self.user_turn_cancel_intents
+                    .lock()
+                    .await
+                    .remove(&cancel_intent_key);
+                self.send_error(
+                    connection_id,
+                    public_turn_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
+                        format!("failed to acquire CLI cancellation ownership: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
         self.mcp_service
             .cancel_turn_mcp_invocations(turn_id.as_str());
 
@@ -9579,9 +9800,11 @@ impl MessageProcessor {
                 .await;
                 return;
             }
-            self.ensure_cli_runtime_turn_interrupted_cleanup(
+            self.cleanup_cli_runtime_terminal_turn_status_with_transition(
                 &cli_turn_binding,
-                Some(reason.as_str()),
+                TurnStatus::Interrupted,
+                &reason,
+                cli_transition.as_ref(),
             )
             .await;
             self.user_turn_cancel_intents
@@ -9742,6 +9965,23 @@ impl MessageProcessor {
                 binding.thread_id
             );
         }
+        let expected = self
+            .crud_store
+            .cli_runtime_turn_terminal_guard(&binding)
+            .await?;
+        let transition = self
+            .try_cli_runtime_turn_transition(&binding)
+            .await?
+            .context("CLI session cancellation is deferred while its transition is owned")?;
+        anyhow::ensure!(
+            expected.is_some()
+                && self
+                    .crud_store
+                    .cli_runtime_turn_terminal_guard(&binding)
+                    .await?
+                    == expected,
+            "CLI cancellation source changed"
+        );
         self.mcp_service.cancel_turn_mcp_invocations(turn_id);
         if !self
             .mark_turn_interrupted(thread_id.to_owned(), turn_id.to_owned(), reason.to_owned())
@@ -9749,8 +9989,13 @@ impl MessageProcessor {
         {
             anyhow::bail!("failed to interrupt CLI runtime turn `{turn_id}`");
         }
-        self.ensure_cli_runtime_turn_interrupted_cleanup(&binding, Some(reason))
-            .await;
+        self.cleanup_cli_runtime_terminal_turn_status_with_transition(
+            &binding,
+            TurnStatus::Interrupted,
+            reason,
+            Some(&transition),
+        )
+        .await;
         Ok(true)
     }
 
@@ -9964,6 +10209,21 @@ impl MessageProcessor {
                 return;
             }
             None => {
+                let transition = match self.cli_runtime_turn_resume_transition(&turn_id).await {
+                    Ok(transition) => transition,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request_id),
+                                INVALID_REQUEST_CODE,
+                                format!("failed to acquire CLI resume ownership: {error:#}"),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
                 let resumed_job = match self
                     .recovery_coordinator
                     .resume_blocked_turn(
@@ -10001,6 +10261,7 @@ impl MessageProcessor {
                     }
                 };
 
+                drop(transition);
                 match self.recovery_coordinator.run_ready_jobs(now_unix, 16).await {
                     Ok(events) => {
                         for event in events {
@@ -10907,6 +11168,7 @@ fn provider_model_from_runtime_model_for_reasoning_lookup(
         .supports_reasoning
         .or_else(|| (!model.effort_options.is_empty()).then_some(true));
     let reasoning = supports_reasoning.map(|supported| ProviderModelReasoningCapabilities {
+        native: Default::default(),
         supported: Some(supported),
         effort_options: model.effort_options.clone(),
         default_effort: None,
@@ -11103,6 +11365,59 @@ fn cli_runtime_unavailable_reason(status: &RuntimeStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_expected_causes_are_explicit_and_public_admission_does_not_imply_policy() {
+        use crate::public_error::test_support::capture_events;
+        use pioneer_tasks::{TaskStartCause, TaskStartReporting};
+        let (_, events) = capture_events(|| {
+            for (failure, cause, class) in [
+                (
+                    TurnStartFailure::protocol_invalid_input("private validation"),
+                    TaskStartCause::Validation,
+                    pioneer_protocol::TaskErrorClass::Validation,
+                ),
+                (
+                    TurnStartFailure::policy_denied("private policy")
+                        .with_task_cause(TaskStartCause::Policy),
+                    TaskStartCause::Policy,
+                    pioneer_protocol::TaskErrorClass::Policy,
+                ),
+                (
+                    TurnStartFailure::conflict("private conflict"),
+                    TaskStartCause::Refusal,
+                    pioneer_protocol::TaskErrorClass::Internal,
+                ),
+            ] {
+                let (public, failure) = failure.into_task_failure();
+                assert_eq!(failure.reporting(), TaskStartReporting::Reported);
+                assert_eq!(failure.descriptor().cause, cause);
+                assert_eq!(failure.descriptor().task_error(None).class, class);
+                assert_eq!(
+                    failure.descriptor().correlation_id.as_deref(),
+                    Some(public.correlation_id.as_str())
+                );
+            }
+            // Flush local breadcrumbs into an event to check their safe fields.
+            tracing::error!("task refusal breadcrumb checkpoint");
+        });
+        assert_eq!(events.len(), 1, "only the test checkpoint creates an event");
+        assert!(!serde_json::to_string(&events).unwrap().contains("private"));
+        for failure in [
+            TurnStartFailure::internal("private internal"),
+            TurnStartFailure::policy_denied("private unclassified policy"),
+            TurnStartFailure::invalid_input("private unclassified validation"),
+        ] {
+            let ((_, failure), events) = capture_events(|| failure.into_task_failure());
+            assert_eq!(events.len(), 1);
+            assert_eq!(failure.descriptor().cause, TaskStartCause::Unclassified);
+            assert_eq!(
+                failure.descriptor().task_error(None).class,
+                pioneer_protocol::TaskErrorClass::Internal
+            );
+            assert!(!serde_json::to_string(&events).unwrap().contains("private"));
+        }
+    }
 
     #[test]
     fn typed_admission_refusals_are_silent_but_unclassified_and_unavailable_failures_are_errors() {
@@ -11390,11 +11705,156 @@ mod tests {
         }
     }
 
+    #[test]
+    fn documented_claude_off_survives_catalog_selector_and_admission() {
+        use pioneer_provider::catalog::ModelCatalog;
+        for (provider, key, id, template, optional) in [
+            (
+                "anthropic",
+                "anthropic",
+                "claude-opus-4-5-20251101",
+                "claude-opus-4-5",
+                true,
+            ),
+            (
+                "anthropic",
+                "anthropic",
+                "claude-opus-4-6",
+                "claude-opus-4-6",
+                true,
+            ),
+            (
+                "anthropic",
+                "anthropic",
+                "claude-sonnet-5",
+                "claude-opus-4-6",
+                true,
+            ),
+            (
+                "anthropic",
+                "anthropic",
+                "claude-opus-5",
+                "claude-opus-4-6",
+                true,
+            ),
+            (
+                "anthropic",
+                "anthropic",
+                "claude-fable-5-1",
+                "claude-opus-4-6",
+                false,
+            ),
+            (
+                "anthropic",
+                "anthropic",
+                "claude-sonnet-5-5",
+                "claude-opus-4-6",
+                false,
+            ),
+            (
+                "bedrock",
+                "amazon-bedrock",
+                "us.anthropic.claude-opus-4-6-v1",
+                "anthropic.claude-opus-4-6-v1",
+                true,
+            ),
+            (
+                "bedrock",
+                "amazon-bedrock",
+                "anthropic.claude-opus-4-5-20251101-v1:0",
+                "anthropic.claude-opus-4-6-v1",
+                true,
+            ),
+            (
+                "bedrock",
+                "amazon-bedrock",
+                "anthropic.claude-fable-5",
+                "anthropic.claude-opus-4-6-v1",
+                false,
+            ),
+        ] {
+            for kind in [
+                "saved",
+                "missing",
+                "partial",
+                "catalog-veto",
+                "native-veto",
+                "capability-veto",
+            ] {
+                let mut models: serde_json::Value = serde_json::from_str(include_str!(
+                    "../../../provider/tests/fixtures/catalog/models.json"
+                ))
+                .unwrap();
+                let mut provenance: serde_json::Value = serde_json::from_str(include_str!(
+                    "../../../provider/tests/fixtures/catalog/provenance.json"
+                ))
+                .unwrap();
+                if kind == "missing" {
+                    models[key].as_object_mut().unwrap().remove(id);
+                } else if kind != "saved" {
+                    let mut entry = models[key][template].clone();
+                    assert!(entry.get("api").is_some());
+                    entry["id"] = serde_json::json!(id);
+                    entry["thinkingLevelMap"] = if kind == "catalog-veto" {
+                        serde_json::json!({"off":null})
+                    } else {
+                        serde_json::json!({"max":"max"})
+                    };
+                    if kind == "capability-veto" {
+                        entry["reasoning"] = serde_json::json!(false);
+                    }
+                    models[key][id] = entry;
+                    provenance[key][id] = provenance[key][template].clone();
+                }
+                // Saved profiles can explicitly veto off too (Opus 5 has
+                // off:null). A documented optional mode only fills missing
+                // metadata; it cannot override that catalog denial.
+                let catalog_off_veto = models[key][id]["reasoning"] == false
+                    || models[key][id]
+                        .get("thinkingLevelMap")
+                        .and_then(|map| map.get("off"))
+                        .is_some_and(serde_json::Value::is_null);
+                let catalog =
+                    ModelCatalog::parse(&models.to_string(), &provenance.to_string()).unwrap();
+                let mut model = reasoning_test_model(None);
+                model.id = id.into();
+                model.provider = provider.into();
+                if kind == "native-veto" {
+                    model.capabilities.reasoning = Some(ProviderModelReasoningCapabilities {
+                        native: [("thinking.types.disabled".into(), Some(false))]
+                            .into_iter()
+                            .collect(),
+                        ..Default::default()
+                    });
+                }
+                catalog.enrich(provider, std::slice::from_mut(&mut model));
+                let rows = pioneer_client::providers::presentation::reasoning_effort_rows_for_model(
+                    &model, None,
+                );
+                let off_allowed = optional && !catalog_off_veto && kind != "native-veto";
+                assert_eq!(
+                    rows.iter().any(|r| r.effort == "none"),
+                    off_allowed,
+                    "{provider}/{id}/{kind}"
+                );
+                assert_eq!(
+                    validate_reasoning_effort_for_model(provider, id, "none", Some(&model)).is_ok(),
+                    off_allowed
+                );
+                for row in rows {
+                    validate_reasoning_effort_for_model(provider, id, &row.effort, Some(&model))
+                        .unwrap();
+                }
+            }
+        }
+    }
+
     fn reasoning_capabilities(
         supported: Option<bool>,
         effort_options: &[&str],
     ) -> ProviderModelReasoningCapabilities {
         ProviderModelReasoningCapabilities {
+            native: Default::default(),
             supported,
             effort_options: effort_options
                 .iter()

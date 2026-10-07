@@ -7,10 +7,12 @@
 
 pub mod attachments;
 pub mod catalog;
+pub mod continuation;
 pub mod definition;
 pub mod factory;
 pub mod failure;
 pub mod file_tools;
+mod generation;
 pub mod history;
 mod http;
 pub mod providers;

@@ -69,13 +69,13 @@ pub use agent_authorship::{
 };
 pub use agent_event::{
     AgentDurableEvent, AgentProgressEvent, DurableEventCausalityKey, ItemHeartbeatSource,
-    NativeTerminalEffectGate, NativeTerminalEffectKind, NativeTerminalEffectPayload,
-    NativeTerminalEffectPreparation, NativeTerminalEffectPreparationFailure,
-    NativeTerminalEffectSpec, ProgressCoalescingKey, ProtocolEventClass, RecoveryAttemptContext,
-    SkillAuditEvent, ToolResultView, TurnAcceptedCapability, TurnCapabilityAcceptedReason,
-    TurnCapabilityRejectedReason, TurnPermissionAuditDecision, TurnPermissionAuditEvent,
-    TurnPermissionAuditEventKind, TurnPermissionAuditRequestKey, TurnRejectedCapability,
-    TurnSkillBinding,
+    NativeDurableCancellationReceipt, NativeTerminalEffectGate, NativeTerminalEffectKind,
+    NativeTerminalEffectPayload, NativeTerminalEffectPreparation,
+    NativeTerminalEffectPreparationFailure, NativeTerminalEffectSpec, ProgressCoalescingKey,
+    ProtocolEventClass, RecoveryAttemptContext, SkillAuditEvent, ToolResultView,
+    TurnAcceptedCapability, TurnCapabilityAcceptedReason, TurnCapabilityRejectedReason,
+    TurnPermissionAuditDecision, TurnPermissionAuditEvent, TurnPermissionAuditEventKind,
+    TurnPermissionAuditRequestKey, TurnRejectedCapability, TurnSkillBinding,
 };
 pub use agent_launch::{
     AgentAuthoredInput, AgentAuthoredInputError, AgentExecutionProfileBackend,
@@ -171,10 +171,11 @@ pub use cli_runtime::{
     CLIRuntimeThreadBindingManagement, CLIRuntimeThreadCompactParams,
     CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams, CLIRuntimeThreadForkResponse,
     CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse, CliMcpAdapterReadiness,
-    CliMcpInjectionKind, CliMcpProjectionUpdateKind, RUNTIME_DIAGNOSTIC_LINE_MAX_CHARS,
-    RUNTIME_DIAGNOSTIC_MAX_LINES, RuntimeAccountSnapshot, RuntimeAppInfo, RuntimeCapabilities,
-    RuntimeDiagnostic, RuntimeDiagnosticLevel, RuntimeModelInfo, RuntimeStatus, RuntimeSummary,
-    sanitize_runtime_diagnostic_line, sanitize_runtime_diagnostic_lines,
+    CliMcpInjectionKind, CliMcpProjectionUpdateKind, CliRuntimeBlockedTurnGuard,
+    RUNTIME_DIAGNOSTIC_LINE_MAX_CHARS, RUNTIME_DIAGNOSTIC_MAX_LINES, RuntimeAccountSnapshot,
+    RuntimeAppInfo, RuntimeCapabilities, RuntimeDiagnostic, RuntimeDiagnosticLevel,
+    RuntimeModelInfo, RuntimeStatus, RuntimeSummary, sanitize_runtime_diagnostic_line,
+    sanitize_runtime_diagnostic_lines,
 };
 pub use client_projection::{
     AgentWorkGraphProjection, AgentWorkNodeProjection, AgentWorkNodeState,

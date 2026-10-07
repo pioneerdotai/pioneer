@@ -12,10 +12,8 @@ pub struct Model {
     pub batch_id: String,
     pub workspace_id: String,
     pub thread_id: String,
-    #[sea_orm(unique_key = "uidx_native_terminal_effect_turn_kind")]
     pub turn_id: String,
     pub runtime_generation: i64,
-    #[sea_orm(unique_key = "uidx_native_terminal_effect_turn_kind")]
     pub effect_kind: String,
     pub gate_kind: String,
     #[sea_orm(column_type = "Text")]
@@ -40,6 +38,10 @@ pub struct Model {
     pub prepared_at: DateTimeWithTimeZone,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    pub gate_probe_at: i64,
+    pub gate_probe_attempts: i64,
+    #[sea_orm(unique)]
+    pub gate_probe_token: Option<String>,
     #[sea_orm(
         belongs_to,
         from = "turn_id",

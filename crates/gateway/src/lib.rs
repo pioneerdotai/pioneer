@@ -1066,10 +1066,9 @@ async fn run_gateway_until_shutdown_inner(
                         post_readiness
                             .set_degraded(ReadinessDegradation::DatabaseMaintenance, true);
                     }
-                    tokio::select! {
-                        _ = cancellation.cancelled() => {}
-                        _ = database::maintenance::run(post_crud_store, cancellation.clone()) => {}
-                    }
+                    // Workers observe cancellation themselves. Keep polling them
+                    // so shutdown joins an already-started bounded zstd CPU batch.
+                    database::maintenance::run(post_crud_store, cancellation.clone()).await;
                 },
             ));
             wait_for_shutdown_signal().await
@@ -1114,6 +1113,7 @@ async fn run_gateway_until_shutdown_inner(
     );
     message_processor.shutdown_remote_access_supervisor().await;
     let server_shutdown_result = handle.shutdown().await;
+    message_processor.shutdown_voice_finalizations().await;
     message_processor.shutdown_cli_runtime_manager().await;
     message_processor.shutdown_mcp_service().await;
     self_improvement_supervisor.shutdown().await;
@@ -2038,3 +2038,9 @@ pub(crate) fn isolated_test_app_config() -> anyhow::Result<pioneer_config::AppCo
         "../../../config/default.toml"
     ))?)
 }
+
+#[cfg(test)]
+pub(crate) mod media_test_fixtures;
+
+#[cfg(test)]
+mod provider_media_regression_tests;

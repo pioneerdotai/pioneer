@@ -1,13 +1,13 @@
 #[cfg(test)]
-use crate::attachments::prepare_messages_for_provider;
+use crate::attachments::prepare_messages_for_request;
 use crate::{
     attachments::{
         PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes, attachment_data_url,
-        ensure_no_unrendered_attachments, prepare_messages_for_provider_async,
+        ensure_no_unrendered_attachments, prepare_messages_for_request_async,
     },
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
     tools::parse::parse_tool_calls,
-    tools::stream::{IncrementalLineDecoder, sse_data},
+    tools::stream::IncrementalSseDecoder,
     types::{
         ChatMessage, ChatRequest, ChatResponse, InputContentType, InputTypeSupport,
         ProviderCapabilities, ProviderInputCapabilities, ProviderReplayState, ProviderTermination,
@@ -87,6 +87,8 @@ struct ApiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
     stream: bool,
+    #[serde(flatten)]
+    generation: crate::generation::Fields,
 }
 
 #[derive(Debug, Serialize)]
@@ -455,10 +457,10 @@ impl OpenAiCompatibleProvider {
     /// Resolve the chat completions endpoint URL.
     /// If the base_url already ends with `/chat/completions`, use it as-is.
     fn chat_completions_url(&self) -> String {
-        if self.base_url.ends_with("/chat/completions") {
-            self.base_url.clone()
+        let base = self.base_url.trim_end_matches('/');
+        if base.ends_with("/chat/completions") {
+            base.to_owned()
         } else {
-            let base = self.base_url.trim_end_matches('/');
             format!("{base}/chat/completions")
         }
     }
@@ -477,6 +479,7 @@ impl OpenAiCompatibleProvider {
         let mut builder = self.client.get(url);
 
         match &self.auth_style {
+            AuthStyle::Bearer if self.credential.is_empty() => {}
             AuthStyle::Bearer => {
                 builder = builder.header("Authorization", format!("Bearer {}", self.credential));
             }
@@ -500,6 +503,7 @@ impl OpenAiCompatibleProvider {
         let mut builder = self.client.post(url);
 
         match &self.auth_style {
+            AuthStyle::Bearer if self.credential.is_empty() => {}
             AuthStyle::Bearer => {
                 builder = builder.header("Authorization", format!("Bearer {}", self.credential));
             }
@@ -759,7 +763,7 @@ impl OpenAiCompatibleProvider {
                 role: role.to_owned(),
                 content: replay.content.map(ApiMessageContent::Text),
                 reasoning_content: replay.reasoning_content,
-                tool_calls: Some(replay.tool_calls),
+                tool_calls: (!replay.tool_calls.is_empty()).then_some(replay.tool_calls),
                 tool_call_id: None,
                 name: None,
             });
@@ -946,6 +950,10 @@ impl OpenAiCompatibleProvider {
                 state.provider
             )
         })?;
+        anyhow::ensure!(
+            crate::continuation::retention(state) != crate::continuation::Retention::Unsupported,
+            "unsupported {provider_name} continuation: unrecognized native state must not be discarded by the readable replay schema"
+        );
         let replay = serde_json::from_value::<CompatibleAssistantReplayState>(payload.clone())
             .map_err(|error| anyhow!("invalid {provider_name} replay state: {error}"))?;
         if replay.schema_version != COMPATIBLE_REPLAY_STATE_SCHEMA_VERSION {
@@ -989,25 +997,36 @@ impl OpenAiCompatibleProvider {
         request: ChatRequest,
         stream: bool,
     ) -> Result<ApiChatRequest> {
+        let request = crate::tools::policy::prepare_request(self.name.as_str(), request)?;
         let capabilities =
             <OpenAiCompatibleProvider as crate::traits::Provider>::capabilities(self);
-        let prepared = prepare_messages_for_provider_async(
+        let prepared = prepare_messages_for_request_async(
             self.name.as_str(),
-            request.model.as_str(),
             &capabilities,
+            &request,
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
-        self.build_chat_request_from_prepared(request, stream, prepared)
+        let has_image = prepared
+            .attachments
+            .iter()
+            .any(|a| a.kind == InputContentType::Image);
+        let body = self.build_chat_request_from_prepared(request, stream, prepared)?;
+        if self.name == "groq" && has_image {
+            crate::attachments::validate_inline_payload("groq", &body)?;
+        }
+        Ok(body)
     }
 
     #[cfg(test)]
     fn build_chat_request(&self, request: ChatRequest, stream: bool) -> Result<ApiChatRequest> {
+        let request = crate::tools::policy::prepare_request(self.name.as_str(), request)?;
         let capabilities =
             <OpenAiCompatibleProvider as crate::traits::Provider>::capabilities(self);
-        let prepared = prepare_messages_for_provider(
+        let prepared = prepare_messages_for_request(
             self.name.as_str(),
             &capabilities,
+            &request,
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )?;
         self.build_chat_request_from_prepared(request, stream, prepared)
@@ -1018,7 +1037,28 @@ impl OpenAiCompatibleProvider {
         &self,
         request: ChatRequest,
     ) -> Result<serde_json::Value> {
-        serde_json::to_value(self.build_chat_request(request, false)?).map_err(Into::into)
+        self.render_chat_request_mode_for_test(request, false)
+    }
+
+    #[cfg(test)]
+    pub(super) fn render_chat_request_mode_for_test(
+        &self,
+        request: ChatRequest,
+        stream: bool,
+    ) -> Result<serde_json::Value> {
+        serde_json::to_value(self.build_chat_request(request, stream)?).map_err(Into::into)
+    }
+
+    /// Uses production's asynchronous model/request-aware materialization and
+    /// shared wire constructor. No HTTP/provider endpoint is involved.
+    #[cfg(test)]
+    pub(crate) async fn render_chat_request_async_for_test(
+        &self,
+        request: ChatRequest,
+        stream: bool,
+    ) -> Result<serde_json::Value> {
+        serde_json::to_value(self.build_chat_request_async(request, stream).await?)
+            .map_err(Into::into)
     }
 
     fn build_chat_request_from_prepared(
@@ -1027,12 +1067,28 @@ impl OpenAiCompatibleProvider {
         stream: bool,
         prepared: PreparedProviderMessages,
     ) -> Result<ApiChatRequest> {
+        let catalog = crate::catalog::model_catalog().ok();
+        self.build_chat_request_with_catalog(request, stream, prepared, catalog.as_deref())
+    }
+
+    fn build_chat_request_with_catalog(
+        &self,
+        request: ChatRequest,
+        stream: bool,
+        mut prepared: PreparedProviderMessages,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> Result<ApiChatRequest> {
+        let request = crate::tools::policy::prepare_request(self.name.as_str(), request)?;
+        crate::tools::policy::prepare_history(self.name.as_str(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name.as_str(), &prepared)?;
+        let generation =
+            crate::generation::chat_fields_from_catalog(catalog, &self.name, &request)?;
         Ok(ApiChatRequest {
+            generation,
             model: request.model,
             messages: self.convert_messages(&prepared)?,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
+            temperature: None,
+            max_tokens: None,
             tools: request
                 .tools
                 .as_ref()
@@ -1069,7 +1125,7 @@ fn finish_compatible_stream(
 ) -> Result<Vec<StreamChunk>> {
     let tool_calls = tool_call_accumulator.take_tool_calls()?;
     let mut chunks = Vec::new();
-    if replay_reasoning_content && !tool_calls.is_empty() {
+    if replay_reasoning_content && (provider_name == "deepseek" || !tool_calls.is_empty()) {
         chunks.push(StreamChunk::provider_replay_state(
             OpenAiCompatibleProvider::assistant_replay_state(
                 provider_name,
@@ -1088,121 +1144,17 @@ fn finish_compatible_stream(
 
 // ── Provider trait implementation ───────────────────────────────────────────
 
-#[async_trait]
-impl crate::traits::Provider for OpenAiCompatibleProvider {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities {
-            streaming: true,
-            vision: self.input_types.image.is_supported(),
-            tool_calling: true,
-            embeddings: false,
-            transcription: false,
-            input_types: self.input_types.clone(),
-        }
-    }
-
-    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let api_request = self.build_chat_request_async(request, false).await?;
-
-        let request_builder = self
-            .authorized_post(&self.chat_completions_url())
-            .json(&api_request);
-        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(self.api_error(response).await);
-        }
-
-        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
-            response,
-            Default::default(),
-            "provider_response",
-        )
-        .await?;
-        let usage = api_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-        });
-
-        let choice = api_response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("no response from {}", self.name))?;
-        let termination = choice
-            .finish_reason
-            .as_deref()
-            .map(ProviderTermination::from_openai_reason)
-            .unwrap_or_else(|| ProviderTermination::Unknown("missing_finish_reason".to_owned()));
-        let message = choice.message;
-
-        let raw_content = message.content.clone();
-        let text = message.effective_content();
-        let tool_calls =
-            parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())?;
-        let reasoning_content = message.reasoning_content.or(message.reasoning);
-
-        if text.is_empty()
-            && tool_calls.is_empty()
-            && reasoning_content.as_deref().unwrap_or_default().is_empty()
-        {
-            return Err(anyhow!("no response from {}", self.name));
-        }
-
-        let provider_replay_state =
-            (self.replay_reasoning_content && !tool_calls.is_empty()).then(|| {
-                Self::assistant_replay_state(
-                    self.name.as_str(),
-                    raw_content,
-                    reasoning_content.clone(),
-                    tool_calls.as_slice(),
-                )
-            });
-
-        Ok(ChatResponse {
-            text,
-            usage,
-            termination,
-            reasoning_content,
-            tool_calls,
-            provider_replay_state,
-        })
-    }
-
-    async fn stream_chat(
-        &self,
-        request: ChatRequest,
-    ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let api_request = self.build_chat_request_async(request, true).await?;
-
-        let request_builder = self
-            .authorized_post(&self.chat_completions_url())
-            .json(&api_request);
-        let response =
-            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
-
-        if !response.status().is_success() {
-            return Err(self.api_error(response).await);
-        }
-
-        let byte_stream = crate::http::bounded_response_stream(
-            response,
-            crate::types::ProviderResponseLimits::default().max_transport_bytes,
-            "provider_stream",
-        );
-        let provider_name = self.name.clone();
-        let replay_reasoning_content = self.replay_reasoning_content;
-
+// The same decoder is used by HTTP transport and in-memory regression fixtures.
+impl OpenAiCompatibleProvider {
+    pub(super) fn decode_stream(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+        provider_name: String,
+        replay_reasoning_content: bool,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
         tokio::spawn(async move {
-            let mut decoder = IncrementalLineDecoder::default();
+            let mut decoder = IncrementalSseDecoder::default();
             let mut tool_call_accumulator = StreamToolCallAccumulator::default();
             let mut terminal_reason = None;
             let mut response_content: Option<String> = None;
@@ -1234,22 +1186,16 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                         return;
                     }
                 };
-                for line in lines {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    let Some(data) = sse_data(line) else {
-                        continue;
-                    };
+                for frame in lines {
+                    let data = frame.data.as_str();
 
                     if data.trim() == "[DONE]" {
                         let terminal = terminal_reason
                             .take()
                             .map(StreamChunk::final_chunk_with)
                             .ok_or_else(|| {
-                                anyhow!("provider stream ended without a finish_reason")
+                                crate::failure::ProviderStreamIncomplete::DoneWithoutFinishReason
+                                    .into()
                             });
                         let _ = tx.send(terminal).await;
                         return;
@@ -1278,21 +1224,31 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                                 }
                             }
                             if let Some(error) = resp.error {
-                                if tx
-                                    .send(Err(anyhow!(
-                                        "{} stream error: {}",
-                                        provider_name,
-                                        error.description()
-                                    )))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
+                                let status = error
+                                    .code
+                                    .as_ref()
+                                    .and_then(serde_json::Value::as_u64)
+                                    .and_then(|code| u16::try_from(code).ok());
+                                let outcome = crate::failure::native_chat_stream_error(
+                                    &error.description(),
+                                    status,
+                                );
+                                let _ = tx.send(Err(outcome)).await;
                                 return;
                             }
                             for choice in resp.choices {
                                 if terminal_reason.is_some() {
+                                    if choice.finish_reason.as_deref().is_some_and(|reason| {
+                                        Some(ProviderTermination::from_openai_reason(reason))
+                                            != terminal_reason
+                                    }) {
+                                        let _ = tx
+                                            .send(Err(anyhow!(
+                                                "provider changed finish_reason after completion"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
                                     if choice.delta.has_payload() {
                                         let _ = tx
                                             .send(Err(anyhow!(
@@ -1364,9 +1320,9 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                                 }
                             }
                         }
-                        Err(e) => {
+                        Err(_) => {
                             if tx
-                                .send(Err(anyhow!("malformed {} SSE frame: {e}", provider_name)))
+                                .send(Err(anyhow!("malformed {} SSE frame", provider_name)))
                                 .await
                                 .is_err()
                             {
@@ -1380,15 +1336,135 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
 
             let terminal = match decoder.finish() {
                 Err(error) => Err(error),
-                Ok(_) => terminal_reason
-                    .map(StreamChunk::final_chunk_with)
-                    .ok_or_else(|| anyhow!("provider stream ended before a terminal marker")),
+                Ok(_) => {
+                    Err(crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into())
+                }
             };
             let _ = tx.send(terminal).await;
         });
 
         let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(Box::pin(chunk_stream))
+        Box::pin(chunk_stream)
+    }
+}
+
+#[async_trait]
+impl crate::traits::Provider for OpenAiCompatibleProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: true,
+            vision: self.input_types.image.is_supported(),
+            tool_calling: true,
+            embeddings: false,
+            transcription: false,
+            input_types: self.input_types.clone(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let api_request = self.build_chat_request_async(request, false).await?;
+
+        let request_builder = self
+            .authorized_post(&self.chat_completions_url())
+            .json(&api_request);
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(self.api_error(response).await);
+        }
+
+        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
+        let usage = api_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+        });
+
+        let choice = api_response
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no response from {}", self.name))?;
+        let termination = choice
+            .finish_reason
+            .as_deref()
+            .map(ProviderTermination::from_openai_reason)
+            .unwrap_or_else(|| ProviderTermination::Unknown("missing_finish_reason".to_owned()));
+        let message = choice.message;
+
+        let raw_content = message.content.clone();
+        let text = message.effective_content();
+        let tool_calls =
+            parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())?;
+        let reasoning_content = message.reasoning_content.or(message.reasoning);
+
+        if text.is_empty()
+            && tool_calls.is_empty()
+            && reasoning_content.as_deref().unwrap_or_default().is_empty()
+        {
+            return Err(anyhow!("no response from {}", self.name));
+        }
+
+        let provider_replay_state = (self.replay_reasoning_content
+            && (self.name == "deepseek" || !tool_calls.is_empty()))
+        .then(|| {
+            Self::assistant_replay_state(
+                self.name.as_str(),
+                raw_content,
+                reasoning_content.clone(),
+                tool_calls.as_slice(),
+            )
+        });
+
+        Ok(ChatResponse {
+            text,
+            usage,
+            termination,
+            reasoning_content,
+            tool_calls,
+            provider_replay_state,
+        })
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        let api_request = self.build_chat_request_async(request, true).await?;
+
+        let request_builder = self
+            .authorized_post(&self.chat_completions_url())
+            .json(&api_request);
+        let response =
+            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
+
+        if !response.status().is_success() {
+            return Err(self.api_error(response).await);
+        }
+
+        let byte_stream = crate::http::bounded_response_stream(
+            response,
+            crate::types::ProviderResponseLimits::default().max_transport_bytes,
+            "provider_stream",
+        );
+        let provider_name = self.name.clone();
+        let replay_reasoning_content = self.replay_reasoning_content;
+
+        Ok(Self::decode_stream(
+            byte_stream,
+            provider_name,
+            replay_reasoning_content,
+        ))
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -1438,6 +1514,607 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vendor_formats_cannot_bypass_explicit_negative_effort_capability() {
+        for format in [
+            "deepseek",
+            "zai",
+            "together",
+            "qwen",
+            "openai",
+            "string-thinking",
+            "openrouter",
+        ] {
+            let catalog = crate::generation::test_catalog_model(
+                "nvidia",
+                "negative-vendor-profile",
+                "deepseek-ai/deepseek-v4-flash-0731",
+                serde_json::json!({"reasoning":true,"api":"openai-completions","compat":{"thinkingFormat":format,"supportsReasoningEffort":false},"thinkingLevelMap":{"high":"high","max":"max"}}),
+            );
+            let provider = OpenAiCompatibleProvider::new(
+                "nvidia",
+                "https://example.test/v1",
+                "",
+                AuthStyle::Bearer,
+            );
+            let mut request = crate::generation::test_request("negative-vendor-profile");
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+            for stream in [false, true] {
+                let prepared = prepared_for(&provider, &request.messages);
+                assert!(
+                    provider
+                        .build_chat_request_with_catalog(
+                            request.clone(),
+                            stream,
+                            prepared,
+                            Some(&catalog)
+                        )
+                        .unwrap_err()
+                        .to_string()
+                        .contains("explicitly does not support")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nvidia_negative_effort_capability_matches_discovery_and_wire_even_with_maps() {
+        for fresh in [false, true] {
+            let catalog = crate::generation::test_catalog(fresh);
+            let id = "deepseek-ai/deepseek-v4-flash-0731";
+            let model = catalog.model("nvidia", id).unwrap();
+            assert_eq!(model.metadata["compat"]["supportsReasoningEffort"], false);
+            let discovered = crate::generation::test_discovery(&catalog, "nvidia", id);
+            for effort in ["high", "max"] {
+                assert!(
+                    !discovered
+                        .capabilities
+                        .reasoning
+                        .as_ref()
+                        .unwrap()
+                        .effort_options
+                        .contains(&effort.into())
+                );
+            }
+            let provider = OpenAiCompatibleProvider::new(
+                "nvidia",
+                "https://example.test/v1",
+                "",
+                AuthStyle::Bearer,
+            );
+            for reasoning in [
+                None,
+                Some(ReasoningConfig::Disabled),
+                Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::Max)),
+            ] {
+                let mut request = crate::generation::test_request(id);
+                request.reasoning = reasoning;
+                for stream in [false, true] {
+                    let prepared = prepared_for(&provider, &request.messages);
+                    let result = provider.build_chat_request_with_catalog(
+                        request.clone(),
+                        stream,
+                        prepared,
+                        Some(&catalog),
+                    );
+                    assert_eq!(result.is_ok(), reasoning.is_none());
+                    if reasoning.is_none() {
+                        let body = serde_json::to_value(result.unwrap()).unwrap();
+                        assert!(body.get("reasoning_effort").is_none());
+                        assert!(body.get("thinking").is_none());
+                        assert_eq!(body["max_tokens"], 1024);
+                    } else {
+                        let error = result.unwrap_err().to_string();
+                        assert!(
+                            error.contains(if crate::generation::selected_off(reasoning) {
+                                "no verified thinking off control"
+                            } else {
+                                "explicitly does not support"
+                            })
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_deepseek_source_profiles_preserve_caps_and_selected_controls() {
+        let catalog = crate::generation::test_catalog(true);
+        let provider = OpenAiCompatibleProvider::new(
+            "deepseek",
+            "https://example.test/v1",
+            "",
+            AuthStyle::Bearer,
+        );
+        for id in ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-flash"] {
+            let model = catalog.model("deepseek", id).unwrap();
+            assert_ne!(model.metadata["compat"]["supportsReasoningEffort"], false);
+            let discovered = crate::generation::test_discovery(&catalog, "deepseek", id);
+            assert!(
+                discovered
+                    .capabilities
+                    .reasoning
+                    .as_ref()
+                    .unwrap()
+                    .effort_options
+                    .contains(&"high".into())
+            );
+            for reasoning in [
+                None,
+                Some(ReasoningConfig::Disabled),
+                Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+            ] {
+                let mut request = crate::generation::test_request(id);
+                request.reasoning = reasoning;
+                for stream in [false, true] {
+                    let body = serde_json::to_value(
+                        provider
+                            .build_chat_request_with_catalog(
+                                request.clone(),
+                                stream,
+                                prepared_for(&provider, &request.messages),
+                                Some(&catalog),
+                            )
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(body["max_tokens"], 1024);
+                    assert_eq!(body["stream"], stream);
+                    if reasoning.is_none() {
+                        assert!(body.get("thinking").is_none());
+                    } else if crate::generation::selected_off(reasoning) {
+                        assert_eq!(body["thinking"]["type"], "disabled");
+                        assert!(body.get("reasoning_effort").is_none());
+                    } else {
+                        assert_eq!(body["thinking"]["type"], "enabled");
+                        assert_eq!(body["reasoning_effort"], "high");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_compatible_profile_preserves_prepared_cap_and_default_in_both_bodies() {
+        let profiles: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/generation-profiles.json"
+        ))
+        .unwrap();
+        for profile in profiles.as_array().unwrap() {
+            let provider = OpenAiCompatibleProvider::new(
+                profile["provider"].as_str().unwrap(),
+                "https://example.test/v1",
+                "",
+                AuthStyle::Bearer,
+            );
+            for stream in [false, true] {
+                let request = crate::generation::test_request(profile["model"].as_str().unwrap());
+                let prepared = prepared_for(&provider, &request.messages);
+                let result =
+                    provider.build_chat_request_with_catalog(request, stream, prepared, None);
+                if profile["default_supported"] == false {
+                    assert!(result.is_err());
+                    continue;
+                }
+                let body = serde_json::to_value(result.unwrap()).unwrap();
+                assert_eq!(body[profile["cap_field"].as_str().unwrap()], profile["cap"]);
+                assert_eq!(body["stream"], stream);
+                assert_eq!(body["messages"][0]["content"], "Hello");
+                assert!(body.get("reasoning_effort").is_none());
+                assert!(body.get("thinking").is_none());
+            }
+            for reasoning in [
+                ReasoningConfig::Disabled,
+                ReasoningConfig::Effort(ReasoningEffort::None),
+                ReasoningConfig::Effort(ReasoningEffort::High),
+            ] {
+                let mut request =
+                    crate::generation::test_request(profile["model"].as_str().unwrap());
+                request.reasoning = Some(reasoning);
+                let prepared = prepared_for(&provider, &request.messages);
+                assert!(
+                    provider
+                        .build_chat_request_with_catalog(request, false, prepared, None)
+                        .is_err(),
+                    "unknown explicit control must not disappear: {}",
+                    profile["provider"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn siliconflow_visible_cap_requires_verified_off_or_a_nonreasoning_model() {
+        use crate::catalog::{
+            ModelCatalog,
+            generator::{SOURCE_URLS, SourceSnapshot, generate},
+        };
+        let mut source: SourceSnapshot =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                .unwrap();
+        let data = &mut source.sources.get_mut(SOURCE_URLS[0]).unwrap().body;
+        data["siliconflow"]["models"] = serde_json::json!({
+            "toggle": {"tool_call":true,"reasoning":true,
+                "reasoning_options":[{"type":"toggle","values":[true,false]}],
+                "limit":{"context":24000,"output":2048}},
+            "mandatory": {"tool_call":true,"reasoning":true,
+                "limit":{"context":24000,"output":2048}},
+            "instruct": {"tool_call":true,"reasoning":false,
+                "limit":{"context":24000,"output":2048}}
+        });
+        let generated = generate(&source, true).unwrap();
+        let catalog = ModelCatalog::parse(
+            &serde_json::to_string(&generated.models).unwrap(),
+            &serde_json::to_string(&generated.provenance).unwrap(),
+        )
+        .unwrap();
+        let provider = OpenAiCompatibleProvider::new(
+            "siliconflow",
+            "https://example.test/v1",
+            "",
+            AuthStyle::Bearer,
+        );
+        for stream in [false, true] {
+            for reasoning in [
+                None,
+                Some(ReasoningConfig::Disabled),
+                Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+            ] {
+                for id in ["toggle", "mandatory", "instruct"] {
+                    let mut request = crate::generation::test_request(id);
+                    request.reasoning = reasoning;
+                    let prepared = prepared_for(&provider, &request.messages);
+                    let result = provider.build_chat_request_with_catalog(
+                        request,
+                        stream,
+                        prepared,
+                        Some(&catalog),
+                    );
+                    let off = crate::generation::selected_off(reasoning);
+                    let supported = (id == "toggle" && off)
+                        || (id == "instruct" && (off || reasoning.is_none()));
+                    if supported {
+                        let body = serde_json::to_value(result.unwrap()).unwrap();
+                        assert_eq!(body["max_tokens"], 1024);
+                        if id == "toggle" {
+                            assert_eq!(body["enable_thinking"], false);
+                        } else {
+                            assert!(body.get("enable_thinking").is_none());
+                        }
+                    } else {
+                        assert!(result.is_err(), "{id}: {reasoning:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn updated_source_limits_maps_and_compat_reach_discovery_and_outgoing_json() {
+        use crate::catalog::{
+            ModelCatalog,
+            generator::{SOURCE_URLS, SourceSnapshot, generate},
+        };
+        let mut source: SourceSnapshot =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                .unwrap();
+        let data = &mut source.sources.get_mut(SOURCE_URLS[0]).unwrap().body;
+        data["deepinfra"]["models"]["fixture-generation-update"] = serde_json::json!({
+            "tool_call":true,"reasoning":true,"temperature":false,
+            "reasoning_options":[{"type":"effort","values":["none","high"]}],
+            "limit":{"context":24000,"output":2048}});
+        let generated = generate(&source, true).unwrap();
+        let mut models = serde_json::to_value(&generated.models).unwrap();
+        // Simulate a validated published metadata update without mutating the
+        // process-global store shared with other tests.
+        models["deepinfra"]["fixture-generation-update"]["compat"]["maxTokensField"] =
+            serde_json::json!("max_completion_tokens");
+        models["deepinfra"]["fixture-generation-update"]["thinkingLevelMap"]["high"] =
+            serde_json::json!("medium");
+        let catalog = ModelCatalog::parse(
+            &models.to_string(),
+            &serde_json::to_string(&generated.provenance).unwrap(),
+        )
+        .unwrap();
+        let provider = OpenAiCompatibleProvider::new(
+            "deepinfra",
+            "https://example.test/v1",
+            "",
+            AuthStyle::Bearer,
+        );
+        let mut request = crate::generation::test_request("fixture-generation-update");
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+        for stream in [false, true] {
+            let prepared = prepared_for(&provider, &request.messages);
+            let body = serde_json::to_value(
+                provider
+                    .build_chat_request_with_catalog(
+                        request.clone(),
+                        stream,
+                        prepared,
+                        Some(&catalog),
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["max_completion_tokens"], 1024);
+            assert!(body.get("max_tokens").is_none());
+            assert_eq!(body["reasoning_effort"], "medium");
+        }
+        let mut discovered = vec![ProviderModelInfo {
+            id: request.model.clone(),
+            name: None,
+            description: None,
+            created: None,
+            provider: "deepinfra".into(),
+            owned_by: None,
+            limits: Default::default(),
+            capabilities: Default::default(),
+            transcription: None,
+            pricing: None,
+            active: None,
+            family: None,
+            lifecycle_status: None,
+        }];
+        catalog.enrich("deepinfra", &mut discovered);
+        assert_eq!(discovered[0].limits.max_output_tokens, Some(2048));
+        assert!(
+            discovered[0]
+                .capabilities
+                .reasoning
+                .as_ref()
+                .unwrap()
+                .effort_options
+                .contains(&"high".into())
+        );
+        request.max_tokens = Some(2049);
+        let prepared = prepared_for(&provider, &request.messages);
+        assert!(
+            provider
+                .build_chat_request_with_catalog(request.clone(), false, prepared, Some(&catalog))
+                .is_err()
+        );
+        request.max_tokens = Some(1024);
+        request.temperature = Some(0.3);
+        let prepared = prepared_for(&provider, &request.messages);
+        assert!(
+            provider
+                .build_chat_request_with_catalog(request.clone(), false, prepared, Some(&catalog))
+                .is_err()
+        );
+        request.temperature = None;
+        request.reasoning = Some(ReasoningConfig::Disabled);
+        let prepared = prepared_for(&provider, &request.messages);
+        let body = serde_json::to_value(
+            provider
+                .build_chat_request_with_catalog(request, true, prepared, Some(&catalog))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["reasoning_effort"], "none");
+    }
+
+    #[test]
+    fn documented_toggle_and_effort_profiles_render_their_actual_chat_controls() {
+        use crate::catalog::{
+            ModelCatalog,
+            generator::{SOURCE_URLS, SourceSnapshot, generate},
+        };
+        let mut source: SourceSnapshot =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                .unwrap();
+        source.sources.get_mut(SOURCE_URLS[0]).unwrap().body["novita"]["models"]["zai-org/glm-4.5"] = serde_json::json!({"tool_call":true,"reasoning":true,
+                "reasoning_options":[{"type":"toggle"}],
+                "limit":{"context":24000,"output":2048}});
+        let generated = generate(&source, true).unwrap();
+        let catalog = ModelCatalog::parse(
+            &serde_json::to_string(&generated.models).unwrap(),
+            &serde_json::to_string(&generated.provenance).unwrap(),
+        )
+        .unwrap();
+        for (name, id, mode, expected) in [
+            (
+                "novita",
+                "zai-org/glm-4.5",
+                ReasoningConfig::Disabled,
+                serde_json::json!({"enable_thinking":false}),
+            ),
+            (
+                "cohere",
+                "command-a-reasoning-08-2025",
+                ReasoningConfig::Disabled,
+                serde_json::json!({"reasoning_effort":"none"}),
+            ),
+            (
+                "cohere",
+                "command-a-reasoning-08-2025",
+                ReasoningConfig::Effort(ReasoningEffort::High),
+                serde_json::json!({"reasoning_effort":"high"}),
+            ),
+            (
+                "mistral",
+                "mistral-medium-latest",
+                ReasoningConfig::Effort(ReasoningEffort::High),
+                serde_json::json!({"reasoning_effort":"high"}),
+            ),
+            (
+                "together",
+                "Qwen/Qwen3.5-9B",
+                ReasoningConfig::Disabled,
+                serde_json::json!({"reasoning":{"enabled":false}}),
+            ),
+            (
+                "together",
+                "deepseek-ai/DeepSeek-V4-Pro",
+                ReasoningConfig::Effort(ReasoningEffort::High),
+                serde_json::json!({"reasoning":{"enabled":true},"reasoning_effort":"high"}),
+            ),
+        ] {
+            let provider = OpenAiCompatibleProvider::new(
+                name,
+                "https://example.test/v1",
+                "",
+                AuthStyle::Bearer,
+            );
+            let mut request = crate::generation::test_request(id);
+            request.reasoning = Some(mode);
+            for stream in [false, true] {
+                let prepared = prepared_for(&provider, &request.messages);
+                let body = serde_json::to_value(
+                    provider
+                        .build_chat_request_with_catalog(
+                            request.clone(),
+                            stream,
+                            prepared,
+                            Some(&catalog),
+                        )
+                        .unwrap(),
+                )
+                .unwrap();
+                for (key, value) in expected.as_object().unwrap() {
+                    assert_eq!(&body[key], value, "{name}/{id}");
+                }
+                assert_eq!(body["max_tokens"], 1024);
+                assert!(body.get("chat_template_kwargs").is_none());
+            }
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::Medium));
+            let prepared = prepared_for(&provider, &request.messages);
+            assert!(
+                provider
+                    .build_chat_request_with_catalog(request, false, prepared, Some(&catalog))
+                    .is_err()
+            );
+        }
+        let provider = OpenAiCompatibleProvider::new(
+            "together",
+            "https://example.test/v1",
+            "",
+            AuthStyle::Bearer,
+        );
+        let mut request = crate::generation::test_request("zai-org/GLM-5.3");
+        request.reasoning = Some(ReasoningConfig::Disabled);
+        let prepared = prepared_for(&provider, &request.messages);
+        assert!(
+            provider
+                .build_chat_request_with_catalog(request, false, prepared, Some(&catalog))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn documented_profile_formats_use_vendor_controls_not_a_universal_effort_field() {
+        let catalog = crate::catalog::ModelCatalog::parse(
+            include_str!("../../tests/fixtures/catalog/models.json"),
+            include_str!("../../tests/fixtures/catalog/provenance.json"),
+        )
+        .unwrap();
+        for (name, model, expected) in [
+            (
+                "groq",
+                "openai/gpt-oss-120b",
+                serde_json::json!({"reasoning_effort":"high"}),
+            ),
+            (
+                "cerebras",
+                "gpt-oss-120b",
+                serde_json::json!({"reasoning_effort":"high"}),
+            ),
+            (
+                "deepseek",
+                "deepseek-v4-flash",
+                serde_json::json!({"thinking":{"type":"enabled"},"reasoning_effort":"high"}),
+            ),
+            (
+                "glm",
+                "glm-5.2",
+                serde_json::json!({"thinking":{"type":"enabled"},"reasoning_effort":"high"}),
+            ),
+            (
+                "fireworks",
+                "accounts/fireworks/models/glm-5p2",
+                serde_json::json!({"reasoning_effort":"high"}),
+            ),
+        ] {
+            let provider = OpenAiCompatibleProvider::new(
+                name,
+                "https://example.test/v1",
+                "",
+                AuthStyle::Bearer,
+            );
+            let mut request = crate::generation::test_request(model);
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+            for stream in [false, true] {
+                let prepared = prepared_for(&provider, &request.messages);
+                let body = serde_json::to_value(
+                    provider
+                        .build_chat_request_with_catalog(
+                            request.clone(),
+                            stream,
+                            prepared,
+                            Some(&catalog),
+                        )
+                        .unwrap(),
+                )
+                .unwrap();
+                for (key, value) in expected.as_object().unwrap() {
+                    assert_eq!(&body[key], value, "{name}/{model}");
+                }
+                assert_eq!(body["max_tokens"], 1024);
+            }
+        }
+    }
+    #[test]
+    fn unknown_signed_extension_is_refused_by_production_compatible_decoder() {
+        let state = ProviderReplayState::for_model(
+            "deepseek",
+            "deepseek-reasoner",
+            serde_json::json!({"schema_version":1,"assistant_message":{"content":"answer","reasoning_content":"readable","tool_calls":[],"signature":"unknown opaque"}}),
+        );
+        assert!(OpenAiCompatibleProvider::decode_replay_state(&state, "deepseek").is_err());
+        assert_eq!(
+            state.payload["assistant_message"]["signature"],
+            "unknown opaque"
+        );
+    }
+
+    #[test]
+    fn deepseek_non_tool_stream_keeps_native_empty_reasoning_field() {
+        let chunks = finish_compatible_stream(
+            &mut StreamToolCallAccumulator::default(),
+            "deepseek",
+            true,
+            Some("answer".into()),
+            Some(String::new()),
+            ProviderTermination::Complete,
+        )
+        .unwrap();
+        let state = chunks
+            .iter()
+            .find_map(|chunk| chunk.provider_replay_state.as_ref())
+            .unwrap();
+        assert_eq!(state.payload["assistant_message"]["reasoning_content"], "");
+        assert!(chunks.last().unwrap().is_final);
+        let ordinary = finish_compatible_stream(
+            &mut StreamToolCallAccumulator::default(),
+            "groq",
+            true,
+            Some("answer".into()),
+            None,
+            ProviderTermination::Complete,
+        )
+        .unwrap();
+        assert!(
+            ordinary
+                .iter()
+                .all(|chunk| chunk.provider_replay_state.is_none())
+        );
+    }
+
     use super::*;
     use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
     use crate::traits::Provider;
@@ -1495,7 +2172,7 @@ mod tests {
     #[tokio::test]
     async fn completed_transcript_keeps_typed_media_through_preflight_budget_and_wire() {
         let provider = OpenAiCompatibleProvider::new(
-            "deepseek",
+            "fixture-media-renderer",
             "https://api.example.com/v1",
             "test-key",
             AuthStyle::Bearer,
@@ -1558,7 +2235,7 @@ mod tests {
         let canonical = messages.clone();
         let prepared = prepare_messages_for_provider_model(
             provider.name(),
-            "deepseek-reasoner",
+            "fixture-media",
             &provider.capabilities(),
             &messages,
         )
@@ -1580,7 +2257,7 @@ mod tests {
             Some("artifact-file")
         );
         let request = ChatRequest {
-            model: "deepseek-reasoner".into(),
+            model: "fixture-media".into(),
             messages: messages.clone(),
             temperature: None,
             max_tokens: None,
@@ -1618,7 +2295,7 @@ mod tests {
         ));
         let prepared_wire = prepare_messages_for_provider_model(
             provider.name(),
-            "deepseek-reasoner",
+            "fixture-media",
             &provider.capabilities(),
             &budgeted.request.messages,
         )
@@ -1631,20 +2308,197 @@ mod tests {
             .build_chat_request_from_prepared(budgeted.request, false, prepared_wire)
             .unwrap();
         let json = serde_json::to_value(&wire).unwrap();
-        assert_eq!(json["messages"].as_array().unwrap().len(), 2);
-        assert!(json["messages"][0].get("tool_calls").is_none());
-        assert!(json["messages"][1].get("tool_call_id").is_none());
+        assert_eq!(json["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(json["messages"][0]["role"], "assistant");
+        assert_eq!(json["messages"][0]["tool_calls"][0]["id"], "call");
+        assert_eq!(json["messages"][1]["role"], "tool");
+        assert_eq!(json["messages"][1]["tool_call_id"], "call");
+        assert_eq!(json["messages"][1]["content"], "tool result");
+        assert_eq!(json["messages"][2]["role"], "user");
+        assert!(json["messages"][2].get("tool_call_id").is_none());
         assert!(
-            json["messages"][1]["content"]
+            json["messages"][2]["content"]
                 .to_string()
                 .contains("image_url")
         );
         assert!(
-            json["messages"][1]["content"]
+            json["messages"][2]["content"]
                 .to_string()
                 .contains("file_data")
         );
         assert_eq!(messages, canonical);
+    }
+
+    #[test]
+    fn mistral_wire_keeps_two_parallel_rounds_and_canonical_ids_separate() {
+        let provider = OpenAiCompatibleProvider::new(
+            "mistral",
+            "https://example.invalid/v1",
+            "unused",
+            AuthStyle::Bearer,
+        );
+        let mut request = crate::tools::policy::test_request();
+        let mut messages = vec![ChatMessage::user("use tools")];
+        for ids in [["foreign/a", "foreign?b"], ["foreign/a", "round-two"]] {
+            let mut assistant = ChatMessage::assistant("");
+            assistant.tool_calls = Some(
+                ids.iter()
+                    .map(|id| ProviderToolCall {
+                        id: (*id).into(),
+                        name: "lookup".into(),
+                        arguments: "{}".into(),
+                    })
+                    .collect(),
+            );
+            messages.push(assistant);
+            messages.extend(
+                ids.iter()
+                    .rev()
+                    .map(|id| ChatMessage::tool_result(*id, "lookup", *id)),
+            );
+        }
+        request.messages = messages.clone();
+        let wire =
+            serde_json::to_value(provider.build_chat_request(request, false).unwrap()).unwrap();
+        for (assistant, result_one, result_two) in [(1, 3, 2), (4, 6, 5)] {
+            assert_eq!(
+                wire["messages"][assistant]["tool_calls"][0]["id"],
+                wire["messages"][result_one]["tool_call_id"]
+            );
+            assert_eq!(
+                wire["messages"][assistant]["tool_calls"][1]["id"],
+                wire["messages"][result_two]["tool_call_id"]
+            );
+            assert_ne!(
+                wire["messages"][assistant]["tool_calls"][0]["id"],
+                wire["messages"][assistant]["tool_calls"][1]["id"]
+            );
+        }
+        assert_eq!(
+            wire["messages"][1]["tool_calls"][0]["id"],
+            wire["messages"][4]["tool_calls"][0]["id"]
+        );
+        assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].id, "foreign/a");
+    }
+
+    #[test]
+    fn each_compatible_profile_serializes_its_own_tool_controls() {
+        let providers = [
+            "groq",
+            "mistral",
+            "xai",
+            "together",
+            "fireworks",
+            "novita",
+            "perplexity",
+            "cohere",
+            "venice",
+            "cerebras",
+            "sambanova",
+            "hyperbolic",
+            "deepinfra",
+            "huggingface",
+            "ai21",
+            "reka",
+            "baseten",
+            "nscale",
+            "anyscale",
+            "nebius",
+            "friendli",
+            "lepton",
+            "siliconflow",
+            "aihubmix",
+            "astrai",
+            "stepfun",
+            "baichuan",
+            "yi",
+            "hunyuan",
+            "ovhcloud",
+            "nvidia",
+            "synthetic",
+            "doubao",
+            "qianfan",
+            "lmstudio",
+            "llamacpp",
+            "sglang",
+            "vllm",
+            "osaurus",
+            "litellm",
+            "custom",
+            "deepseek", // delegates to this builder; replay validation is provider-owned
+        ];
+        for name in providers {
+            let provider = OpenAiCompatibleProvider::new(
+                name,
+                "https://example.invalid/v1",
+                "unused",
+                AuthStyle::Bearer,
+            );
+            for parallel in [None, Some(true), Some(false)] {
+                for choice in [
+                    ToolChoice::Auto,
+                    ToolChoice::None,
+                    ToolChoice::Required,
+                    ToolChoice::Tool {
+                        name: "lookup".into(),
+                    },
+                ] {
+                    let mut request = crate::tools::policy::test_request();
+                    request.tool_choice = Some(choice.clone());
+                    request.parallel_tool_calls = parallel;
+                    let supports_parallel = matches!(
+                        name,
+                        "groq"
+                            | "mistral"
+                            | "xai"
+                            | "fireworks"
+                            | "venice"
+                            | "cerebras"
+                            | "friendli"
+                            | "synthetic"
+                    );
+                    let disabled = matches!(choice, ToolChoice::None);
+                    let forced = matches!(choice, ToolChoice::Required | ToolChoice::Tool { .. });
+                    let unsupported = matches!(name, "cohere" | "novita") && forced
+                        || name == "synthetic" && matches!(choice, ToolChoice::Required)
+                        || parallel == Some(false) && !disabled && !supports_parallel;
+                    let wire = provider.build_chat_request(request, false);
+                    assert_eq!(wire.is_err(), unsupported, "{name} {choice:?} {parallel:?}");
+                    if let Ok(wire) = wire {
+                        let json = serde_json::to_value(wire).unwrap();
+                        assert_eq!(
+                            json.get("parallel_tool_calls")
+                                .and_then(serde_json::Value::as_bool),
+                            if disabled || !supports_parallel {
+                                None
+                            } else {
+                                parallel
+                            },
+                            "{name}"
+                        );
+                        if matches!(name, "cohere" | "novita") {
+                            assert!(json.get("tool_choice").is_none());
+                        } else {
+                            match choice {
+                                ToolChoice::Auto => {
+                                    assert_eq!(json["tool_choice"], "auto", "{name}")
+                                }
+                                ToolChoice::None => {
+                                    assert_eq!(json["tool_choice"], "none", "{name}")
+                                }
+                                ToolChoice::Required => {
+                                    assert_eq!(json["tool_choice"], "required", "{name}")
+                                }
+                                ToolChoice::Tool { .. } => assert_eq!(
+                                    json["tool_choice"]["function"]["name"], "lookup",
+                                    "{name}"
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1693,6 +2547,75 @@ mod tests {
             provider.chat_completions_url(),
             "https://api.example.com/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn registry_endpoint_profiles_construct_exact_chat_and_discovery_routes() {
+        let profiles: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../tests/fixtures/endpoint_profiles.json"))
+                .unwrap();
+        assert_eq!(profiles.len(), 41);
+        for fixture in profiles {
+            let name = fixture["provider"].as_str().unwrap();
+            let definition = crate::definition::provider_definition(name).unwrap();
+            let base = definition.default_base_url.unwrap();
+            assert_eq!(base, fixture["base"].as_str().unwrap(), "{name}");
+            let provider = OpenAiCompatibleProvider::new(
+                name,
+                format!("{base}/"),
+                "dummy-key",
+                AuthStyle::Bearer,
+            );
+            assert_eq!(
+                provider.chat_completions_url(),
+                fixture["chat"].as_str().unwrap(),
+                "{name}"
+            );
+            assert_eq!(
+                provider.models_url(),
+                fixture["models"].as_str().unwrap(),
+                "{name}"
+            );
+            for request in [
+                provider.authorized_get(&provider.models_url()),
+                provider.authorized_post(&provider.chat_completions_url()),
+            ] {
+                let request = request.build().unwrap();
+                assert_eq!(
+                    request.headers()["authorization"],
+                    "Bearer dummy-key",
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_chat_route_with_trailing_slash_and_keyless_local_override() {
+        for base in [
+            "https://example.test/team/v9",
+            "https://example.test/team/v9/",
+            "https://example.test/team/v9/chat/completions/",
+        ] {
+            let provider = OpenAiCompatibleProvider::new("custom", base, "", AuthStyle::Bearer);
+            assert_eq!(
+                provider.chat_completions_url(),
+                "https://example.test/team/v9/chat/completions"
+            );
+            assert_eq!(provider.models_url(), "https://example.test/team/v9/models");
+            for request in [
+                provider.authorized_get(&provider.models_url()),
+                provider.authorized_post(&provider.chat_completions_url()),
+            ] {
+                assert!(
+                    !request
+                        .build()
+                        .unwrap()
+                        .headers()
+                        .contains_key("authorization")
+                );
+            }
+        }
     }
 
     #[test]
@@ -1792,12 +2715,13 @@ mod tests {
             name: "read_file".to_owned(),
             arguments: "{\"path\":\"README.md\"}".to_owned(),
         }];
-        let replay_state = OpenAiCompatibleProvider::assistant_replay_state(
+        let mut replay_state = OpenAiCompatibleProvider::assistant_replay_state(
             provider.name(),
             Some(String::new()),
             Some(String::new()),
             tool_calls.as_slice(),
         );
+        replay_state.model = Some("compatible-model".to_owned());
         let message = ChatMessage::assistant_tool_calls_with_provider_state(
             None::<String>,
             None::<String>,
@@ -1806,7 +2730,10 @@ mod tests {
         );
         let request = ChatRequest {
             model: "compatible-model".to_owned(),
-            messages: vec![message],
+            messages: vec![
+                message,
+                ChatMessage::tool_result("call_1", "read_file", "file contents"),
+            ],
             temperature: None,
             max_tokens: None,
             tools: None,
@@ -1816,21 +2743,82 @@ mod tests {
             compiled_prompt: None,
         };
 
-        let rendered = provider
-            .build_chat_request(request, false)
-            .expect("an explicitly present empty replay field must remain replayable");
+        assert!(request.messages[0].provenance.is_none());
+        for stream in [false, true] {
+            let rendered = provider
+                .build_chat_request(request.clone(), stream)
+                .expect("an explicitly present empty replay field must remain replayable");
 
-        assert_eq!(rendered.messages[0].reasoning_content.as_deref(), Some(""));
-        assert_eq!(text_content(&rendered.messages[0].content), Some(""));
-        assert_eq!(
-            rendered.messages[0]
-                .tool_calls
-                .as_ref()
-                .expect("tool calls must be replayed")[0]
-                .function
-                .arguments,
-            "{\"path\":\"README.md\"}"
+            assert_eq!(rendered.messages[0].reasoning_content.as_deref(), Some(""));
+            assert_eq!(text_content(&rendered.messages[0].content), Some(""));
+            assert_eq!(rendered.messages[1].tool_call_id.as_deref(), Some("call_1"));
+            assert_eq!(
+                rendered.messages[0]
+                    .tool_calls
+                    .as_ref()
+                    .expect("tool calls must be replayed")[0]
+                    .function
+                    .arguments,
+                "{\"path\":\"README.md\"}"
+            );
+            let wire = serde_json::to_value(rendered).unwrap();
+            assert_eq!(wire["stream"], stream);
+            assert_eq!(
+                wire["messages"][0].get("reasoning_content"),
+                Some(&serde_json::json!(""))
+            );
+            assert_eq!(wire["messages"][0]["content"], "");
+            assert_eq!(
+                wire["messages"][0]["tool_calls"][0]["function"]["arguments"],
+                "{\"path\":\"README.md\"}"
+            );
+        }
+    }
+
+    #[test]
+    fn compatible_model_unbound_active_empty_replay_is_rejected_by_request_projection() {
+        let provider = test_provider();
+        let calls = vec![ProviderToolCall {
+            id: "call_1".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: "{\"path\":\"README.md\"}".to_owned(),
+        }];
+        let replay = OpenAiCompatibleProvider::assistant_replay_state(
+            provider.name(),
+            Some(String::new()),
+            Some(String::new()),
+            &calls,
         );
+        assert!(replay.model.is_none());
+        let request = ChatRequest {
+            model: "compatible-model".to_owned(),
+            messages: vec![ChatMessage::assistant_tool_calls_with_provider_state(
+                None::<String>,
+                None::<String>,
+                calls,
+                Some(replay),
+            )],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        assert!(request.messages[0].provenance.is_none());
+        for stream in [false, true] {
+            let error = provider
+                .build_chat_request(request.clone(), stream)
+                .expect_err("model-unbound active replay must fail at the request-aware projector");
+            assert!(
+                error
+                    .downcast_ref::<crate::history::IncompatibleProviderReplayContinuation>()
+                    .is_some()
+            );
+            assert!(error.to_string().contains("test-provider/unknown-model"));
+            assert!(error.to_string().contains("test-provider/compatible-model"));
+        }
     }
 
     #[test]
@@ -2110,6 +3098,7 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "gpt-4".into(),
             messages: vec![
                 ApiMessage {
@@ -2147,7 +3136,7 @@ mod tests {
     }
 
     #[test]
-    fn compatible_request_omits_reasoning_fields_even_when_selected() {
+    fn unknown_compatible_model_rejects_explicit_unverified_reasoning() {
         let provider = test_provider();
         let request = ChatRequest {
             model: "custom-compatible-model".to_owned(),
@@ -2161,15 +3150,8 @@ mod tests {
             compiled_prompt: None,
         };
 
-        let api_request = provider
-            .build_chat_request(request, false)
-            .expect("compatible request should render");
-        let json = serde_json::to_value(&api_request).unwrap();
-
-        assert!(json.get("reasoning_effort").is_none());
-        assert!(json.get("reasoning").is_none());
-        assert!(json.get("output_config").is_none());
-        assert!(json.get("thinkingConfig").is_none());
+        let error = provider.build_chat_request(request, false).unwrap_err();
+        assert!(error.to_string().contains("no documented mapping"));
     }
 
     #[test]
@@ -2256,3 +3238,7 @@ mod tests {
         assert!(caps.vision);
     }
 }
+
+#[cfg(test)]
+#[path = "wire_tests/compatible.rs"]
+mod wire_contract_tests;

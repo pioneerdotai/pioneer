@@ -13,6 +13,27 @@ use sea_orm::sea_query::{ExprTrait, Query};
 const NOW: i64 = 4_000_000_000;
 const MIGRATION: &str = "m20261002_000001_task_run_occurrence_reconcile";
 
+// Event-driven fixture creation needs the cancellation marker columns. Use
+// that production schema prefix, without later irreversible migrations.
+struct TrackerFixtureMigrator;
+
+impl MigratorTrait for TrackerFixtureMigrator {
+    fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+        migrations_through("m20261005_000001_native_cancellation_context")
+    }
+}
+
+fn tracker_rollback_steps() -> u32 {
+    (TrackerFixtureMigrator::migrations()
+        .iter()
+        .rev()
+        .position(|migration| migration.name() == MIGRATION)
+        .expect("parent tracker migration is registered")
+        + 1)
+    .try_into()
+    .unwrap()
+}
+
 async fn row(store: &CrudStore, id: &str) -> Option<pending::Model> {
     pending::Entity::find_by_id(id.to_owned())
         .one(&store.connection)
@@ -65,15 +86,6 @@ async fn turn_status(store: &CrudStore, id: &str, status: &str) {
         .exec(&store.connection)
         .await
         .unwrap();
-}
-
-fn migration_suffix() -> u32 {
-    let migrations = Migrator::migrations();
-    (migrations.len()
-        - migrations
-            .iter()
-            .position(|m| m.name() == MIGRATION)
-            .expect("parent tracker migration registered")) as u32
 }
 
 #[tokio::test]
@@ -577,12 +589,13 @@ async fn source_rollback_and_projection_failure_roll_back_tracker_and_event() {
 #[tokio::test]
 async fn poison_missing_thread_keeps_backoff_and_allows_later_repair() {
     let (store, thread, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
-    turns::Entity::update_many()
-        .col_expr(turns::Column::ThreadId, Expr::val("missing_thread"))
-        .filter(turns::Column::Id.eq(&run.id))
+    // Remove the dependency without changing the occurrence's canonical scope.
+    // Rebinding the Turn would leave its existing stream in another thread.
+    let deleted = pioneer_entity::thread::Entity::delete_by_id(thread.id.clone())
         .exec(&store.connection)
         .await
         .unwrap();
+    assert_eq!(deleted.rows_affected, 1);
     let claim = claimed(&store).await;
     assert_eq!(
         store
@@ -604,12 +617,8 @@ async fn poison_missing_thread_keeps_backoff_and_allows_later_repair() {
     );
     // Repair a dependency without any new source-pair UPDATE. Pending must
     // remain retryable even though neither source trigger can wake it.
-    let restored_thread = Thread {
-        id: "missing_thread".to_owned(),
-        ..thread
-    };
     store
-        .upsert_thread_model(&restored_thread, PersistedActorRef::System)
+        .upsert_thread_model(&thread, PersistedActorRef::System)
         .await
         .unwrap();
     let current = row(&store, &run.id).await.unwrap();
@@ -660,15 +669,17 @@ async fn ordinary_event_driven_repair_can_overtake_claimed_background_work() {
 
 #[tokio::test]
 async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_objects() {
-    let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
+    let store = test_store_with_workspace_migrator::<TrackerFixtureMigrator>("ws_task").await;
+    let (store, _, run) =
+        terminal_task_run_occurrence_fixture_with_store(store, Some(TurnKind::TaskRun)).await;
     let maintenance = store.with_maintenance_access();
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(migration_suffix()))
+    TrackerFixtureMigrator::down(&*tx, Some(tracker_rollback_steps()))
         .await
         .unwrap();
     tx.commit().await.unwrap();
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::up(&*tx, None).await.unwrap();
+    TrackerFixtureMigrator::up(&*tx, None).await.unwrap();
     tx.commit().await.unwrap();
     assert!(
         row(&store, &run.id).await.is_none(),
@@ -697,7 +708,7 @@ async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_obj
         1
     );
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(migration_suffix()))
+    TrackerFixtureMigrator::down(&*tx, Some(tracker_rollback_steps()))
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -721,9 +732,16 @@ async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_obj
         .await
         .unwrap();
     assert!(indexes.is_empty());
-    assert_eq!(
-        Migrator::migrations()[Migrator::migrations().len() - migration_suffix() as usize].name(),
-        MIGRATION
+    let migrations = TrackerFixtureMigrator::migrations();
+    let target = migrations.iter().find(|m| m.name() == MIGRATION).unwrap();
+    assert_eq!(target.name(), MIGRATION);
+    assert_eq!(target.use_transaction(), Some(true));
+    assert!(
+        !TrackerFixtureMigrator::get_applied_migrations(&store.connection)
+            .await
+            .unwrap()
+            .iter()
+            .any(|migration| migration.name() == MIGRATION)
     );
 }
 
@@ -1023,6 +1041,25 @@ async fn terminal_commit_without_fanout_and_generic_recovery_replay_change_track
         .reconcile_claimed_task_run_occurrence(&claim, NOW)
         .await
         .unwrap();
+    assert!(row(&store, &run.id).await.is_none());
+    let accepted =
+        crate::repositories::turn_event::latest_event_for_turn(&store.connection, &run.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(matches!(
+        &accepted.payload,
+        CanonicalTurnEventPayload::TurnCompleted(_)
+    ));
+    let marker =
+        crate::repositories::turn_event_projection_stream_state::find(&store.connection, &run.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        marker.accepted_terminal_event_id.as_ref(),
+        Some(&accepted.id)
+    );
     // Direct store recovery with the same timestamp is still tracked.
     store
         .update_turn_status(
@@ -1035,29 +1072,14 @@ async fn terminal_commit_without_fanout_and_generic_recovery_replay_change_track
         .await
         .unwrap();
     assert!(row(&store, &run.id).await.is_some());
-    let failed = Turn {
-        status: TurnStatus::Failed,
-        turn_kind: TurnKind::TaskRun,
-        ..sample_turn(&run.id)
-    };
-    let event = CanonicalTurnEventPayload::TurnFailed(TurnFailedNotification {
-        workspace_id: thread.workspace_id.clone(),
-        thread_id: thread.id.clone(),
-        turn: failed,
-    });
-    // Real envelope/projection APIs; make its receipt due again to model replay
-    // of an old Turn after a newer generic write restored its status.
-    store
-        .materialize_native_agent_turn_event(event, 1_700_000_004, None)
-        .await
-        .unwrap();
-    let receipt = pioneer_entity::turn_event_projection_state::Entity::find()
-        .filter(pioneer_entity::turn_event_projection_state::Column::TurnId.eq(&run.id))
-        .order_by_desc(pioneer_entity::turn_event_projection_state::Column::Sequence)
-        .one(&store.connection)
-        .await
-        .unwrap()
-        .unwrap();
+    // Replay the accepted Completed event, rather than appending a conflicting
+    // Failed result in the same execution cycle.
+    let receipt =
+        pioneer_entity::turn_event_projection_state::Entity::find_by_id(accepted.id.clone())
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
     store
         .update_turn_status(
             &thread.id,
@@ -1069,6 +1091,17 @@ async fn terminal_commit_without_fanout_and_generic_recovery_replay_change_track
         .await
         .unwrap();
     assert!(row(&store, &run.id).await.is_none());
+    store
+        .update_turn_status(
+            &thread.id,
+            &run.id,
+            TurnStatus::Interrupted,
+            Some("recovery"),
+            1_700_000_004,
+        )
+        .await
+        .unwrap();
+    assert!(row(&store, &run.id).await.is_some());
     let p = pioneer_entity::turn_event_projection_state::Entity::update_many()
         .col_expr(
             pioneer_entity::turn_event_projection_state::Column::Status,
@@ -1097,7 +1130,32 @@ async fn terminal_commit_without_fanout_and_generic_recovery_replay_change_track
             .projected,
         1
     );
-    assert!(row(&store, &run.id).await.is_some());
+    assert!(row(&store, &run.id).await.is_none());
+    let replayed =
+        crate::repositories::turn_event::latest_event_for_turn(&store.connection, &run.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(replayed.id, accepted.id);
+    assert_eq!(replayed.sequence, accepted.sequence);
+    assert_eq!(replayed.idempotency_key, accepted.idempotency_key);
+    let replayed_marker =
+        crate::repositories::turn_event_projection_stream_state::find(&store.connection, &run.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        replayed_marker.accepted_terminal_event_id,
+        marker.accepted_terminal_event_id
+    );
+    assert_eq!(
+        replayed_marker.accepted_terminal_event_type,
+        marker.accepted_terminal_event_type
+    );
+    assert_eq!(
+        replayed_marker.accepted_terminal_sequence,
+        marker.accepted_terminal_sequence
+    );
 }
 
 #[tokio::test]
@@ -1525,11 +1583,11 @@ async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_execu
 
 #[tokio::test]
 async fn migration_installation_and_completion_marker_rollback_together() {
-    let store = test_store_with_workspace("ws_task")
+    let store = test_store_with_workspace_migrator::<TrackerFixtureMigrator>("ws_task")
         .await
         .with_maintenance_access();
     let tx = store.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(migration_suffix()))
+    TrackerFixtureMigrator::down(&*tx, Some(tracker_rollback_steps()))
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -1537,7 +1595,7 @@ async fn migration_installation_and_completion_marker_rollback_together() {
     // tables/index/seed and first trigger have already been written.
     store.connection.execute_unprepared("CREATE TRIGGER task_run_occurrence_reconcile_task_run_update AFTER UPDATE ON task_run WHEN 0 BEGIN SELECT 1; END").await.unwrap();
     let tx = store.connection.begin().await.unwrap();
-    assert!(Migrator::up(&*tx, None).await.is_err());
+    assert!(TrackerFixtureMigrator::up(&*tx, None).await.is_err());
     tx.rollback().await.unwrap();
     let query = Query::select()
         .column("name")
@@ -1576,8 +1634,18 @@ async fn migration_installation_and_completion_marker_rollback_together() {
         .await
         .unwrap();
     let tx = store.connection.begin().await.unwrap();
-    Migrator::up(&*tx, None).await.unwrap();
+    TrackerFixtureMigrator::up(&*tx, None).await.unwrap();
     tx.commit().await.unwrap();
+    assert_eq!(
+        store
+            .connection
+            .query_all_raw(DatabaseBackend::Sqlite.build(&marker))
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "parent tracker completion marker must be installed"
+    );
     assert_eq!(generation(&store).await, 0);
 }
 
@@ -1652,7 +1720,9 @@ async fn attempt_count_saturates_but_poison_row_stays_retryable_forever() {
 
 #[tokio::test]
 async fn recovery_completed_at_write_tracks_preinstall_run_without_history_discovery() {
-    let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
+    let store = test_store_with_workspace_migrator::<TrackerFixtureMigrator>("ws_task").await;
+    let (store, _, run) =
+        terminal_task_run_occurrence_fixture_with_store(store, Some(TurnKind::TaskRun)).await;
     runs::Entity::update_many()
         .col_expr(
             runs::Column::CompletedAt,
@@ -1664,12 +1734,12 @@ async fn recovery_completed_at_write_tracks_preinstall_run_without_history_disco
         .unwrap();
     let maintenance = store.with_maintenance_access();
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::down(&*tx, Some(migration_suffix()))
+    TrackerFixtureMigrator::down(&*tx, Some(tracker_rollback_steps()))
         .await
         .unwrap();
     tx.commit().await.unwrap();
     let tx = maintenance.connection.begin().await.unwrap();
-    Migrator::up(&*tx, None).await.unwrap();
+    TrackerFixtureMigrator::up(&*tx, None).await.unwrap();
     tx.commit().await.unwrap();
     assert!(row(&store, &run.id).await.is_none());
     // The existing generic recovery still owns its algorithm. Its actual

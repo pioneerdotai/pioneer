@@ -90,11 +90,6 @@ impl Drop for PublicationTestHookHandle {
     }
 }
 #[cfg(test)]
-static PUBLICATION_WRITER_FENCE_CHECKS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
-> = std::sync::OnceLock::new();
-
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PublicationTestMetrics {
     coverage_checks: usize,
@@ -177,16 +172,6 @@ impl Drop for PublicationWriterTestGuard {
             metrics.writer_depth -= 1;
         }
     }
-}
-
-#[cfg(test)]
-fn publication_writer_fence_checks(operation: &str) -> usize {
-    *PUBLICATION_WRITER_FENCE_CHECKS
-        .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(operation)
-        .unwrap_or(&0)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1008,7 +993,8 @@ pub(crate) async fn compaction_runner_state<C: ConnectionTrait>(
 /// Preparation reads operation/state and its bounded manifest page; the short
 /// transaction rechecks snapshot, generation, checkpoint, head and Stop fences.
 /// This publishes no history. Source freshness can race this preliminary check:
-/// the existing runner revalidates before any next portion and at publication.
+/// the existing runner revalidates before reading another raw portion. A
+/// completed candidate resumes without revisiting its historical sources.
 pub(crate) async fn compaction_resume_deadline(
     store: &CrudStore,
     operation: &str,
@@ -1029,9 +1015,6 @@ pub(crate) async fn compaction_resume_deadline(
     if !state.can_resume_deadline() || deadline_ms <= state.deadline_ms {
         return Ok(false);
     }
-    if !compaction_manifest_sources_current(&store.connection, operation).await? {
-        return Ok(false);
-    }
     let legacy_final = state.resume_phase.is_none()
         && compaction_manifest_page(
             &store.connection,
@@ -1043,6 +1026,18 @@ pub(crate) async fn compaction_resume_deadline(
         .await?
         .is_empty();
     let next = state.resume_deadline(deadline_ms, legacy_final)?;
+    if matches!(
+        next.phase,
+        RunnerPhase::Ready {
+            purpose: pioneer_compaction::runner::AttemptPurpose::Portion
+        } | RunnerPhase::Backoff {
+            purpose: pioneer_compaction::runner::AttemptPurpose::Portion,
+            ..
+        }
+    ) && !compaction_manifest_sources_current(&store.connection, operation).await?
+    {
+        return Ok(false);
+    }
     let mut snapshot: pioneer_compaction::OperationSnapshot =
         serde_json::from_str(&record.snapshot)?;
     snapshot.admission.deadline_ms = deadline_ms;
@@ -1084,6 +1079,32 @@ pub(crate) async fn compaction_resume_deadline(
     }).await
 }
 
+/// Shared preparation for foreground reconciliation and pending repair. Decode
+/// and encode happen outside the writer; the caller fences every source value.
+pub(super) fn reconciled_terminal_runner(
+    state: &RunnerState,
+    status: &str,
+    outcome: Option<&str>,
+) -> Result<RunnerState> {
+    if status == "running"
+        || status == "completed"
+        || matches!(
+            state.phase,
+            RunnerPhase::Failed { .. } | RunnerPhase::Applied { .. }
+        )
+    {
+        return Ok(state.clone());
+    }
+    let kind = if status == "cancelled" {
+        FailureKind::Cancelled
+    } else if outcome == Some("deadline") {
+        FailureKind::Deadline
+    } else {
+        FailureKind::Permanent
+    };
+    state.terminate(kind)
+}
+
 /// Complete the state record after a control-plane terminal fence. No
 /// attempt can advance past that fence. Preparation reads one bounded row;
 /// the write revalidates its generation and durable terminal classification.
@@ -1117,23 +1138,10 @@ pub(crate) async fn compaction_reconcile_runner_state(
         return Ok(None);
     };
     let state: RunnerState = serde_json::from_str(&state)?;
-    if status == "running"
-        || status == "completed"
-        || matches!(
-            state.phase,
-            RunnerPhase::Failed { .. } | RunnerPhase::Applied { .. }
-        )
-    {
+    let terminal = reconciled_terminal_runner(&state, &status, outcome.as_deref())?;
+    if terminal == state {
         return Ok(Some(state));
     }
-    let kind = if status == "cancelled" {
-        FailureKind::Cancelled
-    } else if outcome.as_deref() == Some("deadline") {
-        FailureKind::Deadline
-    } else {
-        FailureKind::Permanent
-    };
-    let terminal = state.terminate(kind)?;
     let encoded = serde_json::to_string(&terminal)?;
     ensure!(
         encoded.len() <= SOURCE_PAGE_BYTES,
@@ -1706,8 +1714,7 @@ pub(crate) async fn prepare_checkpoint_ancestry<C: ConnectionTrait>(
                             .eq(Expr::Value(operation.into())),
                     )
                     .and(
-                        Expr::col(compaction_checkpoint::Column::Status)
-                            .is_in(["candidate", "retained"]),
+                        Expr::col(compaction_checkpoint::Column::Status).eq(Expr::val("candidate")),
                     )
                     .and(Expr::exists(
                         Query::select()
@@ -1754,22 +1761,16 @@ pub(crate) async fn prepare_checkpoint_ancestry<C: ConnectionTrait>(
     Ok(())
 }
 
-/// A request-local proof created only by the reader preflight below. Keeping
-/// the type private prevents callers from substituting an unchecked boolean.
-/// The durable database nonce also prevents moving a proof between stores.
+/// Request-local validation of the saved candidate and its immutable coverage.
+/// Live source revisions deliberately do not participate after summarization.
 #[derive(Debug)]
 struct PreparedRunnerPublication {
-    database_id: String,
     operation: String,
     checkpoint: String,
     generation: u64,
     expected_head: Option<String>,
-    workspace: Option<String>,
-    structural_generation: i64,
-    source_mutation_generation: Option<i64>,
-    source_insert_generation: Option<i64>,
     identity_current: bool,
-    sources_current: bool,
+    coverage_exact: bool,
 }
 
 async fn prepare_runner_publication(
@@ -1780,26 +1781,13 @@ async fn prepare_runner_publication(
     expected_head: Option<&str>,
 ) -> Result<PreparedRunnerPublication> {
     let snapshot = store.connection.begin_read().await?;
-    let database_fence = snapshot
-        .query_one_raw(Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
-            "SELECT database_id,structural_generation \
-             FROM compaction_publication_fence WHERE singleton=1"
-                .to_owned(),
-        ))
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("compaction publication database fence is missing"))?;
-    let database_id: String = database_fence.try_get("", "database_id")?;
-    let structural_generation: i64 = database_fence.try_get("", "structural_generation")?;
-
-    // Existence and ownership are independent from the later negative stale
-    // scans: an empty scan is not evidence that the operation or candidate
-    // exists. Read all identity fields in this same snapshot as the fence.
+    // Validate the saved candidate, not the current canonical history. Writer
+    // publication rechecks this operation identity and generation atomically.
     let identity = snapshot
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DbBackend::Sqlite,
             r#"
-SELECT o.owner AS operation_owner,o.status,o.expected_head,
+SELECT o.owner AS operation_owner,o.expected_head,
  c.workspace_id,p.operation_id AS candidate_operation,p.owner AS candidate_owner,
  s.generation AS runner_generation,
  json_extract(s.state,'$.phase.Commit.checkpoint') AS runner_checkpoint
@@ -1813,46 +1801,25 @@ WHERE o.id=?1
         ))
         .await?;
     let expected_generation = i64::try_from(generation)?;
-    let (workspace, identity_current) = if let Some(identity) = identity {
+    let identity_current = if let Some(identity) = identity {
         let operation_owner: String = identity.try_get("", "operation_owner")?;
-        let _status: String = identity.try_get("", "status")?;
         let stored_head: Option<String> = identity.try_get("", "expected_head")?;
         let workspace: Option<String> = identity.try_get("", "workspace_id")?;
         let candidate_operation: Option<String> = identity.try_get("", "candidate_operation")?;
         let candidate_owner: Option<String> = identity.try_get("", "candidate_owner")?;
         let runner_generation: Option<i64> = identity.try_get("", "runner_generation")?;
         let runner_checkpoint: Option<String> = identity.try_get("", "runner_checkpoint")?;
-        let current = workspace.is_some()
+        workspace.is_some()
             && candidate_operation.as_deref() == Some(operation)
             && candidate_owner.as_deref() == Some(operation_owner.as_str())
             && stored_head.as_deref() == expected_head
             && runner_generation == Some(expected_generation)
-            && runner_checkpoint.as_deref() == Some(checkpoint);
-        (workspace, current)
+            && runner_checkpoint.as_deref() == Some(checkpoint)
     } else {
-        (None, false)
+        false
     };
 
-    let (source_mutation_generation, source_insert_generation) =
-        if let Some(workspace) = workspace.as_deref() {
-            let source_fence = snapshot
-                .query_one_raw(Statement::from_sql_and_values(
-                    sea_orm::DbBackend::Sqlite,
-                    "SELECT mutation_generation,insert_generation \
-                     FROM compaction_publication_source_fence WHERE workspace_id=?",
-                    [workspace.into()],
-                ))
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("compaction publication source fence is missing"))?;
-            (
-                Some(source_fence.try_get("", "mutation_generation")?),
-                Some(source_fence.try_get("", "insert_generation")?),
-            )
-        } else {
-            (None, None)
-        };
-
-    let sources_current = if identity_current {
+    let coverage_exact = if identity_current {
         #[cfg(any(test, feature = "test-support"))]
         pause_publication_test_hook(
             store.connection.runtime_identity(),
@@ -1860,9 +1827,7 @@ WHERE o.id=?1
             PublicationTestPause::ReaderPreflight,
         )
         .await;
-        let coverage_exact = compaction_runner_coverage_exact(&snapshot, operation).await?;
-        let manifest_current = compaction_manifest_sources_current(&snapshot, operation).await?;
-        coverage_exact && manifest_current
+        compaction_runner_coverage_exact(&snapshot, operation).await?
     } else {
         false
     };
@@ -1870,22 +1835,17 @@ WHERE o.id=?1
     // also releases the maintenance-read permit carried by the scoped store.
     snapshot.commit().await?;
     // Stale candidates do not publish. Validate the graph only after exact
-    // source preflight, with the read snapshot released.
-    if identity_current && sources_current {
+    // saved coverage validation, with the read snapshot released.
+    if identity_current && coverage_exact {
         validate_publication_checkpoint_graph(store, checkpoint).await?;
     }
     Ok(PreparedRunnerPublication {
-        database_id,
         operation: operation.to_owned(),
         checkpoint: checkpoint.to_owned(),
         generation,
         expected_head: expected_head.map(str::to_owned),
-        workspace,
-        structural_generation,
-        source_mutation_generation,
-        source_insert_generation,
         identity_current,
-        sources_current,
+        coverage_exact,
     })
 }
 
@@ -2158,9 +2118,12 @@ async fn compaction_runner_coverage_exact<C: ConnectionTrait>(
     Ok(missing.is_none() && extra.is_none())
 }
 
-/// Two-phase publication: the graph/manifest predicates run in one reader
-/// snapshot, then the writer compares constant-size generations and performs
-/// the existing atomic domain transition.
+/// Validate saved coverage outside writer capacity, then atomically publish.
+/// A finished summary describes the versions actually consumed; subsequent
+/// canonical edits/deletes and unrelated work cannot invalidate that result.
+/// Candidate/manifest metadata is owned by this runner generation. Operation
+/// identity, generation, cancellation and the target head can change while
+/// preparing; the writer rechecks those exact control fields before commit.
 pub(crate) async fn compaction_apply_runner(
     store: &CrudStore,
     operation: &str,
@@ -2395,65 +2358,7 @@ pub(crate) async fn compaction_apply_runner(
                 txn.rollback().await?;
                 return Ok(super::compaction::CommitOutcome::Stale);
             }
-            if !prepared.identity_current {
-                txn.rollback().await?;
-                return Ok(if prepared.workspace.is_some() {
-                    // The constant-size writer guards now match even though
-                    // reader identity did not. Rebuild the proof from the new
-                    // snapshot instead of treating that race as domain stale.
-                    super::compaction::CommitOutcome::RetryValidation
-                } else {
-                    super::compaction::CommitOutcome::Stale
-                });
-            }
-            let (Some(workspace), Some(source_mutation_generation), Some(source_insert_generation)) = (
-                prepared.workspace.as_deref(),
-                prepared.source_mutation_generation,
-                prepared.source_insert_generation,
-            ) else {
-                txn.rollback().await?;
-                return Ok(super::compaction::CommitOutcome::Stale);
-            };
-            // Constant-size fence lookup. Insert generations matter for a
-            // negative result (an insertion can repair it), while an append of
-            // a distinct canonical ID cannot invalidate an already-positive
-            // exact-ID proof.
-            #[cfg(test)]
-            {
-                let mut checks = PUBLICATION_WRITER_FENCE_CHECKS
-                    .get_or_init(|| {
-                        std::sync::Mutex::new(std::collections::BTreeMap::new())
-                    })
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                *checks.entry(operation.to_owned()).or_default() += 1;
-            }
-            let fence_matches = txn
-                .query_one_raw(Statement::from_sql_and_values(
-                    sea_orm::DbBackend::Sqlite,
-                    r#"
-SELECT f.singleton
-FROM compaction_publication_fence f
-JOIN compaction_publication_source_fence s ON s.workspace_id=?2
-WHERE f.singleton=1 AND f.database_id=?1 AND f.structural_generation=?3
- AND s.mutation_generation=?4 AND (?5=1 OR s.insert_generation=?6)
-"#,
-                    [
-                        prepared.database_id.clone().into(),
-                        workspace.into(),
-                        prepared.structural_generation.into(),
-                        source_mutation_generation.into(),
-                        (if prepared.sources_current { 1_i64 } else { 0_i64 }).into(),
-                        source_insert_generation.into(),
-                    ],
-                ))
-                .await?
-                .is_some();
-            if !fence_matches {
-                txn.rollback().await?;
-                return Ok(super::compaction::CommitOutcome::RetryValidation);
-            }
-            if !prepared.sources_current {
+            if !prepared.identity_current || !prepared.coverage_exact {
                 txn.rollback().await?;
                 return Ok(super::compaction::CommitOutcome::Stale);
             }
@@ -3038,8 +2943,8 @@ fn compaction_manifest_sources_current_statement(operation: &str) -> Statement {
     sqlite_specific_sql(COMPACTION_MANIFEST_SOURCES_CURRENT_SQL, [operation.into()])
 }
 
-/// Shared admission/final-preflight predicate. Admission avoids provider work
-/// for an invalid grant; final publication runs it in a fenced reader snapshot.
+/// Admission/read-time predicate. Validate raw inputs before consuming them;
+/// publication of a completed summary never rechecks canonical source state.
 pub(crate) async fn compaction_manifest_sources_current<C: ConnectionTrait>(
     db: &C,
     operation: &str,
@@ -3052,8 +2957,8 @@ pub(crate) async fn compaction_manifest_sources_current<C: ConnectionTrait>(
     // including its unambiguous exact input aliases. Those aliases never
     // authorize direct raw reads or OWN imports. Historical coverage never
     // joins canonical payload/revision rows. OWN imports still require
-    // their immutable delivery proofs. Publication generations fence this
-    // reader proof across the short writer CAS.
+    // their immutable delivery proofs. This check is used before reading raw
+    // portions; finished summaries no longer revalidate live sources.
     let stale = db
         .query_one_raw(compaction_manifest_sources_current_statement(operation))
         .await?;
