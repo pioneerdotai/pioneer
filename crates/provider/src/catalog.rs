@@ -330,6 +330,9 @@ fn enrich_reasoning(provider: &str, model: &mut ProviderModelInfo, entry: Option
         .map(|r| r.native.clone())
         .unwrap_or_default();
     let catalog_thinking = entry.map(|e| e.reasoning);
+    let catalog_off = entry
+        .and_then(|e| e.metadata.get("thinkingLevelMap"))
+        .and_then(|m| m.get("off"));
     let entry = crate::generation::reasoning_model(provider, entry, &native);
     if model.capabilities.reasoning.is_none()
         && fallback.is_none()
@@ -393,8 +396,13 @@ fn enrich_reasoning(provider: &str, model: &mut ProviderModelInfo, entry: Option
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        if !source_efforts.is_empty() {
-            reasoning.effort_options = source_efforts;
+        // Source options supply positive candidates, not a native closed enum.
+        // Keep documented platform controls; explicit denials and the actual
+        // protocol mapper still filter the combined candidates below.
+        for effort in source_efforts {
+            if !reasoning.effort_options.contains(&effort) {
+                reasoning.effort_options.push(effort);
+            }
         }
         if let Some(map) = entry
             .metadata
@@ -408,7 +416,10 @@ fn enrich_reasoning(provider: &str, model: &mut ProviderModelInfo, entry: Option
                     reasoning.effort_options.push(effort.into());
                 }
             }
-            if let Some(off) = map.get("off") {
+            // Native effort denials projected into this map do not establish
+            // mandatory thinking. Only the original catalog off fact can do so;
+            // a separately published native mandatory fact wins below.
+            if let Some(off) = catalog_off {
                 reasoning.mandatory = Some(off.is_null());
             }
         }

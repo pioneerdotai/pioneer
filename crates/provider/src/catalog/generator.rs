@@ -833,36 +833,39 @@ mod specialized_zero_regressions {
         let mut s: SourceSnapshot =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
                 .unwrap();
-        let reference: Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json")).unwrap();
         let changed = json!({"tool_call":true,"name":"dynamic","modalities":{"input":["text"]},"cost":{"input":99,"output":99},"limit":{"context":64000,"output":4000}});
         s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["deepseek"]["models"]["deepseek-v4-flash"] =
+            changed.clone();
+        s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["anthropic"]["models"]["claude-opus-4-6"] =
             changed.clone();
         s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["deepseek"]["models"]["fixture-dynamic"] =
             changed;
         let generated = generate(&s, true).unwrap();
         let known = &generated.models["deepseek"]["deepseek-v4-flash"];
-        for field in ["contextWindow", "maxTokens"] {
-            assert_eq!(
-                known[field],
-                reference["deepseek"]["deepseek-v4-flash"][field]
-            );
-        }
-        // Numeric JSON representations such as 0 and 0.0 carry the same rate.
-        // Compare all pinned cost fields without dropping any pricing evidence.
-        let expected_cost = reference["deepseek"]["deepseek-v4-flash"]["cost"]
-            .as_object()
-            .unwrap();
-        let actual_cost = known["cost"].as_object().unwrap();
+        // DeepSeek's existing IDs, like new IDs, are source-owned. Do not
+        // reintroduce stale pinned limits/prices to exercise override priority.
+        assert_eq!(known["contextWindow"], 64000);
+        assert_eq!(known["maxTokens"], 4000);
         assert_eq!(
-            actual_cost.keys().collect::<Vec<_>>(),
-            expected_cost.keys().collect::<Vec<_>>()
+            known["cost"],
+            json!({"input":99,"output":99,"cacheRead":0,"cacheWrite":0})
         );
-        for (field, expected) in expected_cost {
-            assert_eq!(actual_cost[field].as_f64(), expected.as_f64(), "{field}");
-        }
         assert_eq!(
             generated.provenance["deepseek"]["deepseek-v4-flash"]["contextWindow"]["kind"],
+            "source"
+        );
+        // A genuine explicit context override retains priority, while the
+        // independently source-owned output limit continues to refresh.
+        assert_eq!(
+            generated.models["anthropic"]["claude-opus-4-6"]["contextWindow"],
+            1_000_000
+        );
+        assert_eq!(
+            generated.models["anthropic"]["claude-opus-4-6"]["maxTokens"],
+            4000
+        );
+        assert_eq!(
+            generated.provenance["anthropic"]["claude-opus-4-6"]["contextWindow"]["kind"],
             "override"
         );
         let dynamic = &generated.models["deepseek"]["fixture-dynamic"];

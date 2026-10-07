@@ -389,18 +389,12 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_historical_thinking_does_not_override_off_at_final_materialization() {
-        use crate::types::{
-            AttachmentDataSource, InputTypeSupport, MessageAttachment, MessageContentPart,
-            ProviderInputCapabilities,
-        };
-        let provider =
-            DeepSeekProvider::new("key").with_input_capabilities(ProviderInputCapabilities {
-                text: true,
-                file: InputTypeSupport::native_inline_only(),
-                image: InputTypeSupport::disabled(),
-                audio: InputTypeSupport::disabled(),
-                video: InputTypeSupport::disabled(),
-            });
+        use crate::types::{AttachmentDataSource, MessageAttachment, MessageContentPart};
+        let provider = DeepSeekProvider::new("key");
+        let admission =
+            std::sync::Arc::new(crate::attachments::admission::AdmissionState::for_test(
+                std::sync::Arc::new(crate::generation::test_catalog(true)),
+            ));
         let mut replay = OpenAiCompatibleProvider::assistant_replay_state(
             "deepseek",
             None,
@@ -469,15 +463,52 @@ mod tests {
                     description: "Read".into(),
                     parameters: serde_json::json!({"type":"object"}),
                 }]);
-                // Default Provider budget: first request projection, text-only
-                // early return OR async media materialization with the same mode.
-                let budgeted = crate::attachments::runtime::with_async_authority_scope(
-                    "deepseek-mixed-budget-fixture".into(),
-                    provider.prepare_input_budget(request.clone()),
+                // Use the real model's media contract. DeepSeek's text-only
+                // endpoint must refuse attachments, independent of thinking;
+                // a synthetic adapter capability cannot certify file support.
+                let budgeted = crate::attachments::admission::scope(
+                    admission.clone(),
+                    crate::attachments::runtime::with_async_authority_scope(
+                        "deepseek-mixed-budget-fixture".into(),
+                        provider.prepare_input_budget(request.clone()),
+                    ),
                 )
-                .await
-                .unwrap();
-                assert_eq!(budgeted.media.len(), usize::from(media));
+                .await;
+                if media {
+                    let error = budgeted.err().expect("DeepSeek file input must be refused");
+                    assert_eq!(
+                        error
+                            .downcast_ref::<crate::attachments::MediaInputRejection>()
+                            .unwrap()
+                            .0,
+                        "selected model does not support this media input"
+                    );
+                    for stream in [false, true] {
+                        let error = crate::attachments::admission::scope(
+                            admission.clone(),
+                            crate::attachments::runtime::with_async_authority_scope(
+                                "deepseek-mixed-media-fixture".into(),
+                                provider.transport.render_chat_request_async_for_test(
+                                    provider.prepare_request(request.clone()).unwrap(),
+                                    stream,
+                                ),
+                            ),
+                        )
+                        .await
+                        .unwrap_err();
+                        assert_eq!(
+                            error
+                                .downcast_ref::<crate::attachments::MediaInputRejection>()
+                                .unwrap()
+                                .0,
+                            "selected model does not support this media input"
+                        );
+                    }
+                    assert_eq!(serde_json::to_vec(&canonical).unwrap(), canonical_bytes);
+                    continue;
+                }
+                let budgeted = budgeted.unwrap();
+                assert!(budgeted.media.is_empty());
                 assert_eq!(budgeted.request.messages[2].tool_calls.is_some(), off);
                 assert!(
                     budgeted
@@ -718,6 +749,9 @@ mod tests {
             ReasoningConfig::Effort(ReasoningEffort::None),
         ] {
             let mut request = replay_request("deepseek-v4-flash", None);
+            request
+                .messages
+                .push(ChatMessage::tool_result("call_1", "read_file", "observed"));
             request.reasoning = Some(off);
             request.max_tokens = Some(1024);
             assert!(!provider.thinking_replay_required(&request));
@@ -734,12 +768,18 @@ mod tests {
                 assert_eq!(wire["thinking"]["type"], "disabled");
                 assert!(wire.get("reasoning_effort").is_none());
                 assert_eq!(wire["messages"][0]["tool_calls"][0]["id"], "call_1");
+                assert_eq!(wire["messages"][1]["role"], "tool");
+                assert_eq!(wire["messages"][1]["tool_call_id"], "call_1");
+                assert_eq!(wire["messages"][1]["content"], "observed");
                 assert_eq!(wire["stream"], stream);
                 assert_eq!(wire["max_tokens"], 1024);
             }
         }
         for reasoning in [None, Some(ReasoningConfig::effort(ReasoningEffort::High))] {
             let mut request = replay_request("deepseek-v4-flash", None);
+            request
+                .messages
+                .push(ChatMessage::tool_result("call_1", "read_file", "observed"));
             request.reasoning = reasoning;
             assert!(provider.thinking_replay_required(&request));
             let error = provider.prepare_request(request).unwrap_err();

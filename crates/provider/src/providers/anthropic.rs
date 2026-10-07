@@ -1716,18 +1716,25 @@ mod tests {
                         let mut request = crate::generation::test_request(id);
                         request.reasoning = Some(off);
                         for stream in [false, true] {
-                            assert!(
-                                AnthropicProvider::build_chat_request_with_catalog(
-                                    &request,
-                                    None,
-                                    vec![],
-                                    stream,
-                                    Some(&catalog)
-                                )
-                                .unwrap_err()
-                                .to_string()
-                                .contains("mandatory")
-                            );
+                            let error = AnthropicProvider::build_chat_request_with_catalog(
+                                &request,
+                                None,
+                                vec![],
+                                stream,
+                                Some(&catalog),
+                            )
+                            .unwrap_err()
+                            .to_string();
+                            let expected = if crate::generation::protocol_mandatory("anthropic", id)
+                            {
+                                "mandatory"
+                            } else {
+                                // An optional family can have an explicit
+                                // catalog off veto without becoming mandatory
+                                // in its documented protocol.
+                                "selected reasoning `off` is unsupported by the model's catalog thinking map"
+                            };
+                            assert!(error.contains(expected), "{id}, stream={stream}: {error}");
                         }
                     }
                 }
