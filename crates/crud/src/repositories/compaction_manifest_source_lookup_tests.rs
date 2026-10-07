@@ -3334,7 +3334,7 @@ async fn retired_publication_fence_triggers_are_removed_and_migration_is_idempot
             .find(|migration| {
                 migration.name() == "m20261006_000001_retire_compaction_publication_fences"
             })
-            .expect("publication fence retirement migration must be registered");
+            .expect("publication fence retirement migration is registered");
         for _ in 0..2 {
             // Reapply through the supported serialized migration executor.
             db.execute_raw(Statement::from_sql_and_values(

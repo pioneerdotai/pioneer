@@ -9,7 +9,7 @@ use crate::{
     types::{
         ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
         ProviderInputCapabilities, ProviderTermination, ProviderTimeoutPolicy, Role, StreamChunk,
-        TokenUsage, ToolChoice, ToolDefinition,
+        ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -49,6 +49,8 @@ struct ApiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
     stream: bool,
+    #[serde(flatten)]
+    generation: crate::generation::Fields,
 }
 
 #[derive(Debug, Serialize)]
@@ -157,6 +159,10 @@ struct ApiToolCallFunction {
 
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
     choices: Vec<ApiChoice>,
     #[serde(default)]
     usage: Option<ApiUsage>,
@@ -189,18 +195,16 @@ impl ApiResponseMessage {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiUsage {
-    #[serde(default)]
-    prompt_tokens: Option<u64>,
-    #[serde(default)]
-    completion_tokens: Option<u64>,
-}
+type ApiUsage = crate::usage::ChatUsage;
 
 // ── SSE streaming response types ────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct StreamResponse {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     usage: Option<ApiUsage>,
     #[serde(default)]
@@ -310,6 +314,28 @@ struct ApiModelEntry {
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl CopilotProvider {
+    fn build_chat_request(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        let generation = crate::generation::chat_fields("copilot", request)?;
+        Ok(ApiChatRequest {
+            generation,
+            model: request.model.clone(),
+            messages,
+            temperature: None,
+            max_tokens: None,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: request.tool_choice.clone().map(Self::convert_tool_choice),
+            parallel_tool_calls: request.parallel_tool_calls,
+            stream,
+        })
+    }
+
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_timeout_policy(api_key, ProviderTimeoutPolicy::default())
     }
@@ -603,15 +629,14 @@ impl CopilotProvider {
                                     .await;
                                 return;
                             }
-                            if let Some(usage) = resp.usage {
-                                if tx
-                                    .send(Ok(StreamChunk::usage(TokenUsage {
-                                        input_tokens: usage.prompt_tokens,
-                                        output_tokens: usage.completion_tokens,
-                                    })))
-                                    .await
-                                    .is_err()
-                                {
+                            if resp.usage.is_some() || resp.id.is_some() {
+                                let usage = resp
+                                    .usage
+                                    .map(|u| u.normalized())
+                                    .unwrap_or_default()
+                                    .with_native_id(resp.id.as_deref())
+                                    .with_reported_model(resp.model.as_deref());
+                                if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
                                     return;
                                 }
                             }
@@ -738,6 +763,13 @@ impl CopilotProvider {
 
 #[async_trait]
 impl crate::traits::Provider for CopilotProvider {
+    fn usage_api(&self) -> &'static str {
+        "chat_completions"
+    }
+    fn usage_route(&self) -> Option<String> {
+        crate::usage::route(&self.base_url, "/chat/completions")
+    }
+
     fn name(&self) -> &str {
         "copilot"
     }
@@ -775,19 +807,8 @@ impl crate::traits::Provider for CopilotProvider {
         .await?;
         crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages: Self::convert_messages(&prepared)?,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            stream: false,
-        };
+        let api_request =
+            Self::build_chat_request(&request, Self::convert_messages(&prepared)?, false)?;
 
         let request_builder = self
             .client
@@ -809,10 +830,14 @@ impl crate::traits::Provider for CopilotProvider {
             "provider_response",
         )
         .await?;
-        let usage = api_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-        });
+        let usage = Some(
+            api_response
+                .usage
+                .map(|u| u.normalized())
+                .unwrap_or_default()
+                .with_native_id(api_response.id.as_deref())
+                .with_reported_model(api_response.model.as_deref()),
+        );
 
         let choice = api_response
             .choices
@@ -861,19 +886,8 @@ impl crate::traits::Provider for CopilotProvider {
         .await?;
         crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages: Self::convert_messages(&prepared)?,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            stream: true,
-        };
+        let api_request =
+            Self::build_chat_request(&request, Self::convert_messages(&prepared)?, true)?;
 
         let request_builder = self
             .client
@@ -947,6 +961,26 @@ impl crate::traits::Provider for CopilotProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn actual_chat_bodies_apply_generation_rules_and_reject_unknown_chosen_controls() {
+        let mut request = crate::generation::test_request("gpt-5.4");
+        request.reasoning = Some(crate::types::ReasoningConfig::Disabled);
+        for stream in [false, true] {
+            assert!(
+                CopilotProvider::build_chat_request(&request, vec![], stream).is_err(),
+                "direct OpenAI documentation does not verify private Copilot reasoning controls"
+            );
+        }
+        request.model = "unverified-private-model".into();
+        assert!(CopilotProvider::build_chat_request(&request, vec![], false).is_err());
+        request.reasoning = None;
+        let body = serde_json::to_value(
+            CopilotProvider::build_chat_request(&request, vec![], true).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["max_tokens"], 1024);
+        assert!(body.get("reasoning_effort").is_none());
+    }
     use super::*;
     use crate::attachments::prepare_messages_for_provider;
     use crate::traits::Provider;

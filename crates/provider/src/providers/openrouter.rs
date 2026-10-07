@@ -13,8 +13,8 @@ use crate::{
     types::{
         ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, InputContentType,
         InputTypeSupport, ProviderCapabilities, ProviderInputCapabilities, ProviderReplayState,
-        ProviderTermination, ProviderTimeoutPolicy, ReasoningConfig, ReasoningEffort, Role,
-        StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+        ProviderTermination, ProviderTimeoutPolicy, ReasoningEffort, Role, StreamChunk, TokenUsage,
+        ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -63,6 +63,8 @@ struct ApiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ApiReasoningOptions>,
     stream: bool,
+    #[serde(flatten)]
+    generation: crate::generation::Fields,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +180,10 @@ struct ApiToolCallFunction {
 
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
     choices: Vec<ApiChoice>,
     #[serde(default)]
     usage: Option<ApiUsage>,
@@ -213,13 +219,7 @@ impl ApiResponseMessage {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiUsage {
-    #[serde(default)]
-    prompt_tokens: Option<u64>,
-    #[serde(default)]
-    completion_tokens: Option<u64>,
-}
+type ApiUsage = crate::usage::ChatUsage;
 
 #[derive(Debug, Serialize)]
 struct ApiEmbeddingRequest {
@@ -234,6 +234,8 @@ type ApiEmbeddingResponse = super::embedding::IndexedEmbeddingResponse;
 
 #[derive(Debug, Deserialize)]
 struct StreamResponse {
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -622,19 +624,10 @@ impl OpenRouterArchitecture {
     }
 }
 
+// Keep field presence/null separately from booleans and per-model enums.
 #[derive(Debug, Deserialize)]
-struct OpenRouterReasoningMetadata {
-    #[serde(default)]
-    supported_efforts: Option<Vec<String>>,
-    #[serde(default)]
-    default_effort: Option<String>,
-    #[serde(default)]
-    default_enabled: Option<bool>,
-    #[serde(default)]
-    mandatory: Option<bool>,
-    #[serde(default)]
-    supports_max_tokens: Option<bool>,
-}
+#[serde(transparent)]
+struct OpenRouterReasoningMetadata(serde_json::Map<String, serde_json::Value>);
 
 #[derive(Debug, Deserialize)]
 struct OpenRouterPricing {
@@ -651,6 +644,40 @@ struct OpenRouterPricing {
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl OpenRouterProvider {
+    fn build_chat_request(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        let catalog = crate::catalog::model_catalog().ok();
+        Self::build_chat_request_with_catalog(request, messages, stream, catalog.as_deref())
+    }
+
+    fn build_chat_request_with_catalog(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> Result<ApiChatRequest> {
+        let generation =
+            crate::generation::chat_fields_from_catalog(catalog, "openrouter", request)?;
+        Ok(ApiChatRequest {
+            generation,
+            model: request.model.clone(),
+            messages,
+            temperature: None,
+            max_tokens: None,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: request.tool_choice.clone().map(Self::convert_tool_choice),
+            parallel_tool_calls: request.parallel_tool_calls,
+            reasoning: None,
+            stream,
+        })
+    }
+
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_timeout_policy(api_key, ProviderTimeoutPolicy::default())
     }
@@ -685,21 +712,7 @@ impl OpenRouterProvider {
         stream: bool,
     ) -> Result<ApiChatRequest> {
         let rendered_messages = Self::convert_messages(prepared)?;
-        let reasoning = Self::reasoning_options(request.reasoning);
-        Ok(ApiChatRequest {
-            model: request.model.clone(),
-            messages: rendered_messages,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.clone().map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            reasoning,
-            stream,
-        })
+        Self::build_chat_request(request, rendered_messages, stream)
     }
 
     fn audio_format_from_mime(mime: &str) -> Result<&'static str> {
@@ -720,19 +733,6 @@ impl OpenRouterProvider {
     fn looks_like_url(value: &str) -> bool {
         let value = value.trim().to_ascii_lowercase();
         value.starts_with("http://") || value.starts_with("https://") || value.starts_with("data:")
-    }
-
-    fn reasoning_options(
-        request_reasoning: Option<ReasoningConfig>,
-    ) -> Option<ApiReasoningOptions> {
-        let effort = match request_reasoning {
-            Some(ReasoningConfig::Effort(effort)) => effort,
-            Some(ReasoningConfig::Disabled) | None => return None,
-        };
-
-        Some(ApiReasoningOptions {
-            effort: effort.as_str().to_owned(),
-        })
     }
 
     fn media_url_or_data_url(
@@ -1103,10 +1103,27 @@ impl OpenRouterProvider {
         request_id: Option<String>,
         diagnostics: crate::ProviderStreamDiagnostics,
     ) -> crate::ProviderStream {
+        Self::decode_stream_with_usage(byte_stream, request_id, diagnostics, TokenUsage::default())
+    }
+
+    fn decode_stream_with_usage(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+        request_id: Option<String>,
+        diagnostics: crate::ProviderStreamDiagnostics,
+        header_usage: TokenUsage,
+    ) -> crate::ProviderStream {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
         let stream_diagnostics = diagnostics.clone();
         tokio::spawn(async move {
+            if header_usage.generation_id.is_some()
+                && tx
+                    .send(Ok(StreamChunk::usage(header_usage.clone())))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
             let mut decoder = IncrementalSseDecoder::default();
             let mut tool_call_accumulator = StreamToolCallAccumulator::default();
             let mut terminal_reason = None;
@@ -1196,15 +1213,19 @@ impl OpenRouterProvider {
                                     .await;
                                 return;
                             }
-                            if let Some(usage) = resp.usage {
-                                if tx
-                                    .send(Ok(StreamChunk::usage(TokenUsage {
-                                        input_tokens: usage.prompt_tokens,
-                                        output_tokens: usage.completion_tokens,
-                                    })))
-                                    .await
-                                    .is_err()
-                                {
+                            if resp.usage.is_some() || resp.id.is_some() || resp.model.is_some() {
+                                let usage = resp
+                                    .usage
+                                    .map(|u| u.normalized())
+                                    .unwrap_or_default()
+                                    .with_native_id(
+                                        header_usage
+                                            .generation_id
+                                            .as_deref()
+                                            .or(resp.id.as_deref()),
+                                    )
+                                    .with_reported_model(resp.model.as_deref());
+                                if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
                                     return;
                                 }
                             }
@@ -1363,6 +1384,13 @@ impl OpenRouterProvider {
 
 #[async_trait]
 impl crate::traits::Provider for OpenRouterProvider {
+    fn usage_api(&self) -> &'static str {
+        "chat_completions"
+    }
+    fn usage_route(&self) -> Option<String> {
+        crate::usage::route(&self.base_url, "/chat/completions")
+    }
+
     fn classify_failure(
         &self,
         error: &anyhow::Error,
@@ -1444,90 +1472,126 @@ impl crate::traits::Provider for OpenRouterProvider {
             .send()
             .await?;
 
+        let header_usage = TokenUsage::default().with_native_id(
+            response
+                .headers()
+                .get("X-Generation-Id")
+                .and_then(|value| value.to_str().ok()),
+        );
         if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
+            let error = Self::api_error(response).await;
+            return Err(if header_usage.generation_id.is_some() {
+                crate::usage::with_error_usage(error, &header_usage)
+            } else {
+                error
+            });
         }
 
-        let mut facts = ResponseFailureFacts::capture(&response);
-        let body: serde_json::Value = crate::http::read_response_json_bounded(
-            response,
-            Default::default(),
-            "provider_response",
-        )
-        .await
-        .map_err(|error| facts.failure(error, ProviderFailureStage::Connect))?;
-        facts.observe_body_id(&body);
-        // Chat Completions can report generation failure inside HTTP 200,
-        // either at the top level or in a choice. The envelope code, not 200,
-        // is the failure status in this case.
-        if let Some(error) = body
-            .get("error")
-            .filter(|error| !error.is_null())
-            .or_else(|| {
-                body.get("choices")
-                    .and_then(serde_json::Value::as_array)
-                    .and_then(|choices| {
-                        choices
-                            .iter()
-                            .find_map(|choice| choice.get("error").filter(|error| !error.is_null()))
-                    })
-            })
-        {
-            let error: StreamError = serde_json::from_value(error.clone())
+        let mut observed = header_usage.clone();
+        let result = async {
+            let mut facts = ResponseFailureFacts::capture(&response);
+            let body: serde_json::Value = crate::http::read_response_json_bounded(
+                response,
+                Default::default(),
+                "provider_response",
+            )
+            .await
+            .map_err(|error| facts.failure(error, ProviderFailureStage::Connect))?;
+            facts.observe_body_id(&body);
+            // Retain bounded usage before validating the response or error envelope.
+            let usage = body
+                .get("usage")
+                .and_then(|value| serde_json::from_value::<ApiUsage>(value.clone()).ok())
+                .map(|usage| usage.normalized())
+                .unwrap_or_default()
+                .with_native_id(
+                    header_usage
+                        .generation_id
+                        .as_deref()
+                        .or_else(|| body.get("id").and_then(serde_json::Value::as_str)),
+                )
+                .with_reported_model(body.get("model").and_then(serde_json::Value::as_str));
+            observed.update(&usage);
+            // Chat Completions can report generation failure inside HTTP 200,
+            // either at the top level or in a choice. The envelope code, not 200,
+            // is the failure status in this case.
+            if let Some(error) = body
+                .get("error")
+                .filter(|error| !error.is_null())
+                .or_else(|| {
+                    body.get("choices")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|choices| {
+                            choices.iter().find_map(|choice| {
+                                choice.get("error").filter(|error| !error.is_null())
+                            })
+                        })
+                })
+            {
+                let error: StreamError = serde_json::from_value(error.clone())
+                    .map_err(|error| facts.failure(error.into(), ProviderFailureStage::Connect))?;
+                return Err(OpenRouterFailure::generation(
+                    error,
+                    facts.request_id,
+                    ProviderFailureStage::Connect,
+                    facts.retry_after_ms,
+                )
+                .into());
+            }
+            let api_response: ApiChatResponse = serde_json::from_value(body)
                 .map_err(|error| facts.failure(error.into(), ProviderFailureStage::Connect))?;
-            return Err(OpenRouterFailure::generation(
-                error,
-                facts.request_id,
-                ProviderFailureStage::Connect,
-                facts.retry_after_ms,
-            )
-            .into());
+            let usage = Some(usage);
+
+            let choice = api_response.choices.into_iter().next().ok_or_else(|| {
+                facts.failure(
+                    anyhow!("no response from OpenRouter"),
+                    ProviderFailureStage::Connect,
+                )
+            })?;
+            let termination = choice
+                .finish_reason
+                .as_deref()
+                .map(ProviderTermination::from_openai_reason)
+                .unwrap_or_else(|| {
+                    ProviderTermination::Unknown("missing_finish_reason".to_owned())
+                });
+            let message = choice.message;
+
+            let provider_replay_state = Self::reasoning_details_state(
+                message.reasoning_details.clone().unwrap_or_default(),
+            );
+            let text = message.effective_content();
+            let tool_calls =
+                parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())
+                    .map_err(|error| facts.failure(error, ProviderFailureStage::Connect))?;
+            let reasoning_content = message.reasoning_content.or(message.reasoning);
+
+            if text.is_empty()
+                && tool_calls.is_empty()
+                && reasoning_content.as_deref().unwrap_or_default().is_empty()
+            {
+                return Err(facts.failure(
+                    anyhow!("no response from OpenRouter"),
+                    ProviderFailureStage::Connect,
+                ));
+            }
+
+            Ok(ChatResponse {
+                text,
+                usage,
+                termination,
+                reasoning_content,
+                tool_calls,
+                provider_replay_state,
+            })
         }
-        let api_response: ApiChatResponse = serde_json::from_value(body)
-            .map_err(|error| facts.failure(error.into(), ProviderFailureStage::Connect))?;
-        let usage = api_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-        });
-
-        let choice = api_response.choices.into_iter().next().ok_or_else(|| {
-            facts.failure(
-                anyhow!("no response from OpenRouter"),
-                ProviderFailureStage::Connect,
-            )
-        })?;
-        let termination = choice
-            .finish_reason
-            .as_deref()
-            .map(ProviderTermination::from_openai_reason)
-            .unwrap_or_else(|| ProviderTermination::Unknown("missing_finish_reason".to_owned()));
-        let message = choice.message;
-
-        let provider_replay_state =
-            Self::reasoning_details_state(message.reasoning_details.clone().unwrap_or_default());
-        let text = message.effective_content();
-        let tool_calls =
-            parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())
-                .map_err(|error| facts.failure(error, ProviderFailureStage::Connect))?;
-        let reasoning_content = message.reasoning_content.or(message.reasoning);
-
-        if text.is_empty()
-            && tool_calls.is_empty()
-            && reasoning_content.as_deref().unwrap_or_default().is_empty()
-        {
-            return Err(facts.failure(
-                anyhow!("no response from OpenRouter"),
-                ProviderFailureStage::Connect,
-            ));
-        }
-
-        Ok(ChatResponse {
-            text,
-            usage,
-            termination,
-            reasoning_content,
-            tool_calls,
-            provider_replay_state,
+        .await;
+        result.map_err(|error| {
+            if observed != TokenUsage::default() {
+                crate::usage::with_error_usage(error, &observed)
+            } else {
+                error
+            }
         })
     }
 
@@ -1563,8 +1627,21 @@ impl crate::traits::Provider for OpenRouterProvider {
         let response =
             crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
 
+        // Header is authoritative correlation evidence. If body disagrees,
+        // retain the header; never invent a combined ID. Body is fallback only.
+        let header_usage = TokenUsage::default().with_native_id(
+            response
+                .headers()
+                .get("X-Generation-Id")
+                .and_then(|v| v.to_str().ok()),
+        );
         if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
+            let error = Self::api_error(response).await;
+            return Err(if header_usage.generation_id.is_some() {
+                crate::usage::with_error_usage(error, &header_usage)
+            } else {
+                error
+            });
         }
 
         let request_id = Self::response_request_id(&response);
@@ -1581,10 +1658,11 @@ impl crate::traits::Provider for OpenRouterProvider {
             "provider_stream",
         );
 
-        Ok(Self::decode_stream_with_diagnostics(
+        Ok(Self::decode_stream_with_usage(
             byte_stream,
             request_id,
             diagnostics,
+            header_usage,
         ))
     }
 
@@ -1686,7 +1764,7 @@ fn provider_model_from_openrouter_model_entry(m: OpenRouterModelEntry) -> Provid
             .map(|v| v.iter().any(|m| m.eq_ignore_ascii_case("image")));
     }
     if let Some(reasoning) = reasoning {
-        capabilities.thinking = reasoning.supported;
+        // Effort/default/mandatory/budget facts are not a native thinking bool.
         capabilities.reasoning = Some(reasoning);
     }
 
@@ -1735,48 +1813,226 @@ fn openrouter_embedding_model_from_openrouter_model_entry(
 fn openrouter_reasoning_capabilities(
     metadata: OpenRouterReasoningMetadata,
 ) -> Option<ProviderModelReasoningCapabilities> {
-    let effort_options = metadata
-        .supported_efforts
-        .map(|efforts| {
-            efforts
-                .into_iter()
-                .filter_map(|effort| {
-                    ReasoningEffort::canonical_value(effort.as_str()).map(str::to_owned)
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| {
-            OPENROUTER_GATEWAY_REASONING_EFFORTS
-                .iter()
-                .map(|effort| (*effort).to_owned())
-                .collect()
-        });
-    let default_effort = metadata
-        .default_effort
-        .as_deref()
+    let fields = metadata.0;
+    let mut native = std::collections::BTreeMap::new();
+    let efforts = fields.get("supported_efforts");
+    let values = efforts.and_then(serde_json::Value::as_array);
+    let complete = values.is_some_and(|v| v.iter().all(serde_json::Value::is_string));
+    // Documented null = generic gateway vocabulary; omitted within a reasoning
+    // object = no effort selection. Neither is a confirmed per-model enum.
+    // https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
+    native.insert(
+        "effort.enum".into(),
+        if efforts.is_none() {
+            Some(false)
+        } else if complete {
+            Some(true)
+        } else {
+            None
+        },
+    );
+    if efforts.is_some_and(serde_json::Value::is_null) {
+        native.insert("effort.gateway".into(), Some(true));
+    }
+    let mut options = Vec::new();
+    if complete {
+        for value in values.unwrap() {
+            let raw = value.as_str().unwrap();
+            let value = ReasoningEffort::canonical_value(raw).unwrap_or(raw);
+            native.insert(format!("effort.{value}"), Some(true));
+            if ReasoningEffort::from_str(value).is_some() {
+                options.push(value.to_owned());
+            }
+        }
+    } else if native.get("effort.gateway") == Some(&Some(true)) {
+        options = OPENROUTER_GATEWAY_REASONING_EFFORTS
+            .iter()
+            .map(|v| (*v).into())
+            .collect();
+    }
+    if complete || native.get("effort.gateway") == Some(&Some(true)) {
+        for value in OPENROUTER_GATEWAY_REASONING_EFFORTS {
+            native
+                .entry(format!("effort.{value}"))
+                .or_insert(Some(options.iter().any(|v| v == value)));
+        }
+    }
+    for (source, target) in [
+        ("supported", "reasoning.supported"),
+        ("mandatory", "mandatory"),
+        ("default_enabled", "default_enabled"),
+        ("supports_max_tokens", "supports_token_budget"),
+    ] {
+        if let Some(value) = fields.get(source) {
+            native.insert(target.into(), value.as_bool());
+        }
+    }
+    let default_effort = fields
+        .get("default_effort")
+        .and_then(serde_json::Value::as_str)
         .and_then(ReasoningEffort::canonical_value)
         .map(str::to_owned);
-    if effort_options.is_empty()
-        && default_effort.is_none()
-        && metadata.default_enabled != Some(true)
-        && metadata.mandatory != Some(true)
-        && metadata.supports_max_tokens != Some(true)
-    {
-        return None;
+    if let Some(value) = fields.get("default_effort") {
+        native.insert("default_effort".into(), None);
+        if let Some(raw) = value.as_str() {
+            native.insert(
+                format!(
+                    "default_effort.{}",
+                    ReasoningEffort::canonical_value(raw).unwrap_or(raw)
+                ),
+                Some(true),
+            );
+        }
     }
-
-    Some(ProviderModelReasoningCapabilities {
-        supported: Some(true),
-        effort_options,
+    let mut reasoning = ProviderModelReasoningCapabilities {
+        native,
+        effort_options: options,
         default_effort,
-        mandatory: metadata.mandatory,
-        supports_token_budget: metadata.supports_max_tokens,
-        source: Some(ReasoningCapabilitySource::ProviderMetadata),
-    })
+        source: Some(if complete {
+            ReasoningCapabilitySource::ProviderMetadata
+        } else {
+            ReasoningCapabilitySource::Unknown
+        }),
+        ..Default::default()
+    };
+    preserve_native_reasoning(&mut reasoning);
+    Some(reasoning)
+}
+
+/// Restore separately published fields after catalog enrichment. This uses the
+/// same compact internal facts carried by the authority-bound request scope;
+/// no public schema or second model catalog is introduced.
+pub(crate) fn preserve_native_reasoning(reasoning: &mut ProviderModelReasoningCapabilities) {
+    let native = &reasoning.native;
+    let complete = native.get("effort.enum") == Some(&Some(true));
+    let gateway = native.get("effort.gateway") == Some(&Some(true));
+    if complete || gateway {
+        reasoning.effort_options = OPENROUTER_GATEWAY_REASONING_EFFORTS
+            .iter()
+            .filter(|e| native.get(&format!("effort.{e}")) == Some(&Some(true)))
+            .map(|e| (*e).to_owned())
+            .collect();
+    } else if native.get("effort.enum") == Some(&Some(false)) {
+        reasoning.effort_options.clear();
+    }
+    // A missing/empty effort selector is not an aggregate reasoning denial.
+    // Positive effort or budget support can confirm reasoning; unknown fields
+    // retain the matching catalog fallback (or unknown in the raw parser).
+    // default_enabled/mandatory alone do not establish either capability.
+    if native.get("supports_token_budget") == Some(&Some(true))
+        || native.iter().any(|(k, v)| {
+            k.starts_with("effort.")
+                && !matches!(k.as_str(), "effort.enum" | "effort.gateway")
+                && *v == Some(true)
+        })
+    {
+        reasoning.supported = Some(true);
+    }
+    if let Some(supported) = native.get("reasoning.supported").copied().flatten() {
+        reasoning.supported = Some(supported);
+    }
+    if let Some(mandatory) = native.get("mandatory").copied().flatten() {
+        reasoning.mandatory = Some(mandatory);
+    }
+    if let Some(budget) = native.get("supports_token_budget").copied().flatten() {
+        reasoning.supports_token_budget = Some(budget);
+    }
+    if let Some(default) = native.iter().find_map(|(k, v)| {
+        k.strip_prefix("default_effort.")
+            .filter(|e| *v == Some(true) && ReasoningEffort::from_str(e).is_some())
+    }) {
+        reasoning.default_effort = Some(default.into());
+    }
+    if reasoning.mandatory == Some(true) || reasoning.supported == Some(false) {
+        reasoning
+            .effort_options
+            .retain(|e| reasoning.supported != Some(false) && e != "none");
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn render_chat_request_mode_for_test(
+    catalog: &crate::catalog::ModelCatalog,
+    request: &ChatRequest,
+    stream: bool,
+) -> Result<serde_json::Value> {
+    use crate::Provider;
+    let provider = OpenRouterProvider::new("fixture");
+    let request = crate::tools::policy::prepare_request("openrouter", request.clone())?;
+    let mut prepared = prepare_messages_for_provider_async(
+        "openrouter",
+        &request.model,
+        &provider.capabilities(),
+        &request.rendered_messages_with_compiled_prompt(),
+    )
+    .await?;
+    crate::tools::policy::prepare_history("openrouter", &mut prepared.messages)?;
+    ensure_no_unrendered_attachments("openrouter", &prepared)?;
+    serde_json::to_value(OpenRouterProvider::build_chat_request_with_catalog(
+        &request,
+        OpenRouterProvider::convert_messages(&prepared)?,
+        stream,
+        Some(catalog),
+    )?)
+    .map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn router_default_off_effort_and_mandatory_models_reach_both_bodies() {
+        let catalog = crate::catalog::ModelCatalog::parse(
+            include_str!("../../tests/fixtures/catalog/models.json"),
+            include_str!("../../tests/fixtures/catalog/provenance.json"),
+        )
+        .unwrap();
+        let mut request = crate::generation::test_request("openai/gpt-5.4");
+        for stream in [false, true] {
+            for reasoning in [
+                None,
+                Some(ReasoningConfig::Disabled),
+                Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+            ] {
+                request.reasoning = reasoning;
+                let body = serde_json::to_value(
+                    OpenRouterProvider::build_chat_request_with_catalog(
+                        &request,
+                        vec![],
+                        stream,
+                        Some(&catalog),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(body["max_tokens"], 1024);
+                if reasoning.is_none() {
+                    assert!(body.get("reasoning").is_none());
+                } else {
+                    assert_eq!(
+                        body["reasoning"]["effort"],
+                        if crate::generation::selected_off(reasoning) {
+                            "none"
+                        } else {
+                            "high"
+                        }
+                    );
+                }
+                assert!(body.get("reasoning_effort").is_none());
+            }
+        }
+        request.model = "openai/gpt-oss-120b".into();
+        request.reasoning = Some(ReasoningConfig::Disabled);
+        assert!(
+            OpenRouterProvider::build_chat_request_with_catalog(
+                &request,
+                vec![],
+                false,
+                Some(&catalog)
+            )
+            .is_err()
+        );
+    }
     use super::*;
 
     #[tokio::test]
@@ -2432,6 +2688,7 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "anthropic/claude-sonnet-4".into(),
             messages: vec![
                 ApiMessage {
@@ -2475,6 +2732,7 @@ mod tests {
     #[test]
     fn api_request_serializes_reasoning_options() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "openai/gpt-5".into(),
             messages: vec![ApiMessage {
                 role: "user".into(),
@@ -2501,21 +2759,9 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_options_omit_absent_or_disabled_effort_and_serialize_explicit_none() {
-        assert!(OpenRouterProvider::reasoning_options(None).is_none());
-        assert!(OpenRouterProvider::reasoning_options(Some(ReasoningConfig::disabled())).is_none());
-
-        let reasoning = OpenRouterProvider::reasoning_options(Some(ReasoningConfig::effort(
-            ReasoningEffort::None,
-        )))
-        .expect("explicit none reasoning effort should serialize");
-
-        assert_eq!(reasoning.effort, "none");
-    }
-
-    #[test]
     fn api_request_serializes_reasoning_options_for_any_model() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "anthropic/claude-sonnet-4".into(),
             messages: vec![ApiMessage {
                 role: "user".into(),
@@ -2602,9 +2848,9 @@ mod tests {
             "usage": {"prompt_tokens": 42, "completion_tokens": 15}
         }"#;
         let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        let usage = response.usage.unwrap();
-        assert_eq!(usage.prompt_tokens, Some(42));
-        assert_eq!(usage.completion_tokens, Some(15));
+        let usage = response.usage.unwrap().normalized();
+        assert_eq!(usage.input_tokens, Some(42));
+        assert_eq!(usage.output_tokens, Some(15));
     }
 
     #[test]

@@ -112,7 +112,10 @@ impl GeneratedCatalog {
                 );
                 for field in ["input", "output", "cacheRead", "cacheWrite"] {
                     ensure!(
-                        model["cost"][field].as_f64().is_some_and(|v| v.is_finite()),
+                        model["cost"][field].is_null()
+                            || model["cost"][field]
+                                .as_f64()
+                                .is_some_and(|v| v.is_finite() && v >= 0.),
                         "invalid model pricing"
                     );
                 }
@@ -191,15 +194,20 @@ fn missing_or_falsy(value: &Value) -> bool {
     value.is_null() || value == false || value.as_f64() == Some(0.) || value == ""
 }
 fn source_price(value: &Value) -> Value {
-    if missing_or_falsy(value) {
-        json!(0)
-    } else {
-        value.clone()
-    }
+    value.clone()
 }
 fn cost(source: &Value) -> Value {
-    json!({"input":source_price(&source["input"]), "output":source_price(&source["output"]),
-        "cacheRead":source_price(&source["cache_read"]), "cacheWrite":source_price(&source["cache_write"])})
+    // Preserve tier conditions, TTL prices and non-token fees from the source.
+    let mut result = source.as_object().cloned().unwrap_or_default();
+    for (key, field) in [
+        ("input", "input"),
+        ("output", "output"),
+        ("cacheRead", "cache_read"),
+        ("cacheWrite", "cache_write"),
+    ] {
+        result.insert(key.into(), source_price(&source[field]));
+    }
+    Value::Object(result)
 }
 fn limit(value: &Value, fallback: u64, source: &str) -> (Value, LimitOrigin) {
     if missing_or_falsy(value) {
@@ -246,7 +254,8 @@ fn base(
         "sourceMetadata":source,
         "inputConstraints":source["inputConstraints"],
         "output":source["modalities"]["output"],
-        "cost":cost(&source["cost"]),"contextWindow":context,"maxTokens":output}),
+        "cost":cost(&source["cost"]),"pricingSource":{"url":SOURCE_URLS[0],"units":"USD_per_million_tokens","raw":source["cost"]},"contextWindow":context,"maxTokens":output,
+        "sourceGeneration":{"temperature":source["temperature"],"reasoningOptions":source["reasoning_options"]}}),
         context_origin,
         output_origin,
         reasoning_options: source["reasoning_options"].clone(),
@@ -280,6 +289,13 @@ pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCata
     candidates.extend(supplements);
     for model in &mut candidates {
         compatibility::apply(model);
+        model.model["pricingEvidenceVersion"] = json!(1);
+        model.model["pricingCapturedAt"] = json!(snapshot.captured_at);
+        model.model["pricingUnits"] = json!(if model.provider() == "github-copilot" {
+            "unknown_subscription_units"
+        } else {
+            "USD_per_million_tokens"
+        });
     }
     compatibility::fallbacks(&mut candidates);
     let mut output = GeneratedCatalog {
@@ -348,6 +364,35 @@ mod tests {
             (a, b) => out.push(format!("{path}: actual {a}; expected {b}")),
         }
     }
+
+    fn project_pinned_cost_fields(actual: &mut Value, expected: &Value, raw: &Value) {
+        let prices = actual.as_object_mut().unwrap();
+        // Only source-backed additions absent from Pi's normalized contract
+        // may be projected out. Changed known rates still reach differences.
+        for (field, value) in prices.iter() {
+            if expected.get(field).is_none() {
+                assert_eq!(
+                    raw.get(field),
+                    Some(value),
+                    "additional cost field {field} must retain its exact source value"
+                );
+            }
+        }
+        prices.retain(|field, _| expected.get(field).is_some());
+    }
+    #[test]
+    fn missing_source_price_is_unknown_and_explicit_zero_is_free() {
+        let c = cost(
+            &json!({"input":2,"output":0,"tiers":[{"tier":{"type":"context","size":200000},"input":4}]}),
+        );
+        assert_eq!(c["input"], 2);
+        assert_eq!(c["output"], 0);
+        assert!(c["cacheRead"].is_null());
+        assert!(c["cacheWrite"].is_null());
+        assert_eq!(c["tiers"][0]["tier"]["size"], 200000);
+        assert_eq!(source_price(&json!(false)), false);
+    }
+
     #[test]
     fn separate_input_limit_reaches_runtime_without_changing_pi_model_fields() {
         let mut source = snapshot();
@@ -375,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_non_media_catalog_contract_matches_pi_reference() {
+    fn pinned_non_media_catalog_preserves_pi_contract_and_distinguishes_unknown_pricing() {
         let mut generated = generate(&snapshot(), true).unwrap();
         // Pioneer exposes standard CN/global profiles as well as Pi's coding
         // plans. The supplements are verified against their own source below.
@@ -383,11 +428,23 @@ mod tests {
             assert!(generated.models.remove(supplement).is_some());
             assert!(generated.provenance.remove(supplement).is_some());
         }
-        let reference: Value =
+        // Pi's explicit DeepSeek definitions predate the pinned source snapshot.
+        // Pioneer keeps source limits/modalities/prices authoritative. This
+        // explicit golden overlay covers the full changed provider subtree,
+        // including the source-only alias, without dropping it from comparison.
+        let deepseek: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/catalog/pioneer-deepseek.json"
+        ))
+        .unwrap();
+        let mut reference: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/provenance.json"))
                 .unwrap();
+        reference["deepseek"] = deepseek["provenance"].clone();
         let mut origins = Vec::new();
         for (p, models) in &generated.provenance {
+            if reference.get(p).is_none() {
+                continue;
+            }
             for (id, fields) in models {
                 for field in ["contextWindow", "maxTokens"] {
                     if reference[p][id].is_null() {
@@ -407,33 +464,157 @@ mod tests {
             "origin differences:\n{}",
             origins.join("\n")
         );
-        let mut actual = serde_json::to_value(generated.models).unwrap();
-        let expected: Value =
+        let unprojected = serde_json::to_value(generated.models).unwrap();
+        let mut actual = unprojected.clone();
+        let mut expected: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json")).unwrap();
+        expected["deepseek"] = deepseek["models"].clone();
+        // Preserve the old reader fixture while the generator fixes 3.1 Pro.
+        for models in expected.as_object_mut().unwrap().values_mut() {
+            for model in models.as_object_mut().unwrap().values_mut() {
+                if model["api"] == "google-generative-ai"
+                    && model["id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("gemini-3.1-pro"))
+                {
+                    model["thinkingLevelMap"]["medium"] = json!("MEDIUM");
+                }
+            }
+        }
         // Compare the pinned Pi surface, which deliberately had text/image
         // only. Pioneer media supplements and new registered source routes
         // have their own propagation fixtures below.
+        // The Pi fixture collapsed missing prices into zero. Keep every
+        // known price under exact comparison; allow unknown only when the
+        // source omitted that exact category.
+        let captured_at = snapshot().captured_at;
         let providers = actual.as_object_mut().unwrap();
-        providers.retain(|p, _| !expected[p].is_null());
-        for (p, models) in providers {
+        providers.retain(|provider, _| !expected[provider].is_null());
+        for (provider, models) in providers {
             models
                 .as_object_mut()
                 .unwrap()
-                .retain(|id, _| !expected[p][id].is_null());
-            for model in models.as_object_mut().unwrap().values_mut() {
+                .retain(|id, _| !expected[provider][id].is_null());
+            for (id, model) in models.as_object_mut().unwrap() {
+                // The Pi fixture predates the media contract and supplements.
                 let image = has(&model["input"], "image");
                 model["input"] = if image {
                     json!(["text", "image"])
                 } else {
                     json!(["text"])
                 };
+
+                let source = model.get("pricingSource").cloned().unwrap_or(Value::Null);
+                if model.get("pricingEvidenceVersion").is_some() {
+                    assert_eq!(model["pricingEvidenceVersion"], 1);
+                    assert_eq!(model["pricingCapturedAt"], captured_at);
+                    assert_eq!(
+                        model["pricingUnits"],
+                        if provider == "github-copilot" {
+                            json!("unknown_subscription_units")
+                        } else {
+                            json!("USD_per_million_tokens")
+                        }
+                    );
+                }
                 for field in [
+                    "pricingSource",
+                    "pricingEvidenceVersion",
+                    "pricingCapturedAt",
+                    "pricingUnits",
+                    "sourceGeneration",
                     "inputOrigin",
                     "sourceMetadata",
                     "inputConstraints",
                     "output",
                 ] {
                     model.as_object_mut().unwrap().remove(field);
+                }
+                let reference = &expected[provider][id]["cost"];
+                if let (Some(fallbacks), Some(old)) = (
+                    model
+                        .get_mut("compat")
+                        .and_then(|compat| compat.get_mut("allowedFallbackModels"))
+                        .and_then(Value::as_array_mut),
+                    expected[provider][id]["compat"]["allowedFallbackModels"].as_array(),
+                ) {
+                    assert_eq!(fallbacks.len(), old.len());
+                    for (fallback, old) in fallbacks.iter_mut().zip(old) {
+                        let canonical = &unprojected[fallback["provider"].as_str().unwrap()]
+                            [fallback["model"].as_str().unwrap()];
+                        assert_eq!(fallback["cost"], canonical["cost"]);
+                        project_pinned_cost_fields(
+                            &mut fallback["cost"],
+                            &old["cost"],
+                            &canonical["pricingSource"]["raw"],
+                        );
+                    }
+                }
+                let prices = model["cost"].as_object_mut().unwrap();
+                // Native source fields remain in production; the old fixture
+                // compares normalized fields only. Separate tests assert their
+                // retention and conservative handling of opaque tier conditions.
+                prices.retain(|key, _| reference.get(key).is_some());
+                for (field, native) in [
+                    ("input", "input"),
+                    ("output", "output"),
+                    ("cacheRead", "cache_read"),
+                    ("cacheWrite", "cache_write"),
+                ] {
+                    if provider == "openrouter"
+                        && matches!(id.as_str(), "openrouter/auto" | "openrouter/auto-beta")
+                        && matches!(field, "input" | "output")
+                    {
+                        let native = if field == "input" {
+                            "prompt"
+                        } else {
+                            "completion"
+                        };
+                        assert_eq!(source["raw"][native], "-1");
+                        assert_eq!(
+                            source["unknownRateContract"]["reason"],
+                            "dynamic_selected_model_tariff"
+                        );
+                        assert_eq!(prices[field], Value::Null);
+                        assert_eq!(reference[field], -1_000_000);
+                        // Comparison-only projection of the exact old sentinel.
+                        prices.insert(field.into(), reference[field].clone());
+                    }
+                    if prices.get(field) == Some(&Value::Null)
+                        && reference[field].as_f64() == Some(0.)
+                    {
+                        let router = match field {
+                            "input" => "prompt",
+                            "output" => "completion",
+                            "cacheRead" => "input_cache_read",
+                            _ => "input_cache_write",
+                        };
+                        assert!(
+                            source["raw"][native].is_null() && source["raw"][router].is_null(),
+                            "{provider}/{id}/{field}: explicit zero must not become unknown"
+                        );
+                        prices.insert(field.into(), reference[field].clone());
+                    }
+                }
+                if let (Some(tiers), Some(old)) = (
+                    prices.get_mut("tiers").and_then(Value::as_array_mut),
+                    reference["tiers"].as_array(),
+                ) {
+                    assert_eq!(tiers.len(), old.len());
+                    for (index, (tier, old)) in tiers.iter_mut().zip(old).enumerate() {
+                        project_pinned_cost_fields(tier, old, &source["raw"]["tiers"][index]);
+                        for (field, native) in [
+                            ("input", "input"),
+                            ("output", "output"),
+                            ("cacheRead", "cache_read"),
+                            ("cacheWrite", "cache_write"),
+                        ] {
+                            if tier[field].is_null() && old[field].as_f64() == Some(0.) {
+                                assert!(source["raw"][native].is_null());
+                                tier[field] = old[field].clone();
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -647,6 +828,132 @@ mod validation_tests {
 }
 
 #[cfg(test)]
+mod dynamic_pricing_regressions {
+    use super::*;
+    fn pinned() -> SourceSnapshot {
+        serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json")).unwrap()
+    }
+    #[test]
+    fn full_pinned_generation_accepts_documented_auto_unknown_at_both_strictness_levels() {
+        let strict_output = generate(&pinned(), true).unwrap();
+        for strict in [true, false] {
+            let output = generate(&pinned(), strict).unwrap();
+            assert_eq!(output.models, strict_output.models);
+            assert_eq!(output.provenance, strict_output.provenance);
+            output.validate().unwrap();
+            for id in ["openrouter/auto", "openrouter/auto-beta"] {
+                let m = &output.models["openrouter"][id];
+                assert!(m["cost"]["input"].is_null());
+                assert!(m["cost"]["output"].is_null());
+                assert_eq!(m["pricingSource"]["raw"]["prompt"], "-1");
+                assert_eq!(m["pricingSource"]["raw"]["completion"], "-1");
+                assert_eq!(
+                    m["pricingSource"]["unknownRateContract"]["reason"],
+                    "dynamic_selected_model_tariff"
+                );
+                assert_eq!(m["api"], "openai-completions");
+            }
+        }
+    }
+    #[test]
+    fn sentinel_exception_never_allows_other_negative_or_malformed_rates() {
+        for strict in [true, false] {
+            for value in [
+                json!("-2"),
+                json!(-2),
+                json!("NaN"),
+                json!("inf"),
+                json!("1e308"),
+                json!(1e308),
+                json!("bad"),
+                json!(false),
+            ] {
+                let mut source = pinned();
+                let entries = source.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
+                    .as_array_mut()
+                    .unwrap();
+                let auto = entries
+                    .iter_mut()
+                    .find(|m| m["id"] == "openrouter/auto")
+                    .unwrap();
+                auto["pricing"]["prompt"] = value;
+                assert!(generate(&source, strict).is_err());
+            }
+            let mut source = pinned();
+            let entries = source.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
+                .as_array_mut()
+                .unwrap();
+            let auto = entries
+                .iter()
+                .find(|m| m["id"] == "openrouter/auto")
+                .unwrap()
+                .clone();
+            let mut unsupported = auto;
+            unsupported["id"] = json!("fixture/unknown-sentinel");
+            entries.push(unsupported);
+            assert!(generate(&source, strict).is_err());
+        }
+    }
+    #[test]
+    fn unsupported_source_and_cache_sentinels_are_still_invalid() {
+        let mut source = pinned();
+        let entries = source.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
+            .as_array_mut()
+            .unwrap();
+        let auto = entries
+            .iter_mut()
+            .find(|m| m["id"] == "openrouter/auto")
+            .unwrap();
+        auto["pricing"]["input_cache_read"] = json!("-1");
+        assert!(generate(&source, false).is_err());
+        let mut source = pinned();
+        let entries = source.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"]
+            .as_array_mut()
+            .unwrap();
+        let mut model = entries
+            .iter()
+            .find(|m| {
+                m["tags"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|tag| tag == "tool-use"))
+            })
+            .unwrap()
+            .clone();
+        model["id"] = json!("fixture/negative-vercel");
+        model["pricing"]["input"] = json!("-1");
+        entries.push(model);
+        assert!(generate(&source, false).is_err());
+    }
+    #[test]
+    fn explicit_free_zero_preserves_entire_nonpricing_contract() {
+        let source = pinned();
+        let baseline = generate(&source, true).unwrap();
+        let mut free = source;
+        let auto = free.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|m| m["id"] == "openrouter/auto")
+            .unwrap();
+        auto["pricing"]["prompt"] = json!("0");
+        auto["pricing"]["completion"] = json!("0");
+        let output = generate(&free, true).unwrap();
+        assert_eq!(
+            output.models["openrouter"]["openrouter/auto"]["cost"]["input"],
+            0.
+        );
+        let mut before = baseline.models["openrouter"]["openrouter/auto"].clone();
+        let mut after = output.models["openrouter"]["openrouter/auto"].clone();
+        for field in ["cost", "pricingSource"] {
+            before.as_object_mut().unwrap().remove(field);
+            after.as_object_mut().unwrap().remove(field);
+        }
+        assert_eq!(before, after);
+        assert_eq!(baseline.provenance, output.provenance);
+    }
+}
+
+#[cfg(test)]
 mod media_propagation_tests {
     use super::*;
     #[test]
@@ -806,36 +1113,41 @@ mod specialized_zero_regressions {
         let mut s: SourceSnapshot =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
                 .unwrap();
-        let reference: Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json")).unwrap();
         let changed = json!({"tool_call":true,"name":"dynamic","modalities":{"input":["text"]},"cost":{"input":99,"output":99},"limit":{"context":64000,"output":4000}});
         s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["deepseek"]["models"]["deepseek-v4-flash"] =
+            changed.clone();
+        s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["anthropic"]["models"]["claude-opus-4-6"] =
             changed.clone();
         s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["deepseek"]["models"]["fixture-dynamic"] =
             changed;
         let generated = generate(&s, true).unwrap();
         let known = &generated.models["deepseek"]["deepseek-v4-flash"];
-        for field in ["contextWindow", "maxTokens"] {
-            assert_eq!(
-                known[field],
-                reference["deepseek"]["deepseek-v4-flash"][field]
-            );
-        }
-        // Numeric JSON representations such as 0 and 0.0 carry the same rate.
-        // Compare all pinned cost fields without dropping any pricing evidence.
-        let expected_cost = reference["deepseek"]["deepseek-v4-flash"]["cost"]
-            .as_object()
-            .unwrap();
-        let actual_cost = known["cost"].as_object().unwrap();
+        // DeepSeek's existing IDs, like new IDs, are source-owned. Do not
+        // reintroduce stale pinned limits/prices to exercise override priority.
+        assert_eq!(known["contextWindow"], 64000);
+        assert_eq!(known["maxTokens"], 4000);
+        // The source supplies input/output rates only; missing cache rates
+        // remain unknown rather than being interpreted as free caching.
         assert_eq!(
-            actual_cost.keys().collect::<Vec<_>>(),
-            expected_cost.keys().collect::<Vec<_>>()
+            known["cost"],
+            json!({"input":99,"output":99,"cacheRead":null,"cacheWrite":null})
         );
-        for (field, expected) in expected_cost {
-            assert_eq!(actual_cost[field].as_f64(), expected.as_f64(), "{field}");
-        }
         assert_eq!(
             generated.provenance["deepseek"]["deepseek-v4-flash"]["contextWindow"]["kind"],
+            "source"
+        );
+        // A genuine explicit context override retains priority, while the
+        // independently source-owned output limit continues to refresh.
+        assert_eq!(
+            generated.models["anthropic"]["claude-opus-4-6"]["contextWindow"],
+            1_000_000
+        );
+        assert_eq!(
+            generated.models["anthropic"]["claude-opus-4-6"]["maxTokens"],
+            4000
+        );
+        assert_eq!(
+            generated.provenance["anthropic"]["claude-opus-4-6"]["contextWindow"]["kind"],
             "override"
         );
         let dynamic = &generated.models["deepseek"]["fixture-dynamic"];

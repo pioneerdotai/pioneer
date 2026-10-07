@@ -2071,6 +2071,7 @@ fn hook_tool_names_from_strings(names: &[String]) -> Vec<HookToolName> {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_turn_preflight_stage(
+    event_tx: Arc<AgentEventHub>,
     provider_registry: Arc<ProviderRegistry>,
     provider: Arc<dyn Provider>,
     model: &str,
@@ -2162,6 +2163,12 @@ async fn run_agent_turn_preflight_stage(
     };
 
     run_turn_preflight_orchestrator(TurnPreflightOrchestratorInput {
+        usage_context: Some(preflight::PreflightUsageContext {
+            events: event_tx,
+            workspace: workspace_id.into(),
+            thread: thread_id.into(),
+            turn: turn_id.into(),
+        }),
         provider_registry,
         workspace_id: workspace_id.to_owned(),
         thread_provider: provider,
@@ -3876,6 +3883,7 @@ async fn execute_agent_provider_response(
         })?;
 
         let turn_preflight = run_agent_turn_preflight_stage(
+            event_tx.clone(),
             provider_registry.clone(),
             provider.clone(),
             model.as_str(),
@@ -4225,6 +4233,7 @@ async fn execute_agent_provider_response(
     };
 
     let turn_preflight = run_agent_turn_preflight_stage(
+        event_tx.clone(),
         provider_registry,
         provider.clone(),
         model.as_str(),

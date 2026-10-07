@@ -11168,6 +11168,7 @@ fn provider_model_from_runtime_model_for_reasoning_lookup(
         .supports_reasoning
         .or_else(|| (!model.effort_options.is_empty()).then_some(true));
     let reasoning = supports_reasoning.map(|supported| ProviderModelReasoningCapabilities {
+        native: Default::default(),
         supported: Some(supported),
         effort_options: model.effort_options.clone(),
         default_effort: None,
@@ -11704,11 +11705,156 @@ mod tests {
         }
     }
 
+    #[test]
+    fn documented_claude_off_survives_catalog_selector_and_admission() {
+        use pioneer_provider::catalog::ModelCatalog;
+        for (provider, key, id, template, optional) in [
+            (
+                "anthropic",
+                "anthropic",
+                "claude-opus-4-5-20251101",
+                "claude-opus-4-5",
+                true,
+            ),
+            (
+                "anthropic",
+                "anthropic",
+                "claude-opus-4-6",
+                "claude-opus-4-6",
+                true,
+            ),
+            (
+                "anthropic",
+                "anthropic",
+                "claude-sonnet-5",
+                "claude-opus-4-6",
+                true,
+            ),
+            (
+                "anthropic",
+                "anthropic",
+                "claude-opus-5",
+                "claude-opus-4-6",
+                true,
+            ),
+            (
+                "anthropic",
+                "anthropic",
+                "claude-fable-5-1",
+                "claude-opus-4-6",
+                false,
+            ),
+            (
+                "anthropic",
+                "anthropic",
+                "claude-sonnet-5-5",
+                "claude-opus-4-6",
+                false,
+            ),
+            (
+                "bedrock",
+                "amazon-bedrock",
+                "us.anthropic.claude-opus-4-6-v1",
+                "anthropic.claude-opus-4-6-v1",
+                true,
+            ),
+            (
+                "bedrock",
+                "amazon-bedrock",
+                "anthropic.claude-opus-4-5-20251101-v1:0",
+                "anthropic.claude-opus-4-6-v1",
+                true,
+            ),
+            (
+                "bedrock",
+                "amazon-bedrock",
+                "anthropic.claude-fable-5",
+                "anthropic.claude-opus-4-6-v1",
+                false,
+            ),
+        ] {
+            for kind in [
+                "saved",
+                "missing",
+                "partial",
+                "catalog-veto",
+                "native-veto",
+                "capability-veto",
+            ] {
+                let mut models: serde_json::Value = serde_json::from_str(include_str!(
+                    "../../../provider/tests/fixtures/catalog/models.json"
+                ))
+                .unwrap();
+                let mut provenance: serde_json::Value = serde_json::from_str(include_str!(
+                    "../../../provider/tests/fixtures/catalog/provenance.json"
+                ))
+                .unwrap();
+                if kind == "missing" {
+                    models[key].as_object_mut().unwrap().remove(id);
+                } else if kind != "saved" {
+                    let mut entry = models[key][template].clone();
+                    assert!(entry.get("api").is_some());
+                    entry["id"] = serde_json::json!(id);
+                    entry["thinkingLevelMap"] = if kind == "catalog-veto" {
+                        serde_json::json!({"off":null})
+                    } else {
+                        serde_json::json!({"max":"max"})
+                    };
+                    if kind == "capability-veto" {
+                        entry["reasoning"] = serde_json::json!(false);
+                    }
+                    models[key][id] = entry;
+                    provenance[key][id] = provenance[key][template].clone();
+                }
+                // Saved profiles can explicitly veto off too (Opus 5 has
+                // off:null). A documented optional mode only fills missing
+                // metadata; it cannot override that catalog denial.
+                let catalog_off_veto = models[key][id]["reasoning"] == false
+                    || models[key][id]
+                        .get("thinkingLevelMap")
+                        .and_then(|map| map.get("off"))
+                        .is_some_and(serde_json::Value::is_null);
+                let catalog =
+                    ModelCatalog::parse(&models.to_string(), &provenance.to_string()).unwrap();
+                let mut model = reasoning_test_model(None);
+                model.id = id.into();
+                model.provider = provider.into();
+                if kind == "native-veto" {
+                    model.capabilities.reasoning = Some(ProviderModelReasoningCapabilities {
+                        native: [("thinking.types.disabled".into(), Some(false))]
+                            .into_iter()
+                            .collect(),
+                        ..Default::default()
+                    });
+                }
+                catalog.enrich(provider, std::slice::from_mut(&mut model));
+                let rows = pioneer_client::providers::presentation::reasoning_effort_rows_for_model(
+                    &model, None,
+                );
+                let off_allowed = optional && !catalog_off_veto && kind != "native-veto";
+                assert_eq!(
+                    rows.iter().any(|r| r.effort == "none"),
+                    off_allowed,
+                    "{provider}/{id}/{kind}"
+                );
+                assert_eq!(
+                    validate_reasoning_effort_for_model(provider, id, "none", Some(&model)).is_ok(),
+                    off_allowed
+                );
+                for row in rows {
+                    validate_reasoning_effort_for_model(provider, id, &row.effort, Some(&model))
+                        .unwrap();
+                }
+            }
+        }
+    }
+
     fn reasoning_capabilities(
         supported: Option<bool>,
         effort_options: &[&str],
     ) -> ProviderModelReasoningCapabilities {
         ProviderModelReasoningCapabilities {
+            native: Default::default(),
             supported,
             effort_options: effort_options
                 .iter()

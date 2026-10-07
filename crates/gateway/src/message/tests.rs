@@ -3991,7 +3991,14 @@ impl Provider for CaptureSummaryProvider {
                 limits: Default::default(),
                 capabilities: pioneer_protocol::ProviderModelCapabilities {
                     vision: Some(true),
-                    input_modalities: Some(vec!["text".into(), "image".into(), "pdf".into()]),
+                    // The catalog's o4-mini contract is text/image only. Keep
+                    // PDF on the synthetic model used for native CLI history;
+                    // discovery cannot widen a catalog-known negative.
+                    input_modalities: Some(if id == "test-model" {
+                        vec!["text".into(), "image".into(), "pdf".into()]
+                    } else {
+                        vec!["text".into(), "image".into()]
+                    }),
                     output_modalities: Some(vec!["text".into()]),
                     ..Default::default()
                 },
@@ -4199,6 +4206,7 @@ impl Provider for PromptParityCaptureProvider {
                 tool_calling: Some(true),
                 thinking: Some(true),
                 reasoning: Some(pioneer_protocol::ProviderModelReasoningCapabilities {
+                    native: Default::default(),
                     supported: Some(true),
                     effort_options: vec![
                         "minimal".to_owned(),
@@ -12689,15 +12697,24 @@ async fn discover_native_capture_models(
         .await
         .unwrap();
     assert_eq!(models.len(), 2);
-    assert!(models.iter().all(|model| {
-        model
+    for id in ["test-model", "o4-mini"] {
+        let model = models.iter().find(|model| model.id == id).unwrap();
+        let input = model
             .capabilities
             .input_modalities
             .as_ref()
-            .is_some_and(|input| {
-                input.iter().any(|kind| kind == "image") && input.iter().any(|kind| kind == "pdf")
-            })
-    }));
+            .expect("native capture model must retain explicit input capabilities");
+        assert!(input.iter().any(|kind| kind == "text"));
+        assert!(input.iter().any(|kind| kind == "image"));
+        assert_eq!(model.capabilities.vision, Some(true));
+        assert_eq!(
+            input
+                .iter()
+                .any(|kind| matches!(kind.as_str(), "pdf" | "file" | "document")),
+            id == "test-model",
+            "{id} must retain its own document contract after discovery"
+        );
+    }
 }
 
 async fn materialize_artifact_api_thread(
@@ -13178,11 +13195,14 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
         )
         .await;
     let _first_response = recv_response_by_id(&mut rx, first_request_id.as_str()).await;
-    let first_status = wait_for_turn_status(
-        processor.crud_store.clone(),
-        thread.thread.id.as_str(),
-        first_turn_id,
-        TurnStatus::Completed,
+    let first_status = drain_test_notifications_while(
+        &mut rx,
+        wait_for_turn_status(
+            processor.crud_store.clone(),
+            thread.thread.id.as_str(),
+            first_turn_id,
+            TurnStatus::Completed,
+        ),
     )
     .await;
     let first_persisted = processor
@@ -13219,11 +13239,14 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
         .await;
     let _second_response = recv_response_by_id(&mut rx, second_request_id.as_str()).await;
     assert_eq!(
-        wait_for_turn_status(
-            processor.crud_store.clone(),
-            thread.thread.id.as_str(),
-            second_turn_id,
-            TurnStatus::Completed,
+        drain_test_notifications_while(
+            &mut rx,
+            wait_for_turn_status(
+                processor.crud_store.clone(),
+                thread.thread.id.as_str(),
+                second_turn_id,
+                TurnStatus::Completed,
+            )
         )
         .await,
         TurnStatus::Completed,
@@ -13352,11 +13375,14 @@ async fn followup_history_rejects_unavailable_accepted_artifact_before_provider(
         )
         .await;
     let _first_response = recv_response_by_id(&mut rx, first_request_id.as_str()).await;
-    let first_status = wait_for_turn_status(
-        processor.crud_store.clone(),
-        thread.thread.id.as_str(),
-        first_turn_id,
-        TurnStatus::Completed,
+    let first_status = drain_test_notifications_while(
+        &mut rx,
+        wait_for_turn_status(
+            processor.crud_store.clone(),
+            thread.thread.id.as_str(),
+            first_turn_id,
+            TurnStatus::Completed,
+        ),
     )
     .await;
     let first_persisted = processor
@@ -13398,11 +13424,14 @@ async fn followup_history_rejects_unavailable_accepted_artifact_before_provider(
         )
         .await;
     let _second_response = recv_response_by_id(&mut rx, second_request_id.as_str()).await;
-    let second_status = wait_for_turn_status(
-        processor.crud_store.clone(),
-        thread.thread.id.as_str(),
-        second_turn_id,
-        TurnStatus::Blocked,
+    let second_status = drain_test_notifications_while(
+        &mut rx,
+        wait_for_turn_status(
+            processor.crud_store.clone(),
+            thread.thread.id.as_str(),
+            second_turn_id,
+            TurnStatus::Blocked,
+        ),
     )
     .await;
     let failed = processor
@@ -31784,10 +31813,13 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
     )
     .await;
     assert!(
-        wait_for_prompt_parity_request_count(
-            provider.as_ref(),
-            PromptParityRequestKind::PostTurnExtractor,
-            2,
+        drain_test_notifications_while(
+            &mut harness.rx,
+            wait_for_prompt_parity_request_count(
+                provider.as_ref(),
+                PromptParityRequestKind::PostTurnExtractor,
+                2,
+            )
         )
         .await,
         "both seed turns should finish post-turn extraction before comparison"
@@ -31805,10 +31837,13 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
         exact_user_text,
     )
     .await;
-    if !wait_for_prompt_parity_request_count(
-        provider.as_ref(),
-        PromptParityRequestKind::PostTurnExtractor,
-        1,
+    if !drain_test_notifications_while(
+        &mut harness.rx,
+        wait_for_prompt_parity_request_count(
+            provider.as_ref(),
+            PromptParityRequestKind::PostTurnExtractor,
+            1,
+        ),
     )
     .await
     {
@@ -31871,10 +31906,13 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
     let task = create_task_for_test(&harness.processor, params)
         .await
         .expect("detached prompt parity task should start");
-    let task_status = wait_for_task_status(
-        harness.crud_store.clone(),
-        task.task.id.as_str(),
-        TaskStatus::Completed,
+    let task_status = drain_test_notifications_while(
+        &mut harness.rx,
+        wait_for_task_status(
+            harness.crud_store.clone(),
+            task.task.id.as_str(),
+            TaskStatus::Completed,
+        ),
     )
     .await;
     if task_status != TaskStatus::Completed {
@@ -31889,10 +31927,13 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
             failed.task.error, failed.runs
         );
     }
-    if !wait_for_prompt_parity_request_count(
-        provider.as_ref(),
-        PromptParityRequestKind::PostTurnExtractor,
-        1,
+    if !drain_test_notifications_while(
+        &mut harness.rx,
+        wait_for_prompt_parity_request_count(
+            provider.as_ref(),
+            PromptParityRequestKind::PostTurnExtractor,
+            1,
+        ),
     )
     .await
     {
@@ -32066,10 +32107,13 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
     )
     .await;
     assert!(
-        wait_for_prompt_parity_request_count(
-            provider.as_ref(),
-            PromptParityRequestKind::PostTurnExtractor,
-            2,
+        drain_test_notifications_while(
+            &mut harness.rx,
+            wait_for_prompt_parity_request_count(
+                provider.as_ref(),
+                PromptParityRequestKind::PostTurnExtractor,
+                2,
+            )
         )
         .await,
         "both full-parity seed turns should finish post-turn extraction"
@@ -32167,10 +32211,13 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         )];
     direct_launch.agent_launch = Some(exact_agent_launch.clone());
     run_memory_e2e_turn_with_params(&mut harness, &direct_launch).await;
-    if !wait_for_prompt_parity_request_count(
-        provider.as_ref(),
-        PromptParityRequestKind::PostTurnExtractor,
-        1,
+    if !drain_test_notifications_while(
+        &mut harness.rx,
+        wait_for_prompt_parity_request_count(
+            provider.as_ref(),
+            PromptParityRequestKind::PostTurnExtractor,
+            1,
+        ),
     )
     .await
     {
@@ -32277,10 +32324,13 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
     let task = create_task_for_test(&harness.processor, params)
         .await
         .expect("full prompt parity task should start");
-    let task_status = wait_for_task_status(
-        harness.crud_store.clone(),
-        task.task.id.as_str(),
-        TaskStatus::Completed,
+    let task_status = drain_test_notifications_while(
+        &mut harness.rx,
+        wait_for_task_status(
+            harness.crud_store.clone(),
+            task.task.id.as_str(),
+            TaskStatus::Completed,
+        ),
     )
     .await;
     if task_status != TaskStatus::Completed {
@@ -32346,10 +32396,13 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
             }),
         "the detached child must not inherit the direct Turn's private artifact-output root"
     );
-    if !wait_for_prompt_parity_request_count(
-        provider.as_ref(),
-        PromptParityRequestKind::PostTurnExtractor,
-        1,
+    if !drain_test_notifications_while(
+        &mut harness.rx,
+        wait_for_prompt_parity_request_count(
+            provider.as_ref(),
+            PromptParityRequestKind::PostTurnExtractor,
+            1,
+        ),
     )
     .await
     {
@@ -56500,15 +56553,17 @@ async fn turn_cancel_allows_authorized_non_subscribed_collaborator_user() {
     session_manager
         .set_connection_workspace(foreign_connection_id, Some(workspace_id.clone()))
         .await;
+    let provider_entered = Arc::new(Notify::new());
+    let provider_release = Arc::new(Notify::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "delayed",
-        Arc::new(DelayedProvider {
-            delay: Duration::from_secs(30),
-            text: "too late".to_owned(),
+        Arc::new(CancellationBarrierProvider {
+            entered: provider_entered.clone(),
+            release: provider_release.clone(),
         }),
     ));
     let processor = MessageProcessor::new(
-        thread_manager,
+        thread_manager.clone(),
         provider_registry,
         session_manager,
         workspace_manager,
@@ -56553,8 +56608,34 @@ async fn turn_cancel_allows_authorized_non_subscribed_collaborator_user() {
         .process_request_for_connection(owner_connection_id, &turn_start_request.to_string())
         .await;
     let _ = recv_response_by_id(&mut rx_owner, turn_start_request_id.as_str()).await;
+    // turn/start acknowledges admission before the actor durably registers its
+    // immutable cancellation context. Test collaborator authorization against a
+    // running turn, holding the provider at a barrier instead of racing startup
+    // or a timer-driven completion. Drain the owner's startup notifications so
+    // websocket backpressure cannot prevent the actor from reaching the barrier.
+    timeout(
+        Duration::from_secs(30),
+        drain_test_notifications_while(&mut rx_owner, provider_entered.notified()),
+    )
+    .await
+    .expect("collaborator cancellation provider should enter after context registration");
+    assert!(
+        crud_store
+            .native_cancellation_context(TURN_ID)
+            .await
+            .expect("native cancellation context should load")
+            .is_some(),
+        "running turn must have its durable cancellation context"
+    );
     materialize_test_member_collaborator(crud_store.as_ref(), workspace_id.as_str(), THREAD_ID)
         .await;
+    assert!(
+        !thread_manager
+            .subscribed_connection_ids(THREAD_ID)
+            .await
+            .contains(&foreign_connection_id),
+        "authorized collaborator must remain unsubscribed"
+    );
 
     let cancel_request_id = generate_test_request_id("turncancelforeign", "stop");
     let cancel_request = json!({
@@ -56574,7 +56655,25 @@ async fn turn_cancel_allows_authorized_non_subscribed_collaborator_user() {
     let response = recv_response_by_id(&mut rx_foreign, cancel_request_id.as_str()).await;
     let response: TurnCancelResponse =
         serde_json::from_value(response.result).expect("authorized cancel response should decode");
+    assert_eq!(response.thread_id, THREAD_ID);
+    assert_eq!(response.turn.id, TURN_ID);
     assert_eq!(response.turn.status, TurnStatus::Interrupted);
+    assert_eq!(response.turn.error.as_deref(), Some("foreign stop"));
+    let (_, persisted_turn) = crud_store
+        .get_turn(THREAD_ID, TURN_ID)
+        .await
+        .expect("cancelled turn should load")
+        .expect("cancelled turn should remain persisted");
+    assert_eq!(persisted_turn.status, TurnStatus::Interrupted);
+    assert_eq!(persisted_turn.error.as_deref(), Some("foreign stop"));
+    assert!(
+        crud_store
+            .native_cancellation_was_accepted(TURN_ID)
+            .await
+            .expect("native cancellation receipt should load")
+    );
+    processor.agent_manager.remove_thread(THREAD_ID).await;
+    provider_release.notify_one();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -73764,6 +73863,25 @@ async fn wait_for_run_status(
         .status
 }
 
+/// Keep client notification backpressure out of waits for durable background work.
+/// Call only after receiving the RPC response; the caller still checks the result.
+async fn drain_test_notifications_while<T>(
+    rx: &mut mpsc::Receiver<Message>,
+    completion: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::pin!(completion);
+    loop {
+        tokio::select! {
+            result = &mut completion => return result,
+            notification = rx.recv() => {
+                if notification.is_none() {
+                    return completion.await;
+                }
+            }
+        }
+    }
+}
+
 async fn wait_for_turn_status(
     crud_store: Arc<CrudStore>,
     thread_id: &str,
@@ -78897,7 +79015,9 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
     let mut enabled_budget = None;
     let mut enabled_reserve = None;
     for (effort, reasoning, thinking) in [
-        (None, None, false),
+        // V4's server default enables thinking; only explicit off keeps this
+        // completed non-thinking tool round native instead of portable.
+        (None, None, true),
         (Some("none"), Some(ReasoningConfig::Disabled), false),
         (
             Some("high"),
@@ -80081,6 +80201,713 @@ mod task_delivery_cancellation;
 
 #[path = "tests/memory_post_turn_recovery.rs"]
 mod memory_post_turn_recovery;
+
+#[tokio::test]
+async fn provider_usage_items_persist_idempotently_without_entering_llm_history() {
+    let thread = "thr_usage_ledger";
+    let turn = "turn_usage_ledger";
+    let (processor, store, workspace) = setup_execution_window_terminal_turn(thread, turn).await;
+    start_terminal_test_execution_window(&processor, &workspace, thread, turn, "win_usage_ledger")
+        .await;
+    let make_item = |id: &str, input: Option<u64>, output: Option<u64>, complete: bool| {
+        TurnItem::SystemEvent {
+            id: id.into(),
+            level: pioneer_protocol::SystemEventLevel::Info,
+            message: "Provider usage observation".into(),
+            code: Some("provider_usage".into()),
+            details: Some(
+                json!({"schema_version":1,"nativeMethod":"provider/usage/observed",
+            "physical_attempt_id":id,"provider":"openrouter","model":"fixture","api":"chat_completions",
+            "complete":complete,"usage":{"input_tokens":input,"output_tokens":output,
+                "generation_id":"gen-header","request_id":"req-distinct","reported_model":"returned-model",
+                "cache_read_input_tokens":80,"raw_usage":{"prompt_tokens":input,"completion_tokens":output},
+                "accounting":{"reported_cost":{"amount":0.01,"currency":"credits","provenance":"provider_response_usage.cost"},"estimated_cost":null}}}),
+            ),
+        }
+    };
+    let mut restored = Vec::new();
+    for (id, input, output, complete) in [
+        ("usage-failed", Some(100), Some(2), false),
+        ("usage-retry", Some(120), Some(0), true),
+        ("usage-missing", None, None, false),
+    ] {
+        let item = make_item(id, input, output, complete);
+        let started = AgentDurableEvent::ItemStarted {
+            notification: ItemStartedNotification {
+                workspace_id: workspace.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: make_item(id, None, None, false),
+            },
+        };
+        assert!(processor.handle_durable_agent_event(started).await);
+        let event = AgentDurableEvent::ItemCompleted {
+            notification: ItemCompletedNotification {
+                workspace_id: workspace.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: item.clone(),
+            },
+        };
+        assert!(processor.handle_durable_agent_event(event.clone()).await);
+        assert!(processor.handle_durable_agent_event(event).await);
+        let persisted = store.get_turn_item(turn, id).await.unwrap().unwrap();
+        assert_eq!(persisted, item);
+        restored.push(persisted);
+    }
+    let totals = pioneer_protocol::observed_provider_usage_totals(&restored);
+    assert_eq!(totals.attempts, 3);
+    assert_eq!(totals.known_input_tokens, 220);
+    assert_eq!(totals.known_output_tokens, 2);
+    assert_eq!(totals.missing_input_attempts, 1);
+    let context = store
+        .compaction_source_page(
+            &workspace,
+            thread,
+            turn,
+            pioneer_crud::compaction::PagedSource::ProviderContext,
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(
+        context.entries.is_empty(),
+        "accounting is not provider replay/history"
+    );
+}
+
+#[tokio::test]
+async fn auxiliary_usage_journal_is_scoped_idempotent_bounded_and_restart_readable() {
+    use pioneer_crud::ProviderUsageObservation;
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_aux_usage", "turn_aux_usage").await;
+    let background = store.with_maintenance_access();
+    assert_eq!(
+        background.database_connection().read_class(),
+        pioneer_sqlite::SqliteReadClass::Maintenance
+    );
+    assert_eq!(
+        background.database_connection().write_class(),
+        pioneer_sqlite::SqliteWriteClass::Maintenance
+    );
+    assert_eq!(
+        store.database_connection().write_class(),
+        pioneer_sqlite::SqliteWriteClass::Interactive
+    );
+    let mut partial = ProviderUsageObservation {
+        id: "aux-1".into(),
+        workspace_id: workspace.clone(),
+        operation_kind: "self_improvement".into(),
+        owner_id: "run-usage".into(),
+        status: "started".into(),
+        usage_json: json!({"input_tokens":100,"cache_read_input_tokens":80,"output_tokens":null})
+            .to_string(),
+        started_at: 1,
+        updated_at: 1,
+    };
+    background
+        .record_provider_usage(partial.clone())
+        .await
+        .unwrap();
+    partial.status = "failed".into();
+    partial.updated_at = 2;
+    background
+        .record_provider_usage(partial.clone())
+        .await
+        .unwrap();
+    background
+        .record_provider_usage(partial.clone())
+        .await
+        .unwrap();
+    let mut stale = partial.clone();
+    stale.status = "started".into();
+    stale.updated_at = 3;
+    assert!(background.record_provider_usage(stale).await.is_err());
+    let mut cross_workspace = partial.clone();
+    cross_workspace.workspace_id = "unrelated-workspace".into();
+    assert!(
+        background
+            .record_provider_usage(cross_workspace)
+            .await
+            .is_err()
+    );
+    let mut invalid = partial.clone();
+    invalid.id = "poison".into();
+    invalid.usage_json = "x".repeat(32769);
+    assert!(background.record_provider_usage(invalid).await.is_err());
+    let mut retry = partial.clone();
+    retry.id = "aux-2".into();
+    retry.status = "completed".into();
+    retry.usage_json = json!({"input_tokens":120,"output_tokens":0}).to_string();
+    let (write, read) = tokio::join!(
+        store.record_provider_usage(retry.clone()),
+        background.provider_usage_page(&workspace, "run-usage", "", 1)
+    );
+    write.unwrap();
+    assert_eq!(read.unwrap().len(), 1);
+    let restarted = pioneer_crud::CrudStore::new(background.database_connection());
+    let rows = restarted
+        .provider_usage_page(&workspace, "run-usage", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![partial, retry]);
+    assert!(
+        restarted
+            .provider_usage_page(&workspace, "run-usage", "", 101)
+            .await
+            .is_err()
+    );
+    assert!(
+        restarted
+            .provider_usage_page(&workspace, "another-run", "", 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .compaction_source_page(
+                &workspace,
+                "thr_aux_usage",
+                "turn_aux_usage",
+                pioneer_crud::compaction::PagedSource::ProviderContext,
+                0
+            )
+            .await
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn auxiliary_chat_keeps_native_usage_before_application_validation() {
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_aux_chat", "turn_aux_chat").await;
+    let registry = test_provider();
+    let provider = crate::usage_journal::observe(
+        registry
+            .get_or_create_for_workspace(&workspace, "openai")
+            .unwrap(),
+        store.as_ref(),
+        &workspace,
+        "title",
+        "thr_aux_chat",
+    );
+    let response = provider
+        .chat(ChatRequest {
+            model: "fixture".into(),
+            messages: vec![ChatMessage::user("fixture prompt")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        })
+        .await
+        .unwrap();
+    let rows = store
+        .provider_usage_page(&workspace, "thr_aux_chat", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "completed");
+    let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(Some(retained), response.usage);
+    assert!(!rows[0].usage_json.contains("fixture prompt"));
+}
+
+#[tokio::test]
+async fn auxiliary_stream_partial_usage_survives_drop_and_retry_without_holding_database_capacity()
+{
+    use futures_util::StreamExt;
+    struct Partial;
+    #[async_trait::async_trait]
+    impl pioneer_provider::Provider for Partial {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            anyhow::bail!("unexpected non-stream fixture")
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::usage(pioneer_provider::TokenUsage {
+                    input_tokens: Some(123),
+                    output_tokens: Some(2),
+                    physical_attempt_id: Some(pioneer_protocol::generate_id(21)),
+                    raw_usage: Some(json!({"prompt_tokens":123,"completion_tokens":2})),
+                    ..Default::default()
+                })),
+                Err(anyhow::anyhow!("fixture interrupted")),
+            ])))
+        }
+    }
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_aux_partial", "turn_aux_partial").await;
+    let background = store.with_maintenance_access();
+    let provider = crate::usage_journal::observe(
+        Arc::new(Partial),
+        &background,
+        &workspace,
+        "memory_extraction",
+        "partial-owner",
+    );
+    let request = || ChatRequest {
+        model: "fixture".into(),
+        messages: vec![],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let mut first = provider.stream_chat(request()).await.unwrap();
+    assert_eq!(
+        first
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .usage
+            .unwrap()
+            .input_tokens,
+        Some(123)
+    );
+    drop(first);
+    let mut retry = provider.stream_chat(request()).await.unwrap();
+    assert!(retry.next().await.unwrap().is_ok());
+    assert!(retry.next().await.unwrap().is_err());
+    assert!(retry.next().await.is_none());
+    let rows = background
+        .provider_usage_page(&workspace, "partial-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let statuses = rows
+        .iter()
+        .map(|r| r.status.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        statuses,
+        std::collections::BTreeSet::from(["failed", "started"])
+    );
+    let usages = rows
+        .iter()
+        .map(|r| serde_json::from_str::<pioneer_provider::TokenUsage>(&r.usage_json).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        usages.iter().map(|u| u.input_tokens.unwrap()).sum::<u64>(),
+        246
+    );
+    assert_ne!(usages[0].physical_attempt_id, usages[1].physical_attempt_id);
+}
+
+#[tokio::test]
+async fn failed_codex_summary_journal_retains_decoder_numeric_evidence_without_cli() {
+    use pioneer_cli_agent_runtime::{
+        codex::service::decode_exec_completion, service::ObservedServiceUsage,
+    };
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_cli_evidence", "turn_cli_evidence").await;
+    let transcript = concat!(
+        "{\"type\":\"thread.started\",\"thread_id\":\"SECRET_SESSION\"}\n",
+        "{\"type\":\"turn.started\"}\n",
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":0,\"cached_input_tokens\":80,\"prompt\":\"SECRET_PROMPT\"}}\n"
+    );
+    let mut observed = pioneer_provider::TokenUsage {
+        provider: Some("codex-cli".into()),
+        ..Default::default()
+    };
+    let call = crate::usage_journal::Call::start(
+        store.as_ref(),
+        &workspace,
+        "summary",
+        "failed-summary-owner",
+        &observed,
+    )
+    .await
+    .unwrap();
+    let error = decode_exec_completion(transcript.as_bytes()).err().unwrap();
+    assert!(format!("{error:#}").contains("no final answer"));
+    // Same production metadata consumer used by the summary error path; no CLI process.
+    crate::compaction::apply_cli_usage(
+        &mut observed,
+        &error.downcast_ref::<ObservedServiceUsage>().unwrap().0,
+    );
+    call.record("failed", &observed).await.unwrap();
+    call.record("failed", &observed).await.unwrap();
+    let rows = store
+        .provider_usage_page(&workspace, "failed-summary-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+    let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(retained.input_tokens, Some(100));
+    assert_eq!(retained.output_tokens, Some(0));
+    assert_eq!(retained.cache_read_input_tokens, Some(80));
+    assert_eq!(retained.cache_write_input_tokens, None);
+    assert_eq!(retained.physical_attempt_id, None);
+    assert_eq!(retained.generation_id, None);
+    assert_eq!(
+        retained.accounting.as_ref().unwrap()["reported_cost"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        retained.accounting.as_ref().unwrap()["estimated_cost"],
+        serde_json::Value::Null
+    );
+    assert!(!rows[0].usage_json.contains("SECRET"));
+    assert!(!rows[0].usage_json.contains("no final answer"));
+}
+
+#[tokio::test]
+async fn auxiliary_metadata_only_header_survives_failure_without_inventing_counts() {
+    struct MetadataOnly;
+    #[async_trait::async_trait]
+    impl pioneer_provider::Provider for MetadataOnly {
+        fn name(&self) -> &str {
+            "openrouter"
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            anyhow::bail!("unexpected chat")
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            let snapshot = pioneer_provider::TokenUsage {
+                generation_id: Some("gen-header".into()),
+                reported_model: Some("actual-model".into()),
+                physical_attempt_id: Some("physical-header-attempt".into()),
+                ..Default::default()
+            };
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::usage(snapshot.clone())),
+                Ok(StreamChunk::usage(snapshot)),
+                Err(anyhow::anyhow!("SECRET transport diagnostic")),
+            ])))
+        }
+    }
+    use futures_util::StreamExt;
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_header_evidence", "turn_header_evidence").await;
+    let provider = crate::usage_journal::observe(
+        Arc::new(MetadataOnly),
+        store.as_ref(),
+        &workspace,
+        "title",
+        "header-owner",
+    );
+    let request = ChatRequest {
+        model: "requested".into(),
+        messages: vec![],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let mut stream = provider.stream_chat(request).await.unwrap();
+    assert!(stream.next().await.unwrap().is_ok());
+    assert!(stream.next().await.unwrap().is_ok());
+    assert!(stream.next().await.unwrap().is_err());
+    let rows = store
+        .provider_usage_page(&workspace, "header-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+    let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(retained.generation_id.as_deref(), Some("gen-header"));
+    assert_eq!(retained.reported_model.as_deref(), Some("actual-model"));
+    assert_eq!(retained.input_tokens, None);
+    assert_eq!(retained.output_tokens, None);
+    assert!(!rows[0].usage_json.contains("SECRET"));
+}
+
+#[tokio::test]
+async fn cli_exit_and_reasoning_evidence_reaches_summary_consumer_and_failed_journal_once() {
+    use pioneer_cli_agent_runtime::{
+        claude::service::ensure_process_outcome,
+        codex::service::decode_exec_outcome,
+        service::{ObservedServiceUsage, ServiceFailure},
+    };
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_cli_exit_reasoning", "turn_cli_exit_reasoning")
+            .await;
+    let prefix = concat!(
+        "{\"type\":\"thread.started\",\"thread_id\":\"SECRET_SESSION\"}\n",
+        "{\"type\":\"turn.started\"}\n",
+    );
+    let answer = "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"SECRET_SUMMARY\"}}\n";
+    for (index, (native, legacy, count, reject)) in [
+        (
+            serde_json::json!(7),
+            serde_json::json!(null),
+            Some(100_u64),
+            "success",
+        ),
+        (
+            serde_json::json!(7),
+            serde_json::json!(null),
+            Some(100),
+            "nonzero",
+        ),
+        (
+            serde_json::json!(0),
+            serde_json::json!(null),
+            Some(0),
+            "nonzero",
+        ),
+        (
+            serde_json::json!(null),
+            serde_json::json!(null),
+            None,
+            "nonzero",
+        ),
+        (
+            serde_json::json!("7"),
+            serde_json::json!(null),
+            Some(100),
+            "nonzero",
+        ),
+        (
+            serde_json::json!(-7),
+            serde_json::json!(null),
+            Some(100),
+            "no_answer",
+        ),
+        (
+            serde_json::json!(7),
+            serde_json::json!(null),
+            Some(100),
+            "no_answer",
+        ),
+        (
+            serde_json::json!(7),
+            serde_json::json!(null),
+            Some(100),
+            "trailing",
+        ),
+        (
+            serde_json::json!(7),
+            serde_json::json!(null),
+            Some(100),
+            "malformed",
+        ),
+        (
+            serde_json::json!(0),
+            serde_json::json!(9),
+            Some(100),
+            "nonzero",
+        ),
+        (
+            serde_json::json!(null),
+            serde_json::json!(9),
+            Some(100),
+            "success",
+        ),
+        (
+            serde_json::json!("invalid"),
+            serde_json::json!(9),
+            Some(100),
+            "nonzero",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut usage = serde_json::json!({"reasoning_output_tokens":native,"reasoning_tokens":legacy,"secret":"SECRET_PROMPT","arbitrary_id":"SECRET_ID"});
+        if let Some(count) = count {
+            usage["input_tokens"] = count.into();
+            usage["output_tokens"] = if count == 0 { 0 } else { 13 }.into();
+            usage["cached_input_tokens"] = if count == 0 { 0 } else { 80 }.into();
+        }
+        let terminal = serde_json::json!({"type":"turn.completed","usage":usage});
+        let transcript = format!(
+            "{prefix}{}{terminal}\n{}",
+            if reject == "no_answer" { "" } else { answer },
+            match reject {
+                "trailing" => "{\"type\":\"turn.started\"}\n",
+                "malformed" => "invalid SECRET\n",
+                _ => "",
+            },
+        );
+        let result = decode_exec_outcome(transcript.as_bytes(), reject != "nonzero");
+        let failed = reject != "success";
+        assert_eq!(result.is_err(), failed);
+        let owner = format!("codex-exit-reasoning-{index}");
+        let mut observed = pioneer_provider::TokenUsage {
+            provider: Some("codex-cli".into()),
+            ..Default::default()
+        };
+        let call = crate::usage_journal::Call::start(
+            store.as_ref(),
+            &workspace,
+            "summary",
+            &owner,
+            &observed,
+        )
+        .await
+        .unwrap();
+        // Actual CLI summary consumer, fed by the production exit/decoder path.
+        match result {
+            Ok(completion) => {
+                crate::compaction::apply_cli_usage(&mut observed, &completion.observed_usage)
+            }
+            Err(error) => {
+                assert!(!format!("{error:#?}").contains("SECRET"));
+                if let Some(metadata) = error.downcast_ref::<ObservedServiceUsage>() {
+                    crate::compaction::apply_cli_usage(&mut observed, &metadata.0);
+                }
+            }
+        }
+        let status = if failed { "failed" } else { "completed" };
+        call.record(status, &observed).await.unwrap();
+        call.record(status, &observed).await.unwrap();
+        let rows = store
+            .provider_usage_page(&workspace, &owner, "", 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, status);
+        let retained: pioneer_provider::TokenUsage =
+            serde_json::from_str(&rows[0].usage_json).unwrap();
+        assert_eq!(retained.input_tokens, count);
+        assert_eq!(
+            retained.output_tokens,
+            count.map(|count| if count == 0 { 0 } else { 13 })
+        );
+        assert_eq!(
+            retained.cache_read_input_tokens,
+            count.map(|count| if count == 0 { 0 } else { 80 })
+        );
+        assert_eq!(
+            retained.reasoning_tokens,
+            native.as_u64().or_else(|| legacy.as_u64())
+        );
+        assert_eq!(retained.cache_write_input_tokens, None);
+        assert_eq!(retained.request_id, None);
+        assert_eq!(retained.generation_id, None);
+        if let Some(accounting) = &retained.accounting {
+            assert_eq!(accounting["reported_cost"], serde_json::Value::Null);
+            assert_eq!(accounting["estimated_cost"], serde_json::Value::Null);
+            assert_eq!(accounting["sdk_estimated_cost"], serde_json::Value::Null);
+            if native.as_u64().is_some() {
+                assert_eq!(
+                    accounting["reasoning_source"],
+                    "codex_exec.usage.reasoning_output_tokens"
+                );
+            }
+            if native.as_u64().is_some() && legacy.as_u64().is_some() {
+                assert_eq!(accounting["reasoning_alias_conflict"], native != legacy);
+            }
+        }
+        assert!(!rows[0].usage_json.contains("SECRET"));
+        assert!(!rows[0].usage_json.contains("process failed"));
+    }
+    for (index, (input, output, read, write, cost)) in [
+        (
+            Some(20_u64),
+            Some(11_u64),
+            Some(7_u64),
+            Some(3_u64),
+            Some(0.2),
+        ),
+        (Some(0), Some(0), Some(0), Some(0), Some(0.0)),
+        (None, None, None, None, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut terminal = serde_json::json!({"type":"result","subtype":"error_during_execution","error":{"type":"overloaded_error","message":"SECRET_ERROR"},"session_id":"SECRET_SESSION","usage":{"reasoning_output_tokens":99,"prompt":"SECRET_PROMPT"}});
+        for (key, value) in [
+            ("input_tokens", input),
+            ("output_tokens", output),
+            ("cache_read_input_tokens", read),
+            ("cache_creation_input_tokens", write),
+        ] {
+            if let Some(value) = value {
+                terminal["usage"][key] = value.into();
+            }
+        }
+        if let Some(cost) = cost {
+            terminal["total_cost_usd"] = serde_json::json!(cost);
+        }
+        let error = ensure_process_outcome(terminal.to_string().as_bytes(), false)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.downcast_ref::<ServiceFailure>().unwrap().class,
+            pioneer_protocol::ProviderFailureClass::Provider5xx
+        );
+        let owner = format!("claude-exit-{index}");
+        let mut observed = pioneer_provider::TokenUsage {
+            provider: Some("claude-cli".into()),
+            ..Default::default()
+        };
+        let call = crate::usage_journal::Call::start(
+            store.as_ref(),
+            &workspace,
+            "summary",
+            &owner,
+            &observed,
+        )
+        .await
+        .unwrap();
+        if let Some(metadata) = error.downcast_ref::<ObservedServiceUsage>() {
+            crate::compaction::apply_cli_usage(&mut observed, &metadata.0);
+        }
+        call.record("failed", &observed).await.unwrap();
+        call.record("failed", &observed).await.unwrap();
+        let rows = store
+            .provider_usage_page(&workspace, &owner, "", 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "failed");
+        let retained: pioneer_provider::TokenUsage =
+            serde_json::from_str(&rows[0].usage_json).unwrap();
+        assert_eq!(
+            retained.input_tokens,
+            input.map(|input| input + read.unwrap_or(0) + write.unwrap_or(0))
+        );
+        assert_eq!(retained.output_tokens, output);
+        assert_eq!(retained.cache_read_input_tokens, read);
+        assert_eq!(retained.cache_write_input_tokens, write);
+        assert_eq!(retained.reasoning_tokens, None);
+        assert_eq!(retained.generation_id, None);
+        if let Some(accounting) = &retained.accounting {
+            assert_eq!(accounting["sdk_estimated_cost"]["amount"].as_f64(), cost);
+            assert_eq!(accounting["sdk_estimated_cost"]["currency"], "USD");
+            assert_eq!(
+                accounting["sdk_estimated_cost"]["provenance"],
+                "cli_sdk_price_table_estimate"
+            );
+            assert_eq!(
+                accounting["sdk_estimated_cost"]["sdk_version"],
+                serde_json::Value::Null
+            );
+            assert_eq!(accounting["reported_cost"], serde_json::Value::Null);
+            assert_eq!(accounting["estimated_cost"], serde_json::Value::Null);
+        }
+        assert!(!rows[0].usage_json.contains("SECRET"));
+        assert!(!rows[0].usage_json.contains("overloaded_error"));
+    }
+}
 
 async fn fanout_test_processor() -> (Arc<MessageProcessor>, String) {
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;

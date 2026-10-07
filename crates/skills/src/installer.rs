@@ -1,5 +1,5 @@
 use crate::audit::{SkillAuditAction, SkillAuditDecision, SkillAuditEvent};
-use crate::contract::{SkillSourceKind, parse_skill_from_file};
+use crate::contract::SkillSourceKind;
 use crate::dependencies::{
     DependencyCheckInput, DependencyCheckResult, evaluate_skill_dependencies,
 };
@@ -7,7 +7,7 @@ use crate::provenance::{
     SkillLockEntry, SkillsLock, find_lock_entry, read_skills_lock, remove_lock_entry,
     upsert_lock_entry, write_skills_lock_atomic,
 };
-use crate::security::{SkillSecurityPolicy, ensure_install_path_contained, scan_skill_directory};
+use crate::security::{SkillSecurityPolicy, ensure_install_path_contained};
 use anyhow::{Context, Result, bail};
 use pioneer_protocol::SkillId;
 use std::collections::VecDeque;
@@ -77,6 +77,7 @@ pub struct PrepareMaterializedSkillRequest {
 
 #[derive(Debug, Clone)]
 pub struct PreparedMaterializedSkill {
+    pub input_revision: crate::contract::SkillInputRevision,
     pub definition: crate::compile::SkillDefinition,
     pub source_kind: SkillSourceKind,
     pub source_ref: String,
@@ -654,67 +655,185 @@ fn removal_failpoint(name: &str, index: usize) -> Result<()> {
 pub fn prepare_materialized_skill(
     request: PrepareMaterializedSkillRequest,
 ) -> Result<PreparedMaterializedSkill> {
-    let source_root = request
-        .materialized_source_path
-        .parent()
-        .unwrap_or(request.materialized_source_path.as_path())
-        .to_path_buf();
-
-    let security_report = scan_skill_directory(
-        source_root.as_path(),
-        request.materialized_source_path.as_path(),
-        request.policy.security.max_install_file_bytes.max(1),
-    );
-    if security_report.has_blocking_findings() {
-        bail!("install blocked by security scan findings");
+    let mut preparation = MaterializedSkillPreparation::new(request);
+    loop {
+        if let Some(prepared) = preparation.step(64)? {
+            return Ok(prepared);
+        }
     }
+}
 
-    let skill_file = request.materialized_source_path.join("SKILL.md");
-    if !skill_file.is_file() {
-        bail!(
-            "staged skill `{}` is missing required SKILL.md",
-            request.materialized_source_path.display()
+/// Owned preparation for the native watcher. The request and its security scan
+/// stay together so a caller cannot substitute a report from another package.
+pub struct MaterializedSkillPreparation {
+    request: Option<PrepareMaterializedSkillRequest>,
+    scan: Option<crate::security::SkillDirectoryScan>,
+    input: Option<crate::contract::SkillFileInputRead>,
+    report: Option<crate::security::SecurityScanReport>,
+    largest_file_bytes: u64,
+    watcher: bool,
+}
+
+impl MaterializedSkillPreparation {
+    pub fn new(request: PrepareMaterializedSkillRequest) -> Self {
+        let source_root = request
+            .materialized_source_path
+            .parent()
+            .unwrap_or(&request.materialized_source_path);
+        let scan = crate::security::SkillDirectoryScan::new(
+            source_root,
+            &request.materialized_source_path,
+            request.policy.security.max_install_file_bytes.max(1),
         );
+        Self {
+            request: Some(request),
+            scan: Some(scan),
+            input: None,
+            report: None,
+            largest_file_bytes: 0,
+            watcher: false,
+        }
+    }
+    /// The watcher never traverses input symlinks; foreground preparation keeps
+    /// its existing security-scan policy for contained links.
+    pub fn new_for_watcher(request: PrepareMaterializedSkillRequest) -> Self {
+        let mut preparation = Self::new(request);
+        preparation.watcher = true;
+        preparation
     }
 
-    let definition = parse_skill_from_file(
-        request.skill_id,
-        skill_file.as_path(),
-        request.source_kind.clone(),
-        source_root.as_path(),
-        request.policy.security.max_install_file_bytes.max(1),
-    )?;
-
-    if !request.policy.security.allow_untrusted_install
-        && matches!(
-            definition.runtime.trust_level,
-            crate::contract::SkillTrustLevel::Untrusted
-        )
-    {
-        bail!(
-            "untrusted skill `{}` is blocked by policy",
-            definition.identity.slug
-        );
+    pub fn step(&mut self, entries_budget: usize) -> Result<Option<PreparedMaterializedSkill>> {
+        let request = self
+            .request
+            .as_ref()
+            .context("skill preparation completed")?
+            .clone();
+        self.step_facts(entries_budget)?
+            .map(|facts| facts.prepare(request))
+            .transpose()
     }
 
-    let dependency_report =
-        evaluate_skill_dependencies(&definition, &request.policy.dependency_input);
-
-    if request.policy.block_on_dependency_failures && dependency_report.has_failures() {
-        bail!(
-            "install blocked by dependency failures for `{}`",
-            definition.identity.slug
-        );
+    /// Physical directory security facts and source bytes, independently of a
+    /// Workspace ID or policy decision. Never reusable for another source path.
+    pub fn step_facts(&mut self, entries_budget: usize) -> Result<Option<MaterializedSkillFacts>> {
+        if let Some(scan) = self.scan.as_mut() {
+            if !scan.step(entries_budget.min(64)) {
+                return Ok(None);
+            }
+            let scan = self.scan.take().expect("scan exists");
+            self.largest_file_bytes = scan.largest_file_bytes;
+            let report = scan.report();
+            if report.decision == crate::security::SecurityDecision::Block {
+                bail!("install blocked by security scan findings");
+            }
+            let request = self
+                .request
+                .as_ref()
+                .context("skill preparation completed")?;
+            let path = &request.materialized_source_path;
+            self.input = Some(crate::contract::SkillFileInputRead::new(
+                request.skill_id.clone(),
+                &path.join("SKILL.md"),
+                request.source_kind,
+                path.parent().unwrap_or(path),
+                request.policy.security.max_install_file_bytes.max(1),
+            ));
+            self.input
+                .as_mut()
+                .expect("input reader exists")
+                .follow_links = !self.watcher;
+            self.report = Some(report);
+            return Ok(None);
+        }
+        // One read quantum, then a cancellation checkpoint in the owning worker.
+        // Parsing remains one domain-bounded unit per input (not incremental).
+        if !self
+            .input
+            .as_mut()
+            .context("skill preparation completed")?
+            .step(256 * 1024)?
+        {
+            return Ok(None);
+        }
+        let input = self.input.take().expect("input exists").finish()?;
+        let request = self.request.take().expect("request exists");
+        Ok(Some(MaterializedSkillFacts {
+            largest_file_bytes: self.largest_file_bytes.max(input.len() as u64),
+            source_path: request.materialized_source_path,
+            input,
+            security_report: self.report.take().expect("security report exists"),
+        }))
     }
+}
 
-    Ok(PreparedMaterializedSkill {
-        definition,
-        source_kind: request.source_kind,
-        source_ref: request.source_ref,
-        source_path: request.materialized_source_path,
-        dependency_report,
-        security_report,
-    })
+/// Owned facts of one source directory, retained only by a root round. Security
+/// thresholds, trust, dependency policy and source-kind parsing remain per scope.
+#[derive(Debug)]
+pub struct MaterializedSkillFacts {
+    source_path: PathBuf,
+    input: crate::contract::SkillFileInput,
+    largest_file_bytes: u64,
+    security_report: crate::security::SecurityScanReport,
+}
+impl MaterializedSkillFacts {
+    /// Bytes actually read to prepare the two metadata inputs, excluding later
+    /// destination copies and publication freshness checks.
+    pub fn input_bytes_read(&self) -> usize {
+        self.input.input_bytes_read
+    }
+    pub fn input_revision(&self) -> crate::contract::SkillInputRevision {
+        self.input.revision().clone()
+    }
+    pub fn definition_for(
+        &self,
+        request: &PrepareMaterializedSkillRequest,
+    ) -> Result<crate::compile::SkillDefinition> {
+        self.scoped_definition(request)
+            .map(|(definition, _)| definition)
+    }
+    fn scoped_definition(
+        &self,
+        request: &PrepareMaterializedSkillRequest,
+    ) -> Result<(crate::compile::SkillDefinition, DependencyCheckResult)> {
+        if request.materialized_source_path != self.source_path {
+            bail!("materialized source facts cannot change path");
+        }
+        if self.largest_file_bytes > request.policy.security.max_install_file_bytes.max(1) as u64 {
+            bail!("install blocked by file size policy");
+        }
+        let definition = self
+            .input
+            .parse(request.skill_id.clone(), request.source_kind)?;
+        if !request.policy.security.allow_untrusted_install
+            && matches!(
+                definition.runtime.trust_level,
+                crate::contract::SkillTrustLevel::Untrusted
+            )
+        {
+            bail!("untrusted skill is blocked by policy");
+        }
+        let dependency_report =
+            evaluate_skill_dependencies(&definition, &request.policy.dependency_input);
+        if request.policy.block_on_dependency_failures && dependency_report.has_failures() {
+            bail!("install blocked by dependency failures");
+        }
+        Ok((definition, dependency_report))
+    }
+    pub fn prepare(
+        self,
+        request: PrepareMaterializedSkillRequest,
+    ) -> Result<PreparedMaterializedSkill> {
+        let (definition, dependency_report) = self.scoped_definition(&request)?;
+        Ok(PreparedMaterializedSkill {
+            input_revision: self.input.revision().clone(),
+            definition,
+            dependency_report,
+            source_kind: request.source_kind,
+            source_ref: request.source_ref,
+            source_path: self.source_path,
+            security_report: self.security_report,
+        })
+    }
 }
 
 pub fn commit_prepared_skill(request: CommitPreparedSkillRequest) -> Result<InstallSkillResult> {
@@ -2130,5 +2249,66 @@ Body"#,
             policy: SkillInstallerPolicy::default(),
         })
         .expect("install removal fixture")
+    }
+}
+
+#[cfg(test)]
+mod bounded_watcher_preparation_tests {
+    use super::*;
+
+    #[test]
+    fn an_input_growing_after_scan_and_first_read_never_becomes_publishable_facts() {
+        for sidecar in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("package");
+            fs::create_dir(&path).unwrap();
+            let skill = path.join("SKILL.md");
+            fs::write(
+                &skill,
+                if sidecar {
+                    "---\nname: Test\n---\nBody".to_owned()
+                } else {
+                    format!("---\nname: Test\n---\n{}", "x".repeat(300 * 1024))
+                },
+            )
+            .unwrap();
+            if sidecar {
+                fs::write(
+                    path.join("_meta.json"),
+                    format!("{{\"displayName\":\"{}\"}}", "x".repeat(300 * 1024)),
+                )
+                .unwrap();
+            }
+            let mut policy = SkillInstallerPolicy::default();
+            policy.security.max_install_file_bytes = 400 * 1024;
+            let mut preparation =
+                MaterializedSkillPreparation::new_for_watcher(PrepareMaterializedSkillRequest {
+                    skill_id: SkillId::new("R".repeat(21)).unwrap(),
+                    source_kind: SkillSourceKind::User,
+                    source_ref: "test-growth".into(),
+                    materialized_source_path: path.clone(),
+                    policy,
+                });
+            while preparation.scan.is_some() {
+                assert!(preparation.step_facts(64).unwrap().is_none());
+            }
+            assert!(
+                preparation.step_facts(64).unwrap().is_none(),
+                "read must yield before parsing a large input"
+            );
+            fs::write(
+                if sidecar {
+                    path.join("_meta.json")
+                } else {
+                    skill
+                },
+                vec![b'x'; 800 * 1024],
+            )
+            .unwrap();
+            assert!(
+                preparation.step_facts(64).is_err(),
+                "oversized input cannot produce metadata for publication"
+            );
+        }
     }
 }

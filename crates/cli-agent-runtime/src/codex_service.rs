@@ -61,6 +61,7 @@ pub struct CodexServiceRequest {
     pub input: String,
 }
 pub struct CodexServiceCompletion {
+    pub observed_usage: serde_json::Value,
     pub text: String,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -102,10 +103,7 @@ impl CodexService {
         );
         let run = async {
             let (output, success) = self.invoke(&request, deadline, MAX_SERVICE_BYTES).await?;
-            let completion =
-                decode_exec_completion(&output).context(ServiceStage("cli_exec_decode"))?;
-            ensure!(success, "Codex service process failed");
-            Ok(completion)
+            decode_exec_outcome(&output, success)
         };
         let result = match tokio::time::timeout_at(deadline, run).await {
             Ok(result) => result,
@@ -239,73 +237,113 @@ fn process_config(
     Ok(process)
 }
 
-fn decode_exec_completion(output: &[u8]) -> Result<CodexServiceCompletion> {
+/// Production process-exit boundary, shared by summarize and pure regressions.
+/// Decode first so a valid terminal's numeric evidence survives nonzero exit;
+/// neither a bad transcript nor a failed process becomes a successful summary.
+pub fn decode_exec_outcome(output: &[u8], success: bool) -> Result<CodexServiceCompletion> {
+    let completion = decode_exec_completion(output).context(ServiceStage("cli_exec_decode"))?;
+    if !success {
+        return Err(crate::service::with_observed_usage(
+            anyhow::anyhow!("Codex service process failed"),
+            completion.observed_usage,
+        ));
+    }
+    Ok(completion)
+}
+
+/// Decode the pinned exec JSONL contract without invoking an external process.
+/// Rejected transcripts retain only sanitized terminal numeric usage context.
+pub fn decode_exec_completion(output: &[u8]) -> Result<CodexServiceCompletion> {
     let mut completion = CodexServiceCompletion {
+        observed_usage: serde_json::json!({}),
         text: String::new(),
         input_tokens: None,
         output_tokens: None,
     };
-    let (mut thread, mut started, mut completed) = (false, false, false);
-    for line in output
-        .split(|b| *b == b'\n')
-        .filter(|line| !line.is_empty())
-    {
-        let event: JsonValue =
-            serde_json::from_slice(line).context("invalid Codex service event")?;
-        ensure!(!completed, "Codex service emitted events after completion");
-        match event["type"].as_str() {
-            Some("thread.started") => {
-                ensure!(
-                    !thread && event["thread_id"].as_str().is_some_and(|id| !id.is_empty()),
-                    "invalid Codex service thread start"
-                );
-                thread = true;
-            }
-            Some("turn.started") => {
-                ensure!(thread && !started, "invalid Codex service turn start");
-                started = true;
-            }
-            Some("item.started" | "item.updated" | "item.completed") => {
-                let item = &event["item"];
-                match item["type"].as_str() {
-                    Some("agent_message") => {
-                        ensure!(started, "Codex service answer preceded turn start");
-                        if event["type"] == "item.completed"
-                            && item["phase"].as_str() != Some("commentary")
-                        {
-                            completion.text = item["text"]
-                                .as_str()
-                                .ok_or_else(|| anyhow::anyhow!("invalid service answer"))?
-                                .to_owned();
-                        }
-                    }
-                    Some("reasoning" | "error") => {} // CLI configuration warnings are item errors, not failed turns.
-                    _ => bail!("Codex service attempted a working action"),
+    let result = (|| -> Result<()> {
+        let (mut thread, mut started, mut completed) = (false, false, false);
+        for line in output
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let event: JsonValue =
+                serde_json::from_slice(line).context("invalid Codex service event")?;
+            ensure!(!completed, "Codex service emitted events after completion");
+            match event["type"].as_str() {
+                Some("thread.started") => {
+                    ensure!(
+                        !thread && event["thread_id"].as_str().is_some_and(|id| !id.is_empty()),
+                        "invalid Codex service thread start"
+                    );
+                    thread = true;
                 }
+                Some("turn.started") => {
+                    ensure!(thread && !started, "invalid Codex service turn start");
+                    started = true;
+                }
+                Some("item.started" | "item.updated" | "item.completed") => {
+                    let item = &event["item"];
+                    match item["type"].as_str() {
+                        Some("agent_message") => {
+                            ensure!(started, "Codex service answer preceded turn start");
+                            if event["type"] == "item.completed"
+                                && item["phase"].as_str() != Some("commentary")
+                            {
+                                completion.text = item["text"]
+                                    .as_str()
+                                    .ok_or_else(|| anyhow::anyhow!("invalid service answer"))?
+                                    .to_owned();
+                            }
+                        }
+                        Some("reasoning" | "error") => {} // CLI configuration warnings are item errors, not failed turns.
+                        _ => bail!("Codex service attempted a working action"),
+                    }
+                }
+                Some("turn.failed") => {
+                    let params = json!({"error":event["error"]});
+                    return Err(terminal_failure(&CodexJsonlRpcNotificationEvent {
+                        method: "error".into(),
+                        params: Some(params.clone()),
+                        raw: params,
+                    })
+                    .into())
+                    .map_err(|error: anyhow::Error| {
+                        error.context(crate::service::ObservedServiceUsage(
+                            crate::service::bounded_codex_usage(&event),
+                        ))
+                    });
+                }
+                Some("turn.completed") => {
+                    // Terminal numeric evidence survives application/order rejection.
+                    completion.observed_usage = crate::service::bounded_codex_usage(&event);
+                    ensure!(
+                        started && !completion.text.trim().is_empty(),
+                        "Codex service returned no final answer"
+                    );
+                    completion.input_tokens = event["usage"]["input_tokens"].as_u64();
+                    completion.output_tokens = event["usage"]["output_tokens"].as_u64();
+                    completed = true;
+                }
+                Some("error") => {} // Retriable stream notices; success still requires a terminal completion.
+                _ => bail!("invalid Codex service event"),
             }
-            Some("turn.failed") => {
-                let params = json!({"error":event["error"]});
-                return Err(terminal_failure(&CodexJsonlRpcNotificationEvent {
-                    method: "error".into(),
-                    params: Some(params.clone()),
-                    raw: params,
-                })
-                .into());
-            }
-            Some("turn.completed") => {
-                ensure!(
-                    started && !completion.text.trim().is_empty(),
-                    "Codex service returned no final answer"
-                );
-                completion.input_tokens = event["usage"]["input_tokens"].as_u64();
-                completion.output_tokens = event["usage"]["output_tokens"].as_u64();
-                completed = true;
-            }
-            Some("error") => {} // Retriable stream notices; success still requires a terminal completion.
-            _ => bail!("invalid Codex service event"),
         }
-    }
-    ensure!(completed, "Codex service ended without completion");
+        ensure!(completed, "Codex service ended without completion");
+        Ok(())
+    })();
+    result.map_err(|error| {
+        if completion
+            .observed_usage
+            .as_object()
+            .is_some_and(|m| !m.is_empty())
+        {
+            error.context(crate::service::ObservedServiceUsage(
+                completion.observed_usage.clone(),
+            ))
+        } else {
+            error
+        }
+    })?;
     Ok(completion)
 }
 
@@ -376,6 +414,113 @@ fn terminal_failure(event: &CodexJsonlRpcNotificationEvent) -> ServiceFailure {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn process_exit_boundary_retains_profile_specific_usage_and_stays_failed() {
+        let prefix = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"SECRET_SESSION\"}\n",
+            "{\"type\":\"turn.started\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"SECRET_SUMMARY\"}}\n"
+        );
+        for counter in [
+            serde_json::json!(9),
+            serde_json::json!(0),
+            serde_json::json!(null),
+            serde_json::json!(-1),
+            serde_json::json!("9"),
+            serde_json::json!(true),
+            serde_json::json!(1.5),
+            serde_json::json!([9]),
+            serde_json::json!({"secret":"SECRET"}),
+        ] {
+            let terminal = serde_json::json!({"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":13,"reasoning_output_tokens":counter,"secret":"SECRET"},"total_cost_usd":999});
+            let transcript = format!("{prefix}{terminal}\n");
+            let success = decode_exec_outcome(transcript.as_bytes(), true).unwrap();
+            let error = decode_exec_outcome(transcript.as_bytes(), false)
+                .err()
+                .unwrap();
+            assert!(format!("{error:#}").contains("Codex service process failed"));
+            let observed = &error
+                .downcast_ref::<crate::service::ObservedServiceUsage>()
+                .unwrap()
+                .0;
+            assert_eq!(observed, &success.observed_usage);
+            assert_eq!(
+                observed["reasoning_output_tokens"].as_u64(),
+                counter.as_u64()
+            );
+            assert_eq!(success.output_tokens, Some(13));
+            assert!(!observed.to_string().contains("SECRET"));
+            assert!(observed["total_cost_usd"].is_null());
+        }
+        let missing = format!("{prefix}{{\"type\":\"turn.completed\"}}\n");
+        let error = decode_exec_outcome(missing.as_bytes(), false)
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .downcast_ref::<crate::service::ObservedServiceUsage>()
+                .is_none()
+        );
+        assert_eq!(
+            decode_exec_outcome(missing.as_bytes(), true)
+                .unwrap()
+                .output_tokens,
+            None
+        );
+    }
+
+    #[test]
+    fn rejected_terminal_transcripts_keep_only_available_numeric_evidence() {
+        let start = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"SECRET\"}\n",
+            "{\"type\":\"turn.started\"}\n"
+        );
+        let answer = "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"summary\"}}\n";
+        let terminal = "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":0,\"cached_input_tokens\":80,\"prompt\":\"SECRET\"}}\n";
+        for (transcript, diagnostic) in [
+            (format!("{start}{terminal}"), "no final answer"),
+            (
+                format!("{start}{answer}{terminal}{{\"type\":\"turn.started\"}}\n"),
+                "events after completion",
+            ),
+            (
+                format!("{start}{answer}{terminal}invalid JSON\n"),
+                "invalid Codex service event",
+            ),
+        ] {
+            let error = decode_exec_completion(transcript.as_bytes()).err().unwrap();
+            assert!(format!("{error:#}").contains(diagnostic));
+            let usage = &error
+                .downcast_ref::<crate::service::ObservedServiceUsage>()
+                .unwrap()
+                .0;
+            assert_eq!(usage["input_tokens"], 100);
+            assert_eq!(usage["output_tokens"], 0);
+            assert_eq!(usage["cached_input_tokens"], 80);
+            assert!(!usage.to_string().contains("SECRET"));
+            assert!(!format!("{error:#}").contains("SECRET"));
+        }
+        let success =
+            decode_exec_completion(format!("{start}{answer}{terminal}").as_bytes()).unwrap();
+        assert_eq!(success.input_tokens, Some(100));
+        assert_eq!(success.output_tokens, Some(0));
+        let missing = decode_exec_completion(
+            format!("{start}{answer}{{\"type\":\"turn.completed\"}}\n").as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(missing.input_tokens, None);
+        assert_eq!(missing.output_tokens, None);
+        let rejected_missing =
+            decode_exec_completion(format!("{start}{{\"type\":\"turn.completed\"}}\n").as_bytes())
+                .err()
+                .unwrap();
+        assert!(
+            rejected_missing
+                .downcast_ref::<crate::service::ObservedServiceUsage>()
+                .is_none()
+        );
+    }
+
     use super::*;
     #[test]
     fn terminal_failures_preserve_machine_class_and_cooldown_without_provider_text() {

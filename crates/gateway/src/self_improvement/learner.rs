@@ -728,6 +728,7 @@ pub(crate) struct LearnerReviewerClient<'a> {
     workspace_id: &'a str,
     default_model: &'a GatewaySelfImprovementModelSelectionConfig,
     reviewer_model: Option<&'a GatewaySelfImprovementModelSelectionConfig>,
+    usage_store: Option<(&'a pioneer_crud::CrudStore, &'a str)>,
 }
 
 impl<'a> LearnerReviewerClient<'a> {
@@ -743,7 +744,17 @@ impl<'a> LearnerReviewerClient<'a> {
             workspace_id,
             default_model,
             reviewer_model,
+            usage_store: None,
         }
+    }
+
+    pub(crate) fn with_usage_store(
+        mut self,
+        store: &'a pioneer_crud::CrudStore,
+        run_id: &'a str,
+    ) -> Self {
+        self.usage_store = Some((store, run_id));
+        self
     }
 
     pub(crate) fn with_temporal_context(mut self, context: &'a TemporalLearningContext) -> Self {
@@ -1098,6 +1109,17 @@ impl<'a> LearnerReviewerClient<'a> {
                     "provider_unavailable",
                 )
             })?;
+        let provider = if let Some((store, run_id)) = self.usage_store {
+            crate::usage_journal::observe(
+                provider,
+                store,
+                self.workspace_id,
+                "self_improvement",
+                run_id,
+            )
+        } else {
+            provider
+        };
         let response = provider
             .chat(ChatRequest {
                 model: selection.model.clone(),
@@ -1546,6 +1568,7 @@ mod tests {
                 usage: Some(TokenUsage {
                     input_tokens: Some(10),
                     output_tokens: Some(5),
+                    ..Default::default()
                 }),
                 reasoning_content: None,
                 provider_replay_state: None,

@@ -1073,7 +1073,8 @@ impl SelfImprovementSupervisor {
             run.workspace_id.as_str(),
             &default_model,
             Some(&reviewer_model),
-        );
+        )
+        .with_usage_store(self.maintenance_store.as_ref(), run.id.as_str());
 
         while !analysis.is_complete() {
             if !wake_budget.can_start_chunk() {

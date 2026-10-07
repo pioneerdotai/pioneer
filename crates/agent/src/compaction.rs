@@ -135,7 +135,7 @@ impl Summarizer for NativeSummarizer {
             let classification = self.provider.classify_failure(&error);
             let class = classification.as_ref().map(|c| c.class).unwrap_or_else(|| {
                 crate::classify_provider_failure_message(
-                    &error.to_string(),
+                    &pioneer_provider::usage::classification_source(&error).to_string(),
                     ProviderFailureStage::Connect,
                 )
             });
