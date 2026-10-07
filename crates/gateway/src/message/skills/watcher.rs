@@ -308,6 +308,8 @@ struct Signals {
     claim_cleanup_owners: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     pause_claim_cleanup: AtomicBool,
+    #[cfg(test)]
+    paused_job_deadlines: StdMutex<BTreeMap<PathBuf, Instant>>,
 }
 
 impl Signals {
@@ -1481,6 +1483,10 @@ async fn run_with_signals(
         let claims_pending = signals.cleanup_claims();
         #[cfg(test)]
         if claims_pending && signals.pause_claim_cleanup.swap(false, Ordering::AcqRel) {
+            *signals.paused_job_deadlines.lock().unwrap() = jobs
+                .iter()
+                .map(|(path, job)| (path.clone(), job.resume_at))
+                .collect();
             signals.paused.notify_one();
             tokio::select! { biased; _ = stop.cancelled() => {}, _ = signals.resume.notified() => {} }
         }

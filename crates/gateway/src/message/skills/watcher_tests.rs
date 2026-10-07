@@ -334,13 +334,18 @@ async fn shared_system_roots_are_registered_once_with_all_workspace_scopes() {
 #[test]
 fn native_backend_failure_has_backoff_without_a_polling_fallback() {
     let signals = Arc::new(Signals::default());
+    signals.backend_unavailable.store(true, Ordering::Release);
+    let before = Instant::now();
     let native = Native::new().refresh(
         vec![PathBuf::from("missing-parent")],
         BTreeSet::new(),
-        signals,
+        signals.clone(),
     );
+    assert_eq!(signals.backend_attempts.load(Ordering::Acquire), 1);
+    assert!(native.watcher.is_none());
+    assert!(native.recovery_pending);
     assert_eq!(native.attempts, 1);
-    assert!(native.retry_at > Instant::now());
+    assert!(native.retry_at >= before + retry_delay(1));
     let mut unavailable = Native::new();
     unavailable.request_recovery();
     assert!(
@@ -1723,12 +1728,26 @@ async fn real_worker_keeps_active_claims_and_cleans_retired_owners_while_neighbo
             "---\nname: Cleanup neighbor\n---\nAvailable",
         )
         .unwrap();
+        let neighbor = fs_canonical(&neighbor);
         signals.event(Ok(Event::new(EventKind::Create(
             notify::event::CreateKind::Folder,
         ))
-        .add_path(neighbor)));
+        .add_path(neighbor.clone())));
         let mut progressed = false;
         for _ in 0..200 {
+            // The worker is held at the cleanup barrier. Let its actual dirty
+            // or installer-lock wait expire without draining more reservations.
+            // Counting quanta alone cannot advance debounce/retry deadlines.
+            let job_deadline = signals
+                .paused_job_deadlines
+                .lock()
+                .unwrap()
+                .get(&neighbor)
+                .copied();
+            let deadline = job_deadline.or_else(|| signals.roots.lock().unwrap()[&neighbor].due());
+            if let Some(deadline) = deadline {
+                tokio::time::sleep_until(deadline.into()).await;
+            }
             let before = cleanup_work(&signals);
             signals.pause_claim_cleanup.store(true, Ordering::Release);
             signals.resume.notify_one();
