@@ -55323,15 +55323,17 @@ async fn turn_cancel_allows_authorized_non_subscribed_collaborator_user() {
     session_manager
         .set_connection_workspace(foreign_connection_id, Some(workspace_id.clone()))
         .await;
+    let provider_entered = Arc::new(Notify::new());
+    let provider_release = Arc::new(Notify::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "delayed",
-        Arc::new(DelayedProvider {
-            delay: Duration::from_secs(30),
-            text: "too late".to_owned(),
+        Arc::new(CancellationBarrierProvider {
+            entered: provider_entered.clone(),
+            release: provider_release.clone(),
         }),
     ));
     let processor = MessageProcessor::new(
-        thread_manager,
+        thread_manager.clone(),
         provider_registry,
         session_manager,
         workspace_manager,
@@ -55376,8 +55378,34 @@ async fn turn_cancel_allows_authorized_non_subscribed_collaborator_user() {
         .process_request_for_connection(owner_connection_id, &turn_start_request.to_string())
         .await;
     let _ = recv_response_by_id(&mut rx_owner, turn_start_request_id.as_str()).await;
+    // turn/start acknowledges admission before the actor durably registers its
+    // immutable cancellation context. Test collaborator authorization against a
+    // running turn, holding the provider at a barrier instead of racing startup
+    // or a timer-driven completion. Drain the owner's startup notifications so
+    // websocket backpressure cannot prevent the actor from reaching the barrier.
+    timeout(
+        Duration::from_secs(30),
+        drain_test_notifications_while(&mut rx_owner, provider_entered.notified()),
+    )
+    .await
+    .expect("collaborator cancellation provider should enter after context registration");
+    assert!(
+        crud_store
+            .native_cancellation_context(TURN_ID)
+            .await
+            .expect("native cancellation context should load")
+            .is_some(),
+        "running turn must have its durable cancellation context"
+    );
     materialize_test_member_collaborator(crud_store.as_ref(), workspace_id.as_str(), THREAD_ID)
         .await;
+    assert!(
+        !thread_manager
+            .subscribed_connection_ids(THREAD_ID)
+            .await
+            .contains(&foreign_connection_id),
+        "authorized collaborator must remain unsubscribed"
+    );
 
     let cancel_request_id = generate_test_request_id("turncancelforeign", "stop");
     let cancel_request = json!({
@@ -55397,7 +55425,25 @@ async fn turn_cancel_allows_authorized_non_subscribed_collaborator_user() {
     let response = recv_response_by_id(&mut rx_foreign, cancel_request_id.as_str()).await;
     let response: TurnCancelResponse =
         serde_json::from_value(response.result).expect("authorized cancel response should decode");
+    assert_eq!(response.thread_id, THREAD_ID);
+    assert_eq!(response.turn.id, TURN_ID);
     assert_eq!(response.turn.status, TurnStatus::Interrupted);
+    assert_eq!(response.turn.error.as_deref(), Some("foreign stop"));
+    let (_, persisted_turn) = crud_store
+        .get_turn(THREAD_ID, TURN_ID)
+        .await
+        .expect("cancelled turn should load")
+        .expect("cancelled turn should remain persisted");
+    assert_eq!(persisted_turn.status, TurnStatus::Interrupted);
+    assert_eq!(persisted_turn.error.as_deref(), Some("foreign stop"));
+    assert!(
+        crud_store
+            .native_cancellation_was_accepted(TURN_ID)
+            .await
+            .expect("native cancellation receipt should load")
+    );
+    processor.agent_manager.remove_thread(THREAD_ID).await;
+    provider_release.notify_one();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
