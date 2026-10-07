@@ -68,6 +68,21 @@ pub fn canonical_rounds(records: Vec<CanonicalRecord>) -> Result<Vec<CanonicalRo
                     message["role"] == "assistant",
                     "invalid canonical assistant role"
                 );
+                if message.get("tool_calls").is_none_or(|tools| {
+                    tools.is_null() || tools.as_array().is_some_and(Vec::is_empty)
+                }) {
+                    ensure!(
+                        row.payload["termination"]["kind"] == "complete"
+                            && row.payload["calls"].as_array().is_some_and(Vec::is_empty),
+                        "invalid canonical assistant response"
+                    );
+                    rounds.push(CanonicalRound {
+                        sources: vec![row.reference],
+                        messages: vec![message],
+                        complete: true,
+                    });
+                    continue;
+                }
                 let tools = message["tool_calls"]
                     .as_array()
                     .ok_or_else(|| anyhow::anyhow!("missing canonical tool calls"))?;
@@ -181,6 +196,22 @@ mod tests {
             "assistant_round",
             json!({"version":1,"message":{"role":"assistant","content":"", "reasoning_content":"known reasoning", "provider_replay_state":{"opaque":"keep"},"tool_calls":[{"id":"call","name":"read","arguments":"{}"}]},"calls":[{"provider_call_id":"call","turn_item_id":"item","ordinal":0}]}),
         )
+    }
+
+    #[test]
+    fn terminal_no_tool_envelope_is_a_complete_independent_round() {
+        let final_response = record(
+            "final",
+            "assistant_round",
+            json!({"version":1,"round_id":"final","termination":{"kind":"complete"},"message":{"role":"assistant","content":"answer","provider_replay_state":{"provider":"gemini","model":"fixture","payload":{"schema_version":2,"parts":[{"text":"answer","thoughtSignature":"opaque"}]}}},"calls":[]}),
+        );
+        let rounds = canonical_rounds(vec![final_response]).unwrap();
+        assert_eq!(rounds.len(), 1);
+        assert!(rounds[0].complete);
+        assert_eq!(
+            rounds[0].messages[0]["provider_replay_state"]["payload"]["parts"][0]["thoughtSignature"],
+            "opaque"
+        );
     }
     #[test]
     fn canonical_round_is_atomic_and_preserves_reasoning_without_interpreting_opaque_state() {

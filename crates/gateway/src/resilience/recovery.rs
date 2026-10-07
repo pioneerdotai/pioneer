@@ -4080,7 +4080,10 @@ impl RecoveryCoordinator {
         rows.retain(|row| !verified_legacy.contains(&row.sequence));
         // Capture the exact round/item mapping before the existing recovery
         // assembler orders results and synthesizes safe interrupted observations.
-        let origins = retained_history_origins(&workspace, &thread, turn_id, &rows, &sources)?;
+        let origins = hydrated_retained_history_origins(
+            &store, &workspace, &thread, turn_id, &rows, &sources,
+        )
+        .await?;
         // A terminal shell item is acknowledged before the replay row. Recover
         // that known outcome if the process stopped between the two appends.
         let recorded_items = rows
@@ -4412,6 +4415,77 @@ struct RetainedToolOrigin {
     provenance: Option<pioneer_provider::MessageProvenance>,
 }
 
+async fn hydrated_retained_history_origins(
+    store: &pioneer_crud::CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    rows: &[RetainedProviderHistoryRow],
+    sources: &HashMap<i64, pioneer_compaction::SourceRef>,
+) -> Result<HashMap<i64, RetainedRoundOrigins>> {
+    let mut origins = retained_history_origins(workspace, thread, turn, rows, sources)?;
+    for row in rows.iter().filter(|row| row.source == "assistant_round") {
+        let Ok(envelope) =
+            serde_json::from_str::<pioneer_provider::CanonicalProviderRoundEnvelope>(&row.payload)
+        else {
+            continue;
+        };
+        if envelope.calls.is_empty() {
+            if let (Some(round), Some(source)) =
+                (origins.get_mut(&row.sequence), sources.get(&row.sequence))
+            {
+                let evidence = crate::compaction::final_response_aliases(
+                    store,
+                    workspace,
+                    thread,
+                    turn,
+                    source,
+                    &envelope.round_id,
+                    row.item_id.as_deref(),
+                )
+                .await?;
+                round.assistant.source_aliases = evidence.aliases;
+                round.assistant.complete &= evidence.ready;
+            }
+        }
+    }
+    Ok(origins)
+}
+
+// Uses the same durable hydration as recovery, without starting a coordinator,
+// provider or recovery runner in the regression fixture.
+#[cfg(test)]
+pub(crate) async fn recovered_final_origin_for_test(
+    store: &pioneer_crud::CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    row: &pioneer_crud::TurnLlmContextEntry,
+    source: &pioneer_compaction::SourceRef,
+) -> Result<pioneer_provider::MessageProvenance> {
+    let row = RetainedProviderHistoryRow {
+        sequence: row.sequence,
+        source: row.source.clone(),
+        item_id: row.item_id.clone(),
+        tool_name: row.tool_name.clone(),
+        payload: row.payload.clone(),
+    };
+    let sequence = row.sequence;
+    let mut origins = hydrated_retained_history_origins(
+        &store.with_maintenance_access(),
+        workspace,
+        thread,
+        turn,
+        &[row],
+        &HashMap::from([(sequence, source.clone())]),
+    )
+    .await?;
+    Ok(origins
+        .remove(&sequence)
+        .ok_or_else(|| anyhow::anyhow!("final origin missing"))?
+        .assistant)
+}
+
 fn retained_history_origins(
     workspace: &str,
     thread: &str,
@@ -4593,6 +4667,25 @@ fn assemble_canonical_provider_history(
                 "retained provider round `{}` for turn `{turn_id}` is not an assistant message",
                 pending.envelope.round_id
             );
+        }
+        if pending
+            .envelope
+            .message
+            .tool_calls
+            .as_ref()
+            .is_none_or(|calls| calls.is_empty())
+        {
+            anyhow::ensure!(
+                pending.envelope.termination == ProviderTermination::Complete
+                    && pending.envelope.calls.is_empty()
+                    && pending.results.is_empty(),
+                "invalid retained canonical assistant response"
+            );
+            retained.push(RetainedProviderHistoryMessage {
+                sequence: pending.sequence,
+                message: pending.envelope.message,
+            });
+            return Ok(());
         }
         if pending.envelope.termination != ProviderTermination::ToolCalls {
             bail!(
@@ -5078,6 +5171,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn resumed_no_tool_response_keeps_native_state() {
+        let mut message = ChatMessage::assistant("answer");
+        message.provider_replay_state = Some(ProviderReplayState::for_model(
+            "anthropic",
+            "fixture",
+            serde_json::json!({"schema_version":2,"blocks":[{"type":"text","text":"answer"}]}),
+        ));
+        let envelope = CanonicalProviderRoundEnvelope {
+            version: 1,
+            round_id: "final".into(),
+            termination: ProviderTermination::Complete,
+            message: message.clone(),
+            calls: vec![],
+        };
+        let rows = vec![retained_history_row(
+            10,
+            "assistant_round",
+            Some("final"),
+            None,
+            serde_json::to_string(&envelope).unwrap(),
+        )];
+        let restored = assemble_retained_provider_history("turn", rows).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].message, message);
+    }
     #[test]
     fn legacy_round_requires_durable_outcome_even_with_result_rows() {
         let assistant = ChatMessage::assistant_tool_calls_with_provider_state(

@@ -91,6 +91,41 @@ fn bind_replay_to_response_target(
     }
 }
 
+/// A final no-tool response can contain native state absent from UI text.
+/// Keep it in the existing acknowledged history route before finalization.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn persist_completed_response(
+    events: &AgentEventHub,
+    thread: &str,
+    turn: &str,
+    item: &str,
+    reasoning_item: &str,
+    text: &str,
+    reasoning: &str,
+    replay: Option<&pioneer_provider::ProviderReplayState>,
+) -> Result<(), ChatTurnError> {
+    if replay.is_none() && reasoning.is_empty() {
+        return Ok(());
+    }
+    let mut message = pioneer_provider::ChatMessage::assistant(text);
+    message.reasoning_content = (!reasoning.is_empty()).then(|| reasoning.to_owned());
+    message.provider_replay_state = replay.cloned();
+    super::persist_provider_history_message(
+        events,
+        thread,
+        turn,
+        reasoning_item,
+        &pioneer_provider::CanonicalProviderRoundEnvelope {
+            version: 1,
+            round_id: item.into(),
+            termination: pioneer_provider::ProviderTermination::Complete,
+            message,
+            calls: Vec::new(),
+        },
+    )
+    .await
+}
+
 /// Persist the provider accumulator, including opaque state absent from UI text.
 /// This acknowledged observation precedes failure/recovery and never becomes an
 /// executable assistant/tool round. Cancellation still drops this owned future.
@@ -672,6 +707,19 @@ pub(super) async fn stream_provider_response(
         .await?;
         return Err(error);
     }
+    if stream_tool_calls.is_empty() {
+        persist_completed_response(
+            event_tx,
+            thread_id,
+            turn_id,
+            message_item_id,
+            thinking_item_id,
+            &full_text,
+            &reasoning_parts,
+            provider_replay_state.as_ref(),
+        )
+        .await?;
+    }
     for tool_call in stream_tool_calls {
         super::emit_durable_event(
             event_tx,
@@ -801,7 +849,7 @@ pub(super) async fn non_stream_provider_response(
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
     let model_name = request.model.clone();
 
-    let response = provider.chat(request).await.map_err(|error| {
+    let mut response = provider.chat(request).await.map_err(|error| {
         adapter_error_for_target(
             FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
             provider.as_ref(),
@@ -813,6 +861,11 @@ pub(super) async fn non_stream_provider_response(
         )
     })?;
 
+    bind_replay_to_response_target(
+        &mut response.provider_replay_state,
+        provider.name(),
+        &model_name,
+    );
     if !response.text.is_empty() {
         pioneer_observability::turn_startup::runtime_output(
             turn_id,
@@ -847,6 +900,19 @@ pub(super) async fn non_stream_provider_response(
         model_name.as_str(),
         ProviderTransportKind::NonStream,
     )?;
+    if response.tool_calls.is_empty() {
+        persist_completed_response(
+            event_tx,
+            thread_id,
+            turn_id,
+            message_item_id,
+            thinking_item_id,
+            &response.text,
+            response.reasoning_content.as_deref().unwrap_or_default(),
+            response.provider_replay_state.as_ref(),
+        )
+        .await?;
+    }
     let reasoning_content = match &response.reasoning_content {
         Some(rc) if !rc.is_empty() => vec![rc.clone()],
         _ => Vec::new(),
@@ -1610,6 +1676,58 @@ mod tests {
         };
         assert!(!serde_json::to_string(&failure).unwrap().contains(secret));
         failure
+    }
+
+    #[tokio::test]
+    async fn ordinary_final_without_native_state_or_reasoning_does_not_expect_ui_aliases() {
+        let hub = AgentEventHub::new();
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        persist_completed_response(
+            &hub, "thread", "turn", "final", "thinking", "answer", "", None,
+        )
+        .await
+        .unwrap();
+        assert!(futures_util::FutureExt::now_or_never(receiver.recv()).is_none());
+    }
+
+    #[tokio::test]
+    async fn completed_native_response_waits_for_durable_history_acknowledgement() {
+        let hub = AgentEventHub::new();
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        let state = pioneer_provider::ProviderReplayState::for_model(
+            "gemini",
+            "fixture",
+            serde_json::json!({"schema_version":2,"parts":[{"text":"answer","thoughtSignature":"signed"}]}),
+        );
+        let publish = persist_completed_response(
+            &hub,
+            "thread",
+            "turn",
+            "final",
+            "thinking",
+            "answer",
+            "",
+            Some(&state),
+        );
+        let receive = async {
+            let AgentDurableEvent::TurnProviderHistoryAppended {
+                payload, item_id, ..
+            } = receiver.recv().await.unwrap()
+            else {
+                panic!("expected canonical history");
+            };
+            assert_eq!(item_id, "thinking");
+            let envelope: pioneer_provider::CanonicalProviderRoundEnvelope =
+                serde_json::from_value(payload).unwrap();
+            assert_eq!(
+                envelope.message.provider_replay_state.as_ref(),
+                Some(&state)
+            );
+            assert!(envelope.calls.is_empty());
+            receiver.acknowledge_last(Ok(()));
+        };
+        let (result, ()) = tokio::join!(publish, receive);
+        result.unwrap();
     }
 
     #[tokio::test]

@@ -34,7 +34,7 @@ async fn authorized_event_cannot_restart_reinstalled_or_replaced_identity_after_
     }
 }
 
-// The WebSocket reader must keep progressing with a single async worker.
+// One async worker verifies that the post-put async barrier yields to Cancel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn same_websocket_terminal_decision_after_durable_put_preserves_cancel_timeout_and_success() {
     use pioneer_mcp_oauth::OAuthState;
@@ -108,7 +108,7 @@ async fn oauth_queue_cancellation_impl(
     });
     let secrets = Arc::new(GatewaySecrets::new(other_read.clone()));
     let clock = Arc::new(WireCommitClock::new());
-    let hooks = Arc::new(pioneer_mcp_oauth::OAuthTestHooks::default());
+    let commit_hooks = Arc::new(pioneer_mcp_oauth::OAuthTestHooks::default());
     let mut processor = MessageProcessor::new(
         Arc::new(ThreadManager::new("o4-mini", "openai")),
         test_provider(),
@@ -129,8 +129,8 @@ async fn oauth_queue_cancellation_impl(
             processor.authorization_invalidation_hub.clone(),
             processor.execution_leases.clone(),
             pioneer_mcp_oauth::OAuthServiceOptions {
+                test_hooks: Some(commit_hooks.clone()),
                 clock: clock.clone(),
-                test_hooks: Some(hooks.clone()),
                 poll_interval: if replacement.is_some() {
                     Duration::from_millis(10)
                 } else {
@@ -176,7 +176,7 @@ async fn oauth_queue_cancellation_impl(
         }
     }
     let _release_on_exit = QueueFixtureRelease {
-        hooks: hooks.clone(),
+        commit_hooks: commit_hooks.clone(),
         notifications: vec![token_release.clone(), effect_release.clone()],
         other_read: other_read.clone(),
     };
@@ -821,13 +821,16 @@ async fn oauth_queue_cancellation_impl(
                 .unwrap(),
         )
         .unwrap();
-        hooks
-            .pause_before_winner
+        commit_hooks
+            .pause_after_exchange
             .store(true, std::sync::atomic::Ordering::SeqCst);
         token_release.notify_one();
-        tokio::time::timeout(Duration::from_secs(3), hooks.exchange_persisted.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            commit_hooks.exchange_returned.notified(),
+        )
+        .await
+        .unwrap();
         let staged = serde_json::to_value(
             secrets
                 .mcp_oauth_persistence()
@@ -853,7 +856,7 @@ async fn oauth_queue_cancellation_impl(
         } else if decision == OAuthState::TimedOut {
             *clock.now.lock().unwrap() += Duration::from_secs(4000);
         }
-        hooks.reserve_winner.notify_one();
+        commit_hooks.decide_exchange.notify_one();
         let wire_state = match decision {
             OAuthState::Cancelled => "cancelled",
             OAuthState::TimedOut => "timed_out",
@@ -1510,7 +1513,9 @@ impl pioneer_mcp::McpRuntimeConnector for ScopePhaseConnector {
     }
 }
 
-// Time injection never blocks an OAuth admission or persistence operation.
+// Time observation must never block: event validation and cancellation also
+// read this clock while holding their admission mutex. The async service hook
+// above pauses only the exchange owner after the actual SDK store has returned.
 struct WireCommitClock {
     now: std::sync::Mutex<std::time::SystemTime>,
 }
@@ -1595,13 +1600,13 @@ impl pioneer_mcp::McpRuntimeSession for ScopeRefreshSession {
 }
 
 struct QueueFixtureRelease {
-    hooks: Arc<pioneer_mcp_oauth::OAuthTestHooks>,
+    commit_hooks: Arc<pioneer_mcp_oauth::OAuthTestHooks>,
     notifications: Vec<Arc<tokio::sync::Notify>>,
     other_read: Arc<OtherInstallationRead>,
 }
 impl Drop for QueueFixtureRelease {
     fn drop(&mut self) {
-        self.hooks.reserve_winner.notify_one();
+        self.commit_hooks.decide_exchange.notify_one();
         self.other_read
             .uncertain_promotion
             .store(false, std::sync::atomic::Ordering::SeqCst);
