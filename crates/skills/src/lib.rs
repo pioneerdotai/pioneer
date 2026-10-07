@@ -27,9 +27,9 @@ pub use compile::{
     SkillRuntime, SkillUnavailableReason, compact_skill_label, compile_skill_definition,
 };
 pub use contract::{
-    SkillCatalogSnapshot, SkillDependencies, SkillMarkdownParseContext, SkillSourceKind,
-    SkillTrustLevel, normalize_skill_markdown_plain_description, normalize_skill_slug,
-    parse_skill_from_file, parse_skill_markdown,
+    SkillCatalogSnapshot, SkillDependencies, SkillInputRevision, SkillMarkdownParseContext,
+    SkillSourceKind, SkillTrustLevel, normalize_skill_markdown_plain_description,
+    normalize_skill_slug, parse_skill_from_file, parse_skill_markdown,
 };
 pub use dependencies::{
     DependencyCheckInput, DependencyCheckResult, DependencyDiagnostic, DependencyKind,
@@ -72,7 +72,7 @@ pub use prompt::{
 pub use provenance::{
     SkillLockConversionCandidate, SkillLockEntry, SkillsLock, ensure_skills_lock_v2,
     find_lock_entry, read_skills_lock, remove_lock_entry, upsert_lock_entry,
-    write_skills_lock_atomic,
+    write_skills_lock_atomic, write_skills_lock_atomic_tracked,
 };
 pub use resolver::{
     ExcludedSkill, ResolvedSkill, SkillExcludedReason, SkillExplicitRef, SkillResolutionInput,

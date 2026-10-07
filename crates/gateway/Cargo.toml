@@ -43,6 +43,7 @@ pioneer-tools.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 notify.workspace = true
+same-file.workspace = true
 async-stream.workspace = true
 futures-util.workspace = true
 keepawake.workspace = true

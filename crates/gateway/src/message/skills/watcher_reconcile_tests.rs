@@ -15,7 +15,7 @@ fn package(path: &Path, text: &str) {
 fn config(harness: &Harness, source: &Path) -> ConfiguredRootImportConfig {
     let mut config = harness
         .processor
-        .configured_root_import_config(&harness.workspace.id, false)
+        .configured_root_import_config(&harness.workspace.id)
         .unwrap();
     config.roots[0].source_root = source.to_path_buf();
     config
@@ -28,12 +28,14 @@ fn fence(path: &Path) -> JobFence {
         .unwrap()
         .insert(path.to_path_buf(), Dirty::new(1, std::time::Instant::now()));
     let live = signals.roots.lock().unwrap()[path].live.clone();
+    let stop = tokio_util::sync::CancellationToken::new();
     JobFence {
+        claims: signals.new_claim_owner(path, live.clone()),
         signals,
         live,
         root: path.to_path_buf(),
         incarnation: 1,
-        stop: tokio_util::sync::CancellationToken::new(),
+        stop,
     }
 }
 async fn consume(mut work: Work) -> (usize, usize) {
@@ -44,6 +46,7 @@ async fn consume(mut work: Work) -> (usize, usize) {
             Progress::Changed(_) => changed += 1,
             Progress::Failed => failed += 1,
             Progress::Quantum => {}
+            Progress::Waiting(until) => tokio::time::sleep_until(until.into()).await,
         }
     }
     (changed, failed)
@@ -65,6 +68,41 @@ fn job(
         Arc::default(),
         guard,
     )
+}
+
+#[test]
+fn metadata_hashes_follow_filesystem_identity_without_confusing_case_variant_assets() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    package(root, "case identity");
+    fs::rename(root.join("SKILL.md"), root.join("skill.md")).unwrap();
+    if root.join("SKILL.md").try_exists().unwrap() {
+        assert_eq!(
+            metadata_input(root, Path::new("skill.md")).unwrap(),
+            Some(false)
+        );
+    } else {
+        assert_eq!(metadata_input(root, Path::new("skill.md")).unwrap(), None);
+        fs::write(root.join("SKILL.md"), "canonical metadata").unwrap();
+        assert_eq!(metadata_input(root, Path::new("skill.md")).unwrap(), None);
+    }
+    fs::write(root.join("_META.JSON"), "{}").unwrap();
+    let sidecar = root.join("_meta.json").try_exists().unwrap();
+    assert_eq!(
+        metadata_input(root, Path::new("_META.JSON")).unwrap(),
+        sidecar.then_some(true)
+    );
+    let mut tree = Tree::new(root.to_path_buf(), None, 4096, false).unwrap();
+    while !tree.step().unwrap() {}
+    assert_eq!(
+        tree.input_revision.skill,
+        <[u8; 32]>::from(Sha256::digest(fs::read(root.join("SKILL.md")).unwrap()))
+    );
+    assert_eq!(
+        tree.input_revision.sidecar,
+        sidecar
+            .then(|| <[u8; 32]>::from(Sha256::digest(fs::read(root.join("_meta.json")).unwrap())))
+    );
 }
 
 #[test]
@@ -719,7 +757,7 @@ async fn shared_source_bytes_and_preparation_are_read_once_for_matching_scope_po
     let first = config(&harness, &source);
     let mut second = harness
         .processor
-        .configured_root_import_config("other", false)
+        .configured_root_import_config("other")
         .unwrap();
     second.roots[0].source_root = source.clone();
     let mut registry = first.clone();
@@ -733,6 +771,18 @@ async fn shared_source_bytes_and_preparation_are_read_once_for_matching_scope_po
         .find(|root| root.source_kind == SkillSourceKind::Registry)
         .unwrap()
         .managed_root;
+    let mut system = first.clone();
+    system.roots[0].source_kind = SkillSourceKind::System;
+    system.roots[0].scope_key = "system".into();
+    system.roots[0].managed_root = harness
+        .processor
+        .managed_root_scan_config("ws")
+        .unwrap()
+        .roots
+        .into_iter()
+        .find(|root| root.source_kind == SkillSourceKind::System)
+        .unwrap()
+        .managed_root;
     let guard = fence(&source);
     let counters = guard.signals.clone();
     assert_eq!(
@@ -742,20 +792,28 @@ async fn shared_source_bytes_and_preparation_are_read_once_for_matching_scope_po
             vec![
                 Mapping::Import(first.clone(), Some(harness.workspace.clone())),
                 Mapping::Import(second.clone(), Some(other.clone())),
-                Mapping::Import(registry, Some(harness.workspace.clone()))
+                Mapping::Import(registry, Some(harness.workspace.clone())),
+                Mapping::Import(system, None)
             ],
             Arc::default(),
             Arc::default(),
             guard
         ))
         .await,
-        (3, 0)
+        (4, 0)
     );
     assert_eq!(
         counters
             .preparations
             .load(std::sync::atomic::Ordering::Relaxed),
         1
+    );
+    assert_eq!(
+        counters
+            .preparation_input_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        fs::metadata(source.join("pkg/SKILL.md")).unwrap().len(),
+        "one real read of shared preparation inputs, independent of mappings"
     );
     assert_eq!(
         counters.hashes.load(std::sync::atomic::Ordering::Relaxed),
@@ -780,6 +838,15 @@ async fn shared_source_bytes_and_preparation_are_read_once_for_matching_scope_po
         .list_skill_installations_scope_page("user", "other", None, 64)
         .await
         .unwrap();
+    let system_rows = harness
+        .processor
+        .crud_store
+        .list_skill_installations_scope_page("system", "system", None, 64)
+        .await
+        .unwrap();
+    assert_eq!(system_rows.len(), 1);
+    assert_ne!(system_rows[0].skill_id, user[0].skill_id);
+    assert_eq!(system_rows[0].source_kind, "system");
     assert_ne!(user[0].skill_id, other_rows[0].skill_id);
     assert_ne!(user[0].install_path, other_rows[0].install_path);
     // An incompatible policy cannot borrow a successful security decision.
@@ -963,6 +1030,49 @@ async fn baseline_prunes_current_scope_after_success_and_removed_mapping_but_not
     );
 }
 
+async fn publish(
+    crud: &pioneer_crud::CrudStore,
+    lock: &Arc<tokio::sync::Mutex<()>>,
+    candidate: SkillStorageRelocationCandidate,
+    snapshot: pioneer_crud::SkillReconciliationSnapshot,
+    workspace: Option<pioneer_entity::workspace::Model>,
+    stage: Option<PathBuf>,
+    recovery: Option<PathBuf>,
+    stop: tokio_util::sync::CancellationToken,
+    current: impl Fn() -> bool + Send + Sync + 'static,
+    tracked: impl Fn(PathBuf, bool) -> Result<()> + Send + Sync + 'static,
+) -> Result<SkillStorageRelocationOutcome> {
+    let mut publication = storage::publish_watched_candidate(
+        crud,
+        lock,
+        candidate,
+        snapshot,
+        workspace,
+        stage,
+        recovery,
+        stop,
+        current,
+        tracked,
+        |_, _| {},
+    );
+    let mut outcome = None;
+    while let Some(progress) = publication.next().await {
+        match progress? {
+            storage::PublicationProgress::Finished(result, bytes) => {
+                assert!(bytes <= BYTES);
+                outcome = Some(result);
+            }
+            storage::PublicationProgress::Waiting(until) => {
+                tokio::time::sleep_until(until.into()).await;
+            }
+            storage::PublicationProgress::Quantum(bytes) => {
+                assert!(bytes <= BYTES);
+            }
+        }
+    }
+    outcome.context("publisher ended without an outcome")
+}
+
 async fn publication_fixture(
     harness: &Harness,
 ) -> (
@@ -1046,7 +1156,7 @@ async fn cancellation_before_first_db_poll_restores_files_and_lock_and_has_no_co
     let lock = candidate.managed_lock_path.clone().unwrap();
     let stop = tokio_util::sync::CancellationToken::new();
     let cancel = stop.clone();
-    let error = storage::publish_watched_candidate(
+    let error = publish(
         &harness.processor.crud_store,
         &harness.processor.skills_write_lock,
         candidate,
@@ -1100,7 +1210,7 @@ async fn confirmed_mutation_rollback_restores_publication_while_lost_commit_ack_
     let (candidate, snapshot, stage, wrapper) = publication_fixture(&harness).await;
     let destination = candidate.destination.clone();
     harness.processor.crud_store.database_connection().execute_unprepared("CREATE TRIGGER reject_watched_update BEFORE UPDATE ON skill_installation BEGIN SELECT RAISE(ABORT,'injected mutation rejection'); END").await.unwrap();
-    let error = storage::publish_watched_candidate(
+    let error = publish(
         &harness.processor.crud_store,
         &harness.processor.skills_write_lock,
         candidate.clone(),
@@ -1135,7 +1245,7 @@ async fn confirmed_mutation_rollback_restores_publication_while_lost_commit_ack_
         .unwrap();
     let _reset = PublicationFaultReset;
     storage::WATCH_PUBLICATION_FAULT.with(|fault| fault.set(Some("commit_ack")));
-    let error = storage::publish_watched_candidate(
+    let error = publish(
         &harness.processor.crud_store,
         &harness.processor.skills_write_lock,
         candidate,
@@ -1184,7 +1294,7 @@ async fn preparation_rejection_and_failed_file_or_lock_restoration_keep_last_bac
         let _reset = PublicationFaultReset;
         storage::WATCH_PUBLICATION_FAULT.with(|slot| slot.set(fault));
         assert!(
-            storage::publish_watched_candidate(
+            publish(
                 &harness.processor.crud_store,
                 &harness.processor.skills_write_lock,
                 candidate,
@@ -1355,7 +1465,7 @@ async fn fresh_worker_forwards_unknown_commit_with_current_guards_then_reclaims_
     let _reset = PublicationFaultReset;
     storage::WATCH_PUBLICATION_FAULT.with(|fault| fault.set(Some("commit_ack")));
     assert!(
-        storage::publish_watched_candidate(
+        publish(
             &harness.processor.crud_store,
             &harness.processor.skills_write_lock,
             candidate,
@@ -1403,7 +1513,7 @@ async fn failed_begin_after_successful_reader_preparation_proves_no_commit() {
     // The fixture owns the executor and closes only its writer. Reader preparation
     // remains real and succeeds; begin then returns a genuine closed-pool error.
     harness.writer.clone().close().await.unwrap();
-    let error = storage::publish_watched_candidate(
+    let error = publish(
         &harness.processor.crud_store,
         &harness.processor.skills_write_lock,
         candidate,
@@ -1474,7 +1584,7 @@ async fn missing_scoped_pack_parent_and_incompatible_parent_reject_before_begin(
             .await
             .unwrap();
         let writes = harness.observer.writes.lock().unwrap().len();
-        let error = storage::publish_watched_candidate(
+        let error = publish(
             &harness.processor.crud_store,
             &harness.processor.skills_write_lock,
             candidate,
@@ -1583,7 +1693,7 @@ async fn large_lock_preserves_foreign_entries_and_serializes_a_foreground_writer
         .unwrap();
     });
     assert_eq!(
-        storage::publish_watched_candidate(
+        publish(
             &harness.processor.crud_store,
             &harness.processor.skills_write_lock,
             candidate,
@@ -1593,7 +1703,7 @@ async fn large_lock_preserves_foreign_entries_and_serializes_a_foreground_writer
             None,
             Default::default(),
             || true,
-            |_, committed| {
+            move |_, committed| {
                 if !committed {
                     if let Some(sender) = started_tx.lock().unwrap().take() {
                         sender.send(()).unwrap();
@@ -1641,7 +1751,7 @@ async fn real_commit_failure_adopts_existing_bytes_and_new_edits_forward_without
     let destination = candidate.destination.clone();
     let source = harness.directory.path().join("source");
     harness.processor.crud_store.database_connection().execute_unprepared("PRAGMA foreign_keys=ON; CREATE TABLE watched_commit_parent(id INTEGER PRIMARY KEY); CREATE TABLE watched_commit_child(parent INTEGER REFERENCES watched_commit_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER fail_watched_commit AFTER UPDATE ON skill_installation BEGIN INSERT INTO watched_commit_child VALUES(123); END").await.unwrap();
-    let error = storage::publish_watched_candidate(
+    let error = publish(
         &harness.processor.crud_store,
         &harness.processor.skills_write_lock,
         candidate,
@@ -1747,4 +1857,1145 @@ async fn real_commit_failure_adopts_existing_bytes_and_new_edits_forward_without
         fs::read_to_string(destination.join("assets/value.txt")).unwrap(),
         "new source edit while outcome uncertain"
     );
+}
+
+struct LocalFsFaults(Vec<(PathBuf, &'static str)>);
+impl LocalFsFaults {
+    fn new(faults: Vec<(PathBuf, &'static str)>) -> Self {
+        FS_FAULTS.lock().unwrap().extend(faults.iter().cloned());
+        Self(faults)
+    }
+}
+impl Drop for LocalFsFaults {
+    fn drop(&mut self) {
+        let mut faults = FS_FAULTS.lock().unwrap();
+        for fault in &self.0 {
+            faults.remove(fault);
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_marker_cleanup_and_nested_directory_failures_preserve_neighbors_and_baseline() {
+    for point in ["marker", "cleanup", "read_dir"] {
+        let harness = harness().await;
+        let source = harness.directory.path().join("source");
+        package(&source.join("healthy"), "healthy remainder");
+        let source = fs::canonicalize(source).unwrap();
+        let attempts: Attempts = Arc::default();
+        let poisoned = if point == "read_dir" {
+            let path = source.join("blocked");
+            fs::create_dir(&path).unwrap();
+            package(&path.join("hidden-by-error"), "must not infer absence");
+            path
+        } else {
+            let path = new_attempt(&source, source.clone()).unwrap();
+            package(&path.join("backup"), "last recoverable bytes");
+            set_attempt_publishing(&path, true).unwrap();
+            if point == "cleanup" {
+                attempts
+                    .lock()
+                    .unwrap()
+                    .insert(path.clone(), Attempt::new(source.clone()));
+            }
+            path
+        };
+        let garbage = new_attempt(&source, source.clone()).unwrap();
+        package(&garbage.join("payload"), "safe garbage");
+        attempts
+            .lock()
+            .unwrap()
+            .insert(garbage.clone(), Attempt::new(source.clone()));
+        let faults = LocalFsFaults::new(vec![(poisoned.clone(), point)]);
+        let (_, snapshot, _, _) = publication_fixture(&harness).await;
+        let mut stale_baseline = snapshot.record.clone();
+        stale_baseline.skill_id = SkillId::new("B".repeat(21)).unwrap();
+        let baseline: Arc<StdMutex<Baseline>> = Arc::default();
+        changed_availability(&baseline, &stale_baseline, None);
+        let mut managed = harness.processor.managed_root_scan_config("ws").unwrap();
+        managed
+            .roots
+            .retain(|root| root.source_kind == SkillSourceKind::User);
+        managed.roots[0].managed_root = source.clone();
+        let result = consume(root_job(
+            harness.processor.clone(),
+            source.clone(),
+            vec![
+                Mapping::Import(config(&harness, &source), Some(harness.workspace.clone())),
+                Mapping::Managed(managed, Some(harness.workspace.clone())),
+            ],
+            baseline.clone(),
+            attempts.clone(),
+            fence(&source),
+        ))
+        .await;
+        assert!(
+            result.0 > 0,
+            "healthy package must advance after {point} failure"
+        );
+        assert!(result.1 > 0, "incomplete root must retain failed work");
+        assert!(
+            poisoned.exists(),
+            "unreadable or protected data must survive"
+        );
+        assert!(
+            !garbage.exists(),
+            "independent cleanup artifact must progress"
+        );
+        assert!(
+            baseline
+                .lock()
+                .unwrap()
+                .managed
+                .keys()
+                .any(|key| key.2 == stale_baseline.skill_id)
+        );
+        drop(faults);
+    }
+}
+
+#[tokio::test]
+async fn unresolved_marker_does_not_stop_resolving_an_independent_committed_attempt() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = fs::canonicalize(directory.path()).unwrap();
+    let bad = new_attempt(&owner, owner.clone()).unwrap();
+    let good = new_attempt(&owner, owner.clone()).unwrap();
+    let id = SkillId::new("C".repeat(21)).unwrap();
+    for path in [&bad, &good] {
+        set_attempt_skill(path, id.clone()).unwrap();
+        set_attempt_publishing(path, true).unwrap();
+    }
+    let attempts: Attempts = Arc::default();
+    for path in [&bad, &good] {
+        attempts
+            .lock()
+            .unwrap()
+            .insert(path.clone(), Attempt::new(owner.clone()));
+    }
+    let _fault = LocalFsFaults::new(vec![(bad.clone(), "marker")]);
+    let result = consume(resolved_attempts(attempts.clone(), fence(&owner), id)).await;
+    assert!(result.1 > 0);
+    assert!(!attempts.lock().unwrap()[&bad].committed);
+    assert!(attempts.lock().unwrap()[&good].committed);
+    assert!(!attempt_marker(&good).unwrap().unwrap().publishing);
+    let other_root = owner.join("independent-root");
+    fs::create_dir(&other_root).unwrap();
+    assert_eq!(
+        consume(resolved_attempts(
+            attempts.clone(),
+            fence(&other_root),
+            SkillId::new("D".repeat(21)).unwrap()
+        ))
+        .await
+        .1,
+        0,
+        "unreadable artifacts remain failed work of their owner, not every physical root"
+    );
+    let mut pending = has_pending_attempt(
+        attempts.clone(),
+        fence(&other_root),
+        SkillId::new("D".repeat(21)).unwrap(),
+    );
+    while let Some(page) = pending.next().await {
+        assert!(!page.unwrap().1);
+    }
+    consume(cleanup(attempts, fence(&owner))).await;
+    assert!(bad.exists());
+    assert!(!good.exists());
+}
+
+#[tokio::test]
+async fn sidecar_change_appearance_and_removal_after_preparation_never_publish_stale_metadata() {
+    for (before, after) in [
+        (Some("old"), Some("new")),
+        (None, Some("new")),
+        (Some("old"), None),
+    ] {
+        let harness = harness().await;
+        let source = harness.directory.path().join("source");
+        let package_path = source.join("pkg");
+        package(&package_path, "same SKILL.md");
+        let sidecar = package_path.join("_meta.json");
+        if let Some(owner) = before {
+            fs::write(&sidecar, format!("{{\"owner\":\"{owner}\"}}")).unwrap();
+        }
+        let guard = fence(&source);
+        let counters = guard.signals.clone();
+        let mut work = job(&harness, &source, Arc::default(), guard);
+        loop {
+            assert!(matches!(work.next().await, Some(Ok(Progress::Quantum))));
+            if counters
+                .prepared_inputs
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 1
+            {
+                break;
+            }
+        }
+        if let Some(owner) = after {
+            fs::write(&sidecar, format!("{{\"owner\":\"{owner}\"}}")).unwrap();
+        } else {
+            fs::remove_file(&sidecar).unwrap();
+        }
+        assert!(consume(work).await.1 > 0);
+        let rows = harness
+            .processor
+            .crud_store
+            .list_skill_installations_scope_page("user", "ws", None, 64)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].fingerprint.is_empty());
+        assert!(
+            !config(&harness, &source).roots[0]
+                .managed_root
+                .join(rows[0].skill_id.as_str())
+                .join("test-skill/SKILL.md")
+                .exists()
+        );
+        assert_eq!(
+            consume(job(&harness, &source, Arc::default(), fence(&source))).await,
+            (1, 0)
+        );
+        let row = harness
+            .processor
+            .crud_store
+            .find_skill_installation(&rows[0].skill_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.owner.as_deref(), after);
+        let lock = pioneer_skills::read_skills_lock(
+            &config(&harness, &source).roots[0]
+                .managed_root
+                .join("skills-lock.toml"),
+        )
+        .unwrap();
+        assert_eq!(lock.entries[0].owner.as_deref(), after);
+    }
+}
+
+#[tokio::test]
+async fn source_change_between_scope_mappings_invalidates_cached_inputs_without_another_security_scan()
+ {
+    let harness = harness().await;
+    harness
+        .processor
+        .workspace_manager
+        .create_workspace("other", Some("Other"))
+        .await
+        .unwrap();
+    let other = harness
+        .processor
+        .workspace_manager
+        .active_page(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == "other")
+        .unwrap();
+    let source = harness.directory.path().join("source");
+    package(&source.join("pkg"), "unchanged markdown");
+    let sidecar = source.join("pkg/_meta.json");
+    fs::write(&sidecar, "{\"owner\":\"old\"}").unwrap();
+    let mut second = harness
+        .processor
+        .configured_root_import_config("other")
+        .unwrap();
+    second.roots[0].source_root = source.clone();
+    let guard = fence(&source);
+    let counters = guard.signals.clone();
+    let mut work = root_job(
+        harness.processor.clone(),
+        source.clone(),
+        vec![
+            Mapping::Import(config(&harness, &source), Some(harness.workspace.clone())),
+            Mapping::Import(second, Some(other)),
+        ],
+        Arc::default(),
+        Arc::default(),
+        guard,
+    );
+    loop {
+        if matches!(work.next().await.unwrap().unwrap(), Progress::Changed(_)) {
+            break;
+        }
+    }
+    fs::write(&sidecar, "{\"owner\":\"new\"}").unwrap();
+    assert!(consume(work).await.1 > 0);
+    assert_eq!(
+        counters
+            .preparations
+            .load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    assert_eq!(
+        counters.hashes.load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    let first = harness
+        .processor
+        .crud_store
+        .list_skill_installations_scope_page("user", "ws", None, 64)
+        .await
+        .unwrap();
+    let second = harness
+        .processor
+        .crud_store
+        .list_skill_installations_scope_page("user", "other", None, 64)
+        .await
+        .unwrap();
+    assert_eq!(first[0].owner.as_deref(), Some("old"));
+    assert_eq!(
+        fs::read_to_string(Path::new(&first[0].install_path).join("_meta.json")).unwrap(),
+        "{\"owner\":\"old\"}"
+    );
+    assert!(second[0].fingerprint.is_empty());
+}
+
+#[tokio::test]
+async fn publisher_rejects_changed_sidecar_in_a_stage_even_when_markdown_fingerprint_is_unchanged()
+{
+    let harness = harness().await;
+    let (candidate, snapshot, stage, wrapper) = publication_fixture(&harness).await;
+    let destination = candidate.destination.clone();
+    fs::write(stage.join("_meta.json"), "{\"owner\":\"unprepared\"}").unwrap();
+    assert!(
+        publish(
+            &harness.processor.crud_store,
+            &harness.processor.skills_write_lock,
+            candidate,
+            snapshot.clone(),
+            Some(harness.workspace.clone()),
+            Some(stage),
+            None,
+            Default::default(),
+            || true,
+            |_, _| Ok(())
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("assets/value.txt")).unwrap(),
+        "old destination"
+    );
+    assert_eq!(
+        harness
+            .processor
+            .crud_store
+            .list_skill_reconciliation_page("user", "ws", None, 64)
+            .await
+            .unwrap(),
+        vec![snapshot]
+    );
+    assert!(!attempt_marker(&wrapper).unwrap().unwrap().publishing);
+}
+
+#[tokio::test]
+async fn real_worker_retains_failed_root_generation_while_a_neighbor_is_published() {
+    let harness = harness().await;
+    let source = harness.directory.path().join("source");
+    package(&source.join("healthy"), "neighbor progresses");
+    let source = fs::canonicalize(source).unwrap();
+    let bad = new_attempt(&source, source.clone()).unwrap();
+    package(&bad.join("backup"), "protected");
+    set_attempt_publishing(&bad, true).unwrap();
+    let _fault = LocalFsFaults::new(vec![(bad.clone(), "marker")]);
+    let signals = Arc::new(Signals::default());
+    let stop = tokio_util::sync::CancellationToken::new();
+    let worker = tokio::spawn(super::super::run_with_signals(
+        harness.processor.clone(),
+        stop.clone(),
+        signals.clone(),
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let failed = signals
+                .roots
+                .lock()
+                .unwrap()
+                .get(&source)
+                .is_some_and(|dirty| dirty.attempts > 0);
+            if failed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    {
+        let roots = signals.roots.lock().unwrap();
+        let dirty = &roots[&source];
+        assert_ne!(dirty.generation, dirty.acknowledged);
+        assert!(dirty.retry_at > std::time::Instant::now());
+    }
+    let rows = harness
+        .processor
+        .crud_store
+        .list_skill_installations_scope_page("user", "ws", None, 64)
+        .await
+        .unwrap();
+    assert!(rows.iter().any(|row| !row.fingerprint.is_empty()));
+    assert!(bad.join("backup/SKILL.md").exists());
+    stop.cancel();
+    worker.await.unwrap();
+    assert!(bad.exists());
+}
+
+#[tokio::test]
+async fn actual_managed_job_keeps_leaf_slug_with_sidecar_and_finishes_an_external_leaf_rename() {
+    let harness = harness().await;
+    let (candidate, snapshot, _, _) = publication_fixture(&harness).await;
+    let destination = candidate.destination;
+    fs::write(
+        destination.join("_meta.json"),
+        "{\"slug\":\"sidecar-slug\",\"owner\":\"meta\"}",
+    )
+    .unwrap();
+    let mut config = harness.processor.managed_root_scan_config("ws").unwrap();
+    config
+        .roots
+        .retain(|root| root.source_kind == SkillSourceKind::User);
+    let root = config.roots[0].managed_root.clone();
+    let run = || {
+        root_job(
+            harness.processor.clone(),
+            root.clone(),
+            vec![Mapping::Managed(
+                config.clone(),
+                Some(harness.workspace.clone()),
+            )],
+            Arc::default(),
+            Arc::default(),
+            fence(&root),
+        )
+    };
+    assert_eq!(consume(run()).await, (1, 0));
+    let row = harness
+        .processor
+        .crud_store
+        .find_skill_installation(&snapshot.record.skill_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.slug, "test-skill");
+    assert_eq!(row.owner.as_deref(), Some("meta"));
+    let renamed = destination.with_file_name("renamed-leaf");
+    fs::rename(&destination, &renamed).unwrap();
+    assert_eq!(consume(run()).await, (1, 0));
+    let row = harness
+        .processor
+        .crud_store
+        .find_skill_installation(&snapshot.record.skill_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.slug, "renamed-leaf");
+    assert_eq!(Path::new(&row.install_path), renamed);
+    assert_eq!(
+        fs::read_to_string(renamed.join("assets/value.txt")).unwrap(),
+        "old destination"
+    );
+    assert_eq!(
+        pioneer_skills::read_skills_lock(&root.join("skills-lock.toml"))
+            .unwrap()
+            .entries[0]
+            .slug,
+        "renamed-leaf"
+    );
+}
+
+#[tokio::test]
+async fn actual_import_generates_identity_for_an_unregistered_container_but_ignores_extra_known_leaves()
+ {
+    let harness = harness().await;
+    let mut config = config(&harness, &harness.directory.path().join("unused"));
+    let root = config.roots[0].managed_root.clone();
+    config.roots[0].source_root = root.clone();
+    config.roots[0].source_is_pioneer_managed = true;
+    let arbitrary_id = "A".repeat(21);
+    package(
+        &root.join(&arbitrary_id).join("test-skill"),
+        "unregistered layout",
+    );
+    let run = || {
+        root_job(
+            harness.processor.clone(),
+            root.clone(),
+            vec![Mapping::Import(
+                config.clone(),
+                Some(harness.workspace.clone()),
+            )],
+            Arc::default(),
+            Arc::default(),
+            fence(&root),
+        )
+    };
+    assert_eq!(consume(run()).await, (1, 0));
+    let rows = harness
+        .processor
+        .crud_store
+        .list_skill_installations_scope_page("user", "ws", None, 64)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_ne!(rows[0].skill_id.as_str(), arbitrary_id);
+    package(
+        &root.join(rows[0].skill_id.as_str()).join("extra"),
+        "not a new identity",
+    );
+    assert_eq!(consume(run()).await, (0, 0));
+    assert_eq!(
+        harness
+            .processor
+            .crud_store
+            .list_skill_installations_scope_page("user", "ws", None, 64)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn concurrent_first_lock_access_converts_v1_once_under_existing_lock() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let lock_path = temp.path().join("skills-lock.toml");
+    fs::write(
+            lock_path.as_path(),
+            "version = 1\n[[entries]]\nowner='owner'\nslug='test-skill'\nsource_kind='user'\nsource_ref='legacy'\ninstall_path='/legacy/test-skill'\ntrust_level='community'\nfingerprint='legacy-fingerprint'\ninstalled_at=7\n",
+        )
+        .expect("write v1 lock");
+    let candidate = pioneer_skills::SkillLockConversionCandidate {
+        skill_id: SkillId::new("T".repeat(21)).unwrap(),
+        owner: Some("owner".to_owned()),
+        slug: "test-skill".to_owned(),
+        source_kind: "user".to_owned(),
+        source_ref: "legacy".to_owned(),
+        install_path: "/legacy/test-skill".to_owned(),
+        version: None,
+        trust_level: pioneer_skills::SkillTrustLevel::Community,
+        fingerprint: "legacy-fingerprint".to_owned(),
+    };
+    let lock = Arc::new(Mutex::new(()));
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let lock = lock.clone();
+        let lock_path = lock_path.clone();
+        let candidate = candidate.clone();
+        tasks.push(tokio::spawn(async move {
+            let _guard = lock.lock().await;
+            pioneer_skills::ensure_skills_lock_v2(&lock_path, &[candidate]).expect("ensure v2")
+        }));
+    }
+    let first = tasks.remove(0).await.expect("first ensure task");
+    let second = tasks.remove(0).await.expect("second ensure task");
+    assert_eq!(first, second);
+    assert_eq!(first.entries.len(), 1);
+    assert_eq!(
+        first.entries[0].skill_id,
+        SkillId::new("T".repeat(21)).unwrap()
+    );
+    assert_eq!(
+        pioneer_skills::read_skills_lock(&lock_path).expect("strict v2 read"),
+        first
+    );
+}
+
+fn large_metadata_inputs(path: &Path) -> usize {
+    let skill = format!("---\nname: Test skill\n---\n{}", "x".repeat(600 * 1024));
+    let sidecar = serde_json::to_vec(
+        &serde_json::json!({"owner":"prepared", "extra":"y".repeat(700 * 1024)}),
+    )
+    .unwrap();
+    fs::write(path.join("SKILL.md"), &skill).unwrap();
+    fs::write(path.join("_meta.json"), &sidecar).unwrap();
+    skill.len() + sidecar.len()
+}
+
+#[tokio::test]
+async fn publisher_final_validation_is_bounded_and_pre_db_cancellation_compensates() {
+    for cancel in [false, true] {
+        let harness = harness().await;
+        let (mut candidate, snapshot, stage, wrapper) = publication_fixture(&harness).await;
+        let total = large_metadata_inputs(&candidate.source_path);
+        fs::copy(
+            candidate.source_path.join("SKILL.md"),
+            stage.join("SKILL.md"),
+        )
+        .unwrap();
+        fs::copy(
+            candidate.source_path.join("_meta.json"),
+            stage.join("_meta.json"),
+        )
+        .unwrap();
+        let prepared =
+            pioneer_skills::prepare_materialized_skill(PrepareMaterializedSkillRequest {
+                skill_id: candidate.expected_row.skill_id.clone(),
+                source_kind: SkillSourceKind::User,
+                source_ref: candidate.expected_row.source_ref.clone(),
+                materialized_source_path: candidate.source_path.clone(),
+                policy: config(&harness, &candidate.source_path).installer_policy,
+            })
+            .unwrap();
+        candidate.prepared_metadata = metadata(&prepared, candidate.expected_row.slug.clone());
+        let stop = tokio_util::sync::CancellationToken::new();
+        let destination = candidate.destination.clone();
+        let mut publication = storage::publish_watched_candidate(
+            &harness.processor.crud_store,
+            &harness.processor.skills_write_lock,
+            candidate,
+            snapshot.clone(),
+            Some(harness.workspace.clone()),
+            Some(stage.clone()),
+            None,
+            stop.clone(),
+            || true,
+            |_, _| Ok(()),
+            |_, _| {},
+        );
+        let mut bytes_read = 0;
+        let mut final_quanta = 0;
+        let mut cancelled = false;
+        let mut failed = false;
+        while let Some(progress) = publication.next().await {
+            match progress {
+                Ok(storage::PublicationProgress::Quantum(bytes)) => {
+                    assert!(bytes <= BYTES);
+                    bytes_read += bytes;
+                    if !stage.exists() && bytes != 0 {
+                        final_quanta += 1;
+                        if cancel && !cancelled {
+                            stop.cancel();
+                            cancelled = true;
+                        }
+                    }
+                }
+                Ok(storage::PublicationProgress::Finished(outcome, bytes)) => {
+                    assert_eq!(outcome, SkillStorageRelocationOutcome::Switched);
+                    assert!(bytes <= BYTES);
+                    bytes_read += bytes;
+                }
+                Ok(storage::PublicationProgress::Waiting(_)) => {
+                    panic!("fixture owns an uncontended installer lock")
+                }
+                Err(error) => {
+                    assert!(cancelled);
+                    assert_eq!(
+                        error
+                            .downcast_ref::<pioneer_crud::SkillReconciliationError>()
+                            .unwrap()
+                            .outcome,
+                        pioneer_crud::SkillReconciliationFailure::NotCommitted
+                    );
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if cancel {
+            assert!(failed && cancelled);
+            assert_eq!(
+                fs::read_to_string(destination.join("assets/value.txt")).unwrap(),
+                "old destination"
+            );
+            assert!(stage.join("SKILL.md").exists());
+            assert!(!attempt_marker(&wrapper).unwrap().unwrap().publishing);
+            assert_eq!(
+                harness
+                    .processor
+                    .crud_store
+                    .list_skill_reconciliation_page("user", "ws", None, 64)
+                    .await
+                    .unwrap(),
+                vec![snapshot]
+            );
+        } else {
+            assert_eq!(
+                bytes_read,
+                3 * total,
+                "source, stage and final published inputs all count actual reads"
+            );
+            assert!(final_quanta >= 5);
+        }
+    }
+}
+
+#[tokio::test]
+async fn large_input_noop_and_unknown_recovery_use_the_same_bounded_verification_cursor() {
+    let harness = harness().await;
+    let root = harness.directory.path().join("source");
+    let source = root.join("pkg");
+    package(&source, "content");
+    let total = large_metadata_inputs(&source);
+    let fence = fence(&root);
+    let attempts: Attempts = Arc::default();
+    let baseline = Arc::default();
+    let conf = config(&harness, &root);
+    assert_eq!(
+        consume(job(&harness, &root, baseline.clone(), fence.clone()))
+            .await
+            .1,
+        0
+    );
+    let initial = fence.signals.verification_bytes.load(Ordering::Relaxed);
+    assert_eq!(initial, 3 * total as u64);
+    assert_eq!(
+        consume(job(&harness, &root, baseline, fence.clone())).await,
+        (0, 0)
+    );
+    assert_eq!(
+        fence.signals.verification_bytes.load(Ordering::Relaxed) - initial,
+        total as u64,
+        "no-op verifies current source bytes in bounded steps"
+    );
+    let row = harness
+        .processor
+        .crud_store
+        .list_skill_installations_scope_page("user", "ws", None, 64)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let wrapper =
+        new_attempt(Path::new(&row.install_path).parent().unwrap(), root.clone()).unwrap();
+    set_attempt_skill(&wrapper, row.skill_id.clone()).unwrap();
+    set_attempt_publishing(&wrapper, true).unwrap();
+    attempts
+        .lock()
+        .unwrap()
+        .insert(wrapper.clone(), Attempt::new(root.clone()));
+    let before = fence.signals.verification_bytes.load(Ordering::Relaxed);
+    assert_eq!(
+        consume(root_job(
+            harness.processor.clone(),
+            root.clone(),
+            vec![Mapping::Import(conf, Some(harness.workspace.clone()))],
+            Arc::default(),
+            attempts,
+            fence.clone()
+        ))
+        .await
+        .1,
+        0
+    );
+    assert_eq!(
+        fence.signals.verification_bytes.load(Ordering::Relaxed) - before,
+        3 * total as u64,
+        "no-op plus forward recovery verifies source and destination"
+    );
+    assert!(!wrapper.exists());
+}
+
+#[tokio::test]
+async fn a_pending_import_waits_without_blocking_a_publishers_owned_cursor() {
+    let harness = harness().await;
+    let (candidate, snapshot, stage, _) = publication_fixture(&harness).await;
+    let mut publisher = storage::publish_watched_candidate(
+        &harness.processor.crud_store,
+        &harness.processor.skills_write_lock,
+        candidate,
+        snapshot,
+        Some(harness.workspace.clone()),
+        Some(stage.clone()),
+        None,
+        Default::default(),
+        || true,
+        |_, _| Ok(()),
+        |_, _| {},
+    );
+    while let Some(progress) = publisher.next().await {
+        assert!(matches!(
+            progress.unwrap(),
+            storage::PublicationProgress::Quantum(_)
+        ));
+        if !stage.exists() {
+            break;
+        }
+    }
+    assert!(harness.processor.skills_write_lock.try_lock().is_err());
+    let root = harness.directory.path().join("neighbor-source");
+    package(&root.join("pkg"), "independent");
+    let mut neighbor = job(&harness, &root, Arc::default(), fence(&root));
+    loop {
+        let progress = tokio::time::timeout(std::time::Duration::from_secs(2), neighbor.next())
+            .await
+            .expect("pending registration cannot await the only worker's own installer lock")
+            .unwrap()
+            .unwrap();
+        if let Progress::Waiting(until) = progress {
+            assert!(until > std::time::Instant::now());
+            break;
+        }
+    }
+    let mut committed = false;
+    while let Some(progress) = publisher.next().await {
+        committed |= matches!(
+            progress.unwrap(),
+            storage::PublicationProgress::Finished(SkillStorageRelocationOutcome::Switched, _)
+        );
+    }
+    assert!(committed);
+    assert_eq!(consume(neighbor).await, (1, 0));
+}
+
+// Count real marker, tree and revision reads, including partial read failures.
+// Whole-lock parsing remains an explicit open contract, not a bounded phase.
+// Temp roots isolate these counters from concurrently running tests.
+fn actual_read_bytes(root: &Path) -> u64 {
+    let physical = fs::canonicalize(root).unwrap();
+    FS_READ_BYTES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path.starts_with(root) || path.starts_with(&physical))
+        .map(|(_, bytes)| bytes)
+        .sum()
+}
+fn padded_attempt(parent: &Path, owner: &Path, id: SkillId) -> PathBuf {
+    let wrapper = new_attempt(parent, owner.to_path_buf()).unwrap();
+    set_attempt_skill(&wrapper, id).unwrap();
+    set_attempt_publishing(&wrapper, true).unwrap();
+    package(&wrapper.join("backup"), "protected last copy");
+    let marker = attempt_marker(&wrapper).unwrap().unwrap();
+    let mut bytes = serde_json::to_vec(&marker).unwrap();
+    assert!(bytes.len() < MARKER_BYTES);
+    bytes.resize(MARKER_BYTES, b' '); // valid JSON whitespace, not malformed padding
+    fs::write(wrapper.join(ATTEMPT_MARKER), bytes).unwrap();
+    wrapper
+}
+
+#[tokio::test]
+async fn discovery_marker_backlog_yields_real_root_quanta_without_losing_artifacts() {
+    let harness = harness().await;
+    let root = harness.directory.path().join("marker-backlog");
+    fs::create_dir(&root).unwrap();
+    let id = SkillId::new("M".repeat(21)).unwrap();
+    let wrappers = (0..80)
+        .map(|_| padded_attempt(&root, &root, id.clone()))
+        .collect::<Vec<_>>();
+    let attempts: Attempts = Arc::default();
+    let mut work = root_job(
+        harness.processor.clone(),
+        root.clone(),
+        Vec::new(),
+        Arc::default(),
+        attempts.clone(),
+        fence(&root),
+    );
+    let mut discovery_quanta = 0;
+    loop {
+        let before = actual_read_bytes(harness.directory.path());
+        let progress = work.next().await;
+        let read = actual_read_bytes(harness.directory.path()) - before;
+        assert!(read <= BYTES as u64, "outer root quantum read {read} bytes");
+        match progress {
+            Some(Ok(Progress::Quantum)) => {
+                if attempts.lock().unwrap().len() < wrappers.len() {
+                    discovery_quanta += 1;
+                }
+            }
+            Some(Ok(Progress::Failed)) => panic!("valid padded markers must remain readable"),
+            Some(Err(error)) => panic!("{error:#}"),
+            None => break,
+            _ => {}
+        }
+    }
+    assert!(discovery_quanta >= 5);
+    assert_eq!(attempts.lock().unwrap().len(), wrappers.len());
+    assert!(
+        wrappers
+            .iter()
+            .all(|path| path.join("backup/SKILL.md").exists())
+    );
+}
+
+#[tokio::test]
+async fn pending_and_resolved_marker_pages_count_both_real_reads_and_resume_every_artifact() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(directory.path()).unwrap();
+    let target = SkillId::new("N".repeat(21)).unwrap();
+    let other = SkillId::new("O".repeat(21)).unwrap();
+    let attempts: Attempts = Arc::default();
+    let wrappers = (0..65)
+        .map(|_| padded_attempt(&root, &root, target.clone()))
+        .collect::<Vec<_>>();
+    for path in &wrappers {
+        attempts
+            .lock()
+            .unwrap()
+            .insert(path.clone(), Attempt::new(root.clone()));
+    }
+    let guard = fence(&root);
+    let mut pending = has_pending_attempt(attempts.clone(), guard.clone(), other);
+    let mut pages = 0;
+    let mut bytes = 0;
+    loop {
+        let before = actual_read_bytes(&root);
+        let progress = pending.next().await;
+        let read = actual_read_bytes(&root) - before;
+        assert!(read <= BYTES as u64);
+        bytes += read;
+        match progress {
+            Some(result) => {
+                assert_eq!(result.unwrap(), (None, false));
+                pages += 1;
+            }
+            None => break,
+        }
+    }
+    assert!(pages >= 5);
+    assert_eq!(bytes, 65 * MARKER_BYTES as u64);
+    let mut resolved = resolved_attempts(attempts.clone(), guard, target);
+    let mut quanta = 0;
+    let mut read_total = 0;
+    loop {
+        let before = actual_read_bytes(&root);
+        let progress = resolved.next().await;
+        let read = actual_read_bytes(&root) - before;
+        assert!(
+            read <= BYTES as u64,
+            "state update rereads its marker in the same quantum"
+        );
+        read_total += read;
+        match progress {
+            Some(result) => {
+                assert!(matches!(result.unwrap(), Progress::Quantum));
+                quanta += 1;
+            }
+            None => break,
+        }
+    }
+    assert!(quanta >= 10);
+    assert_eq!(read_total, 2 * 65 * MARKER_BYTES as u64);
+    assert!(
+        attempts
+            .lock()
+            .unwrap()
+            .values()
+            .all(|attempt| attempt.committed)
+    );
+    for path in wrappers {
+        assert!(!attempt_marker(&path).unwrap().unwrap().publishing);
+        assert!(
+            path.join("backup/SKILL.md").exists(),
+            "resolution alone is not recursive cleanup"
+        );
+    }
+}
+
+#[tokio::test]
+async fn final_noop_metadata_read_and_recovery_markers_are_separate_outer_root_quanta() {
+    let harness = harness().await;
+    let root = harness.directory.path().join("source");
+    let source = root.join("pkg");
+    package(&source, "initial");
+    let skill = format!(
+        "---\nname: Test\nslug: test-skill\n---\n{}",
+        "x".repeat(254 * 1024)
+    );
+    fs::write(source.join("SKILL.md"), &skill).unwrap();
+    let baseline = Arc::default();
+    let guard = fence(&root);
+    assert_eq!(
+        consume(job(&harness, &root, baseline.clone(), guard.clone())).await,
+        (1, 0)
+    );
+    let row = harness
+        .processor
+        .crud_store
+        .list_skill_installations_scope_page("user", "ws", None, 64)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let attempts: Attempts = Arc::default();
+    let parent = Path::new(&row.install_path).parent().unwrap();
+    let wrappers = (0..30)
+        .map(|_| padded_attempt(parent, &root, row.skill_id.clone()))
+        .collect::<Vec<_>>();
+    for path in &wrappers {
+        attempts
+            .lock()
+            .unwrap()
+            .insert(path.clone(), Attempt::new(root.clone()));
+    }
+    let mut work = root_job(
+        harness.processor.clone(),
+        root.clone(),
+        vec![Mapping::Import(
+            config(&harness, &root),
+            Some(harness.workspace.clone()),
+        )],
+        baseline,
+        attempts.clone(),
+        guard.clone(),
+    );
+    let mut final_noop_read = false;
+    let mut recovery_marker_quantum = false;
+    loop {
+        let before = actual_read_bytes(harness.directory.path());
+        let verified = guard.signals.verification_bytes.load(Ordering::Relaxed);
+        let progress = work.next().await;
+        let read = actual_read_bytes(harness.directory.path()) - before;
+        assert!(
+            read <= BYTES as u64,
+            "outer root quantum mixed {read} bytes"
+        );
+        let verification = guard.signals.verification_bytes.load(Ordering::Relaxed) - verified;
+        if !final_noop_read && verification != 0 {
+            // This one positive chunk completes the near-256 KiB no-op input.
+            assert_eq!(verification, skill.len() as u64);
+            assert_eq!(
+                read, verification,
+                "recovery cannot consume markers after that final chunk"
+            );
+            final_noop_read = true;
+        } else if final_noop_read && verification == 0 && read >= 7 * MARKER_BYTES as u64 {
+            recovery_marker_quantum = true;
+        }
+        match progress {
+            Some(result) => {
+                assert!(!matches!(result.unwrap(), Progress::Failed));
+            }
+            None => break,
+        }
+    }
+    assert!(final_noop_read && recovery_marker_quantum);
+    assert!(attempts.lock().unwrap().is_empty());
+    assert!(wrappers.iter().all(|path| !path.exists()));
+}
+
+#[tokio::test]
+async fn marker_backlog_quanta_leave_a_neighbor_progress_and_cancel_without_erasing_backups() {
+    let harness = harness().await;
+    let slow = harness.directory.path().join("slow-markers");
+    let fast = harness.directory.path().join("fast-package");
+    fs::create_dir(&slow).unwrap();
+    package(&fast.join("pkg"), "neighbor progress");
+    let wrappers = (0..80)
+        .map(|_| padded_attempt(&slow, &slow, SkillId::new("P".repeat(21)).unwrap()))
+        .collect::<Vec<_>>();
+    // Also fail after reading a complete near-limit file, so failed reads are
+    // included in the outer quantum accounting instead of counting only Ok.
+    let mut invalid = attempt_marker(&wrappers[1]).unwrap().unwrap();
+    invalid.version = 99;
+    let mut bytes = serde_json::to_vec(&invalid).unwrap();
+    bytes.resize(MARKER_BYTES, b' ');
+    fs::write(wrappers[1].join(ATTEMPT_MARKER), bytes).unwrap();
+    let _faults = LocalFsFaults::new(vec![(wrappers[0].clone(), "marker")]);
+    let guard = fence(&slow);
+    let attempts: Attempts = Arc::default();
+    let mut slow_work = root_job(
+        harness.processor.clone(),
+        slow.clone(),
+        Vec::new(),
+        Arc::default(),
+        attempts,
+        guard.clone(),
+    );
+    let mut fast_work = job(&harness, &fast, Arc::default(), fence(&fast));
+    let mut neighbor_changed = false;
+    let mut failed = false;
+    for _ in 0..200 {
+        let before = actual_read_bytes(harness.directory.path());
+        let step = slow_work.next().await;
+        assert!(actual_read_bytes(harness.directory.path()) - before <= BYTES as u64);
+        assert!(
+            step.is_some(),
+            "neighbor must publish before the artifact backlog is drained"
+        );
+        failed |= matches!(step.unwrap().unwrap(), Progress::Failed);
+        match fast_work.next().await {
+            Some(result) => {
+                if matches!(result.unwrap(), Progress::Changed(_)) {
+                    neighbor_changed = true;
+                }
+            }
+            None => panic!("neighbor ended without a change"),
+        }
+        if neighbor_changed && failed {
+            break;
+        }
+    }
+    assert!(neighbor_changed && failed);
+    guard.stop.cancel();
+    assert!(slow_work.next().await.unwrap().is_err());
+    assert!(
+        wrappers
+            .iter()
+            .all(|path| path.join("backup/SKILL.md").exists())
+    );
+}
+
+#[tokio::test]
+async fn pre_staging_artifact_check_resumes_bounded_pages_before_publication() {
+    let harness = harness().await;
+    let root = harness.directory.path().join("source");
+    package(&root.join("pkg"), "pending import with protected artifacts");
+    let attempts: Attempts = Arc::default();
+    let conf = config(&harness, &root);
+    let guard = fence(&root);
+    let mut work = root_job(
+        harness.processor.clone(),
+        root.clone(),
+        vec![Mapping::Import(
+            conf.clone(),
+            Some(harness.workspace.clone()),
+        )],
+        Arc::default(),
+        attempts.clone(),
+        guard,
+    );
+    // Stop after pending-row registration, before destination preparation.
+    let row = loop {
+        work.next().await.unwrap().unwrap();
+        if let Some(row) = harness
+            .processor
+            .crud_store
+            .list_skill_installations_scope_page("user", "ws", None, 64)
+            .await
+            .unwrap()
+            .pop()
+        {
+            break row;
+        }
+    };
+    let parent = conf.roots[0].managed_root.join(row.skill_id.as_str());
+    fs::create_dir_all(&parent).unwrap();
+    let wrappers = (0..65)
+        .map(|_| padded_attempt(&parent, &root, row.skill_id.clone()))
+        .collect::<Vec<_>>();
+    for path in &wrappers {
+        attempts
+            .lock()
+            .unwrap()
+            .insert(path.clone(), Attempt::new(root.clone()));
+    }
+    let mut changed = false;
+    let mut large_marker_quanta = 0;
+    loop {
+        let before = actual_read_bytes(harness.directory.path());
+        let progress = work.next().await;
+        let read = actual_read_bytes(harness.directory.path()) - before;
+        assert!(read <= BYTES as u64);
+        if !changed && read >= 10 * MARKER_BYTES as u64 {
+            large_marker_quanta += 1;
+        }
+        match progress {
+            Some(result) => match result.unwrap() {
+                Progress::Changed(_) => changed = true,
+                Progress::Failed => {
+                    panic!("protected unknown artifacts do not block a fresh guarded publication")
+                }
+                _ => {}
+            },
+            None => break,
+        }
+    }
+    assert!(changed && large_marker_quanta >= 4);
+    assert!(attempts.lock().unwrap().is_empty());
+    assert!(wrappers.iter().all(|path| !path.exists()));
 }

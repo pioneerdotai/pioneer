@@ -21,6 +21,36 @@ use std::sync::Mutex as StdMutex;
 
 const FILES: usize = 64;
 const BYTES: usize = 256 * 1024;
+const MARKER_BYTES: usize = 16 * 1024;
+// Include the extra byte which detects growth after stat. Reserving this
+// maximum per read bounds a page even on errors and on concurrent file growth.
+const MARKER_READ_BYTES: usize = MARKER_BYTES + 1;
+const MARKER_PAGE: usize = BYTES / MARKER_READ_BYTES;
+#[cfg(test)]
+static FS_READ_BYTES: std::sync::LazyLock<StdMutex<BTreeMap<PathBuf, u64>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(BTreeMap::new()));
+#[cfg(test)]
+pub(in crate::message::skills) fn record_fs_read(path: &Path, bytes: usize) {
+    *FS_READ_BYTES
+        .lock()
+        .unwrap()
+        .entry(path.to_path_buf())
+        .or_default() += bytes as u64;
+}
+#[cfg(test)]
+static FS_FAULTS: std::sync::LazyLock<StdMutex<BTreeSet<(PathBuf, &'static str)>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(BTreeSet::new()));
+#[cfg(test)]
+fn fs_fault(path: &Path, point: &'static str) -> Result<()> {
+    if FS_FAULTS
+        .lock()
+        .unwrap()
+        .contains(&(path.to_path_buf(), point))
+    {
+        bail!("injected local FS failure");
+    }
+    Ok(())
+}
 
 #[derive(Default)]
 pub(super) struct Baseline {
@@ -67,11 +97,26 @@ pub(super) struct AttemptMarker {
     #[serde(default)]
     pub(super) skill_id: Option<SkillId>,
 }
+#[cfg(test)]
 pub(crate) fn new_attempt(parent: &Path, owner: PathBuf) -> Result<PathBuf> {
-    let directory = tempfile::Builder::new()
-        .prefix(".pioneer-relocation-")
-        .tempdir_in(parent)?;
-    let path = directory.path().to_path_buf();
+    new_attempt_tracked(parent, owner, |_| Ok(()))
+}
+pub(crate) fn new_attempt_tracked(
+    parent: &Path,
+    owner: PathBuf,
+    claim: impl Fn(&Path) -> Result<()>,
+) -> Result<PathBuf> {
+    // Reserve the exact path before CREATE can reach the callback. No name
+    // filter is used to infer ownership of arbitrary directories.
+    let path = parent.join(format!(
+        ".pioneer-relocation-{}",
+        pioneer_protocol::generate_id(16)
+    ));
+    claim(&path)?;
+    match fs::create_dir(&path) {
+        Err(error) => return Err(error.into()),
+        Ok(()) => {}
+    }
     let marker = AttemptMarker {
         version: 1,
         token: path
@@ -83,10 +128,17 @@ pub(crate) fn new_attempt(parent: &Path, owner: PathBuf) -> Result<PathBuf> {
         publishing: false,
         skill_id: None,
     };
-    write_attempt_marker(&path, &marker)?;
-    Ok(directory.keep())
+    if let Err(error) = write_attempt_marker(&path, &marker) {
+        // No payload or backup exists yet; never recursively erase an
+        // unexpected entry that appeared in the reserved directory.
+        let _ = fs::remove_dir(&path);
+        return Err(error);
+    }
+    Ok(path)
 }
 pub(super) fn attempt_marker(path: &Path) -> Result<Option<AttemptMarker>> {
+    #[cfg(test)]
+    fs_fault(path, "marker")?;
     let file = path.join(ATTEMPT_MARKER);
     let metadata = match fs::symlink_metadata(&file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -95,16 +147,28 @@ pub(super) fn attempt_marker(path: &Path) -> Result<Option<AttemptMarker>> {
     };
     // An exact, versioned marker is required. A similarly named directory or a
     // legitimate dot-package is never treated as our garbage.
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 16 * 1024 {
-        return Ok(None);
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MARKER_BYTES as u64
+    {
+        bail!("unreadable or invalid skill attempt marker");
     }
-    let Ok(marker) = serde_json::from_slice::<AttemptMarker>(&fs::read(file)?) else {
-        return Ok(None);
-    };
+    let mut bytes = Vec::new();
+    let result = File::open(&file)?
+        .take(MARKER_READ_BYTES as u64)
+        .read_to_end(&mut bytes);
+    #[cfg(test)]
+    record_fs_read(&file, bytes.len());
+    result?;
+    if bytes.len() > MARKER_BYTES {
+        bail!("skill attempt marker grew past its schema bound");
+    }
+    let marker =
+        serde_json::from_slice::<AttemptMarker>(&bytes).context("invalid skill attempt marker")?;
     if marker.version != 1
         || path.file_name().and_then(|p| p.to_str()) != Some(marker.token.as_str())
     {
-        return Ok(None);
+        bail!("skill attempt marker does not identify this wrapper");
     }
     Ok(Some(marker))
 }
@@ -140,6 +204,7 @@ struct Discovery {
     limit: usize,
     attempts: Attempts,
     root: PathBuf,
+    failed: bool,
 }
 impl Discovery {
     fn new(root: &Path, limit: usize, attempts: Attempts) -> Result<Self> {
@@ -157,10 +222,17 @@ impl Discovery {
             limit: limit.max(1),
             attempts,
             root: root.to_path_buf(),
+            failed: false,
         })
     }
     fn step(&mut self) -> Result<bool> {
+        let mut marker_reads = MARKER_PAGE;
         for _ in 0..FILES {
+            // Stop before consuming the next directory entry; its cursor and
+            // all unvisited artifacts survive the byte allowance boundary.
+            if marker_reads == 0 {
+                return Ok(false);
+            }
             let Some((entries, depth)) = self.directories.last_mut() else {
                 return Ok(true);
             };
@@ -169,7 +241,13 @@ impl Discovery {
                 self.directories.pop();
                 continue;
             };
-            let entry = entry?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    self.failed = true;
+                    continue;
+                }
+            };
             let path = entry.path();
             if self
                 .attempts
@@ -179,24 +257,44 @@ impl Discovery {
             {
                 continue;
             }
-            let metadata = fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                continue;
-            }
-            if let Some(_marker) = attempt_marker(&path)? {
-                self.attempts
-                    .lock()
-                    .expect("skills attempts lock")
-                    .insert(path, Attempt::new(self.root.clone()));
-                continue;
-            }
-            if path.join("SKILL.md").is_file() {
-                self.packages.insert(path);
-                if self.packages.len() > self.limit {
-                    self.packages.pop_last();
+            // Failure belongs to this entry; do not infer absence or traverse an
+            // unreadable marker, and do not abandon accessible sibling packages.
+            let result = (|| -> Result<()> {
+                #[cfg(test)]
+                fs_fault(&path, "metadata")?;
+                let metadata = fs::symlink_metadata(&path)?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Ok(());
                 }
-            } else if depth == 0 {
-                self.directories.push((fs::read_dir(path)?, 1));
+                marker_reads -= 1;
+                if attempt_marker(&path)?.is_some() {
+                    self.attempts
+                        .lock()
+                        .expect("skills attempts lock")
+                        .insert(path.clone(), Attempt::new(self.root.clone()));
+                    return Ok(());
+                }
+                match fs::symlink_metadata(path.join("SKILL.md")) {
+                    Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                        self.packages.insert(path.clone());
+                        if self.packages.len() > self.limit {
+                            self.packages.pop_last();
+                        }
+                    }
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(error.into());
+                    }
+                    _ if depth == 0 => {
+                        #[cfg(test)]
+                        fs_fault(&path, "read_dir")?;
+                        self.directories.push((fs::read_dir(&path)?, 1));
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })();
+            if result.is_err() {
+                self.failed = true;
             }
         }
         Ok(self.directories.is_empty())
@@ -207,8 +305,43 @@ struct FileWork {
     input: File,
     output: Option<File>,
     digest: Sha256,
+    input_digest: Option<(bool, Sha256)>,
     bytes: u64,
     initial: fs::Metadata,
+    #[cfg(test)]
+    path: PathBuf,
+}
+
+fn metadata_input(root: &Path, relative: &Path) -> Result<Option<bool>> {
+    let Some(name) = relative
+        .to_str()
+        .filter(|_| relative.components().count() == 1)
+    else {
+        return Ok(None);
+    };
+    for (expected, sidecar) in [("SKILL.md", false), ("_meta.json", true)] {
+        if name == expected {
+            return Ok(Some(sidecar));
+        }
+        if !name.eq_ignore_ascii_case(expected) {
+            continue;
+        }
+        // Case-insensitive filesystems may return a different entry spelling.
+        // An unrelated case-variant file on a case-sensitive filesystem must
+        // never replace the actual metadata input's digest.
+        let requested = root.join(expected);
+        match fs::symlink_metadata(&requested) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                if same_file::is_same_file(root.join(relative), requested)? {
+                    return Ok(Some(sidecar));
+                }
+            }
+            Ok(_) => {}
+        }
+    }
+    Ok(None)
 }
 
 /// One order-independent digest over relative paths, directories and file
@@ -220,6 +353,7 @@ struct Tree {
     directories: Vec<ReadDir>,
     file: Option<FileWork>,
     digest: [u8; 32],
+    input_revision: pioneer_skills::SkillInputRevision,
     count: u64,
     max_file_bytes: u64,
     allow_symlinks: bool,
@@ -243,6 +377,10 @@ impl Tree {
             target,
             file: None,
             digest: [0; 32],
+            input_revision: pioneer_skills::SkillInputRevision {
+                skill: [0; 32],
+                sidecar: None,
+            },
             count: 0,
             max_file_bytes: max_file_bytes.max(1) as u64,
             allow_symlinks,
@@ -273,6 +411,8 @@ impl Tree {
                 let mut buffer = vec![0; remaining_bytes.min(64 * 1024)];
                 let read = file.input.read(&mut buffer)?;
                 #[cfg(test)]
+                record_fs_read(&file.path, read);
+                #[cfg(test)]
                 if read != 0 {
                     if let Some(signals) = &self.source_signals {
                         signals
@@ -290,6 +430,14 @@ impl Tree {
                     if let Some(output) = file.output.take() {
                         output.set_permissions(file.initial.permissions())?;
                     }
+                    if let Some((sidecar, digest)) = file.input_digest {
+                        let hash = digest.finalize().into();
+                        if sidecar {
+                            self.input_revision.sidecar = Some(hash);
+                        } else {
+                            self.input_revision.skill = hash;
+                        }
+                    }
                     self.include(file.digest.finalize().into())?;
                 } else {
                     file.bytes = file
@@ -300,6 +448,9 @@ impl Tree {
                         bail!("skill file exceeds max_install_file_bytes");
                     }
                     file.digest.update(&buffer[..read]);
+                    if let Some((_, digest)) = &mut file.input_digest {
+                        digest.update(&buffer[..read]);
+                    }
                     if let Some(output) = &mut file.output {
                         output.write_all(&buffer[..read])?;
                     }
@@ -371,8 +522,12 @@ impl Tree {
                     input,
                     output,
                     digest,
+                    input_digest: metadata_input(&self.root, relative)?
+                        .map(|sidecar| (sidecar, Sha256::new())),
                     bytes: 0,
                     initial,
+                    #[cfg(test)]
+                    path,
                 });
             } else {
                 bail!("unsupported skill package entry");
@@ -450,6 +605,7 @@ fn cleanup(attempts: Attempts, fence: JobFence) -> Work {
     Box::pin(async_stream::try_stream! {
         let mut after = None;
         loop {
+            fence.check()?;
             let page = {
                 let paths = attempts.lock().expect("skills attempts lock");
                 let lower = after
@@ -467,13 +623,25 @@ fn cleanup(attempts: Attempts, fence: JobFence) -> Work {
             after = page.last().map(|(path, _, _)| path.clone());
             yield Progress::Quantum;
             for (path, owner, committed) in page {
+                fence.check()?;
                 if owner != fence.root {
                     continue;
                 }
                 let check = path.clone();
-                let removable = owned_fs(&fence.stop, move || Ok(!check.try_exists()? || attempt_marker(&check)?.is_some_and(|marker| !marker.publishing || committed))).await?;
+                let removable = owned_fs(&fence.stop, move || {
+                    #[cfg(test)] fs_fault(&check, "cleanup")?;
+                    Ok(!check.try_exists()? || attempt_marker(&check)?.is_some_and(|marker| !marker.publishing || committed))
+                }).await;
                 yield Progress::Quantum;
+                let removable = match removable { Ok(removable) => removable, Err(_) => { yield Progress::Failed; continue; } };
                 if !removable { continue; }
+                fence.claim_path(&path, true);
+                #[cfg(test)] {
+                    if fence.signals.pause_cleanup.lock().unwrap().take_if(|root| root == &fence.root).is_some() {
+                        *fence.signals.pause_root.lock().unwrap() = Some(fence.root.clone());
+                    }
+                }
+                yield Progress::Quantum;
                 let garbage = path.clone();
                 let start = owned_fs(&fence.stop, move || Removal::new(garbage)).await;
                 let Ok(mut removal) = start else {
@@ -481,6 +649,7 @@ fn cleanup(attempts: Attempts, fence: JobFence) -> Work {
                     continue;
                 };
                 loop {
+                    fence.check()?;
                     let result = owned_fs(&fence.stop, move || {
                         let done = removal.step()?;
                         Ok((removal, done))
@@ -510,24 +679,30 @@ fn resolved_attempts(attempts: Attempts, fence: JobFence, skill_id: SkillId) -> 
     Box::pin(async_stream::try_stream! {
         let mut after = None;
         loop {
+            fence.check()?;
             let paths = {
                 let tracked = attempts.lock().expect("skills attempts lock");
-                tracked.range::<PathBuf, _>((after.as_ref().map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded), std::ops::Bound::Unbounded)).take(FILES).map(|(path, _)| path.clone()).collect::<Vec<_>>()
+                // Eligibility read plus set_attempt_publishing's fresh reread.
+                tracked.range::<PathBuf, _>((after.as_ref().map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded), std::ops::Bound::Unbounded)).take(FILES.min(MARKER_PAGE / 2)).map(|(path, attempt)| (path.clone(), attempt.owner.clone())).collect::<Vec<_>>()
             };
             if paths.is_empty() { break; }
-            after = paths.last().cloned();
+            after = paths.last().map(|(path, _)| path.clone());
             let id = skill_id.clone();
             let tracked = attempts.clone();
-            owned_fs(&fence.stop, move || {
-                for path in paths {
-                    if attempt_marker(&path)?.is_some_and(|marker| marker.skill_id.as_ref() == Some(&id) && marker.publishing) {
+            let owner = fence.root.clone();
+            let failed = owned_fs(&fence.stop, move || {
+                let mut failed = false;
+                for (path, artifact_owner) in paths {
+                    let marker = match attempt_marker(&path) { Ok(marker) => marker, Err(_) => { failed |= artifact_owner == owner; continue; } };
+                    if marker.is_some_and(|marker| marker.skill_id.as_ref() == Some(&id) && marker.publishing) {
                         if let Some(attempt) = tracked.lock().expect("skills attempts lock").get_mut(&path) { attempt.committed = true; }
                         if set_attempt_publishing(&path, false).is_err() { warn!("committed skill artifact outcome persistence deferred; cleanup uses acknowledged in-memory proof"); }
                     }
                 }
-                Ok(())
+                Ok(failed)
             }).await?;
             yield Progress::Quantum;
+            if failed { yield Progress::Failed; }
         }
     })
 }
@@ -535,24 +710,76 @@ fn has_pending_attempt(
     attempts: Attempts,
     fence: JobFence,
     skill_id: SkillId,
-) -> Pin<Box<dyn Stream<Item = Result<Option<PathBuf>>> + Send>> {
+) -> Pin<Box<dyn Stream<Item = Result<(Option<PathBuf>, bool)>> + Send>> {
     Box::pin(async_stream::try_stream! {
         let mut after = None;
         loop {
+            fence.check()?;
             let paths = {
                 let tracked = attempts.lock().expect("skills attempts lock");
-                tracked.range::<PathBuf, _>((after.as_ref().map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded), std::ops::Bound::Unbounded)).take(FILES).map(|(path, attempt)| (path.clone(), attempt.committed)).collect::<Vec<_>>()
+                tracked.range::<PathBuf, _>((after.as_ref().map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded), std::ops::Bound::Unbounded)).take(FILES.min(MARKER_PAGE)).map(|(path, attempt)| (path.clone(), attempt.committed, attempt.owner.clone())).collect::<Vec<_>>()
             };
             if paths.is_empty() { break; }
-            after = paths.last().map(|(path, _)| path.clone());
+            after = paths.last().map(|(path, _, _)| path.clone());
             let id = skill_id.clone();
-            let pending = owned_fs(&fence.stop, move || {
-                for (path, committed) in paths { if !committed && attempt_marker(&path)?.is_some_and(|marker| marker.skill_id.as_ref() == Some(&id) && marker.publishing) { return Ok(Some(path)); } }
-                Ok(None)
+            let owner = fence.root.clone();
+            let (pending, failed) = owned_fs(&fence.stop, move || {
+                let mut failed = false;
+                let mut found = None;
+                for (path, committed, artifact_owner) in paths {
+                    let marker = match attempt_marker(&path) { Ok(marker) => marker, Err(_) => { failed |= artifact_owner == owner; continue; } };
+                    if !committed && marker.is_some_and(|marker| marker.skill_id.as_ref() == Some(&id) && marker.publishing) { found = found.or(Some(path)); }
+                }
+                Ok((found, failed))
             }).await?;
             let done = pending.is_some();
-            yield pending;
+            yield (pending, failed);
             if done { break; }
+        }
+    })
+}
+
+// The stream retains publication state and installer-lock ownership between
+// byte quanta; a waiting sibling retains its cursor with an explicit deadline.
+fn publish_job(
+    this: Arc<MessageProcessor>,
+    candidate: SkillStorageRelocationCandidate,
+    snapshot: pioneer_crud::SkillReconciliationSnapshot,
+    workspace: Option<pioneer_entity::workspace::Model>,
+    stage: Option<PathBuf>,
+    recovery: Option<PathBuf>,
+    attempts: Attempts,
+    fence: JobFence,
+) -> Work {
+    Box::pin(async_stream::try_stream! {
+        let scope = candidate.expected_row.scope_key.clone();
+        fence.claim_path(&candidate.destination, false);
+        fence.claim_path(&candidate.source_path, false);
+        let guard = fence.clone(); let claim = fence.clone(); let paths = fence.clone();
+        let mut publication = storage::publish_watched_candidate(
+            &this.crud_store, &this.skills_write_lock, candidate, snapshot, workspace,
+            stage, recovery, fence.stop.clone(), move || guard.valid(),
+            move |path, committed| {
+                let path = super::physical_root(&path)?;
+                claim.claim_path(&path, true);
+                attempts.lock().expect("skills attempts lock").insert(path, Attempt { owner: claim.root.clone(), committed });
+                Ok(())
+            },
+            move |path, subtree| paths.claim_path(path, subtree),
+        );
+        while let Some(progress) = publication.next().await {
+            match progress? {
+                storage::PublicationProgress::Quantum(_bytes) => {
+                    #[cfg(test)] fence.signals.verification_bytes.fetch_add(_bytes as u64, std::sync::atomic::Ordering::Relaxed);
+                    yield Progress::Quantum;
+                }
+                storage::PublicationProgress::Waiting(until) => { yield Progress::Waiting(until); }
+                storage::PublicationProgress::Finished(SkillStorageRelocationOutcome::Switched, _bytes) => {
+                    #[cfg(test)] fence.signals.verification_bytes.fetch_add(_bytes as u64, std::sync::atomic::Ordering::Relaxed);
+                    yield Progress::Changed(scope.clone());
+                }
+                storage::PublicationProgress::Finished(SkillStorageRelocationOutcome::Stale, _) => { Err::<(), anyhow::Error>(anyhow::anyhow!("stale skill projection"))?; }
+            }
         }
     })
 }
@@ -575,35 +802,41 @@ fn recover_publication(
         let row = snapshot.record.clone();
         let mut pending = has_pending_attempt(attempts.clone(), fence.clone(), row.skill_id.clone());
         let mut recover = None;
-        while let Some(found) = pending.next().await { recover = recover.or(found?); yield Progress::Quantum; }
+        while let Some(found) = pending.next().await {
+            let (found, failed) = found?;
+            recover = recover.or(found);
+            yield Progress::Quantum;
+            if failed { yield Progress::Failed; }
+        }
         let Some(recover) = recover else { return; };
         let candidate = SkillStorageRelocationCandidate {
             expected_row: row.clone(), source_path: path.clone(), install_root: managed_root.clone(), destination: path,
             prepared_metadata: metadata, remove_managed_source_after_switch: false, managed_path_to_remove_after_switch: None,
             managed_lock_path: Some(managed_root.join("skills-lock.toml")), max_skill_file_bytes: max_bytes.max(1),
         };
-        let handle = tokio::runtime::Handle::current(); let guard = fence.clone(); let token = fence.stop.clone();
-        let tracked = attempts.clone(); let owner = fence.root.clone();
-        let outcome = owned_fs(&fence.stop, move || handle.block_on(storage::publish_watched_candidate(
-            &this.crud_store, &this.skills_write_lock, candidate, snapshot, workspace, None, Some(recover), token, move || guard.valid(),
-            move |path, committed| { tracked.lock().expect("skills attempts lock").insert(path, Attempt { owner: owner.clone(), committed }); Ok(()) },
-        ))).await?;
-        if outcome != SkillStorageRelocationOutcome::Switched { Err::<(), anyhow::Error>(anyhow::anyhow!("stale forward recovery"))?; }
-        yield Progress::Changed(row.scope_key);
+        let mut publication = publish_job(this, candidate, snapshot, workspace, None, Some(recover), attempts.clone(), fence.clone());
+        while let Some(progress) = publication.next().await { yield progress?; }
         let mut resolved = resolved_attempts(attempts, fence, row.skill_id);
         while let Some(progress) = resolved.next().await { yield progress?; }
     })
 }
 
 fn metadata(prepared: &PreparedMaterializedSkill, slug: String) -> PreparedSkillStorageMetadata {
-    definition_metadata(&prepared.definition, &prepared.source_ref, slug)
+    definition_metadata(
+        &prepared.definition,
+        &prepared.source_ref,
+        slug,
+        prepared.input_revision.clone(),
+    )
 }
 fn definition_metadata(
     definition: &pioneer_skills::SkillDefinition,
     source_ref: &str,
     slug: String,
+    input_revision: pioneer_skills::SkillInputRevision,
 ) -> PreparedSkillStorageMetadata {
     PreparedSkillStorageMetadata {
+        input_revision,
         owner: definition.identity.owner.clone(),
         slug,
         version: definition.identity.version_hint.clone(),
@@ -683,9 +916,13 @@ pub(super) fn root_job(
             yield Progress::Quantum;
             if done { break; }
         }
+        let mut round_complete = !recovery_scan.failed;
+        if !round_complete { yield Progress::Failed; }
         let mut old_attempts = cleanup(attempts.clone(), fence.clone());
         while let Some(progress) = old_attempts.next().await {
-            yield progress?;
+            let progress = progress?;
+            if matches!(progress, Progress::Failed) { round_complete = false; }
+            yield progress;
         }
         let packages: Vec<_> = if limit.is_some() { recovery_scan.packages.into_iter().collect() } else { Vec::new() };
         let source_limit = mappings.iter().filter_map(|mapping| match mapping {
@@ -712,9 +949,13 @@ pub(super) fn root_job(
                         );
                         loop {
                             match std::panic::AssertUnwindSafe(work.next()).catch_unwind().await {
-                                Ok(Some(Ok(progress))) => yield progress,
+                                Ok(Some(Ok(progress))) => {
+                                    if matches!(progress, Progress::Failed) { round_complete = false; }
+                                    yield progress;
+                                },
                                 Ok(None) => break,
                                 _ => {
+                                    round_complete = false;
                                     yield Progress::Failed;
                                     break;
                                 }
@@ -722,7 +963,9 @@ pub(super) fn root_job(
                         }
                         let mut garbage = cleanup(attempts.clone(), fence.clone());
                         while let Some(progress) = garbage.next().await {
-                            yield progress?;
+                            let progress = progress?;
+                            if matches!(progress, Progress::Failed) { round_complete = false; }
+                            yield progress;
                         }
                     }
                 }
@@ -730,7 +973,7 @@ pub(super) fn root_job(
                     let mapping = &config.roots[0];
                     let mut after = None;
                     let mut seen = BTreeSet::new();
-                    let mut complete = true;
+                    let mut complete = round_complete;
                     loop {
                         fence.check()?;
                         let page = cancellable_db(
@@ -762,7 +1005,7 @@ pub(super) fn root_job(
                             loop {
                                 match std::panic::AssertUnwindSafe(work.next()).catch_unwind().await {
                                     Ok(Some(Ok(progress))) => {
-                                        if matches!(progress, Progress::Failed) { complete = false; }
+                                        if matches!(progress, Progress::Failed) { complete = false; round_complete = false; }
                                         yield progress;
                                     },
                                     Ok(None) => break,
@@ -774,7 +1017,11 @@ pub(super) fn root_job(
                                 }
                             }
                             let mut garbage = cleanup(attempts.clone(), fence.clone());
-                            while let Some(progress) = garbage.next().await { yield progress?; }
+                            while let Some(progress) = garbage.next().await {
+                                let progress = progress?;
+                                if matches!(progress, Progress::Failed) { complete = false; round_complete = false; }
+                                yield progress;
+                            }
                         }
                     }
                     if complete {
@@ -922,10 +1169,11 @@ fn import_job(
                 pack_member_key: None,
             };
             fence.check()?;
-            let _lock = cancellable_db(&fence.stop, async {
-                Ok(this.skills_write_lock.lock().await)
-            })
-            .await?;
+            let _lock = loop {
+                fence.check()?;
+                if let Ok(lock) = this.skills_write_lock.try_lock() { break lock; }
+                yield Progress::Waiting(std::time::Instant::now() + std::time::Duration::from_secs(5));
+            };
             let registered = cancellable_db(
                 &fence.stop,
                 this.crud_store
@@ -950,7 +1198,7 @@ fn import_job(
             #[cfg(test)] fence.signals.preparations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut common_request = request.clone();
             common_request.policy.security.max_install_file_bytes = source_limit;
-            let mut preparation = owned_fs(&fence.stop, move || Ok(MaterializedSkillPreparation::new(common_request))).await?;
+            let mut preparation = owned_fs(&fence.stop, move || Ok(MaterializedSkillPreparation::new_for_watcher(common_request))).await?;
             let physical = loop {
                 fence.check()?;
                 let work = owned_fs(&fence.stop, move || { let result = preparation.step_facts(FILES)?; Ok((preparation, result)) }).await;
@@ -965,13 +1213,16 @@ fn import_job(
                 yield Progress::Quantum;
                 if let Some(physical) = result { break Arc::new(physical); }
             };
+            #[cfg(test)] fence.signals.preparation_input_bytes.fetch_add(physical.input_bytes_read() as u64, std::sync::atomic::Ordering::Relaxed);
             facts.lock().expect("source facts lock").entry(package.clone()).or_default().physical = Some(Ok(physical.clone()));
             physical
         };
         // Same physical facts, distinct source-kind parsing, policy, ID and scope.
+        let input_revision = physical.input_revision();
+        #[cfg(test)] fence.signals.prepared_inputs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let definition = owned_fs(&fence.stop, move || physical.definition_for(&request)).await?;
         yield Progress::Quantum;
-        let metadata = definition_metadata(&definition, &source_ref, definition.identity.slug.clone());
+        let metadata = definition_metadata(&definition, &source_ref, definition.identity.slug.clone(), input_revision.clone());
         let destination =
             canonical_skill_install_path(&root.managed_root, &row.skill_id, &metadata.slug)?;
         let destination = storage::normalize_absolute_path(&destination)?;
@@ -1009,6 +1260,10 @@ fn import_job(
             source_tree = next;
             yield Progress::Quantum;
             if done {
+                if source_tree.input_revision != input_revision {
+                    facts.lock().expect("source facts lock").entry(package.clone()).or_default().physical = Some(Err("skill inputs changed after preparation".into()));
+                    Err::<(), anyhow::Error>(anyhow::anyhow!("skill inputs changed after preparation"))?;
+                }
                 break source_tree.fingerprint();
             }
         };
@@ -1048,6 +1303,15 @@ fn import_job(
                     }
                 };
                 if source_hash == target_hash {
+                    // A shared round cache is not proof that metadata inputs
+                    // stayed unchanged before another scope's no-op decision.
+                    let mut verification = storage::verify_skill_inputs(package.clone(), input_revision.clone(), max_bytes, fence.stop.clone());
+                    while let Some(bytes) = verification.next().await {
+                        let (_bytes, done) = bytes?;
+                        #[cfg(test)] fence.signals.verification_bytes.fetch_add(_bytes as u64, std::sync::atomic::Ordering::Relaxed);
+                        yield Progress::Quantum;
+                        if done { break; }
+                    }
                     // A failed COMMIT can leave the old DB row while publication
                     // already placed these bytes at destination. Forward with fresh
                     // guards using the owned artifact; never copy the same tree
@@ -1067,32 +1331,45 @@ fn import_job(
             .parent()
             .context("skill destination has no parent")?
             .to_path_buf();
+        fence.claim_path(&parent, false);
         let parent = owned_fs(&fence.stop, move || { fs::create_dir_all(&parent)?; Ok(fs::canonicalize(parent)?) }).await?;
         // A protected unknown backup does not block newer source edits. Known
         // garbage must finish cleanup first, so failed GC cannot grow staging.
         let mut after = None;
         loop {
+            fence.check()?;
             let page = {
                 let tracked = attempts.lock().expect("skills attempts lock");
                 let lower = after.as_ref().map_or(std::ops::Bound::Included(&parent), std::ops::Bound::Excluded);
-                tracked.range::<PathBuf, _>((lower, std::ops::Bound::Unbounded)).take_while(|(path, _)| path.starts_with(&parent)).take(FILES).map(|(path, attempt)| (path.clone(), attempt.committed)).collect::<Vec<_>>()
+                tracked.range::<PathBuf, _>((lower, std::ops::Bound::Unbounded)).take_while(|(path, _)| path.starts_with(&parent)).take(FILES.min(MARKER_PAGE)).map(|(path, attempt)| (path.clone(), attempt.committed)).collect::<Vec<_>>()
             };
             if page.is_empty() { break; }
             after = page.last().map(|(path, _)| path.clone());
             let expected_parent = parent.clone();
-            let blocked = owned_fs(&fence.stop, move || {
+            let (blocked, failed) = owned_fs(&fence.stop, move || {
+                let mut blocked = false;
+                let mut failed = false;
                 for (path, committed) in page {
-                    if path.parent() == Some(expected_parent.as_path()) && path.try_exists()? && (committed || attempt_marker(&path)?.is_none_or(|marker| !marker.publishing)) { return Ok(true); }
+                    if path.parent() != Some(expected_parent.as_path()) { continue; }
+                    let exists = match path.try_exists() { Ok(exists) => exists, Err(_) => { failed = true; continue; } };
+                    if !exists { continue; }
+                    let marker = match attempt_marker(&path) { Ok(marker) => marker, Err(_) => { failed = true; continue; } };
+                    blocked |= committed || marker.is_none_or(|marker| !marker.publishing);
                 }
-                Ok(false)
+                Ok((blocked, failed))
             }).await?;
             yield Progress::Quantum;
+            if failed { yield Progress::Failed; }
             if blocked { Err::<(), anyhow::Error>(anyhow::anyhow!("previous skill stage cleanup is pending"))?; }
         }
         let registry = attempts.clone();
         let owner = fence.root.clone();
+        let claim = fence.clone();
         let attempt = owned_fs(&fence.stop, move || {
-            let path = new_attempt(&parent, owner.clone())?;
+            let path = new_attempt_tracked(&parent, owner.clone(), |path| {
+                claim.claim_path(path, true);
+                Ok(())
+            })?;
             fs::create_dir(path.join("payload"))?;
             registry
                 .lock()
@@ -1101,6 +1378,13 @@ fn import_job(
             Ok(path)
         })
         .await?;
+        #[cfg(test)] {
+            *fence.signals.stages_created.lock().unwrap().entry(fence.root.clone()).or_default() += 1;
+            if fence.signals.pause_stage.lock().unwrap().take_if(|root| root == &fence.root).is_some() {
+                *fence.signals.pause_root.lock().unwrap() = Some(fence.root.clone());
+            }
+        }
+        yield Progress::Quantum;
         let source = package.clone();
         let target = attempt.join("payload");
         let mut copy = owned_fs(&fence.stop, move || {
@@ -1117,6 +1401,10 @@ fn import_job(
             copy = next;
             yield Progress::Quantum;
             if done {
+                if copy.input_revision != input_revision {
+                    facts.lock().expect("source facts lock").entry(package.clone()).or_default().physical = Some(Err("copied skill inputs do not match prepared metadata".into()));
+                    Err::<(), anyhow::Error>(anyhow::anyhow!("copied skill inputs do not match prepared metadata"))?;
+                }
                 break copy.fingerprint();
             }
         };
@@ -1137,46 +1425,10 @@ fn import_job(
             max_skill_file_bytes: max_bytes.max(1),
         };
         fence.check()?;
-        let scope = root.scope_key.clone();
-        let publisher = this.clone();
-        let handle = tokio::runtime::Handle::current();
-        let staged = attempt.join("payload");
-        let guard = fence.clone();
-        let token = fence.stop.clone();
-        let garbage = attempts.clone();
-        let owner = fence.root.clone();
-        let outcome = owned_fs(&fence.stop, move || {
-            handle.block_on(storage::publish_watched_candidate(
-                &publisher.crud_store,
-                &publisher.skills_write_lock,
-                candidate,
-                snapshot,
-                workspace,
-                Some(staged),
-                None,
-                token,
-                move || guard.valid(),
-                move |path, committed| {
-                    let path = super::physical_root(&path)?;
-                    garbage
-                        .lock()
-                        .expect("skills attempts lock")
-                        .insert(path, Attempt { owner: owner.clone(), committed });
-                    Ok(())
-                },
-            ))
-        })
-        .await?;
-        match outcome {
-            SkillStorageRelocationOutcome::Switched => {
-                yield Progress::Changed(scope);
-                let mut resolved = resolved_attempts(attempts.clone(), fence.clone(), definition.identity.skill_id.clone());
-                while let Some(progress) = resolved.next().await { yield progress?; }
-            },
-            SkillStorageRelocationOutcome::Stale => {
-                Err::<(), anyhow::Error>(anyhow::anyhow!("stale configured skill projection"))?
-            }
-        }
+        let mut publication = publish_job(this, candidate, snapshot, workspace, Some(attempt.join("payload")), None, attempts.clone(), fence.clone());
+        while let Some(progress) = publication.next().await { yield progress?; }
+        let mut resolved = resolved_attempts(attempts, fence, definition.identity.skill_id.clone());
+        while let Some(progress) = resolved.next().await { yield progress?; }
 
     })
 }
@@ -1211,9 +1463,16 @@ fn managed_job(
                 }
                 Ok(_) => {}
             }
-            let direct = fs::symlink_metadata(&path)
-                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-                && path.join("SKILL.md").is_file();
+            let direct = match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => match fs::symlink_metadata(path.join("SKILL.md")) {
+                    Ok(metadata) => metadata.is_file() && !metadata.file_type().is_symlink(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error.into()),
+                },
+                Ok(_) => false,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
             Ok(Some((direct.then_some(path), fs::read_dir(parent)?)))
         })
         .await?;
@@ -1241,8 +1500,13 @@ fn managed_job(
                         if metadata.is_dir()
                             && !metadata.file_type().is_symlink()
                             && !entry.file_name().to_string_lossy().starts_with('.')
-                            && path.join("SKILL.md").is_file()
                         {
+                            let skill = match fs::symlink_metadata(path.join("SKILL.md")) {
+                                Ok(metadata) => metadata.is_file() && !metadata.file_type().is_symlink(),
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                                Err(error) => return Err(error.into()),
+                            };
+                            if !skill { continue; }
                             leaves.push(path);
                             if leaves.len() > 1 {
                                 done = true;
@@ -1288,7 +1552,7 @@ fn managed_job(
             policy: config.installer_policy.clone(),
         };
         let mut preparation = owned_fs(&fence.stop, move || {
-            Ok(MaterializedSkillPreparation::new(request))
+            Ok(MaterializedSkillPreparation::new_for_watcher(request))
         })
         .await?;
         let prepared = loop {
@@ -1327,6 +1591,7 @@ fn managed_job(
             tree = next;
             yield Progress::Quantum;
             if done {
+                if tree.input_revision != prepared.input_revision { Err::<(), anyhow::Error>(anyhow::anyhow!("managed inputs changed after preparation"))?; }
                 break tree.fingerprint();
             }
         };
@@ -1354,39 +1619,8 @@ fn managed_job(
             max_skill_file_bytes: max_bytes.max(1),
         };
         fence.check()?;
-        let publisher = this.clone();
-        let handle = tokio::runtime::Handle::current();
-        let guard = fence.clone();
-        let token = fence.stop.clone();
-        let garbage = attempts.clone();
-        let owner = fence.root.clone();
-        let outcome = owned_fs(&fence.stop, move || {
-            handle.block_on(storage::publish_watched_candidate(
-                &publisher.crud_store,
-                &publisher.skills_write_lock,
-                candidate,
-                snapshot,
-                workspace,
-                None,
-                None,
-                token,
-                move || guard.valid(),
-                move |path, committed| {
-                    let path = super::physical_root(&path)?;
-                    garbage.lock().expect("skills attempts lock").insert(path, Attempt { owner: owner.clone(), committed });
-                    Ok(())
-                },
-            ))
-        })
-        .await?;
-        match outcome {
-            SkillStorageRelocationOutcome::Switched => {
-                yield Progress::Changed(root.scope_key.clone());
-            }
-            SkillStorageRelocationOutcome::Stale => {
-                Err::<(), anyhow::Error>(anyhow::anyhow!("stale managed skill projection"))?
-            }
-        }
+        let mut publication = publish_job(this.clone(), candidate, snapshot, workspace, None, None, attempts.clone(), fence.clone());
+        while let Some(progress) = publication.next().await { yield progress?; }
         let refreshed = cancellable_db(
             &fence.stop,
             this.crud_store.find_skill_installation(&row.skill_id),

@@ -97,6 +97,7 @@ pioneer-promt = { path = "crates/promt" }
 
 # Native skills directory notifications (FSEvents on macOS).
 notify = { version = "=8.2.0", default-features = true }
+same-file = "=1.0.6"
 async-stream = "0.3"
 
 # Error handling

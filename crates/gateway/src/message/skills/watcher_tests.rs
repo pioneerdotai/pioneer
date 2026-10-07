@@ -38,6 +38,9 @@ pub(super) async fn harness() -> Harness {
     harness_with_bad_root(false).await
 }
 async fn harness_with_bad_root(bad_root: bool) -> Harness {
+    harness_with_layout(bad_root, false).await
+}
+async fn harness_with_layout(bad_root: bool, overlap: bool) -> Harness {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("skills.sqlite");
     let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
@@ -87,6 +90,11 @@ async fn harness_with_bad_root(bad_root: bool) -> Harness {
             .to_string(),
     ];
     config.skills.user_import_roots = vec![directory.path().join("source").display().to_string()];
+    if overlap {
+        config.skills.user_import_roots = config.skills.user_roots.clone();
+        config.skills.registry_import_roots =
+            vec![directory.path().join("neighbor").display().to_string()];
+    }
     if bad_root {
         let path = directory.path().join("bad-root");
         std::fs::write(&path, b"not a directory").unwrap();
@@ -633,6 +641,12 @@ fn bounded_native_directory_registration_and_shared_sentinel_replacement() {
         );
     }
     assert_eq!(native.watched[&sentinel].owners.len(), 2);
+    let b_guard = {
+        let mut roots = signals.roots.lock().unwrap();
+        roots.insert(a.clone(), Dirty::new(1, Instant::now()));
+        roots.insert(b.clone(), Dirty::new(2, Instant::now()));
+        roots[&b].live.clone()
+    };
     let watched_before = native.watch_calls[&sentinel];
     native.fail_watch_once.insert(sentinel.clone());
     std::fs::remove_dir(&sentinel).unwrap();
@@ -650,6 +664,11 @@ fn bounded_native_directory_registration_and_shared_sentinel_replacement() {
         "unwatch plus failed replacement cannot claim a live subscription"
     );
     assert!(native.plans[&a].retry_at > Instant::now());
+    assert!(
+        !b_guard.load(Ordering::Acquire),
+        "replacing a shared subscription fences other owners' prepared jobs"
+    );
+    assert_eq!(native.observation(&b), Observation::Registering);
     native.plans.get_mut(&a).unwrap().retry_at = Instant::now();
     native.plans.get_mut(&b).unwrap().retry_at = Instant::now();
     for _ in 0..4 {
@@ -725,12 +744,14 @@ fn prepared_guard_never_waits_for_the_callback_mutex_under_writer_capacity() {
         .unwrap()
         .insert(root.clone(), Dirty::new(1, Instant::now()));
     let live = signals.roots.lock().unwrap()[&root].live.clone();
+    let stop = CancellationToken::new();
     let guard = JobFence {
+        claims: signals.new_claim_owner(&root, live.clone()),
         signals: signals.clone(),
         live: live.clone(),
         root,
         incarnation: 1,
-        stop: CancellationToken::new(),
+        stop,
     };
     let lock = signals.roots.lock().unwrap();
     assert!(
@@ -795,4 +816,947 @@ async fn unavailable_backend_keeps_real_worker_initial_reconciliation_and_idle_b
     assert!(signals.loop_iterations.load(Ordering::Relaxed) - iterations < 3);
     stop.cancel();
     worker.await.unwrap();
+}
+
+async fn settled(signals: &Signals) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let complete = {
+                let roots = signals.roots.lock().unwrap();
+                !roots.is_empty()
+                    && roots
+                        .values()
+                        .all(|dirty| dirty.generation == dirty.acknowledged)
+            };
+            if complete {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("real worker must settle");
+}
+
+#[tokio::test]
+async fn one_need_rescan_recovers_once_and_returns_the_real_worker_to_idle() {
+    let harness = harness().await;
+    let signals = Arc::new(Signals::default());
+    let stop = CancellationToken::new();
+    let worker = tokio::spawn(run_with_signals(
+        harness.processor.clone(),
+        stop.clone(),
+        signals.clone(),
+    ));
+    settled(&signals).await;
+    signals.event(Ok(
+        Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)
+    ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while signals.backend_creations.load(Ordering::Acquire) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("need_rescan must recover observation");
+    settled(&signals).await;
+    let rounds = signals.root_rounds.load(Ordering::Acquire);
+    let reads = harness.observer.reads.lock().unwrap().len();
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(signals.backend_creations.load(Ordering::Acquire), 2);
+    assert_eq!(signals.root_rounds.load(Ordering::Acquire), rounds);
+    assert_eq!(harness.observer.reads.lock().unwrap().len(), reads);
+    assert!(!signals.recover.load(Ordering::Acquire));
+    stop.cancel();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn recovery_signal_is_consumed_and_a_signal_during_recreation_gets_its_own_round() {
+    let harness = harness().await;
+    let signals = Arc::new(Signals::default());
+    let stop = CancellationToken::new();
+    let worker = tokio::spawn(run_with_signals(
+        harness.processor.clone(),
+        stop.clone(),
+        signals.clone(),
+    ));
+    settled(&signals).await;
+    assert_eq!(signals.backend_creations.load(Ordering::Acquire), 1);
+    signals.event(Err(notify::Error::generic("one backend failure")));
+    signals
+        .signal_during_recovery
+        .store(true, Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while signals.backend_creations.load(Ordering::Acquire) < 3 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("new recovery signal must survive the in-progress recreation");
+    settled(&signals).await;
+    assert!(!signals.recover.load(Ordering::Acquire));
+    let creations = signals.backend_creations.load(Ordering::Acquire);
+    let rounds = signals.root_rounds.load(Ordering::Acquire);
+    let reads = harness.observer.reads.lock().unwrap().len();
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(signals.backend_creations.load(Ordering::Acquire), creations);
+    assert_eq!(signals.root_rounds.load(Ordering::Acquire), rounds);
+    assert_eq!(harness.observer.reads.lock().unwrap().len(), reads);
+    stop.cancel();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn degraded_clean_roots_do_not_rescan_at_each_failed_constructor_retry() {
+    let harness = harness().await;
+    let signals = Arc::new(Signals::default());
+    signals.backend_unavailable.store(true, Ordering::Release);
+    let stop = CancellationToken::new();
+    let worker = tokio::spawn(run_with_signals(
+        harness.processor.clone(),
+        stop.clone(),
+        signals.clone(),
+    ));
+    settled(&signals).await;
+    let rounds = signals.root_rounds.load(Ordering::Acquire);
+    let reads = harness.observer.reads.lock().unwrap().len();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while signals.backend_attempts.load(Ordering::Acquire) < 3 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("real loop must retry construction with 5/10 second backoff");
+    assert_eq!(signals.backend_creations.load(Ordering::Acquire), 0);
+    assert_eq!(signals.root_rounds.load(Ordering::Acquire), rounds);
+    assert_eq!(harness.observer.reads.lock().unwrap().len(), reads);
+    stop.cancel();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn late_registration_barrier_fences_old_job_and_observes_previously_unwatched_bytes() {
+    let harness = harness().await;
+    std::fs::create_dir_all(harness.directory.path().join("source")).unwrap();
+    let root = fs_canonical(&harness.directory.path().join("source"));
+    let signals = Arc::new(Signals::default());
+    signals
+        .directory_registration
+        .store(true, Ordering::Release);
+    let stop = CancellationToken::new();
+    let worker = tokio::spawn(run_with_signals(
+        harness.processor.clone(),
+        stop.clone(),
+        signals.clone(),
+    ));
+    settled(&signals).await;
+    let old_live = signals.roots.lock().unwrap()[&root].live.clone();
+    *signals.pause_root.lock().unwrap() = Some(root.clone());
+    signals.event(Ok(Event::new(EventKind::Modify(
+        notify::event::ModifyKind::Any,
+    ))
+    .add_path(root.join("edit.txt"))));
+    tokio::time::timeout(Duration::from_secs(3), signals.paused.notified())
+        .await
+        .unwrap();
+    for i in 0..150 {
+        std::fs::create_dir(root.join(format!("new-{i}"))).unwrap();
+    }
+    let late = root.join("new-149");
+    std::fs::write(late.join("SKILL.md"), "---\nname: Late\n---\nNew bytes").unwrap();
+    signals.event(Ok(Event::new(EventKind::Create(
+        notify::event::CreateKind::Folder,
+    ))
+    .add_path(root.join("new-0"))));
+    signals
+        .roots
+        .lock()
+        .unwrap()
+        .get_mut(&root)
+        .unwrap()
+        .watch_dirty = true;
+    signals.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while old_live.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the real loop must retire the old cursor before replacement");
+    settled(&signals).await;
+    assert!(
+        !old_live.load(Ordering::Acquire),
+        "completed registration must never revive the old prepared guard"
+    );
+    let rows = harness
+        .processor
+        .crud_store
+        .list_skill_installations_scope_page("user", "ws", None, 64)
+        .await
+        .unwrap();
+    assert!(rows.iter().any(|row| {
+        std::fs::read_to_string(Path::new(&row.install_path).join("SKILL.md"))
+            .unwrap()
+            .contains("New bytes")
+    }));
+    stop.cancel();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn owned_linux_folder_events_do_not_restart_an_overlapping_import() {
+    let harness = harness_with_layout(false, true).await;
+    let root = harness.directory.path().join("managed/ws/user");
+    let source = root.join("unregistered");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("SKILL.md"),
+        "---\nname: Owned staging\n---\nImport",
+    )
+    .unwrap();
+    std::fs::write(source.join("large.asset"), vec![b'a'; 800 * 1024]).unwrap();
+    let neighbor = harness.directory.path().join("neighbor/pkg");
+    std::fs::create_dir_all(&neighbor).unwrap();
+    std::fs::write(
+        neighbor.join("SKILL.md"),
+        "---\nname: Neighbor\n---\nIndependent",
+    )
+    .unwrap();
+    let large_skill = format!("---\nname: Owned staging\n---\n{}", "x".repeat(600 * 1024));
+    let large_sidecar = serde_json::to_vec(
+        &serde_json::json!({"owner":"prepared", "extra":"y".repeat(700 * 1024)}),
+    )
+    .unwrap();
+    std::fs::write(source.join("SKILL.md"), &large_skill).unwrap();
+    std::fs::write(source.join("_meta.json"), &large_sidecar).unwrap();
+    let metadata_bytes = large_skill.len() + large_sidecar.len();
+    let root = fs_canonical(&root);
+    let signals = Arc::new(Signals::default());
+    signals
+        .directory_registration
+        .store(true, Ordering::Release);
+    signals
+        .native_events_disabled
+        .store(true, Ordering::Release);
+    *signals.pause_stage.lock().unwrap() = Some(root.clone());
+    *signals.pause_cleanup.lock().unwrap() = Some(root.clone());
+    let stop = CancellationToken::new();
+    let worker = tokio::spawn(run_with_signals(
+        harness.processor.clone(),
+        stop.clone(),
+        signals.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(10), signals.paused.notified())
+        .await
+        .unwrap();
+    let (wrapper, guard) = {
+        let roots = signals.roots.lock().unwrap();
+        let dirty = &roots[&root];
+        (
+            roots
+                .owned_paths
+                .iter()
+                .find(|(_, claims)| {
+                    claims.get(&root).is_some_and(|claim| {
+                        claim.subtree && claim.lease.live.load(Ordering::Acquire)
+                    })
+                })
+                .unwrap()
+                .0
+                .clone(),
+            dirty.live.clone(),
+        )
+    };
+    let stages = signals.stages_created.lock().unwrap()[&root];
+    for path in [wrapper.clone(), wrapper.join("payload")] {
+        signals.event(Ok(Event::new(EventKind::Create(
+            notify::event::CreateKind::Folder,
+        ))
+        .add_path(path)));
+    }
+    signals.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), signals.paused.notified())
+        .await
+        .unwrap();
+    assert!(
+        guard.load(Ordering::Acquire),
+        "owned staging/rename cannot retire its publisher"
+    );
+    assert_eq!(signals.stages_created.lock().unwrap()[&root], stages);
+    for path in [wrapper.join("payload"), wrapper.clone()] {
+        signals.event(Ok(Event::new(EventKind::Remove(
+            notify::event::RemoveKind::Folder,
+        ))
+        .add_path(path)));
+    }
+    signals.resume.notify_one();
+    settled(&signals).await;
+    assert_eq!(
+        signals.stages_created.lock().unwrap()[&root],
+        stages,
+        "no staging/cleanup loop"
+    );
+    let user = harness
+        .processor
+        .crud_store
+        .list_skill_installations_scope_page("user", "ws", None, 64)
+        .await
+        .unwrap();
+    let registry = harness
+        .processor
+        .crud_store
+        .list_skill_installations_scope_page("registry", "ws", None, 64)
+        .await
+        .unwrap();
+    assert_eq!(user.len(), 1);
+    assert!(!user[0].fingerprint.is_empty());
+    assert_eq!(registry.len(), 1);
+    assert!(!registry[0].fingerprint.is_empty());
+    assert!(
+        signals.verification_bytes.load(Ordering::Acquire) >= 3 * metadata_bytes as u64,
+        "real worker counts source, stage and final destination reads while a neighbor progresses"
+    );
+    let old = signals.roots.lock().unwrap()[&root].live.clone();
+    let displaced = root.with_extension("displaced");
+    std::fs::rename(&root, &displaced).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    signals.event(Ok(Event::new(EventKind::Modify(
+        notify::event::ModifyKind::Name(notify::event::RenameMode::Both),
+    ))
+    .add_path(root.clone())
+    .add_path(displaced)));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while old.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("external root replacement still fences");
+    stop.cancel();
+    worker.await.unwrap();
+}
+
+#[test]
+fn local_native_registration_failures_keep_a_and_c_and_retry_only_b() {
+    for point in ["metadata", "read_dir", "watch"] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs_canonical(directory.path());
+        for name in ["a", "b", "c"] {
+            std::fs::create_dir(root.join(name)).unwrap();
+        }
+        std::fs::create_dir(root.join("b/old-child")).unwrap();
+        let b = root.join("b");
+        let signals = Arc::new(Signals::default());
+        signals
+            .native_events_disabled
+            .store(true, Ordering::Release);
+        signals
+            .roots
+            .lock()
+            .unwrap()
+            .insert(root.clone(), Dirty::new(1, Instant::now()));
+        let mut native = Native::new();
+        native.recursive = false;
+        // Establish a prior full proof, including B's child, before a local failure.
+        for _ in 0..10 {
+            native = native.refresh(vec![root.clone()], BTreeSet::new(), signals.clone());
+        }
+        signals
+            .registration_faults
+            .lock()
+            .unwrap()
+            .insert((b.clone(), point));
+        for _ in 0..10 {
+            native = native.refresh(
+                vec![root.clone()],
+                BTreeSet::from([root.clone()]),
+                signals.clone(),
+            );
+            if native.plans[&root].attempts != 0 {
+                break;
+            }
+        }
+        assert!(native.watched[&root.join("a")].active);
+        assert!(native.watched[&root.join("c")].active);
+        assert!(
+            native.watched.contains_key(&root.join("b/old-child")),
+            "partial walk cannot prune old proof"
+        );
+        assert_eq!(native.observation(&root), Observation::Degraded);
+        assert!(native.plans[&root].failed_paths.contains_key(&b));
+        let calls = native.watch_calls.clone();
+        for _ in 0..3 {
+            native = native.refresh(vec![root.clone()], BTreeSet::new(), signals.clone());
+        }
+        assert_eq!(
+            native.watch_calls, calls,
+            "backoff prevents immediate retries"
+        );
+        native.plans.get_mut(&root).unwrap().retry_at = Instant::now();
+        for _ in 0..10 {
+            native = native.refresh(vec![root.clone()], BTreeSet::new(), signals.clone());
+            if native.plans[&root].walk.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            native.watch_calls.get(&root.join("a")),
+            calls.get(&root.join("a"))
+        );
+        assert_eq!(
+            native.watch_calls.get(&root.join("c")),
+            calls.get(&root.join("c"))
+        );
+        assert!(native.plans[&root].attempts >= 2);
+        signals.registration_faults.lock().unwrap().clear();
+        native.plans.get_mut(&root).unwrap().retry_at = Instant::now();
+        for _ in 0..10 {
+            native = native.refresh(vec![root.clone()], BTreeSet::new(), signals.clone());
+        }
+        assert_eq!(native.observation(&root), Observation::Subscribed);
+        assert!(native.watched[&b].active);
+        assert!(
+            signals.roots.lock().unwrap()[&root]
+                .rescan_generation
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn registration_unwind_keeps_the_worker_alive_with_backoff_and_shutdown() {
+    let harness = harness().await;
+    let signals = Arc::new(Signals::default());
+    signals
+        .native_events_disabled
+        .store(true, Ordering::Release);
+    signals
+        .directory_registration
+        .store(true, Ordering::Release);
+    let stop = CancellationToken::new();
+    let worker = tokio::spawn(run_with_signals(
+        harness.processor.clone(),
+        stop.clone(),
+        signals.clone(),
+    ));
+    settled(&signals).await;
+    let before = signals.backend_attempts.load(Ordering::Acquire);
+    signals
+        .registration_panic_once
+        .store(true, Ordering::Release);
+    let root = signals.roots.lock().unwrap().keys().next().unwrap().clone();
+    let old = signals.roots.lock().unwrap()[&root].live.clone();
+    signals.event(Ok(Event::new(EventKind::Create(
+        notify::event::CreateKind::Folder,
+    ))
+    .add_path(root.clone())));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while old.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!worker.is_finished());
+    assert_eq!(
+        signals.backend_attempts.load(Ordering::Acquire),
+        before,
+        "unwind does not retry immediately"
+    );
+    tokio::time::timeout(Duration::from_secs(12), async {
+        while signals.backend_creations.load(Ordering::Acquire) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    settled(&signals).await;
+    let attempts = signals.backend_attempts.load(Ordering::Acquire);
+    let rounds = signals.root_rounds.load(Ordering::Acquire);
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(signals.backend_attempts.load(Ordering::Acquire), attempts);
+    assert_eq!(signals.root_rounds.load(Ordering::Acquire), rounds);
+    stop.cancel();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn local_registration_recovery_fences_a_degraded_job_before_its_old_ack() {
+    let harness = harness().await;
+    let source = harness.directory.path().join("source");
+    for name in ["a", "b", "c"] {
+        std::fs::create_dir_all(source.join(name)).unwrap();
+    }
+    for name in ["a", "c"] {
+        std::fs::write(
+            source.join(name).join("SKILL.md"),
+            format!("---\nname: {name}\n---\nNeighbor"),
+        )
+        .unwrap();
+    }
+    let root = fs_canonical(&source);
+    let signals = Arc::new(Signals::default());
+    signals
+        .native_events_disabled
+        .store(true, Ordering::Release);
+    signals
+        .directory_registration
+        .store(true, Ordering::Release);
+    signals
+        .registration_faults
+        .lock()
+        .unwrap()
+        .insert((root.join("b"), "metadata"));
+    *signals.pause_root.lock().unwrap() = Some(root.clone());
+    let stop = CancellationToken::new();
+    let worker = tokio::spawn(run_with_signals(
+        harness.processor.clone(),
+        stop.clone(),
+        signals.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(10), signals.paused.notified())
+        .await
+        .unwrap();
+    let old = signals.roots.lock().unwrap()[&root].live.clone();
+    signals.registration_faults.lock().unwrap().clear();
+    // The blocked test barrier lets the registration retry deadline elapse.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    signals.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while old.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("restored B cannot allow an old degraded cursor to ACK");
+    settled(&signals).await;
+    let rows = harness
+        .processor
+        .crud_store
+        .list_skill_installations_scope_page("user", "ws", None, 64)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| !row.fingerprint.is_empty()));
+    stop.cancel();
+    worker.await.unwrap();
+}
+
+#[test]
+fn callback_reservation_lookups_follow_path_depth_instead_of_completed_packages() {
+    for reservations in [16, 20_000] {
+        let root = PathBuf::from("/reserved");
+        let signals = Signals::default();
+        signals
+            .directory_registration
+            .store(true, Ordering::Release);
+        let mut dirty = Dirty::new(1, Instant::now());
+        dirty.watch_dirty = false;
+        dirty.watch_fence = false;
+        signals.roots.lock().unwrap().insert(root.clone(), dirty);
+        let live = signals.roots.lock().unwrap()[&root].live.clone();
+        let lease = signals.new_claim_owner(&root, live);
+        for index in 0..reservations {
+            signals.claim_path(&lease, &root.join(format!("completed-{index}")), true);
+        }
+        let exact = root.join("destination");
+        let subtree = root.join("owned-wrapper");
+        signals.claim_path(&lease, &exact, false);
+        signals.claim_path(&lease, &subtree, true);
+        for (path, fenced) in [
+            (exact.clone(), false),
+            (subtree.join("payload/assets"), false),
+            (exact.join("external-child"), true),
+            (root.join("external-folder"), true),
+            (root.clone(), true),
+            (PathBuf::from("/"), true),
+        ] {
+            signals.owned_lookups.store(0, Ordering::Relaxed);
+            let before = {
+                let mut roots = signals.roots.lock().unwrap();
+                let dirty = roots.get_mut(&root).unwrap();
+                dirty.watch_fence = false;
+                dirty.watch_dirty = false;
+                dirty.generation
+            };
+            signals.event(Ok(Event::new(EventKind::Create(
+                notify::event::CreateKind::Folder,
+            ))
+            .add_path(path.clone())));
+            let roots = signals.roots.lock().unwrap();
+            assert_eq!(roots[&root].watch_fence, fenced, "{path:?}");
+            assert!(roots[&root].watch_dirty);
+            assert_eq!(
+                roots[&root].generation,
+                before + 1,
+                "own proof never suppresses dirty events"
+            );
+            let lookups = signals.owned_lookups.load(Ordering::Relaxed);
+            assert!(lookups <= path.ancestors().count() as u64);
+            if path == exact {
+                assert_eq!(lookups, 1);
+            }
+            if path == subtree.join("payload/assets") {
+                assert_eq!(lookups, 3);
+            }
+            if path == root.join("external-folder") {
+                assert_eq!(lookups, path.ancestors().count() as u64);
+            }
+        }
+    }
+}
+
+fn reservation_job(signals: &Arc<Signals>, root: &Path) -> Job {
+    let live = signals
+        .roots
+        .lock()
+        .unwrap()
+        .get(root)
+        .map(|dirty| dirty.live.clone())
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
+    Job {
+        signals: signals.clone(),
+        claims: signals.new_claim_owner(root, live),
+        incarnation: 1,
+        generation: 1,
+        stream: Box::pin(futures_util::stream::empty()),
+        failed: false,
+        resume_at: Instant::now(),
+    }
+}
+fn cleanup_work(signals: &Signals) -> u64 {
+    signals.claim_cleanup_records.load(Ordering::Acquire)
+        + signals.claim_cleanup_owners.load(Ordering::Acquire)
+}
+fn reservation_event(signals: &Signals, root: &Path, path: &Path, fenced: bool) {
+    let before = {
+        let mut state = signals.roots.lock().unwrap();
+        let dirty = state.get_mut(root).unwrap();
+        dirty.watch_fence = false;
+        dirty.watch_dirty = false;
+        dirty.generation
+    };
+    signals.event(Ok(Event::new(EventKind::Create(
+        notify::event::CreateKind::Folder,
+    ))
+    .add_path(path.to_path_buf())));
+    let state = signals.roots.lock().unwrap();
+    assert_eq!(state[root].watch_fence, fenced, "{path:?}");
+    assert!(state[root].watch_dirty);
+    assert_eq!(state[root].generation, before + 1);
+}
+
+#[test]
+fn active_reservations_are_not_rescanned_and_retired_records_are_removed_in_quanta() {
+    let signals = Arc::new(Signals::default());
+    let root = PathBuf::from("/large-claims");
+    let job = reservation_job(&signals, &root);
+    for index in 0..20_000 {
+        signals.claim_path(&job.claims, &root.join(format!("path-{index:05}")), true);
+    }
+    for _ in 0..128 {
+        assert!(!signals.cleanup_claims());
+    }
+    assert_eq!(cleanup_work(&signals), 0, "no job ended: no index walk");
+    let lease = job.claims.clone();
+    // Job destruction can happen inside the roots lock in watch_fence/snapshot.
+    let lock = signals.roots.lock().unwrap();
+    drop(job);
+    assert!(!lease.live.load(Ordering::Acquire));
+    drop(lock);
+    let mut quanta = 0;
+    loop {
+        let before = cleanup_work(&signals);
+        let pending = signals.cleanup_claims();
+        assert!(cleanup_work(&signals) - before <= CLAIM_CLEANUP_QUANTUM as u64);
+        quanta += 1;
+        if !pending {
+            break;
+        }
+    }
+    assert!(quanta > 300);
+    assert_eq!(
+        signals.claim_cleanup_records.load(Ordering::Acquire),
+        20_000
+    );
+    let state = signals.roots.lock().unwrap();
+    assert!(state.owners.is_empty());
+    assert!(state.owned_paths.is_empty());
+}
+
+#[test]
+fn retirement_during_cleanup_keeps_the_cursor_and_revisits_earlier_owners() {
+    let signals = Arc::new(Signals::default());
+    let mut prefix = (0..100)
+        .map(|i| reservation_job(&signals, &PathBuf::from(format!("/active-{i}"))))
+        .collect::<Vec<_>>();
+    let retired = reservation_job(&signals, Path::new("/retired"));
+    for i in 0..256 {
+        signals.claim_path(
+            &retired.claims,
+            &PathBuf::from(format!("/retired/{i}")),
+            true,
+        );
+    }
+    drop(retired);
+    assert!(signals.cleanup_claims());
+    assert_eq!(signals.claim_cleanup_records.load(Ordering::Acquire), 0);
+    let early = prefix.remove(0);
+    let early_id = early.claims.id;
+    drop(early);
+    let before = cleanup_work(&signals);
+    assert!(signals.cleanup_claims());
+    assert!(cleanup_work(&signals) - before <= CLAIM_CLEANUP_QUANTUM as u64);
+    assert!(
+        signals.claim_cleanup_records.load(Ordering::Acquire) > 0,
+        "new retirement must not reset the cursor to the active prefix"
+    );
+    while signals.cleanup_claims() {}
+    assert!(
+        !signals.roots.lock().unwrap().owners.contains_key(&early_id),
+        "retirement behind the cursor is visited on the next pass"
+    );
+    assert_eq!(signals.claim_cleanup_records.load(Ordering::Acquire), 256);
+    drop(prefix);
+    while signals.cleanup_claims() {}
+    assert!(signals.roots.lock().unwrap().owners.is_empty());
+}
+
+#[test]
+fn same_root_replacement_and_overlapping_owners_survive_old_claim_cleanup() {
+    let signals = Arc::new(Signals::default());
+    signals
+        .directory_registration
+        .store(true, Ordering::Release);
+    let root = PathBuf::from("/overlap");
+    let nested = root.join("nested");
+    {
+        let mut state = signals.roots.lock().unwrap();
+        state.insert(root.clone(), Dirty::new(1, Instant::now()));
+        state.insert(nested.clone(), Dirty::new(2, Instant::now()));
+    }
+    let old = reservation_job(&signals, &root);
+    let other = reservation_job(&signals, &nested);
+    let shared = nested.join("shared");
+    let exact = root.join("new-exact");
+    let abandoned = root.join("abandoned");
+    signals.claim_path(&old.claims, &shared, true);
+    signals.claim_path(&other.claims, &shared, true);
+    signals.claim_path(&old.claims, &exact, true);
+    signals.claim_path(&old.claims, &abandoned, true);
+    for i in 0..512 {
+        signals.claim_path(&old.claims, &root.join(format!("a-{i:04}")), true);
+    }
+    let old_lease = old.claims.clone();
+    drop(old);
+    let replacement = reservation_job(&signals, &root);
+    assert_ne!(old_lease.id, replacement.claims.id);
+    signals.claim_path(&replacement.claims, &exact, false);
+    // An outliving closure cannot reactivate ownership of the retired job.
+    signals.claim_path(&old_lease, &abandoned, true);
+    assert!(signals.cleanup_claims());
+    assert!(
+        signals
+            .roots
+            .lock()
+            .unwrap()
+            .owners
+            .contains_key(&old_lease.id)
+    );
+    reservation_event(&signals, &root, &abandoned.join("external"), true);
+    reservation_event(&signals, &root, &exact, false);
+    reservation_event(&signals, &root, &exact.join("external"), true);
+    reservation_event(&signals, &root, &shared.join("payload"), false);
+    reservation_event(&signals, &nested, &shared.join("payload"), false);
+    while signals.cleanup_claims() {}
+    reservation_event(&signals, &root, &exact, false);
+    reservation_event(&signals, &nested, &shared.join("payload"), false);
+    let state = signals.roots.lock().unwrap();
+    assert!(!state.owners.contains_key(&old_lease.id));
+    assert!(Arc::ptr_eq(
+        &state.owned_paths[&exact][&root].lease,
+        &replacement.claims
+    ));
+    assert!(Arc::ptr_eq(
+        &state.owned_paths[&shared][&nested].lease,
+        &other.claims
+    ));
+    drop(state);
+    // Registration recovery can fence a suspended job before it is dropped.
+    signals.roots.lock().unwrap()[&root]
+        .live
+        .store(false, Ordering::Release);
+    assert!(replacement.claims.live.load(Ordering::Acquire));
+    assert!(!replacement.claims.valid());
+    reservation_event(&signals, &root, &exact, true);
+    reservation_event(&signals, &nested, &shared.join("payload"), false);
+    // Even a reservation cannot suppress replacement of a root/sentinel.
+    reservation_event(&signals, &root, &root, true);
+    reservation_event(&signals, &nested, &root, true);
+}
+
+#[test]
+fn every_job_map_removal_revokes_ownership_before_physical_cleanup() {
+    for removal in ["remove", "retain", "clear", "shutdown"] {
+        let signals = Arc::new(Signals::default());
+        let root = PathBuf::from("/job-lifecycle");
+        let job = reservation_job(&signals, &root);
+        for i in 0..256 {
+            signals.claim_path(&job.claims, &root.join(format!("claim-{i}")), true);
+        }
+        let lease = job.claims.clone();
+        let mut jobs = BTreeMap::from([(root.clone(), job)]);
+        let lock = signals.roots.lock().unwrap();
+        match removal {
+            "retain" => jobs.retain(|_, _| false),
+            "clear" => jobs.clear(),
+            "shutdown" => {
+                signals.retire_claims(&jobs[&root].claims);
+                assert!(!lease.live.load(Ordering::Acquire));
+                jobs.clear();
+            }
+            _ => {
+                jobs.remove(&root);
+            }
+        }
+        assert!(!lease.live.load(Ordering::Acquire), "{removal}");
+        assert_eq!(cleanup_work(&signals), 0, "{removal}: no Drop walk");
+        drop(lock);
+        let before = cleanup_work(&signals);
+        assert!(signals.cleanup_claims());
+        assert!(cleanup_work(&signals) - before <= CLAIM_CLEANUP_QUANTUM as u64);
+        assert!(signals.roots.lock().unwrap().owners.contains_key(&lease.id));
+    }
+}
+
+#[tokio::test]
+async fn real_worker_keeps_active_claims_and_cleans_retired_owners_while_neighbor_advances() {
+    for cancel in [false, true] {
+        let harness = harness_with_layout(false, true).await;
+        let root = harness.directory.path().join("managed/ws/user");
+        let source = root.join("unregistered");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: Lease lifecycle\n---\nImport",
+        )
+        .unwrap();
+        std::fs::write(source.join("large.asset"), vec![b'a'; 800 * 1024]).unwrap();
+        let root = fs_canonical(&root);
+        let signals = Arc::new(Signals::default());
+        signals
+            .directory_registration
+            .store(true, Ordering::Release);
+        signals
+            .native_events_disabled
+            .store(true, Ordering::Release);
+        *signals.pause_stage.lock().unwrap() = Some(root.clone());
+        let stop = CancellationToken::new();
+        let worker = tokio::spawn(run_with_signals(
+            harness.processor.clone(),
+            stop.clone(),
+            signals.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), signals.paused.notified())
+            .await
+            .unwrap();
+        let lease = signals
+            .roots
+            .lock()
+            .unwrap()
+            .owners
+            .values()
+            .find(|owner| owner.lease.root == root && owner.lease.live.load(Ordering::Acquire))
+            .unwrap()
+            .lease
+            .clone();
+        let prepared_guard = signals.roots.lock().unwrap()[&root].live.clone();
+        for i in 0..20_000 {
+            signals.claim_path(&lease, &root.join(format!("reserved-{i:05}")), true);
+        }
+        let records = signals.claim_cleanup_records.load(Ordering::Acquire);
+        for _ in 0..3 {
+            *signals.pause_root.lock().unwrap() = Some(root.clone());
+            signals.resume.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), signals.paused.notified())
+                .await
+                .unwrap();
+            assert!(lease.live.load(Ordering::Acquire));
+            assert_eq!(
+                signals.claim_cleanup_records.load(Ordering::Acquire),
+                records,
+                "real useful worker quanta never rescan an active owner's paths"
+            );
+        }
+        signals.pause_claim_cleanup.store(true, Ordering::Release);
+        if cancel {
+            signals.event(Ok(Event::new(EventKind::Modify(
+                notify::event::ModifyKind::Name(notify::event::RenameMode::Both),
+            ))
+            .add_path(root.clone())
+            .add_path(root.with_extension("external-replacement"))));
+        }
+        signals.resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), signals.paused.notified())
+            .await
+            .unwrap();
+        assert!(!lease.live.load(Ordering::Acquire));
+        if cancel {
+            assert!(
+                !prepared_guard.load(Ordering::Acquire),
+                "external root replacement fences prepared publication as well as ownership"
+            );
+        }
+        assert!(
+            signals.claim_cleanup_records.load(Ordering::Acquire) - records
+                <= CLAIM_CLEANUP_QUANTUM as u64
+        );
+        assert!(signals.roots.lock().unwrap().owners.contains_key(&lease.id));
+        reservation_event(&signals, &root, &root.join("reserved-19999/external"), true);
+        let neighbor = harness.directory.path().join("neighbor");
+        let package = neighbor.join("pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("SKILL.md"),
+            "---\nname: Cleanup neighbor\n---\nAvailable",
+        )
+        .unwrap();
+        signals.event(Ok(Event::new(EventKind::Create(
+            notify::event::CreateKind::Folder,
+        ))
+        .add_path(neighbor)));
+        let mut progressed = false;
+        for _ in 0..200 {
+            let before = cleanup_work(&signals);
+            signals.pause_claim_cleanup.store(true, Ordering::Release);
+            signals.resume.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), signals.paused.notified())
+                .await
+                .unwrap();
+            assert!(cleanup_work(&signals) - before <= CLAIM_CLEANUP_QUANTUM as u64);
+            let rows = harness
+                .processor
+                .crud_store
+                .list_skill_installations_scope_page("registry", "ws", None, 64)
+                .await
+                .unwrap();
+            if rows.iter().any(|row| !row.fingerprint.is_empty()) {
+                assert!(
+                    signals.roots.lock().unwrap().owners.contains_key(&lease.id),
+                    "neighbor publishes before the large retired owner is drained"
+                );
+                progressed = true;
+                break;
+            }
+        }
+        assert!(progressed);
+        stop.cancel();
+        worker.await.unwrap();
+        let state = signals.roots.lock().unwrap();
+        assert!(state.owners.is_empty());
+        assert!(state.owned_paths.is_empty());
+        assert!(!lease.live.load(Ordering::Acquire));
+    }
 }
