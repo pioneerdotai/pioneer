@@ -11368,6 +11368,11 @@ mod tests {
             )
             .await
             .unwrap();
+            let ready = store
+                .find_thread_episodic_index_job_by_item(&ready.index_item_id)
+                .await
+                .unwrap()
+                .unwrap();
             let capsule = store
                 .list_thread_episodic_workspace_capsules(&workspace, 1)
                 .await
@@ -13787,6 +13792,17 @@ mod tests {
         unrelated.rollback().await.unwrap();
         old_work.abort();
         assert!(old_work.await.unwrap_err().is_cancelled());
+        // A canceled manual quantum retains its attempt for shutdown or the
+        // next quantum. Resume the executor so it drops the abandoned async
+        // ownership before waiting for the replacement's admission barrier.
+        assert_eq!(
+            executor_a
+                .run_once(chrono::Utc::now().timestamp())
+                .await
+                .unwrap()
+                .claimed,
+            0
+        );
         reset_started_rx.await.unwrap();
         // The transition owns this workspace, but canonical source/job writes
         // remain available. Ordinary indexing cannot claim the new durable job.

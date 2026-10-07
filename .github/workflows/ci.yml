@@ -88,9 +88,16 @@ jobs:
           set -euo pipefail
           cargo check --locked --workspace
 
+      - name: cargo-test-episodic-regressions
+        if: matrix.run_tests == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p pioneer-gateway --lib thread_episodic -- --nocapture
+
       - name: cargo-test-workspace
         if: matrix.run_tests == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked
+          cargo test --locked -- --nocapture
