@@ -58,11 +58,19 @@ jobs:
 
       - name: install-linux-build-dependencies
         if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 10
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
+          # Keep the runner's official Ubuntu fallbacks; its Azure mirror stalled CI.
+          sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          apt_options=(
+            -o Acquire::Retries=3
+            -o Acquire::http::Timeout=30
+            -o Acquire::https::Timeout=30
+          )
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y \
             pkg-config \
             libasound2-dev \
             libegl1-mesa-dev \
